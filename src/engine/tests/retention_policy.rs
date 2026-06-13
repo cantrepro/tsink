@@ -1798,11 +1798,8 @@ fn compute_only_storage_refreshes_remote_tombstones_without_segment_inventory_ch
     storage.close().unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_recovers() {
-    use std::os::unix::fs::PermissionsExt;
-
     let object_store_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];
     let registry = SeriesRegistry::new();
@@ -1842,17 +1839,16 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         &[(30, 30.0), (31, 31.0)],
     );
 
-    let level_root = object_store_dir
+    let invalid_segment_root = object_store_dir
         .path()
         .join("cold")
         .join(BLOB_LANE_ROOT)
         .join("segments")
-        .join("L0");
-    std::fs::create_dir_all(&level_root).unwrap();
-    let original_permissions = std::fs::metadata(&level_root).unwrap().permissions();
-    let mut denied_permissions = original_permissions.clone();
-    denied_permissions.set_mode(0o000);
-    std::fs::set_permissions(&level_root, denied_permissions).unwrap();
+        .join("L0")
+        .join("seg-00000000000000ff");
+    // A segment-shaped directory without a manifest forces the inventory scan to fail
+    // deterministically, which keeps the visible catalog stale until the retry succeeds.
+    std::fs::create_dir_all(&invalid_segment_root).unwrap();
 
     std::thread::sleep(Duration::from_millis(5));
     assert_eq!(
@@ -1894,7 +1890,7 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
     assert_eq!(repeated_snapshot.remote.consecutive_refresh_failures, 1);
     assert!(repeated_snapshot.remote.backoff_active);
 
-    std::fs::set_permissions(&level_root, original_permissions).unwrap();
+    std::fs::remove_dir_all(&invalid_segment_root).unwrap();
 
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
