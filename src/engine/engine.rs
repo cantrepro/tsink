@@ -34,6 +34,7 @@ const STORAGE_CLOSED: u8 = 2;
 const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
+const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 struct ChunkStorageOptions {
@@ -42,6 +43,7 @@ struct ChunkStorageOptions {
     partition_window: i64,
     max_writers: usize,
     write_timeout: Duration,
+    compaction_interval: Duration,
 }
 
 impl Default for ChunkStorageOptions {
@@ -59,6 +61,7 @@ impl Default for ChunkStorageOptions {
             .max(1),
             max_writers: crate::cgroup::default_workers_limit().max(1),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
         }
     }
 }
@@ -230,7 +233,9 @@ pub struct ChunkStorage {
     write_limiter: Semaphore,
     write_timeout: Duration,
     max_observed_timestamp: AtomicI64,
-    lifecycle: AtomicU8,
+    lifecycle: Arc<AtomicU8>,
+    compaction_lock: Arc<Mutex<()>>,
+    compaction_thread: Option<std::thread::Thread>,
 }
 
 impl ChunkStorage {
@@ -271,6 +276,30 @@ impl ChunkStorage {
         options: ChunkStorageOptions,
     ) -> Self {
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
+        let numeric_compactor = numeric_lane_path.as_ref().map(|path| {
+            Compactor::new_with_segment_id_allocator(
+                path,
+                chunk_point_cap,
+                Arc::clone(&next_segment_id),
+            )
+        });
+        let blob_compactor = blob_lane_path.as_ref().map(|path| {
+            Compactor::new_with_segment_id_allocator(
+                path,
+                chunk_point_cap,
+                Arc::clone(&next_segment_id),
+            )
+        });
+        let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
+        let compaction_lock = Arc::new(Mutex::new(()));
+        let compaction_thread = Self::spawn_background_compaction_thread(
+            Arc::downgrade(&lifecycle),
+            Arc::clone(&compaction_lock),
+            numeric_compactor.clone(),
+            blob_compactor.clone(),
+            options.compaction_interval,
+        );
+
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
             registry_write_txn: Mutex::new(()),
@@ -281,20 +310,8 @@ impl ChunkStorage {
             persisted_chunk_watermarks: RwLock::new(HashMap::new()),
             next_chunk_sequence: AtomicU64::new(1),
             chunk_point_cap: chunk_point_cap.clamp(1, u16::MAX as usize),
-            numeric_compactor: numeric_lane_path.as_ref().map(|path| {
-                Compactor::new_with_segment_id_allocator(
-                    path,
-                    chunk_point_cap,
-                    Arc::clone(&next_segment_id),
-                )
-            }),
-            blob_compactor: blob_lane_path.as_ref().map(|path| {
-                Compactor::new_with_segment_id_allocator(
-                    path,
-                    chunk_point_cap,
-                    Arc::clone(&next_segment_id),
-                )
-            }),
+            numeric_compactor,
+            blob_compactor,
             numeric_lane_path,
             blob_lane_path,
             next_segment_id,
@@ -305,7 +322,52 @@ impl ChunkStorage {
             write_limiter: Semaphore::new(options.max_writers.max(1)),
             write_timeout: options.write_timeout,
             max_observed_timestamp: AtomicI64::new(i64::MIN),
-            lifecycle: AtomicU8::new(STORAGE_OPEN),
+            lifecycle,
+            compaction_lock,
+            compaction_thread,
+        }
+    }
+
+    fn spawn_background_compaction_thread(
+        lifecycle: std::sync::Weak<AtomicU8>,
+        compaction_lock: Arc<Mutex<()>>,
+        numeric_compactor: Option<Compactor>,
+        blob_compactor: Option<Compactor>,
+        compaction_interval: Duration,
+    ) -> Option<std::thread::Thread> {
+        if numeric_compactor.is_none() && blob_compactor.is_none() {
+            return None;
+        }
+
+        let handle = std::thread::Builder::new()
+            .name("tsink-compaction".to_string())
+            .spawn(move || loop {
+                std::thread::park_timeout(compaction_interval);
+
+                let Some(lifecycle) = lifecycle.upgrade() else {
+                    break;
+                };
+
+                match lifecycle.load(Ordering::SeqCst) {
+                    STORAGE_OPEN => {}
+                    STORAGE_CLOSED => break,
+                    _ => continue,
+                }
+
+                let _compaction_guard = compaction_lock.lock();
+                let _ =
+                    Self::compact_compactors(numeric_compactor.as_ref(), blob_compactor.as_ref());
+            })
+            .ok()?;
+
+        let thread = handle.thread().clone();
+        drop(handle);
+        Some(thread)
+    }
+
+    fn notify_compaction_thread(&self) {
+        if let Some(compaction_thread) = &self.compaction_thread {
+            compaction_thread.unpark();
         }
     }
 
@@ -1018,14 +1080,25 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn compact_once_if_needed(&self) -> Result<()> {
-        if let Some(compactor) = &self.numeric_compactor {
+    fn compact_compactors(
+        numeric_compactor: Option<&Compactor>,
+        blob_compactor: Option<&Compactor>,
+    ) -> Result<()> {
+        if let Some(compactor) = numeric_compactor {
             compactor.compact_once()?;
         }
-        if let Some(compactor) = &self.blob_compactor {
+        if let Some(compactor) = blob_compactor {
             compactor.compact_once()?;
         }
         Ok(())
+    }
+
+    fn compact_once_if_needed(&self) -> Result<()> {
+        let _compaction_guard = self.compaction_lock.lock();
+        Self::compact_compactors(
+            self.numeric_compactor.as_ref(),
+            self.blob_compactor.as_ref(),
+        )
     }
 }
 
@@ -1280,6 +1353,8 @@ impl Storage for ChunkStorage {
             return Err(TsinkError::StorageClosed);
         }
 
+        self.notify_compaction_thread();
+
         let close_result = (|| {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
@@ -1292,6 +1367,7 @@ impl Storage for ChunkStorage {
         } else {
             self.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
         }
+        self.notify_compaction_thread();
 
         close_result
     }
@@ -1305,6 +1381,8 @@ impl Drop for ChunkStorage {
 
         // Best-effort shutdown to avoid losing in-memory active chunks on last Arc drop.
         let _ = <Self as Storage>::close(self);
+        self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
+        self.notify_compaction_thread();
     }
 }
 
@@ -1321,6 +1399,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         .max(1),
         max_writers: builder.max_writers(),
         write_timeout: builder.write_timeout(),
+        compaction_interval: DEFAULT_COMPACTION_INTERVAL,
     };
 
     let base_data_path = builder.data_path().map(|path| path.to_path_buf());
@@ -1595,13 +1674,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT, WAL_DIR_NAME,
+        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, DEFAULT_COMPACTION_INTERVAL,
+        NUMERIC_LANE_ROOT, WAL_DIR_NAME,
     };
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
     use crate::engine::encoder::Encoder;
-    use crate::engine::segment::SegmentWriter;
+    use crate::engine::segment::{load_segments_for_level, SegmentWriter};
     use crate::engine::series_registry::SeriesRegistry;
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
     use crate::wal::WalSyncMode;
@@ -2004,6 +2084,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
 
@@ -2063,6 +2144,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
         let labels = vec![Label::new("host", "a")];
@@ -2457,6 +2539,69 @@ mod tests {
     }
 
     #[test]
+    fn background_compaction_reduces_l0_segments_while_storage_is_open() {
+        use std::thread;
+        use std::time::Instant;
+
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert("background_compaction", &labels)
+            .unwrap()
+            .series_id;
+
+        for segment_id in 1..=4 {
+            let mut chunks = HashMap::new();
+            chunks.insert(
+                series_id,
+                vec![make_persisted_numeric_chunk(
+                    series_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                )],
+            );
+            SegmentWriter::new(&lane_path, 0, segment_id)
+                .unwrap()
+                .write_segment(&registry, &chunks)
+                .unwrap();
+        }
+
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            5,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(1),
+                compaction_interval: Duration::from_millis(25),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut compacted = false;
+
+        while Instant::now() < deadline {
+            let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+            let l1 = load_segments_for_level(&lane_path, 1).unwrap();
+            if l0.len() < 4 && !l1.is_empty() {
+                compacted = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(compacted, "background thread did not compact L0 into L1");
+        storage.close().unwrap();
+    }
+
+    #[test]
     fn reenable_wal_after_wal_disabled_run_ignores_stale_wal_generation() {
         let temp_dir = TempDir::new().unwrap();
         let stale_labels = vec![Label::new("host", "stale")];
@@ -2664,6 +2809,7 @@ mod tests {
                 partition_window: 1,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         );
 
@@ -2846,6 +2992,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 1,
                 write_timeout: Duration::ZERO,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         );
 
@@ -2880,6 +3027,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 1,
                 write_timeout: Duration::from_secs(2),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
         let labels = vec![Label::new("host", "a")];
