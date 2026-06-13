@@ -877,7 +877,12 @@ impl ChunkStorage {
         } else {
             crate::engine::segment::LoadedSegmentIndexes::default()
         };
-        let loaded_segments = merge_loaded_segment_indexes(loaded_numeric, loaded_blob)?;
+        let loaded_segments = merge_loaded_segment_indexes(
+            loaded_numeric,
+            loaded_blob,
+            self.numeric_lane_path.is_some(),
+            self.blob_lane_path.is_some(),
+        )?;
         self.apply_loaded_segment_indexes(loaded_segments)
     }
 
@@ -2141,6 +2146,23 @@ impl ChunkStorage {
         Ok(())
     }
 
+    fn rollback_published_segments(&self, segment_roots: &[PathBuf]) -> Result<()> {
+        for root in segment_roots.iter().rev() {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: root.clone(),
+                        source: err,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn persist_segment(&self, include_wal_highwater: bool) -> Result<bool> {
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
             return Ok(false);
@@ -2226,21 +2248,43 @@ impl ChunkStorage {
 
         {
             let registry = self.registry.read();
+            let mut published_segment_roots = Vec::new();
 
-            if let (Some(path), false) = (&self.numeric_lane_path, numeric_chunks.is_empty()) {
-                let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
-                let writer = SegmentWriter::new(path, 0, segment_id)?;
-                writer.write_segment_with_wal_highwater(
-                    &registry,
-                    &numeric_chunks,
-                    wal_highwater,
-                )?;
-            }
+            let persist_result = (|| -> Result<()> {
+                if let (Some(path), false) = (&self.numeric_lane_path, numeric_chunks.is_empty()) {
+                    let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
+                    let writer = SegmentWriter::new(path, 0, segment_id)?;
+                    writer.write_segment_with_wal_highwater(
+                        &registry,
+                        &numeric_chunks,
+                        wal_highwater,
+                    )?;
+                    published_segment_roots.push(writer.layout().root.clone());
+                }
 
-            if let (Some(path), false) = (&self.blob_lane_path, blob_chunks.is_empty()) {
-                let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
-                let writer = SegmentWriter::new(path, 0, segment_id)?;
-                writer.write_segment_with_wal_highwater(&registry, &blob_chunks, wal_highwater)?;
+                if let (Some(path), false) = (&self.blob_lane_path, blob_chunks.is_empty()) {
+                    let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
+                    let writer = SegmentWriter::new(path, 0, segment_id)?;
+                    writer.write_segment_with_wal_highwater(
+                        &registry,
+                        &blob_chunks,
+                        wal_highwater,
+                    )?;
+                    published_segment_roots.push(writer.layout().root.clone());
+                }
+
+                Ok(())
+            })();
+
+            if let Err(persist_err) = persist_result {
+                if let Err(rollback_err) =
+                    self.rollback_published_segments(&published_segment_roots)
+                {
+                    return Err(TsinkError::Other(format!(
+                        "persist failed and rollback failed: persist={persist_err}, rollback={rollback_err}"
+                    )));
+                }
+                return Err(persist_err);
             }
         }
 
@@ -2685,7 +2729,12 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     } else {
         crate::engine::segment::LoadedSegmentIndexes::default()
     };
-    let loaded_segments = merge_loaded_segment_indexes(loaded_numeric, loaded_blob)?;
+    let loaded_segments = merge_loaded_segment_indexes(
+        loaded_numeric,
+        loaded_blob,
+        numeric_lane_path.is_some(),
+        blob_lane_path.is_some(),
+    )?;
     let replay_highwater = loaded_segments.wal_replay_highwater;
 
     let wal = if let Some(data_path) = builder.data_path() {
@@ -2745,6 +2794,8 @@ fn clear_wal_dir_if_present(wal_path: &Path) -> Result<()> {
 fn merge_loaded_segment_indexes(
     mut numeric: crate::engine::segment::LoadedSegmentIndexes,
     mut blob: crate::engine::segment::LoadedSegmentIndexes,
+    numeric_lane_enabled: bool,
+    blob_lane_enabled: bool,
 ) -> Result<crate::engine::segment::LoadedSegmentIndexes> {
     let mut series_by_id = BTreeMap::new();
     for series in numeric.series.drain(..) {
@@ -2774,8 +2825,14 @@ fn merge_loaded_segment_indexes(
     indexed_segments.append(&mut blob.indexed_segments);
     indexed_segments.sort_by_key(|segment| (segment.manifest.level, segment.manifest.segment_id));
 
-    let replay_highwater = match (numeric_has_segments, blob_has_segments) {
-        (true, true) => numeric.wal_replay_highwater.min(blob.wal_replay_highwater),
+    let replay_highwater = match (numeric_lane_enabled, blob_lane_enabled) {
+        (true, true) => match (numeric_has_segments, blob_has_segments) {
+            // Both lane families are configured, so one-sided segment visibility can be a
+            // failed/crashed split persist. Fall back to full WAL replay to avoid skipping
+            // frames needed by the missing lane.
+            (true, true) => numeric.wal_replay_highwater.min(blob.wal_replay_highwater),
+            _ => WalHighWatermark::default(),
+        },
         (true, false) => numeric.wal_replay_highwater,
         (false, true) => blob.wal_replay_highwater,
         (false, false) => WalHighWatermark::default(),
@@ -3195,14 +3252,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, DEFAULT_ADMISSION_POLL_INTERVAL,
-        DEFAULT_COMPACTION_INTERVAL, NUMERIC_LANE_ROOT, WAL_DIR_NAME,
+        merge_loaded_segment_indexes, ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT,
+        DEFAULT_ADMISSION_POLL_INTERVAL, DEFAULT_COMPACTION_INTERVAL, NUMERIC_LANE_ROOT,
+        WAL_DIR_NAME,
     };
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
     use crate::engine::encoder::Encoder;
-    use crate::engine::segment::{load_segments_for_level, SegmentWriter};
+    use crate::engine::segment::{
+        load_segment_indexes, load_segments_for_level, SegmentWriter, WalHighWatermark,
+    };
     use crate::engine::series_registry::SeriesRegistry;
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
     use crate::wal::WalSyncMode;
@@ -4699,6 +4759,80 @@ mod tests {
         assert!(blob_root.exists());
 
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn replay_highwater_is_conservative_when_one_configured_lane_has_no_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
+        let labels = vec![Label::new("kind", "numeric")];
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert("watermark_gap", &labels)
+            .unwrap()
+            .series_id;
+
+        let mut numeric_chunks = HashMap::new();
+        numeric_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(series_id, &[(1, 1.0)])],
+        );
+        SegmentWriter::new(&numeric_lane_path, 0, 1)
+            .unwrap()
+            .write_segment_with_wal_highwater(
+                &registry,
+                &numeric_chunks,
+                WalHighWatermark {
+                    segment: 3,
+                    frame: 7,
+                },
+            )
+            .unwrap();
+
+        let loaded_numeric = load_segment_indexes(&numeric_lane_path).unwrap();
+        let loaded_blob = load_segment_indexes(&blob_lane_path).unwrap();
+        let merged = merge_loaded_segment_indexes(loaded_numeric, loaded_blob, true, true).unwrap();
+        assert_eq!(merged.wal_replay_highwater, WalHighWatermark::default());
+    }
+
+    #[test]
+    fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
+        std::fs::write(&blob_lane_path, b"not-a-directory").unwrap();
+
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(numeric_lane_path.clone()),
+            Some(blob_lane_path),
+            1,
+            ChunkStorageOptions::default(),
+        );
+        let numeric_labels = vec![Label::new("kind", "numeric")];
+        let blob_labels = vec![Label::new("kind", "blob")];
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "lane_atomicity",
+                    numeric_labels.clone(),
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    "lane_atomicity",
+                    blob_labels.clone(),
+                    DataPoint::new(1, "a"),
+                ),
+            ])
+            .unwrap();
+        storage.flush_all_active().unwrap();
+
+        assert!(storage.persist_segment(true).is_err());
+        assert!(load_segments_for_level(&numeric_lane_path, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
