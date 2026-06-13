@@ -41,6 +41,7 @@ const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const CLOSE_COMPACTION_MAX_PASSES: usize = 128;
 const IN_MEMORY_SHARD_COUNT: usize = 64;
 const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
 
@@ -53,6 +54,7 @@ struct ChunkStorageOptions {
     write_timeout: Duration,
     memory_budget_bytes: u64,
     compaction_interval: Duration,
+    background_threads_enabled: bool,
 }
 
 impl Default for ChunkStorageOptions {
@@ -72,6 +74,7 @@ impl Default for ChunkStorageOptions {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             memory_budget_bytes: u64::MAX,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            background_threads_enabled: true,
         }
     }
 }
@@ -313,13 +316,17 @@ impl ChunkStorage {
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));
-        let compaction_thread = Self::spawn_background_compaction_thread(
-            Arc::downgrade(&lifecycle),
-            Arc::clone(&compaction_lock),
-            numeric_compactor.clone(),
-            blob_compactor.clone(),
-            options.compaction_interval,
-        );
+        let compaction_thread = if options.background_threads_enabled {
+            Self::spawn_background_compaction_thread(
+                Arc::downgrade(&lifecycle),
+                Arc::clone(&compaction_lock),
+                numeric_compactor.clone(),
+                blob_compactor.clone(),
+                options.compaction_interval,
+            )
+        } else {
+            None
+        };
 
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
@@ -1963,22 +1970,30 @@ impl ChunkStorage {
     fn compact_compactors(
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut compacted = false;
         if let Some(compactor) = numeric_compactor {
-            compactor.compact_once()?;
+            compacted |= compactor.compact_once()?;
         }
         if let Some(compactor) = blob_compactor {
-            compactor.compact_once()?;
+            compacted |= compactor.compact_once()?;
         }
-        Ok(())
+        Ok(compacted)
     }
 
-    fn compact_once_if_needed(&self) -> Result<()> {
+    fn compact_until_settled(&self, max_passes: usize) -> Result<usize> {
         let _compaction_guard = self.compaction_lock.lock();
-        Self::compact_compactors(
-            self.numeric_compactor.as_ref(),
-            self.blob_compactor.as_ref(),
-        )
+        let mut passes = 0usize;
+        for _ in 0..max_passes.max(1) {
+            if !Self::compact_compactors(
+                self.numeric_compactor.as_ref(),
+                self.blob_compactor.as_ref(),
+            )? {
+                break;
+            }
+            passes = passes.saturating_add(1);
+        }
+        Ok(passes)
     }
 }
 
@@ -2280,7 +2295,8 @@ impl Storage for ChunkStorage {
             if self.memory_budget_value() != usize::MAX {
                 self.refresh_memory_usage();
             }
-            self.compact_once_if_needed()
+            self.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+            Ok(())
         })();
 
         if close_result.is_ok() {
@@ -2312,6 +2328,7 @@ impl Drop for ChunkStorage {
 pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     let timestamp_precision = builder.timestamp_precision();
     let retention = builder.retention();
+    let wal_enabled = builder.wal_enabled();
     let storage_options = ChunkStorageOptions {
         retention_window: duration_to_timestamp_units(retention, timestamp_precision),
         retention_enforced: builder.retention_enforced(),
@@ -2324,6 +2341,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         write_timeout: builder.write_timeout(),
         memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
         compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+        background_threads_enabled: wal_enabled,
     };
 
     let base_data_path = builder.data_path().map(|path| path.to_path_buf());
@@ -2351,7 +2369,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
 
     let wal = if let Some(data_path) = builder.data_path() {
         let wal_path = data_path.join(WAL_DIR_NAME);
-        if builder.wal_enabled() {
+        if wal_enabled {
             let wal = FramedWal::open_with_buffer_size(
                 wal_path,
                 builder.wal_sync_mode(),
@@ -2382,7 +2400,9 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
     }
-    storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL);
+    if wal_enabled {
+        storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL);
+    }
 
     Ok(storage as Arc<dyn Storage>)
 }
@@ -3267,6 +3287,7 @@ mod tests {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         ));
 
@@ -3327,6 +3348,7 @@ mod tests {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         ));
         let labels = vec![Label::new("host", "a")];
@@ -3431,6 +3453,7 @@ mod tests {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         ));
         let labels = vec![Label::new("host", "a")];
@@ -3984,6 +4007,7 @@ mod tests {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: Duration::from_millis(25),
+                background_threads_enabled: true,
             },
         );
 
@@ -4292,6 +4316,7 @@ mod tests {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         );
 
@@ -4342,6 +4367,7 @@ mod tests {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: 1,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         );
 
@@ -4674,6 +4700,7 @@ mod tests {
                 write_timeout: Duration::ZERO,
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         );
 
@@ -4710,6 +4737,7 @@ mod tests {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
             },
         ));
         let labels = vec![Label::new("host", "a")];

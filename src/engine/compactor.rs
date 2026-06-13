@@ -15,7 +15,7 @@ use crate::{Result, TsinkError};
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
 const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
-const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 64;
+const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
@@ -61,14 +61,12 @@ impl Compactor {
         }
     }
 
-    pub fn compact_once(&self) -> Result<()> {
+    pub fn compact_once(&self) -> Result<bool> {
         if self.try_compact_level(CompactionLevel::L0, CompactionLevel::L1, self.l0_trigger)? {
-            return Ok(());
+            return Ok(true);
         }
 
-        let _ =
-            self.try_compact_level(CompactionLevel::L1, CompactionLevel::L2, self.l1_trigger)?;
-        Ok(())
+        self.try_compact_level(CompactionLevel::L1, CompactionLevel::L2, self.l1_trigger)
     }
 
     fn try_compact_level(
@@ -702,8 +700,8 @@ mod tests {
             .series_id;
 
         for segment_id in 1..=4 {
-            let start = (segment_id as i64 - 1) * 50;
-            let points = (start..start + 50)
+            let start = (segment_id as i64 - 1) * 300;
+            let points = (start..start + 300)
                 .map(|ts| (ts, ts as f64))
                 .collect::<Vec<_>>();
 
@@ -722,7 +720,9 @@ mod tests {
         let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
         assert!(l0.is_empty());
         assert!(l1.len() >= 2);
-        assert!(l1.iter().all(|segment| segment.manifest.point_count <= 128));
+        assert!(l1.iter().all(|segment| {
+            segment.manifest.point_count <= 2 * super::DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER
+        }));
 
         let loaded = load_segments(temp_dir.path()).unwrap();
         let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
@@ -730,7 +730,7 @@ mod tests {
             .iter()
             .map(|chunk| chunk.header.point_count as usize)
             .sum::<usize>();
-        assert_eq!(total_points, 200);
+        assert_eq!(total_points, 1200);
     }
 
     fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
