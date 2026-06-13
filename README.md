@@ -36,6 +36,7 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - [Quick Start](#quick-start)
 - [Async Usage](#async-usage)
 - [Server Mode](#server-mode-prometheus-wire-compatible)
+- [Python Bindings](#python-bindings)
 - [Query APIs](#query-apis)
 - [Series Discovery](#series-discovery)
 - [Value Model](#value-model)
@@ -250,6 +251,107 @@ curl -X POST http://localhost:9201/api/v1/import/prometheus \
   -H 'Content-Type: text/plain' \
   --data-binary @metrics.txt
 ```
+
+## Python Bindings
+
+The [`tsink_uniffi`](https://pypi.org/project/tsink-uniffi/) package provides Python bindings for tsink via [UniFFI](https://mozilla.github.io/uniffi-rs/). It exposes the core storage engine to Python with native performance.
+
+### Installation
+
+```bash
+pip install tsink_uniffi
+```
+
+### Quick Start
+
+```python
+import time
+from tsink_uniffi import (
+    TsinkStorageBuilder,
+    UDataPoint,
+    ULabel,
+    URow,
+    UValue,
+    UTimestampPrecision,
+    UAggregation,
+    UQueryOptions,
+)
+
+# Build an in-memory store
+builder = TsinkStorageBuilder()
+builder.with_timestamp_precision(UTimestampPrecision.SECONDS)
+builder.with_memory_limit(64 * 1024 * 1024)  # 64 MB
+db = builder.build()
+
+now = int(time.time())
+
+# Insert rows
+db.insert_rows([
+    URow(
+        metric="cpu_usage",
+        labels=[
+            ULabel(name="host", value="server-1"),
+            ULabel(name="region", value="us-east"),
+        ],
+        data_point=UDataPoint(
+            value=UValue.F64(45.0),
+            timestamp=now,
+        ),
+    ),
+])
+
+# Query a single series
+points = db.select(
+    metric="cpu_usage",
+    labels=[
+        ULabel(name="host", value="server-1"),
+        ULabel(name="region", value="us-east"),
+    ],
+    start=now - 60,
+    end=now + 1,
+)
+for p in points:
+    print(f"ts={p.timestamp}  value={p.value}")
+```
+
+### Series Discovery and Aggregation
+
+```python
+# List all known metric + label-set combinations
+for m in db.list_metrics():
+    label_str = ", ".join(f"{l.name}={l.value}" for l in m.labels)
+    print(f"  {m.name} {{ {label_str} }}")
+
+# Query all label sets for a metric
+for series in db.select_all(metric="cpu_usage", start=now - 60, end=now + 1):
+    label_str = ", ".join(f"{l.name}={l.value}" for l in series.labels)
+    print(f"  {{ {label_str} }}  →  {len(series.data_points)} points")
+
+# Aggregation query
+avg_points = db.select_with_options(
+    metric="cpu_usage",
+    options=UQueryOptions(
+        labels=[ULabel(name="host", value="server-1")],
+        start=now - 60,
+        end=now + 1,
+        aggregation=UAggregation.AVG,
+        downsample=None,
+        limit=None,
+        offset=0,
+    ),
+)
+```
+
+### Memory Introspection
+
+```python
+print(f"Memory used:   {db.memory_used():,} bytes")
+print(f"Memory budget: {db.memory_budget():,} bytes")
+
+db.close()
+```
+
+The Python API mirrors the Rust API — see the sections below for details on query options, aggregation functions, and value types.
 
 ## Query APIs
 
@@ -871,7 +973,8 @@ tsink/
 │       ├── parser.rs           # Parser
 │       └── eval/               # Evaluation engine
 ├── crates/
-│   └── tsink-server/           # Prometheus-compatible network server
+│   ├── tsink-server/           # Prometheus-compatible network server
+│   └── tsink-uniffi/           # Python bindings via UniFFI (PyPI: tsink-uniffi)
 ├── tests/                      # Integration tests
 ├── benches/                    # Criterion benchmarks
 ├── examples/                   # Usage examples
