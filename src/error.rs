@@ -40,6 +40,21 @@ pub enum TsinkError {
     #[error("Write timeout exceeded after {timeout_ms}ms with {workers} concurrent writers")]
     WriteTimeout { timeout_ms: u64, workers: usize },
 
+    #[error("Memory budget exceeded: budget {budget} bytes, required at least {required} bytes")]
+    MemoryBudgetExceeded { budget: usize, required: usize },
+
+    #[error(
+        "Series cardinality limit exceeded: limit {limit}, current {current}, requested {requested}"
+    )]
+    CardinalityLimitExceeded {
+        limit: usize,
+        current: usize,
+        requested: usize,
+    },
+
+    #[error("WAL size limit exceeded: limit {limit} bytes, required at least {required} bytes")]
+    WalSizeLimitExceeded { limit: u64, required: u64 },
+
     #[error("Storage is shutting down")]
     StorageShuttingDown,
 

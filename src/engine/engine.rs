@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rayon::prelude::*;
@@ -41,6 +41,7 @@ const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLOSE_COMPACTION_MAX_PASSES: usize = 128;
 const IN_MEMORY_SHARD_COUNT: usize = 64;
 const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
@@ -53,6 +54,9 @@ struct ChunkStorageOptions {
     max_writers: usize,
     write_timeout: Duration,
     memory_budget_bytes: u64,
+    cardinality_limit: usize,
+    wal_size_limit_bytes: u64,
+    admission_poll_interval: Duration,
     compaction_interval: Duration,
     background_threads_enabled: bool,
 }
@@ -73,6 +77,9 @@ impl Default for ChunkStorageOptions {
             max_writers: crate::cgroup::default_workers_limit().max(1),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             memory_budget_bytes: u64::MAX,
+            cardinality_limit: usize::MAX,
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
         }
@@ -253,7 +260,11 @@ pub struct ChunkStorage {
     write_timeout: Duration,
     memory_used_bytes: AtomicU64,
     memory_budget_bytes: AtomicU64,
+    cardinality_limit: usize,
+    wal_size_limit_bytes: u64,
+    admission_poll_interval: Duration,
     memory_backpressure_lock: Mutex<()>,
+    admission_backpressure_lock: Mutex<()>,
     max_observed_timestamp: AtomicI64,
     lifecycle: Arc<AtomicU8>,
     compaction_lock: Arc<Mutex<()>>,
@@ -350,7 +361,11 @@ impl ChunkStorage {
             write_timeout: options.write_timeout,
             memory_used_bytes: AtomicU64::new(0),
             memory_budget_bytes: AtomicU64::new(options.memory_budget_bytes),
+            cardinality_limit: options.cardinality_limit,
+            wal_size_limit_bytes: options.wal_size_limit_bytes,
+            admission_poll_interval: options.admission_poll_interval,
             memory_backpressure_lock: Mutex::new(()),
+            admission_backpressure_lock: Mutex::new(()),
             max_observed_timestamp: AtomicI64::new(i64::MIN),
             lifecycle,
             compaction_lock,
@@ -591,6 +606,14 @@ impl ChunkStorage {
             .min(usize::MAX as u64) as usize
     }
 
+    fn cardinality_limit_value(&self) -> usize {
+        self.cardinality_limit
+    }
+
+    fn wal_size_limit_value(&self) -> u64 {
+        self.wal_size_limit_bytes
+    }
+
     fn compute_memory_usage_bytes(&self) -> usize {
         let mut total = 0usize;
 
@@ -648,6 +671,156 @@ impl ChunkStorage {
         }
 
         bytes
+    }
+
+    fn estimate_write_memory_growth_bytes(
+        &self,
+        points: &[PendingPoint],
+        grouped: &BTreeMap<SeriesId, (ValueLane, Vec<usize>)>,
+    ) -> usize {
+        let per_point_bytes = std::mem::size_of::<ChunkPoint>();
+        let point_storage_bytes = points.len().saturating_mul(per_point_bytes);
+        let heap_bytes = points.iter().fold(0usize, |acc, point| {
+            acc.saturating_add(value_heap_bytes(&point.value))
+        });
+
+        // New active states preallocate a chunk-sized point buffer.
+        let per_new_active_series = std::mem::size_of::<ActiveSeriesState>().saturating_add(
+            self.chunk_point_cap
+                .saturating_mul(std::mem::size_of::<ChunkPoint>()),
+        );
+        let new_active_series = grouped
+            .keys()
+            .filter(|series_id| {
+                !self
+                    .active_shard(**series_id)
+                    .read()
+                    .contains_key(series_id)
+            })
+            .count();
+        let active_state_bytes = new_active_series.saturating_mul(per_new_active_series);
+
+        point_storage_bytes
+            .saturating_add(heap_bytes)
+            .saturating_add(active_state_bytes)
+    }
+
+    fn estimate_write_wal_growth_bytes(
+        &self,
+        new_series_defs: &[SeriesDefinitionFrame],
+        batches: &[SamplesBatchFrame],
+    ) -> Result<u64> {
+        let Some(_wal) = &self.wal else {
+            return Ok(0);
+        };
+
+        let mut bytes = 0u64;
+        for definition in new_series_defs {
+            bytes = bytes.saturating_add(FramedWal::estimate_series_definition_frame_bytes(
+                definition,
+            )?);
+        }
+        bytes = bytes.saturating_add(FramedWal::estimate_samples_frame_bytes(batches)?);
+        Ok(bytes)
+    }
+
+    fn memory_budget_shortfall(&self, estimated_growth_bytes: usize) -> Option<(usize, usize)> {
+        let budget = self.memory_budget_value();
+        if budget == usize::MAX {
+            return None;
+        }
+
+        let used = self.refresh_memory_usage();
+        let required = used.saturating_add(estimated_growth_bytes);
+        (required > budget).then_some((budget, required))
+    }
+
+    fn wal_size_shortfall(&self, estimated_growth_bytes: u64) -> Result<Option<(u64, u64)>> {
+        let limit = self.wal_size_limit_value();
+        if limit == u64::MAX || estimated_growth_bytes == 0 {
+            return Ok(None);
+        }
+
+        let Some(wal) = &self.wal else {
+            return Ok(None);
+        };
+
+        if estimated_growth_bytes > limit {
+            return Ok(Some((limit, estimated_growth_bytes)));
+        }
+
+        let current = wal.total_size_bytes()?;
+        let required = current.saturating_add(estimated_growth_bytes);
+        Ok((required > limit).then_some((limit, required)))
+    }
+
+    fn relieve_pressure_once(&self) -> Result<()> {
+        let _backpressure_guard = self.admission_backpressure_lock.lock();
+        self.flush_all_active()?;
+        self.prune_empty_active_series();
+        if self.persist_segment(true)? {
+            self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
+        }
+        self.enforce_memory_budget_if_needed()?;
+        Ok(())
+    }
+
+    fn enforce_admission_controls(
+        &self,
+        estimated_memory_growth_bytes: usize,
+        estimated_wal_growth_bytes: u64,
+    ) -> Result<()> {
+        let deadline = Instant::now() + self.write_timeout;
+
+        loop {
+            if let Some((_budget, _required)) =
+                self.memory_budget_shortfall(estimated_memory_growth_bytes)
+            {
+                self.relieve_pressure_once()?;
+
+                if let Some((post_budget, post_required)) =
+                    self.memory_budget_shortfall(estimated_memory_growth_bytes)
+                {
+                    if Instant::now() >= deadline {
+                        return Err(TsinkError::MemoryBudgetExceeded {
+                            budget: post_budget,
+                            required: post_required,
+                        });
+                    }
+                    self.notify_flush_thread();
+                    std::thread::sleep(
+                        self.admission_poll_interval
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
+                }
+            }
+
+            if let Some((_limit, _required)) =
+                self.wal_size_shortfall(estimated_wal_growth_bytes)?
+            {
+                self.relieve_pressure_once()?;
+
+                if let Some((post_limit, post_required)) =
+                    self.wal_size_shortfall(estimated_wal_growth_bytes)?
+                {
+                    if Instant::now() >= deadline {
+                        return Err(TsinkError::WalSizeLimitExceeded {
+                            limit: post_limit,
+                            required: post_required,
+                        });
+                    }
+                    self.notify_flush_thread();
+                    std::thread::sleep(
+                        self.admission_poll_interval
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
+                }
+            }
+
+            return Ok(());
+        }
     }
 
     fn prune_empty_active_series(&self) {
@@ -2106,6 +2279,19 @@ impl Storage for ChunkStorage {
                         value: data_point.value.clone(),
                     });
                 }
+
+                let cardinality_limit = self.cardinality_limit_value();
+                if cardinality_limit != usize::MAX && !created_series.is_empty() {
+                    let current = registry.series_count();
+                    if current > cardinality_limit {
+                        return Err(TsinkError::CardinalityLimitExceeded {
+                            limit: cardinality_limit,
+                            current,
+                            requested: created_series.len(),
+                        });
+                    }
+                }
+
                 Ok(())
             })() {
                 registry.rollback_created_series(&created_series);
@@ -2121,16 +2307,26 @@ impl Storage for ChunkStorage {
             let grouped_points = Self::group_pending_point_indexes_by_series(&pending_points)?;
             self.validate_pending_point_families(&pending_points, &grouped_points)?;
             self.validate_points_against_retention(&pending_points)?;
+            let wal_batches = if self.wal.is_some() {
+                Some(Self::encode_wal_batches(&pending_points, &grouped_points)?)
+            } else {
+                None
+            };
+            let estimated_memory_growth =
+                self.estimate_write_memory_growth_bytes(&pending_points, &grouped_points);
+            let estimated_wal_growth = self.estimate_write_wal_growth_bytes(
+                &new_series_defs,
+                wal_batches.as_deref().unwrap_or(&[]),
+            )?;
+            self.enforce_admission_controls(estimated_memory_growth, estimated_wal_growth)?;
             reserved_series = self.reserve_series_lanes(&pending_points)?;
 
-            if let Some(wal) = &self.wal {
-                let batches = Self::encode_wal_batches(&pending_points, &grouped_points)?;
-
+            if let (Some(wal), Some(batches)) = (&self.wal, wal_batches.as_deref()) {
                 for definition in &new_series_defs {
                     wal.append_series_definition(definition)?;
                 }
 
-                wal.append_samples(&batches)?;
+                wal.append_samples(batches)?;
             }
 
             self.ingest_pending_points(std::mem::take(&mut pending_points))
@@ -2409,6 +2605,9 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         max_writers: builder.max_writers(),
         write_timeout: builder.write_timeout(),
         memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
+        cardinality_limit: builder.cardinality_limit(),
+        wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
+        admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
         compaction_interval: DEFAULT_COMPACTION_INTERVAL,
         background_threads_enabled: wal_enabled,
     };
@@ -2943,8 +3142,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, DEFAULT_COMPACTION_INTERVAL,
-        NUMERIC_LANE_ROOT, WAL_DIR_NAME,
+        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, DEFAULT_ADMISSION_POLL_INTERVAL,
+        DEFAULT_COMPACTION_INTERVAL, NUMERIC_LANE_ROOT, WAL_DIR_NAME,
     };
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
@@ -3355,6 +3554,9 @@ mod tests {
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -3416,6 +3618,9 @@ mod tests {
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -3521,6 +3726,9 @@ mod tests {
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -4075,6 +4283,9 @@ mod tests {
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: Duration::from_millis(25),
                 background_threads_enabled: true,
             },
@@ -4384,6 +4595,9 @@ mod tests {
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -4434,7 +4648,10 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
-                memory_budget_bytes: 1,
+                memory_budget_bytes: 512,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -4470,7 +4687,7 @@ mod tests {
                 DataPoint::new(6, 6.0),
             ]
         );
-        assert_eq!(storage.memory_budget(), 1);
+        assert_eq!(storage.memory_budget(), 512);
         assert!(
             storage.memory_used() <= storage.memory_budget(),
             "memory usage should fall under budget after spill"
@@ -4504,6 +4721,104 @@ mod tests {
 
         assert_eq!(storage.memory_budget(), 1234);
         assert_eq!(storage.memory_used(), 0);
+    }
+
+    #[test]
+    fn memory_budget_guard_rejects_writes_when_in_memory_budget_cannot_be_relaxed() {
+        let storage = StorageBuilder::new()
+            .with_wal_enabled(false)
+            .with_memory_limit(1)
+            .with_write_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+
+        let err = storage
+            .insert_rows(&[Row::new("memory_guard_metric", DataPoint::new(1, 1.0))])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TsinkError::MemoryBudgetExceeded { budget: 1, .. }
+        ));
+        assert!(
+            storage
+                .select("memory_guard_metric", &[], 0, 10)
+                .unwrap()
+                .is_empty(),
+            "rejected writes must not mutate in-memory state"
+        );
+    }
+
+    #[test]
+    fn cardinality_limit_rejects_new_series_beyond_limit() {
+        let storage = StorageBuilder::new()
+            .with_cardinality_limit(1)
+            .build()
+            .unwrap();
+        let labels_a = vec![Label::new("host", "a")];
+        let labels_b = vec![Label::new("host", "b")];
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                "cardinality_guard_metric",
+                labels_a.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let err = storage
+            .insert_rows(&[Row::with_labels(
+                "cardinality_guard_metric",
+                labels_b.clone(),
+                DataPoint::new(1, 2.0),
+            )])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TsinkError::CardinalityLimitExceeded { limit: 1, .. }
+        ));
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                "cardinality_guard_metric",
+                labels_a.clone(),
+                DataPoint::new(2, 3.0),
+            )])
+            .unwrap();
+        let points_a = storage
+            .select("cardinality_guard_metric", &labels_a, 0, 10)
+            .unwrap();
+        assert_eq!(points_a.len(), 2);
+        assert!(storage
+            .select("cardinality_guard_metric", &labels_b, 0, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn wal_size_limit_rejects_writes_that_cannot_fit_new_frames() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_write_timeout(Duration::ZERO)
+            .with_wal_size_limit(1)
+            .build()
+            .unwrap();
+
+        let err = storage
+            .insert_rows(&[Row::new("wal_guard_metric", DataPoint::new(1, 1.0))])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TsinkError::WalSizeLimitExceeded { limit: 1, .. }
+        ));
+        assert!(
+            storage
+                .select("wal_guard_metric", &[], 0, 10)
+                .unwrap()
+                .is_empty(),
+            "WAL admission failure must not ingest points"
+        );
     }
 
     #[test]
@@ -4768,6 +5083,9 @@ mod tests {
                 max_writers: 1,
                 write_timeout: Duration::ZERO,
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },
@@ -4805,6 +5123,9 @@ mod tests {
                 max_writers: 1,
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
                 background_threads_enabled: true,
             },

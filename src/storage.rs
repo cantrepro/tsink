@@ -330,7 +330,9 @@ pub struct StorageBuilder {
     write_timeout: Duration,
     partition_duration: Duration,
     memory_limit_bytes: usize,
+    cardinality_limit: usize,
     wal_enabled: bool,
+    wal_size_limit_bytes: usize,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
 }
@@ -347,7 +349,9 @@ impl Default for StorageBuilder {
             write_timeout: Duration::from_secs(30),
             partition_duration: Duration::from_secs(3600),
             memory_limit_bytes: usize::MAX,
+            cardinality_limit: usize::MAX,
             wal_enabled: true,
+            wal_size_limit_bytes: usize::MAX,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
         }
@@ -426,10 +430,19 @@ impl StorageBuilder {
     /// Sets a global in-memory byte budget for active + sealed chunks.
     ///
     /// When exceeded, the engine applies backpressure by persisting sealed chunks to L0
-    /// and evicting the oldest sealed chunks from RAM.
+    /// and evicting the oldest sealed chunks from RAM before admitting new writes.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.memory_limit_bytes = bytes;
+        self
+    }
+
+    /// Sets a hard upper bound for total series cardinality.
+    ///
+    /// New metric+label combinations are rejected once the limit is reached.
+    #[must_use]
+    pub fn with_cardinality_limit(mut self, series: usize) -> Self {
+        self.cardinality_limit = series;
         self
     }
 
@@ -437,6 +450,15 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    /// Sets a hard upper bound for on-disk WAL bytes across all WAL segments.
+    ///
+    /// `usize::MAX` disables the limit.
+    #[must_use]
+    pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
+        self.wal_size_limit_bytes = bytes;
         self
     }
 
@@ -495,8 +517,16 @@ impl StorageBuilder {
         self.memory_limit_bytes
     }
 
+    pub(crate) fn cardinality_limit(&self) -> usize {
+        self.cardinality_limit
+    }
+
     pub(crate) fn wal_enabled(&self) -> bool {
         self.wal_enabled
+    }
+
+    pub(crate) fn wal_size_limit_bytes(&self) -> usize {
+        self.wal_size_limit_bytes
     }
 
     pub(crate) fn wal_buffer_size(&self) -> usize {

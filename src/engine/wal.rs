@@ -363,6 +363,35 @@ impl FramedWal {
         self.path.lock().clone()
     }
 
+    pub fn total_size_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for segment in collect_wal_segment_files(&self.dir)? {
+            match fs::metadata(&segment.path) {
+                Ok(meta) => {
+                    total = total.saturating_add(meta.len());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn estimate_series_definition_frame_bytes(
+        definition: &SeriesDefinitionFrame,
+    ) -> Result<u64> {
+        let payload = encode_series_definition(definition)?;
+        Ok(FRAME_HEADER_LEN as u64 + payload.len() as u64)
+    }
+
+    pub fn estimate_samples_frame_bytes(batches: &[SamplesBatchFrame]) -> Result<u64> {
+        if batches.is_empty() {
+            return Ok(0);
+        }
+        let payload = encode_samples_payload(batches)?;
+        Ok(FRAME_HEADER_LEN as u64 + payload.len() as u64)
+    }
+
     pub fn append_series_definition(&self, definition: &SeriesDefinitionFrame) -> Result<()> {
         let payload = encode_series_definition(definition)?;
         self.append_frame(FRAME_TYPE_SERIES_DEF, &payload)

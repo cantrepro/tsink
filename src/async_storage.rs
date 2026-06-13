@@ -424,10 +424,24 @@ impl AsyncStorageBuilder {
         self
     }
 
+    /// Sets a hard upper bound for total series cardinality.
+    #[must_use]
+    pub fn with_cardinality_limit(mut self, series: usize) -> Self {
+        self.inner = self.inner.with_cardinality_limit(series);
+        self
+    }
+
     /// Enables or disables WAL.
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.inner = self.inner.with_wal_enabled(enabled);
+        self
+    }
+
+    /// Sets a hard upper bound for on-disk WAL bytes.
+    #[must_use]
+    pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.with_wal_size_limit(bytes);
         self
     }
 

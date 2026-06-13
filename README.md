@@ -376,6 +376,9 @@ Key internals:
 | `with_max_writers(n)` | Available CPUs (cgroup-aware) | Maximum concurrent writer threads. |
 | `with_write_timeout(duration)` | 30s | Timeout for write operations. |
 | `with_partition_duration(duration)` | 1 hour | Time partition granularity. |
+| `with_memory_limit(bytes)` | Unlimited | Hard in-memory budget with admission backpressure before writes. |
+| `with_cardinality_limit(series)` | Unlimited | Hard cap on total metric+label series cardinality. |
+| `with_wal_size_limit(bytes)` | Unlimited | Hard cap on total WAL bytes across all WAL segments. |
 | `with_wal_buffer_size(n)` | 4096 | WAL buffer size in bytes. |
 
 ## Examples
