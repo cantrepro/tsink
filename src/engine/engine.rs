@@ -1649,9 +1649,78 @@ impl ChunkStorage {
     }
 
     fn ingest_pending_points(&self, points: Vec<PendingPoint>) -> Result<()> {
-        for point in points {
-            self.append_point_to_series(point.series_id, point.lane, point.ts, point.value)?;
+        if points.is_empty() {
+            return Ok(());
         }
+
+        let mut points_by_shard: [Vec<PendingPoint>; IN_MEMORY_SHARD_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        for point in points {
+            let shard_idx = Self::series_shard_idx(point.series_id);
+            points_by_shard[shard_idx].push(point);
+        }
+
+        for (shard_idx, shard_points) in points_by_shard.into_iter().enumerate() {
+            if shard_points.is_empty() {
+                continue;
+            }
+            self.ingest_pending_points_for_shard(shard_idx, shard_points)?;
+        }
+
+        Ok(())
+    }
+
+    fn ingest_pending_points_for_shard(
+        &self,
+        shard_idx: usize,
+        shard_points: Vec<PendingPoint>,
+    ) -> Result<()> {
+        if shard_points.is_empty() {
+            return Ok(());
+        }
+
+        let mut finalized = Vec::<(SeriesId, Chunk)>::new();
+        {
+            let mut active = self.active_builders[shard_idx].write();
+
+            for point in shard_points {
+                let state = active.entry(point.series_id).or_insert_with(|| {
+                    ActiveSeriesState::new(point.series_id, point.lane, self.chunk_point_cap)
+                });
+
+                if state.lane != point.lane {
+                    return Err(TsinkError::ValueTypeMismatch {
+                        expected: lane_name(state.lane).to_string(),
+                        actual: lane_name(point.lane).to_string(),
+                    });
+                }
+
+                if let Some(chunk) =
+                    state.rotate_partition_if_needed(point.ts, self.partition_window)?
+                {
+                    finalized.push((point.series_id, chunk));
+                }
+
+                state.builder.append(point.ts, point.value);
+                self.update_max_observed_timestamp(point.ts);
+
+                if let Some(chunk) = state.rotate_full_if_needed()? {
+                    finalized.push((point.series_id, chunk));
+                }
+            }
+        }
+
+        if finalized.is_empty() {
+            return Ok(());
+        }
+
+        let mut sealed = self.sealed_chunks[shard_idx].write();
+        for (series_id, chunk) in finalized {
+            let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
+            let key = SealedChunkKey::from_chunk(&chunk, sequence);
+            sealed.entry(series_id).or_default().insert(key, chunk);
+        }
+
         Ok(())
     }
 
