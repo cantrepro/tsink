@@ -1,6 +1,6 @@
 use crate::value::Value;
 
-use super::series_registry::SeriesId;
+use super::series::SeriesId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

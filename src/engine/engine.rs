@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rayon::prelude::*;
+use roaring::RoaringTreemap;
+use tracing::warn;
 
 use crate::concurrency::{Semaphore, SemaphoreGuard};
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
@@ -17,9 +20,10 @@ use crate::engine::query::{
     EncodedChunkDescriptor,
 };
 use crate::engine::segment::{
-    collect_expired_segment_dirs, load_segment_indexes, SegmentWriter, WalHighWatermark,
+    chunk_payload_uses_zstd, collect_expired_segment_dirs, decompress_chunk_payload_zstd,
+    load_segment_indexes, load_segment_indexes_with_series, SegmentWriter, WalHighWatermark,
 };
-use crate::engine::series_registry::{
+use crate::engine::series::{
     validate_labels, validate_metric, SeriesId, SeriesRegistry, SeriesResolution,
 };
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
@@ -400,6 +404,7 @@ struct PersistedIndexState {
 const NUMERIC_LANE_ROOT: &str = "lane_numeric";
 const BLOB_LANE_ROOT: &str = "lane_blob";
 const WAL_DIR_NAME: &str = "wal";
+const SERIES_INDEX_FILE_NAME: &str = "series_index.bin";
 
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
@@ -414,6 +419,7 @@ pub struct ChunkStorage {
     chunk_point_cap: usize,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
+    series_index_path: Option<PathBuf>,
     next_segment_id: Arc<AtomicU64>,
     numeric_compactor: Option<Compactor>,
     blob_compactor: Option<Compactor>,
@@ -478,6 +484,18 @@ impl ChunkStorage {
         next_segment_id: u64,
         options: ChunkStorageOptions,
     ) -> Result<Self> {
+        let series_index_path = numeric_lane_path
+            .as_ref()
+            .and_then(|path| {
+                path.parent()
+                    .map(|parent| parent.join(SERIES_INDEX_FILE_NAME))
+            })
+            .or_else(|| {
+                blob_lane_path.as_ref().and_then(|path| {
+                    path.parent()
+                        .map(|parent| parent.join(SERIES_INDEX_FILE_NAME))
+                })
+            });
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
         let numeric_compactor = numeric_lane_path.as_ref().map(|path| {
             Compactor::new_with_segment_id_allocator(
@@ -523,6 +541,7 @@ impl ChunkStorage {
             blob_compactor,
             numeric_lane_path,
             blob_lane_path,
+            series_index_path,
             next_segment_id,
             wal,
             retention_window: options.retention_window.max(0),
@@ -1220,6 +1239,17 @@ impl ChunkStorage {
         }
     }
 
+    fn replace_registry_from_snapshot(&self, registry: SeriesRegistry) {
+        *self.registry.write() = registry;
+    }
+
+    fn persist_series_registry_index(&self) -> Result<()> {
+        let Some(path) = &self.series_index_path else {
+            return Ok(());
+        };
+        self.registry.read().persist_to_path(path)
+    }
+
     fn reload_persisted_indexes_from_disk(&self) -> Result<()> {
         self.reload_persisted_indexes_from_disk_with_exclusions(None, None)
     }
@@ -1265,7 +1295,8 @@ impl ChunkStorage {
             self.numeric_lane_path.is_some(),
             self.blob_lane_path.is_some(),
         )?;
-        self.apply_loaded_segment_indexes(loaded_segments)
+        self.apply_loaded_segment_indexes(loaded_segments, false)?;
+        self.persist_series_registry_index()
     }
 
     fn refresh_persisted_indexes_and_evict_flushed_sealed_chunks(&self) -> Result<()> {
@@ -1801,7 +1832,7 @@ impl ChunkStorage {
                             value_codec: chunk_ref.value_codec,
                             point_count: chunk_ref.point_count as usize,
                         },
-                        payload,
+                        payload.as_ref(),
                         start,
                         end,
                         out,
@@ -1895,23 +1926,21 @@ impl ChunkStorage {
         Ok(out)
     }
 
-    fn intersect_candidates(
-        candidates: &mut BTreeSet<SeriesId>,
-        filter: Option<&BTreeSet<SeriesId>>,
-    ) {
+    fn intersect_candidates(candidates: &mut BTreeSet<SeriesId>, filter: Option<&RoaringTreemap>) {
         match filter {
-            Some(filter) => candidates.retain(|series_id| filter.contains(series_id)),
+            Some(filter) => candidates.retain(|series_id| filter.contains(*series_id)),
             None => candidates.clear(),
         }
     }
 
-    fn subtract_candidates(
-        candidates: &mut BTreeSet<SeriesId>,
-        filter: Option<&BTreeSet<SeriesId>>,
-    ) {
+    fn subtract_candidates(candidates: &mut BTreeSet<SeriesId>, filter: Option<&RoaringTreemap>) {
         if let Some(filter) = filter {
-            candidates.retain(|series_id| !filter.contains(series_id));
+            candidates.retain(|series_id| !filter.contains(*series_id));
         }
+    }
+
+    fn bitmap_to_series_set(bitmap: &RoaringTreemap) -> BTreeSet<SeriesId> {
+        bitmap.iter().collect()
     }
 
     fn apply_postings_matcher_to_candidates(
@@ -1944,10 +1973,12 @@ impl ChunkStorage {
                         ));
                     };
 
-                    let mut matched = BTreeSet::<SeriesId>::new();
+                    let mut matched = RoaringTreemap::new();
                     for (metric, series_ids) in registry.metric_postings_entries() {
                         if regex.is_match(metric) {
-                            matched.extend(series_ids.iter().copied());
+                            for series_id in series_ids.iter() {
+                                matched.insert(series_id);
+                            }
                         }
                     }
 
@@ -1989,7 +2020,7 @@ impl ChunkStorage {
                     ));
                 };
 
-                let mut matched = BTreeSet::<SeriesId>::new();
+                let mut matched = RoaringTreemap::new();
                 for (pair, series_ids) in registry.postings_entries() {
                     if pair.name_id != label_name_id {
                         continue;
@@ -1998,7 +2029,9 @@ impl ChunkStorage {
                         continue;
                     };
                     if regex.is_match(label_value) {
-                        matched.extend(series_ids.iter().copied());
+                        for series_id in series_ids.iter() {
+                            matched.insert(series_id);
+                        }
                     }
                 }
 
@@ -2023,7 +2056,7 @@ impl ChunkStorage {
         let mut candidates = if let Some(metric) = selection.metric.as_ref() {
             registry
                 .series_id_postings_for_metric(metric)
-                .cloned()
+                .map(Self::bitmap_to_series_set)
                 .unwrap_or_default()
         } else {
             registry
@@ -2598,6 +2631,7 @@ impl ChunkStorage {
     fn apply_loaded_segment_indexes(
         &self,
         loaded: crate::engine::segment::LoadedSegmentIndexes,
+        reconcile_registry_with_persisted: bool,
     ) -> Result<()> {
         {
             let mut registry = self.registry.write();
@@ -2652,6 +2686,14 @@ impl ChunkStorage {
                     chunk.chunk_offset,
                 )
             });
+        }
+
+        if reconcile_registry_with_persisted {
+            let keep = persisted_refs
+                .keys()
+                .copied()
+                .collect::<BTreeSet<SeriesId>>();
+            self.registry.write().retain_series_ids(&keep);
         }
 
         self.mark_materialized_series_ids(persisted_refs.keys().copied());
@@ -3830,6 +3872,12 @@ impl Storage for ChunkStorage {
             if let Some(path) = wal_dir.as_deref() {
                 copy_dir_if_exists(path, &staging.join(WAL_DIR_NAME))?;
             }
+            // Persist the current in-memory registry into the snapshot staging directory.
+            // Copying the on-disk index can race with background refresh and capture a stale
+            // mapping that omits series already present in WAL/segments.
+            self.registry
+                .read()
+                .persist_to_path(&staging.join(SERIES_INDEX_FILE_NAME))?;
             Ok(())
         })();
 
@@ -3875,6 +3923,7 @@ impl Storage for ChunkStorage {
                 self.refresh_memory_usage();
             }
             self.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+            self.persist_series_registry_index()?;
             Ok(())
         })();
 
@@ -3942,13 +3991,34 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         (None, None)
     };
 
+    let series_index_path = base_data_path
+        .as_ref()
+        .map(|base_path| base_path.join(SERIES_INDEX_FILE_NAME));
+    let persisted_registry = if let Some(index_path) = &series_index_path {
+        match SeriesRegistry::load_from_path(index_path) {
+            Ok(registry) => Some(registry),
+            Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                warn!(
+                    path = %index_path.display(),
+                    error = %err,
+                    "Failed to load persisted series registry index; rebuilding from segments"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let load_series_from_segments = persisted_registry.is_none();
+
     let loaded_numeric = if let Some(path) = &numeric_lane_path {
-        load_segment_indexes(path)?
+        load_segment_indexes_with_series(path, load_series_from_segments)?
     } else {
         crate::engine::segment::LoadedSegmentIndexes::default()
     };
     let loaded_blob = if let Some(path) = &blob_lane_path {
-        load_segment_indexes(path)?
+        load_segment_indexes_with_series(path, load_series_from_segments)?
     } else {
         crate::engine::segment::LoadedSegmentIndexes::default()
     };
@@ -3986,9 +4056,13 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         loaded_segments.next_segment_id,
         storage_options,
     )?);
-    storage.apply_loaded_segment_indexes(loaded_segments)?;
+    if let Some(registry) = persisted_registry {
+        storage.replace_registry_from_snapshot(registry);
+    }
+    storage.apply_loaded_segment_indexes(loaded_segments, !load_series_from_segments)?;
     storage.replay_from_wal(replay_highwater)?;
     storage.sweep_expired_persisted_segments()?;
+    storage.persist_series_registry_index()?;
     if storage.memory_budget_value() != usize::MAX {
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
@@ -4315,7 +4389,7 @@ impl<'a> PersistedSourceMergeCursor<'a> {
                     value_codec: chunk_ref.value_codec,
                     point_count: chunk_ref.point_count as usize,
                 },
-                payload,
+                payload.as_ref(),
                 self.start,
                 self.end,
                 &mut self.current_points,
@@ -4496,7 +4570,7 @@ fn merge_sorted_query_sources_into(
 fn persisted_chunk_payload<'a>(
     persisted_segment_maps: &'a [Arc<PlatformMmap>],
     chunk_ref: &PersistedChunkRef,
-) -> Result<&'a [u8]> {
+) -> Result<Cow<'a, [u8]>> {
     let Some(mapped_segment) = persisted_segment_maps.get(chunk_ref.segment_slot) else {
         return Err(TsinkError::DataCorruption(format!(
             "missing mapped segment slot {}",
@@ -4548,6 +4622,7 @@ fn persisted_chunk_payload<'a>(
     let payload_len = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(usize::MAX);
     let payload_start = 42usize;
     let payload_end = payload_start.saturating_add(payload_len);
+    let chunk_flags = record[19];
 
     if payload_end.saturating_add(4) != record.len() {
         return Err(TsinkError::DataCorruption(format!(
@@ -4556,7 +4631,12 @@ fn persisted_chunk_payload<'a>(
         )));
     }
 
-    Ok(&record[payload_start..payload_end])
+    let payload = &record[payload_start..payload_end];
+    if chunk_payload_uses_zstd(chunk_flags)? {
+        return Ok(Cow::Owned(decompress_chunk_payload_zstd(payload)?));
+    }
+
+    Ok(Cow::Borrowed(payload))
 }
 
 fn duration_to_timestamp_units(duration: Duration, precision: TimestampPrecision) -> i64 {
@@ -4682,7 +4762,7 @@ mod tests {
     use crate::engine::segment::{
         load_segment_indexes, load_segments_for_level, SegmentWriter, WalHighWatermark,
     };
-    use crate::engine::series_registry::SeriesRegistry;
+    use crate::engine::series::SeriesRegistry;
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
     use crate::wal::WalSyncMode;
     use crate::{
@@ -6952,7 +7032,7 @@ mod tests {
         )
         .unwrap();
         storage
-            .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap())
+            .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
             .unwrap();
 
         let before = storage

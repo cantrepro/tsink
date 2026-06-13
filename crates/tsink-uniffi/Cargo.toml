@@ -11,7 +11,7 @@ name = "tsink_uniffi"
 
 [dependencies]
 tsink = { version = "0.8.1", path = "../.." }
-uniffi = { version = "0.29", features = ["cli"] }
+uniffi = { version = "0.31", features = ["cli"] }
 parking_lot = "0.12"
 thiserror = "2.0"
 
@@ -20,4 +20,4 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dev-dependencies]
-tempfile = "3.14"
+tempfile = "3.26"

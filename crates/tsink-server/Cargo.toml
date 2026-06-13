@@ -9,8 +9,8 @@ license = "MIT"
 
 [dependencies]
 tsink = { version = "0.8.1", path = "../..", features = ["promql"] }
-prost = "0.13"
-regex = "1.11"
+prost = "0.14"
+regex = "1.12"
 snap = "1.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "sync", "macros", "time"] }
 tokio-rustls = "0.26"
@@ -21,4 +21,4 @@ serde_json = "1.0"
 socket2 = "0.6"
 
 [dev-dependencies]
-tempfile = "3.14"
+tempfile = "3.26"

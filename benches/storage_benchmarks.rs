@@ -6,9 +6,8 @@
 //! Quick check:
 //!   cargo bench --bench storage_benchmarks -- "^(insert_rows|select|concurrent_rw)/" --quick --noplot
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;

@@ -1,9 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 
 use crate::{Label, Result, Row, TsinkError};
+use roaring::RoaringTreemap;
 
 pub type SeriesId = u64;
 pub type DictionaryId = u32;
+
+const REGISTRY_INDEX_MAGIC: [u8; 4] = *b"RIDX";
+const REGISTRY_INDEX_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LabelPairId {
@@ -81,6 +88,24 @@ impl StringDictionary {
             .enumerate()
             .map(|(idx, value)| (idx as DictionaryId, value.as_str()))
     }
+
+    fn from_values(values: Vec<String>, dict_name: &str) -> Result<Self> {
+        if values.len() > DictionaryId::MAX as usize + 1 {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "{dict_name} dictionary exceeded u32 id space"
+            )));
+        }
+
+        let mut by_value = HashMap::with_capacity(values.len());
+        for (idx, value) in values.iter().enumerate() {
+            by_value.insert(value.clone(), idx as DictionaryId);
+        }
+
+        Ok(Self {
+            by_value,
+            by_id: values,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -91,8 +116,8 @@ pub struct SeriesRegistry {
     label_value_dict: StringDictionary,
     by_key: HashMap<SeriesKeyIds, SeriesId>,
     by_id: HashMap<SeriesId, SeriesDefinition>,
-    metric_postings: HashMap<DictionaryId, BTreeSet<SeriesId>>,
-    postings: BTreeMap<LabelPairId, BTreeSet<SeriesId>>,
+    metric_postings: HashMap<DictionaryId, RoaringTreemap>,
+    postings: BTreeMap<LabelPairId, RoaringTreemap>,
 }
 
 pub(crate) fn validate_metric(metric: &str) -> Result<()> {
@@ -221,7 +246,7 @@ impl SeriesRegistry {
 
             let remove_metric_posting =
                 if let Some(series_ids) = self.metric_postings.get_mut(&resolution.metric_id) {
-                    series_ids.remove(&resolution.series_id);
+                    series_ids.remove(resolution.series_id);
                     series_ids.is_empty()
                 } else {
                     false
@@ -232,7 +257,7 @@ impl SeriesRegistry {
 
             for pair in &resolution.label_pairs {
                 let remove_posting = if let Some(series_ids) = self.postings.get_mut(pair) {
-                    series_ids.remove(&resolution.series_id);
+                    series_ids.remove(resolution.series_id);
                     series_ids.is_empty()
                 } else {
                     false
@@ -325,11 +350,11 @@ impl SeriesRegistry {
 
         self.metric_postings
             .get(&metric_id)
-            .map(|ids| ids.iter().copied().collect())
+            .map(|ids| ids.iter().collect())
             .unwrap_or_default()
     }
 
-    pub fn series_id_postings_for_metric(&self, metric: &str) -> Option<&BTreeSet<SeriesId>> {
+    pub fn series_id_postings_for_metric(&self, metric: &str) -> Option<&RoaringTreemap> {
         let metric_id = self.metric_dict.get_id(metric)?;
         self.metric_postings.get(&metric_id)
     }
@@ -359,7 +384,7 @@ impl SeriesRegistry {
         Some(SeriesKey { metric, labels })
     }
 
-    pub fn postings_for_ids(&self, pair: LabelPairId) -> Option<&BTreeSet<SeriesId>> {
+    pub fn postings_for_ids(&self, pair: LabelPairId) -> Option<&RoaringTreemap> {
         self.postings.get(&pair)
     }
 
@@ -367,7 +392,7 @@ impl SeriesRegistry {
         &self,
         label_name: &str,
         label_value: &str,
-    ) -> Option<&BTreeSet<SeriesId>> {
+    ) -> Option<&RoaringTreemap> {
         let name_id = self.label_name_dict.get_id(label_name)?;
         let value_id = self.label_value_dict.get_id(label_value)?;
         self.postings_for_ids(LabelPairId { name_id, value_id })
@@ -393,7 +418,7 @@ impl SeriesRegistry {
         self.metric_dict.entries()
     }
 
-    pub fn metric_postings_entries(&self) -> impl Iterator<Item = (&str, &BTreeSet<SeriesId>)> {
+    pub fn metric_postings_entries(&self) -> impl Iterator<Item = (&str, &RoaringTreemap)> {
         self.metric_postings
             .iter()
             .filter_map(|(metric_id, series_ids)| {
@@ -411,7 +436,7 @@ impl SeriesRegistry {
         self.label_value_dict.entries()
     }
 
-    pub fn postings_entries(&self) -> impl Iterator<Item = (LabelPairId, &BTreeSet<SeriesId>)> {
+    pub fn postings_entries(&self) -> impl Iterator<Item = (LabelPairId, &RoaringTreemap)> {
         self.postings.iter().map(|(pair, ids)| (*pair, ids))
     }
 
@@ -476,6 +501,195 @@ impl SeriesRegistry {
             .insert(series_id);
     }
 
+    fn rebuild_postings_indexes(&mut self) {
+        self.metric_postings.clear();
+        self.postings.clear();
+
+        for series in self.by_id.values() {
+            self.metric_postings
+                .entry(series.metric_id)
+                .or_default()
+                .insert(series.series_id);
+            for pair in &series.label_pairs {
+                self.postings
+                    .entry(*pair)
+                    .or_default()
+                    .insert(series.series_id);
+            }
+        }
+    }
+
+    pub fn retain_series_ids(&mut self, keep: &BTreeSet<SeriesId>) {
+        self.by_id.retain(|series_id, _| keep.contains(series_id));
+        self.by_key.retain(|_, series_id| keep.contains(series_id));
+        self.rebuild_postings_indexes();
+
+        let next = self
+            .by_id
+            .keys()
+            .copied()
+            .max()
+            .and_then(|max_id| max_id.checked_add(1))
+            .unwrap_or(1);
+        self.next_series_id = next;
+    }
+
+    pub fn persist_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&REGISTRY_INDEX_MAGIC);
+        bytes.extend_from_slice(&REGISTRY_INDEX_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&self.next_series_id.to_le_bytes());
+        bytes.extend_from_slice(&(self.metric_dict.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.label_name_dict.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.label_value_dict.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.by_id.len() as u64).to_le_bytes());
+        // Reserved for future index sections.
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        for (id, value) in self.metric_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+        for (id, value) in self.label_name_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+        for (id, value) in self.label_value_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+
+        let mut series = self.by_id.values().cloned().collect::<Vec<_>>();
+        series.sort_by_key(|entry| entry.series_id);
+        for entry in &series {
+            bytes.extend_from_slice(&entry.series_id.to_le_bytes());
+            bytes.extend_from_slice(&entry.metric_id.to_le_bytes());
+            let pair_count = u16::try_from(entry.label_pairs.len()).map_err(|_| {
+                TsinkError::InvalidConfiguration(
+                    "series label pair count exceeds u16 in registry index".to_string(),
+                )
+            })?;
+            bytes.extend_from_slice(&pair_count.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            for pair in &entry.label_pairs {
+                bytes.extend_from_slice(&pair.name_id.to_le_bytes());
+                bytes.extend_from_slice(&pair.value_id.to_le_bytes());
+            }
+        }
+
+        let tmp_path = path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        if bytes.len() < 52 {
+            return Err(TsinkError::DataCorruption(
+                "series index file is too short".to_string(),
+            ));
+        }
+
+        let mut pos = 0usize;
+        let magic = read_array::<4>(&bytes, &mut pos)?;
+        if magic != REGISTRY_INDEX_MAGIC {
+            return Err(TsinkError::DataCorruption(
+                "series index magic mismatch".to_string(),
+            ));
+        }
+
+        let version = read_u16(&bytes, &mut pos)?;
+        if version != REGISTRY_INDEX_VERSION {
+            return Err(TsinkError::DataCorruption(format!(
+                "unsupported series index version {version}"
+            )));
+        }
+
+        let _flags = read_u16(&bytes, &mut pos)?;
+        let next_series_id = read_u64(&bytes, &mut pos)?;
+        let metric_count = read_u32(&bytes, &mut pos)? as usize;
+        let label_name_count = read_u32(&bytes, &mut pos)? as usize;
+        let label_value_count = read_u32(&bytes, &mut pos)? as usize;
+        let series_count = read_u64(&bytes, &mut pos)? as usize;
+        let _reserved_metric_postings_count = read_u64(&bytes, &mut pos)? as usize;
+        let _reserved_postings_count = read_u64(&bytes, &mut pos)? as usize;
+
+        let metric_values = parse_dictionary(&bytes, &mut pos, metric_count)?;
+        let label_name_values = parse_dictionary(&bytes, &mut pos, label_name_count)?;
+        let label_value_values = parse_dictionary(&bytes, &mut pos, label_value_count)?;
+
+        let metric_dict = StringDictionary::from_values(metric_values, "metric")?;
+        let label_name_dict = StringDictionary::from_values(label_name_values, "label name")?;
+        let label_value_dict = StringDictionary::from_values(label_value_values, "label value")?;
+
+        let mut by_id = HashMap::<SeriesId, SeriesDefinition>::with_capacity(series_count);
+        let mut by_key = HashMap::<SeriesKeyIds, SeriesId>::with_capacity(series_count);
+        for _ in 0..series_count {
+            let series_id = read_u64(&bytes, &mut pos)?;
+            let metric_id = read_u32(&bytes, &mut pos)?;
+            let pair_count = read_u16(&bytes, &mut pos)? as usize;
+            let _reserved = read_u16(&bytes, &mut pos)?;
+            let mut label_pairs = Vec::with_capacity(pair_count);
+            for _ in 0..pair_count {
+                let name_id = read_u32(&bytes, &mut pos)?;
+                let value_id = read_u32(&bytes, &mut pos)?;
+                label_pairs.push(LabelPairId { name_id, value_id });
+            }
+            label_pairs.sort_unstable();
+            label_pairs.dedup();
+
+            let key = SeriesKeyIds {
+                metric_id,
+                label_pairs: label_pairs.clone(),
+            };
+            by_key.insert(key, series_id);
+            by_id.insert(
+                series_id,
+                SeriesDefinition {
+                    series_id,
+                    metric_id,
+                    label_pairs,
+                },
+            );
+        }
+
+        if pos != bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "series index has trailing bytes".to_string(),
+            ));
+        }
+
+        let mut registry = Self {
+            next_series_id: next_series_id.max(1),
+            metric_dict,
+            label_name_dict,
+            label_value_dict,
+            by_key,
+            by_id,
+            metric_postings: HashMap::new(),
+            postings: BTreeMap::new(),
+        };
+
+        registry.rebuild_postings_indexes();
+        if registry.next_series_id == 0 {
+            registry.next_series_id = 1;
+        }
+        Ok(registry)
+    }
+
     fn alloc_series_id(&mut self) -> Result<SeriesId> {
         let id = self.next_series_id;
         self.next_series_id = self.next_series_id.checked_add(1).ok_or_else(|| {
@@ -483,6 +697,74 @@ impl SeriesRegistry {
         })?;
         Ok(id)
     }
+}
+
+fn write_dict_entry(out: &mut Vec<u8>, id: u32, value: &str) -> Result<()> {
+    let value_bytes = value.as_bytes();
+    let len = u32::try_from(value_bytes.len()).map_err(|_| {
+        TsinkError::InvalidConfiguration("registry dictionary string exceeds u32".to_string())
+    })?;
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(value_bytes);
+    Ok(())
+}
+
+fn parse_dictionary(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<String>> {
+    let mut values = Vec::with_capacity(count);
+    for expected_id in 0..count {
+        let id = read_u32(bytes, pos)? as usize;
+        if id != expected_id {
+            return Err(TsinkError::DataCorruption(format!(
+                "registry dictionary id {} is not dense at expected {}",
+                id, expected_id
+            )));
+        }
+
+        let len = read_u32(bytes, pos)? as usize;
+        let value_bytes = read_bytes(bytes, pos, len)?;
+        let value = String::from_utf8(value_bytes.to_vec())?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
+    let mut raw = [0u8; 2];
+    raw.copy_from_slice(read_bytes(bytes, pos, 2)?);
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(read_bytes(bytes, pos, 4)?);
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(read_bytes(bytes, pos, 8)?);
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn read_array<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N]> {
+    let mut raw = [0u8; N];
+    raw.copy_from_slice(read_bytes(bytes, pos, N)?);
+    Ok(raw)
+}
+
+fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = pos.saturating_add(len);
+    if end > bytes.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "registry payload truncated: need {} bytes, have {}",
+            len,
+            bytes.len().saturating_sub(*pos)
+        )));
+    }
+    let out = &bytes[*pos..end];
+    *pos = end;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -555,8 +837,8 @@ mod tests {
 
         let postings = registry.postings_for_label("region", "use1").unwrap();
         assert_eq!(postings.len(), 2);
-        assert!(postings.contains(&a.series_id));
-        assert!(postings.contains(&b.series_id));
+        assert!(postings.contains(a.series_id));
+        assert!(postings.contains(b.series_id));
     }
 
     #[test]

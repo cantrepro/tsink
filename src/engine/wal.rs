@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::segment::WalHighWatermark;
-use crate::engine::series_registry::SeriesId;
+use crate::engine::series::SeriesId;
 use crate::wal::WalSyncMode;
 use crate::{Label, Result, TsinkError};
 

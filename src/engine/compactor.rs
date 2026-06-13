@@ -9,7 +9,7 @@ use crate::engine::encoder::Encoder;
 use crate::engine::segment::{
     load_segments, load_segments_for_level, LoadedSegment, PersistedSeries, SegmentWriter,
 };
-use crate::engine::series_registry::{SeriesId, SeriesRegistry};
+use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::{Result, TsinkError};
 
 const DEFAULT_L0_TRIGGER: usize = 4;
@@ -632,7 +632,7 @@ mod tests {
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::segment::{load_segments, load_segments_for_level, SegmentWriter};
-    use crate::engine::series_registry::SeriesRegistry;
+    use crate::engine::series::SeriesRegistry;
     use crate::{Label, Value};
 
     #[test]

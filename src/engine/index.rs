@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::chunk::{TimestampCodecId, ValueCodecId, ValueLane};
-use super::series_registry::SeriesId;
+use super::series::SeriesId;
 
 #[derive(Debug, Clone)]
 pub struct ChunkIndexEntry {

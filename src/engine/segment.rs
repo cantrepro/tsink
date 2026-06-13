@@ -1,14 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use roaring::RoaringTreemap;
 use tracing::warn;
 
 use crate::engine::chunk::{Chunk, ChunkHeader, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::index::{ChunkIndex, ChunkIndexEntry};
-use crate::engine::series_registry::{LabelPairId, SeriesId, SeriesRegistry};
+use crate::engine::series::{LabelPairId, SeriesId, SeriesRegistry};
 use crate::mmap::{create_mmap, PlatformMmap};
 use crate::{Label, Result, TsinkError};
 
@@ -18,11 +19,15 @@ const CHUNK_INDEX_MAGIC: [u8; 4] = *b"CID2";
 const SERIES_MAGIC: [u8; 4] = *b"SRS2";
 const POSTINGS_MAGIC: [u8; 4] = *b"PST2";
 
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const FILE_KIND_CHUNKS: u8 = 1;
 const FILE_KIND_CHUNK_INDEX: u8 = 2;
 const FILE_KIND_SERIES: u8 = 3;
 const FILE_KIND_POSTINGS: u8 = 4;
+pub(crate) const CHUNK_FLAG_PAYLOAD_ZSTD: u8 = 0b0000_0001;
+const CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES: usize = 4;
+// Use zstd level 1 to keep write CPU overhead low.
+const CHUNK_PAYLOAD_ZSTD_LEVEL_FAST: i32 = 1;
 
 const CHUNKS_HEADER_LEN: usize = 16;
 const CHUNK_INDEX_HEADER_LEN: usize = 24;
@@ -33,7 +38,7 @@ const MANIFEST_FILE_ENTRY_LEN: usize = 20;
 const MANIFEST_FILE_ENTRY_COUNT: u32 = 4;
 
 type BuildChunksAndIndexOutput = (Vec<u8>, ChunkIndex, usize, usize, Option<i64>, Option<i64>);
-type SegmentPostings = BTreeMap<LabelPairId, BTreeSet<SeriesId>>;
+type SegmentPostings = BTreeMap<LabelPairId, RoaringTreemap>;
 type BuildSeriesFileOutput = (Vec<u8>, SegmentPostings, usize);
 
 #[derive(Debug, Clone)]
@@ -364,6 +369,13 @@ pub fn load_segments(base: impl AsRef<Path>) -> Result<LoadedSegments> {
 }
 
 pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndexes> {
+    load_segment_indexes_with_series(base, true)
+}
+
+pub fn load_segment_indexes_with_series(
+    base: impl AsRef<Path>,
+    load_series: bool,
+) -> Result<LoadedSegmentIndexes> {
     let dirs = collect_segment_dirs(base.as_ref(), 0..=2u8)?;
 
     let mut parsed = Vec::new();
@@ -371,7 +383,7 @@ pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndex
     let mut max_wal_highwater = WalHighWatermark::default();
 
     for dir in dirs {
-        match load_segment_dir_indexed(&dir) {
+        match load_segment_dir_indexed(&dir, load_series) {
             Ok(segment) => {
                 max_segment_id = max_segment_id.max(segment.manifest.segment_id);
                 max_wal_highwater = max_wal_highwater.max(segment.manifest.wal_highwater);
@@ -685,7 +697,7 @@ fn load_segment_dir(path: &Path) -> Result<ParsedSegment> {
     })
 }
 
-fn load_segment_dir_indexed(path: &Path) -> Result<ParsedIndexedSegment> {
+fn load_segment_dir_indexed(path: &Path, load_series: bool) -> Result<ParsedIndexedSegment> {
     let layout = SegmentLayout {
         root: path.to_path_buf(),
         chunks_path: path.join("chunks.bin"),
@@ -704,8 +716,6 @@ fn load_segment_dir_indexed(path: &Path) -> Result<ParsedIndexedSegment> {
     let manifest_bytes = fs::read(&layout.manifest_path)?;
     let parsed_manifest = parse_manifest(&manifest_bytes)?;
     let chunk_index_bytes = fs::read(&layout.chunk_index_path)?;
-    let series_bytes = fs::read(&layout.series_path)?;
-    let postings_bytes = fs::read(&layout.postings_path)?;
 
     let chunks_file = File::open(&layout.chunks_path)?;
     let chunks_mmap = create_mmap(chunks_file).map_err(|err| TsinkError::MemoryMap {
@@ -723,18 +733,24 @@ fn load_segment_dir_indexed(path: &Path) -> Result<ParsedIndexedSegment> {
         FILE_KIND_CHUNK_INDEX,
         &chunk_index_bytes,
     )?;
-    verify_file_manifest_entry(&parsed_manifest.files[2], FILE_KIND_SERIES, &series_bytes)?;
-    verify_file_manifest_entry(
-        &parsed_manifest.files[3],
-        FILE_KIND_POSTINGS,
-        &postings_bytes,
-    )?;
 
-    let parsed_series = parse_series_file(&series_bytes)?;
-    let series = decode_persisted_series(&parsed_series)?;
+    let series = if load_series {
+        let series_bytes = fs::read(&layout.series_path)?;
+        let postings_bytes = fs::read(&layout.postings_path)?;
+        verify_file_manifest_entry(&parsed_manifest.files[2], FILE_KIND_SERIES, &series_bytes)?;
+        verify_file_manifest_entry(
+            &parsed_manifest.files[3],
+            FILE_KIND_POSTINGS,
+            &postings_bytes,
+        )?;
 
-    // Parse for corruption detection even though startup path rebuilds postings from series labels.
-    parse_postings_file(&postings_bytes)?;
+        let parsed_series = parse_series_file(&series_bytes)?;
+        // Parse for corruption detection even though startup path rebuilds postings from series labels.
+        parse_postings_file(&postings_bytes)?;
+        decode_persisted_series(&parsed_series)?
+    } else {
+        Vec::new()
+    };
 
     let chunk_index = parse_chunk_index_file(&chunk_index_bytes)?;
     validate_chunk_index_against_chunks_file(chunks_mmap.as_slice(), &chunk_index)?;
@@ -842,7 +858,7 @@ fn build_chunks_and_index(
 }
 
 fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
-    let payload = &chunk.encoded_payload;
+    let (chunk_flags, payload) = encode_chunk_payload_for_storage(&chunk.encoded_payload)?;
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| TsinkError::InvalidConfiguration("chunk payload too large".to_string()))?;
 
@@ -851,14 +867,14 @@ fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
     header_body.push(chunk.header.lane as u8);
     header_body.push(chunk.header.ts_codec as u8);
     header_body.push(chunk.header.value_codec as u8);
-    header_body.push(0u8);
+    header_body.push(chunk_flags);
     header_body.extend_from_slice(&chunk.header.point_count.to_le_bytes());
     header_body.extend_from_slice(&chunk.header.min_ts.to_le_bytes());
     header_body.extend_from_slice(&chunk.header.max_ts.to_le_bytes());
     header_body.extend_from_slice(&payload_len.to_le_bytes());
 
     let header_crc32 = checksum32(&header_body);
-    let payload_crc32 = checksum32(payload);
+    let payload_crc32 = checksum32(&payload);
 
     let record_len = 4usize
         .saturating_add(header_body.len())
@@ -872,7 +888,7 @@ fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
     out.extend_from_slice(&record_len_u32.to_le_bytes());
     out.extend_from_slice(&header_crc32.to_le_bytes());
     out.extend_from_slice(&header_body);
-    out.extend_from_slice(payload);
+    out.extend_from_slice(&payload);
     out.extend_from_slice(&payload_crc32.to_le_bytes());
 
     Ok(())
@@ -964,7 +980,7 @@ fn build_series_file(
     let mut label_value_values = Vec::<String>::new();
 
     let mut series_entries = Vec::<SegmentSeriesEntry>::new();
-    let mut postings = BTreeMap::<LabelPairId, BTreeSet<SeriesId>>::new();
+    let mut postings = BTreeMap::<LabelPairId, RoaringTreemap>::new();
 
     let mut series_ids = chunks_by_series
         .iter()
@@ -1075,7 +1091,7 @@ fn infer_series_lane(
         .unwrap_or(ValueLane::Numeric)
 }
 
-fn build_postings_file(postings: &BTreeMap<LabelPairId, BTreeSet<SeriesId>>) -> Result<Vec<u8>> {
+fn build_postings_file(postings: &BTreeMap<LabelPairId, RoaringTreemap>) -> Result<Vec<u8>> {
     let postings = postings.iter().collect::<Vec<_>>();
 
     let mut bytes = Vec::new();
@@ -1085,11 +1101,12 @@ fn build_postings_file(postings: &BTreeMap<LabelPairId, BTreeSet<SeriesId>>) -> 
     bytes.extend_from_slice(&(postings.len() as u64).to_le_bytes());
 
     for (pair, series_ids) in postings {
-        let deltas = encode_series_id_deltas(series_ids.iter().copied());
         let series_count = u32::try_from(series_ids.len()).map_err(|_| {
             TsinkError::InvalidConfiguration("posting list exceeds u32".to_string())
         })?;
-        let encoded_len = u32::try_from(deltas.len()).map_err(|_| {
+        let mut encoded = Vec::new();
+        series_ids.serialize_into(&mut encoded)?;
+        let encoded_len = u32::try_from(encoded.len()).map_err(|_| {
             TsinkError::InvalidConfiguration("posting payload exceeds u32".to_string())
         })?;
 
@@ -1097,26 +1114,10 @@ fn build_postings_file(postings: &BTreeMap<LabelPairId, BTreeSet<SeriesId>>) -> 
         bytes.extend_from_slice(&pair.value_id.to_le_bytes());
         bytes.extend_from_slice(&series_count.to_le_bytes());
         bytes.extend_from_slice(&encoded_len.to_le_bytes());
-        bytes.extend_from_slice(&deltas);
+        bytes.extend_from_slice(&encoded);
     }
 
     Ok(bytes)
-}
-
-fn encode_series_id_deltas<I>(ids: I) -> Vec<u8>
-where
-    I: IntoIterator<Item = SeriesId>,
-{
-    let mut out = Vec::new();
-    let mut prev = 0u64;
-
-    for id in ids {
-        let delta = id.saturating_sub(prev);
-        encode_uvarint(delta, &mut out);
-        prev = id;
-    }
-
-    out
 }
 
 fn build_manifest_file(
@@ -1462,18 +1463,18 @@ fn parse_postings_file(bytes: &[u8]) -> Result<()> {
         let encoded_len = read_u32(bytes, &mut pos)? as usize;
         let payload = read_bytes(bytes, &mut pos, encoded_len)?;
 
-        let mut payload_pos = 0usize;
-        let mut prev = 0u64;
-        for _ in 0..series_count {
-            let delta = decode_uvarint(payload, &mut payload_pos)?;
-            let id = prev.saturating_add(delta);
-            prev = id;
-        }
-
-        if payload_pos != payload.len() {
-            return Err(TsinkError::DataCorruption(
-                "posting list payload has trailing bytes".to_string(),
-            ));
+        let bitmap = RoaringTreemap::deserialize_from(&mut std::io::Cursor::new(payload)).map_err(
+            |err| {
+                TsinkError::DataCorruption(format!(
+                    "failed to decode roaring posting payload: {err}"
+                ))
+            },
+        )?;
+        if bitmap.len() != series_count as u64 {
+            return Err(TsinkError::DataCorruption(format!(
+                "posting list cardinality mismatch: expected {series_count}, decoded {}",
+                bitmap.len()
+            )));
         }
     }
 
@@ -1614,7 +1615,7 @@ fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecordMeta>> {
         let lane = decode_lane(read_u8(bytes, &mut pos)?)?;
         let ts_codec = decode_ts_codec(read_u8(bytes, &mut pos)?)?;
         let value_codec = decode_value_codec(read_u8(bytes, &mut pos)?)?;
-        let _chunk_flags = read_u8(bytes, &mut pos)?;
+        let chunk_flags = read_u8(bytes, &mut pos)?;
         let point_count = read_u16(bytes, &mut pos)?;
         let min_ts = read_i64(bytes, &mut pos)?;
         let max_ts = read_i64(bytes, &mut pos)?;
@@ -1627,13 +1628,14 @@ fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecordMeta>> {
             ));
         }
 
-        let payload = read_bytes(bytes, &mut pos, payload_len)?.to_vec();
+        let payload = read_bytes(bytes, &mut pos, payload_len)?;
         let payload_crc32 = read_u32(bytes, &mut pos)?;
-        if checksum32(&payload) != payload_crc32 {
+        if checksum32(payload) != payload_crc32 {
             return Err(TsinkError::DataCorruption(
                 "chunk payload crc mismatch".to_string(),
             ));
         }
+        let payload = decode_chunk_payload_from_storage(payload, chunk_flags)?;
 
         if pos != record_end {
             return Err(TsinkError::DataCorruption(
@@ -1755,7 +1757,7 @@ fn validate_chunk_index_against_chunks_file(bytes: &[u8], index: &ChunkIndex) ->
         let lane = decode_lane(read_u8(bytes, &mut pos)?)?;
         let ts_codec = decode_ts_codec(read_u8(bytes, &mut pos)?)?;
         let value_codec = decode_value_codec(read_u8(bytes, &mut pos)?)?;
-        let _chunk_flags = read_u8(bytes, &mut pos)?;
+        let chunk_flags = read_u8(bytes, &mut pos)?;
         let point_count = read_u16(bytes, &mut pos)?;
         let min_ts = read_i64(bytes, &mut pos)?;
         let max_ts = read_i64(bytes, &mut pos)?;
@@ -1780,6 +1782,7 @@ fn validate_chunk_index_against_chunks_file(bytes: &[u8], index: &ChunkIndex) ->
                 "chunk index entry does not match chunk header".to_string(),
             ));
         }
+        validate_chunk_payload_flags(chunk_flags)?;
 
         let payload = read_bytes(bytes, &mut pos, payload_len)?;
         let payload_crc32 = read_u32(bytes, &mut pos)?;
@@ -1926,40 +1929,71 @@ fn checksum32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
 
-fn encode_uvarint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
+fn encode_chunk_payload_for_storage(payload: &[u8]) -> Result<(u8, Vec<u8>)> {
+    let compressed =
+        zstd::bulk::compress(payload, CHUNK_PAYLOAD_ZSTD_LEVEL_FAST).map_err(|err| {
+            TsinkError::Compression(format!("zstd compress chunk payload failed: {err}"))
+        })?;
+
+    let original_len = u32::try_from(payload.len())
+        .map_err(|_| TsinkError::InvalidConfiguration("chunk payload too large".to_string()))?;
+    let mut wrapped = Vec::with_capacity(
+        CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES.saturating_add(compressed.len()),
+    );
+    wrapped.extend_from_slice(&original_len.to_le_bytes());
+    wrapped.extend_from_slice(&compressed);
+
+    if wrapped.len() >= payload.len() {
+        return Ok((0u8, payload.to_vec()));
     }
-    out.push(value as u8);
+
+    Ok((CHUNK_FLAG_PAYLOAD_ZSTD, wrapped))
 }
 
-fn decode_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut x = 0u64;
-    let mut shift = 0u32;
+pub(crate) fn validate_chunk_payload_flags(chunk_flags: u8) -> Result<()> {
+    if chunk_flags & !CHUNK_FLAG_PAYLOAD_ZSTD != 0 {
+        return Err(TsinkError::DataCorruption(format!(
+            "invalid chunk payload flags {chunk_flags:#04x}"
+        )));
+    }
+    Ok(())
+}
 
-    while shift <= 63 {
-        let byte = *bytes.get(*pos).ok_or_else(|| {
-            TsinkError::DataCorruption("uvarint is truncated at end of payload".to_string())
-        })?;
-        *pos += 1;
+pub(crate) fn chunk_payload_uses_zstd(chunk_flags: u8) -> Result<bool> {
+    validate_chunk_payload_flags(chunk_flags)?;
+    Ok(chunk_flags & CHUNK_FLAG_PAYLOAD_ZSTD != 0)
+}
 
-        if byte < 0x80 {
-            if shift == 63 && byte > 1 {
-                return Err(TsinkError::DataCorruption(
-                    "uvarint overflow while decoding".to_string(),
-                ));
-            }
-            return Ok(x | ((byte as u64) << shift));
-        }
-
-        x |= ((byte & 0x7F) as u64) << shift;
-        shift += 7;
+pub(crate) fn decompress_chunk_payload_zstd(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() < CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES {
+        return Err(TsinkError::DataCorruption(
+            "compressed chunk payload missing original length prefix".to_string(),
+        ));
     }
 
-    Err(TsinkError::DataCorruption(
-        "uvarint overflow while decoding".to_string(),
-    ))
+    let mut raw = [0u8; CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES];
+    raw.copy_from_slice(&payload[..CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES]);
+    let expected_len = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(usize::MAX);
+    let compressed = &payload[CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES..];
+    let decoded = zstd::bulk::decompress(compressed, expected_len).map_err(|err| {
+        TsinkError::Compression(format!("zstd decompress chunk payload failed: {err}"))
+    })?;
+
+    if decoded.len() != expected_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk payload decompressed length mismatch: expected {expected_len}, got {}",
+            decoded.len()
+        )));
+    }
+
+    Ok(decoded)
+}
+
+fn decode_chunk_payload_from_storage(payload: &[u8], chunk_flags: u8) -> Result<Vec<u8>> {
+    if chunk_payload_uses_zstd(chunk_flags)? {
+        return decompress_chunk_payload_zstd(payload);
+    }
+    Ok(payload.to_vec())
 }
 
 fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
@@ -2024,11 +2058,13 @@ mod tests {
 
     use super::{
         collect_expired_segment_dirs, load_segments, load_segments_for_level, SegmentWriter,
-        WalHighWatermark,
+        WalHighWatermark, CHUNKS_HEADER_LEN, CHUNK_FLAG_PAYLOAD_ZSTD,
     };
-    use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
+    use crate::engine::chunk::{
+        Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
+    };
     use crate::engine::encoder::Encoder;
-    use crate::engine::series_registry::SeriesRegistry;
+    use crate::engine::series::SeriesRegistry;
     use crate::{Label, Value};
 
     #[test]
@@ -2094,6 +2130,49 @@ mod tests {
         let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].manifest.wal_highwater, highwater);
+    }
+
+    #[test]
+    fn segment_writer_compresses_chunk_payloads_with_zstd() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+        let series = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "zstd")])
+            .unwrap();
+
+        let original_payload = vec![7u8; 4096];
+        let chunk = Chunk {
+            header: ChunkHeader {
+                series_id: series.series_id,
+                lane: ValueLane::Numeric,
+                point_count: 1,
+                min_ts: 10,
+                max_ts: 10,
+                ts_codec: TimestampCodecId::DeltaVarint,
+                value_codec: ValueCodecId::ConstantRle,
+            },
+            points: Vec::new(),
+            encoded_payload: original_payload.clone(),
+        };
+
+        let mut chunks_by_series = HashMap::new();
+        chunks_by_series.insert(series.series_id, vec![chunk]);
+
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        writer.write_segment(&registry, &chunks_by_series).unwrap();
+
+        let chunks_bytes = fs::read(writer.layout().chunks_path.clone()).unwrap();
+        let chunk_flags_offset = CHUNKS_HEADER_LEN + 4 + 4 + 8 + 1 + 1 + 1;
+        assert_ne!(
+            chunks_bytes[chunk_flags_offset] & CHUNK_FLAG_PAYLOAD_ZSTD,
+            0,
+            "chunk payload should be stored with zstd flag for large compressible payloads"
+        );
+
+        let loaded = load_segments(tmp.path()).unwrap();
+        let loaded_chunks = loaded.chunks_by_series.get(&series.series_id).unwrap();
+        assert_eq!(loaded_chunks.len(), 1);
+        assert_eq!(loaded_chunks[0].encoded_payload, original_payload);
     }
 
     #[test]

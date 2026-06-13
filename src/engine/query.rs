@@ -2,7 +2,7 @@ use crate::{DataPoint, Label, Result};
 
 use super::chunk::Chunk;
 use super::encoder::Encoder;
-use super::series_registry::SeriesId;
+use super::series::SeriesId;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EncodedChunkDescriptor {

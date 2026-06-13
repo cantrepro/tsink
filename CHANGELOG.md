@@ -1,5 +1,10 @@
-0.8.2
+0.9.0
 tsink
+- BREAKING: Upgrade storage metadata/index format to disk-backed inverted index + roaring bitmaps + persisted series/label dictionaries (introduces `series_index.bin` and bumps segment format to v2; old on-disk segments are not compatible)
+- Use roaring bitmap postings for metric/label matcher candidate resolution
+- Persist and reload global series/label dictionaries and series definitions to accelerate reopen/startup
+- Encode/decode `postings.bin` using roaring payloads
+- Compress `chunks.bin` chunk payloads with fast zstd (level 1) when it reduces size; keep uncompressed payloads when not beneficial, and transparently decode both formats on read via chunk flags
 - Add storage observability snapshot API (`Storage::observability_snapshot`) with structured WAL/flush/compaction/query internals
 - Instrument WAL internals (replay runs/frames/points/errors/duration, append series/batches/points/bytes/errors, reset stats, active segment/highwater visibility)
 - Instrument flush/persist internals (pipeline runs/success/timeouts/errors/duration, active flush series/chunks/points, persist success/noop/errors, persisted series/chunks/points/segments, eviction stats)
