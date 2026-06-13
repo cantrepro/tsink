@@ -133,7 +133,7 @@ impl DiskPartition {
             });
         }
 
-        let meta_file = File::open(&meta_path)?;
+        let meta_file = std::io::BufReader::new(File::open(&meta_path)?);
         let meta: PartitionMeta = serde_json::from_reader(meta_file)?;
 
         // Memory-map the data file
