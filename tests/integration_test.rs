@@ -958,26 +958,36 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
         storage.close().unwrap();
     }
 
-    let segment_dirs = fs::read_dir(
-        temp_dir
-            .path()
-            .join("lane_numeric")
-            .join("segments")
-            .join("L0"),
-    )
-    .unwrap()
-    .filter_map(|entry| entry.ok())
-    .filter(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .map(|name| name.starts_with("seg-"))
-            .unwrap_or(false)
-    })
-    .count();
+    let count_segments_in_level = |level: &str| -> usize {
+        fs::read_dir(
+            temp_dir
+                .path()
+                .join("lane_numeric")
+                .join("segments")
+                .join(level),
+        )
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.starts_with("seg-"))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+    };
+    let l0_segment_dirs = count_segments_in_level("L0");
+    let l1_segment_dirs = count_segments_in_level("L1");
+    let l2_segment_dirs = count_segments_in_level("L2");
+    let segment_dirs = l0_segment_dirs + l1_segment_dirs + l2_segment_dirs;
     assert!(
         segment_dirs >= 1,
-        "expected at least one segment directory, got {segment_dirs}"
+        "expected at least one segment directory across levels, got {segment_dirs} (L0={l0_segment_dirs}, L1={l1_segment_dirs}, L2={l2_segment_dirs})"
     );
 
     let storage = StorageBuilder::new()

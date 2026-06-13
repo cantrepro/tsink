@@ -17,7 +17,7 @@ use crate::engine::segment::{
 };
 use crate::engine::series::SeriesRegistry;
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
-use crate::wal::WalSyncMode;
+use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     DataPoint, Label, Row, SeriesMatcher, SeriesSelection, Storage, StorageBuilder,
     TimestampPrecision, TsinkError, Value,
@@ -25,6 +25,7 @@ use crate::{
 
 mod admission_control;
 mod capacity;
+mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;

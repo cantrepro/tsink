@@ -31,7 +31,7 @@ pub use storage::{
     WalObservabilitySnapshot,
 };
 pub use value::{Aggregator, BytesAggregation, Codec, CodecAggregator, Value};
-pub use wal::WalSyncMode;
+pub use wal::{WalReplayMode, WalSyncMode};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

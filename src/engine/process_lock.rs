@@ -1,6 +1,9 @@
 use super::*;
+use std::time::{Duration, Instant};
 
 const DATA_PATH_LOCK_FILE_NAME: &str = ".tsink.lock";
+const LOCK_ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCK_ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub(super) struct DataPathProcessLock {
@@ -23,20 +26,27 @@ impl DataPathProcessLock {
                 source,
             })?;
 
-        if let Err(source) = lock_file.try_lock() {
-            return match source {
-                std::fs::TryLockError::WouldBlock => {
-                    Err(TsinkError::InvalidConfiguration(format!(
-                        "data path {} is already locked by another tsink process ({})",
-                        data_path.display(),
-                        lock_path.display()
-                    )))
+        let deadline = Instant::now() + LOCK_ACQUIRE_RETRY_TIMEOUT;
+        loop {
+            match lock_file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(TsinkError::InvalidConfiguration(format!(
+                            "data path {} is already locked by another tsink process ({})",
+                            data_path.display(),
+                            lock_path.display()
+                        )));
+                    }
+                    std::thread::sleep(LOCK_ACQUIRE_RETRY_INTERVAL);
                 }
-                std::fs::TryLockError::Error(source) => Err(TsinkError::IoWithPath {
-                    path: lock_path.clone(),
-                    source,
-                }),
-            };
+                Err(std::fs::TryLockError::Error(source)) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: lock_path.clone(),
+                        source,
+                    });
+                }
+            }
         }
 
         Ok(Self {

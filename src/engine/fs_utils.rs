@@ -37,6 +37,15 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_path_if_exists_and_sync_parent(path: &Path) -> Result<()> {
+    let existed = path.exists();
+    remove_path_if_exists(path)?;
+    if existed {
+        sync_parent_dir(path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
     let Some(parent) = target.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
@@ -166,10 +175,61 @@ pub(crate) fn rename_tmp(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sync_dir_if_exists(path: &Path) {
-    if let Ok(dir) = std::fs::File::open(path) {
-        let _ = dir.sync_all();
+pub(crate) fn rename_and_sync_parents(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(source, destination)?;
+
+    let source_parent = source.parent();
+    let destination_parent = destination.parent();
+    match (source_parent, destination_parent) {
+        (Some(source_parent), Some(destination_parent)) if source_parent == destination_parent => {
+            sync_dir(destination_parent)?
+        }
+        (Some(source_parent), Some(destination_parent)) => {
+            sync_dir(source_parent)?;
+            sync_dir(destination_parent)?;
+        }
+        (None, Some(destination_parent)) => sync_dir(destination_parent)?,
+        (Some(source_parent), None) => sync_dir(source_parent)?,
+        (None, None) => {}
     }
+
+    Ok(())
+}
+
+pub(crate) fn sync_dir_if_exists(path: &Path) {
+    let _ = sync_dir_if_exists_result(path);
+}
+
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
+    let dir = std::fs::File::open(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    dir.sync_all().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub(crate) fn sync_dir_if_exists_result(path: &Path) -> Result<()> {
+    match std::fs::File::open(path) {
+        Ok(dir) => dir.sync_all().map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_file_atomically_and_sync_parent(path: &Path, bytes: &[u8]) -> Result<()> {

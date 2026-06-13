@@ -69,22 +69,35 @@ impl ChunkStorage {
 
                 let mut previous_persisted_source_max_ts = i64::MIN;
                 let mut has_previous_persisted_source_chunk = false;
+                let mut overlapping_persisted_cluster_level = 0u8;
                 for chunk_ref in &chunks[..end_idx] {
                     if chunk_ref.max_ts < start {
                         continue;
                     }
+
+                    let overlaps_previous_persisted_source = has_previous_persisted_source_chunk
+                        && chunk_ref.min_ts <= previous_persisted_source_max_ts;
 
                     if has_previous_chunk
                         && chunk_ref.min_ts <= previous_max_ts
                         && has_previous_persisted_chunk
                         && chunk_ref.min_ts <= previous_persisted_max_ts
                     {
-                        requires_timestamp_dedupe = true;
+                        requires_exact_dedupe = true;
                     }
                     if has_previous_persisted_source_chunk
                         && chunk_ref.min_ts < previous_persisted_source_max_ts
                     {
                         persisted_source_sorted = false;
+                    }
+                    if overlaps_previous_persisted_source {
+                        if chunk_ref.level != overlapping_persisted_cluster_level {
+                            requires_timestamp_dedupe = true;
+                        }
+                        overlapping_persisted_cluster_level =
+                            overlapping_persisted_cluster_level.max(chunk_ref.level);
+                    } else {
+                        overlapping_persisted_cluster_level = chunk_ref.level;
                     }
 
                     has_previous_chunk = true;
@@ -215,6 +228,9 @@ impl ChunkStorage {
         let mut requires_output_validation = false;
         let mut requires_timestamp_dedupe = false;
         let mut requires_exact_dedupe = false;
+        let mut has_previous_persisted_source_chunk = false;
+        let mut previous_persisted_source_max_ts = i64::MIN;
+        let mut overlapping_persisted_cluster_level = 0u8;
 
         {
             let persisted_index = self.persisted_index.read();
@@ -226,19 +242,34 @@ impl ChunkStorage {
                         continue;
                     }
 
+                    let overlaps_previous_persisted_source = has_previous_persisted_source_chunk
+                        && chunk_ref.min_ts <= previous_persisted_source_max_ts;
+
                     if has_previous_chunk && chunk_ref.min_ts <= previous_max_ts {
                         has_overlap = true;
                         if has_previous_persisted_chunk
                             && chunk_ref.min_ts <= previous_persisted_max_ts
                         {
+                            requires_exact_dedupe = true;
+                        }
+                    }
+                    if overlaps_previous_persisted_source {
+                        if chunk_ref.level != overlapping_persisted_cluster_level {
                             requires_timestamp_dedupe = true;
                         }
+                        overlapping_persisted_cluster_level =
+                            overlapping_persisted_cluster_level.max(chunk_ref.level);
+                    } else {
+                        overlapping_persisted_cluster_level = chunk_ref.level;
                     }
 
                     has_previous_chunk = true;
                     has_previous_persisted_chunk = true;
+                    has_previous_persisted_source_chunk = true;
                     previous_max_ts = previous_max_ts.max(chunk_ref.max_ts);
                     previous_persisted_max_ts = previous_persisted_max_ts.max(chunk_ref.max_ts);
+                    previous_persisted_source_max_ts =
+                        previous_persisted_source_max_ts.max(chunk_ref.max_ts);
 
                     let payload = persisted_chunk_payload(
                         persisted_index.segment_maps.as_slice(),

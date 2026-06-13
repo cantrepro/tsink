@@ -1,6 +1,6 @@
 //! Main storage API and query helpers for tsink.
 
-use crate::wal::WalSyncMode;
+use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
     Result, Row, TsinkError,
@@ -347,6 +347,7 @@ pub struct StorageBuilder {
     wal_size_limit_bytes: usize,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
+    wal_replay_mode: WalReplayMode,
     background_fail_fast: bool,
 }
 
@@ -367,6 +368,7 @@ impl Default for StorageBuilder {
             wal_size_limit_bytes: usize::MAX,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
+            wal_replay_mode: WalReplayMode::default(),
             background_fail_fast: false,
         }
     }
@@ -490,6 +492,13 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets WAL replay policy when corruption is encountered mid-log.
+    #[must_use]
+    pub fn with_wal_replay_mode(mut self, mode: WalReplayMode) -> Self {
+        self.wal_replay_mode = mode;
+        self
+    }
+
     /// Enables fail-fast mode when background flush/compaction workers hit errors.
     #[must_use]
     pub fn with_background_fail_fast(mut self, enabled: bool) -> Self {
@@ -564,6 +573,10 @@ impl StorageBuilder {
 
     pub(crate) fn wal_sync_mode(&self) -> WalSyncMode {
         self.wal_sync_mode
+    }
+
+    pub(crate) fn wal_replay_mode(&self) -> WalReplayMode {
+        self.wal_replay_mode
     }
 
     pub(crate) fn background_fail_fast(&self) -> bool {

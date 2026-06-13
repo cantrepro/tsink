@@ -16,10 +16,14 @@ tsink
 - Skip unconditional active-chunk finalize sort when append timestamps are already monotonic; only sort out-of-order chunks
 - Add atomic snapshot/restore APIs (`Storage::snapshot`, `StorageBuilder::restore_from_snapshot`) with segment-consistent, WAL-aware backups
 - Decouple background flush/compaction maintenance from WAL enablement so persistent storage keeps draining/compacting even when WAL is disabled
+- Fix flaky close/persist overlap handling by preserving same-timestamp distinct values across segments while still preferring compacted generations after crash-recovery overlap
 - Always stamp persisted segment manifests with WAL high-water marks whenever WAL is configured, including persist paths invoked with non-WAL flags
 - Make compaction source replacement crash-recoverable via replacement markers finalized at startup and before compaction passes
 - Add single-process `data_path` lock file (`.tsink.lock`) to prevent concurrent writers from opening the same storage root
 - Surface background flush/compaction worker failures in observability health state, with optional fail-fast mode to stop new operations
+- Strengthen fsync durability boundaries for snapshot/restore rename flows and WAL reset/rotation directory mutations
+- Add configurable WAL replay policy (`Salvage` default, `Strict` optional) for mid-log corruption handling during startup replay
+- Expand failure-mode verification with deterministic corruption fuzz tests for WAL replay tails and segment decoding robustness
 tsink-server
 - Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges
 - Deepen `/api/v1/status/tsdb` response with nested internal observability sections (`wal`, `flush`, `compaction`, `query`)

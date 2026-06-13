@@ -135,6 +135,7 @@ impl SealedChunkKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PersistedChunkRef {
+    pub(super) level: u8,
     pub(super) min_ts: i64,
     pub(super) max_ts: i64,
     pub(super) point_count: u16,

@@ -549,8 +549,8 @@ where
         return Ok(());
     }
 
-    let mut pending_point: Option<ChunkPoint> = None;
     let mut chunk_points = Vec::with_capacity(point_cap);
+    let mut last_emitted_point: Option<ChunkPoint> = None;
 
     while let Some(key) = heap.pop() {
         let Some(cursor) = cursors.get_mut(key.cursor_idx) else {
@@ -574,27 +574,19 @@ where
             });
         }
 
-        if pending_point
+        if last_emitted_point
             .as_ref()
-            .is_some_and(|pending| pending.ts == point.ts)
+            .is_some_and(|previous| previous.ts == point.ts && previous.value == point.value)
         {
-            pending_point = Some(point);
             continue;
         }
 
-        if let Some(previous) = pending_point.take() {
-            chunk_points.push(previous);
-            if chunk_points.len() >= point_cap {
-                let points = std::mem::replace(&mut chunk_points, Vec::with_capacity(point_cap));
-                emit_chunk(encode_compacted_chunk(series_id, lane, points)?)?;
-            }
-        }
-
-        pending_point = Some(point);
-    }
-
-    if let Some(point) = pending_point.take() {
+        last_emitted_point = Some(point.clone());
         chunk_points.push(point);
+        if chunk_points.len() >= point_cap {
+            let points = std::mem::replace(&mut chunk_points, Vec::with_capacity(point_cap));
+            emit_chunk(encode_compacted_chunk(series_id, lane, points)?)?;
+        }
     }
 
     if !chunk_points.is_empty() {

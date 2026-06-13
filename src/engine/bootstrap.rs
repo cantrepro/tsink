@@ -1,7 +1,10 @@
 use super::*;
 use tracing::warn;
 
-use crate::engine::fs_utils::{copy_dir_contents, remove_path_if_exists, stage_dir_path};
+use crate::engine::fs_utils::{
+    copy_dir_contents, remove_path_if_exists, remove_path_if_exists_and_sync_parent,
+    rename_and_sync_parents, stage_dir_path, sync_dir,
+};
 use crate::engine::segment::load_segment_indexes_with_series;
 
 pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
@@ -92,7 +95,7 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         storage.replace_registry_from_snapshot(registry);
     }
     storage.apply_loaded_segment_indexes(loaded_segments, !load_series_from_segments)?;
-    storage.replay_from_wal(replay_highwater)?;
+    storage.replay_from_wal(replay_highwater, builder.wal_replay_mode())?;
     storage.sweep_expired_persisted_segments()?;
     storage.persist_series_registry_index()?;
     if storage.memory_budget_value() != usize::MAX {
@@ -135,9 +138,11 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
     let staging = stage_dir_path(data_path, "restore-staging")?;
     std::fs::create_dir_all(&staging)?;
     if let Err(err) = copy_dir_contents(snapshot_path, &staging) {
-        let _ = remove_path_if_exists(&staging);
+        let _ = remove_path_if_exists_and_sync_parent(&staging);
         return Err(err);
     }
+
+    sync_dir(&staging)?;
 
     let backup = if data_path.exists() {
         Some(stage_dir_path(data_path, "restore-backup")?)
@@ -146,31 +151,31 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
     };
 
     if let Some(backup_path) = backup.as_ref() {
-        if let Err(err) = std::fs::rename(data_path, backup_path) {
-            let _ = remove_path_if_exists(&staging);
-            return Err(err.into());
+        if let Err(err) = rename_and_sync_parents(data_path, backup_path) {
+            let _ = remove_path_if_exists_and_sync_parent(&staging);
+            return Err(err);
         }
     }
 
-    if let Err(activate_err) = std::fs::rename(&staging, data_path) {
+    if let Err(activate_err) = rename_and_sync_parents(&staging, data_path) {
         let mut rollback_err = None;
         if let Some(backup_path) = backup.as_ref() {
-            if let Err(err) = std::fs::rename(backup_path, data_path) {
+            if let Err(err) = rename_and_sync_parents(backup_path, data_path) {
                 rollback_err = Some(err);
             }
         }
-        let _ = remove_path_if_exists(&staging);
+        let _ = remove_path_if_exists_and_sync_parent(&staging);
 
         if let Some(rollback_err) = rollback_err {
             return Err(TsinkError::Other(format!(
                 "restore activation failed: {activate_err}; rollback failed: {rollback_err}"
             )));
         }
-        return Err(activate_err.into());
+        return Err(activate_err);
     }
 
     if let Some(backup_path) = backup {
-        if let Err(cleanup_err) = remove_path_if_exists(&backup_path) {
+        if let Err(cleanup_err) = remove_path_if_exists_and_sync_parent(&backup_path) {
             return Err(TsinkError::Other(format!(
                 "restore succeeded but failed to remove backup {}: {cleanup_err}",
                 backup_path.display()

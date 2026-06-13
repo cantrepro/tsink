@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 
 #[test]
 fn recovers_rows_from_wal_after_reopen() {
@@ -33,6 +34,67 @@ fn recovers_rows_from_wal_after_reopen() {
     assert_eq!(points.len(), 3);
     assert_eq!(points[0], DataPoint::new(1, 1.0));
     assert_eq!(points[2], DataPoint::new(3, 3.0));
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn wal_replay_policy_strict_vs_salvage_handles_mid_log_corruption() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+
+    {
+        let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "replay_policy".to_string(),
+            labels: labels.clone(),
+        })
+        .unwrap();
+        let batch = SamplesBatchFrame::from_points(
+            1,
+            ValueLane::Numeric,
+            &[ChunkPoint {
+                ts: 1,
+                value: Value::F64(1.0),
+            }],
+        )
+        .unwrap();
+        wal.append_samples(&[batch]).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal.path())
+            .unwrap();
+        file.write_all(b"W2FR\x02\x00\x00\x00\x00").unwrap();
+        file.flush().unwrap();
+    }
+
+    let strict_err = match StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_replay_mode(WalReplayMode::Strict)
+        .build()
+    {
+        Ok(_) => panic!("strict WAL replay mode should fail on corrupted tail"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        strict_err,
+        TsinkError::DataCorruption(message)
+            if message.contains("WAL replay corruption")
+    ));
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_replay_mode(WalReplayMode::Salvage)
+        .build()
+        .unwrap();
+
+    let points = reopened.select("replay_policy", &labels, 0, 10).unwrap();
+    assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
 
     reopened.close().unwrap();
 }

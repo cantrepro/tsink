@@ -250,15 +250,21 @@ impl Storage for ChunkStorage {
         })();
 
         if let Err(err) = snapshot_result {
-            let _ = crate::engine::fs_utils::remove_path_if_exists(&staging);
+            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
             drop(write_permits);
             return Err(err);
         }
 
-        if let Err(err) = std::fs::rename(&staging, destination) {
-            let _ = crate::engine::fs_utils::remove_path_if_exists(&staging);
+        if let Err(err) = crate::engine::fs_utils::sync_dir(&staging) {
+            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
             drop(write_permits);
-            return Err(err.into());
+            return Err(err);
+        }
+
+        if let Err(err) = crate::engine::fs_utils::rename_and_sync_parents(&staging, destination) {
+            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
+            drop(write_permits);
+            return Err(err);
         }
 
         drop(write_permits);

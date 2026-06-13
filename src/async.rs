@@ -1,7 +1,7 @@
 //! Runtime-agnostic async facade over sync `Storage` using dedicated worker threads.
 
 use crate::cgroup;
-use crate::wal::WalSyncMode;
+use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     DataPoint, Label, MetricSeries, QueryOptions, Result, Row, SeriesSelection, Storage,
     StorageBuilder, TimestampPrecision, TsinkError,
@@ -472,6 +472,13 @@ impl AsyncStorageBuilder {
     #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.inner = self.inner.with_wal_sync_mode(mode);
+        self
+    }
+
+    /// Sets WAL replay policy when corruption is encountered mid-log.
+    #[must_use]
+    pub fn with_wal_replay_mode(mut self, mode: WalReplayMode) -> Self {
+        self.inner = self.inner.with_wal_replay_mode(mode);
         self
     }
 

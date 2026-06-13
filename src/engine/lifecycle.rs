@@ -1,7 +1,11 @@
 use super::*;
 
 impl ChunkStorage {
-    pub(super) fn replay_from_wal(&self, replay_highwater: WalHighWatermark) -> Result<()> {
+    pub(super) fn replay_from_wal(
+        &self,
+        replay_highwater: WalHighWatermark,
+        replay_mode: crate::wal::WalReplayMode,
+    ) -> Result<()> {
         let Some(wal) = &self.wal else {
             return Ok(());
         };
@@ -17,7 +21,7 @@ impl ChunkStorage {
         let mut replay_points = 0u64;
 
         let replay_result = (|| -> Result<()> {
-            let mut stream = wal.replay_stream_after(replay_highwater)?;
+            let mut stream = wal.replay_stream_after_with_mode(replay_highwater, replay_mode)?;
             while let Some(frame) = stream.next_frame()? {
                 replay_frames = replay_frames.saturating_add(1);
                 match frame {
@@ -119,6 +123,7 @@ impl ChunkStorage {
                         .entry(entry.series_id)
                         .or_default()
                         .push(PersistedChunkRef {
+                            level: indexed_segment.manifest.level,
                             min_ts: entry.min_ts,
                             max_ts: entry.max_ts,
                             point_count: entry.point_count,

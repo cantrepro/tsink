@@ -16,7 +16,7 @@ use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane
 use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::segment::WalHighWatermark;
 use crate::engine::series::SeriesId;
-use crate::wal::WalSyncMode;
+use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{Label, Result, TsinkError, Value};
 
 const WAL_FILE_NAME: &str = "wal.log";
@@ -143,6 +143,7 @@ struct WalSegmentFile {
 pub struct WalReplayStream {
     segments: Vec<WalSegmentFile>,
     replay_highwater: WalHighWatermark,
+    replay_mode: WalReplayMode,
     next_segment_idx: usize,
     current_segment_id: u64,
     current_reader: Option<BufReader<File>>,
@@ -150,14 +151,72 @@ pub struct WalReplayStream {
 }
 
 impl WalReplayStream {
-    fn new(segments: Vec<WalSegmentFile>, replay_highwater: WalHighWatermark) -> Self {
+    fn new(
+        segments: Vec<WalSegmentFile>,
+        replay_highwater: WalHighWatermark,
+        replay_mode: WalReplayMode,
+    ) -> Self {
         Self {
             segments,
             replay_highwater,
+            replay_mode,
             next_segment_idx: 0,
             current_segment_id: 0,
             current_reader: None,
             halted: false,
+        }
+    }
+
+    fn stop_or_fail_corruption(
+        &mut self,
+        segment_id: u64,
+        frame_seq: Option<u64>,
+        reason: &str,
+    ) -> Result<Option<ReplayFrame>> {
+        if let Some(frame_seq) = frame_seq {
+            warn!(
+                segment = segment_id,
+                frame = frame_seq,
+                reason,
+                "WAL replay corruption"
+            );
+        } else {
+            warn!(segment = segment_id, reason, "WAL replay corruption");
+        }
+
+        match self.replay_mode {
+            WalReplayMode::Salvage => {
+                self.halted = true;
+                Ok(None)
+            }
+            WalReplayMode::Strict => {
+                Err(wal_replay_corruption_error(segment_id, frame_seq, reason))
+            }
+        }
+    }
+
+    fn stop_or_fail_decode_error(
+        &mut self,
+        segment_id: u64,
+        frame_seq: u64,
+        decode_err: TsinkError,
+    ) -> Result<Option<ReplayFrame>> {
+        warn!(
+            segment = segment_id,
+            frame = frame_seq,
+            error = %decode_err,
+            "WAL replay decode failure"
+        );
+        match self.replay_mode {
+            WalReplayMode::Salvage => {
+                self.halted = true;
+                Ok(None)
+            }
+            WalReplayMode::Strict => Err(wal_replay_corruption_error(
+                segment_id,
+                Some(frame_seq),
+                &decode_err.to_string(),
+            )),
         }
     }
 
@@ -180,23 +239,17 @@ impl WalReplayStream {
                     continue;
                 }
                 HeaderRead::Truncated => {
-                    warn!(
-                        segment = segment_id,
-                        "Stopping WAL replay at truncated frame header"
+                    return self.stop_or_fail_corruption(
+                        segment_id,
+                        None,
+                        "truncated frame header",
                     );
-                    self.halted = true;
-                    return Ok(None);
                 }
                 HeaderRead::FrameHeader(header) => header,
             };
 
             let Some(parsed_header) = parse_frame_header(&header)? else {
-                warn!(
-                    segment = segment_id,
-                    "Stopping WAL replay at frame with magic mismatch"
-                );
-                self.halted = true;
-                return Ok(None);
+                return self.stop_or_fail_corruption(segment_id, None, "frame with magic mismatch");
             };
             let frame_type = parsed_header.frame_type;
             let frame_seq = parsed_header.frame_seq;
@@ -204,38 +257,31 @@ impl WalReplayStream {
             let expected_crc32 = parsed_header.expected_crc32;
 
             if payload_len > MAX_FRAME_PAYLOAD_BYTES {
-                warn!(
-                    segment = segment_id,
-                    frame = frame_seq,
-                    payload_len,
-                    "Stopping WAL replay due to oversized frame payload"
+                return self.stop_or_fail_corruption(
+                    segment_id,
+                    Some(frame_seq),
+                    "oversized frame payload",
                 );
-                self.halted = true;
-                return Ok(None);
             }
 
             let mut payload = vec![0u8; payload_len];
             if let Err(e) = reader.read_exact(&mut payload) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    warn!(
-                        segment = segment_id,
-                        frame = frame_seq,
-                        "Stopping WAL replay at truncated frame payload"
+                    return self.stop_or_fail_corruption(
+                        segment_id,
+                        Some(frame_seq),
+                        "truncated frame payload",
                     );
-                    self.halted = true;
-                    return Ok(None);
                 }
                 return Err(e.into());
             }
 
             if checksum32(&payload) != expected_crc32 {
-                warn!(
-                    segment = segment_id,
-                    frame = frame_seq,
-                    "Stopping WAL replay at frame with checksum mismatch"
+                return self.stop_or_fail_corruption(
+                    segment_id,
+                    Some(frame_seq),
+                    "frame with checksum mismatch",
                 );
-                self.halted = true;
-                return Ok(None);
             }
 
             let frame_pos = WalHighWatermark {
@@ -247,19 +293,20 @@ impl WalReplayStream {
             }
 
             let frame = match frame_type {
-                FRAME_TYPE_SERIES_DEF => {
-                    ReplayFrame::SeriesDefinition(decode_series_definition(&payload)?)
-                }
-                FRAME_TYPE_SAMPLES => ReplayFrame::Samples(decode_samples_payload(&payload)?),
-                other => {
-                    warn!(
-                        segment = segment_id,
-                        frame = frame_seq,
-                        frame_type = other,
-                        "Stopping WAL replay at unknown frame type"
+                FRAME_TYPE_SERIES_DEF => match decode_series_definition(&payload) {
+                    Ok(frame) => ReplayFrame::SeriesDefinition(frame),
+                    Err(err) => return self.stop_or_fail_decode_error(segment_id, frame_seq, err),
+                },
+                FRAME_TYPE_SAMPLES => match decode_samples_payload(&payload) {
+                    Ok(frame) => ReplayFrame::Samples(frame),
+                    Err(err) => return self.stop_or_fail_decode_error(segment_id, frame_seq, err),
+                },
+                _ => {
+                    return self.stop_or_fail_corruption(
+                        segment_id,
+                        Some(frame_seq),
+                        "unknown frame type",
                     );
-                    self.halted = true;
-                    return Ok(None);
                 }
             };
 
@@ -283,6 +330,21 @@ impl WalReplayStream {
         }
 
         Ok(false)
+    }
+}
+
+fn wal_replay_corruption_error(
+    segment_id: u64,
+    frame_seq: Option<u64>,
+    reason: &str,
+) -> TsinkError {
+    match frame_seq {
+        Some(frame_seq) => TsinkError::DataCorruption(format!(
+            "WAL replay corruption at segment {segment_id}, frame {frame_seq}: {reason}"
+        )),
+        None => TsinkError::DataCorruption(format!(
+            "WAL replay corruption at segment {segment_id}: {reason}"
+        )),
     }
 }
 
@@ -368,6 +430,7 @@ impl FramedWal {
         if segments.is_empty() {
             let path = segment_path(&dir, 0);
             File::create(&path)?;
+            sync_dir_path(&dir)?;
             segments.push(WalSegmentFile { id: 0, path });
         }
 
@@ -490,14 +553,26 @@ impl FramedWal {
     }
 
     pub fn replay_frames(&self) -> Result<Vec<ReplayFrame>> {
-        self.replay_frames_after(WalHighWatermark::default())
+        self.replay_frames_after_with_mode(WalHighWatermark::default(), WalReplayMode::default())
+    }
+
+    pub fn replay_frames_with_mode(&self, replay_mode: WalReplayMode) -> Result<Vec<ReplayFrame>> {
+        self.replay_frames_after_with_mode(WalHighWatermark::default(), replay_mode)
     }
 
     pub fn replay_frames_after(
         &self,
         replay_highwater: WalHighWatermark,
     ) -> Result<Vec<ReplayFrame>> {
-        let mut stream = self.replay_stream_after(replay_highwater)?;
+        self.replay_frames_after_with_mode(replay_highwater, WalReplayMode::default())
+    }
+
+    pub fn replay_frames_after_with_mode(
+        &self,
+        replay_highwater: WalHighWatermark,
+        replay_mode: WalReplayMode,
+    ) -> Result<Vec<ReplayFrame>> {
+        let mut stream = self.replay_stream_after_with_mode(replay_highwater, replay_mode)?;
         let mut out = Vec::new();
         while let Some(frame) = stream.next_frame()? {
             out.push(frame);
@@ -509,8 +584,20 @@ impl FramedWal {
         &self,
         replay_highwater: WalHighWatermark,
     ) -> Result<WalReplayStream> {
+        self.replay_stream_after_with_mode(replay_highwater, WalReplayMode::default())
+    }
+
+    pub fn replay_stream_after_with_mode(
+        &self,
+        replay_highwater: WalHighWatermark,
+        replay_mode: WalReplayMode,
+    ) -> Result<WalReplayStream> {
         let segments = collect_wal_segment_files(&self.dir)?;
-        Ok(WalReplayStream::new(segments, replay_highwater))
+        Ok(WalReplayStream::new(
+            segments,
+            replay_highwater,
+            replay_mode,
+        ))
     }
 
     pub fn current_highwater(&self) -> WalHighWatermark {
@@ -541,6 +628,7 @@ impl FramedWal {
             BufWriter::with_capacity(capacity, replacement),
         );
         let _ = old_writer.into_parts();
+        writer.get_ref().sync_data()?;
         drop(writer);
 
         for segment in collect_wal_segment_files(&self.dir)? {
@@ -554,6 +642,8 @@ impl FramedWal {
                 Err(e) => return Err(e.into()),
             }
         }
+
+        sync_dir_path(&self.dir)?;
 
         *self.last_sync.lock() = Instant::now();
         Ok(())
@@ -606,6 +696,7 @@ impl FramedWal {
             next_seq = 1;
             self.active_segment.store(active_segment, Ordering::SeqCst);
             *self.path.lock() = path;
+            sync_dir_path(&self.dir)?;
         }
 
         if active_segment == min_highwater.segment && next_seq <= min_highwater.frame {
@@ -732,6 +823,7 @@ impl FramedWal {
         self.active_segment.store(next_segment, Ordering::SeqCst);
         self.next_seq.store(1, Ordering::SeqCst);
         *self.path.lock() = next_path;
+        sync_dir_path(&self.dir)?;
 
         Ok(true)
     }
@@ -762,23 +854,45 @@ fn merge_encoded_payload(ts_payload: &[u8], value_payload: &[u8]) -> Vec<u8> {
     payload
 }
 
+fn sync_dir_path(path: &Path) -> Result<()> {
+    let dir = File::open(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    dir.sync_all().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 fn replay_from_path(path: &Path, replay_highwater: WalHighWatermark) -> Result<Vec<ReplayFrame>> {
-    replay_from_segments(
+    replay_from_path_with_mode(path, replay_highwater, WalReplayMode::default())
+}
+
+#[cfg(test)]
+fn replay_from_path_with_mode(
+    path: &Path,
+    replay_highwater: WalHighWatermark,
+    replay_mode: WalReplayMode,
+) -> Result<Vec<ReplayFrame>> {
+    replay_from_segments_with_mode(
         vec![WalSegmentFile {
             id: 0,
             path: path.to_path_buf(),
         }],
         replay_highwater,
+        replay_mode,
     )
 }
 
 #[cfg(test)]
-fn replay_from_segments(
+fn replay_from_segments_with_mode(
     segments: Vec<WalSegmentFile>,
     replay_highwater: WalHighWatermark,
+    replay_mode: WalReplayMode,
 ) -> Result<Vec<ReplayFrame>> {
-    let mut stream = WalReplayStream::new(segments, replay_highwater);
+    let mut stream = WalReplayStream::new(segments, replay_highwater, replay_mode);
     let mut out = Vec::new();
     while let Some(frame) = stream.next_frame()? {
         out.push(frame);
@@ -1084,14 +1198,17 @@ mod tests {
 
     use super::{
         checksum32, collect_wal_segment_files, encode_series_definition, replay_from_path,
-        scan_last_seq, FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame,
-        DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF,
-        WAL_FILE_NAME,
+        replay_from_path_with_mode, scan_last_seq, FramedWal, ReplayFrame, SamplesBatchFrame,
+        SeriesDefinitionFrame, DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC,
+        FRAME_TYPE_SERIES_DEF, WAL_FILE_NAME,
     };
     use crate::engine::binio::{write_u32_at, write_u64_at};
     use crate::engine::chunk::{ChunkPoint, ValueLane};
     use crate::engine::segment::WalHighWatermark;
-    use crate::{wal::WalSyncMode, Label, Value};
+    use crate::{
+        wal::{WalReplayMode, WalSyncMode},
+        Label, TsinkError, Value,
+    };
 
     fn series_def_frame_header(seq: u64, payload_len: usize, crc32: u32) -> [u8; FRAME_HEADER_LEN] {
         let mut header = [0u8; FRAME_HEADER_LEN];
@@ -1101,6 +1218,11 @@ mod tests {
         write_u32_at(&mut header, 16, payload_len as u32).unwrap();
         write_u32_at(&mut header, 20, crc32).unwrap();
         header
+    }
+
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *state
     }
 
     #[test]
@@ -1387,6 +1509,35 @@ mod tests {
     }
 
     #[test]
+    fn replay_strict_mode_errors_at_truncated_tail_frame() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "m".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+
+        {
+            let mut file = OpenOptions::new().append(true).open(wal.path()).unwrap();
+            file.write_all(b"W2FR\x02\x00\x00\x00\x00").unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = replay_from_path_with_mode(
+            &wal.path(),
+            WalHighWatermark::default(),
+            WalReplayMode::Strict,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TsinkError::DataCorruption(message) if message.contains("truncated frame header"))
+        );
+    }
+
+    #[test]
     fn replay_stops_at_frame_with_magic_mismatch() {
         let temp_dir = TempDir::new().unwrap();
         let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
@@ -1409,6 +1560,46 @@ mod tests {
         let replay = replay_from_path(&wal.path(), WalHighWatermark::default()).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
+    }
+
+    #[test]
+    fn replay_salvage_mode_handles_random_truncated_tails() {
+        for seed in 0u64..32 {
+            let temp_dir = TempDir::new().unwrap();
+            let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+            wal.append_series_definition(&SeriesDefinitionFrame {
+                series_id: 1,
+                metric: "cpu".to_string(),
+                labels: vec![Label::new("host", "a")],
+            })
+            .unwrap();
+
+            let mut state = seed.wrapping_mul(17).wrapping_add(3);
+            let noise_len = ((next_u64(&mut state) % (FRAME_HEADER_LEN as u64 - 1)) + 1) as usize;
+            let mut noise = Vec::with_capacity(noise_len);
+            for _ in 0..noise_len {
+                noise.push((next_u64(&mut state) & 0xff) as u8);
+            }
+
+            {
+                let mut file = OpenOptions::new().append(true).open(wal.path()).unwrap();
+                file.write_all(&noise).unwrap();
+                file.flush().unwrap();
+            }
+
+            let replay = replay_from_path_with_mode(
+                &wal.path(),
+                WalHighWatermark::default(),
+                WalReplayMode::Salvage,
+            )
+            .unwrap();
+            assert_eq!(
+                replay.len(),
+                1,
+                "salvage replay should recover valid prefix for seed {seed}"
+            );
+            assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
+        }
     }
 
     #[test]
