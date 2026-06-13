@@ -395,6 +395,9 @@ cargo run --example comprehensive
 ```bash
 cargo test
 cargo bench
+cargo bench --bench storage_benchmarks -- '^concurrent_rw/' --quick --noplot
+scripts/check_insert_select_perf.sh quick  # Quick insert/select matrix
+scripts/check_insert_select_perf.sh full   # Full insert/select matrix
 scripts/measure_bpp.sh quick   # Quick bytes-per-point measurement
 scripts/measure_bpp.sh full    # Full bytes-per-point measurement
 ```

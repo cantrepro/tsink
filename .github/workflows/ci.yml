@@ -58,12 +58,20 @@ jobs:
         run: bash scripts/measure_bpp.sh quick
 
   bench:
-    if: false
-    name: Benchmarks
+    name: Benchmarks (quick regression check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run benchmarks
-        run: cargo bench --workspace
+      - name: Restore criterion baseline
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            criterion-${{ runner.os }}-
+      - name: Run benchmarks (quick)
+        run: bash scripts/measure_perf.sh quick
+      - name: Check for regressions (>50%)
+        run: bash scripts/check_bench_regression.sh 50
