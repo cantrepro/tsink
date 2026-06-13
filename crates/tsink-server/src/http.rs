@@ -153,10 +153,18 @@ impl HttpResponse {
 
 pub async fn read_http_request<R: AsyncRead + Unpin>(
     stream: &mut R,
+    buffer: &mut Vec<u8>,
 ) -> Result<HttpRequest, String> {
-    let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
+        if let Some(pos) = find_sequence(buffer, b"\r\n\r\n") {
+            let end = pos + 4;
+            if end > MAX_HEADER_BYTES {
+                return Err("request headers too large".to_string());
+            }
+            break end;
+        }
+
         let read = stream
             .read(&mut chunk)
             .await
@@ -170,8 +178,8 @@ pub async fn read_http_request<R: AsyncRead + Unpin>(
             return Err("request headers too large".to_string());
         }
 
-        if let Some(pos) = find_sequence(&buffer, b"\r\n\r\n") {
-            break pos + 4;
+        if find_sequence(buffer, b"\r\n\r\n").is_none() && buffer.len() > MAX_HEADER_BYTES {
+            return Err("request headers too large".to_string());
         }
     };
 
@@ -217,9 +225,9 @@ pub async fn read_http_request<R: AsyncRead + Unpin>(
         return Err("request body too large".to_string());
     }
 
-    let mut body = buffer[header_end..].to_vec();
-    while body.len() < content_length {
-        let to_read = (content_length - body.len()).min(chunk.len());
+    let request_end = header_end + content_length;
+    while buffer.len() < request_end {
+        let to_read = (request_end - buffer.len()).min(chunk.len());
         let read = stream
             .read(&mut chunk[..to_read])
             .await
@@ -227,11 +235,10 @@ pub async fn read_http_request<R: AsyncRead + Unpin>(
         if read == 0 {
             return Err("connection closed while reading request body".to_string());
         }
-        body.extend_from_slice(&chunk[..read]);
+        buffer.extend_from_slice(&chunk[..read]);
     }
-    if body.len() > content_length {
-        body.truncate(content_length);
-    }
+    let body = buffer[header_end..request_end].to_vec();
+    buffer.drain(..request_end);
 
     Ok(HttpRequest {
         method,
@@ -339,5 +346,36 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_http_request_preserves_pipelined_bytes() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\nGET /two HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("write should work");
+        drop(client);
+
+        let mut read_buffer = Vec::new();
+        let first = read_http_request(&mut server, &mut read_buffer)
+            .await
+            .expect("first request should parse");
+        let second = read_http_request(&mut server, &mut read_buffer)
+            .await
+            .expect("second request should parse");
+
+        assert_eq!(first.method, "GET");
+        assert_eq!(first.path, "/one");
+        assert_eq!(second.method, "GET");
+        assert_eq!(second.path, "/two");
     }
 }

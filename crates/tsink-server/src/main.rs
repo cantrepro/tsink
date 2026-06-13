@@ -140,7 +140,20 @@ where
                 let value = args
                     .next()
                     .ok_or_else(|| "--auth-token requires a token value".to_string())?;
-                config.auth_token = Some(value);
+                let token = value.trim();
+                if token.is_empty() {
+                    return Err("--auth-token must not be empty".to_string());
+                }
+                config.auth_token = Some(token.to_string());
+            }
+            "--enable-admin-api" => {
+                config.admin_api_enabled = true;
+            }
+            "--admin-path-prefix" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--admin-path-prefix requires a filesystem path".to_string())?;
+                config.admin_path_prefix = Some(PathBuf::from(value));
             }
             "-h" | "--help" => {
                 print_usage();
@@ -150,7 +163,22 @@ where
         }
     }
 
+    validate_server_config(&config)?;
     Ok(config)
+}
+
+fn validate_server_config(config: &ServerConfig) -> Result<(), String> {
+    let has_auth = config
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    if config.admin_api_enabled && !has_auth {
+        return Err("--enable-admin-api requires --auth-token".to_string());
+    }
+    if config.admin_path_prefix.is_some() && !config.admin_api_enabled {
+        return Err("--admin-path-prefix requires --enable-admin-api".to_string());
+    }
+    Ok(())
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -209,7 +237,11 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err(format!("duration must be non-negative: '{value}'"));
     }
 
-    Ok(Duration::from_secs_f64(secs))
+    if !secs.is_finite() {
+        return Err(format!("invalid duration: '{value}'"));
+    }
+
+    Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration: '{value}'"))
 }
 
 fn parse_byte_size(value: &str) -> Result<usize, String> {
@@ -270,6 +302,8 @@ Server options:
   --tls-cert <PATH>                 TLS certificate file (PEM)
   --tls-key <PATH>                  TLS private key file (PEM)
   --auth-token <TOKEN>              Require Bearer token on requests
+  --enable-admin-api                Enable admin snapshot/restore endpoints
+  --admin-path-prefix <PATH>        Restrict admin file paths under PATH
 
 Endpoints:
   GET  /healthz
@@ -288,4 +322,36 @@ Endpoints:
   POST /api/v1/admin/restore        Restore snapshot to data path
   POST /api/v1/admin/delete_series  Delete series (stub)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_rejects_non_finite_values() {
+        assert!(parse_duration("NaNs").is_err());
+        assert!(parse_duration("infs").is_err());
+    }
+
+    #[test]
+    fn admin_api_requires_auth_token() {
+        let args = vec!["--enable-admin-api".to_string()];
+        let err =
+            parse_server_args(args.into_iter()).expect_err("admin API without auth must fail");
+        assert!(err.contains("--enable-admin-api requires --auth-token"));
+    }
+
+    #[test]
+    fn admin_path_prefix_requires_admin_api() {
+        let args = vec![
+            "--admin-path-prefix".to_string(),
+            "/tmp/admin".to_string(),
+            "--auth-token".to_string(),
+            "secret".to_string(),
+        ];
+        let err =
+            parse_server_args(args.into_iter()).expect_err("admin path prefix without admin API");
+        assert!(err.contains("--admin-path-prefix requires --enable-admin-api"));
+    }
 }

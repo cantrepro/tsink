@@ -1,4 +1,4 @@
-use crate::http::{json_response, text_response, HttpRequest, HttpResponse};
+use crate::http::{json_response, text_response, HttpRequest, HttpResponse, MAX_BODY_BYTES};
 use crate::prom_remote::{
     Label as PromLabel, LabelMatcher, MatcherType, Query, QueryResult, ReadRequest, ReadResponse,
     Sample as PromSample, TimeSeries, WriteRequest,
@@ -7,9 +7,9 @@ use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
-use snap::raw::{Decoder as SnappyDecoder, Encoder as SnappyEncoder};
+use snap::raw::{decompress_len, Decoder as SnappyDecoder, Encoder as SnappyEncoder};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tsink::promql::ast::{Expr, MatchOp};
@@ -20,12 +20,34 @@ use tsink::{
     StorageBuilder, TimestampPrecision,
 };
 
+#[cfg(test)]
 pub async fn handle_request(
     storage: &Arc<dyn Storage>,
     engine: &Engine,
     request: HttpRequest,
     server_start: Instant,
     timestamp_precision: TimestampPrecision,
+) -> HttpResponse {
+    handle_request_with_admin(
+        storage,
+        engine,
+        request,
+        server_start,
+        timestamp_precision,
+        false,
+        None,
+    )
+    .await
+}
+
+pub async fn handle_request_with_admin(
+    storage: &Arc<dyn Storage>,
+    engine: &Engine,
+    request: HttpRequest,
+    server_start: Instant,
+    timestamp_precision: TimestampPrecision,
+    admin_api_enabled: bool,
+    admin_path_prefix: Option<&Path>,
 ) -> HttpResponse {
     let path = request.path_without_query().to_owned();
     match (request.method.as_str(), path.as_str()) {
@@ -54,9 +76,13 @@ pub async fn handle_request(
             handle_prometheus_import(storage, &request, timestamp_precision).await
         }
         ("GET", "/api/v1/status/tsdb") => handle_tsdb_status(storage).await,
-        ("POST", "/api/v1/admin/snapshot") => handle_admin_snapshot(storage, &request).await,
-        ("POST", "/api/v1/admin/restore") => handle_admin_restore(&request).await,
-        ("POST", "/api/v1/admin/delete_series") => {
+        ("POST", "/api/v1/admin/snapshot") if admin_api_enabled => {
+            handle_admin_snapshot(storage, &request, admin_path_prefix).await
+        }
+        ("POST", "/api/v1/admin/restore") if admin_api_enabled => {
+            handle_admin_restore(&request, admin_path_prefix).await
+        }
+        ("POST", "/api/v1/admin/delete_series") if admin_api_enabled => {
             text_response(501, "series deletion is not yet supported")
         }
         _ => text_response(404, "not found"),
@@ -180,6 +206,7 @@ async fn handle_series(storage: &Arc<dyn Storage>, request: &HttpRequest) -> Htt
     let storage = Arc::clone(storage);
     let result = tokio::task::spawn_blocking(move || {
         let mut all_series = Vec::new();
+        let mut seen = BTreeSet::<(String, Vec<(String, String)>)>::new();
         for match_str in &matchers {
             let expr = match tsink::promql::parse(match_str) {
                 Ok(expr) => expr,
@@ -197,10 +224,19 @@ async fn handle_series(storage: &Arc<dyn Storage>, request: &HttpRequest) -> Htt
                 .select_series(&selection)
                 .map_err(|err| format!("series selection failed: {err}"))?;
             for s in series {
+                let mut labels: Vec<(String, String)> = s
+                    .labels
+                    .into_iter()
+                    .map(|label| (label.name, label.value))
+                    .collect();
+                labels.sort();
+                if !seen.insert((s.name.clone(), labels.clone())) {
+                    continue;
+                }
                 let mut labels_map = serde_json::Map::new();
-                labels_map.insert("__name__".to_string(), JsonValue::String(s.name.clone()));
-                for label in &s.labels {
-                    labels_map.insert(label.name.clone(), JsonValue::String(label.value.clone()));
+                labels_map.insert("__name__".to_string(), JsonValue::String(s.name));
+                for (name, value) in labels {
+                    labels_map.insert(name, JsonValue::String(value));
                 }
                 all_series.push(JsonValue::Object(labels_map));
             }
@@ -588,8 +624,10 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
     })
     .await;
 
-    let (series_count, observability): (usize, tsink::StorageObservabilitySnapshot) =
-        result.unwrap_or_default();
+    let (series_count, observability): (usize, tsink::StorageObservabilitySnapshot) = match result {
+        Ok(values) => values,
+        Err(err) => return text_response(500, &format!("status task failed: {err}")),
+    };
 
     json_response(
         200,
@@ -682,7 +720,11 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
     )
 }
 
-async fn handle_admin_snapshot(storage: &Arc<dyn Storage>, request: &HttpRequest) -> HttpResponse {
+async fn handle_admin_snapshot(
+    storage: &Arc<dyn Storage>,
+    request: &HttpRequest,
+    admin_path_prefix: Option<&Path>,
+) -> HttpResponse {
     let path = match non_empty_param(request.param("path")) {
         Some(path) => path,
         None => {
@@ -702,9 +744,13 @@ async fn handle_admin_snapshot(storage: &Arc<dyn Storage>, request: &HttpRequest
         }
     };
 
+    let path_buf = match resolve_admin_path(Path::new(&path), admin_path_prefix, false) {
+        Ok(path_buf) => path_buf,
+        Err(err) => return text_response(400, &err),
+    };
+
     let storage = Arc::clone(storage);
     let response_path = path.clone();
-    let path_buf = PathBuf::from(path);
     let result = tokio::task::spawn_blocking(move || storage.snapshot(&path_buf)).await;
 
     match result {
@@ -722,7 +768,10 @@ async fn handle_admin_snapshot(storage: &Arc<dyn Storage>, request: &HttpRequest
     }
 }
 
-async fn handle_admin_restore(request: &HttpRequest) -> HttpResponse {
+async fn handle_admin_restore(
+    request: &HttpRequest,
+    admin_path_prefix: Option<&Path>,
+) -> HttpResponse {
     let payload = match parse_optional_json_body::<RestoreAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
         Err(err) => return text_response(400, &err),
@@ -754,10 +803,18 @@ async fn handle_admin_restore(request: &HttpRequest) -> HttpResponse {
         );
     };
 
-    let response_snapshot_path = snapshot_path.clone();
-    let response_data_path = data_path.clone();
-    let snapshot_path_buf = PathBuf::from(snapshot_path);
-    let data_path_buf = PathBuf::from(data_path);
+    let snapshot_path_buf =
+        match resolve_admin_path(Path::new(&snapshot_path), admin_path_prefix, true) {
+            Ok(path_buf) => path_buf,
+            Err(err) => return text_response(400, &err),
+        };
+    let data_path_buf = match resolve_admin_path(Path::new(&data_path), admin_path_prefix, false) {
+        Ok(path_buf) => path_buf,
+        Err(err) => return text_response(400, &err),
+    };
+
+    let response_snapshot_path = snapshot_path_buf.display().to_string();
+    let response_data_path = data_path_buf.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
         StorageBuilder::restore_from_snapshot(&snapshot_path_buf, &data_path_buf)
     })
@@ -777,6 +834,66 @@ async fn handle_admin_restore(request: &HttpRequest) -> HttpResponse {
         Ok(Err(err)) => text_response(500, &format!("restore failed: {err}")),
         Err(err) => text_response(500, &format!("restore task failed: {err}")),
     }
+}
+
+fn resolve_admin_path(
+    requested_path: &Path,
+    admin_path_prefix: Option<&Path>,
+    must_exist: bool,
+) -> Result<PathBuf, String> {
+    let resolved = canonicalize_requested_path(requested_path, must_exist)?;
+    if let Some(prefix) = admin_path_prefix {
+        if !resolved.starts_with(prefix) {
+            return Err(format!(
+                "path '{}' is outside admin path prefix '{}'",
+                resolved.display(),
+                prefix.display()
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn canonicalize_requested_path(path: &Path, must_exist: bool) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(path)
+    };
+
+    if must_exist {
+        return absolute
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve path {}: {err}", absolute.display()));
+    }
+
+    let mut existing = absolute.as_path();
+    let mut missing_segments = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return Err(format!(
+                "path '{}' does not have an existing parent directory",
+                absolute.display()
+            ));
+        };
+        missing_segments.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            format!(
+                "path '{}' does not have an existing parent directory",
+                absolute.display()
+            )
+        })?;
+    }
+
+    let mut canonical = existing
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve path {}: {err}", existing.display()))?;
+    for segment in missing_segments.iter().rev() {
+        canonical.push(segment);
+    }
+    Ok(canonical)
 }
 
 async fn handle_remote_write(storage: &Arc<dyn Storage>, request: &HttpRequest) -> HttpResponse {
@@ -902,10 +1019,8 @@ fn parse_prometheus_text(text: &str, default_timestamp: i64) -> Result<Vec<Row>,
         }
 
         let (metric_and_labels, rest) = if let Some(brace_start) = line.find('{') {
-            let brace_end = line[brace_start..]
-                .find('}')
-                .ok_or_else(|| format!("unclosed brace in line: {line}"))?
-                + brace_start;
+            let brace_end = find_label_block_end(line, brace_start)
+                .ok_or_else(|| format!("unclosed brace in line: {line}"))?;
             let metric_name = &line[..brace_start];
             let labels_str = &line[brace_start + 1..brace_end];
             let rest = line[brace_end + 1..].trim();
@@ -949,23 +1064,101 @@ fn parse_prometheus_text(text: &str, default_timestamp: i64) -> Result<Vec<Row>,
     Ok(rows)
 }
 
-fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> {
-    let mut labels = Vec::new();
-    if labels_str.is_empty() {
-        return Ok(labels);
-    }
+fn find_label_block_end(line: &str, open_brace: usize) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
 
-    for pair in labels_str.split(',') {
-        let pair = pair.trim();
-        if pair.is_empty() {
+    for (offset, ch) in line[open_brace + 1..].char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        let (name, value) = pair
-            .split_once('=')
-            .ok_or_else(|| format!("invalid label pair: '{pair}'"))?;
-        let name = name.trim();
-        let value = value.trim().trim_matches('"');
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '}' if !in_quotes => return Some(open_brace + 1 + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> {
+    let mut labels = Vec::new();
+    let mut chars = labels_str.chars().peekable();
+
+    loop {
+        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+            chars.next();
+        }
+
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut name = String::new();
+        while let Some(&ch) = chars.peek() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                name.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if name.is_empty() {
+            return Err(format!("invalid label in '{labels_str}'"));
+        }
+
+        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+            chars.next();
+        }
+
+        if chars.next() != Some('=') {
+            return Err(format!("invalid label pair for '{name}' in '{labels_str}'"));
+        }
+
+        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+            chars.next();
+        }
+
+        if chars.next() != Some('"') {
+            return Err(format!(
+                "label '{name}' value must be quoted in '{labels_str}'"
+            ));
+        }
+
+        let mut value = String::new();
+        loop {
+            match chars.next() {
+                Some('"') => break,
+                Some('\\') => match chars.next() {
+                    Some('\\') => value.push('\\'),
+                    Some('"') => value.push('"'),
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some('r') => value.push('\r'),
+                    Some(other) => value.push(other),
+                    None => return Err(format!("unterminated escape sequence in '{labels_str}'")),
+                },
+                Some(ch) => value.push(ch),
+                None => return Err(format!("unterminated label value in '{labels_str}'")),
+            }
+        }
+
         labels.push(Label::new(name, value));
+
+        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+            chars.next();
+        }
+
+        match chars.peek() {
+            Some(',') => {
+                chars.next();
+            }
+            Some(_) => return Err(format!("expected ',' separator in '{labels_str}'")),
+            None => break,
+        }
     }
 
     Ok(labels)
@@ -975,9 +1168,25 @@ fn decode_body(request: &HttpRequest) -> Result<Vec<u8>, String> {
     match request.header("content-encoding") {
         None => Ok(request.body.clone()),
         Some(encoding) if encoding.eq_ignore_ascii_case("identity") => Ok(request.body.clone()),
-        Some(encoding) if encoding.eq_ignore_ascii_case("snappy") => SnappyDecoder::new()
-            .decompress_vec(&request.body)
-            .map_err(|err| format!("snappy decode failed: {err}")),
+        Some(encoding) if encoding.eq_ignore_ascii_case("snappy") => {
+            let decoded_len = decompress_len(&request.body)
+                .map_err(|err| format!("snappy decode failed: {err}"))?;
+            if decoded_len > MAX_BODY_BYTES {
+                return Err(format!(
+                    "decoded request body too large: {decoded_len} bytes (max {MAX_BODY_BYTES})"
+                ));
+            }
+            let decoded = SnappyDecoder::new()
+                .decompress_vec(&request.body)
+                .map_err(|err| format!("snappy decode failed: {err}"))?;
+            if decoded.len() > MAX_BODY_BYTES {
+                return Err(format!(
+                    "decoded request body too large: {} bytes (max {MAX_BODY_BYTES})",
+                    decoded.len()
+                ));
+            }
+            Ok(decoded)
+        }
         Some(encoding) => Err(format!("unsupported content-encoding: {encoding}")),
     }
 }
@@ -1373,6 +1582,23 @@ mod tests {
         assert_eq!(points[0].value.as_f64(), Some(11.5));
     }
 
+    #[test]
+    fn decode_body_rejects_oversized_snappy_payload() {
+        let oversized = vec![0_u8; MAX_BODY_BYTES + 1];
+        let compressed = SnappyEncoder::new()
+            .compress_vec(&oversized)
+            .expect("snappy encode should succeed");
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/write".to_string(),
+            headers: HashMap::from([("content-encoding".to_string(), "snappy".to_string())]),
+            body: compressed,
+        };
+
+        let err = decode_body(&request).expect_err("oversized decoded body must fail");
+        assert!(err.contains("decoded request body too large"));
+    }
+
     #[tokio::test]
     async fn remote_read_returns_snappy_protobuf() {
         let storage = make_storage();
@@ -1561,6 +1787,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn series_endpoint_deduplicates_overlapping_matches() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        storage
+            .insert_rows(&[Row::with_labels(
+                "http_requests",
+                vec![Label::new("method", "GET")],
+                DataPoint::new(1_700_000_000_000, 1.0),
+            )])
+            .expect("insert should work");
+
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/series?match[]=http_requests&match[]=http_requests".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        let data = body["data"].as_array().expect("data should be array");
+        assert_eq!(data.len(), 1);
+    }
+
+    #[tokio::test]
     async fn labels_endpoint_returns_all_label_names() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -1678,6 +1938,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_endpoints_disabled_by_default() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/snapshot".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::to_vec(&json!({"path": "/tmp/tsink-snapshot"}))
+                .expect("json should encode"),
+        };
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 404);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_path_outside_prefix() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let prefix = temp_dir.path().join("allowed");
+        std::fs::create_dir_all(&prefix).expect("prefix directory should be created");
+        let disallowed = temp_dir.path().join("outside").join("snapshot");
+
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/snapshot".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::to_vec(&json!({
+                "path": disallowed.to_string_lossy()
+            }))
+            .expect("json should encode"),
+        };
+
+        let response = handle_request_with_admin(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            Some(prefix.as_path()),
+        )
+        .await;
+        assert_eq!(response.status, 400);
+    }
+
+    #[tokio::test]
     async fn ready_endpoint_returns_200() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -1760,12 +2076,14 @@ mod tests {
             .expect("json should encode"),
         };
 
-        let response = handle_request(
+        let response = handle_request_with_admin(
             &storage,
             &engine,
             request,
             start_time(),
             TimestampPrecision::Milliseconds,
+            true,
+            None,
         )
         .await;
         assert_eq!(response.status, 200);
@@ -1807,12 +2125,14 @@ mod tests {
             .expect("json should encode"),
         };
 
-        let response = handle_request(
+        let response = handle_request_with_admin(
             &storage,
             &engine,
             request,
             start_time(),
             TimestampPrecision::Milliseconds,
+            true,
+            None,
         )
         .await;
         assert_eq!(response.status, 200);
@@ -1869,6 +2189,27 @@ test_metric{job="test2"} 99 1700000000000
         assert_eq!(points[0].value.as_f64(), Some(42.0));
     }
 
+    #[test]
+    fn parse_prom_labels_supports_escaped_values() {
+        let labels = parse_prom_labels(r#"job="api,west",path="a\\b",quote="x\"y",nl="line\n2""#)
+            .expect("labels should parse");
+
+        assert_eq!(labels[0], Label::new("job", "api,west"));
+        assert_eq!(labels[1], Label::new("path", r#"a\b"#));
+        assert_eq!(labels[2], Label::new("quote", "x\"y"));
+        assert_eq!(labels[3], Label::new("nl", "line\n2"));
+    }
+
+    #[test]
+    fn parse_prometheus_text_handles_quoted_closing_brace() {
+        let rows = parse_prometheus_text(r#"metric{job="a}b",path="c,d"} 1 1000"#, 0)
+            .expect("text should parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metric(), "metric");
+        assert!(rows[0].labels().contains(&Label::new("job", "a}b")));
+        assert!(rows[0].labels().contains(&Label::new("path", "c,d")));
+    }
+
     #[tokio::test]
     async fn unknown_route_returns_404() {
         let storage = make_storage();
@@ -1904,12 +2245,14 @@ test_metric{job="test2"} 99 1700000000000
             body: Vec::new(),
         };
 
-        let response = handle_request(
+        let response = handle_request_with_admin(
             &storage,
             &engine,
             request,
             start_time(),
             TimestampPrecision::Milliseconds,
+            true,
+            None,
         )
         .await;
         assert_eq!(response.status, 501);

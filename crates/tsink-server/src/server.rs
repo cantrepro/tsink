@@ -1,6 +1,6 @@
 use crate::handlers;
 use crate::http::{read_http_request, text_response, write_http_response, HttpResponse};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,6 +29,8 @@ pub struct ServerConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auth_token: Option<String>,
+    pub admin_api_enabled: bool,
+    pub admin_path_prefix: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -47,11 +49,16 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             auth_token: None,
+            admin_api_enabled: false,
+            admin_path_prefix: None,
         }
     }
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<(), String> {
+    validate_runtime_config(&config)?;
+    let admin_path_prefix = resolve_admin_path_prefix(config.admin_path_prefix.as_deref())?;
+
     let storage =
         build_storage(&config).map_err(|err| format!("failed to build storage: {err}"))?;
 
@@ -66,6 +73,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let server_start = Instant::now();
     let auth_token = config.auth_token.clone();
     let precision = config.timestamp_precision;
+    let admin_api_enabled = config.admin_api_enabled;
     tokio::spawn(async move {
         if let Err(err) = wait_for_shutdown_signal().await {
             eprintln!("signal handler error: {err}");
@@ -110,6 +118,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         let storage = Arc::clone(&storage);
         let tls_acceptor = tls_acceptor.clone();
         let auth_token = auth_token.clone();
+        let admin_path_prefix = admin_path_prefix.clone();
         let active = Arc::clone(&active_connections);
 
         active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -126,6 +135,8 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
                 precision,
                 tls_acceptor.as_ref(),
                 auth_token.as_deref(),
+                admin_api_enabled,
+                admin_path_prefix.as_deref(),
                 &mut shutdown_rx,
             )
             .await;
@@ -147,6 +158,40 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let _ = tokio::task::spawn_blocking(move || storage_clone.close()).await;
 
     Ok(())
+}
+
+fn validate_runtime_config(config: &ServerConfig) -> Result<(), String> {
+    let has_auth = config
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    if config.admin_api_enabled && !has_auth {
+        return Err("--enable-admin-api requires --auth-token".to_string());
+    }
+    if config.admin_path_prefix.is_some() && !config.admin_api_enabled {
+        return Err("--admin-path-prefix requires --enable-admin-api".to_string());
+    }
+    Ok(())
+}
+
+fn resolve_admin_path_prefix(path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    let canonical = std::fs::canonicalize(path).map_err(|err| {
+        format!(
+            "failed to resolve admin path prefix {}: {err}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "admin path prefix must be a directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 async fn shutdown_rx_changed(mut rx: watch::Receiver<bool>) {
@@ -225,6 +270,8 @@ async fn handle_connection(
     precision: TimestampPrecision,
     tls_acceptor: Option<&tokio_rustls::TlsAcceptor>,
     auth_token: Option<&str>,
+    admin_api_enabled: bool,
+    admin_path_prefix: Option<&Path>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     let sock_ref = socket2::SockRef::from(&stream);
@@ -245,6 +292,8 @@ async fn handle_connection(
             server_start,
             precision,
             auth_token,
+            admin_api_enabled,
+            admin_path_prefix,
             shutdown_rx,
         )
         .await
@@ -258,6 +307,8 @@ async fn handle_connection(
             server_start,
             precision,
             auth_token,
+            admin_api_enabled,
+            admin_path_prefix,
             shutdown_rx,
         )
         .await
@@ -273,15 +324,18 @@ async fn handle_http_loop<R, W>(
     server_start: Instant,
     precision: TimestampPrecision,
     auth_token: Option<&str>,
+    admin_api_enabled: bool,
+    admin_path_prefix: Option<&Path>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut read_buffer = Vec::with_capacity(8 * 1024);
     loop {
         let request = tokio::select! {
-            result = tokio::time::timeout(KEEP_ALIVE_TIMEOUT, read_http_request(reader)) => {
+            result = tokio::time::timeout(KEEP_ALIVE_TIMEOUT, read_http_request(reader, &mut read_buffer)) => {
                 match result {
                     Ok(Ok(req)) => req,
                     Ok(Err(err)) => {
@@ -321,8 +375,16 @@ where
             .header("connection")
             .is_some_and(|v| v.eq_ignore_ascii_case("close"));
 
-        let response =
-            handlers::handle_request(storage, engine, request, server_start, precision).await;
+        let response = handlers::handle_request_with_admin(
+            storage,
+            engine,
+            request,
+            server_start,
+            precision,
+            admin_api_enabled,
+            admin_path_prefix,
+        )
+        .await;
 
         let response = if close {
             response.with_header("Connection", "close")
@@ -399,6 +461,8 @@ mod tests {
                 Instant::now(),
                 TimestampPrecision::Milliseconds,
                 auth_token_owned.as_deref(),
+                false,
+                None,
                 &mut shutdown_rx,
             )
             .await;
@@ -461,5 +525,18 @@ mod tests {
         )
         .await;
         assert_eq!(extract_status_code(&response), 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_api_requires_auth_token() {
+        let config = ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            admin_api_enabled: true,
+            ..ServerConfig::default()
+        };
+        let err = run_server(config)
+            .await
+            .expect_err("admin API without auth token should fail");
+        assert!(err.contains("--enable-admin-api requires --auth-token"));
     }
 }

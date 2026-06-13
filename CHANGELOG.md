@@ -29,6 +29,13 @@ tsink-server
 - Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges
 - Deepen `/api/v1/status/tsdb` response with nested internal observability sections (`wal`, `flush`, `compaction`, `query`)
 - Add admin snapshot/restore endpoints (`POST /api/v1/admin/snapshot`, `POST /api/v1/admin/restore`)
+- Bound Snappy request decompression to `MAX_BODY_BYTES` to prevent oversized decoded payload OOMs
+- Reject non-finite retention durations and use checked `Duration` conversion to avoid CLI panics
+- Preserve unread socket bytes between requests so HTTP keep-alive pipelining parses correctly
+- Disable admin endpoints by default; require `--enable-admin-api` plus `--auth-token` to enable them
+- Add optional `--admin-path-prefix` restriction so snapshot/restore paths stay within an allowed root
+- Return HTTP 500 from `/api/v1/status/tsdb` when its background status task fails instead of defaulting values
+- Deduplicate `/api/v1/series` results across overlapping `match[]` selectors and harden Prometheus text label parsing for quotes/escapes
 
 0.8.1
 general
