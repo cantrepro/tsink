@@ -99,10 +99,94 @@ pub fn default_workers_limit() -> usize {
 mod tests {
     use super::*;
 
+    #[allow(unused_unsafe)]
+    fn set_env_var(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(v) => set_env_var(key, v),
+                None => remove_env_var(key),
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(v) => set_env_var(self.key, v),
+                None => remove_env_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_available_cpus() {
         let cpus = available_cpus();
         assert!(cpus > 0);
         assert!(cpus <= 1024); // Reasonable upper bound
+    }
+
+    #[test]
+    fn parse_cpu_override_env_accepts_positive_usize() {
+        let key = "TSINK_TEST_CPU_OVERRIDE_VALID";
+        let _guard = EnvVarGuard::new(key, Some("7"));
+
+        assert_eq!(parse_cpu_override_env(key), Some(7));
+    }
+
+    #[test]
+    fn parse_cpu_override_env_rejects_zero() {
+        let key = "TSINK_TEST_CPU_OVERRIDE_ZERO";
+        let _guard = EnvVarGuard::new(key, Some("0"));
+
+        assert_eq!(parse_cpu_override_env(key), None);
+    }
+
+    #[test]
+    fn parse_cpu_override_env_rejects_non_numeric_values() {
+        let key = "TSINK_TEST_CPU_OVERRIDE_INVALID";
+        let _guard = EnvVarGuard::new(key, Some("not-a-number"));
+
+        assert_eq!(parse_cpu_override_env(key), None);
+    }
+
+    #[test]
+    fn parse_cpu_override_env_returns_none_when_missing() {
+        let key = "TSINK_TEST_CPU_OVERRIDE_MISSING";
+        let _guard = EnvVarGuard::new(key, None);
+
+        assert_eq!(parse_cpu_override_env(key), None);
+    }
+
+    #[test]
+    fn parse_cpu_override_env_rejects_values_larger_than_usize() {
+        let key = "TSINK_TEST_CPU_OVERRIDE_OVERFLOW";
+        let _guard = EnvVarGuard::new(key, Some("18446744073709551616"));
+
+        assert_eq!(parse_cpu_override_env(key), None);
+    }
+
+    #[test]
+    fn default_workers_limit_uses_available_cpu_count() {
+        assert_eq!(default_workers_limit(), available_cpus());
     }
 }

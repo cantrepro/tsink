@@ -161,6 +161,8 @@ impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
 mod tests {
     use super::TsinkError;
     use crossbeam_channel::RecvTimeoutError;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn recv_timeout_error_timeout_maps_to_channel_timeout() {
@@ -172,5 +174,39 @@ mod tests {
     fn recv_timeout_error_disconnected_maps_to_channel_receive() {
         let err: TsinkError = RecvTimeoutError::Disconnected.into();
         assert!(matches!(err, TsinkError::ChannelReceive { .. }));
+    }
+
+    #[test]
+    fn recv_error_maps_to_channel_receive() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(tx);
+
+        let err: TsinkError = rx.recv().unwrap_err().into();
+        assert!(matches!(err, TsinkError::ChannelReceive { .. }));
+    }
+
+    #[test]
+    fn send_error_maps_to_channel_send() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(rx);
+
+        let err: TsinkError = tx.send(1).unwrap_err().into();
+        assert!(matches!(err, TsinkError::ChannelSend { .. }));
+    }
+
+    #[test]
+    fn poison_error_maps_to_lock_poisoned() {
+        let shared = Arc::new(Mutex::new(1usize));
+        let shared_for_thread = Arc::clone(&shared);
+
+        let _ = thread::spawn(move || {
+            let _guard = shared_for_thread.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        })
+        .join();
+
+        let poison = shared.lock().unwrap_err();
+        let err: TsinkError = poison.into();
+        assert!(matches!(err, TsinkError::LockPoisoned { .. }));
     }
 }

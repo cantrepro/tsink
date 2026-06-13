@@ -177,6 +177,10 @@ impl<'a> Drop for SemaphoreGuard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_semaphore() {
@@ -192,5 +196,99 @@ mod tests {
 
         drop(_guard1);
         assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[test]
+    fn semaphore_with_zero_permits_clamps_to_one() {
+        let sem = Semaphore::new(0);
+        assert_eq!(sem.capacity(), 1);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[test]
+    fn try_acquire_for_returns_timeout_when_no_permits_are_available() {
+        let sem = Semaphore::new(1);
+        let _held = sem.acquire();
+
+        let result = sem.try_acquire_for(Duration::from_millis(10));
+        assert!(matches!(
+            result,
+            Err(TsinkError::WriteTimeout { workers: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn try_acquire_for_zero_timeout_behaves_like_non_blocking_try() {
+        let sem = Semaphore::new(1);
+        let _held = sem.acquire();
+
+        let result = sem.try_acquire_for(Duration::ZERO);
+        assert!(matches!(
+            result,
+            Err(TsinkError::WriteTimeout {
+                timeout_ms: 0,
+                workers: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn try_acquire_for_succeeds_when_permit_is_released_before_deadline() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            thread::spawn(move || sem.try_acquire_for(Duration::from_millis(200)).is_ok())
+        };
+
+        thread::sleep(Duration::from_millis(25));
+        drop(held);
+
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn acquire_all_returns_all_permits_and_releases_on_drop() {
+        let sem = Semaphore::new(3);
+        let guards = sem.acquire_all(Duration::from_millis(20)).unwrap();
+
+        assert_eq!(guards.len(), 3);
+        assert_eq!(sem.available_permits(), 0);
+
+        drop(guards);
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[test]
+    fn acquire_blocks_until_permit_is_released() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            thread::spawn(move || {
+                let _guard = sem.acquire();
+                tx.send(()).unwrap();
+            })
+        };
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(held);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_ok());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn acquire_all_times_out_if_any_permit_remains_unavailable() {
+        let sem = Semaphore::new(2);
+        let _held = sem.acquire();
+
+        let result = sem.acquire_all(Duration::from_millis(10));
+        assert!(matches!(
+            result,
+            Err(TsinkError::WriteTimeout { workers: 2, .. })
+        ));
     }
 }
