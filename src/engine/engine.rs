@@ -1226,8 +1226,8 @@ impl ChunkStorage {
             return Ok(());
         };
 
-        let frames = wal.replay_frames_after(replay_highwater)?;
-        for frame in frames {
+        let mut stream = wal.replay_stream_after(replay_highwater)?;
+        while let Some(frame) = stream.next_frame()? {
             match frame {
                 ReplayFrame::SeriesDefinition(definition) => {
                     self.registry.write().register_series_with_id(
@@ -1812,9 +1812,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
                 builder.wal_sync_mode(),
                 builder.wal_buffer_size(),
             )?;
-            if replay_highwater.segment == 0 {
-                wal.ensure_min_next_seq(replay_highwater.frame.saturating_add(1));
-            }
+            wal.ensure_min_highwater(replay_highwater)?;
             Some(wal)
         } else {
             clear_wal_dir_if_present(&wal_path)?;

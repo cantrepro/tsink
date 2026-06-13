@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ use crate::wal::WalSyncMode;
 use crate::{Label, Result, TsinkError};
 
 const WAL_FILE_NAME: &str = "wal.log";
+const WAL_SEGMENT_FILE_PREFIX: &str = "wal-";
+const WAL_SEGMENT_FILE_SUFFIX: &str = ".log";
 const DEFAULT_WAL_BUFFER_SIZE: usize = 4096;
+const DEFAULT_WAL_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const FRAME_MAGIC: [u8; 4] = *b"TSFR";
 const FRAME_HEADER_LEN: usize = 24;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -98,12 +102,193 @@ pub enum ReplayFrame {
     Samples(Vec<SamplesBatchFrame>),
 }
 
-pub struct FramedWal {
+#[derive(Debug, Clone)]
+struct WalSegmentFile {
+    id: u64,
     path: PathBuf,
+}
+
+pub struct WalReplayStream {
+    segments: Vec<WalSegmentFile>,
+    replay_highwater: WalHighWatermark,
+    next_segment_idx: usize,
+    current_segment_id: u64,
+    current_reader: Option<BufReader<File>>,
+    halted: bool,
+}
+
+impl WalReplayStream {
+    fn new(segments: Vec<WalSegmentFile>, replay_highwater: WalHighWatermark) -> Self {
+        Self {
+            segments,
+            replay_highwater,
+            next_segment_idx: 0,
+            current_segment_id: 0,
+            current_reader: None,
+            halted: false,
+        }
+    }
+
+    pub fn next_frame(&mut self) -> Result<Option<ReplayFrame>> {
+        if self.halted {
+            return Ok(None);
+        }
+
+        loop {
+            if self.current_reader.is_none() && !self.open_next_segment()? {
+                return Ok(None);
+            }
+
+            let segment_id = self.current_segment_id;
+            let reader = self.current_reader.as_mut().expect("reader set above");
+
+            let header = match read_header(reader)? {
+                HeaderRead::Eof => {
+                    self.current_reader = None;
+                    continue;
+                }
+                HeaderRead::Truncated => {
+                    warn!(
+                        segment = segment_id,
+                        "Stopping WAL replay at truncated frame header"
+                    );
+                    self.halted = true;
+                    return Ok(None);
+                }
+                HeaderRead::FrameHeader(header) => header,
+            };
+
+            if header[0..4] != FRAME_MAGIC {
+                warn!(
+                    segment = segment_id,
+                    "Stopping WAL replay at frame with magic mismatch"
+                );
+                self.halted = true;
+                return Ok(None);
+            }
+
+            let frame_type = header[4];
+            let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
+            let payload_len =
+                u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
+            let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
+
+            if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+                warn!(
+                    segment = segment_id,
+                    frame = frame_seq,
+                    payload_len,
+                    "Stopping WAL replay due to oversized frame payload"
+                );
+                self.halted = true;
+                return Ok(None);
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            if let Err(e) = reader.read_exact(&mut payload) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    warn!(
+                        segment = segment_id,
+                        frame = frame_seq,
+                        "Stopping WAL replay at truncated frame payload"
+                    );
+                    self.halted = true;
+                    return Ok(None);
+                }
+                return Err(e.into());
+            }
+
+            if checksum32(&payload) != expected_crc32 {
+                warn!(
+                    segment = segment_id,
+                    frame = frame_seq,
+                    "Stopping WAL replay at frame with checksum mismatch"
+                );
+                self.halted = true;
+                return Ok(None);
+            }
+
+            let frame_pos = WalHighWatermark {
+                segment: segment_id,
+                frame: frame_seq,
+            };
+            if frame_pos <= self.replay_highwater {
+                continue;
+            }
+
+            let frame = match frame_type {
+                FRAME_TYPE_SERIES_DEF => {
+                    ReplayFrame::SeriesDefinition(decode_series_definition(&payload)?)
+                }
+                FRAME_TYPE_SAMPLES => ReplayFrame::Samples(decode_samples_payload(&payload)?),
+                other => {
+                    warn!(
+                        segment = segment_id,
+                        frame = frame_seq,
+                        frame_type = other,
+                        "Stopping WAL replay at unknown frame type"
+                    );
+                    self.halted = true;
+                    return Ok(None);
+                }
+            };
+
+            return Ok(Some(frame));
+        }
+    }
+
+    fn open_next_segment(&mut self) -> Result<bool> {
+        while let Some(segment) = self.segments.get(self.next_segment_idx) {
+            self.next_segment_idx += 1;
+
+            let file = match OpenOptions::new().read(true).open(&segment.path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+
+            self.current_segment_id = segment.id;
+            self.current_reader = Some(BufReader::new(file));
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+}
+
+enum HeaderRead {
+    Eof,
+    Truncated,
+    FrameHeader([u8; FRAME_HEADER_LEN]),
+}
+
+fn read_header(reader: &mut BufReader<File>) -> Result<HeaderRead> {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    let mut offset = 0usize;
+    while offset < FRAME_HEADER_LEN {
+        match reader.read(&mut header[offset..]) {
+            Ok(0) if offset == 0 => return Ok(HeaderRead::Eof),
+            Ok(0) => return Ok(HeaderRead::Truncated),
+            Ok(read) => {
+                offset += read;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(HeaderRead::FrameHeader(header))
+}
+
+pub struct FramedWal {
+    dir: PathBuf,
+    path: Mutex<PathBuf>,
     writer: Mutex<BufWriter<File>>,
+    active_segment: AtomicU64,
     next_seq: AtomicU64,
+    last_highwater: Mutex<WalHighWatermark>,
     sync_mode: WalSyncMode,
     last_sync: Mutex<Instant>,
+    segment_max_bytes: u64,
 }
 
 impl FramedWal {
@@ -116,30 +301,66 @@ impl FramedWal {
         sync_mode: WalSyncMode,
         buffer_size: usize,
     ) -> Result<Self> {
+        Self::open_with_options(dir, sync_mode, buffer_size, DEFAULT_WAL_SEGMENT_MAX_BYTES)
+    }
+
+    fn open_with_options(
+        dir: impl AsRef<Path>,
+        sync_mode: WalSyncMode,
+        buffer_size: usize,
+        segment_max_bytes: u64,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
-        let path = dir.join(WAL_FILE_NAME);
-        if !path.exists() {
+        let mut segments = collect_wal_segment_files(&dir)?;
+        if segments.is_empty() {
+            let path = segment_path(&dir, 0);
             File::create(&path)?;
+            segments.push(WalSegmentFile { id: 0, path });
         }
 
-        let last_seq = scan_last_seq(&path)?;
+        let mut active = segments.last().cloned().ok_or_else(|| TsinkError::Wal {
+            operation: "open".to_string(),
+            details: "missing WAL segment after initialization".to_string(),
+        })?;
+        let mut active_last_seq = 0u64;
+        let mut last_highwater = WalHighWatermark::default();
+        for segment in &segments {
+            let last_seq = scan_last_seq(&segment.path)?;
+            if segment.id == active.id {
+                active_last_seq = last_seq;
+                active = segment.clone();
+            }
+            if last_seq > 0 {
+                last_highwater = last_highwater.max(WalHighWatermark {
+                    segment: segment.id,
+                    frame: last_seq,
+                });
+            }
+        }
 
-        let writer_file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let writer_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active.path)?;
         let writer = BufWriter::with_capacity(buffer_size.max(1), writer_file);
 
         Ok(Self {
-            path,
+            dir,
+            path: Mutex::new(active.path),
             writer: Mutex::new(writer),
-            next_seq: AtomicU64::new(last_seq.saturating_add(1)),
+            active_segment: AtomicU64::new(active.id),
+            next_seq: AtomicU64::new(active_last_seq.saturating_add(1)),
+            last_highwater: Mutex::new(last_highwater),
             sync_mode,
             last_sync: Mutex::new(Instant::now()),
+            segment_max_bytes: segment_max_bytes.max(1),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn path(&self) -> PathBuf {
+        self.path.lock().clone()
     }
 
     pub fn append_series_definition(&self, definition: &SeriesDefinitionFrame) -> Result<()> {
@@ -164,21 +385,56 @@ impl FramedWal {
         &self,
         replay_highwater: WalHighWatermark,
     ) -> Result<Vec<ReplayFrame>> {
-        replay_from_path(&self.path, replay_highwater)
+        let mut stream = self.replay_stream_after(replay_highwater)?;
+        let mut out = Vec::new();
+        while let Some(frame) = stream.next_frame()? {
+            out.push(frame);
+        }
+        Ok(out)
+    }
+
+    pub fn replay_stream_after(
+        &self,
+        replay_highwater: WalHighWatermark,
+    ) -> Result<WalReplayStream> {
+        let segments = collect_wal_segment_files(&self.dir)?;
+        Ok(WalReplayStream::new(segments, replay_highwater))
     }
 
     pub fn current_highwater(&self) -> WalHighWatermark {
-        WalHighWatermark {
-            segment: 0,
-            frame: self.next_seq.load(Ordering::SeqCst).saturating_sub(1),
-        }
+        *self.last_highwater.lock()
     }
 
     pub fn reset(&self) -> Result<()> {
         let mut writer = self.writer.lock();
         writer.flush()?;
-        writer.get_mut().set_len(0)?;
         writer.get_mut().sync_data()?;
+        let active_path = self.path.lock().clone();
+        let replacement = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&active_path)?;
+        let capacity = writer.capacity();
+        let old_writer = std::mem::replace(
+            &mut *writer,
+            BufWriter::with_capacity(capacity, replacement),
+        );
+        let _ = old_writer.into_parts();
+        drop(writer);
+
+        for segment in collect_wal_segment_files(&self.dir)? {
+            if segment.path == active_path {
+                continue;
+            }
+
+            match fs::remove_file(&segment.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
         *self.last_sync.lock() = Instant::now();
         Ok(())
     }
@@ -196,6 +452,54 @@ impl FramedWal {
                 Err(actual) => current = actual,
             }
         }
+
+        if min_next_seq == 0 {
+            return;
+        }
+
+        let mut last_highwater = self.last_highwater.lock();
+        let floor = WalHighWatermark {
+            segment: self.active_segment.load(Ordering::SeqCst),
+            frame: min_next_seq.saturating_sub(1),
+        };
+        if *last_highwater < floor {
+            *last_highwater = floor;
+        }
+    }
+
+    pub fn ensure_min_highwater(&self, min_highwater: WalHighWatermark) -> Result<()> {
+        let mut writer = self.writer.lock();
+        let mut active_segment = self.active_segment.load(Ordering::SeqCst);
+        let mut next_seq = self.next_seq.load(Ordering::SeqCst);
+
+        if active_segment < min_highwater.segment {
+            let path = segment_path(&self.dir, min_highwater.segment);
+            let replacement = OpenOptions::new().create(true).append(true).open(&path)?;
+            let capacity = writer.capacity();
+            let old_writer = std::mem::replace(
+                &mut *writer,
+                BufWriter::with_capacity(capacity, replacement),
+            );
+            let _ = old_writer.into_parts();
+
+            active_segment = min_highwater.segment;
+            next_seq = 1;
+            self.active_segment.store(active_segment, Ordering::SeqCst);
+            *self.path.lock() = path;
+        }
+
+        if active_segment == min_highwater.segment && next_seq <= min_highwater.frame {
+            next_seq = min_highwater.frame.saturating_add(1);
+        }
+
+        self.next_seq.store(next_seq, Ordering::SeqCst);
+
+        let mut last_highwater = self.last_highwater.lock();
+        if *last_highwater < min_highwater {
+            *last_highwater = min_highwater;
+        }
+
+        Ok(())
     }
 
     fn append_frame(&self, frame_type: u8, payload: &[u8]) -> Result<()> {
@@ -211,6 +515,7 @@ impl FramedWal {
         let mut writer = self.writer.lock();
         let frame_start_len = writer.get_ref().metadata()?.len();
         let frame_seq = self.next_seq.load(Ordering::SeqCst);
+        let active_segment = self.active_segment.load(Ordering::SeqCst);
 
         let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
         header.extend_from_slice(&FRAME_MAGIC);
@@ -251,6 +556,11 @@ impl FramedWal {
 
         self.next_seq
             .store(frame_seq.saturating_add(1), Ordering::SeqCst);
+        *self.last_highwater.lock() = WalHighWatermark {
+            segment: active_segment,
+            frame: frame_seq,
+        };
+        self.rotate_if_needed(&mut writer)?;
 
         Ok(())
     }
@@ -263,13 +573,39 @@ impl FramedWal {
         writer.get_mut().set_len(frame_start_len)?;
         writer.get_mut().sync_data()?;
 
+        let active_path = self.path.lock().clone();
         let replacement = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?;
+            .open(&active_path)?;
         let capacity = writer.capacity();
         let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));
         let _ = old_writer.into_parts();
+
+        Ok(())
+    }
+
+    fn rotate_if_needed(&self, writer: &mut BufWriter<File>) -> Result<()> {
+        if writer.get_ref().metadata()?.len() < self.segment_max_bytes {
+            return Ok(());
+        }
+
+        writer.get_mut().sync_data()?;
+        *self.last_sync.lock() = Instant::now();
+
+        let next_segment = self.active_segment.load(Ordering::SeqCst).saturating_add(1);
+        let next_path = segment_path(&self.dir, next_segment);
+        let replacement = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&next_path)?;
+        let capacity = writer.capacity();
+        let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));
+        let _ = old_writer.into_parts();
+
+        self.active_segment.store(next_segment, Ordering::SeqCst);
+        self.next_seq.store(1, Ordering::SeqCst);
+        *self.path.lock() = next_path;
 
         Ok(())
     }
@@ -300,79 +636,103 @@ fn merge_encoded_payload(ts_payload: &[u8], value_payload: &[u8]) -> Vec<u8> {
     payload
 }
 
+#[cfg(test)]
 fn replay_from_path(path: &Path, replay_highwater: WalHighWatermark) -> Result<Vec<ReplayFrame>> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    let mut reader = BufReader::new(file);
+    replay_from_segments(
+        vec![WalSegmentFile {
+            id: 0,
+            path: path.to_path_buf(),
+        }],
+        replay_highwater,
+    )
+}
+
+#[cfg(test)]
+fn replay_from_segments(
+    segments: Vec<WalSegmentFile>,
+    replay_highwater: WalHighWatermark,
+) -> Result<Vec<ReplayFrame>> {
+    let mut stream = WalReplayStream::new(segments, replay_highwater);
     let mut out = Vec::new();
-
-    loop {
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        match reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-
-        if header[0..4] != FRAME_MAGIC {
-            warn!("Stopping WAL replay at frame with magic mismatch");
-            break;
-        }
-
-        let frame_type = header[4];
-        let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
-        let payload_len =
-            u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
-        let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
-
-        if payload_len > MAX_FRAME_PAYLOAD_BYTES {
-            warn!(
-                payload_len,
-                "Stopping WAL replay due to oversized frame payload"
-            );
-            break;
-        }
-
-        let mut payload = vec![0u8; payload_len];
-        match reader.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                warn!("Stopping WAL replay at truncated frame");
-                break;
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        if checksum32(&payload) != expected_crc32 {
-            warn!("Stopping WAL replay at frame with checksum mismatch");
-            break;
-        }
-
-        let frame_pos = WalHighWatermark {
-            segment: 0,
-            frame: frame_seq,
-        };
-        if frame_pos <= replay_highwater {
-            continue;
-        }
-
-        let frame = match frame_type {
-            FRAME_TYPE_SERIES_DEF => {
-                ReplayFrame::SeriesDefinition(decode_series_definition(&payload)?)
-            }
-            FRAME_TYPE_SAMPLES => ReplayFrame::Samples(decode_samples_payload(&payload)?),
-            other => {
-                warn!(
-                    frame_type = other,
-                    "Stopping WAL replay at unknown frame type"
-                );
-                break;
-            }
-        };
-
+    while let Some(frame) = stream.next_frame()? {
         out.push(frame);
     }
 
     Ok(out)
+}
+
+fn collect_wal_segment_files(dir: &Path) -> Result<Vec<WalSegmentFile>> {
+    let mut deduped = BTreeMap::<u64, WalSegmentFile>::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let segment_id = if file_name == WAL_FILE_NAME {
+            Some(0)
+        } else {
+            parse_segment_file_name(&file_name)
+        };
+
+        let Some(segment_id) = segment_id else {
+            continue;
+        };
+        let path = entry.path();
+        let is_segment_file = file_name.starts_with(WAL_SEGMENT_FILE_PREFIX);
+        deduped
+            .entry(segment_id)
+            .and_modify(|existing| {
+                let existing_name = existing
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if is_segment_file || existing_name == WAL_FILE_NAME {
+                    *existing = WalSegmentFile {
+                        id: segment_id,
+                        path: path.clone(),
+                    };
+                }
+            })
+            .or_insert(WalSegmentFile {
+                id: segment_id,
+                path,
+            });
+    }
+
+    Ok(deduped.into_values().collect())
+}
+
+fn parse_segment_file_name(file_name: &str) -> Option<u64> {
+    if !file_name.starts_with(WAL_SEGMENT_FILE_PREFIX)
+        || !file_name.ends_with(WAL_SEGMENT_FILE_SUFFIX)
+    {
+        return None;
+    }
+
+    let hex_start = WAL_SEGMENT_FILE_PREFIX.len();
+    let hex_end = file_name
+        .len()
+        .saturating_sub(WAL_SEGMENT_FILE_SUFFIX.len());
+    if hex_end <= hex_start {
+        return None;
+    }
+
+    let hex = &file_name[hex_start..hex_end];
+    if hex.len() != 16 {
+        return None;
+    }
+
+    u64::from_str_radix(hex, 16).ok()
+}
+
+fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {
+    dir.join(format!(
+        "{WAL_SEGMENT_FILE_PREFIX}{segment_id:016x}{WAL_SEGMENT_FILE_SUFFIX}"
+    ))
 }
 
 fn scan_last_seq(path: &Path) -> Result<u64> {
@@ -653,9 +1013,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        checksum32, encode_series_definition, replay_from_path, scan_last_seq, FramedWal,
-        ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame, FRAME_HEADER_LEN, FRAME_MAGIC,
-        FRAME_TYPE_SERIES_DEF, WAL_FILE_NAME,
+        checksum32, collect_wal_segment_files, encode_series_definition, replay_from_path,
+        scan_last_seq, FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame,
+        DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF,
+        WAL_FILE_NAME,
     };
     use crate::engine::chunk::{ChunkPoint, ValueLane};
     use crate::engine::segment::WalHighWatermark;
@@ -838,6 +1199,90 @@ mod tests {
     }
 
     #[test]
+    fn wal_rotates_segments_and_replays_across_them() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open_with_options(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            (FRAME_HEADER_LEN as u64) + 40,
+        )
+        .unwrap();
+
+        for series_id in 0..10 {
+            wal.append_series_definition(&SeriesDefinitionFrame {
+                series_id,
+                metric: format!("cpu_{series_id}"),
+                labels: vec![Label::new("host", "a")],
+            })
+            .unwrap();
+        }
+
+        let segments = collect_wal_segment_files(temp_dir.path()).unwrap();
+        assert!(
+            segments.len() >= 2,
+            "expected WAL rotation, got {segments:?}"
+        );
+
+        let replay = wal.replay_frames().unwrap();
+        assert_eq!(replay.len(), 10);
+    }
+
+    #[test]
+    fn replay_stream_after_skips_checkpointed_frames() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 2,
+            metric: "mem".to_string(),
+            labels: vec![Label::new("host", "b")],
+        })
+        .unwrap();
+
+        let mut stream = wal
+            .replay_stream_after(WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            })
+            .unwrap();
+        let first = stream.next_frame().unwrap();
+        assert!(matches!(first, Some(ReplayFrame::SeriesDefinition(_))));
+        assert!(stream.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn ensure_min_highwater_moves_active_segment_floor() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.ensure_min_highwater(WalHighWatermark {
+            segment: 3,
+            frame: 8,
+        })
+        .unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 7,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+
+        assert_eq!(
+            wal.current_highwater(),
+            WalHighWatermark {
+                segment: 3,
+                frame: 9
+            }
+        );
+    }
+
+    #[test]
     fn replay_stops_at_truncated_tail_frame() {
         let temp_dir = TempDir::new().unwrap();
         let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
@@ -855,7 +1300,7 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let replay = replay_from_path(wal.path(), WalHighWatermark::default()).unwrap();
+        let replay = replay_from_path(&wal.path(), WalHighWatermark::default()).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
     }
@@ -880,7 +1325,7 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let replay = replay_from_path(wal.path(), WalHighWatermark::default()).unwrap();
+        let replay = replay_from_path(&wal.path(), WalHighWatermark::default()).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
     }
@@ -972,11 +1417,18 @@ mod tests {
 
         let writer_file = OpenOptions::new().read(true).open(&wal_path).unwrap();
         let wal = FramedWal {
-            path: PathBuf::from(&wal_path),
+            dir: temp_dir.path().to_path_buf(),
+            path: parking_lot::Mutex::new(PathBuf::from(&wal_path)),
             writer: parking_lot::Mutex::new(std::io::BufWriter::new(writer_file)),
+            active_segment: AtomicU64::new(0),
             next_seq: AtomicU64::new(7),
+            last_highwater: parking_lot::Mutex::new(WalHighWatermark {
+                segment: 0,
+                frame: 6,
+            }),
             sync_mode: WalSyncMode::PerAppend,
             last_sync: parking_lot::Mutex::new(Instant::now()),
+            segment_max_bytes: DEFAULT_WAL_SEGMENT_MAX_BYTES,
         };
 
         let err = wal.append_series_definition(&SeriesDefinitionFrame {

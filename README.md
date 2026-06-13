@@ -312,7 +312,9 @@ When persistence is enabled, tsink writes separate numeric/blob lane segment fam
       L1/...
       L2/...
   wal/
-    wal.log
+    wal-0000000000000000.log
+    wal-0000000000000001.log
+    ...
 ```
 
 Each segment directory contains:
