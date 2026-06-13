@@ -180,7 +180,7 @@ impl FramedWal {
         let payload_crc32 = checksum32(payload);
 
         let mut writer = self.writer.lock();
-        let frame_seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let frame_seq = self.next_seq.load(Ordering::SeqCst);
 
         let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
         header.extend_from_slice(&FRAME_MAGIC);
@@ -207,6 +207,9 @@ impl FramedWal {
                 }
             }
         }
+
+        self.next_seq
+            .store(frame_seq.saturating_add(1), Ordering::SeqCst);
 
         Ok(())
     }
@@ -324,6 +327,7 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
         let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
         let payload_len =
             u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
+        let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
 
         if payload_len > MAX_FRAME_PAYLOAD_BYTES {
             break;
@@ -331,6 +335,10 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
 
         let mut payload = vec![0u8; payload_len];
         if reader.read_exact(&mut payload).is_err() {
+            break;
+        }
+
+        if checksum32(&payload) != expected_crc32 {
             break;
         }
 
@@ -582,6 +590,9 @@ fn checksum32(bytes: &[u8]) -> u32 {
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use tempfile::TempDir;
 
@@ -766,5 +777,72 @@ mod tests {
         file.flush().unwrap();
 
         assert_eq!(scan_last_seq(&wal_path).unwrap(), 2);
+    }
+
+    #[test]
+    fn scan_last_seq_stops_at_frame_with_checksum_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join(WAL_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+
+        let payload = encode_series_definition(&SeriesDefinitionFrame {
+            series_id: 42,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+
+        let write_frame = |file: &mut std::fs::File, seq: u64, payload: &[u8], crc32: u32| {
+            let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
+            header.extend_from_slice(&FRAME_MAGIC);
+            header.push(FRAME_TYPE_SERIES_DEF);
+            header.extend_from_slice(&[0u8; 3]);
+            header.extend_from_slice(&seq.to_le_bytes());
+            header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            header.extend_from_slice(&crc32.to_le_bytes());
+            file.write_all(&header).unwrap();
+            file.write_all(payload).unwrap();
+        };
+
+        write_frame(&mut file, 2, &payload, checksum32(&payload));
+        write_frame(
+            &mut file,
+            10_000,
+            &payload,
+            checksum32(&payload).wrapping_add(1),
+        );
+        file.flush().unwrap();
+
+        assert_eq!(scan_last_seq(&wal_path).unwrap(), 2);
+    }
+
+    #[test]
+    fn failed_append_does_not_advance_next_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join(WAL_FILE_NAME);
+        std::fs::File::create(&wal_path).unwrap();
+
+        let writer_file = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        let wal = FramedWal {
+            path: PathBuf::from(&wal_path),
+            writer: parking_lot::Mutex::new(std::io::BufWriter::new(writer_file)),
+            next_seq: AtomicU64::new(7),
+            sync_mode: WalSyncMode::PerAppend,
+            last_sync: parking_lot::Mutex::new(Instant::now()),
+        };
+
+        let err = wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 11,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        });
+
+        assert!(err.is_err());
+        assert_eq!(wal.next_seq.load(Ordering::SeqCst), 7);
     }
 }

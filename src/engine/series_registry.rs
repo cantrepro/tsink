@@ -95,6 +95,40 @@ pub struct SeriesRegistry {
     postings: BTreeMap<LabelPairId, BTreeSet<SeriesId>>,
 }
 
+pub(crate) fn validate_metric(metric: &str) -> Result<()> {
+    if metric.is_empty() {
+        return Err(TsinkError::MetricRequired);
+    }
+    if metric.len() > u16::MAX as usize {
+        return Err(TsinkError::InvalidMetricName(format!(
+            "metric name too long: {} bytes (max {})",
+            metric.len(),
+            u16::MAX as usize
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_labels(labels: &[Label]) -> Result<()> {
+    for label in labels {
+        if !label.is_valid() {
+            return Err(TsinkError::InvalidLabel(
+                "label name and value must be non-empty".to_string(),
+            ));
+        }
+        if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
+            || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
+        {
+            return Err(TsinkError::InvalidLabel(format!(
+                "label name/value must be within limits (name <= {}, value <= {})",
+                crate::label::MAX_LABEL_NAME_LEN,
+                crate::label::MAX_LABEL_VALUE_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl SeriesRegistry {
     pub fn new() -> Self {
         Self {
@@ -108,8 +142,8 @@ impl SeriesRegistry {
         metric: &str,
         labels: &[Label],
     ) -> Result<SeriesResolution> {
-        self.validate_metric(metric)?;
-        self.validate_labels(labels)?;
+        validate_metric(metric)?;
+        validate_labels(labels)?;
 
         let metric_id = self.metric_dict.intern(metric, "metric")?;
         let label_pairs = self.intern_label_pairs(labels)?;
@@ -179,8 +213,8 @@ impl SeriesRegistry {
         metric: &str,
         labels: &[Label],
     ) -> Result<SeriesResolution> {
-        self.validate_metric(metric)?;
-        self.validate_labels(labels)?;
+        validate_metric(metric)?;
+        validate_labels(labels)?;
 
         let metric_id = self.metric_dict.intern(metric, "metric")?;
         let label_pairs = self.intern_label_pairs(labels)?;
@@ -352,40 +386,6 @@ impl SeriesRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
-    }
-
-    fn validate_metric(&self, metric: &str) -> Result<()> {
-        if metric.is_empty() {
-            return Err(TsinkError::MetricRequired);
-        }
-        if metric.len() > u16::MAX as usize {
-            return Err(TsinkError::InvalidMetricName(format!(
-                "metric name too long: {} bytes (max {})",
-                metric.len(),
-                u16::MAX as usize
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_labels(&self, labels: &[Label]) -> Result<()> {
-        for label in labels {
-            if !label.is_valid() {
-                return Err(TsinkError::InvalidLabel(
-                    "label name and value must be non-empty".to_string(),
-                ));
-            }
-            if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
-                || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
-            {
-                return Err(TsinkError::InvalidLabel(format!(
-                    "label name/value must be within limits (name <= {}, value <= {})",
-                    crate::label::MAX_LABEL_NAME_LEN,
-                    crate::label::MAX_LABEL_VALUE_LEN
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn intern_label_pairs(&mut self, labels: &[Label]) -> Result<Vec<LabelPairId>> {

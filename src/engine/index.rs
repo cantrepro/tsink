@@ -38,6 +38,16 @@ impl ChunkIndex {
         });
     }
 
+    fn series_bounds(&self, series_id: SeriesId) -> std::ops::Range<usize> {
+        let start = self
+            .entries
+            .partition_point(|entry| entry.series_id < series_id);
+        let end = self
+            .entries
+            .partition_point(|entry| entry.series_id <= series_id);
+        start..end
+    }
+
     pub fn range_for_series(
         &self,
         series_id: SeriesId,
@@ -48,19 +58,15 @@ impl ChunkIndex {
             return Vec::new();
         }
 
-        self.entries
+        let bounds = self.series_bounds(series_id);
+        self.entries[bounds]
             .iter()
-            .filter(|entry| {
-                entry.series_id == series_id && entry.max_ts >= start && entry.min_ts < end
-            })
+            .filter(|entry| entry.max_ts >= start && entry.min_ts < end)
             .collect()
     }
 
     pub fn entries_for_series(&self, series_id: SeriesId) -> Vec<&ChunkIndexEntry> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.series_id == series_id)
-            .collect()
+        self.entries[self.series_bounds(series_id)].iter().collect()
     }
 }
 

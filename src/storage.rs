@@ -793,6 +793,12 @@ fn aggregate_bucket(
     Ok(aggregated)
 }
 
+fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
+    let rel = ts as i128 - start as i128;
+    let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
+    bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 pub(crate) fn downsample_points(
     points: &[DataPoint],
     interval: i64,
@@ -802,12 +808,6 @@ pub(crate) fn downsample_points(
 ) -> Result<Vec<DataPoint>> {
     if points.is_empty() || interval <= 0 || start >= end {
         return Ok(Vec::new());
-    }
-
-    fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
-        let rel = ts as i128 - start as i128;
-        let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
-        bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     let mut result = Vec::new();
@@ -851,12 +851,6 @@ pub(crate) fn downsample_points_with_custom(
 ) -> Result<Vec<DataPoint>> {
     if points.is_empty() || interval <= 0 || start >= end {
         return Ok(Vec::new());
-    }
-
-    fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
-        let rel = ts as i128 - start as i128;
-        let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
-        bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     let mut result = Vec::new();

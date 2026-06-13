@@ -113,8 +113,8 @@ impl Row {
     }
 
     /// Gets the data point.
-    pub fn data_point(&self) -> DataPoint {
-        self.data_point.clone()
+    pub fn data_point(&self) -> &DataPoint {
+        &self.data_point
     }
 
     /// Sets the metric name.

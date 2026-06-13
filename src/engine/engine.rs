@@ -12,7 +12,7 @@ use crate::engine::compactor::Compactor;
 use crate::engine::encoder::TrialEncoder;
 use crate::engine::query::{ChunkSeriesCursor, decode_chunk_points_in_range_into};
 use crate::engine::segment::{SegmentWriter, load_segments};
-use crate::engine::series_registry::{SeriesId, SeriesRegistry};
+use crate::engine::series_registry::{SeriesId, SeriesRegistry, validate_labels, validate_metric};
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
 use crate::storage::{
     TimestampPrecision, aggregate_series, downsample_points, downsample_points_with_custom,
@@ -420,7 +420,7 @@ impl ChunkStorage {
             if !points_are_sorted_by_timestamp(out) {
                 out.sort_by_key(|point| point.timestamp);
             }
-            dedupe_identical_points_per_timestamp(out);
+            dedupe_last_value_per_timestamp(out);
         }
         Ok(())
     }
@@ -437,8 +437,8 @@ impl ChunkStorage {
     }
 
     fn validate_select_request(metric: &str, labels: &[Label], start: i64, end: i64) -> Result<()> {
-        Self::validate_metric(metric)?;
-        Self::validate_labels(labels)?;
+        validate_metric(metric)?;
+        validate_labels(labels)?;
         if start >= end {
             return Err(TsinkError::InvalidTimeRange { start, end });
         }
@@ -493,40 +493,6 @@ impl ChunkStorage {
         }
         if !points_are_sorted_by_timestamp(out) {
             out.sort_by_key(|point| point.timestamp);
-        }
-        Ok(())
-    }
-
-    fn validate_metric(metric: &str) -> Result<()> {
-        if metric.is_empty() {
-            return Err(TsinkError::MetricRequired);
-        }
-        if metric.len() > u16::MAX as usize {
-            return Err(TsinkError::InvalidMetricName(format!(
-                "metric name too long: {} bytes (max {})",
-                metric.len(),
-                u16::MAX as usize
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_labels(labels: &[Label]) -> Result<()> {
-        for label in labels {
-            if !label.is_valid() {
-                return Err(TsinkError::InvalidLabel(
-                    "label name and value must be non-empty".to_string(),
-                ));
-            }
-            if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
-                || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
-            {
-                return Err(TsinkError::InvalidLabel(format!(
-                    "label name/value must be within limits (name <= {}, value <= {})",
-                    crate::label::MAX_LABEL_NAME_LEN,
-                    crate::label::MAX_LABEL_VALUE_LEN
-                )));
-            }
         }
         Ok(())
     }
@@ -869,7 +835,7 @@ impl Storage for ChunkStorage {
                     series_id: resolution.series_id,
                     lane,
                     ts: data_point.timestamp,
-                    value: data_point.value,
+                    value: data_point.value.clone(),
                 });
             }
         }
@@ -924,8 +890,8 @@ impl Storage for ChunkStorage {
 
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>> {
         self.ensure_open()?;
-        Self::validate_metric(metric)?;
-        Self::validate_labels(&opts.labels)?;
+        validate_metric(metric)?;
+        validate_labels(&opts.labels)?;
 
         if opts.start >= opts.end {
             return Err(TsinkError::InvalidTimeRange {
@@ -1001,7 +967,7 @@ impl Storage for ChunkStorage {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
         self.ensure_open()?;
-        Self::validate_metric(metric)?;
+        validate_metric(metric)?;
 
         if start >= end {
             return Err(TsinkError::InvalidTimeRange { start, end });
@@ -1241,29 +1207,21 @@ fn points_are_sorted_by_timestamp(points: &[DataPoint]) -> bool {
         .all(|window| window[0].timestamp <= window[1].timestamp)
 }
 
-fn dedupe_identical_points_per_timestamp(points: &mut Vec<DataPoint>) {
+fn dedupe_last_value_per_timestamp(points: &mut Vec<DataPoint>) {
     if points.len() < 2 {
         return;
     }
 
     let mut deduped: Vec<DataPoint> = Vec::with_capacity(points.len());
-    let mut current_ts: Option<i64> = None;
-    let mut group_start = 0usize;
 
     for point in points.drain(..) {
-        if current_ts != Some(point.timestamp) {
-            current_ts = Some(point.timestamp);
-            group_start = deduped.len();
-            deduped.push(point);
+        if let Some(last) = deduped.last_mut()
+            && last.timestamp == point.timestamp
+        {
+            *last = point;
             continue;
         }
-
-        let is_duplicate = deduped[group_start..]
-            .iter()
-            .any(|existing| existing == &point);
-        if !is_duplicate {
-            deduped.push(point);
-        }
+        deduped.push(point);
     }
 
     *points = deduped;
@@ -1285,6 +1243,7 @@ fn lane_name(lane: ValueLane) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -1295,6 +1254,9 @@ mod tests {
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
+    use crate::engine::encoder::TrialEncoder;
+    use crate::engine::segment::SegmentWriter;
+    use crate::engine::series_registry::SeriesRegistry;
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
     use crate::wal::WalSyncMode;
     use crate::{
@@ -1871,6 +1833,61 @@ mod tests {
     }
 
     #[test]
+    fn query_prefers_compacted_generation_when_compaction_crash_leaves_both_generations() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let metric = "compaction_crash_dupe";
+
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert(metric, &labels)
+            .unwrap()
+            .series_id;
+
+        let mut stale_l0 = HashMap::new();
+        stale_l0.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(1, 1.0), (2, 2.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 0, 1)
+            .unwrap()
+            .write_segment(&registry, &stale_l0)
+            .unwrap();
+
+        let mut compacted_l1 = HashMap::new();
+        compacted_l1.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(1, 10.0), (2, 2.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 1, 2)
+            .unwrap()
+            .write_segment(&registry, &compacted_l1)
+            .unwrap();
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(2)
+            .build()
+            .unwrap();
+
+        let points = reopened.select(metric, &labels, 0, 10).unwrap();
+        assert_eq!(
+            points,
+            vec![DataPoint::new(1, 10.0), DataPoint::new(2, 2.0)]
+        );
+
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn reenable_wal_after_wal_disabled_run_ignores_stale_wal_generation() {
         let temp_dir = TempDir::new().unwrap();
         let stale_labels = vec![Label::new("host", "stale")];
@@ -2328,5 +2345,31 @@ mod tests {
 
         writer.join().unwrap();
         closer.join().unwrap();
+    }
+
+    fn make_persisted_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
+        assert!(!points.is_empty());
+        let chunk_points = points
+            .iter()
+            .map(|(ts, value)| ChunkPoint {
+                ts: *ts,
+                value: Value::F64(*value),
+            })
+            .collect::<Vec<_>>();
+        let encoded = TrialEncoder::encode_chunk_points(&chunk_points, ValueLane::Numeric).unwrap();
+
+        Chunk {
+            header: ChunkHeader {
+                series_id,
+                lane: ValueLane::Numeric,
+                point_count: chunk_points.len() as u16,
+                min_ts: chunk_points.first().unwrap().ts,
+                max_ts: chunk_points.last().unwrap().ts,
+                ts_codec: encoded.ts_codec,
+                value_codec: encoded.value_codec,
+            },
+            points: chunk_points,
+            encoded_payload: encoded.payload,
+        }
     }
 }
