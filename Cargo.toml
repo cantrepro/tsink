@@ -31,12 +31,13 @@ chrono = "0.4"
 # Memory mapping
 memmap2 = "0.9"
 
+# Logging
+tracing = "0.1"
+
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Logging
-tracing = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
