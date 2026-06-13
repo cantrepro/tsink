@@ -14,6 +14,18 @@ where
     condition()
 }
 
+fn memory_required_for_rejected_write(storage: &ChunkStorage, rows: &[Row]) -> usize {
+    storage
+        .memory
+        .budget_bytes
+        .store(1, std::sync::atomic::Ordering::Release);
+    match storage.insert_rows(rows) {
+        Ok(()) => panic!("expected calibrated admission write to exceed the memory budget"),
+        Err(TsinkError::MemoryBudgetExceeded { required, .. }) => required,
+        Err(err) => panic!("expected memory budget error during calibration, got {err:?}"),
+    }
+}
+
 #[test]
 fn timestamp_precision_changes_retention_unit_conversion() {
     let seconds_storage = StorageBuilder::new()
@@ -212,7 +224,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     let second_blob = "b".repeat(4096);
     let third_blob = "c".repeat(4096);
     let fourth_blob = "d".repeat(4096);
-    let build_storage = |root: &TempDir| {
+    let build_storage = |root: &TempDir, write_timeout: Duration| {
         let wal = FramedWal::open(root.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
         ChunkStorage::new_with_data_path_and_options(
             8,
@@ -230,7 +242,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 max_active_partition_heads_per_series:
                     crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
                 max_writers: 1,
-                write_timeout: Duration::from_secs(1),
+                write_timeout,
                 memory_budget_bytes: 1_000_000,
                 cardinality_limit: usize::MAX,
                 wal_size_limit_bytes: u64::MAX,
@@ -249,7 +261,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         .unwrap()
     };
     let calibration_dir = TempDir::new().unwrap();
-    let calibration = build_storage(&calibration_dir);
+    let calibration = build_storage(&calibration_dir, Duration::ZERO);
     calibration
         .insert_rows(&[
             Row::new(
@@ -266,17 +278,31 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
             ),
         ])
         .unwrap();
+    let fourth_row = Row::new(
+        "memory_backpressure_head_guard",
+        DataPoint::new(22, fourth_blob.clone()),
+    );
+    let pre_relief_required =
+        memory_required_for_rejected_write(&calibration, std::slice::from_ref(&fourth_row));
+    calibration
+        .memory
+        .budget_bytes
+        .store(u64::MAX, std::sync::atomic::Ordering::Release);
     calibration.flush_background_eligible_active().unwrap();
     calibration.persist_segment_with_outcome().unwrap();
-    calibration
-        .insert_rows(&[Row::new(
-            "memory_backpressure_head_guard",
-            DataPoint::new(22, fourth_blob.clone()),
-        )])
-        .unwrap();
-    let target_budget = calibration.memory_used().saturating_add(512) as u64;
+    let post_relief_required =
+        memory_required_for_rejected_write(&calibration, std::slice::from_ref(&fourth_row));
+    assert!(
+        post_relief_required < pre_relief_required,
+        "background-eligible flush should reduce admission memory requirement: pre={pre_relief_required} post={post_relief_required}",
+    );
+    let target_budget = pre_relief_required.saturating_sub(1);
+    assert!(
+        post_relief_required <= target_budget,
+        "calibrated post-relief requirement should fit below the pressure budget: budget={target_budget} post={post_relief_required}",
+    );
 
-    let storage = std::sync::Arc::new(build_storage(&temp_dir));
+    let storage = std::sync::Arc::new(build_storage(&temp_dir, Duration::from_secs(1)));
 
     storage
         .insert_rows(&[
@@ -316,18 +342,20 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     storage
         .memory
         .budget_bytes
-        .store(target_budget, std::sync::atomic::Ordering::Release);
+        .store(target_budget as u64, std::sync::atomic::Ordering::Release);
 
     storage
-        .insert_rows(&[Row::new(
-            "memory_backpressure_head_guard",
-            DataPoint::new(22, fourth_blob.clone()),
-        )])
+        .insert_rows(std::slice::from_ref(&fourth_row))
         .unwrap();
 
     assert!(
         wait_for_condition(Duration::from_secs(1), Duration::from_millis(10), || {
             !load_segments_for_level(&lane_path, 0).unwrap().is_empty()
+                && storage
+                    .observability_snapshot()
+                    .flush
+                    .persisted_segments_total
+                    > before.flush.persisted_segments_total
         }),
         "background flush should publish a persisted segment while relieving admission pressure",
     );

@@ -191,24 +191,21 @@ fn data_path_lock_releases_on_close_and_allows_reopen() {
 fn data_path_lock_retries_until_last_handle_drops() {
     let temp_dir = TempDir::new().unwrap();
 
-    let storage = StorageBuilder::new()
-        .with_data_path(temp_dir.path())
-        .build()
-        .unwrap();
-    let delayed_handle = storage.clone();
+    let lock = Arc::new(
+        super::super::process_lock::DataPathProcessLock::acquire(temp_dir.path()).unwrap(),
+    );
+    let delayed_handle = Arc::clone(&lock);
 
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         drop(delayed_handle);
     });
 
-    drop(storage);
+    drop(lock);
 
-    let reopened = StorageBuilder::new()
-        .with_data_path(temp_dir.path())
-        .build()
-        .unwrap();
-    reopened.close().unwrap();
+    let reopened =
+        super::super::process_lock::DataPathProcessLock::acquire(temp_dir.path()).unwrap();
+    drop(reopened);
     releaser.join().unwrap();
 }
 
