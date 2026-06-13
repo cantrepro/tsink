@@ -1,6 +1,6 @@
 [package]
 name = "tsink"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["h2337"]
 description = "A lightweight embedded time-series database with a straightforward API"

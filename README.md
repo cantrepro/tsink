@@ -32,7 +32,7 @@ Add tsink to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsink = "0.6.1"
+tsink = "0.7.0"
 ```
 
 ## Quick Start
@@ -129,6 +129,12 @@ let points = storage.select(
 let all_results = storage.select_all("http_requests", 1600000000, 1600000100)?;
 for (labels, points) in all_results {
     println!("Labels: {:?}, Points: {}", labels, points.len());
+}
+
+// Discover all metric series currently known by storage
+let all_series = storage.list_metrics()?;
+for series in all_series {
+    println!("Metric: {}, Labels: {:?}", series.name, series.labels);
 }
 ```
 

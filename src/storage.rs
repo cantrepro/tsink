@@ -8,6 +8,7 @@ use crate::partition::SharedPartition;
 use crate::wal::{DiskWal, NopWal, Wal, WalReader, WalSyncMode};
 use crate::{DataPoint, Label, Result, Row, TsinkError};
 use crossbeam_channel::{Sender, bounded};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +30,15 @@ pub enum TimestampPrecision {
     Microseconds,
     Milliseconds,
     Seconds,
+}
+
+/// A unique metric series identified by name and label set.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct MetricSeries {
+    pub name: String,
+    pub labels: Vec<Label>,
 }
 
 /// Storage provides thread-safe capabilities for insertion and retrieval from time-series storage.
@@ -56,6 +66,13 @@ pub trait Storage: Send + Sync {
         start: i64,
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
+
+    /// Lists all known metric series across partitions and WAL.
+    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
+        Err(TsinkError::Other(
+            "list_metrics is not implemented for this storage backend".to_string(),
+        ))
+    }
 
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
@@ -355,6 +372,11 @@ struct StorageImpl {
 }
 
 impl StorageImpl {
+    fn canonical_series(name: String, mut labels: Vec<Label>) -> MetricSeries {
+        labels.sort();
+        MetricSeries { name, labels }
+    }
+
     fn ensure_operational(&self) -> Result<()> {
         match self.lifecycle.load(Ordering::SeqCst) {
             STORAGE_OPEN => Ok(()),
@@ -1077,6 +1099,63 @@ impl Storage for StorageImpl {
         results.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(results)
+    }
+
+    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
+        self.ensure_operational()?;
+
+        let mut unique = BTreeSet::new();
+        let mut skipped_invalid = 0usize;
+
+        {
+            let _partition_ops_guard = self.partition_ops_lock.read();
+
+            for partition in self.partition_list.iter() {
+                if partition.size() == 0 || partition.expired() {
+                    continue;
+                }
+
+                for (name, labels) in partition.list_metric_series()? {
+                    if Self::validate_metric_name(&name).is_err()
+                        || Self::validate_labels(&labels).is_err()
+                    {
+                        skipped_invalid += 1;
+                        continue;
+                    }
+
+                    unique.insert(Self::canonical_series(name, labels));
+                }
+            }
+        }
+
+        if let Some(data_path) = &self.data_path {
+            let wal_dir = data_path.join("wal");
+            if wal_dir.exists() {
+                let rows = WalReader::new(&wal_dir)?.read_all()?;
+                for row in rows {
+                    if Self::validate_metric_name(row.metric()).is_err()
+                        || Self::validate_labels(row.labels()).is_err()
+                    {
+                        skipped_invalid += 1;
+                        continue;
+                    }
+
+                    unique.insert(Self::canonical_series(
+                        row.metric().to_string(),
+                        row.labels().to_vec(),
+                    ));
+                }
+            }
+        }
+
+        if skipped_invalid > 0 {
+            warn!(
+                count = skipped_invalid,
+                "Skipping invalid metric series while listing metrics"
+            );
+        }
+
+        Ok(unique.into_iter().collect())
     }
 
     fn close(&self) -> Result<()> {

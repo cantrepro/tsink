@@ -425,6 +425,18 @@ impl crate::partition::Partition for MemoryPartition {
         Ok(results)
     }
 
+    fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>> {
+        let mut series = Vec::with_capacity(self.metrics.len());
+
+        for entry in self.metrics.iter() {
+            let (metric, mut labels) = unmarshal_metric_name(entry.key())?;
+            labels.sort();
+            series.push((metric, labels));
+        }
+
+        Ok(series)
+    }
+
     fn min_timestamp(&self) -> i64 {
         self.min_t.load(Ordering::SeqCst)
     }

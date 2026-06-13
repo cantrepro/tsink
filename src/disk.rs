@@ -287,6 +287,34 @@ impl crate::partition::Partition for DiskPartition {
         Ok(results)
     }
 
+    fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>> {
+        if self.expired() {
+            return Ok(Vec::new());
+        }
+
+        let mut series = Vec::with_capacity(self.meta.metrics.len());
+
+        for encoded_key in self.meta.metrics.keys() {
+            let marshaled = decode_metric_key(encoded_key);
+
+            match unmarshal_metric_name(&marshaled) {
+                Ok((metric, labels))
+                    if encoded_key_matches_series(encoded_key, &metric, &labels) =>
+                {
+                    let mut labels = labels;
+                    labels.sort();
+                    series.push((metric, labels));
+                }
+                _ => {
+                    // Legacy metadata stored plain UTF-8 keys directly.
+                    series.push((encoded_key.clone(), Vec::new()));
+                }
+            }
+        }
+
+        Ok(series)
+    }
+
     fn min_timestamp(&self) -> i64 {
         self.meta.min_timestamp
     }
@@ -397,4 +425,10 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn encoded_key_matches_series(encoded_key: &str, metric: &str, labels: &[Label]) -> bool {
+    let marshaled = marshal_metric_name(metric, labels);
+    let canonical = encode_metric_key(&marshaled);
+    encoded_key.eq_ignore_ascii_case(&canonical)
 }

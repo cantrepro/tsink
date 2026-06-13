@@ -20,7 +20,8 @@ pub mod wal;
 pub use error::{Result, TsinkError};
 pub use label::Label;
 pub use storage::{
-    Aggregation, DownsampleOptions, QueryOptions, Storage, StorageBuilder, TimestampPrecision,
+    Aggregation, DownsampleOptions, MetricSeries, QueryOptions, Storage, StorageBuilder,
+    TimestampPrecision,
 };
 pub use wal::WalSyncMode;
 

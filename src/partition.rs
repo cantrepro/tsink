@@ -36,6 +36,9 @@ pub trait Partition: Send + Sync {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
 
+    /// Lists all metric series stored in this partition as (metric, labels) pairs.
+    fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>>;
+
     /// Returns the minimum timestamp in the partition.
     fn min_timestamp(&self) -> i64;
 

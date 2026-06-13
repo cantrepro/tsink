@@ -205,3 +205,62 @@ fn disk_partition_select_all_supports_legacy_hex_plain_metric_keys() {
     assert_eq!(all[0].0.len(), 0);
     assert_eq!(all[0].1.len(), 1);
 }
+
+#[test]
+fn disk_partition_list_metric_series_supports_legacy_hex_plain_metric_keys() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let data = {
+        let rows = vec![Row::new("deadbeef", DataPoint::new(1, 1.0))];
+        let temp_mem = TempDir::new().unwrap();
+        let wal: Arc<dyn tsink::wal::Wal> = Arc::new(tsink::wal::NopWal);
+        let partition: tsink::partition::SharedPartition =
+            Arc::new(tsink::memory::MemoryPartition::new(
+                wal,
+                Duration::from_secs(60),
+                tsink::TimestampPrecision::Seconds,
+                Duration::from_secs(3600),
+            ));
+        partition.insert_rows(&rows).unwrap();
+        tsink::memory::flush_memory_partition_to_disk(
+            partition.clone(),
+            temp_mem.path(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        std::fs::read(temp_mem.path().join(tsink::disk::DATA_FILE_NAME)).unwrap()
+    };
+
+    let mut metrics = HashMap::new();
+    metrics.insert(
+        "deadbeef".to_string(),
+        DiskMetric {
+            name: "deadbeef".to_string(),
+            offset: 0,
+            encoded_size: data.len() as u64,
+            min_timestamp: 1,
+            max_timestamp: 1,
+            num_data_points: 1,
+        },
+    );
+
+    let partition = DiskPartition::create(
+        temp_dir.path(),
+        PartitionMeta {
+            min_timestamp: 1,
+            max_timestamp: 1,
+            num_data_points: 1,
+            metrics,
+            timestamp_precision: TimestampPrecision::Seconds,
+            created_at: SystemTime::now(),
+        },
+        data,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let listed = partition.list_metric_series().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, "deadbeef");
+    assert!(listed[0].1.is_empty());
+}

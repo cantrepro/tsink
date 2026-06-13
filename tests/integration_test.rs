@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use tsink::{
-    DataPoint, Label, QueryOptions, Row, StorageBuilder, TimestampPrecision, TsinkError,
-    WalSyncMode,
+    DataPoint, Label, MetricSeries, QueryOptions, Row, StorageBuilder, TimestampPrecision,
+    TsinkError, WalSyncMode,
 };
 
 #[test]
@@ -264,6 +264,10 @@ fn test_operations_after_close_return_storage_closed() {
         storage.select_with_options("closed_metric", QueryOptions::new(0, 10)),
         Err(TsinkError::StorageClosed)
     ));
+    assert!(matches!(
+        storage.list_metrics(),
+        Err(TsinkError::StorageClosed)
+    ));
     assert!(matches!(storage.close(), Err(TsinkError::StorageClosed)));
 }
 
@@ -355,6 +359,69 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
             .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
         "newly inserted point should survive close/reopen even with existing disk partitions"
     );
+}
+
+#[test]
+fn test_list_metrics_deduplicates_across_disk_memory_and_wal() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_partition_duration(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::new("cpu", DataPoint::new(10, 1.0)),
+                Row::with_labels(
+                    "http_requests",
+                    vec![Label::new("status", "200"), Label::new("method", "GET")],
+                    DataPoint::new(11, 2.0),
+                ),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::new("cpu", DataPoint::new(12, 3.0)),
+            Row::with_labels(
+                "queue_depth",
+                vec![Label::new("queue", "critical")],
+                DataPoint::new(13, 4.0),
+            ),
+        ])
+        .unwrap();
+
+    let metrics = storage.list_metrics().unwrap();
+    let expected = vec![
+        MetricSeries {
+            name: "cpu".to_string(),
+            labels: Vec::new(),
+        },
+        MetricSeries {
+            name: "http_requests".to_string(),
+            labels: vec![Label::new("method", "GET"), Label::new("status", "200")],
+        },
+        MetricSeries {
+            name: "queue_depth".to_string(),
+            labels: vec![Label::new("queue", "critical")],
+        },
+    ];
+
+    assert_eq!(metrics, expected);
 }
 
 #[test]

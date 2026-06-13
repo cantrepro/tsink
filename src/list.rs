@@ -250,6 +250,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>> {
+            Ok(Vec::new())
+        }
+
         fn min_timestamp(&self) -> i64 {
             self.min
         }
