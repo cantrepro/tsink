@@ -157,6 +157,7 @@ remote_read:
 | `select_with_options(metric, QueryOptions)` | Supports downsampling, aggregation, custom bytes aggregation, and pagination. |
 | `list_metrics()` | Lists all known metric + label-set series. |
 | `list_metrics_with_wal()` | Like `list_metrics`, but also includes series only present in the WAL. |
+| `select_series(SeriesSelection)` | Matcher-based series discovery (`=`, `!=`, `=~`, `!~`) with optional time-window filtering. |
 
 ### Downsampling and Aggregation
 

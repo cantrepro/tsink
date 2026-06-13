@@ -6,6 +6,7 @@ use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
     Result, Row, TsinkError, Value,
 };
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,111 @@ pub enum TimestampPrecision {
 pub struct MetricSeries {
     pub name: String,
     pub labels: Vec<Label>,
+}
+
+/// Label matcher operator for series selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SeriesMatcherOp {
+    Equal,
+    NotEqual,
+    RegexMatch,
+    RegexNoMatch,
+}
+
+/// Label matcher for series selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeriesMatcher {
+    pub name: String,
+    pub op: SeriesMatcherOp,
+    pub value: String,
+}
+
+impl SeriesMatcher {
+    #[must_use]
+    pub fn new(name: impl Into<String>, op: SeriesMatcherOp, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            op,
+            value: value.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn equal(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::Equal, value)
+    }
+
+    #[must_use]
+    pub fn not_equal(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::NotEqual, value)
+    }
+
+    #[must_use]
+    pub fn regex_match(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::RegexMatch, value)
+    }
+
+    #[must_use]
+    pub fn regex_no_match(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::RegexNoMatch, value)
+    }
+}
+
+/// Selection request for matching metric series.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeriesSelection {
+    pub metric: Option<String>,
+    pub matchers: Vec<SeriesMatcher>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+}
+
+impl SeriesSelection {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_metric(mut self, metric: impl Into<String>) -> Self {
+        self.metric = Some(metric.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_matcher(mut self, matcher: SeriesMatcher) -> Self {
+        self.matchers.push(matcher);
+        self
+    }
+
+    #[must_use]
+    pub fn with_matchers(mut self, matchers: Vec<SeriesMatcher>) -> Self {
+        self.matchers = matchers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_time_range(mut self, start: i64, end: i64) -> Self {
+        self.start = Some(start);
+        self.end = Some(end);
+        self
+    }
+
+    pub(crate) fn normalized_time_range(&self) -> Result<Option<(i64, i64)>> {
+        match (self.start, self.end) {
+            (None, None) => Ok(None),
+            (Some(start), Some(end)) => {
+                if start >= end {
+                    return Err(TsinkError::InvalidTimeRange { start, end });
+                }
+                Ok(Some((start, end)))
+            }
+            _ => Err(TsinkError::InvalidConfiguration(
+                "series selection requires both start and end when time range filtering is enabled"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 /// Storage provides thread-safe capabilities for insertion and retrieval from time-series storage.
@@ -79,6 +185,54 @@ pub trait Storage: Send + Sync {
         self.list_metrics()
     }
 
+    /// Selects metric series by structured label matchers (non-PromQL API).
+    fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
+        if let Some(metric) = &selection.metric {
+            if metric.is_empty() {
+                return Err(TsinkError::MetricRequired);
+            }
+            if metric.len() > u16::MAX as usize {
+                return Err(TsinkError::InvalidMetricName(format!(
+                    "metric name too long: {} bytes (max {})",
+                    metric.len(),
+                    u16::MAX as usize
+                )));
+            }
+        }
+
+        let time_range = selection.normalized_time_range()?;
+        let compiled_matchers = compile_series_matchers(&selection.matchers)?;
+
+        let mut series = self.list_metrics()?;
+        series.retain(|entry| {
+            if selection
+                .metric
+                .as_ref()
+                .is_some_and(|metric| entry.name != *metric)
+            {
+                return false;
+            }
+
+            compiled_matchers
+                .iter()
+                .all(|matcher| matcher.matches(&entry.name, &entry.labels))
+        });
+
+        if let Some((start, end)) = time_range {
+            let mut filtered = Vec::with_capacity(series.len());
+            for entry in series {
+                let points = self.select(&entry.name, &entry.labels, start, end)?;
+                if !points.is_empty() {
+                    filtered.push(entry);
+                }
+            }
+            series = filtered;
+        }
+
+        series.sort();
+        Ok(series)
+    }
+
     /// Returns currently estimated in-memory bytes owned by the storage engine.
     fn memory_used(&self) -> usize {
         0
@@ -93,6 +247,76 @@ pub trait Storage: Send + Sync {
 
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledSeriesMatcher {
+    pub name: String,
+    pub op: SeriesMatcherOp,
+    pub value: String,
+    pub regex: Option<Regex>,
+}
+
+impl CompiledSeriesMatcher {
+    pub(crate) fn matches(&self, metric: &str, labels: &[Label]) -> bool {
+        let actual = if self.name == "__name__" {
+            Some(metric)
+        } else {
+            labels
+                .iter()
+                .find(|label| label.name == self.name)
+                .map(|label| label.value.as_str())
+        };
+
+        match self.op {
+            SeriesMatcherOp::Equal => actual.is_some_and(|value| value == self.value),
+            SeriesMatcherOp::NotEqual => actual.is_none_or(|value| value != self.value),
+            SeriesMatcherOp::RegexMatch => actual.is_some_and(|value| {
+                self.regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(value))
+            }),
+            SeriesMatcherOp::RegexNoMatch => !actual.is_some_and(|value| {
+                self.regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(value))
+            }),
+        }
+    }
+}
+
+pub(crate) fn compile_series_matchers(
+    matchers: &[SeriesMatcher],
+) -> Result<Vec<CompiledSeriesMatcher>> {
+    let mut compiled = Vec::with_capacity(matchers.len());
+    for matcher in matchers {
+        if matcher.name.is_empty() {
+            return Err(TsinkError::InvalidLabel(
+                "series matcher label name cannot be empty".to_string(),
+            ));
+        }
+
+        let regex = match matcher.op {
+            SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch => {
+                let anchored = format!("^(?:{})$", matcher.value);
+                Some(Regex::new(&anchored).map_err(|err| {
+                    TsinkError::InvalidConfiguration(format!(
+                        "invalid matcher regex '{}': {err}",
+                        matcher.value
+                    ))
+                })?)
+            }
+            SeriesMatcherOp::Equal | SeriesMatcherOp::NotEqual => None,
+        };
+
+        compiled.push(CompiledSeriesMatcher {
+            name: matcher.name.clone(),
+            op: matcher.op,
+            value: matcher.value.clone(),
+            regex,
+        });
+    }
+    Ok(compiled)
 }
 
 /// Builder for creating a Storage instance.

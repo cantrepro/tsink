@@ -385,8 +385,22 @@ impl SeriesRegistry {
         self.label_value_dict.get_id(label_value)
     }
 
+    pub fn label_value_by_id(&self, value_id: DictionaryId) -> Option<&str> {
+        self.label_value_dict.get_value(value_id)
+    }
+
     pub fn metric_entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {
         self.metric_dict.entries()
+    }
+
+    pub fn metric_postings_entries(&self) -> impl Iterator<Item = (&str, &BTreeSet<SeriesId>)> {
+        self.metric_postings
+            .iter()
+            .filter_map(|(metric_id, series_ids)| {
+                self.metric_dict
+                    .get_value(*metric_id)
+                    .map(|metric| (metric, series_ids))
+            })
     }
 
     pub fn label_name_entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {

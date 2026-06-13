@@ -3,8 +3,8 @@
 use crate::cgroup;
 use crate::wal::WalSyncMode;
 use crate::{
-    DataPoint, Label, MetricSeries, QueryOptions, Result, Row, Storage, StorageBuilder,
-    TimestampPrecision, TsinkError,
+    DataPoint, Label, MetricSeries, QueryOptions, Result, Row, SeriesSelection, Storage,
+    StorageBuilder, TimestampPrecision, TsinkError,
 };
 use parking_lot::Mutex;
 use std::path::Path;
@@ -72,6 +72,10 @@ enum ReadCommand {
         reply: Reply<Vec<(Vec<Label>, Vec<DataPoint>)>>,
     },
     ListMetrics {
+        reply: Reply<Vec<MetricSeries>>,
+    },
+    SelectSeries {
+        selection: SeriesSelection,
         reply: Reply<Vec<MetricSeries>>,
     },
 }
@@ -257,6 +261,18 @@ impl AsyncStorage {
         self.runtime
             .read_tx
             .send(ReadCommand::ListMetrics { reply })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
+    /// Select series using structured matchers.
+    pub async fn select_series(&self, selection: SeriesSelection) -> Result<Vec<MetricSeries>> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .read_tx
+            .send(ReadCommand::SelectSeries { selection, reply })
             .await
             .map_err(|_| runtime_stopped_error())?;
         recv_reply(recv).await
@@ -508,6 +524,13 @@ fn read_worker_loop(storage: Arc<dyn Storage>, receiver: async_channel::Receiver
                     continue;
                 }
                 let result = storage.list_metrics();
+                let _ = reply.send_blocking(result);
+            }
+            ReadCommand::SelectSeries { selection, reply } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                let result = storage.select_series(&selection);
                 let _ = reply.send_blocking(result);
             }
         }

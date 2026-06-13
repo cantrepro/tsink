@@ -25,7 +25,8 @@ use crate::engine::series_registry::{
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
 use crate::mmap::PlatformMmap;
 use crate::storage::{
-    aggregate_series, downsample_points, downsample_points_with_custom, TimestampPrecision,
+    aggregate_series, compile_series_matchers, downsample_points, downsample_points_with_custom,
+    CompiledSeriesMatcher, SeriesMatcherOp, SeriesSelection, TimestampPrecision,
 };
 use crate::{
     Aggregation, DataPoint, Label, MetricSeries, QueryOptions, Result, Row, Storage,
@@ -1023,6 +1024,242 @@ impl ChunkStorage {
         Ok(out)
     }
 
+    fn intersect_candidates(
+        candidates: &mut BTreeSet<SeriesId>,
+        filter: Option<&BTreeSet<SeriesId>>,
+    ) {
+        match filter {
+            Some(filter) => candidates.retain(|series_id| filter.contains(series_id)),
+            None => candidates.clear(),
+        }
+    }
+
+    fn subtract_candidates(
+        candidates: &mut BTreeSet<SeriesId>,
+        filter: Option<&BTreeSet<SeriesId>>,
+    ) {
+        if let Some(filter) = filter {
+            candidates.retain(|series_id| !filter.contains(series_id));
+        }
+    }
+
+    fn apply_postings_matcher_to_candidates(
+        registry: &SeriesRegistry,
+        candidates: &mut BTreeSet<SeriesId>,
+        matcher: &CompiledSeriesMatcher,
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        if matcher.name == "__name__" {
+            match matcher.op {
+                SeriesMatcherOp::Equal => {
+                    Self::intersect_candidates(
+                        candidates,
+                        registry.series_id_postings_for_metric(&matcher.value),
+                    );
+                }
+                SeriesMatcherOp::NotEqual => {
+                    Self::subtract_candidates(
+                        candidates,
+                        registry.series_id_postings_for_metric(&matcher.value),
+                    );
+                }
+                SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch => {
+                    let Some(regex) = matcher.regex.as_ref() else {
+                        return Err(TsinkError::InvalidConfiguration(
+                            "regex matcher missing compiled regex".to_string(),
+                        ));
+                    };
+
+                    let mut matched = BTreeSet::<SeriesId>::new();
+                    for (metric, series_ids) in registry.metric_postings_entries() {
+                        if regex.is_match(metric) {
+                            matched.extend(series_ids.iter().copied());
+                        }
+                    }
+
+                    if matcher.op == SeriesMatcherOp::RegexMatch {
+                        Self::intersect_candidates(candidates, Some(&matched));
+                    } else {
+                        Self::subtract_candidates(candidates, Some(&matched));
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
+        match matcher.op {
+            SeriesMatcherOp::Equal => {
+                Self::intersect_candidates(
+                    candidates,
+                    registry.postings_for_label(&matcher.name, &matcher.value),
+                );
+            }
+            SeriesMatcherOp::NotEqual => {
+                Self::subtract_candidates(
+                    candidates,
+                    registry.postings_for_label(&matcher.name, &matcher.value),
+                );
+            }
+            SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch => {
+                let Some(label_name_id) = registry.label_name_id(&matcher.name) else {
+                    if matcher.op == SeriesMatcherOp::RegexMatch {
+                        candidates.clear();
+                    }
+                    return Ok(());
+                };
+
+                let Some(regex) = matcher.regex.as_ref() else {
+                    return Err(TsinkError::InvalidConfiguration(
+                        "regex matcher missing compiled regex".to_string(),
+                    ));
+                };
+
+                let mut matched = BTreeSet::<SeriesId>::new();
+                for (pair, series_ids) in registry.postings_entries() {
+                    if pair.name_id != label_name_id {
+                        continue;
+                    }
+                    let Some(label_value) = registry.label_value_by_id(pair.value_id) else {
+                        continue;
+                    };
+                    if regex.is_match(label_value) {
+                        matched.extend(series_ids.iter().copied());
+                    }
+                }
+
+                if matcher.op == SeriesMatcherOp::RegexMatch {
+                    Self::intersect_candidates(candidates, Some(&matched));
+                } else {
+                    Self::subtract_candidates(candidates, Some(&matched));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn select_series_candidate_ids(
+        &self,
+        selection: &SeriesSelection,
+        compiled_matchers: &[CompiledSeriesMatcher],
+    ) -> Result<Vec<SeriesId>> {
+        let registry = self.registry.read();
+
+        let mut candidates = if let Some(metric) = selection.metric.as_ref() {
+            registry
+                .series_id_postings_for_metric(metric)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            registry
+                .all_series_ids()
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        };
+
+        for matcher in compiled_matchers {
+            Self::apply_postings_matcher_to_candidates(&registry, &mut candidates, matcher)?;
+            if candidates.is_empty() {
+                break;
+            }
+        }
+
+        Ok(candidates.into_iter().collect())
+    }
+
+    fn series_ids_with_data_in_time_range(
+        &self,
+        series_ids: Vec<SeriesId>,
+        start: i64,
+        end: i64,
+    ) -> Vec<SeriesId> {
+        if series_ids.is_empty() {
+            return series_ids;
+        }
+
+        let _visibility_guard = self.flush_visibility_lock.read();
+        let persisted_index = self.persisted_index.read();
+        let mut filtered = Vec::with_capacity(series_ids.len());
+
+        for series_id in series_ids {
+            let persisted_overlap =
+                persisted_index
+                    .chunk_refs
+                    .get(&series_id)
+                    .is_some_and(|chunks| {
+                        let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
+                        chunks[..end_idx]
+                            .iter()
+                            .any(|chunk| chunk.max_ts >= start && chunk.min_ts < end)
+                    });
+
+            if persisted_overlap {
+                filtered.push(series_id);
+                continue;
+            }
+
+            let active = self.active_shard(series_id).read();
+            {
+                let sealed = self.sealed_shard(series_id).read();
+                let sealed_overlap = sealed.get(&series_id).is_some_and(|chunks| {
+                    let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
+                    chunks
+                        .range(..end_bound)
+                        .any(|(_, chunk)| chunk.header.max_ts >= start && chunk.header.min_ts < end)
+                });
+                if sealed_overlap {
+                    filtered.push(series_id);
+                    continue;
+                }
+            }
+
+            let active_overlap = active.get(&series_id).is_some_and(|state| {
+                state
+                    .builder
+                    .points()
+                    .iter()
+                    .any(|point| point.ts >= start && point.ts < end)
+            });
+            if active_overlap {
+                filtered.push(series_id);
+            }
+        }
+
+        filtered
+    }
+
+    fn select_series_impl(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
+        if let Some(metric) = selection.metric.as_ref() {
+            validate_metric(metric)?;
+        }
+
+        let time_range = selection.normalized_time_range()?;
+        let compiled_matchers = compile_series_matchers(&selection.matchers)?;
+        let mut candidate_ids = self.select_series_candidate_ids(selection, &compiled_matchers)?;
+
+        if let Some((start, end)) = time_range {
+            candidate_ids = self.series_ids_with_data_in_time_range(candidate_ids, start, end);
+        }
+
+        let registry = self.registry.read();
+        let mut series = Vec::with_capacity(candidate_ids.len());
+        for series_id in candidate_ids {
+            if let Some(key) = registry.decode_series_key(series_id) {
+                series.push(MetricSeries {
+                    name: key.metric,
+                    labels: key.labels,
+                });
+            }
+        }
+
+        series.sort();
+        Ok(series)
+    }
+
     fn validate_select_request(metric: &str, labels: &[Label], start: i64, end: i64) -> Result<()> {
         validate_metric(metric)?;
         validate_labels(labels)?;
@@ -1831,6 +2068,11 @@ impl Storage for ChunkStorage {
         Ok(metrics)
     }
 
+    fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
+        self.ensure_open()?;
+        self.select_series_impl(selection)
+    }
+
     fn memory_used(&self) -> usize {
         let used = self.compute_memory_usage_bytes();
         self.memory_used_bytes
@@ -2225,7 +2467,8 @@ mod tests {
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
     use crate::wal::WalSyncMode;
     use crate::{
-        DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision, TsinkError, Value,
+        DataPoint, Label, Row, SeriesMatcher, SeriesSelection, Storage, StorageBuilder,
+        TimestampPrecision, TsinkError, Value,
     };
 
     #[test]
@@ -2957,6 +3200,118 @@ mod tests {
 
         assert_eq!(points_short, vec![DataPoint::new(1, 1.0)]);
         assert_eq!(points_long, vec![DataPoint::new(1, 10.0)]);
+    }
+
+    #[test]
+    fn select_series_supports_matcher_intersections() {
+        let storage = ChunkStorage::new(2, None);
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "cpu",
+                    vec![Label::new("host", "a"), Label::new("region", "use1")],
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    "cpu",
+                    vec![Label::new("host", "b"), Label::new("region", "usw2")],
+                    DataPoint::new(1, 2.0),
+                ),
+                Row::with_labels(
+                    "memory",
+                    vec![Label::new("host", "a"), Label::new("region", "use1")],
+                    DataPoint::new(1, 3.0),
+                ),
+            ])
+            .unwrap();
+
+        let selected = storage
+            .select_series(
+                &SeriesSelection::new()
+                    .with_metric("cpu")
+                    .with_matcher(SeriesMatcher::equal("host", "a"))
+                    .with_matcher(SeriesMatcher::regex_match("region", "use.*")),
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "cpu");
+        assert_eq!(
+            selected[0].labels,
+            vec![Label::new("host", "a"), Label::new("region", "use1")]
+        );
+
+        let not_equal = storage
+            .select_series(
+                &SeriesSelection::new()
+                    .with_metric("cpu")
+                    .with_matcher(SeriesMatcher::not_equal("host", "a")),
+            )
+            .unwrap();
+        assert_eq!(not_equal.len(), 1);
+        assert_eq!(
+            not_equal[0].labels,
+            vec![Label::new("host", "b"), Label::new("region", "usw2")]
+        );
+    }
+
+    #[test]
+    fn select_series_time_range_uses_chunk_indexes() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(1)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "cpu",
+                    vec![Label::new("host", "old")],
+                    DataPoint::new(10, 1.0),
+                ),
+                Row::with_labels(
+                    "cpu",
+                    vec![Label::new("host", "new")],
+                    DataPoint::new(200, 2.0),
+                ),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(1)
+            .build()
+            .unwrap();
+
+        let selected = reopened
+            .select_series(
+                &SeriesSelection::new()
+                    .with_metric("cpu")
+                    .with_time_range(100, 300),
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "cpu");
+        assert_eq!(selected[0].labels, vec![Label::new("host", "new")]);
+
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn select_series_rejects_invalid_regex() {
+        let storage = ChunkStorage::new(2, None);
+        let err = storage
+            .select_series(
+                &SeriesSelection::new()
+                    .with_metric("cpu")
+                    .with_matcher(SeriesMatcher::regex_match("host", "(")),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
     }
 
     #[test]

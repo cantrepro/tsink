@@ -3,7 +3,6 @@ use crate::prom_remote::{
     Sample as PromSample, TimeSeries, WriteRequest,
 };
 use prost::Message;
-use regex::Regex;
 use snap::raw::{Decoder as SnappyDecoder, Encoder as SnappyEncoder};
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
@@ -13,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tsink::{
-    DataPoint, Label, MetricSeries, Row, Storage, StorageBuilder, TimestampPrecision, TsinkError,
+    DataPoint, Label, Row, SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage,
+    StorageBuilder, TimestampPrecision, TsinkError,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -223,17 +223,14 @@ fn handle_remote_read(storage: &Arc<dyn Storage>, request: &HttpRequest) -> Http
 }
 
 fn execute_query(storage: &Arc<dyn Storage>, query: &Query) -> Result<QueryResult, String> {
+    let selection = series_selection_from_remote_matchers(&query.matchers)?;
     let series_list = storage
-        .list_metrics_with_wal()
-        .map_err(|err| format!("failed to list metrics: {err}"))?;
+        .select_series(&selection)
+        .map_err(|err| format!("failed to resolve candidate series: {err}"))?;
 
     let mut out_series = Vec::new();
     let end = query.end_timestamp_ms.saturating_add(1);
     for series in series_list {
-        if !matches_series(&series, &query.matchers)? {
-            continue;
-        }
-
         let points =
             match storage.select(&series.name, &series.labels, query.start_timestamp_ms, end) {
                 Ok(points) => points,
@@ -292,56 +289,33 @@ fn extract_metric_and_labels(labels: Vec<PromLabel>) -> Option<(String, Vec<Labe
     metric.map(|name| (name, out_labels))
 }
 
-fn matches_series(series: &MetricSeries, matchers: &[LabelMatcher]) -> Result<bool, String> {
+fn series_selection_from_remote_matchers(
+    matchers: &[LabelMatcher],
+) -> Result<SeriesSelection, String> {
+    let mut selection = SeriesSelection::new();
+
     for matcher in matchers {
         let matcher_type = MatcherType::try_from(matcher.r#type)
             .map_err(|_| format!("unknown matcher type: {}", matcher.r#type))?;
-        let label_value = label_value(series, &matcher.name);
 
-        match matcher_type {
-            MatcherType::Eq => {
-                if label_value != Some(matcher.value.as_str()) {
-                    return Ok(false);
-                }
-            }
-            MatcherType::Neq => {
-                if label_value == Some(matcher.value.as_str()) {
-                    return Ok(false);
-                }
-            }
-            MatcherType::Re => {
-                let regex = compile_prometheus_regex(&matcher.value)?;
-                if !label_value.is_some_and(|value| regex.is_match(value)) {
-                    return Ok(false);
-                }
-            }
-            MatcherType::Nre => {
-                let regex = compile_prometheus_regex(&matcher.value)?;
-                if label_value.is_some_and(|value| regex.is_match(value)) {
-                    return Ok(false);
-                }
-            }
+        if matcher.name == "__name__" && matches!(matcher_type, MatcherType::Eq) {
+            selection = selection.with_metric(matcher.value.clone());
         }
+
+        let op = match matcher_type {
+            MatcherType::Eq => SeriesMatcherOp::Equal,
+            MatcherType::Neq => SeriesMatcherOp::NotEqual,
+            MatcherType::Re => SeriesMatcherOp::RegexMatch,
+            MatcherType::Nre => SeriesMatcherOp::RegexNoMatch,
+        };
+        selection = selection.with_matcher(SeriesMatcher::new(
+            matcher.name.clone(),
+            op,
+            matcher.value.clone(),
+        ));
     }
 
-    Ok(true)
-}
-
-fn compile_prometheus_regex(pattern: &str) -> Result<Regex, String> {
-    let wrapped = format!("^(?:{})$", pattern);
-    Regex::new(&wrapped).map_err(|err| format!("invalid regex matcher '{pattern}': {err}"))
-}
-
-fn label_value<'a>(series: &'a MetricSeries, name: &str) -> Option<&'a str> {
-    if name == "__name__" {
-        return Some(series.name.as_str());
-    }
-
-    series
-        .labels
-        .iter()
-        .find(|label| label.name == name)
-        .map(|label| label.value.as_str())
+    Ok(selection)
 }
 
 fn decode_body(request: &HttpRequest) -> Result<Vec<u8>, String> {
