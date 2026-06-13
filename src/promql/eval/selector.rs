@@ -74,7 +74,7 @@ pub(crate) fn eval_matrix_selector(
                 let points = engine.storage().select(metric, &labels, start, end)?;
                 let samples = points
                     .into_iter()
-                    .filter(|p| p.timestamp >= start && p.timestamp < end)
+                    .filter(|p| p.timestamp > start && p.timestamp < end)
                     .filter(|p| !is_stale_nan_value(&p.value))
                     .fold(Series::new(metric.clone(), labels), |mut series, point| {
                         if let Some(histogram) = point.value.as_histogram() {
@@ -190,7 +190,7 @@ fn collect_range_series_for_metric(
 
         let series = points
             .into_iter()
-            .filter(|p| p.timestamp >= start && p.timestamp < end)
+            .filter(|p| p.timestamp > start && p.timestamp < end)
             .filter(|p| !is_stale_nan_value(&p.value))
             .fold(
                 Series::new(metric.to_string(), labels),

@@ -138,9 +138,13 @@ pub(super) fn authorize_request_scope(
 }
 
 pub(super) fn extract_bearer_token(request: &crate::http::HttpRequest) -> Option<&str> {
-    request
-        .header("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
+    let authorization = request.header("authorization")?;
+    let (scheme, token) = authorization.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
 }
 
 fn classify_request_scope(request: &crate::http::HttpRequest) -> RequestScope {
@@ -334,4 +338,26 @@ fn request_permission_for(
         _ => None,
     };
     Ok(permission)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn request_with_auth(value: &str) -> crate::http::HttpRequest {
+        crate::http::HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/labels".to_string(),
+            headers: HashMap::from([("authorization".to_string(), value.to_string())]),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bearer_token_extraction_is_case_insensitive_and_trims_token() {
+        let request = request_with_auth("bearer   secret-token   ");
+        assert_eq!(extract_bearer_token(&request), Some("secret-token"));
+    }
 }

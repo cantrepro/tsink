@@ -1351,9 +1351,13 @@ fn unix_timestamp_millis() -> u64 {
 }
 
 fn bearer_token(request: &HttpRequest) -> Option<&str> {
-    request
-        .header("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
+    let authorization = request.header("authorization")?;
+    let (scheme, token) = authorization.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
 }
 
 fn tenant_header_value(request: &HttpRequest) -> Result<Option<&str>, String> {

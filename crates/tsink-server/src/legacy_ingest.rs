@@ -844,14 +844,11 @@ fn parse_graphite_timestamp(
 
 fn normalize_legacy_tags(
     tags: Vec<(String, String)>,
-    context: &str,
+    _context: &str,
 ) -> Result<Vec<(String, String)>, String> {
     let mut normalized = Vec::with_capacity(tags.len());
     for (name, value) in tags {
         let value = value.trim();
-        if value.is_empty() {
-            return Err(format!("{context} label '{name}' value must not be empty"));
-        }
         normalized.push((name, value.to_string()));
     }
     Ok(normalized)

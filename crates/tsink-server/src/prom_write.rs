@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use tsink::label::{MAX_LABEL_NAME_LEN, MAX_LABEL_VALUE_LEN, MAX_METRIC_NAME_LEN};
 use tsink::{
     DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint as TsinkHistogramResetHint,
-    Label, NativeHistogram, Row, Value,
+    Label, NativeHistogram, Row, TimestampPrecision, Value,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -124,6 +124,7 @@ pub struct NormalizedMetricMetadataUpdate {
 pub fn normalize_remote_write_request(
     write_req: WriteRequest,
     tenant_id: &str,
+    precision: TimestampPrecision,
 ) -> Result<NormalizedWriteEnvelope, String> {
     let mut envelope = NormalizedWriteEnvelope::default();
 
@@ -137,13 +138,14 @@ pub fn normalize_remote_write_request(
         let identity = normalize_series_identity(series.labels, tenant_id, series_idx)?;
 
         for (sample_idx, sample) in series.samples.into_iter().enumerate() {
-            validate_timestamp_sanity(
+            let timestamp = convert_remote_write_timestamp(
                 sample.timestamp,
+                precision,
                 &format!("remote write timeseries index {series_idx} sample index {sample_idx}"),
             )?;
             envelope.scalar_samples.push(NormalizedScalarSample {
                 series: identity.clone(),
-                data_point: DataPoint::new(sample.timestamp, sample.value),
+                data_point: DataPoint::new(timestamp, sample.value),
             });
         }
 
@@ -151,6 +153,7 @@ pub fn normalize_remote_write_request(
             envelope.exemplars.push(normalize_exemplar(
                 identity.clone(),
                 exemplar,
+                precision,
                 series_idx,
                 exemplar_idx,
             )?);
@@ -160,6 +163,7 @@ pub fn normalize_remote_write_request(
             envelope.histogram_samples.push(normalize_histogram(
                 identity.clone(),
                 histogram,
+                precision,
                 series_idx,
                 histogram_idx,
             )?);
@@ -248,11 +252,13 @@ fn normalize_metadata_update(
 fn normalize_exemplar(
     series: NormalizedSeriesIdentity,
     exemplar: crate::prom_remote::Exemplar,
+    precision: TimestampPrecision,
     series_idx: usize,
     exemplar_idx: usize,
 ) -> Result<NormalizedExemplar, String> {
-    validate_timestamp_sanity(
+    let timestamp = convert_remote_write_timestamp(
         exemplar.timestamp,
+        precision,
         &format!("remote write timeseries index {series_idx} exemplar index {exemplar_idx}"),
     )?;
     let labels = normalize_auxiliary_labels(
@@ -262,7 +268,7 @@ fn normalize_exemplar(
     Ok(NormalizedExemplar {
         series,
         labels,
-        timestamp: exemplar.timestamp,
+        timestamp,
         value: exemplar.value,
     })
 }
@@ -270,11 +276,13 @@ fn normalize_exemplar(
 fn normalize_histogram(
     series: NormalizedSeriesIdentity,
     histogram: crate::prom_remote::Histogram,
+    precision: TimestampPrecision,
     series_idx: usize,
     histogram_idx: usize,
 ) -> Result<NormalizedHistogramSample, String> {
-    validate_timestamp_sanity(
+    let timestamp = convert_remote_write_timestamp(
         histogram.timestamp,
+        precision,
         &format!("remote write timeseries index {series_idx} histogram index {histogram_idx}"),
     )?;
     let reset_hint = HistogramResetHint::try_from(histogram.reset_hint).map_err(|_| {
@@ -305,7 +313,7 @@ fn normalize_histogram(
         positive_deltas: histogram.positive_deltas,
         positive_counts: histogram.positive_counts,
         reset_hint,
-        timestamp: histogram.timestamp,
+        timestamp,
         custom_values: histogram.custom_values,
     })
 }
@@ -403,9 +411,6 @@ fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> 
     if name.is_empty() {
         return Err(format!("{context} label name must not be empty"));
     }
-    if value.is_empty() {
-        return Err(format!("{context} label '{name}' value must not be empty"));
-    }
     if name.len() > MAX_LABEL_NAME_LEN {
         return Err(format!(
             "{context} label '{name}' exceeds the {MAX_LABEL_NAME_LEN}-byte name limit"
@@ -417,6 +422,22 @@ fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> 
         ));
     }
     Ok(())
+}
+
+fn convert_remote_write_timestamp(
+    timestamp_millis: i64,
+    precision: TimestampPrecision,
+    context: &str,
+) -> Result<i64, String> {
+    validate_timestamp_sanity(timestamp_millis, context)?;
+    let millis = i128::from(timestamp_millis);
+    let scaled = match precision {
+        TimestampPrecision::Seconds => millis / 1_000,
+        TimestampPrecision::Milliseconds => millis,
+        TimestampPrecision::Microseconds => millis.saturating_mul(1_000),
+        TimestampPrecision::Nanoseconds => millis.saturating_mul(1_000_000),
+    };
+    i64::try_from(scaled).map_err(|_| format!("{context} timestamp is out of range"))
 }
 
 fn validate_timestamp_sanity(timestamp: i64, context: &str) -> Result<(), String> {
@@ -517,6 +538,7 @@ mod tests {
                 metadata: Vec::new(),
             },
             "tenant-a",
+            TimestampPrecision::Milliseconds,
         )
         .expect("normalization should succeed");
 
@@ -556,10 +578,98 @@ mod tests {
                 metadata: Vec::new(),
             },
             "tenant-a",
+            TimestampPrecision::Milliseconds,
         )
         .expect_err("duplicate labels must be rejected");
 
         assert!(err.contains("duplicate label 'host'"));
+    }
+
+    #[test]
+    fn normalize_remote_write_request_converts_timestamps_to_server_precision() {
+        let envelope = normalize_remote_write_request(
+            WriteRequest {
+                timeseries: vec![TimeSeries {
+                    labels: vec![PromLabel {
+                        name: "__name__".to_string(),
+                        value: "cpu_usage".to_string(),
+                    }],
+                    samples: vec![Sample {
+                        value: 11.5,
+                        timestamp: 1_700_000_000_123,
+                    }],
+                    ..Default::default()
+                }],
+                metadata: Vec::new(),
+            },
+            "tenant-a",
+            TimestampPrecision::Seconds,
+        )
+        .expect("normalization should succeed");
+
+        assert_eq!(
+            envelope.scalar_samples[0].data_point.timestamp,
+            1_700_000_000
+        );
+
+        let envelope = normalize_remote_write_request(
+            WriteRequest {
+                timeseries: vec![TimeSeries {
+                    labels: vec![PromLabel {
+                        name: "__name__".to_string(),
+                        value: "cpu_usage".to_string(),
+                    }],
+                    samples: vec![Sample {
+                        value: 11.5,
+                        timestamp: 1_700_000_000_123,
+                    }],
+                    ..Default::default()
+                }],
+                metadata: Vec::new(),
+            },
+            "tenant-a",
+            TimestampPrecision::Nanoseconds,
+        )
+        .expect("normalization should succeed");
+
+        assert_eq!(
+            envelope.scalar_samples[0].data_point.timestamp,
+            1_700_000_000_123_000_000
+        );
+    }
+
+    #[test]
+    fn normalize_remote_write_request_accepts_empty_label_values() {
+        let envelope = normalize_remote_write_request(
+            WriteRequest {
+                timeseries: vec![TimeSeries {
+                    labels: vec![
+                        PromLabel {
+                            name: "__name__".to_string(),
+                            value: "cpu_usage".to_string(),
+                        },
+                        PromLabel {
+                            name: "optional".to_string(),
+                            value: String::new(),
+                        },
+                    ],
+                    samples: vec![Sample {
+                        value: 11.5,
+                        timestamp: 1_700_000_000_000,
+                    }],
+                    ..Default::default()
+                }],
+                metadata: Vec::new(),
+            },
+            "tenant-a",
+            TimestampPrecision::Milliseconds,
+        )
+        .expect("normalization should succeed");
+
+        assert!(envelope.scalar_samples[0]
+            .series
+            .labels
+            .contains(&Label::new("optional", "")));
     }
 
     #[test]
@@ -681,6 +791,7 @@ mod tests {
                 }],
             },
             "tenant-a",
+            TimestampPrecision::Milliseconds,
         )
         .expect("normalization should succeed");
 
@@ -710,6 +821,7 @@ mod tests {
                 metadata: Vec::new(),
             },
             "tenant-a",
+            TimestampPrecision::Milliseconds,
         )
         .expect_err("max timestamp must be rejected");
 

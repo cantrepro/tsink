@@ -27,7 +27,7 @@ pub(crate) fn validate_labels(labels: &[Label]) -> Result<()> {
         }
         if !label.is_valid() {
             return Err(TsinkError::InvalidLabel(
-                "label name and value must be non-empty".to_string(),
+                "label name must be non-empty".to_string(),
             ));
         }
         if label.name.len() > crate::label::MAX_LABEL_NAME_LEN

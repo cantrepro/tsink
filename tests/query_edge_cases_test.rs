@@ -214,12 +214,24 @@ fn test_query_rejects_invalid_labels() {
     let err = storage
         .select(
             "invalid_label_select",
-            &[Label::new("key", "")],
+            &[Label::new("", "value")],
             1,
             i64::MAX,
         )
         .unwrap_err();
     assert!(matches!(err, TsinkError::InvalidLabel(_)));
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "empty_label_value",
+            vec![Label::new("key", "")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    let points = storage
+        .select("empty_label_value", &[Label::new("key", "")], 1, 2)
+        .unwrap();
+    assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
 
     let oversized = Label {
         name: "key".to_string(),

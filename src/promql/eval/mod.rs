@@ -223,11 +223,17 @@ impl Engine {
 
     fn build_prefetch_cache(&self, expr: &Expr, start: i64, end: i64) -> Result<PrefetchCache> {
         let mut metrics = BTreeSet::new();
-        let mut max_window = self.default_lookback_delta;
-        self.collect_prefetch_requirements(expr, &mut metrics, &mut max_window);
+        let mut max_past_window = self.default_lookback_delta;
+        let mut max_future_window = 0;
+        self.collect_prefetch_requirements(
+            expr,
+            &mut metrics,
+            &mut max_past_window,
+            &mut max_future_window,
+        );
 
-        let fetch_start = start.saturating_sub(max_window);
-        let fetch_end = end.saturating_add(1);
+        let fetch_start = start.saturating_sub(max_past_window);
+        let fetch_end = end.saturating_add(max_future_window).saturating_add(1);
 
         let mut cache = PrefetchCache::default();
         for metric in metrics {
@@ -246,7 +252,8 @@ impl Engine {
         &self,
         expr: &Expr,
         metrics: &mut BTreeSet<String>,
-        max_window: &mut i64,
+        max_past_window: &mut i64,
+        max_future_window: &mut i64,
     ) {
         match expr {
             Expr::VectorSelector(VectorSelector {
@@ -258,7 +265,14 @@ impl Engine {
                     metrics.insert(metric.clone());
                 }
                 let offset = duration_to_units(*offset, self.timestamp_units_per_second);
-                *max_window = (*max_window).max(self.default_lookback_delta.saturating_add(offset));
+                let past = self.default_lookback_delta.saturating_add(offset.max(0));
+                let future = if offset < 0 {
+                    offset.saturating_neg()
+                } else {
+                    0
+                };
+                *max_past_window = (*max_past_window).max(past);
+                *max_future_window = (*max_future_window).max(future);
             }
             Expr::MatrixSelector(MatrixSelector { vector, range }) => {
                 if let Some(metric) = &vector.metric_name {
@@ -266,32 +280,73 @@ impl Engine {
                 }
                 let offset = duration_to_units(vector.offset, self.timestamp_units_per_second);
                 let range = duration_to_units(*range, self.timestamp_units_per_second);
-                *max_window = (*max_window).max(
-                    self.default_lookback_delta
-                        .saturating_add(offset)
-                        .saturating_add(range),
-                );
+                let past = range.saturating_add(offset.max(0));
+                let future = if offset < 0 {
+                    offset.saturating_neg()
+                } else {
+                    0
+                };
+                *max_past_window = (*max_past_window).max(past);
+                *max_future_window = (*max_future_window).max(future);
             }
-            Expr::Unary(u) => self.collect_prefetch_requirements(&u.expr, metrics, max_window),
+            Expr::Unary(u) => self.collect_prefetch_requirements(
+                &u.expr,
+                metrics,
+                max_past_window,
+                max_future_window,
+            ),
             Expr::Binary(b) => {
-                self.collect_prefetch_requirements(&b.lhs, metrics, max_window);
-                self.collect_prefetch_requirements(&b.rhs, metrics, max_window);
+                self.collect_prefetch_requirements(
+                    &b.lhs,
+                    metrics,
+                    max_past_window,
+                    max_future_window,
+                );
+                self.collect_prefetch_requirements(
+                    &b.rhs,
+                    metrics,
+                    max_past_window,
+                    max_future_window,
+                );
             }
             Expr::Aggregation(a) => {
                 if let Some(param) = &a.param {
-                    self.collect_prefetch_requirements(param, metrics, max_window);
+                    self.collect_prefetch_requirements(
+                        param,
+                        metrics,
+                        max_past_window,
+                        max_future_window,
+                    );
                 }
-                self.collect_prefetch_requirements(&a.expr, metrics, max_window);
+                self.collect_prefetch_requirements(
+                    &a.expr,
+                    metrics,
+                    max_past_window,
+                    max_future_window,
+                );
             }
             Expr::Call(c) => {
                 for arg in &c.args {
-                    self.collect_prefetch_requirements(arg, metrics, max_window);
+                    self.collect_prefetch_requirements(
+                        arg,
+                        metrics,
+                        max_past_window,
+                        max_future_window,
+                    );
                 }
             }
-            Expr::Subquery(SubqueryExpr { expr, .. }) => {
-                self.collect_prefetch_requirements(expr, metrics, max_window)
-            }
-            Expr::Paren(inner) => self.collect_prefetch_requirements(inner, metrics, max_window),
+            Expr::Subquery(SubqueryExpr { expr, .. }) => self.collect_prefetch_requirements(
+                expr,
+                metrics,
+                max_past_window,
+                max_future_window,
+            ),
+            Expr::Paren(inner) => self.collect_prefetch_requirements(
+                inner,
+                metrics,
+                max_past_window,
+                max_future_window,
+            ),
             Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
         }
     }

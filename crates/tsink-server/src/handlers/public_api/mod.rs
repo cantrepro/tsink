@@ -105,6 +105,7 @@ mod tests {
                     .compress_vec(&encoded)
                     .expect("snappy encode should succeed"),
             },
+            TimestampPrecision::Milliseconds,
             None,
             None,
             None,
@@ -169,6 +170,7 @@ mod tests {
                         .compress_vec(&encoded)
                         .expect("snappy encode should succeed"),
                 },
+                TimestampPrecision::Milliseconds,
                 None,
                 None,
                 None,

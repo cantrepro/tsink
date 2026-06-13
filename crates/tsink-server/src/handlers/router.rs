@@ -195,6 +195,7 @@ pub(super) async fn route_request(
                 metadata_store,
                 exemplar_store,
                 &request,
+                timestamp_precision,
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,

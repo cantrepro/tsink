@@ -11084,6 +11084,7 @@ mod tests {
             &metadata_store,
             &exemplar_store,
             &request,
+            TimestampPrecision::Milliseconds,
             None,
             None,
             None,

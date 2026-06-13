@@ -247,7 +247,7 @@ An empty metric name is rejected at ingest time.
 
 ### Labels
 
-A label is a UTF-8 key-value pair. Both name and value must be non-empty. Length limits:
+A label is a UTF-8 key-value pair. Names must be non-empty; values may be empty. Length limits:
 
 | Field | Limit |
 |---|---|

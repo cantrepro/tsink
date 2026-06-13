@@ -6,6 +6,7 @@ pub(crate) async fn handle_remote_write(
     metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
+    precision: TimestampPrecision,
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
@@ -21,6 +22,7 @@ pub(crate) async fn handle_remote_write(
         metadata_store,
         exemplar_store,
         request,
+        precision,
         cluster_context,
         edge_sync_context,
         tenant_registry,
@@ -37,6 +39,7 @@ pub(crate) async fn handle_remote_write_with_admission(
     metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
+    precision: TimestampPrecision,
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
@@ -68,7 +71,7 @@ pub(crate) async fn handle_remote_write_with_admission(
         Ok(req) => req,
         Err(err) => return text_response(400, &format!("invalid protobuf body: {err}")),
     };
-    let envelope = match normalize_remote_write_request(write_req, &tenant_id) {
+    let envelope = match normalize_remote_write_request(write_req, &tenant_id, precision) {
         Ok(envelope) => envelope,
         Err(err) => return text_response(400, &err),
     };

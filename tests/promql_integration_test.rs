@@ -632,6 +632,55 @@ fn selector_exact_and_regex_matchers_work() {
 }
 
 #[test]
+fn negative_offset_reads_forward_in_time_for_range_queries() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::new("future_metric", DataPoint::new(600, 1.0)),
+            Row::new("future_metric", DataPoint::new(660, 7.0)),
+        ])
+        .unwrap();
+
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+    let value = engine
+        .range_query("future_metric offset -1m", 600, 600, 60)
+        .unwrap();
+    let series = as_range_vector(value);
+
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].samples, vec![(600, 7.0)]);
+}
+
+#[test]
+fn range_selectors_exclude_the_left_boundary() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::new("boundary_metric", DataPoint::new(0, 1.0)),
+            Row::new("boundary_metric", DataPoint::new(60, 2.0)),
+            Row::new("boundary_metric", DataPoint::new(120, 3.0)),
+            Row::new("boundary_metric", DataPoint::new(180, 4.0)),
+        ])
+        .unwrap();
+
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+    let samples = as_instant_vector(
+        engine
+            .instant_query("count_over_time(boundary_metric[3m])", 180)
+            .unwrap(),
+    );
+
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].value, 3.0);
+}
+
+#[test]
 fn rate_irate_and_increase_work_for_counter_data() {
     let storage = setup_storage();
     let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
@@ -851,7 +900,7 @@ fn over_time_functions_work() {
             .unwrap(),
     );
     assert_eq!(avg.len(), 1);
-    assert!((avg[0].value - 450.0).abs() < 1e-9);
+    assert!((avg[0].value - 480.0).abs() < 1e-9);
 
     let count = as_instant_vector(
         engine
@@ -862,7 +911,7 @@ fn over_time_functions_work() {
             .unwrap(),
     );
     assert_eq!(count.len(), 1);
-    assert!((count[0].value - 6.0).abs() < 1e-9);
+    assert!((count[0].value - 5.0).abs() < 1e-9);
 }
 
 #[test]
@@ -1207,7 +1256,7 @@ fn additional_range_functions_work() {
             .instant_query("delta(reset_metric[3m])", 180)
             .unwrap(),
     );
-    assert_eq!(delta[0].value, 6.0);
+    assert_eq!(delta[0].value, 4.5);
 
     let idelta = as_instant_vector(
         engine
@@ -1221,7 +1270,7 @@ fn additional_range_functions_work() {
             .instant_query("changes(reset_metric[3m])", 180)
             .unwrap(),
     );
-    assert_eq!(changes[0].value, 3.0);
+    assert_eq!(changes[0].value, 2.0);
 
     let resets = as_instant_vector(
         engine
@@ -1249,14 +1298,14 @@ fn additional_range_functions_work() {
             .instant_query("stdvar_over_time(reset_metric[3m])", 180)
             .unwrap(),
     );
-    assert!((stdvar[0].value - 5.25).abs() < 1e-9);
+    assert!((stdvar[0].value - (38.0 / 9.0)).abs() < 1e-9);
 
     let stddev = as_instant_vector(
         engine
             .instant_query("stddev_over_time(reset_metric[3m])", 180)
             .unwrap(),
     );
-    assert!((stddev[0].value - 5.25_f64.sqrt()).abs() < 1e-9);
+    assert!((stddev[0].value - (38.0_f64 / 9.0).sqrt()).abs() < 1e-9);
 }
 
 #[test]
@@ -1328,7 +1377,7 @@ fn absent_and_additional_range_functions_work() {
             .unwrap(),
     );
     assert_eq!(quantile.len(), 1);
-    assert!((quantile[0].value - 3.0).abs() < 1e-9);
+    assert!((quantile[0].value - 4.0).abs() < 1e-9);
 
     let deriv = as_instant_vector(
         engine
@@ -1742,7 +1791,7 @@ fn native_histogram_selectors_and_supported_functions_work() {
     let increased = as_instant_vector(
         engine
             .instant_query(
-                r#"increase(request_duration_native_seconds{instance="a"}[1m])"#,
+                r#"increase(request_duration_native_seconds{instance="a"}[2m])"#,
                 120,
             )
             .unwrap(),
@@ -1751,15 +1800,15 @@ fn native_histogram_selectors_and_supported_functions_work() {
         .histogram
         .as_deref()
         .expect("increase should return a histogram sample");
-    assert_eq!(increased_hist.count, Some(HistogramCount::Float(10.0)));
-    assert_eq!(increased_hist.sum, 8.0);
-    assert_eq!(increased_hist.zero_count, Some(HistogramCount::Float(2.0)));
-    assert_eq!(increased_hist.positive_counts, vec![3.0, 5.0]);
+    assert_eq!(increased_hist.count, Some(HistogramCount::Float(20.0)));
+    assert_eq!(increased_hist.sum, 16.0);
+    assert_eq!(increased_hist.zero_count, Some(HistogramCount::Float(4.0)));
+    assert_eq!(increased_hist.positive_counts, vec![6.0, 10.0]);
 
     let rated = as_instant_vector(
         engine
             .instant_query(
-                r#"rate(request_duration_native_seconds{instance="a"}[1m])"#,
+                r#"rate(request_duration_native_seconds{instance="a"}[2m])"#,
                 120,
             )
             .unwrap(),
@@ -1892,7 +1941,7 @@ fn math_and_predict_linear_functions_work() {
             .unwrap(),
     );
     assert_eq!(mad.len(), 1);
-    assert!((mad[0].value - 1.5).abs() < 1e-9);
+    assert!((mad[0].value - 2.0).abs() < 1e-9);
 
     let des = as_instant_vector(
         engine

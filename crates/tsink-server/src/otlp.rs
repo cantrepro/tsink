@@ -826,14 +826,7 @@ fn any_value_to_string(value: Option<AnyValue>, context: &str) -> Result<String,
         return Err(format!("{context} contains an attribute without a value"));
     };
     match value {
-        any_value::Value::StringValue(value) => {
-            if value.is_empty() {
-                return Err(format!(
-                    "{context} contains an empty string attribute value, which tsink labels cannot represent safely"
-                ));
-            }
-            Ok(value)
-        }
+        any_value::Value::StringValue(value) => Ok(value),
         any_value::Value::BoolValue(value) => Ok(value.to_string()),
         any_value::Value::IntValue(value) => Ok(value.to_string()),
         any_value::Value::DoubleValue(value) => Ok(format_float(value)),
@@ -969,9 +962,6 @@ fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> 
     let max_label_value_len = tsink::label::MAX_LABEL_VALUE_LEN;
     if name.is_empty() {
         return Err(format!("{context} label name must not be empty"));
-    }
-    if value.is_empty() {
-        return Err(format!("{context} label '{name}' value must not be empty"));
     }
     if name.len() > max_label_name_len {
         return Err(format!(

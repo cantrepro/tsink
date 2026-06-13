@@ -11,7 +11,7 @@ pub const MAX_LABEL_VALUE_LEN: usize = 16 * 1024;
 /// Maximum metric-name length that can be marshaled losslessly by the current binary format.
 pub const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 
-/// Metric label. Empty names or values are invalid.
+/// Metric label. Empty names are invalid; empty values are valid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Label {
     pub name: String,
@@ -28,7 +28,7 @@ impl Label {
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.name.is_empty() && !self.value.is_empty()
+        !self.name.is_empty()
     }
 }
 
@@ -176,12 +176,6 @@ pub fn unmarshal_metric_name(marshaled: &[u8]) -> crate::Result<(String, Vec<Lab
         }
         let value_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
-        if value_len == 0 {
-            return Err(TsinkError::DataCorruption(
-                "invalid metric key encoding: empty label value".to_string(),
-            ));
-        }
-
         if pos + value_len > bytes.len() {
             return Err(TsinkError::DataCorruption(format!(
                 "invalid metric key encoding: label value length {} exceeds payload size {}",
@@ -228,7 +222,7 @@ mod tests {
         assert!(!label1.is_valid());
 
         let label2 = Label::new("name", "");
-        assert!(!label2.is_valid());
+        assert!(label2.is_valid());
     }
 
     #[test]
@@ -258,6 +252,15 @@ mod tests {
         let label2 = Label::new("key", "b".repeat(0x80));
         let marshaled2 = marshal_metric_name("world", &[label2]);
         assert!(!marshaled2.is_empty());
+    }
+
+    #[test]
+    fn test_marshal_preserves_empty_label_values() {
+        let marshaled = marshal_metric_name("metric", &[Label::new("optional", "")]);
+        let (metric, labels) = unmarshal_metric_name(&marshaled).unwrap();
+
+        assert_eq!(metric, "metric");
+        assert_eq!(labels, vec![Label::new("optional", "")]);
     }
 
     #[test]

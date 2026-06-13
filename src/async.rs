@@ -425,15 +425,18 @@ impl AsyncStorage {
             return Err(TsinkError::StorageClosed);
         }
 
+        let mut state_guard = ClosingStateGuard::new(&self.runtime.state);
         let (reply, recv) = reply_channel();
         self.runtime
             .write_tx
             .send(WriteCommand::Close { reply })
             .await
             .map_err(|_| {
+                state_guard.disarm();
                 self.runtime.state.store(STATE_CLOSED, Ordering::SeqCst);
                 runtime_stopped_error()
             })?;
+        state_guard.disarm();
 
         recv_reply(recv).await
     }
@@ -443,6 +446,34 @@ impl AsyncStorage {
             return Err(TsinkError::StorageClosed);
         }
         Ok(())
+    }
+}
+
+struct ClosingStateGuard<'a> {
+    state: &'a AtomicU8,
+    armed: bool,
+}
+
+impl<'a> ClosingStateGuard<'a> {
+    fn new(state: &'a AtomicU8) -> Self {
+        Self { state, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClosingStateGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.state.compare_exchange(
+                STATE_CLOSING,
+                STATE_OPEN,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
     }
 }
 
