@@ -284,6 +284,8 @@ Endpoints:
   POST /api/v1/read                 Prometheus remote read
   POST /api/v1/import/prometheus    Text exposition format ingestion
   GET  /api/v1/status/tsdb          TSDB stats
+  POST /api/v1/admin/snapshot       Create atomic snapshot
+  POST /api/v1/admin/restore        Restore snapshot to data path
   POST /api/v1/admin/delete_series  Delete series (stub)"
     );
 }

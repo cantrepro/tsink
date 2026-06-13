@@ -349,6 +349,16 @@ pub trait Storage: Send + Sync {
         StorageObservabilitySnapshot::default()
     }
 
+    /// Writes an atomic on-disk snapshot to `destination`.
+    ///
+    /// Snapshot support is backend-specific and may not be available for all storage
+    /// implementations.
+    fn snapshot(&self, _destination: &Path) -> Result<()> {
+        Err(TsinkError::InvalidConfiguration(
+            "snapshot is not implemented for this storage backend".to_string(),
+        ))
+    }
+
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
 }
@@ -583,6 +593,14 @@ impl StorageBuilder {
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
         crate::engine::build_storage(self)
+    }
+
+    /// Atomically restores `data_path` from a previously created snapshot directory.
+    pub fn restore_from_snapshot(
+        snapshot_path: impl AsRef<Path>,
+        data_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        crate::engine::restore_storage_from_snapshot(snapshot_path.as_ref(), data_path.as_ref())
     }
 
     pub(crate) fn chunk_points(&self) -> usize {

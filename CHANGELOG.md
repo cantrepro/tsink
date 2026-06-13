@@ -5,9 +5,11 @@ tsink
 - Instrument flush/persist internals (pipeline runs/success/timeouts/errors/duration, active flush series/chunks/points, persist success/noop/errors, persisted series/chunks/points/segments, eviction stats)
 - Instrument compaction internals with per-run source/output segment/chunk/point accounting and expose `CompactionRunStats`
 - Instrument query internals (`select`, `select_with_options`, `select_all`, `select_series`) with call/error/duration/result counts plus merge-path vs append/sort-path selection counters
+- Add atomic snapshot/restore APIs (`Storage::snapshot`, `StorageBuilder::restore_from_snapshot`) with segment-consistent, WAL-aware backups
 tsink-server
 - Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges
 - Deepen `/api/v1/status/tsdb` response with nested internal observability sections (`wal`, `flush`, `compaction`, `query`)
+- Add admin snapshot/restore endpoints (`POST /api/v1/admin/snapshot`, `POST /api/v1/admin/restore`)
 
 0.8.1
 general

@@ -22,6 +22,7 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - **Rich queries** — downsampling, aggregation (12 built-in functions), pagination, and custom bytes aggregation via the `Codec`/`Aggregator` traits.
 - **Disk persistence** — immutable segment files with a crash-safe commit protocol.
 - **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) with idempotent replay on recovery.
+- **Atomic snapshot/restore** — create segment-consistent, WAL-aware backups and restore them atomically.
 - **Out-of-order writes** — data is returned sorted by timestamp regardless of insertion order.
 - **Concurrent writers** — multiple threads can insert simultaneously with sharded internal locking.
 - **Optional PromQL engine** — instant and range queries with 20+ built-in functions; enable with the `promql` Cargo feature.
@@ -43,6 +44,7 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - [Label Constraints](#label-constraints)
 - [PromQL Engine](#promql-engine)
 - [Persistence and WAL](#persistence-and-wal)
+- [Snapshots and Restore](#snapshots-and-restore)
 - [On-Disk Layout](#on-disk-layout)
 - [Compression and Encoding](#compression-and-encoding)
 - [Performance](#performance)
@@ -200,6 +202,8 @@ cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-
 | POST | `/api/v1/read` | Prometheus remote read (protobuf + snappy). |
 | POST | `/api/v1/import/prometheus` | Prometheus text exposition format ingestion. |
 | GET | `/api/v1/status/tsdb` | TSDB stats (JSON). |
+| POST | `/api/v1/admin/snapshot` | Create atomic segment-consistent, WAL-aware snapshot (`{\"path\":\"...\"}`). |
+| POST | `/api/v1/admin/restore` | Restore snapshot to a data directory (`{\"snapshotPath\":\"...\",\"dataPath\":\"...\"}`). |
 | POST | `/api/v1/admin/delete_series` | Delete series (stub, returns 501). |
 
 ### TLS
@@ -836,6 +840,43 @@ let points = storage.select("metric", &[], 0, i64::MAX)?;
 ```
 
 Recovery is idempotent — a high-water mark ensures WAL frames are never applied twice.
+
+### Snapshots and Restore
+
+Use `snapshot()` for an atomic, segment-consistent, WAL-aware backup of a live storage:
+
+```rust
+use tsink::{DataPoint, Row, StorageBuilder};
+
+let storage = StorageBuilder::new()
+    .with_data_path("/data/tsink-primary")
+    .build()?;
+
+storage.insert_rows(&[
+    Row::new("cpu", DataPoint::new(1, 0.5)),
+    Row::new("cpu", DataPoint::new(2, 0.7)),
+])?;
+
+storage.snapshot(std::path::Path::new("/backups/tsink-snap-001"))?;
+storage.close()?;
+```
+
+Restore the snapshot atomically into another data path:
+
+```rust
+use tsink::StorageBuilder;
+
+StorageBuilder::restore_from_snapshot(
+    std::path::Path::new("/backups/tsink-snap-001"),
+    std::path::Path::new("/data/tsink-restore"),
+)?;
+
+let restored = StorageBuilder::new()
+    .with_data_path("/data/tsink-restore")
+    .build()?;
+```
+
+`restore_from_snapshot` replaces the target data directory in a single staged publish step and preserves WAL replay semantics on reopen.
 
 ### Multi-Dimensional Label Querying
 

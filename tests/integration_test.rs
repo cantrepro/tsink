@@ -135,6 +135,111 @@ fn test_persistence() {
 }
 
 #[test]
+fn test_snapshot_and_restore_recover_wal_backed_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("source");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let restore_path = temp_dir.path().join("restore");
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_chunk_points(4096)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::new("snapshot_metric", DataPoint::new(1, 11.0)),
+                Row::new("snapshot_metric", DataPoint::new(2, 22.0)),
+            ])
+            .unwrap();
+
+        storage.snapshot(&snapshot_path).unwrap();
+        storage.close().unwrap();
+    }
+
+    // Force a WAL-only restore path to verify replay-aware recovery.
+    let _ = fs::remove_dir_all(snapshot_path.join("lane_numeric"));
+    let _ = fs::remove_dir_all(snapshot_path.join("lane_blob"));
+
+    StorageBuilder::restore_from_snapshot(&snapshot_path, &restore_path).unwrap();
+
+    let restored = StorageBuilder::new()
+        .with_data_path(&restore_path)
+        .with_chunk_points(4096)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let points = restored.select("snapshot_metric", &[], 0, 10).unwrap();
+    assert_eq!(
+        points,
+        vec![DataPoint::new(1, 11.0), DataPoint::new(2, 22.0)]
+    );
+    restored.close().unwrap();
+}
+
+#[test]
+fn test_restore_from_snapshot_replaces_existing_target_contents() {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("source");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let target_path = temp_dir.path().join("target");
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("restored_metric", DataPoint::new(1, 1.0))])
+            .unwrap();
+        storage.snapshot(&snapshot_path).unwrap();
+        storage.close().unwrap();
+    }
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(&target_path)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("old_metric", DataPoint::new(1, 9.0))])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    StorageBuilder::restore_from_snapshot(&snapshot_path, &target_path).unwrap();
+
+    let restored = StorageBuilder::new()
+        .with_data_path(&target_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let restored_points = restored.select("restored_metric", &[], 0, 10).unwrap();
+    assert_eq!(restored_points, vec![DataPoint::new(1, 1.0)]);
+    let old_points = restored.select("old_metric", &[], 0, 10).unwrap();
+    assert!(old_points.is_empty());
+
+    restored.close().unwrap();
+}
+
+#[test]
+fn test_snapshot_requires_persistent_storage() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("snapshot");
+
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+}
+
+#[test]
 fn test_out_of_order_inserts() {
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)

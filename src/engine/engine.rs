@@ -46,6 +46,7 @@ const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLOSE_COMPACTION_MAX_PASSES: usize = 128;
 const IN_MEMORY_SHARD_COUNT: usize = 64;
 const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
+static SNAPSHOT_STAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn saturating_u64_from_usize(value: usize) -> u64 {
     value.min(u64::MAX as usize) as u64
@@ -3781,6 +3782,73 @@ impl Storage for ChunkStorage {
         }
     }
 
+    fn snapshot(&self, destination: &Path) -> Result<()> {
+        self.ensure_open()?;
+        let write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
+        self.ensure_open()?;
+        let _compaction_guard = self.compaction_lock.lock();
+
+        if destination.exists() {
+            drop(write_permits);
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot destination already exists: {}",
+                destination.display()
+            )));
+        }
+
+        let Some(destination_parent) = destination.parent() else {
+            drop(write_permits);
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot destination has no parent directory: {}",
+                destination.display()
+            )));
+        };
+        std::fs::create_dir_all(destination_parent)?;
+
+        let wal_dir = self
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.path().parent().map(|path| path.to_path_buf()));
+
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() && wal_dir.is_none() {
+            drop(write_permits);
+            return Err(TsinkError::InvalidConfiguration(
+                "snapshot requires persistent storage (data_path with segments and/or WAL)"
+                    .to_string(),
+            ));
+        }
+
+        let staging = stage_dir_path(destination, "snapshot")?;
+        std::fs::create_dir_all(&staging)?;
+        let snapshot_result = (|| -> Result<()> {
+            if let Some(path) = &self.numeric_lane_path {
+                copy_dir_if_exists(path, &staging.join(NUMERIC_LANE_ROOT))?;
+            }
+            if let Some(path) = &self.blob_lane_path {
+                copy_dir_if_exists(path, &staging.join(BLOB_LANE_ROOT))?;
+            }
+            if let Some(path) = wal_dir.as_deref() {
+                copy_dir_if_exists(path, &staging.join(WAL_DIR_NAME))?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = snapshot_result {
+            let _ = remove_path_if_exists(&staging);
+            drop(write_permits);
+            return Err(err);
+        }
+
+        if let Err(err) = std::fs::rename(&staging, destination) {
+            let _ = remove_path_if_exists(&staging);
+            drop(write_permits);
+            return Err(err.into());
+        }
+
+        drop(write_permits);
+        Ok(())
+    }
+
     fn close(&self) -> Result<()> {
         if self
             .lifecycle
@@ -3941,6 +4009,202 @@ fn clear_wal_dir_if_present(wal_path: &Path) -> Result<()> {
         std::fs::remove_dir_all(wal_path)?;
     } else {
         std::fs::remove_file(wal_path)?;
+    }
+
+    Ok(())
+}
+
+fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
+    let Some(parent) = target.parent() else {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "{purpose} target has no parent directory: {}",
+            target.display()
+        )));
+    };
+
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("snapshot");
+
+    for _ in 0..256 {
+        let nonce = SNAPSHOT_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".tmp-tsink-{purpose}-{target_name}-{nonce:016x}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(TsinkError::Other(format!(
+        "failed to allocate unique staging path for {}",
+        target.display()
+    )))
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(source)?;
+    if !metadata.is_dir() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "expected directory while copying {}, found non-directory",
+            source.display()
+        )));
+    }
+
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_type = entry.file_type()?;
+        let entry_source = entry.path();
+        let entry_destination = destination.join(entry.file_name());
+
+        if entry_type.is_dir() {
+            copy_dir_recursive(&entry_source, &entry_destination)?;
+        } else if entry_type.is_file() {
+            std::fs::copy(&entry_source, &entry_destination)?;
+        } else {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "unsupported non-file entry while copying snapshot: {}",
+                entry_source.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()> {
+    match std::fs::metadata(source) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "snapshot source is not a directory: {}",
+                    source.display()
+                )));
+            }
+            copy_dir_recursive(source, destination)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(source)?;
+    if !metadata.is_dir() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot path is not a directory: {}",
+            source.display()
+        )));
+    }
+
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_type = entry.file_type()?;
+        let entry_source = entry.path();
+        let entry_destination = destination.join(entry.file_name());
+
+        if entry_type.is_dir() {
+            copy_dir_recursive(&entry_source, &entry_destination)?;
+        } else if entry_type.is_file() {
+            std::fs::copy(&entry_source, &entry_destination)?;
+        } else {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "unsupported non-file entry while restoring snapshot: {}",
+                entry_source.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+pub fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Path) -> Result<()> {
+    if snapshot_path == data_path {
+        return Err(TsinkError::InvalidConfiguration(
+            "snapshot and restore paths must differ".to_string(),
+        ));
+    }
+
+    let snapshot_meta = std::fs::metadata(snapshot_path).map_err(|err| TsinkError::IoWithPath {
+        path: snapshot_path.to_path_buf(),
+        source: err,
+    })?;
+    if !snapshot_meta.is_dir() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot path is not a directory: {}",
+            snapshot_path.display()
+        )));
+    }
+
+    let Some(parent) = data_path.parent() else {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "restore target has no parent directory: {}",
+            data_path.display()
+        )));
+    };
+    std::fs::create_dir_all(parent)?;
+
+    let staging = stage_dir_path(data_path, "restore-staging")?;
+    std::fs::create_dir_all(&staging)?;
+    if let Err(err) = copy_dir_contents(snapshot_path, &staging) {
+        let _ = remove_path_if_exists(&staging);
+        return Err(err);
+    }
+
+    let backup = if data_path.exists() {
+        Some(stage_dir_path(data_path, "restore-backup")?)
+    } else {
+        None
+    };
+
+    if let Some(backup_path) = backup.as_ref() {
+        if let Err(err) = std::fs::rename(data_path, backup_path) {
+            let _ = remove_path_if_exists(&staging);
+            return Err(err.into());
+        }
+    }
+
+    if let Err(activate_err) = std::fs::rename(&staging, data_path) {
+        let mut rollback_err = None;
+        if let Some(backup_path) = backup.as_ref() {
+            if let Err(err) = std::fs::rename(backup_path, data_path) {
+                rollback_err = Some(err);
+            }
+        }
+        let _ = remove_path_if_exists(&staging);
+
+        if let Some(rollback_err) = rollback_err {
+            return Err(TsinkError::Other(format!(
+                "restore activation failed: {activate_err}; rollback failed: {rollback_err}"
+            )));
+        }
+        return Err(activate_err.into());
+    }
+
+    if let Some(backup_path) = backup {
+        if let Err(cleanup_err) = remove_path_if_exists(&backup_path) {
+            return Err(TsinkError::Other(format!(
+                "restore succeeded but failed to remove backup {}: {cleanup_err}",
+                backup_path.display()
+            )));
+        }
     }
 
     Ok(())

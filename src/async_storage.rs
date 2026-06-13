@@ -7,7 +7,7 @@ use crate::{
     StorageBuilder, TimestampPrecision, TsinkError,
 };
 use parking_lot::Mutex;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -49,6 +49,7 @@ type Reply<T> = async_channel::Sender<Result<T>>;
 
 enum WriteCommand {
     InsertRows { rows: Vec<Row>, reply: Reply<()> },
+    Snapshot { path: PathBuf, reply: Reply<()> },
     Close { reply: Reply<()> },
 }
 
@@ -288,6 +289,21 @@ impl AsyncStorage {
         self.runtime.storage.memory_budget()
     }
 
+    /// Writes an atomic on-disk snapshot to `path`.
+    pub async fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .write_tx
+            .send(WriteCommand::Snapshot {
+                path: path.as_ref().to_path_buf(),
+                reply,
+            })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
     /// Close the storage. Additional operations return `StorageClosed`.
     pub async fn close(&self) -> Result<()> {
         if self
@@ -477,6 +493,10 @@ fn write_worker_loop(
                 // Writes are side-effecting: once accepted into the queue they must run,
                 // even if the caller drops/cancels the awaiting future.
                 let result = storage.insert_rows(&rows);
+                let _ = reply.send_blocking(result);
+            }
+            WriteCommand::Snapshot { path, reply } => {
+                let result = storage.snapshot(&path);
                 let _ = reply.send_blocking(result);
             }
             WriteCommand::Close { reply } => {

@@ -4,9 +4,12 @@ use crate::prom_remote::{
     Sample as PromSample, TimeSeries, WriteRequest,
 };
 use prost::Message;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use snap::raw::{Decoder as SnappyDecoder, Encoder as SnappyEncoder};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tsink::promql::ast::{Expr, MatchOp};
@@ -14,7 +17,7 @@ use tsink::promql::types::PromqlValue;
 use tsink::promql::Engine;
 use tsink::{
     DataPoint, Label, Row, SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage,
-    TimestampPrecision,
+    StorageBuilder, TimestampPrecision,
 };
 
 pub async fn handle_request(
@@ -51,11 +54,45 @@ pub async fn handle_request(
             handle_prometheus_import(storage, &request, timestamp_precision).await
         }
         ("GET", "/api/v1/status/tsdb") => handle_tsdb_status(storage).await,
+        ("POST", "/api/v1/admin/snapshot") => handle_admin_snapshot(storage, &request).await,
+        ("POST", "/api/v1/admin/restore") => handle_admin_restore(&request).await,
         ("POST", "/api/v1/admin/delete_series") => {
             text_response(501, "series deletion is not yet supported")
         }
         _ => text_response(404, "not found"),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SnapshotAdminPayload {
+    path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RestoreAdminPayload {
+    #[serde(default, alias = "snapshotPath")]
+    snapshot_path: Option<String>,
+    #[serde(default, alias = "dataPath")]
+    data_path: Option<String>,
+}
+
+fn parse_optional_json_body<T: DeserializeOwned>(
+    request: &HttpRequest,
+) -> Result<Option<T>, String> {
+    if request.body.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::from_slice(&request.body)
+        .map(Some)
+        .map_err(|err| format!("invalid JSON body: {err}"))
+}
+
+fn non_empty_param(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 async fn handle_instant_query(
@@ -645,6 +682,103 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
     )
 }
 
+async fn handle_admin_snapshot(storage: &Arc<dyn Storage>, request: &HttpRequest) -> HttpResponse {
+    let path = match non_empty_param(request.param("path")) {
+        Some(path) => path,
+        None => {
+            let payload = match parse_optional_json_body::<SnapshotAdminPayload>(request) {
+                Ok(payload) => payload.unwrap_or_default(),
+                Err(err) => return text_response(400, &err),
+            };
+            match non_empty_param(payload.path) {
+                Some(path) => path,
+                None => {
+                    return text_response(
+                        400,
+                        "missing required parameter 'path' (query/form or JSON body)",
+                    )
+                }
+            }
+        }
+    };
+
+    let storage = Arc::clone(storage);
+    let response_path = path.clone();
+    let path_buf = PathBuf::from(path);
+    let result = tokio::task::spawn_blocking(move || storage.snapshot(&path_buf)).await;
+
+    match result {
+        Ok(Ok(())) => json_response(
+            200,
+            &json!({
+                "status": "success",
+                "data": {
+                    "path": response_path
+                }
+            }),
+        ),
+        Ok(Err(err)) => text_response(500, &format!("snapshot failed: {err}")),
+        Err(err) => text_response(500, &format!("snapshot task failed: {err}")),
+    }
+}
+
+async fn handle_admin_restore(request: &HttpRequest) -> HttpResponse {
+    let payload = match parse_optional_json_body::<RestoreAdminPayload>(request) {
+        Ok(payload) => payload.unwrap_or_default(),
+        Err(err) => return text_response(400, &err),
+    };
+
+    let snapshot_path = non_empty_param(
+        request
+            .param("snapshot_path")
+            .or_else(|| request.param("snapshotPath")),
+    )
+    .or_else(|| non_empty_param(payload.snapshot_path));
+    let data_path = non_empty_param(
+        request
+            .param("data_path")
+            .or_else(|| request.param("dataPath")),
+    )
+    .or_else(|| non_empty_param(payload.data_path));
+
+    let Some(snapshot_path) = snapshot_path else {
+        return text_response(
+            400,
+            "missing required parameter 'snapshot_path' (or 'snapshotPath')",
+        );
+    };
+    let Some(data_path) = data_path else {
+        return text_response(
+            400,
+            "missing required parameter 'data_path' (or 'dataPath')",
+        );
+    };
+
+    let response_snapshot_path = snapshot_path.clone();
+    let response_data_path = data_path.clone();
+    let snapshot_path_buf = PathBuf::from(snapshot_path);
+    let data_path_buf = PathBuf::from(data_path);
+    let result = tokio::task::spawn_blocking(move || {
+        StorageBuilder::restore_from_snapshot(&snapshot_path_buf, &data_path_buf)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => json_response(
+            200,
+            &json!({
+                "status": "success",
+                "data": {
+                    "snapshotPath": response_snapshot_path,
+                    "dataPath": response_data_path
+                }
+            }),
+        ),
+        Ok(Err(err)) => text_response(500, &format!("restore failed: {err}")),
+        Err(err) => text_response(500, &format!("restore task failed: {err}")),
+    }
+}
+
 async fn handle_remote_write(storage: &Arc<dyn Storage>, request: &HttpRequest) -> HttpResponse {
     let decoded = match decode_body(request) {
         Ok(body) => body,
@@ -1145,6 +1279,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tempfile::TempDir;
     use tsink::{StorageBuilder, TimestampPrecision};
 
     fn make_storage() -> Arc<dyn Storage> {
@@ -1596,6 +1731,102 @@ mod tests {
         assert!(body["data"]["flush"]["pipelineRunsTotal"].is_number());
         assert!(body["data"]["compaction"]["runsTotal"].is_number());
         assert!(body["data"]["query"]["selectCallsTotal"].is_number());
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_endpoint_creates_snapshot() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let source_path = temp_dir.path().join("source");
+        let snapshot_path = temp_dir.path().join("snapshot");
+
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let engine = make_engine(&storage);
+
+        storage
+            .insert_rows(&[Row::new("admin_snapshot_metric", DataPoint::new(1, 1.0))])
+            .expect("insert should succeed");
+
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/snapshot".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::to_vec(&json!({
+                "path": snapshot_path.to_string_lossy()
+            }))
+            .expect("json should encode"),
+        };
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert!(snapshot_path.exists());
+
+        storage.close().expect("close should succeed");
+    }
+
+    #[tokio::test]
+    async fn admin_restore_endpoint_restores_snapshot() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let source_path = temp_dir.path().join("source");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        let restore_path = temp_dir.path().join("restored");
+
+        let source_storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        source_storage
+            .insert_rows(&[Row::new("admin_restore_metric", DataPoint::new(1, 9.0))])
+            .expect("insert should succeed");
+        source_storage
+            .snapshot(&snapshot_path)
+            .expect("snapshot should succeed");
+        source_storage.close().expect("close should succeed");
+
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/restore".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::to_vec(&json!({
+                "snapshotPath": snapshot_path.to_string_lossy(),
+                "dataPath": restore_path.to_string_lossy(),
+            }))
+            .expect("json should encode"),
+        };
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let restored_storage = StorageBuilder::new()
+            .with_data_path(&restore_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("restored storage should build");
+        let points = restored_storage
+            .select("admin_restore_metric", &[], 0, 10)
+            .expect("select should succeed");
+        assert_eq!(points, vec![DataPoint::new(1, 9.0)]);
+        restored_storage.close().expect("close should succeed");
     }
 
     #[tokio::test]

@@ -131,6 +131,38 @@ async fn persistent_storage_reopen_roundtrip() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_snapshot_restore_roundtrip() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("source");
+    let snapshot_path = dir.path().join("snapshot");
+    let restored_path = dir.path().join("restored");
+
+    {
+        let storage = AsyncStorageBuilder::new()
+            .with_data_path(&source_path)
+            .build()?;
+        storage
+            .insert_rows(vec![Row::new("snapshot_async", DataPoint::new(1, 42.0))])
+            .await?;
+        storage.snapshot(&snapshot_path).await?;
+        storage.close().await?;
+    }
+
+    StorageBuilder::restore_from_snapshot(&snapshot_path, &restored_path)?;
+
+    {
+        let restored = AsyncStorageBuilder::new()
+            .with_data_path(&restored_path)
+            .build()?;
+        let points = restored.select("snapshot_async", vec![], 0, 10).await?;
+        assert_eq!(points, vec![DataPoint::new(1, 42.0)]);
+        restored.close().await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_from_tokio_tasks() -> Result<()> {
     let storage = AsyncStorageBuilder::new().with_read_workers(2).build()?;
