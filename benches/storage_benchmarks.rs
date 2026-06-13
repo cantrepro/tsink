@@ -3,6 +3,9 @@
 //! Run with: cargo bench
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 
 /// Benchmark storage insertions
@@ -71,8 +74,6 @@ fn bench_select_among_thousand_points(c: &mut Criterion) {
 
 /// Benchmark selecting among millions of points
 fn bench_select_among_million_points(c: &mut Criterion) {
-    use std::time::Duration;
-
     // Create storage with much larger partition duration to fit 1M points
     // 1M seconds = ~278 hours, so use 150 hour partitions (2 partitions total)
     let storage = StorageBuilder::new()
@@ -121,9 +122,6 @@ fn bench_select_among_million_points(c: &mut Criterion) {
 
 /// Benchmark concurrent insertions
 fn bench_concurrent_insertions(c: &mut Criterion) {
-    use std::sync::Arc;
-    use std::thread;
-
     c.bench_function("concurrent_insert_10_threads", |b| {
         b.iter(|| {
             let storage = Arc::new(

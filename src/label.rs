@@ -1,5 +1,6 @@
 //! Label handling for metrics.
 
+use crate::TsinkError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -96,8 +97,6 @@ pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> String {
 
 /// Unmarshals a metric name back into metric and labels.
 pub fn unmarshal_metric_name(marshaled: &str) -> crate::Result<(String, Vec<Label>)> {
-    use crate::TsinkError;
-
     let bytes = marshaled.as_bytes();
     if bytes.len() < 2 {
         return Ok((marshaled.to_string(), Vec::new()));

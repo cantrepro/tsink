@@ -1,7 +1,7 @@
 //! Concurrency utilities for tsink.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -16,7 +16,8 @@ pub struct Semaphore {
     permits: Arc<AtomicUsize>,
     #[allow(dead_code)]
     max_permits: usize,
-    waiters: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+    condvar: Arc<Condvar>,
+    mutex: Arc<Mutex<()>>,
 }
 
 impl Semaphore {
@@ -25,7 +26,8 @@ impl Semaphore {
         Self {
             permits: Arc::new(AtomicUsize::new(permits)),
             max_permits: permits,
-            waiters: Arc::new(Mutex::new(Vec::new())),
+            condvar: Arc::new(Condvar::new()),
+            mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -49,8 +51,11 @@ impl Semaphore {
                     return SemaphoreGuard { semaphore: self };
                 }
             } else {
-                // Wait for a permit to become available
-                thread::yield_now();
+                // Wait for a permit to become available using condition variable
+                let mut lock = self.mutex.lock();
+                while self.permits.load(Ordering::Acquire) == 0 {
+                    self.condvar.wait(&mut lock);
+                }
             }
         }
     }
@@ -75,11 +80,8 @@ impl Semaphore {
         let previous = self.permits.fetch_add(1, Ordering::AcqRel);
         debug!("Released semaphore permit, {} now available", previous + 1);
 
-        // Wake up any waiters
-        let mut waiters = self.waiters.lock();
-        if let Some(waiter) = waiters.pop() {
-            waiter.store(true, Ordering::Release);
-        }
+        // Wake up all waiters to avoid starvation
+        self.condvar.notify_all();
     }
 
     /// Returns the number of available permits.

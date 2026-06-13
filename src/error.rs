@@ -100,25 +100,25 @@ pub enum TsinkError {
 }
 
 impl<T> From<std::sync::PoisonError<T>> for TsinkError {
-    fn from(_: std::sync::PoisonError<T>) -> Self {
+    fn from(err: std::sync::PoisonError<T>) -> Self {
         TsinkError::LockPoisoned {
-            resource: "unknown".to_string(),
+            resource: format!("{:?}", err),
         }
     }
 }
 
 impl<T> From<crossbeam_channel::SendError<T>> for TsinkError {
-    fn from(_: crossbeam_channel::SendError<T>) -> Self {
+    fn from(err: crossbeam_channel::SendError<T>) -> Self {
         TsinkError::ChannelSend {
-            channel: "unknown".to_string(),
+            channel: format!("{:?}", err),
         }
     }
 }
 
 impl From<crossbeam_channel::RecvError> for TsinkError {
-    fn from(_: crossbeam_channel::RecvError) -> Self {
+    fn from(err: crossbeam_channel::RecvError) -> Self {
         TsinkError::ChannelReceive {
-            channel: "unknown".to_string(),
+            channel: format!("{:?}", err),
         }
     }
 }
@@ -130,7 +130,7 @@ impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
                 TsinkError::ChannelTimeout { timeout_ms: 0 }
             }
             crossbeam_channel::RecvTimeoutError::Disconnected => TsinkError::ChannelReceive {
-                channel: "unknown".to_string(),
+                channel: "timeout: channel disconnected".to_string(),
             },
         }
     }

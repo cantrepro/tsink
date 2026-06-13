@@ -1,5 +1,7 @@
 //! Integration tests for tsink.
 
+use std::sync::Arc;
+use std::thread;
 use tempfile::TempDir;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision, TsinkError};
 
@@ -133,9 +135,6 @@ fn test_out_of_order_inserts() {
 
 #[test]
 fn test_concurrent_writes() {
-    use std::sync::Arc;
-    use std::thread;
-
     // Use in-memory storage for more reliable testing
     let storage = Arc::new(
         StorageBuilder::new()

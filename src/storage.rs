@@ -4,7 +4,7 @@ use crate::disk::DiskPartition;
 use crate::list::PartitionList;
 use crate::memory::MemoryPartition;
 use crate::partition::SharedPartition;
-use crate::wal::{DiskWal, NopWal, Wal};
+use crate::wal::{DiskWal, NopWal, Wal, WalReader};
 use crate::{DataPoint, Label, Result, Row, TsinkError};
 use crossbeam_channel::{Sender, bounded};
 use std::fs;
@@ -130,6 +130,26 @@ impl StorageBuilder {
 
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
+        // Check file descriptor limits on Unix systems
+        #[cfg(unix)]
+        {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+                    let required_fds = 100; // Minimum required file descriptors
+                    if rlim.rlim_cur < required_fds {
+                        tracing::warn!(
+                            "Low file descriptor limit: {}. Consider increasing with 'ulimit -n'",
+                            rlim.rlim_cur
+                        );
+                    }
+                }
+            }
+        }
+
         // Create WAL based on configuration
         let wal: Arc<dyn Wal> = if let Some(ref data_path) = self.data_path {
             if self.wal_enabled && self.wal_buffer_size > 0 {
@@ -194,8 +214,6 @@ struct StorageImpl {
 
 impl StorageImpl {
     fn recover_from_wal(&self, wal_dir: &Path) -> Result<()> {
-        use crate::wal::WalReader;
-
         let reader = WalReader::new(wal_dir)?;
         let rows = reader.read_all()?;
 

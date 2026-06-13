@@ -1,5 +1,6 @@
 //! Write-ahead log implementation.
 
+use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::{DataPoint, Result, Row, TsinkError};
 use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
@@ -169,8 +170,6 @@ impl DiskWal {
 
 impl Wal for DiskWal {
     fn append_rows(&self, rows: &[Row]) -> Result<()> {
-        use crate::label::marshal_metric_name;
-
         self.get_or_create_writer()?;
 
         let mut current = self.current_segment.lock();
@@ -180,7 +179,7 @@ impl Wal for DiskWal {
                 segment.writer.write_all(&[WalOperation::Insert as u8])?;
 
                 // Marshal metric name with labels (like Go version)
-                let metric_name = marshal_metric_name(&row.metric, &row.labels);
+                let metric_name = marshal_metric_name(row.metric(), row.labels());
 
                 // Write metric name length as varint
                 let mut len_buf = [0u8; 10];
@@ -192,11 +191,11 @@ impl Wal for DiskWal {
 
                 // Write timestamp as varint
                 let mut ts_buf = [0u8; 10];
-                let ts_size = encode_varint(row.data_point.timestamp, &mut ts_buf);
+                let ts_size = encode_varint(row.data_point().timestamp, &mut ts_buf);
                 segment.writer.write_all(&ts_buf[..ts_size])?;
 
                 // Write value as float64 bits encoded as uvarint
-                let value_bits = row.data_point.value.to_bits();
+                let value_bits = row.data_point().value.to_bits();
                 let mut val_buf = [0u8; 10];
                 let val_size = encode_uvarint(value_bits, &mut val_buf);
                 segment.writer.write_all(&val_buf[..val_size])?;
@@ -317,8 +316,6 @@ impl WalReader {
 
     /// Reads a single WAL segment.
     fn read_segment(&mut self, path: &Path) -> Result<()> {
-        use crate::label::unmarshal_metric_name;
-
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 

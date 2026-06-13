@@ -3,7 +3,7 @@
 use crate::disk::{DiskMetric, DiskPartition, PartitionMeta};
 use crate::encoding::GorillaEncoder;
 use crate::label::marshal_metric_name;
-use crate::partition::SharedPartition;
+use crate::partition::{Partition, SharedPartition};
 use crate::wal::Wal;
 use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
 use dashmap::DashMap;
@@ -77,8 +77,6 @@ impl MemoryPartition {
         dir_path: impl AsRef<Path>,
         retention: Duration,
     ) -> Result<DiskPartition> {
-        use crate::partition::Partition;
-
         let dir_path = dir_path.as_ref();
 
         // Create directory
@@ -159,16 +157,22 @@ impl crate::partition::Partition for MemoryPartition {
 
         for row in rows {
             // Check if row is outdated
-            if row.data_point.timestamp < self.min_t.load(Ordering::SeqCst) {
+            if row.data_point().timestamp < self.min_t.load(Ordering::SeqCst) {
                 outdated_rows.push(row.clone());
                 continue;
             }
 
-            // Use current time if timestamp is 0
-            let timestamp = if row.data_point.timestamp == 0 {
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            // Validate and handle zero timestamp
+            let timestamp = if row.data_point().timestamp == 0 {
+                let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                tracing::warn!(
+                    "Replacing zero timestamp with current time {} for metric {}",
+                    now,
+                    row.metric()
+                );
+                now
             } else {
-                row.data_point.timestamp
+                row.data_point().timestamp
             };
 
             if timestamp > max_timestamp {
@@ -176,21 +180,35 @@ impl crate::partition::Partition for MemoryPartition {
             }
 
             // Get or create metric
-            let metric_name = marshal_metric_name(&row.metric, &row.labels);
+            let metric_name = marshal_metric_name(row.metric(), row.labels());
             let metric = self.get_or_create_metric(metric_name);
 
             // Insert the point
-            metric.insert_point(DataPoint::new(timestamp, row.data_point.value));
+            metric.insert_point(DataPoint::new(timestamp, row.data_point().value));
             rows_added += 1;
         }
 
         // Update counters
         self.num_points.fetch_add(rows_added, Ordering::SeqCst);
 
-        // Update max timestamp
-        let current_max = self.max_t.load(Ordering::SeqCst);
-        if max_timestamp > current_max {
-            self.max_t.store(max_timestamp, Ordering::SeqCst);
+        // Update max timestamp atomically
+        loop {
+            let current_max = self.max_t.load(Ordering::Acquire);
+            if max_timestamp <= current_max {
+                break;
+            }
+            if self
+                .max_t
+                .compare_exchange_weak(
+                    current_max,
+                    max_timestamp,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
         }
 
         Ok(outdated_rows)
@@ -305,25 +323,29 @@ impl MemoryMetric {
             size: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(0),
             max_timestamp: AtomicI64::new(0),
-            points: RwLock::new(Vec::with_capacity(1000)),
+            points: RwLock::new(Vec::new()),
             out_of_order_points: Mutex::new(Vec::new()),
         }
     }
 
     fn insert_point(&self, point: DataPoint) {
-        // Use compare_exchange to atomically check and update size from 0 to 1
-        // This ensures only one thread can successfully perform the first insertion
-        if self
-            .size
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // First insertion - only one thread can get here
+        // Check if this is the first insertion using a more reliable approach
+        let is_first = self.size.load(Ordering::Acquire) == 0;
+
+        if is_first {
+            // Acquire write lock first to ensure atomicity
             let mut points = self.points.write();
-            points.push(point);
-            self.min_timestamp.store(point.timestamp, Ordering::SeqCst);
-            self.max_timestamp.store(point.timestamp, Ordering::SeqCst);
-            return;
+
+            // Double-check inside the lock
+            if self.size.load(Ordering::Acquire) == 0 {
+                points.push(point);
+                self.min_timestamp.store(point.timestamp, Ordering::Release);
+                self.max_timestamp.store(point.timestamp, Ordering::Release);
+                self.size.store(1, Ordering::Release);
+                return;
+            }
+            // If we're here, another thread beat us to it
+            drop(points);
         }
 
         // Not the first insertion - normal path
@@ -355,22 +377,25 @@ impl MemoryMetric {
     }
 
     fn select_points(&self, start: i64, end: i64) -> Vec<DataPoint> {
-        let points = self.points.read();
-        let ooo_points = self.out_of_order_points.lock();
-
         let mut result = Vec::new();
 
-        // Add in-order points
-        for point in points.iter() {
-            if point.timestamp >= start && point.timestamp < end {
-                result.push(point.clone());
+        // Read in-order points first and release lock quickly
+        {
+            let points = self.points.read();
+            for point in points.iter() {
+                if point.timestamp >= start && point.timestamp < end {
+                    result.push(*point);
+                }
             }
         }
 
-        // Add out-of-order points
-        for point in ooo_points.iter() {
-            if point.timestamp >= start && point.timestamp < end {
-                result.push(point.clone());
+        // Then read out-of-order points
+        {
+            let ooo_points = self.out_of_order_points.lock();
+            for point in ooo_points.iter() {
+                if point.timestamp >= start && point.timestamp < end {
+                    result.push(*point);
+                }
             }
         }
 
@@ -380,34 +405,18 @@ impl MemoryMetric {
     }
 
     fn encode_all_points<W: Write>(&self, encoder: &mut GorillaEncoder<W>) -> Result<()> {
-        let points = self.points.read().clone();
-        let mut ooo_points = self.out_of_order_points.lock().clone();
+        let points = self.points.read();
+        let ooo_points = self.out_of_order_points.lock();
 
-        // Sort out-of-order points
-        ooo_points.sort_by_key(|p| p.timestamp);
+        // Create a sorted iterator without cloning
+        let mut all_points: Vec<&DataPoint> = Vec::with_capacity(points.len() + ooo_points.len());
+        all_points.extend(points.iter());
+        all_points.extend(ooo_points.iter());
+        all_points.sort_by_key(|p| p.timestamp);
 
-        // Merge sorted arrays
-        let mut i = 0;
-        let mut j = 0;
-
-        while i < ooo_points.len() && j < points.len() {
-            if ooo_points[i].timestamp < points[j].timestamp {
-                encoder.encode_point(&ooo_points[i])?;
-                i += 1;
-            } else {
-                encoder.encode_point(&points[j])?;
-                j += 1;
-            }
-        }
-
-        while i < ooo_points.len() {
-            encoder.encode_point(&ooo_points[i])?;
-            i += 1;
-        }
-
-        while j < points.len() {
-            encoder.encode_point(&points[j])?;
-            j += 1;
+        // Encode all points in sorted order
+        for point in all_points {
+            encoder.encode_point(point)?;
         }
 
         Ok(())
@@ -422,7 +431,7 @@ impl MemoryMetric {
     }
 
     fn size(&self) -> usize {
-        self.size.load(Ordering::SeqCst) + self.out_of_order_points.lock().len()
+        self.size.load(Ordering::SeqCst)
     }
 }
 

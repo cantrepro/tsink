@@ -45,11 +45,11 @@ impl DataPoint {
 #[derive(Debug, Clone)]
 pub struct Row {
     /// The unique name of the metric.
-    pub metric: String,
+    metric: String,
     /// Optional key-value properties for detailed identification.
-    pub labels: Vec<Label>,
+    labels: Vec<Label>,
     /// The data point.
-    pub data_point: DataPoint,
+    data_point: DataPoint,
 }
 
 impl Row {
@@ -73,6 +73,36 @@ impl Row {
             labels,
             data_point,
         }
+    }
+
+    /// Gets the metric name.
+    pub fn metric(&self) -> &str {
+        &self.metric
+    }
+
+    /// Gets the labels.
+    pub fn labels(&self) -> &[Label] {
+        &self.labels
+    }
+
+    /// Gets the data point.
+    pub fn data_point(&self) -> DataPoint {
+        self.data_point
+    }
+
+    /// Sets the metric name.
+    pub fn set_metric(&mut self, metric: impl Into<String>) {
+        self.metric = metric.into();
+    }
+
+    /// Sets the labels.
+    pub fn set_labels(&mut self, labels: Vec<Label>) {
+        self.labels = labels;
+    }
+
+    /// Sets the data point.
+    pub fn set_data_point(&mut self, data_point: DataPoint) {
+        self.data_point = data_point;
     }
 }
 
