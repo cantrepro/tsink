@@ -504,13 +504,13 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        let mut write_permits = Vec::with_capacity(self.write_limiter.capacity());
-        for _ in 0..self.write_limiter.capacity() {
-            let Some(permit) = self.write_limiter.try_acquire() else {
-                return Ok(());
-            };
-            write_permits.push(permit);
-        }
+        // Drain writer permits with a bounded wait so background flush can still make progress
+        // under sustained write load instead of bailing immediately when one permit is busy.
+        let write_permits = match self.write_limiter.acquire_all(self.write_timeout) {
+            Ok(permits) => permits,
+            Err(TsinkError::WriteTimeout { .. }) => return Ok(()),
+            Err(err) => return Err(err),
+        };
         self.flush_all_active()?;
         let persisted = self.persist_segment(true)?;
         drop(write_permits);
@@ -4584,6 +4584,85 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn flush_pipeline_waits_for_busy_writer_permit() {
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(lane_path.clone()),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_millis(250),
+                memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: false,
+            },
+        );
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                "flush_busy_writer",
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let series_id = storage
+            .registry
+            .read()
+            .resolve_existing("flush_busy_writer", &labels)
+            .unwrap()
+            .series_id;
+
+        let active_before = storage
+            .active_shard(series_id)
+            .read()
+            .get(&series_id)
+            .map_or(0, |state| state.builder.len());
+        assert_eq!(active_before, 1);
+
+        let held_permit = storage.write_limiter.acquire();
+        thread::scope(|scope| {
+            let flush = scope.spawn(|| storage.flush_pipeline_once());
+            thread::sleep(Duration::from_millis(50));
+            drop(held_permit);
+            flush.join().unwrap().unwrap();
+        });
+
+        let active_after = storage
+            .active_shard(series_id)
+            .read()
+            .get(&series_id)
+            .map_or(0, |state| state.builder.len());
+        assert_eq!(active_after, 0);
+        assert_eq!(
+            storage
+                .select("flush_busy_writer", &labels, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !load_segments_for_level(&lane_path, 0).unwrap().is_empty(),
+            "flush pipeline should persist after blocked writer permit is released"
         );
 
         storage.close().unwrap();
