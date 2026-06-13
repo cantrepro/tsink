@@ -371,48 +371,50 @@ impl ChunkStorage {
                 };
 
                 let interval = storage.background_persisted_refresh_poll_interval();
-                let control = BackgroundWorkerControl::for_storage(storage.as_ref());
-                let maintenance_pass =
-                    Self::begin_background_worker_pass(&control, interval, || {
-                        storage.background_maintenance_gate()
-                    });
-                let _maintenance_guard = match maintenance_pass {
-                    BackgroundWorkerPass::Ready(guard) => guard,
-                    BackgroundWorkerPass::Pause(duration) => {
-                        std::thread::park_timeout(duration);
-                        continue;
+                let park_duration = 'pass: {
+                    let control = BackgroundWorkerControl::for_storage(storage.as_ref());
+                    let maintenance_pass =
+                        Self::begin_background_worker_pass(&control, interval, || {
+                            storage.background_maintenance_gate()
+                        });
+                    let maintenance_guard = match maintenance_pass {
+                        BackgroundWorkerPass::Ready(guard) => guard,
+                        BackgroundWorkerPass::Pause(duration) => break 'pass Some(duration),
+                        BackgroundWorkerPass::Exit => break 'pass None,
+                    };
+
+                    match control.handle_result(
+                        "flush_maintenance",
+                        storage.run_post_flush_maintenance_if_pending(),
+                    ) {
+                        BackgroundWorkerFlow::Continue => {}
+                        BackgroundWorkerFlow::Pause(duration) => {
+                            drop(maintenance_guard);
+                            break 'pass Some(duration);
+                        }
+                        BackgroundWorkerFlow::Exit => {
+                            drop(maintenance_guard);
+                            break 'pass None;
+                        }
                     }
-                    BackgroundWorkerPass::Exit => break,
+
+                    let park_duration = match control.handle_result(
+                        "persisted_refresh",
+                        storage.sync_persisted_segments_from_disk_if_dirty(),
+                    ) {
+                        BackgroundWorkerFlow::Continue => Some(interval),
+                        BackgroundWorkerFlow::Pause(duration) => Some(duration),
+                        BackgroundWorkerFlow::Exit => None,
+                    };
+                    drop(maintenance_guard);
+                    park_duration
                 };
 
-                match control.handle_result(
-                    "flush_maintenance",
-                    storage.run_post_flush_maintenance_if_pending(),
-                ) {
-                    BackgroundWorkerFlow::Continue => {}
-                    BackgroundWorkerFlow::Pause(duration) => {
-                        drop(_maintenance_guard);
-                        std::thread::park_timeout(duration);
-                        continue;
-                    }
-                    BackgroundWorkerFlow::Exit => break,
-                }
-
-                match control.handle_result(
-                    "persisted_refresh",
-                    storage.sync_persisted_segments_from_disk_if_dirty(),
-                ) {
-                    BackgroundWorkerFlow::Continue => {}
-                    BackgroundWorkerFlow::Pause(duration) => {
-                        drop(_maintenance_guard);
-                        std::thread::park_timeout(duration);
-                        continue;
-                    }
-                    BackgroundWorkerFlow::Exit => break,
-                }
-
-                drop(_maintenance_guard);
-                std::thread::park_timeout(interval);
+                drop(storage);
+                let Some(park_duration) = park_duration else {
+                    break;
+                };
+                std::thread::park_timeout(park_duration);
             })?;
 
         Ok(Some(handle))

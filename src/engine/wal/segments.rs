@@ -412,7 +412,7 @@ pub(super) fn write_published_highwater_marker(
             file.sync_data()?;
         }
         drop(file);
-        fs::rename(tmp_path, path)?;
+        crate::engine::fs_utils::rename_tmp(tmp_path, path)?;
         if sync {
             sync_dir_path(dir)?;
         }
@@ -420,7 +420,7 @@ pub(super) fn write_published_highwater_marker(
     })();
 
     if write_result.is_err() {
-        let _ = fs::remove_file(tmp_path);
+        let _ = crate::engine::fs_utils::remove_file_if_exists(tmp_path);
     }
 
     write_result

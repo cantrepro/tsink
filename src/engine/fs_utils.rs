@@ -95,8 +95,64 @@ pub(crate) fn path_exists_no_follow(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+#[cfg(windows)]
+fn is_transient_windows_fs_error(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(5 | 32 | 33))
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(windows)]
+fn retry_windows_fs_operation<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const RETRY_ATTEMPTS: usize = 128;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+    for attempt in 0..RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt + 1 < RETRY_ATTEMPTS && is_transient_windows_fs_error(&err) => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("Windows filesystem retry loop should return from inside the loop")
+}
+
+#[cfg(windows)]
+fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_windows_fs_operation(|| std::fs::remove_dir_all(path))
+}
+
+#[cfg(not(windows))]
+fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
+#[cfg(windows)]
+fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_windows_fs_operation(|| std::fs::remove_file(path))
+}
+
+#[cfg(not(windows))]
+fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn rename_path_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    retry_windows_fs_operation(|| std::fs::rename(source, destination))
+}
+
+#[cfg(not(windows))]
+fn rename_path_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
 pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
-    match std::fs::remove_dir_all(path) {
+    match remove_dir_all_with_retry(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -104,7 +160,7 @@ pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
 }
 
 pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {
-    match std::fs::remove_file(path) {
+    match remove_file_with_retry(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -334,15 +390,17 @@ fn rename_tmp_impl(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
     let source = wide_path(tmp_path)?;
     let destination = wide_path(path)?;
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    let moved = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    retry_windows_fs_operation(|| {
+        let moved = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), flags) };
+        if moved == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn rename_and_sync_parents(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::rename(source, destination)?;
+    rename_path_with_retry(source, destination)?;
 
     let source_parent = source.parent();
     let destination_parent = destination.parent();

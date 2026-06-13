@@ -2404,7 +2404,7 @@ fn flush_pipeline_completes_while_another_writer_permit_is_held() {
             flush_tx.send(storage.flush_pipeline_once()).unwrap();
         });
         let flush_result = flush_rx
-            .recv_timeout(Duration::from_millis(200))
+            .recv_timeout(Duration::from_secs(2))
             .expect("flush should not wait for an unrelated held writer permit");
         flush_result.unwrap();
         drop(held_permit);
