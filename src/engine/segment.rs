@@ -77,6 +77,13 @@ pub struct SegmentManifest {
     pub series_count: usize,
     pub min_ts: Option<i64>,
     pub max_ts: Option<i64>,
+    pub wal_highwater: WalHighWatermark,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WalHighWatermark {
+    pub segment: u64,
+    pub frame: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +120,7 @@ pub struct LoadedSegmentIndexes {
     pub next_segment_id: u64,
     pub series: Vec<PersistedSeries>,
     pub indexed_segments: Vec<IndexedSegment>,
+    pub wal_replay_highwater: WalHighWatermark,
 }
 
 #[derive(Debug)]
@@ -145,6 +153,7 @@ struct ParsedManifest {
     series_count: usize,
     min_ts: Option<i64>,
     max_ts: Option<i64>,
+    wal_highwater: WalHighWatermark,
     files: [ManifestFileEntry; 4],
 }
 
@@ -188,6 +197,19 @@ impl SegmentWriter {
         registry: &SeriesRegistry,
         chunks_by_series: &HashMap<SeriesId, Vec<Chunk>>,
     ) -> Result<SegmentManifest> {
+        self.write_segment_with_wal_highwater(
+            registry,
+            chunks_by_series,
+            WalHighWatermark::default(),
+        )
+    }
+
+    pub fn write_segment_with_wal_highwater(
+        &self,
+        registry: &SeriesRegistry,
+        chunks_by_series: &HashMap<SeriesId, Vec<Chunk>>,
+        wal_highwater: WalHighWatermark,
+    ) -> Result<SegmentManifest> {
         prepare_staging_dir(&self.staging_layout.root)?;
 
         let (chunks_bytes, mut chunk_index, chunk_count, point_count, min_ts, max_ts) =
@@ -219,6 +241,7 @@ impl SegmentWriter {
             series_count,
             min_ts,
             max_ts,
+            wal_highwater,
         };
 
         let manifest_bytes = build_manifest_file(&self.staging_layout, &manifest)?;
@@ -316,11 +339,13 @@ pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndex
 
     let mut parsed = Vec::new();
     let mut max_segment_id = 0u64;
+    let mut max_wal_highwater = WalHighWatermark::default();
 
     for dir in dirs {
         match load_segment_dir_indexed(&dir) {
             Ok(segment) => {
                 max_segment_id = max_segment_id.max(segment.manifest.segment_id);
+                max_wal_highwater = max_wal_highwater.max(segment.manifest.wal_highwater);
                 parsed.push(segment);
             }
             Err(TsinkError::DataCorruption(msg)) => {
@@ -364,6 +389,7 @@ pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndex
         next_segment_id: max_segment_id.saturating_add(1).max(1),
         series: series_by_id.into_values().collect(),
         indexed_segments,
+        wal_replay_highwater: max_wal_highwater,
     })
 }
 
@@ -539,6 +565,7 @@ fn load_segment_dir(path: &Path) -> Result<ParsedSegment> {
         series_count: parsed_manifest.series_count,
         min_ts: parsed_manifest.min_ts,
         max_ts: parsed_manifest.max_ts,
+        wal_highwater: parsed_manifest.wal_highwater,
     };
 
     Ok(ParsedSegment {
@@ -611,6 +638,7 @@ fn load_segment_dir_indexed(path: &Path) -> Result<ParsedIndexedSegment> {
         series_count: parsed_manifest.series_count,
         min_ts: parsed_manifest.min_ts,
         max_ts: parsed_manifest.max_ts,
+        wal_highwater: parsed_manifest.wal_highwater,
     };
 
     Ok(ParsedIndexedSegment {
@@ -1024,8 +1052,8 @@ fn build_manifest_file(layout: &SegmentLayout, manifest: &SegmentManifest) -> Re
     bytes.extend_from_slice(&(manifest.series_count as u64).to_le_bytes());
     bytes.extend_from_slice(&(manifest.chunk_count as u64).to_le_bytes());
     bytes.extend_from_slice(&(manifest.point_count as u64).to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&manifest.wal_highwater.segment.to_le_bytes());
+    bytes.extend_from_slice(&manifest.wal_highwater.frame.to_le_bytes());
     bytes.extend_from_slice(&MANIFEST_FILE_ENTRY_COUNT.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
 
@@ -1087,8 +1115,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
     let series_count = read_u64(bytes, &mut pos)? as usize;
     let chunk_count = read_u64(bytes, &mut pos)? as usize;
     let point_count = read_u64(bytes, &mut pos)? as usize;
-    let _wal_highwater_segment = read_u64(bytes, &mut pos)?;
-    let _wal_highwater_frame = read_u64(bytes, &mut pos)?;
+    let wal_highwater_segment = read_u64(bytes, &mut pos)?;
+    let wal_highwater_frame = read_u64(bytes, &mut pos)?;
     let file_entry_count = read_u32(bytes, &mut pos)?;
     let _reserved1 = read_u32(bytes, &mut pos)?;
 
@@ -1138,6 +1166,10 @@ fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
             None
         } else {
             Some(max_ts_raw)
+        },
+        wal_highwater: WalHighWatermark {
+            segment: wal_highwater_segment,
+            frame: wal_highwater_frame,
         },
         files,
     })
@@ -1900,7 +1932,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{load_segments, SegmentWriter};
+    use super::{load_segments, load_segments_for_level, SegmentWriter, WalHighWatermark};
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::series_registry::SeriesRegistry;
@@ -1950,6 +1982,25 @@ mod tests {
         assert!(writer.layout().manifest_path.exists());
         let loaded = load_segments(tmp.path()).unwrap();
         assert_eq!(loaded.next_segment_id, 2);
+    }
+
+    #[test]
+    fn segment_roundtrip_preserves_wal_highwater() {
+        let tmp = TempDir::new().unwrap();
+        let (registry, chunks_by_series) = sample_segment_input();
+
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        let highwater = WalHighWatermark {
+            segment: 3,
+            frame: 77,
+        };
+        writer
+            .write_segment_with_wal_highwater(&registry, &chunks_by_series, highwater)
+            .unwrap();
+
+        let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].manifest.wal_highwater, highwater);
     }
 
     fn sample_segment_input() -> (SeriesRegistry, HashMap<u64, Vec<Chunk>>) {

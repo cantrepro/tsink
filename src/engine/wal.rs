@@ -9,6 +9,7 @@ use tracing::warn;
 
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::encoder::{EncodedChunk, Encoder};
+use crate::engine::segment::WalHighWatermark;
 use crate::engine::series_registry::SeriesId;
 use crate::wal::WalSyncMode;
 use crate::{Label, Result, TsinkError};
@@ -156,7 +157,21 @@ impl FramedWal {
     }
 
     pub fn replay_frames(&self) -> Result<Vec<ReplayFrame>> {
-        replay_from_path(&self.path)
+        self.replay_frames_after(WalHighWatermark::default())
+    }
+
+    pub fn replay_frames_after(
+        &self,
+        replay_highwater: WalHighWatermark,
+    ) -> Result<Vec<ReplayFrame>> {
+        replay_from_path(&self.path, replay_highwater)
+    }
+
+    pub fn current_highwater(&self) -> WalHighWatermark {
+        WalHighWatermark {
+            segment: 0,
+            frame: self.next_seq.load(Ordering::SeqCst).saturating_sub(1),
+        }
     }
 
     pub fn reset(&self) -> Result<()> {
@@ -164,9 +179,23 @@ impl FramedWal {
         writer.flush()?;
         writer.get_mut().set_len(0)?;
         writer.get_mut().sync_data()?;
-        self.next_seq.store(1, Ordering::SeqCst);
         *self.last_sync.lock() = Instant::now();
         Ok(())
+    }
+
+    pub fn ensure_min_next_seq(&self, min_next_seq: u64) {
+        let mut current = self.next_seq.load(Ordering::SeqCst);
+        while current < min_next_seq {
+            match self.next_seq.compare_exchange_weak(
+                current,
+                min_next_seq,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn append_frame(&self, frame_type: u8, payload: &[u8]) -> Result<()> {
@@ -271,7 +300,7 @@ fn merge_encoded_payload(ts_payload: &[u8], value_payload: &[u8]) -> Vec<u8> {
     payload
 }
 
-fn replay_from_path(path: &Path) -> Result<Vec<ReplayFrame>> {
+fn replay_from_path(path: &Path, replay_highwater: WalHighWatermark) -> Result<Vec<ReplayFrame>> {
     let file = OpenOptions::new().read(true).open(path)?;
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();
@@ -290,7 +319,7 @@ fn replay_from_path(path: &Path) -> Result<Vec<ReplayFrame>> {
         }
 
         let frame_type = header[4];
-        let _frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
+        let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
         let payload_len =
             u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
         let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
@@ -316,6 +345,14 @@ fn replay_from_path(path: &Path) -> Result<Vec<ReplayFrame>> {
         if checksum32(&payload) != expected_crc32 {
             warn!("Stopping WAL replay at frame with checksum mismatch");
             break;
+        }
+
+        let frame_pos = WalHighWatermark {
+            segment: 0,
+            frame: frame_seq,
+        };
+        if frame_pos <= replay_highwater {
+            continue;
         }
 
         let frame = match frame_type {
@@ -621,6 +658,7 @@ mod tests {
         FRAME_TYPE_SERIES_DEF, WAL_FILE_NAME,
     };
     use crate::engine::chunk::{ChunkPoint, ValueLane};
+    use crate::engine::segment::WalHighWatermark;
     use crate::{wal::WalSyncMode, Label, Value};
 
     #[test]
@@ -685,6 +723,52 @@ mod tests {
     }
 
     #[test]
+    fn replay_frames_after_skips_checkpointed_frames() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 7,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+
+        let batch = SamplesBatchFrame::from_points(
+            7,
+            ValueLane::Numeric,
+            &[
+                ChunkPoint {
+                    ts: 10,
+                    value: Value::F64(1.0),
+                },
+                ChunkPoint {
+                    ts: 20,
+                    value: Value::F64(2.0),
+                },
+            ],
+        )
+        .unwrap();
+        wal.append_samples(&[batch]).unwrap();
+
+        let replay = wal
+            .replay_frames_after(WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            })
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(replay[0], ReplayFrame::Samples(_)));
+        assert_eq!(
+            wal.current_highwater(),
+            WalHighWatermark {
+                segment: 0,
+                frame: 2
+            }
+        );
+    }
+
+    #[test]
     fn wal_reset_clears_existing_frames() {
         let temp_dir = TempDir::new().unwrap();
         let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
@@ -699,6 +783,46 @@ mod tests {
         assert_eq!(wal.replay_frames().unwrap().len(), 1);
         wal.reset().unwrap();
         assert!(wal.replay_frames().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wal_reset_preserves_monotonic_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 7,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+        assert_eq!(wal.current_highwater().frame, 1);
+
+        wal.reset().unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 8,
+            metric: "mem".to_string(),
+            labels: vec![Label::new("host", "b")],
+        })
+        .unwrap();
+
+        assert_eq!(wal.current_highwater().frame, 2);
+    }
+
+    #[test]
+    fn ensure_min_next_seq_sets_sequence_floor() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.ensure_min_next_seq(5);
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 7,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+
+        assert_eq!(wal.current_highwater().frame, 5);
     }
 
     #[test]
@@ -731,7 +855,7 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let replay = replay_from_path(wal.path()).unwrap();
+        let replay = replay_from_path(wal.path(), WalHighWatermark::default()).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
     }
@@ -756,7 +880,7 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let replay = replay_from_path(wal.path()).unwrap();
+        let replay = replay_from_path(wal.path(), WalHighWatermark::default()).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
     }

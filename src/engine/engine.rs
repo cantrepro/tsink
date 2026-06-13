@@ -16,7 +16,7 @@ use crate::engine::query::{
     decode_chunk_points_in_range_into, decode_encoded_chunk_payload_in_range_into,
     EncodedChunkDescriptor,
 };
-use crate::engine::segment::{load_segment_indexes, SegmentWriter};
+use crate::engine::segment::{load_segment_indexes, SegmentWriter, WalHighWatermark};
 use crate::engine::series_registry::{
     validate_labels, validate_metric, SeriesId, SeriesRegistry, SeriesResolution,
 };
@@ -481,7 +481,7 @@ impl ChunkStorage {
             write_permits.push(permit);
         }
         self.flush_all_active()?;
-        self.persist_segment()?;
+        self.persist_segment(true)?;
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
@@ -734,7 +734,7 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.persist_segment()?;
+        self.persist_segment(false)?;
         self.reload_persisted_indexes_from_disk()?;
 
         while used > budget {
@@ -1221,12 +1221,12 @@ impl ChunkStorage {
         Ok(batches)
     }
 
-    fn replay_from_wal(&self) -> Result<()> {
+    fn replay_from_wal(&self, replay_highwater: WalHighWatermark) -> Result<()> {
         let Some(wal) = &self.wal else {
             return Ok(());
         };
 
-        let frames = wal.replay_frames()?;
+        let frames = wal.replay_frames_after(replay_highwater)?;
         for frame in frames {
             match frame {
                 ReplayFrame::SeriesDefinition(definition) => {
@@ -1333,10 +1333,19 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn persist_segment(&self) -> Result<()> {
+    fn persist_segment(&self, include_wal_highwater: bool) -> Result<()> {
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
             return Ok(());
         }
+
+        let wal_highwater = if include_wal_highwater {
+            self.wal
+                .as_ref()
+                .map(|wal| wal.current_highwater())
+                .unwrap_or_default()
+        } else {
+            WalHighWatermark::default()
+        };
 
         let delta_chunks = {
             let persisted = self.persisted_chunk_watermarks.read();
@@ -1389,13 +1398,17 @@ impl ChunkStorage {
             if let (Some(path), false) = (&self.numeric_lane_path, numeric_chunks.is_empty()) {
                 let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
                 let writer = SegmentWriter::new(path, 0, segment_id)?;
-                writer.write_segment(&registry, &numeric_chunks)?;
+                writer.write_segment_with_wal_highwater(
+                    &registry,
+                    &numeric_chunks,
+                    wal_highwater,
+                )?;
             }
 
             if let (Some(path), false) = (&self.blob_lane_path, blob_chunks.is_empty()) {
                 let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
                 let writer = SegmentWriter::new(path, 0, segment_id)?;
-                writer.write_segment(&registry, &blob_chunks)?;
+                writer.write_segment_with_wal_highwater(&registry, &blob_chunks, wal_highwater)?;
             }
         }
 
@@ -1718,7 +1731,7 @@ impl Storage for ChunkStorage {
         let close_result = (|| {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
-            self.persist_segment()?;
+            self.persist_segment(true)?;
             if self.memory_budget_value() != usize::MAX {
                 self.refresh_memory_usage();
             }
@@ -1789,15 +1802,20 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         crate::engine::segment::LoadedSegmentIndexes::default()
     };
     let loaded_segments = merge_loaded_segment_indexes(loaded_numeric, loaded_blob)?;
+    let replay_highwater = loaded_segments.wal_replay_highwater;
 
     let wal = if let Some(data_path) = builder.data_path() {
         let wal_path = data_path.join(WAL_DIR_NAME);
         if builder.wal_enabled() {
-            Some(FramedWal::open_with_buffer_size(
+            let wal = FramedWal::open_with_buffer_size(
                 wal_path,
                 builder.wal_sync_mode(),
                 builder.wal_buffer_size(),
-            )?)
+            )?;
+            if replay_highwater.segment == 0 {
+                wal.ensure_min_next_seq(replay_highwater.frame.saturating_add(1));
+            }
+            Some(wal)
         } else {
             clear_wal_dir_if_present(&wal_path)?;
             None
@@ -1815,7 +1833,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         storage_options,
     ));
     storage.apply_loaded_segment_indexes(loaded_segments)?;
-    storage.replay_from_wal()?;
+    storage.replay_from_wal(replay_highwater)?;
     if storage.memory_budget_value() != usize::MAX {
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
@@ -1864,14 +1882,25 @@ fn merge_loaded_segment_indexes(
         }
     }
 
+    let numeric_has_segments = !numeric.indexed_segments.is_empty();
+    let blob_has_segments = !blob.indexed_segments.is_empty();
+
     let mut indexed_segments = numeric.indexed_segments;
     indexed_segments.append(&mut blob.indexed_segments);
     indexed_segments.sort_by_key(|segment| (segment.manifest.level, segment.manifest.segment_id));
+
+    let replay_highwater = match (numeric_has_segments, blob_has_segments) {
+        (true, true) => numeric.wal_replay_highwater.min(blob.wal_replay_highwater),
+        (true, false) => numeric.wal_replay_highwater,
+        (false, true) => blob.wal_replay_highwater,
+        (false, false) => WalHighWatermark::default(),
+    };
 
     Ok(crate::engine::segment::LoadedSegmentIndexes {
         next_segment_id: numeric.next_segment_id.max(blob.next_segment_id).max(1),
         series: series_by_id.into_values().collect(),
         indexed_segments,
+        wal_replay_highwater: replay_highwater,
     })
 }
 
