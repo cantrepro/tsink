@@ -5,6 +5,7 @@ use crate::promql::ast::{
 };
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::lexer::{Lexer, Token, TokenKind};
+use regex::Regex;
 
 pub fn parse(input: &str) -> Result<Expr> {
     let tokens = Lexer::new(input).tokenize()?;
@@ -344,6 +345,11 @@ impl Parser {
         if matches!(self.peek().kind, TokenKind::LBrace) {
             matchers = self.parse_label_matchers()?;
         }
+        if metric_name.is_none() && !has_non_empty_matcher(&matchers)? {
+            return Err(PromqlError::Parse(
+                "vector selector must contain a metric name or at least one matcher that does not match the empty string".to_string(),
+            ));
+        }
 
         let vector = VectorSelector {
             metric_name,
@@ -614,6 +620,29 @@ impl Parser {
 
         Ok(self.expect_duration()?.saturating_mul(sign))
     }
+}
+
+fn has_non_empty_matcher(matchers: &[LabelMatcher]) -> Result<bool> {
+    for matcher in matchers {
+        if !label_matcher_matches_empty(matcher)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn label_matcher_matches_empty(matcher: &LabelMatcher) -> Result<bool> {
+    match matcher.op {
+        MatchOp::Equal => Ok(matcher.value.is_empty()),
+        MatchOp::NotEqual => Ok(!matcher.value.is_empty()),
+        MatchOp::RegexMatch => Ok(anchored_regex(&matcher.value)?.is_match("")),
+        MatchOp::RegexNoMatch => Ok(!anchored_regex(&matcher.value)?.is_match("")),
+    }
+}
+
+fn anchored_regex(pattern: &str) -> Result<Regex> {
+    let anchored = format!("^(?:{pattern})$");
+    Regex::new(&anchored).map_err(PromqlError::from)
 }
 
 fn apply_offset_modifier(expr: &mut Expr, offset: i64) -> Result<()> {

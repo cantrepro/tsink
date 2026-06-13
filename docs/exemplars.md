@@ -88,8 +88,8 @@ The exemplar query endpoint takes a PromQL expression and a time range, extracts
 | Parameter | Required | Description |
 |---|---|---|
 | `query` | Yes | PromQL expression. All vector (`metric{...}`) and matrix (`metric{...}[d]`) selectors are used as lookups. |
-| `start` | Yes | Start of the query range (timestamp in the server's configured precision, or RFC 3339). |
-| `end` | Yes | End of the query range. Must not be before `start`. |
+| `start` | Yes | Start of the query range. Numeric values are Unix seconds, matching the Prometheus HTTP API; RFC 3339 is also accepted. |
+| `end` | Yes | End of the query range. Must not be before `start`. Numeric values use the same format as `start`. |
 | `limit` | No | Maximum total exemplars to return. Defaults to `max_query_results`. Must be > 0 and ≤ `max_query_results`. |
 
 **Response:** `200 application/json`

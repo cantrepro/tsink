@@ -64,7 +64,7 @@
     {
       "name": "query_up_instant",
       "method": "GET",
-      "path": "/api/v1/query?query=up&time=1700000015000",
+      "path": "/api/v1/query?query=up&time=1700000015",
       "expectedData": {
         "resultType": "vector",
         "result": [
@@ -90,7 +90,7 @@
     {
       "name": "query_up_range_single_step",
       "method": "GET",
-      "path": "/api/v1/query_range?query=up&start=1700000015000&end=1700000015000&step=15s",
+      "path": "/api/v1/query_range?query=up&start=1700000015&end=1700000015&step=15s",
       "expectedData": {
         "resultType": "matrix",
         "result": [

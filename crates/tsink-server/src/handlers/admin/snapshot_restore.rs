@@ -180,14 +180,14 @@ pub(crate) async fn handle_admin_delete_series(
         Err(err) => return text_response(400, &err),
     };
     let start = match request.param("start").or(payload_start) {
-        Some(value) => match parse_timestamp(&value, precision) {
+        Some(value) => match parse_storage_timestamp(&value, precision) {
             Ok(timestamp) => timestamp,
             Err(err) => return text_response(400, &format!("invalid 'start': {err}")),
         },
         None => i64::MIN,
     };
     let end = match request.param("end").or(payload_end) {
-        Some(value) => match parse_timestamp(&value, precision) {
+        Some(value) => match parse_storage_timestamp(&value, precision) {
             Ok(timestamp) => timestamp,
             Err(err) => return text_response(400, &format!("invalid 'end': {err}")),
         },

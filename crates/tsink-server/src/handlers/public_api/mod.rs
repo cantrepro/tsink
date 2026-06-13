@@ -223,8 +223,7 @@ mod tests {
             &engine,
             &HttpRequest {
                 method: "GET".to_string(),
-                path: "/api/v1/query?query=cpu_usage{host=\"query-a\"}&time=1700000000000"
-                    .to_string(),
+                path: "/api/v1/query?query=cpu_usage{host=\"query-a\"}&time=1700000000".to_string(),
                 headers: HashMap::new(),
                 body: Vec::new(),
             },

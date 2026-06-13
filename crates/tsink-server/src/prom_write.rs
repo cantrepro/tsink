@@ -401,6 +401,11 @@ fn validate_metric_name(metric: &str, context: &str) -> Result<(), String> {
     if metric.is_empty() {
         return Err(format!("{context} must not be empty"));
     }
+    if !is_prometheus_metric_name(metric) {
+        return Err(format!(
+            "{context} must match Prometheus metric name syntax [a-zA-Z_:][a-zA-Z0-9_:]*"
+        ));
+    }
     if metric.len() > MAX_METRIC_NAME_LEN {
         return Err(format!("{context} must be <= {MAX_METRIC_NAME_LEN} bytes"));
     }
@@ -410,6 +415,11 @@ fn validate_metric_name(metric: &str, context: &str) -> Result<(), String> {
 fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{context} label name must not be empty"));
+    }
+    if !is_prometheus_label_name(name) {
+        return Err(format!(
+            "{context} label '{name}' must match Prometheus label name syntax [a-zA-Z_][a-zA-Z0-9_]*"
+        ));
     }
     if name.len() > MAX_LABEL_NAME_LEN {
         return Err(format!(
@@ -422,6 +432,32 @@ fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> 
         ));
     }
     Ok(())
+}
+
+fn is_prometheus_metric_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (is_ascii_alpha(first) || first == b'_' || first == b':')
+        && bytes.all(|byte| is_ascii_alphanumeric(byte) || byte == b'_' || byte == b':')
+}
+
+fn is_prometheus_label_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (is_ascii_alpha(first) || first == b'_')
+        && bytes.all(|byte| is_ascii_alphanumeric(byte) || byte == b'_')
+}
+
+fn is_ascii_alpha(byte: u8) -> bool {
+    byte.is_ascii_alphabetic()
+}
+
+fn is_ascii_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
 }
 
 fn convert_remote_write_timestamp(
@@ -670,6 +706,60 @@ mod tests {
             .series
             .labels
             .contains(&Label::new("optional", "")));
+    }
+
+    #[test]
+    fn normalize_remote_write_request_rejects_invalid_prometheus_names() {
+        let invalid_metric = normalize_remote_write_request(
+            WriteRequest {
+                timeseries: vec![TimeSeries {
+                    labels: vec![PromLabel {
+                        name: "__name__".to_string(),
+                        value: "9cpu".to_string(),
+                    }],
+                    samples: vec![Sample {
+                        value: 1.0,
+                        timestamp: 1_700_000_000_000,
+                    }],
+                    ..Default::default()
+                }],
+                metadata: Vec::new(),
+            },
+            "tenant-a",
+            TimestampPrecision::Milliseconds,
+        )
+        .expect_err("invalid metric name should be rejected");
+        assert!(invalid_metric.contains("Prometheus metric name syntax"));
+
+        let invalid_label = normalize_remote_write_request(
+            WriteRequest {
+                timeseries: vec![TimeSeries {
+                    labels: vec![
+                        PromLabel {
+                            name: "__name__".to_string(),
+                            value: "cpu_usage".to_string(),
+                        },
+                        PromLabel {
+                            name: "bad-label".to_string(),
+                            value: "server-a".to_string(),
+                        },
+                    ],
+                    samples: vec![Sample {
+                        value: 1.0,
+                        timestamp: 1_700_000_000_000,
+                    }],
+                    ..Default::default()
+                }],
+                metadata: Vec::new(),
+            },
+            "tenant-a",
+            TimestampPrecision::Milliseconds,
+        )
+        .expect_err("invalid label name should be rejected");
+        assert!(invalid_label.contains("Prometheus label name syntax"));
+
+        build_metadata_update("valid:metric_name", MetricType::Counter, "", "", "metadata")
+            .expect("colon is valid in metric names");
     }
 
     #[test]

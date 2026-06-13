@@ -417,7 +417,7 @@ A secret path is interpreted as:
 
 `command` is executed to load or reload the current value. `rotateCommand` is executed during a `Rotate` operation; if empty the target is not rotatable via the exec path. This allows integration with any secrets management system (HashiCorp Vault, AWS Secrets Manager via CLI, etc.).
 
-Atomic file writes during rotation use a `.tmp-<timestamp>` temporary file followed by `rename`, ensuring no reader ever sees a partial write.
+Atomic file writes during rotation use a unique hidden temporary file followed by `rename`, ensuring no reader ever sees a partial write. On Unix-like systems, rotated token files are written with `0600` permissions.
 
 ### 7.4 Overlap window
 

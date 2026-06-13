@@ -1077,6 +1077,12 @@ pub(super) async fn handle_internal_ingest_write(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
 ) -> HttpResponse {
+    if let Err(response) =
+        authorize_internal_cluster_request(request, internal_api, cluster_context, false, &[])
+    {
+        return response;
+    }
+
     let payload: InternalIngestWriteRequest = match parse_internal_json_body(request) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1467,6 +1473,12 @@ pub(super) async fn handle_internal_ingest_rows(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
 ) -> HttpResponse {
+    if let Err(response) =
+        authorize_internal_cluster_request(request, internal_api, cluster_context, false, &[])
+    {
+        return response;
+    }
+
     let payload: InternalIngestRowsRequest = match parse_internal_json_body(request) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -2947,6 +2959,23 @@ mod tests {
         let body: JsonValue =
             serde_json::from_slice(&response.body).expect("response body should be valid JSON");
         assert_eq!(body["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_authenticates_before_parsing_json_body() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_rows".to_string(),
+            headers: internal_headers(None, Some(INTERNAL_RPC_PROTOCOL_VERSION), &[]),
+            body: br#"{"rows":"not-valid""#.to_vec(),
+        };
+
+        let response =
+            handle_internal_ingest_rows(&storage, &request, Some(&internal_api), None, None).await;
+
+        assert_eq!(response.status, 401);
     }
 
     #[tokio::test]

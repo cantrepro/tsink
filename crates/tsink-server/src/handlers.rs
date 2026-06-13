@@ -115,8 +115,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use snap::raw::{decompress_len, Decoder as SnappyDecoder, Encoder as SnappyEncoder};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4582,35 +4580,10 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T, description: &str) -> R
         .map_err(|err| format!("failed to serialize {description}: {err}"))?;
     encoded.push(b'\n');
 
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary {description} file {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(&encoded).map_err(|err| {
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, &encoded).map_err(|err| {
         format!(
-            "failed to write temporary {description} file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to fsync temporary {description} file {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace {description} file {} with {}: {err}",
-            path.display(),
-            tmp_path.display()
+            "failed to write {description} file {} atomically: {err}",
+            path.display()
         )
     })
 }
@@ -6320,9 +6293,6 @@ fn current_timestamp(precision: TimestampPrecision) -> i64 {
 }
 
 fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
-    if let Ok(ts) = s.parse::<i64>() {
-        return Ok(ts);
-    }
     if let Ok(datetime) = DateTime::parse_from_rfc3339(s) {
         return datetime_to_units(datetime, precision)
             .ok_or_else(|| format!("invalid timestamp: '{s}'"));
@@ -6333,9 +6303,26 @@ fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String
     scale_seconds_to_units(secs, precision).ok_or_else(|| format!("invalid timestamp: '{s}'"))
 }
 
+fn parse_storage_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
+    if let Ok(ts) = s.parse::<i64>() {
+        return Ok(ts);
+    }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(s) {
+        return datetime_to_units(datetime, precision)
+            .ok_or_else(|| format!("invalid timestamp: '{s}'"));
+    }
+    let units = s
+        .parse::<f64>()
+        .map_err(|_| format!("invalid timestamp: '{s}'"))?;
+    if !units.is_finite() || units < i64::MIN as f64 || units > i64::MAX as f64 {
+        return Err(format!("invalid timestamp: '{s}'"));
+    }
+    Ok(units as i64)
+}
+
 fn parse_step(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
-    if let Ok(ms) = s.parse::<f64>() {
-        return parse_step_milliseconds(ms, precision, s);
+    if let Ok(secs) = s.parse::<f64>() {
+        return parse_step_seconds(secs, precision, s);
     }
     let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
         (stripped, "ms")
@@ -6377,21 +6364,6 @@ fn parse_step_seconds(secs: f64, precision: TimestampPrecision, raw: &str) -> Re
     scale_seconds_to_units(secs, precision)
         .map(|step| step.max(1))
         .ok_or_else(|| format!("invalid step: '{raw}'"))
-}
-
-fn parse_step_milliseconds(
-    millis: f64,
-    precision: TimestampPrecision,
-    raw: &str,
-) -> Result<i64, String> {
-    if !millis.is_finite() {
-        return Err(format!("invalid step: '{raw}'"));
-    }
-    if millis <= 0.0 {
-        return Err("step must be positive".to_string());
-    }
-    let secs = millis / 1_000.0;
-    parse_step_seconds(secs, precision, raw)
 }
 
 fn scale_seconds_to_units(secs: f64, precision: TimestampPrecision) -> Option<i64> {
@@ -12577,7 +12549,7 @@ mod tests {
 
         let query_request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query?query=cpu_usage{host=\"server-a\"}&time=1700000000000".to_string(),
+            path: "/api/v1/query?query=cpu_usage{host=\"server-a\"}&time=1700000000".to_string(),
             headers: HashMap::from([(
                 tenant::SCOPE_ORG_ID_HEADER.to_string(),
                 "team-b".to_string(),
@@ -12903,7 +12875,7 @@ mod tests {
         .expect("tenant registry should parse");
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query_range?query=up&start=1700000000000&end=1700000003000&step=1s"
+            path: "/api/v1/query_range?query=up&start=1700000000&end=1700000003&step=1s"
                 .to_string(),
             headers: HashMap::from([
                 (tenant::TENANT_HEADER.to_string(), "team-b".to_string()),
@@ -13170,7 +13142,7 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query?query=up&time=1700000000000".to_string(),
+            path: "/api/v1/query?query=up&time=1700000000".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
         };
@@ -13204,8 +13176,7 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query?query=request_duration_native_seconds&time=1700000000000"
-                .to_string(),
+            path: "/api/v1/query?query=request_duration_native_seconds&time=1700000000".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
         };
@@ -13252,7 +13223,7 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query_range?query=up&start=1700000000000&end=1700000030000&step=15s"
+            path: "/api/v1/query_range?query=up&start=1700000000&end=1700000030&step=15s"
                 .to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
@@ -13289,7 +13260,7 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query?query=up&time=1700000000000".to_string(),
+            path: "/api/v1/query?query=up&time=1700000000".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
         };
@@ -13348,7 +13319,7 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: "/api/v1/query_range?query=up&start=1700000000000&end=1700000030000&step=15s"
+            path: "/api/v1/query_range?query=up&start=1700000000&end=1700000030&step=15s"
                 .to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
@@ -13428,7 +13399,10 @@ mod tests {
 
         let request = HttpRequest {
             method: "GET".to_string(),
-            path: format!("/api/v1/query?query=up&time={query_ts}"),
+            path: format!(
+                "/api/v1/query?query=up&time={}",
+                timestamp_to_f64(query_ts, TimestampPrecision::Milliseconds)
+            ),
             headers: HashMap::new(),
             body: Vec::new(),
         };
@@ -17130,7 +17104,7 @@ mod tests {
             &engine,
             HttpRequest {
                 method: "GET".to_string(),
-                path: "/api/v1/query?query=cpu_usage{host=\"a\"}&time=1000".to_string(),
+                path: "/api/v1/query?query=cpu_usage{host=\"a\"}&time=1".to_string(),
                 headers: HashMap::from([(tenant::TENANT_HEADER.to_string(), "team-a".to_string())]),
                 body: Vec::new(),
             },
@@ -17809,6 +17783,34 @@ test_metric{job="test2"} 99 1700000000000
     }
 
     #[test]
+    fn parse_timestamp_treats_numeric_values_as_unix_seconds() {
+        assert_eq!(
+            parse_timestamp("1700000000", TimestampPrecision::Milliseconds)
+                .expect("integer timestamp should parse as Unix seconds"),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_timestamp("1700000000.123", TimestampPrecision::Milliseconds)
+                .expect("float timestamp should parse as Unix seconds"),
+            1_700_000_000_123
+        );
+    }
+
+    #[test]
+    fn parse_storage_timestamp_treats_numeric_values_as_storage_units() {
+        assert_eq!(
+            parse_storage_timestamp("1700000000000", TimestampPrecision::Milliseconds)
+                .expect("storage timestamp should parse"),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_storage_timestamp("1700000000000.0", TimestampPrecision::Milliseconds)
+                .expect("storage float timestamp should parse"),
+            1_700_000_000_000
+        );
+    }
+
+    #[test]
     fn parse_step_rejects_non_finite_values() {
         assert!(parse_step("NaN", TimestampPrecision::Milliseconds).is_err());
         assert!(parse_step("inf", TimestampPrecision::Milliseconds).is_err());
@@ -17817,13 +17819,17 @@ test_metric{job="test2"} 99 1700000000000
     }
 
     #[test]
-    fn parse_step_treats_bare_numeric_values_as_milliseconds() {
+    fn parse_step_treats_bare_numeric_values_as_seconds() {
         assert_eq!(
-            parse_step("15000", TimestampPrecision::Milliseconds).expect("step should parse"),
+            parse_step("15", TimestampPrecision::Milliseconds).expect("step should parse"),
             15_000
         );
         assert_eq!(
             parse_step("15s", TimestampPrecision::Milliseconds).expect("step should parse"),
+            15_000
+        );
+        assert_eq!(
+            parse_step("15000ms", TimestampPrecision::Milliseconds).expect("step should parse"),
             15_000
         );
     }

@@ -27,7 +27,9 @@ use tsink::promql::Engine;
 use tsink::{Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision, WalSyncMode};
 
 const MAX_CONNECTIONS: usize = 1024;
+const MAX_GRAPHITE_CONNECTIONS: usize = 1024;
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const GRAPHITE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const DEFAULT_STORAGE_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
@@ -1237,6 +1239,7 @@ async fn run_graphite_listener(
     tenant_id: &str,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let connection_limit = Arc::new(Semaphore::new(MAX_GRAPHITE_CONNECTIONS));
     loop {
         let stream = tokio::select! {
             result = listener.accept() => {
@@ -1246,10 +1249,21 @@ async fn run_graphite_listener(
             _ = shutdown_rx.changed() => return Ok(()),
         };
 
+        let connection_permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                legacy_ingest::record_request_throttled(
+                    legacy_ingest::LegacyAdapterKind::Graphite,
+                    0,
+                );
+                continue;
+            }
+        };
         let app_context = app_context.clone();
         let tenant_id = tenant_id.to_string();
         let mut connection_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(err) = handle_graphite_connection(
                 stream,
                 &app_context,
@@ -1276,16 +1290,24 @@ async fn handle_graphite_connection(
 
     loop {
         line.clear();
-        let bytes_read = tokio::select! {
-            result = reader.read_until(b'\n', &mut line) => result.map_err(|err| format!("graphite read failed: {err}"))?,
-            _ = shutdown_rx.changed() => return Ok(()),
-        };
+        let bytes_read =
+            match read_graphite_line(&mut reader, &mut line, config.max_line_bytes, shutdown_rx)
+                .await?
+            {
+                GraphiteLineRead::Line(bytes) => bytes,
+                GraphiteLineRead::Eof | GraphiteLineRead::Shutdown | GraphiteLineRead::Timeout => {
+                    return Ok(())
+                }
+                GraphiteLineRead::TooLong => {
+                    legacy_ingest::record_request_throttled(
+                        legacy_ingest::LegacyAdapterKind::Graphite,
+                        0,
+                    );
+                    return Ok(());
+                }
+            };
         if bytes_read == 0 {
             return Ok(());
-        }
-        if line.len() > config.max_line_bytes {
-            legacy_ingest::record_request_throttled(legacy_ingest::LegacyAdapterKind::Graphite, 0);
-            continue;
         }
         let raw_line = match std::str::from_utf8(&line) {
             Ok(line) => line,
@@ -1354,6 +1376,52 @@ async fn handle_graphite_connection(
                     );
                 }
             }
+        }
+    }
+}
+
+enum GraphiteLineRead {
+    Line(usize),
+    Eof,
+    Shutdown,
+    Timeout,
+    TooLong,
+}
+
+async fn read_graphite_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_line_bytes: usize,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<GraphiteLineRead, String> {
+    let max_line_bytes = max_line_bytes.max(1);
+    loop {
+        let available = tokio::select! {
+            result = tokio::time::timeout(GRAPHITE_READ_TIMEOUT, reader.fill_buf()) => {
+                match result {
+                    Ok(Ok(buffer)) => buffer,
+                    Ok(Err(err)) => return Err(format!("graphite read failed: {err}")),
+                    Err(_) => return Ok(GraphiteLineRead::Timeout),
+                }
+            }
+            _ = shutdown_rx.changed() => return Ok(GraphiteLineRead::Shutdown),
+        };
+        if available.is_empty() {
+            return Ok(GraphiteLineRead::Eof);
+        }
+
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let consume_len = newline_pos.map_or(available.len(), |pos| pos + 1);
+        let remaining_capacity = max_line_bytes.saturating_add(1).saturating_sub(line.len());
+        let copy_len = consume_len.min(remaining_capacity);
+        line.extend_from_slice(&available[..copy_len]);
+        reader.consume(consume_len);
+
+        if line.len() > max_line_bytes {
+            return Ok(GraphiteLineRead::TooLong);
+        }
+        if newline_pos.is_some() {
+            return Ok(GraphiteLineRead::Line(line.len()));
         }
     }
 }
@@ -2489,6 +2557,26 @@ mod tests {
         let _ = listener_task.await;
     }
 
+    #[tokio::test]
+    async fn graphite_line_reader_rejects_overlong_lines_before_newline() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"abcdef")
+            .await
+            .expect("line bytes should write");
+        drop(writer);
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut line = Vec::new();
+        let result = read_graphite_line(&mut reader, &mut line, 4, &mut shutdown_rx)
+            .await
+            .expect("line read should not fail");
+
+        assert!(matches!(result, GraphiteLineRead::TooLong));
+        assert_eq!(line.len(), 5);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_token_required_when_configured() {
         let response = send_request(
@@ -3422,7 +3510,7 @@ mod tests {
             build_http_request("GET", "/api/v1/series?match[]=compat_metric", &[], &[]);
         let query_request = build_http_request(
             "GET",
-            "/api/v1/query?query=compat_metric&time=1700000000000",
+            "/api/v1/query?query=compat_metric&time=1700000000",
             &[],
             &[],
         );

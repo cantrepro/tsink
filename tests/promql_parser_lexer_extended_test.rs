@@ -316,6 +316,26 @@ fn parser_08_parses_vector_selector_without_metric_name() {
 }
 
 #[test]
+fn parser_08b_rejects_metricless_selectors_that_can_match_empty() {
+    for query in [
+        "{}",
+        r#"{job=""}"#,
+        r#"{job!="api"}"#,
+        r#"{job=~".*"}"#,
+        r#"{job!~".+"}"#,
+    ] {
+        let err = parse(query).expect_err("metricless selector should be rejected");
+        assert!(
+            err.to_string().contains("does not match the empty string"),
+            "unexpected error for {query}: {err}"
+        );
+    }
+
+    assert!(parse(r#"{job!=""}"#).is_ok());
+    assert!(parse(r#"{job=~".+"}"#).is_ok());
+}
+
+#[test]
 fn parser_09_parses_all_label_matcher_operators() {
     let expr = parse(r#"up{a="1",b!="2",c=~"re",d!~"no"}"#).unwrap();
     match expr {

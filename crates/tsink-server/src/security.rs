@@ -7,8 +7,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
-use std::fs;
-use std::io::BufReader;
+use std::fs::{self, OpenOptions};
+use std::io::{BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 const GENERATED_TOKEN_BYTES: usize = 32;
 const DEFAULT_ROTATION_OVERLAP_SECS: u64 = 300;
 const SECURITY_AUDIT_CAPACITY: usize = 128;
+static SECRET_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1341,19 +1344,101 @@ fn write_string_atomically(path: &Path, value: &str) -> Result<(), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("invalid secret file path {}", path.display()))?;
-    let temp_name = format!(".{file_name}.tmp-{}", unix_time_ms());
-    let temp_path = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(temp_name);
-    fs::write(&temp_path, value.as_bytes()).map_err(|err| {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create secret file directory {}: {err}",
+            parent.display()
+        )
+    })?;
+
+    let temp_path = reserve_secret_temp_path(parent, file_name)?;
+    let write_result = write_secret_temp_file(&temp_path, value);
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "failed to replace secret file {}: {err}",
+            path.display()
+        ));
+    }
+    sync_parent_dir(parent)?;
+    Ok(())
+}
+
+fn reserve_secret_temp_path(parent: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    for _ in 0..256 {
+        let nonce = SECRET_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{pid}-{nonce:016x}",
+            unix_time_ms()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temp_path) {
+            Ok(_) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to reserve temporary secret file {}: {err}",
+                    temp_path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to reserve unique temporary secret file for {}",
+        parent.join(file_name).display()
+    ))
+}
+
+fn write_secret_temp_file(temp_path: &Path, value: &str) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(temp_path).map_err(|err| {
+        format!(
+            "failed to open temporary secret file {}: {err}",
+            temp_path.display()
+        )
+    })?;
+    file.write_all(value.as_bytes()).map_err(|err| {
         format!(
             "failed to write temporary secret file {}: {err}",
             temp_path.display()
         )
     })?;
-    fs::rename(&temp_path, path)
-        .map_err(|err| format!("failed to replace secret file {}: {err}", path.display()))?;
+    file.sync_all().map_err(|err| {
+        format!(
+            "failed to fsync temporary secret file {}: {err}",
+            temp_path.display()
+        )
+    })
+}
+
+fn sync_parent_dir(parent: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| {
+                format!(
+                    "failed to fsync secret file directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
     Ok(())
 }
 
@@ -1443,6 +1528,8 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     const TEST_CERT: &str = include_str!("cluster/testdata/internal-mtls-server-cert.pem");
@@ -1471,6 +1558,29 @@ mod tests {
         assert!(secret.matches(Some("token-a")));
         assert_eq!(
             fs::read_to_string(secret_path).expect("secret file should read"),
+            "token-b"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_string_atomically_restricts_secret_file_permissions() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let secret_path = temp_dir.path().join("public.token");
+        fs::write(&secret_path, "token-a\n").expect("secret should write");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o644))
+            .expect("permissions should update");
+
+        write_string_atomically(&secret_path, "token-b").expect("secret should rotate");
+
+        let mode = fs::metadata(&secret_path)
+            .expect("secret metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            fs::read_to_string(&secret_path).expect("secret should read"),
             "token-b"
         );
     }

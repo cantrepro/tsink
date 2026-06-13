@@ -177,7 +177,7 @@ Instant PromQL evaluation.
 | Parameter | Required | Description |
 |---|---|---|
 | `query` | Yes | PromQL expression string. |
-| `time` | No | Evaluation timestamp. Unix milliseconds (default precision) or RFC 3339. Defaults to current server time. |
+| `time` | No | Evaluation timestamp. Numeric values are Unix seconds, matching the Prometheus HTTP API; RFC 3339 is also accepted. Defaults to current server time. |
 
 **Response:** `200 application/json`
 
@@ -207,9 +207,9 @@ Range PromQL evaluation.
 | Parameter | Required | Description |
 |---|---|---|
 | `query` | Yes | PromQL expression string. |
-| `start` | Yes | Range start. Unix milliseconds or RFC 3339. |
+| `start` | Yes | Range start. Numeric values are Unix seconds, matching the Prometheus HTTP API; RFC 3339 is also accepted. |
 | `end` | Yes | Range end. Must be ≥ `start`. |
-| `step` | Yes | Step duration in milliseconds or Go-style duration string (e.g. `15s`, `1m`). |
+| `step` | Yes | Step duration as seconds when numeric, or as a Go-style duration string (e.g. `15s`, `1m`, `1500ms`). |
 
 **Response:** `200 application/json`
 
