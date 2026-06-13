@@ -24,7 +24,9 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) with idempotent replay on recovery.
 - **Out-of-order writes** — data is returned sorted by timestamp regardless of insertion order.
 - **Concurrent writers** — multiple threads can insert simultaneously.
-- **Optional PromQL engine** — enable with the `promql` Cargo feature.
+- **Optional PromQL engine** — instant and range queries with 20+ built-in functions; enable with the `promql` Cargo feature.
+- **LSM-style compaction** — tiered L0 → L1 → L2 segment compaction reduces read amplification.
+- **Cgroup-aware defaults** — worker thread counts respect container CPU limits.
 
 ## Installation
 
@@ -120,6 +122,16 @@ Run the server:
 cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-data
 ```
 
+Full CLI options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--listen <ADDR>` | `127.0.0.1:9201` | Bind address. |
+| `--data-path <PATH>` | None (in-memory) | Persist tsink data under PATH. |
+| `--wal-enabled <BOOL>` | `true` | Enable WAL. |
+| `--no-wal` | — | Disable WAL (shorthand). |
+| `--timestamp-precision <s\|ms\|us\|ns>` | `ms` | Timestamp precision (server defaults to milliseconds). |
+
 Supported endpoints:
 - `GET /healthz`
 - `POST /api/v1/write` (Prometheus remote write)
@@ -144,6 +156,7 @@ remote_read:
 | `select_all(metric, start, end)` | Returns grouped results for all label sets of a metric. |
 | `select_with_options(metric, QueryOptions)` | Supports downsampling, aggregation, custom bytes aggregation, and pagination. |
 | `list_metrics()` | Lists all known metric + label-set series. |
+| `list_metrics_with_wal()` | Like `list_metrics`, but also includes series only present in the WAL. |
 
 ### Downsampling and Aggregation
 
@@ -211,6 +224,49 @@ Notes:
 - Convenience conversions are provided: `DataPoint::new(ts, 42.5)` auto-converts via `Into<Value>`.
 - Accessor methods: `value.as_f64()`, `value.as_i64()`, `value.as_u64()`, `value.as_bool()`, `value.as_bytes()`, `value.as_str()`.
 
+## PromQL Engine
+
+Enable with the `promql` feature. The engine supports instant and range queries over data stored in tsink.
+
+```rust
+use std::sync::Arc;
+use tsink::{StorageBuilder, DataPoint, Row};
+use tsink::promql::Engine;
+
+let storage = StorageBuilder::new().build()?;
+storage.insert_rows(&[
+    Row::new("http_requests_total", DataPoint::new(1_000, 10.0)),
+    Row::new("http_requests_total", DataPoint::new(2_000, 25.0)),
+    Row::new("http_requests_total", DataPoint::new(3_000, 50.0)),
+])?;
+
+let engine = Engine::new(storage.clone());
+
+// Instant query — evaluates at a single point in time.
+let result = engine.instant_query("http_requests_total", 3_000)?;
+
+// Range query — evaluates at each step across a time window.
+let result = engine.range_query("http_requests_total", 1_000, 3_000, 1_000)?;
+```
+
+Use `Engine::with_precision(storage, precision)` if your timestamps are not in nanoseconds.
+
+Supported functions:
+
+| Category | Functions |
+|---|---|
+| Rate/counter | `rate`, `irate`, `increase` |
+| Over-time | `avg_over_time`, `sum_over_time`, `min_over_time`, `max_over_time`, `count_over_time` |
+| Math | `abs`, `ceil`, `floor`, `round`, `clamp`, `clamp_min`, `clamp_max` |
+| Type conversion | `scalar`, `vector` |
+| Time | `time`, `timestamp` |
+| Sorting | `sort`, `sort_desc` |
+| Label manipulation | `label_replace`, `label_join` |
+
+Aggregation operators: `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk` — with `by`/`without` grouping.
+
+Binary operators: `+`, `-`, `*`, `/`, `%`, `^`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `unless` — with `on`/`ignoring` vector matching and `bool` modifier.
+
 ## Persistence and WAL
 
 Set `with_data_path(...)` to enable persistence:
@@ -262,7 +318,46 @@ When persistence is enabled, tsink writes separate numeric/blob lane segment fam
 Each segment directory contains:
 `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
 
-The storage format uses CRC32c and XXH64 checksums for corruption detection and a crash-safe commit protocol (write temps, fsync, rename atomically). See [`docs/storage.md`](docs/storage.md) for the full binary format specification.
+The storage format uses CRC32c and XXH64 checksums for corruption detection and a crash-safe commit protocol (write temps, fsync, rename atomically).
+
+### Compaction
+
+tsink uses tiered LSM-style compaction across three levels:
+
+| Level | Trigger | Description |
+|---|---|---|
+| L0 | Every flush | Newly flushed segments land here. |
+| L1 | 4 L0 segments | L0 segments are merged and re-chunked into L1. |
+| L2 | 4 L1 segments | L1 segments are merged into larger L2 segments. |
+
+Compaction runs automatically in the background and is transparent to reads and writes.
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────┐
+│                    Public API                       │
+│   StorageBuilder / Storage / AsyncStorage / PromQL  │
+├────────────┬──────────────┬─────────────────────────┤
+│  Writers   │   Readers    │       Compactor         │
+│ (N threads)│  (concurrent)│   (background merges)   │
+├────────────┴──────────────┴─────────────────────────┤
+│               Engine (partitioned by time)           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │ Active   │  │ Immutable│  │ Segments │          │
+│  │ Chunks   │→ │ Chunks   │→ │ (L0/L1/  │          │
+│  │ (memory) │  │ (memory) │  │  L2 disk)│          │
+│  └──────────┘  └──────────┘  └──────────┘          │
+├─────────────────────────────────────────────────────┤
+│  WAL (write-ahead log)  │  Series Registry + Index  │
+└─────────────────────────┴───────────────────────────┘
+```
+
+Key internals:
+- **Time partitions** split data by wall-clock intervals (default: 1 hour).
+- **Chunks** group data points (default: 2048 per chunk) with delta-of-delta timestamp encoding and per-lane value encoding (numeric vs. blob).
+- **Series registry** maps metric name + label set → series ID, with inverted postings for label-based lookups.
+- **Segment files** are immutable, CRC32c + XXH64 checksummed, and consist of: `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
 
 ## StorageBuilder Options
 
@@ -275,7 +370,7 @@ The storage format uses CRC32c and XXH64 checksums for corruption detection and 
 | `with_retention(duration)` | 14 days | Data retention window. |
 | `with_retention_enforced(bool)` | `true` | Enforce retention window (`false` keeps data forever). |
 | `with_timestamp_precision(p)` | `Nanoseconds` | Timestamp unit (`Seconds`, `Milliseconds`, `Microseconds`, `Nanoseconds`). |
-| `with_max_writers(n)` | CPU count | Maximum concurrent writer threads. |
+| `with_max_writers(n)` | Available CPUs (cgroup-aware) | Maximum concurrent writer threads. |
 | `with_write_timeout(duration)` | 30s | Timeout for write operations. |
 | `with_partition_duration(duration)` | 1 hour | Time partition granularity. |
 | `with_wal_buffer_size(n)` | 4096 | WAL buffer size in bytes. |
@@ -297,6 +392,10 @@ cargo bench
 scripts/measure_bpp.sh quick   # Quick bytes-per-point measurement
 scripts/measure_bpp.sh full    # Full bytes-per-point measurement
 ```
+
+## Minimum Supported Rust Version
+
+Rust **2021 edition**. Tested on stable.
 
 ## License
 
