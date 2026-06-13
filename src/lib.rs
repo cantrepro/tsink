@@ -2,6 +2,8 @@
 //!
 //! tsink is a Rust implementation of a time-series storage engine with a straightforward API.
 
+#[cfg(feature = "async-storage")]
+pub mod async_storage;
 pub mod cgroup;
 pub mod concurrency;
 pub mod engine;
@@ -14,6 +16,8 @@ pub mod storage;
 pub mod value;
 pub mod wal;
 
+#[cfg(feature = "async-storage")]
+pub use async_storage::{AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder};
 pub use error::{Result, TsinkError};
 pub use label::Label;
 pub use storage::{

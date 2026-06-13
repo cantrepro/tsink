@@ -40,6 +40,13 @@ Enable PromQL support:
 tsink = { version = "0.8.0", features = ["promql"] }
 ```
 
+Enable async storage facade (dedicated worker threads, runtime-agnostic futures):
+
+```toml
+[dependencies]
+tsink = { version = "0.8.0", features = ["async-storage"] }
+```
+
 ## Quick Start
 
 ```rust
@@ -75,6 +82,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     storage.close()?;
     Ok(())
 }
+```
+
+## Async Usage
+
+`async-storage` exposes `AsyncStorage` and `AsyncStorageBuilder`.
+The async API routes requests through bounded queues to dedicated worker threads, while reusing the existing synchronous engine implementation.
+
+```rust
+use tsink::{AsyncStorageBuilder, DataPoint, Row};
+
+# async fn run() -> tsink::Result<()> {
+let storage = AsyncStorageBuilder::new()
+    .with_queue_capacity(1024)
+    .with_read_workers(4)
+    .build()?;
+
+storage
+    .insert_rows(vec![Row::new("cpu", DataPoint::new(1, 42.0))])
+    .await?;
+
+let points = storage.select("cpu", vec![], 0, 10).await?;
+assert_eq!(points.len(), 1);
+
+storage.close().await?;
+# Ok(())
+# }
 ```
 
 ## Query APIs
