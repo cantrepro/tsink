@@ -171,6 +171,49 @@ tsink-server \
 
 ---
 
+## Documentation
+
+### Getting started
+
+- [Embedded library guide](docs/embedded-library.md) — using tsink as a Rust dependency, `StorageBuilder` configuration, sync and async APIs, snapshots
+- [Python bindings guide](docs/python-bindings.md) — UniFFI setup, `TsinkStorageBuilder`, type mappings, error handling
+- [Server deployment](docs/server-deployment.md) — running the single-node server binary, CLI flags, environment variables
+- [Cluster setup](docs/cluster-setup.md) — multi-node deployment, peer discovery, shard count, replication factor, consistency levels, node roles
+
+### Architecture & design
+
+- [Architecture overview](docs/architecture.md) — high-level system design, component interactions, data flow
+- [Storage engine internals](docs/storage-engine.md) — WAL, segments, LSM-style compaction, encoding codecs, mmap reads, write buffer
+- [PromQL implementation](docs/promql.md) — lexer, parser, evaluator, supported functions, aggregations, subqueries
+- [Clustering internals](docs/clustering-internals.md) — consistent hash ring, replication protocol, hinted handoff, digest repair, rebalance, distributed queries
+
+### API & protocol reference
+
+- [HTTP API reference](docs/http-api.md) — all endpoints, request/response formats, authentication headers, error codes
+- [PromQL reference](docs/promql-reference.md) — function catalogue, operators, vector matching, type coercion rules
+- [Ingestion protocols](docs/ingestion-protocols.md) — Prometheus remote write, InfluxDB line protocol, OTLP, StatsD, Graphite wire formats and endpoints
+- [Configuration reference](docs/configuration.md) — complete list of server, engine, cluster, and security options with defaults
+
+### Features
+
+- [Tiered storage](docs/tiered-storage.md) — hot/warm/cold lifecycle, retention windows, object-store backing
+- [Compaction](docs/compaction.md) — L0/L1/L2 levels, merge strategies, tombstone handling, tuning
+- [Rollups & downsampling](docs/rollups.md) — rollup policies, materialization scheduling, query integration
+- [Data types & native histograms](docs/data-types.md) — float64, bytes, native histograms, timestamp precision modes
+- [Exemplars](docs/exemplars.md) — exemplar storage, querying, cardinality limits
+
+### Security & operations
+
+- [Security model](docs/security.md) — TLS/mTLS setup, RBAC roles, OIDC authentication, audit logging
+- [Multi-tenancy](docs/multi-tenancy.md) — tenant isolation, per-tenant quotas, admission budgets, usage accounting
+- [Secret rotation](docs/secret-rotation.md) — rotating auth tokens, TLS certificates, mTLS materials, grace periods
+- [Monitoring & observability](docs/monitoring.md) — `/metrics` endpoint, self-instrumentation, health probes, support bundles
+- [Recording & alerting rules](docs/rules.md) — rule definitions, evaluation intervals, recording rule output
+- [Performance tuning](docs/performance-tuning.md) — memory budgets, compaction tuning, write pipelining, cgroup-aware scheduling
+- [Migration guide](docs/migration.md) — migrating from Prometheus, VictoriaMetrics, InfluxDB; backfill, verify, cutover
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
