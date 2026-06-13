@@ -235,7 +235,7 @@ impl BlockingInsertStorage {
 impl Storage for BlockingInsertStorage {
     fn insert_rows(&self, rows: &[Row]) -> Result<()> {
         self.insert_calls.fetch_add(1, Ordering::SeqCst);
-        self.insert_started.notify_waiters();
+        self.insert_started.notify_one();
 
         if self.block_inserts.load(Ordering::SeqCst) {
             let mut released = self.release_flag.lock();

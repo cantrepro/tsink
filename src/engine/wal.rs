@@ -8,6 +8,10 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use tracing::warn;
 
+use crate::engine::binio::{
+    append_i64, append_u16, append_u32, append_u64, append_u8, checksum32, read_bytes, read_i64,
+    read_u16, read_u32, read_u32_at, read_u64, read_u64_at, read_u8, write_u32_at, write_u64_at,
+};
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::segment::WalHighWatermark;
@@ -186,20 +190,18 @@ impl WalReplayStream {
                 HeaderRead::FrameHeader(header) => header,
             };
 
-            if header[0..4] != FRAME_MAGIC {
+            let Some(parsed_header) = parse_frame_header(&header)? else {
                 warn!(
                     segment = segment_id,
                     "Stopping WAL replay at frame with magic mismatch"
                 );
                 self.halted = true;
                 return Ok(None);
-            }
-
-            let frame_type = header[4];
-            let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
-            let payload_len =
-                u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
-            let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
+            };
+            let frame_type = parsed_header.frame_type;
+            let frame_seq = parsed_header.frame_seq;
+            let payload_len = parsed_header.payload_len;
+            let expected_crc32 = parsed_header.expected_crc32;
 
             if payload_len > MAX_FRAME_PAYLOAD_BYTES {
                 warn!(
@@ -288,6 +290,27 @@ enum HeaderRead {
     Eof,
     Truncated,
     FrameHeader([u8; FRAME_HEADER_LEN]),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedFrameHeader {
+    frame_type: u8,
+    frame_seq: u64,
+    payload_len: usize,
+    expected_crc32: u32,
+}
+
+fn parse_frame_header(header: &[u8; FRAME_HEADER_LEN]) -> Result<Option<ParsedFrameHeader>> {
+    if header[0..4] != FRAME_MAGIC {
+        return Ok(None);
+    }
+
+    Ok(Some(ParsedFrameHeader {
+        frame_type: header[4],
+        frame_seq: read_u64_at(header, 8)?,
+        payload_len: read_u32_at(header, 16)? as usize,
+        expected_crc32: read_u32_at(header, 20)?,
+    }))
 }
 
 fn read_header(reader: &mut BufReader<File>) -> Result<HeaderRead> {
@@ -617,9 +640,9 @@ impl FramedWal {
         let mut header = [0u8; FRAME_HEADER_LEN];
         header[0..4].copy_from_slice(&FRAME_MAGIC);
         header[4] = frame_type;
-        header[8..16].copy_from_slice(&frame_seq.to_le_bytes());
-        header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[20..24].copy_from_slice(&payload_crc32.to_le_bytes());
+        write_u64_at(&mut header, 8, frame_seq)?;
+        write_u32_at(&mut header, 16, payload.len() as u32)?;
+        write_u32_at(&mut header, 20, payload_crc32)?;
 
         let write_result = writer
             .write_all(&header)
@@ -732,9 +755,9 @@ fn split_encoded_payload(payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 
 fn merge_encoded_payload(ts_payload: &[u8], value_payload: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + ts_payload.len() + value_payload.len());
-    payload.extend_from_slice(&(ts_payload.len() as u32).to_le_bytes());
+    append_u32(&mut payload, ts_payload.len() as u32);
     payload.extend_from_slice(ts_payload);
-    payload.extend_from_slice(&(value_payload.len() as u32).to_le_bytes());
+    append_u32(&mut payload, value_payload.len() as u32);
     payload.extend_from_slice(value_payload);
     payload
 }
@@ -852,14 +875,12 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
             Err(e) => return Err(e.into()),
         }
 
-        if header[0..4] != FRAME_MAGIC {
+        let Some(parsed_header) = parse_frame_header(&header)? else {
             break;
-        }
-
-        let frame_seq = u64::from_le_bytes(header[8..16].try_into().unwrap_or([0u8; 8]));
-        let payload_len =
-            u32::from_le_bytes(header[16..20].try_into().unwrap_or([0u8; 4])) as usize;
-        let expected_crc32 = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0u8; 4]));
+        };
+        let frame_seq = parsed_header.frame_seq;
+        let payload_len = parsed_header.payload_len;
+        let expected_crc32 = parsed_header.expected_crc32;
 
         if payload_len > MAX_FRAME_PAYLOAD_BYTES {
             break;
@@ -882,14 +903,14 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
 
 fn encode_series_definition(definition: &SeriesDefinitionFrame) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
-    payload.extend_from_slice(&definition.series_id.to_le_bytes());
+    append_u64(&mut payload, definition.series_id);
 
     write_string_u16(&mut payload, &definition.metric)?;
 
     let labels_len = u16::try_from(definition.labels.len()).map_err(|_| {
         TsinkError::InvalidConfiguration("too many labels in series definition".to_string())
     })?;
-    payload.extend_from_slice(&labels_len.to_le_bytes());
+    append_u16(&mut payload, labels_len);
 
     for label in &definition.labels {
         write_string_u16(&mut payload, &label.name)?;
@@ -931,16 +952,16 @@ fn encode_samples_payload(batches: &[SamplesBatchFrame]) -> Result<Vec<u8>> {
     let count = u16::try_from(batches.len()).map_err(|_| {
         TsinkError::InvalidConfiguration("too many batches in WAL frame".to_string())
     })?;
-    payload.extend_from_slice(&count.to_le_bytes());
+    append_u16(&mut payload, count);
 
     for batch in batches {
-        payload.extend_from_slice(&batch.series_id.to_le_bytes());
-        payload.push(batch.lane as u8);
-        payload.push(batch.ts_codec as u8);
-        payload.push(batch.value_codec as u8);
-        payload.push(0u8);
-        payload.extend_from_slice(&batch.point_count.to_le_bytes());
-        payload.extend_from_slice(&batch.base_ts.to_le_bytes());
+        append_u64(&mut payload, batch.series_id);
+        append_u8(&mut payload, batch.lane as u8);
+        append_u8(&mut payload, batch.ts_codec as u8);
+        append_u8(&mut payload, batch.value_codec as u8);
+        append_u8(&mut payload, 0u8);
+        append_u16(&mut payload, batch.point_count);
+        append_i64(&mut payload, batch.base_ts);
 
         let ts_len = u32::try_from(batch.ts_payload.len()).map_err(|_| {
             TsinkError::InvalidConfiguration("WAL ts payload exceeds u32".to_string())
@@ -949,8 +970,8 @@ fn encode_samples_payload(batches: &[SamplesBatchFrame]) -> Result<Vec<u8>> {
             TsinkError::InvalidConfiguration("WAL value payload exceeds u32".to_string())
         })?;
 
-        payload.extend_from_slice(&ts_len.to_le_bytes());
-        payload.extend_from_slice(&value_len.to_le_bytes());
+        append_u32(&mut payload, ts_len);
+        append_u32(&mut payload, value_len);
         payload.extend_from_slice(&batch.ts_payload);
         payload.extend_from_slice(&batch.value_payload);
     }
@@ -1005,7 +1026,7 @@ fn write_string_u16(out: &mut Vec<u8>, text: &str) -> Result<()> {
     let len = u16::try_from(bytes.len()).map_err(|_| {
         TsinkError::InvalidConfiguration("string too long for u16 encoding".to_string())
     })?;
-    out.extend_from_slice(&len.to_le_bytes());
+    append_u16(out, len);
     out.extend_from_slice(bytes);
     Ok(())
 }
@@ -1051,61 +1072,6 @@ fn decode_value_codec(raw: u8) -> Result<ValueCodecId> {
     }
 }
 
-fn read_u8(payload: &[u8], pos: &mut usize) -> Result<u8> {
-    let byte = *payload.get(*pos).ok_or_else(|| {
-        TsinkError::DataCorruption("payload truncated while reading u8".to_string())
-    })?;
-    *pos += 1;
-    Ok(byte)
-}
-
-fn read_u16(payload: &[u8], pos: &mut usize) -> Result<u16> {
-    let bytes = read_bytes(payload, pos, 2)?;
-    let mut raw = [0u8; 2];
-    raw.copy_from_slice(bytes);
-    Ok(u16::from_le_bytes(raw))
-}
-
-fn read_u32(payload: &[u8], pos: &mut usize) -> Result<u32> {
-    let bytes = read_bytes(payload, pos, 4)?;
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(bytes);
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_u64(payload: &[u8], pos: &mut usize) -> Result<u64> {
-    let bytes = read_bytes(payload, pos, 8)?;
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(bytes);
-    Ok(u64::from_le_bytes(raw))
-}
-
-fn read_i64(payload: &[u8], pos: &mut usize) -> Result<i64> {
-    let bytes = read_bytes(payload, pos, 8)?;
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(bytes);
-    Ok(i64::from_le_bytes(raw))
-}
-
-fn read_bytes<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = pos.saturating_add(len);
-    if end > payload.len() {
-        return Err(TsinkError::DataCorruption(format!(
-            "payload truncated: need {} bytes, have {}",
-            len,
-            payload.len().saturating_sub(*pos)
-        )));
-    }
-
-    let bytes = &payload[*pos..end];
-    *pos = end;
-    Ok(bytes)
-}
-
-fn checksum32(bytes: &[u8]) -> u32 {
-    crc32fast::hash(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
@@ -1122,9 +1088,20 @@ mod tests {
         DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF,
         WAL_FILE_NAME,
     };
+    use crate::engine::binio::{write_u32_at, write_u64_at};
     use crate::engine::chunk::{ChunkPoint, ValueLane};
     use crate::engine::segment::WalHighWatermark;
     use crate::{wal::WalSyncMode, Label, Value};
+
+    fn series_def_frame_header(seq: u64, payload_len: usize, crc32: u32) -> [u8; FRAME_HEADER_LEN] {
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        header[0..4].copy_from_slice(&FRAME_MAGIC);
+        header[4] = FRAME_TYPE_SERIES_DEF;
+        write_u64_at(&mut header, 8, seq).unwrap();
+        write_u32_at(&mut header, 16, payload_len as u32).unwrap();
+        write_u32_at(&mut header, 20, crc32).unwrap();
+        header
+    }
 
     #[test]
     fn samples_batch_roundtrip_preserves_points() {
@@ -1453,13 +1430,7 @@ mod tests {
         .unwrap();
 
         let write_frame = |file: &mut std::fs::File, seq: u64, payload: &[u8]| {
-            let mut header = Vec::with_capacity(24);
-            header.extend_from_slice(&FRAME_MAGIC);
-            header.push(FRAME_TYPE_SERIES_DEF);
-            header.extend_from_slice(&[0u8; 3]);
-            header.extend_from_slice(&seq.to_le_bytes());
-            header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            header.extend_from_slice(&checksum32(payload).to_le_bytes());
+            let header = series_def_frame_header(seq, payload.len(), checksum32(payload));
             file.write_all(&header).unwrap();
             file.write_all(payload).unwrap();
         };
@@ -1490,13 +1461,7 @@ mod tests {
         .unwrap();
 
         let write_frame = |file: &mut std::fs::File, seq: u64, payload: &[u8], crc32: u32| {
-            let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
-            header.extend_from_slice(&FRAME_MAGIC);
-            header.push(FRAME_TYPE_SERIES_DEF);
-            header.extend_from_slice(&[0u8; 3]);
-            header.extend_from_slice(&seq.to_le_bytes());
-            header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            header.extend_from_slice(&crc32.to_le_bytes());
+            let header = series_def_frame_header(seq, payload.len(), crc32);
             file.write_all(&header).unwrap();
             file.write_all(payload).unwrap();
         };

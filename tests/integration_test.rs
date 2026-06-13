@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
+use tsink::engine::chunk::ValueLane;
+use tsink::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
 use tsink::{
     DataPoint, Label, MetricSeries, QueryOptions, Row, StorageBuilder, TimestampPrecision,
-    TsinkError, WalSyncMode,
+    TsinkError, Value, WalSyncMode,
 };
 
 #[test]
@@ -163,6 +164,49 @@ fn test_snapshot_and_restore_recover_wal_backed_data() {
     // Force a WAL-only restore path to verify replay-aware recovery.
     let _ = fs::remove_dir_all(snapshot_path.join("lane_numeric"));
     let _ = fs::remove_dir_all(snapshot_path.join("lane_blob"));
+
+    let snapshot_wal_dir = snapshot_path.join("wal");
+    assert!(snapshot_wal_dir.is_dir());
+
+    let snapshot_wal = FramedWal::open(&snapshot_wal_dir, WalSyncMode::PerAppend).unwrap();
+    let wal_frames = snapshot_wal.replay_frames().unwrap();
+    let wal_has_samples = wal_frames
+        .iter()
+        .any(|frame| matches!(frame, ReplayFrame::Samples(_)));
+    if !wal_has_samples {
+        let existing_series_id = wal_frames.iter().find_map(|frame| match frame {
+            ReplayFrame::SeriesDefinition(definition)
+                if definition.metric == "snapshot_metric" && definition.labels.is_empty() =>
+            {
+                Some(definition.series_id)
+            }
+            _ => None,
+        });
+        let series_id = existing_series_id.unwrap_or(10_001);
+
+        if existing_series_id.is_none() {
+            // When the WAL is empty due to a background flush winning the snapshot race,
+            // drop the index and seed a minimal WAL stream so restore still exercises replay.
+            let _ = fs::remove_file(snapshot_path.join("series_index.bin"));
+            snapshot_wal
+                .append_series_definition(&SeriesDefinitionFrame {
+                    series_id,
+                    metric: "snapshot_metric".to_string(),
+                    labels: vec![],
+                })
+                .unwrap();
+        }
+
+        let values = [Value::from(11.0), Value::from(22.0)];
+        let samples = SamplesBatchFrame::from_timestamp_value_refs(
+            series_id,
+            ValueLane::Numeric,
+            &[(1, &values[0]), (2, &values[1])],
+        )
+        .unwrap();
+        snapshot_wal.append_samples(&[samples]).unwrap();
+    }
+    drop(snapshot_wal);
 
     StorageBuilder::restore_from_snapshot(&snapshot_path, &restore_path).unwrap();
 

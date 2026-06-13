@@ -983,45 +983,6 @@ The `measure_bpp.sh` script accepts environment variables for workload tuning:
 | `TSINK_RETENTION_SECONDS` / `TSINK_PARTITION_SECONDS` | Retention and partition windows. |
 | `TSINK_FAIL_ON_TARGET` | Fail if compression target is not met. |
 
-## Project Structure
-
-```text
-tsink/
-├── src/
-│   ├── lib.rs                  # Public API re-exports
-│   ├── storage.rs              # Storage trait and StorageBuilder
-│   ├── value.rs                # Value types, Codec, Aggregator traits
-│   ├── label.rs                # Label handling and marshaling
-│   ├── error.rs                # TsinkError and Result type
-│   ├── wal.rs                  # WalSyncMode
-│   ├── async_storage.rs        # Async facade (feature-gated)
-│   ├── cgroup.rs               # Container resource detection
-│   ├── concurrency.rs          # Concurrency primitives
-│   ├── mmap.rs                 # Memory-mapped I/O
-│   ├── engine/
-│   │   ├── engine.rs           # Core storage engine
-│   │   ├── compactor.rs        # LSM compaction
-│   │   ├── segment.rs          # Segment file I/O
-│   │   ├── chunk.rs            # Chunk structures
-│   │   ├── encoder.rs          # Compression codecs
-│   │   ├── query.rs            # Query execution
-│   │   ├── series_registry.rs  # Series tracking and indexing
-│   │   ├── index.rs            # Index structures
-│   │   └── wal.rs              # WAL implementation
-│   └── promql/                 # PromQL engine (feature-gated)
-│       ├── ast.rs              # Abstract syntax tree
-│       ├── lexer.rs            # Tokenizer
-│       ├── parser.rs           # Parser
-│       └── eval/               # Evaluation engine
-├── crates/
-│   ├── tsink-server/           # Prometheus-compatible network server
-│   └── tsink-uniffi/           # Python bindings via UniFFI (PyPI: tsink-uniffi)
-├── tests/                      # Integration tests
-├── benches/                    # Criterion benchmarks
-├── examples/                   # Usage examples
-└── scripts/                    # Development and CI scripts
-```
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

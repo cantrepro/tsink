@@ -1,5 +1,6 @@
 use crate::{DataPoint, Result, TsinkError, Value};
 
+use super::binio::{read_array, read_bytes, read_i64, read_u32, read_u64};
 use super::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 
 #[derive(Debug, Clone)]
@@ -1355,15 +1356,15 @@ fn decode_single_value(bytes: &[u8]) -> Result<(Value, usize)> {
 
     let value = match tag {
         1 => {
-            let value = f64::from_le_bytes(read_array8(bytes, &mut pos)?);
+            let value = f64::from_le_bytes(read_array::<8>(bytes, &mut pos)?);
             Value::F64(value)
         }
         2 => {
-            let value = i64::from_le_bytes(read_array8(bytes, &mut pos)?);
+            let value = i64::from_le_bytes(read_array::<8>(bytes, &mut pos)?);
             Value::I64(value)
         }
         3 => {
-            let value = u64::from_le_bytes(read_array8(bytes, &mut pos)?);
+            let value = u64::from_le_bytes(read_array::<8>(bytes, &mut pos)?);
             Value::U64(value)
         }
         4 => {
@@ -1437,50 +1438,6 @@ fn encode_svarint(value: i64, out: &mut Vec<u8>) {
 fn decode_svarint(bytes: &[u8], pos: &mut usize) -> Result<i64> {
     let zigzag = decode_uvarint(bytes, pos)?;
     Ok(((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64)))
-}
-
-fn read_array8(bytes: &[u8], pos: &mut usize) -> Result<[u8; 8]> {
-    let data = read_bytes(bytes, pos, 8)?;
-    let mut out = [0u8; 8];
-    out.copy_from_slice(data);
-    Ok(out)
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    let raw = read_array4(bytes, pos)?;
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64> {
-    let raw = read_array8(bytes, pos)?;
-    Ok(i64::from_le_bytes(raw))
-}
-
-fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let raw = read_array8(bytes, pos)?;
-    Ok(u64::from_le_bytes(raw))
-}
-
-fn read_array4(bytes: &[u8], pos: &mut usize) -> Result<[u8; 4]> {
-    let data = read_bytes(bytes, pos, 4)?;
-    let mut out = [0u8; 4];
-    out.copy_from_slice(data);
-    Ok(out)
-}
-
-fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = pos.saturating_add(len);
-    if end > bytes.len() {
-        return Err(TsinkError::DataCorruption(format!(
-            "payload truncated: need {} bytes, have {}",
-            len,
-            bytes.len().saturating_sub(*pos)
-        )));
-    }
-
-    let slice = &bytes[*pos..end];
-    *pos = end;
-    Ok(slice)
 }
 
 struct BitWriter {

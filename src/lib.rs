@@ -12,7 +12,11 @@ pub mod label;
 pub mod mmap;
 #[cfg(feature = "promql")]
 pub mod promql;
+pub(crate) mod query_aggregation;
+pub(crate) mod query_matcher;
+pub(crate) mod query_selection;
 pub mod storage;
+pub(crate) mod validation;
 pub mod value;
 pub mod wal;
 

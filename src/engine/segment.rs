@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use roaring::RoaringTreemap;
 use tracing::warn;
 
+use crate::engine::binio::{
+    append_i64, append_u16, append_u32, append_u64, append_u8, checksum32, read_array, read_bytes,
+    read_i64, read_u16, read_u32, read_u32_at, read_u64, read_u8, write_u64_at,
+};
 use crate::engine::chunk::{Chunk, ChunkHeader, TimestampCodecId, ValueCodecId, ValueLane};
+use crate::engine::fs_utils::{
+    remove_path_if_exists, rename_tmp, sync_dir_if_exists, write_tmp_and_sync,
+};
 use crate::engine::index::{ChunkIndex, ChunkIndexEntry};
 use crate::engine::series::{LabelPairId, SeriesId, SeriesRegistry};
 use crate::mmap::{create_mmap, PlatformMmap};
@@ -275,20 +281,14 @@ impl SegmentWriter {
         write_tmp_and_sync(&self.staging_layout.manifest_path, &manifest_bytes)?;
         rename_tmp(&self.staging_layout.manifest_path)?;
 
-        if let Ok(dir) = File::open(&self.staging_layout.root) {
-            let _ = dir.sync_all();
-        }
+        sync_dir_if_exists(&self.staging_layout.root);
         ensure_publish_target_clear(&self.layout)?;
         fs::rename(&self.staging_layout.root, &self.layout.root)?;
 
         // Best effort directory sync for crash safety.
-        if let Ok(dir) = File::open(&self.layout.root) {
-            let _ = dir.sync_all();
-        }
+        sync_dir_if_exists(&self.layout.root);
         if let Some(level_root) = self.layout.root.parent() {
-            if let Ok(dir) = File::open(level_root) {
-                let _ = dir.sync_all();
-            }
+            sync_dir_if_exists(level_root);
         }
 
         Ok(manifest)
@@ -789,9 +789,9 @@ fn build_chunks_and_index(
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&CHUNKS_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes());
+    append_u16(&mut bytes, FORMAT_VERSION);
+    append_u16(&mut bytes, 0u16);
+    append_u64(&mut bytes, 0u64);
 
     let mut index = ChunkIndex::default();
 
@@ -852,7 +852,7 @@ fn build_chunks_and_index(
         }
     }
 
-    bytes[8..16].copy_from_slice(&(chunk_count as u64).to_le_bytes());
+    write_u64_at(bytes.as_mut_slice(), 8, chunk_count as u64)?;
 
     Ok((bytes, index, chunk_count, point_count, min_ts, max_ts))
 }
@@ -863,15 +863,15 @@ fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
         .map_err(|_| TsinkError::InvalidConfiguration("chunk payload too large".to_string()))?;
 
     let mut header_body = Vec::with_capacity(34);
-    header_body.extend_from_slice(&chunk.header.series_id.to_le_bytes());
-    header_body.push(chunk.header.lane as u8);
-    header_body.push(chunk.header.ts_codec as u8);
-    header_body.push(chunk.header.value_codec as u8);
-    header_body.push(chunk_flags);
-    header_body.extend_from_slice(&chunk.header.point_count.to_le_bytes());
-    header_body.extend_from_slice(&chunk.header.min_ts.to_le_bytes());
-    header_body.extend_from_slice(&chunk.header.max_ts.to_le_bytes());
-    header_body.extend_from_slice(&payload_len.to_le_bytes());
+    append_u64(&mut header_body, chunk.header.series_id);
+    append_u8(&mut header_body, chunk.header.lane as u8);
+    append_u8(&mut header_body, chunk.header.ts_codec as u8);
+    append_u8(&mut header_body, chunk.header.value_codec as u8);
+    append_u8(&mut header_body, chunk_flags);
+    append_u16(&mut header_body, chunk.header.point_count);
+    append_i64(&mut header_body, chunk.header.min_ts);
+    append_i64(&mut header_body, chunk.header.max_ts);
+    append_u32(&mut header_body, payload_len);
 
     let header_crc32 = checksum32(&header_body);
     let payload_crc32 = checksum32(&payload);
@@ -885,11 +885,11 @@ fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
         TsinkError::InvalidConfiguration("chunk record exceeds u32 length".to_string())
     })?;
 
-    out.extend_from_slice(&record_len_u32.to_le_bytes());
-    out.extend_from_slice(&header_crc32.to_le_bytes());
+    append_u32(out, record_len_u32);
+    append_u32(out, header_crc32);
     out.extend_from_slice(&header_body);
     out.extend_from_slice(&payload);
-    out.extend_from_slice(&payload_crc32.to_le_bytes());
+    append_u32(out, payload_crc32);
 
     Ok(())
 }
@@ -914,29 +914,29 @@ fn build_chunk_index_file(index: &mut ChunkIndex) -> Result<Vec<u8>> {
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&CHUNK_INDEX_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&(index.entries.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&(series_ranges.len() as u64).to_le_bytes());
+    append_u16(&mut bytes, FORMAT_VERSION);
+    append_u16(&mut bytes, 0u16);
+    append_u64(&mut bytes, index.entries.len() as u64);
+    append_u64(&mut bytes, series_ranges.len() as u64);
 
     for entry in &index.entries {
-        bytes.extend_from_slice(&entry.series_id.to_le_bytes());
-        bytes.extend_from_slice(&entry.min_ts.to_le_bytes());
-        bytes.extend_from_slice(&entry.max_ts.to_le_bytes());
-        bytes.extend_from_slice(&entry.chunk_offset.to_le_bytes());
-        bytes.extend_from_slice(&entry.chunk_len.to_le_bytes());
-        bytes.extend_from_slice(&entry.point_count.to_le_bytes());
-        bytes.push(entry.lane as u8);
-        bytes.push(entry.ts_codec as u8);
-        bytes.push(entry.value_codec as u8);
-        bytes.push(entry.level);
+        append_u64(&mut bytes, entry.series_id);
+        append_i64(&mut bytes, entry.min_ts);
+        append_i64(&mut bytes, entry.max_ts);
+        append_u64(&mut bytes, entry.chunk_offset);
+        append_u32(&mut bytes, entry.chunk_len);
+        append_u16(&mut bytes, entry.point_count);
+        append_u8(&mut bytes, entry.lane as u8);
+        append_u8(&mut bytes, entry.ts_codec as u8);
+        append_u8(&mut bytes, entry.value_codec as u8);
+        append_u8(&mut bytes, entry.level);
     }
 
     for (series_id, first_entry_index, count) in series_ranges {
-        bytes.extend_from_slice(&series_id.to_le_bytes());
-        bytes.extend_from_slice(&first_entry_index.to_le_bytes());
-        bytes.extend_from_slice(&count.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        append_u64(&mut bytes, series_id);
+        append_u64(&mut bytes, first_entry_index);
+        append_u32(&mut bytes, count);
+        append_u32(&mut bytes, 0u32);
     }
 
     Ok(bytes)
@@ -1023,12 +1023,12 @@ fn build_series_file(
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SERIES_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&(metric_values.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(label_name_values.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(label_value_values.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(series_entries.len() as u64).to_le_bytes());
+    append_u16(&mut bytes, FORMAT_VERSION);
+    append_u16(&mut bytes, 0u16);
+    append_u32(&mut bytes, metric_values.len() as u32);
+    append_u32(&mut bytes, label_name_values.len() as u32);
+    append_u32(&mut bytes, label_value_values.len() as u32);
+    append_u64(&mut bytes, series_entries.len() as u64);
 
     for (id, value) in metric_values.iter().enumerate() {
         write_dict_entry(&mut bytes, id as u32, value)?;
@@ -1052,16 +1052,16 @@ fn build_series_file(
             TsinkError::InvalidConfiguration("series label pair count exceeds u16".to_string())
         })?;
 
-        bytes.extend_from_slice(&series.series_id.to_le_bytes());
-        bytes.push(series.lane as u8);
-        bytes.push(0u8);
-        bytes.extend_from_slice(&label_pair_count.to_le_bytes());
-        bytes.extend_from_slice(&series.metric_id.to_le_bytes());
-        bytes.extend_from_slice(&(pairs_offset as u64).to_le_bytes());
+        append_u64(&mut bytes, series.series_id);
+        append_u8(&mut bytes, series.lane as u8);
+        append_u8(&mut bytes, 0u8);
+        append_u16(&mut bytes, label_pair_count);
+        append_u32(&mut bytes, series.metric_id);
+        append_u64(&mut bytes, pairs_offset as u64);
 
         for pair in &series.label_pairs {
-            pairs_bytes.extend_from_slice(&pair.name_id.to_le_bytes());
-            pairs_bytes.extend_from_slice(&pair.value_id.to_le_bytes());
+            append_u32(&mut pairs_bytes, pair.name_id);
+            append_u32(&mut pairs_bytes, pair.value_id);
         }
     }
 
@@ -1074,8 +1074,8 @@ fn write_dict_entry(out: &mut Vec<u8>, id: u32, value: &str) -> Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| TsinkError::InvalidConfiguration("dictionary string too large".to_string()))?;
 
-    out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
+    append_u32(out, id);
+    append_u32(out, len);
     out.extend_from_slice(bytes);
     Ok(())
 }
@@ -1096,9 +1096,9 @@ fn build_postings_file(postings: &BTreeMap<LabelPairId, RoaringTreemap>) -> Resu
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&POSTINGS_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&(postings.len() as u64).to_le_bytes());
+    append_u16(&mut bytes, FORMAT_VERSION);
+    append_u16(&mut bytes, 0u16);
+    append_u64(&mut bytes, postings.len() as u64);
 
     for (pair, series_ids) in postings {
         let series_count = u32::try_from(series_ids.len()).map_err(|_| {
@@ -1110,10 +1110,10 @@ fn build_postings_file(postings: &BTreeMap<LabelPairId, RoaringTreemap>) -> Resu
             TsinkError::InvalidConfiguration("posting payload exceeds u32".to_string())
         })?;
 
-        bytes.extend_from_slice(&pair.name_id.to_le_bytes());
-        bytes.extend_from_slice(&pair.value_id.to_le_bytes());
-        bytes.extend_from_slice(&series_count.to_le_bytes());
-        bytes.extend_from_slice(&encoded_len.to_le_bytes());
+        append_u32(&mut bytes, pair.name_id);
+        append_u32(&mut bytes, pair.value_id);
+        append_u32(&mut bytes, series_count);
+        append_u32(&mut bytes, encoded_len);
         bytes.extend_from_slice(&encoded);
     }
 
@@ -1126,38 +1126,38 @@ fn build_manifest_file(
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&MANIFEST_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&manifest.segment_id.to_le_bytes());
-    bytes.push(manifest.level);
+    append_u16(&mut bytes, FORMAT_VERSION);
+    append_u16(&mut bytes, 0u16);
+    append_u64(&mut bytes, manifest.segment_id);
+    append_u8(&mut bytes, manifest.level);
     bytes.extend_from_slice(&[0u8; 7]);
-    bytes.extend_from_slice(&manifest.min_ts.unwrap_or(0).to_le_bytes());
-    bytes.extend_from_slice(&manifest.max_ts.unwrap_or(0).to_le_bytes());
+    append_i64(&mut bytes, manifest.min_ts.unwrap_or(0));
+    append_i64(&mut bytes, manifest.max_ts.unwrap_or(0));
 
     let created_unix_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
-    bytes.extend_from_slice(&created_unix_ns.to_le_bytes());
+    append_i64(&mut bytes, created_unix_ns);
 
-    bytes.extend_from_slice(&(manifest.series_count as u64).to_le_bytes());
-    bytes.extend_from_slice(&(manifest.chunk_count as u64).to_le_bytes());
-    bytes.extend_from_slice(&(manifest.point_count as u64).to_le_bytes());
-    bytes.extend_from_slice(&manifest.wal_highwater.segment.to_le_bytes());
-    bytes.extend_from_slice(&manifest.wal_highwater.frame.to_le_bytes());
-    bytes.extend_from_slice(&MANIFEST_FILE_ENTRY_COUNT.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    append_u64(&mut bytes, manifest.series_count as u64);
+    append_u64(&mut bytes, manifest.chunk_count as u64);
+    append_u64(&mut bytes, manifest.point_count as u64);
+    append_u64(&mut bytes, manifest.wal_highwater.segment);
+    append_u64(&mut bytes, manifest.wal_highwater.frame);
+    append_u32(&mut bytes, MANIFEST_FILE_ENTRY_COUNT);
+    append_u32(&mut bytes, 0u32);
 
     for entry in &file_entries {
-        bytes.push(entry.kind);
-        bytes.push(0u8);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&entry.file_len.to_le_bytes());
-        bytes.extend_from_slice(&entry.hash64.to_le_bytes());
+        append_u8(&mut bytes, entry.kind);
+        append_u8(&mut bytes, 0u8);
+        append_u16(&mut bytes, 0u16);
+        append_u64(&mut bytes, entry.file_len);
+        append_u64(&mut bytes, entry.hash64);
     }
 
     let crc = checksum32(&bytes);
-    bytes.extend_from_slice(&crc.to_le_bytes());
+    append_u32(&mut bytes, crc);
 
     Ok(bytes)
 }
@@ -1169,11 +1169,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
         ));
     }
 
-    let expected_crc = {
-        let mut raw = [0u8; 4];
-        raw.copy_from_slice(&bytes[bytes.len() - 4..]);
-        u32::from_le_bytes(raw)
-    };
+    let expected_crc = read_u32_at(bytes, bytes.len() - 4)?;
     let actual_crc = checksum32(&bytes[..bytes.len() - 4]);
     if expected_crc != actual_crc {
         return Err(TsinkError::DataCorruption(
@@ -1855,22 +1851,6 @@ fn decode_value_codec(raw: u8) -> Result<ValueCodecId> {
     }
 }
 
-fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp_path = tmp_path_for(path);
-    let file = File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(bytes)?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    Ok(())
-}
-
-fn rename_tmp(path: &Path) -> Result<()> {
-    let tmp_path = tmp_path_for(path);
-    fs::rename(tmp_path, path)?;
-    Ok(())
-}
-
 fn prepare_staging_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(
@@ -1899,34 +1879,8 @@ fn ensure_publish_target_clear(layout: &SegmentLayout) -> Result<()> {
     )))
 }
 
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn tmp_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    path.with_file_name(format!("{file_name}.tmp"))
-}
-
 fn hash64(bytes: &[u8]) -> u64 {
     xxhash_rust::xxh64::xxh64(bytes, 0)
-}
-
-fn checksum32(bytes: &[u8]) -> u32 {
-    crc32fast::hash(bytes)
 }
 
 fn encode_chunk_payload_for_storage(payload: &[u8]) -> Result<(u8, Vec<u8>)> {
@@ -1940,7 +1894,7 @@ fn encode_chunk_payload_for_storage(payload: &[u8]) -> Result<(u8, Vec<u8>)> {
     let mut wrapped = Vec::with_capacity(
         CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES.saturating_add(compressed.len()),
     );
-    wrapped.extend_from_slice(&original_len.to_le_bytes());
+    append_u32(&mut wrapped, original_len);
     wrapped.extend_from_slice(&compressed);
 
     if wrapped.len() >= payload.len() {
@@ -1971,9 +1925,7 @@ pub(crate) fn decompress_chunk_payload_zstd(payload: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    let mut raw = [0u8; CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES];
-    raw.copy_from_slice(&payload[..CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES]);
-    let expected_len = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(usize::MAX);
+    let expected_len = usize::try_from(read_u32_at(payload, 0)?).unwrap_or(usize::MAX);
     let compressed = &payload[CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES..];
     let decoded = zstd::bulk::decompress(compressed, expected_len).map_err(|err| {
         TsinkError::Compression(format!("zstd decompress chunk payload failed: {err}"))
@@ -1994,59 +1946,6 @@ fn decode_chunk_payload_from_storage(payload: &[u8], chunk_flags: u8) -> Result<
         return decompress_chunk_payload_zstd(payload);
     }
     Ok(payload.to_vec())
-}
-
-fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
-    let byte = *bytes.get(*pos).ok_or_else(|| {
-        TsinkError::DataCorruption("payload truncated while reading u8".to_string())
-    })?;
-    *pos += 1;
-    Ok(byte)
-}
-
-fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
-    let mut raw = [0u8; 2];
-    raw.copy_from_slice(read_bytes(bytes, pos, 2)?);
-    Ok(u16::from_le_bytes(raw))
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(read_bytes(bytes, pos, 4)?);
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(read_bytes(bytes, pos, 8)?);
-    Ok(u64::from_le_bytes(raw))
-}
-
-fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64> {
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(read_bytes(bytes, pos, 8)?);
-    Ok(i64::from_le_bytes(raw))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N]> {
-    let mut raw = [0u8; N];
-    raw.copy_from_slice(read_bytes(bytes, pos, N)?);
-    Ok(raw)
-}
-
-fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = pos.saturating_add(len);
-    if end > bytes.len() {
-        return Err(TsinkError::DataCorruption(format!(
-            "payload truncated: need {} bytes, have {}",
-            len,
-            bytes.len().saturating_sub(*pos)
-        )));
-    }
-
-    let out = &bytes[*pos..end];
-    *pos = end;
-    Ok(out)
 }
 
 #[cfg(test)]

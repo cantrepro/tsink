@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
+use crate::engine::binio::{
+    append_u16, append_u32, append_u64, read_array, read_bytes, read_u16, read_u32, read_u64,
+};
+use crate::engine::fs_utils::write_file_atomically_and_sync_parent;
+use crate::validation::{validate_labels, validate_metric};
 use crate::{Label, Result, Row, TsinkError};
 use roaring::RoaringTreemap;
 
@@ -118,40 +122,6 @@ pub struct SeriesRegistry {
     by_id: HashMap<SeriesId, SeriesDefinition>,
     metric_postings: HashMap<DictionaryId, RoaringTreemap>,
     postings: BTreeMap<LabelPairId, RoaringTreemap>,
-}
-
-pub(crate) fn validate_metric(metric: &str) -> Result<()> {
-    if metric.is_empty() {
-        return Err(TsinkError::MetricRequired);
-    }
-    if metric.len() > u16::MAX as usize {
-        return Err(TsinkError::InvalidMetricName(format!(
-            "metric name too long: {} bytes (max {})",
-            metric.len(),
-            u16::MAX as usize
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_labels(labels: &[Label]) -> Result<()> {
-    for label in labels {
-        if !label.is_valid() {
-            return Err(TsinkError::InvalidLabel(
-                "label name and value must be non-empty".to_string(),
-            ));
-        }
-        if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
-            || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
-        {
-            return Err(TsinkError::InvalidLabel(format!(
-                "label name/value must be within limits (name <= {}, value <= {})",
-                crate::label::MAX_LABEL_NAME_LEN,
-                crate::label::MAX_LABEL_VALUE_LEN
-            )));
-        }
-    }
-    Ok(())
 }
 
 impl SeriesRegistry {
@@ -541,16 +511,16 @@ impl SeriesRegistry {
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&REGISTRY_INDEX_MAGIC);
-        bytes.extend_from_slice(&REGISTRY_INDEX_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&self.next_series_id.to_le_bytes());
-        bytes.extend_from_slice(&(self.metric_dict.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(self.label_name_dict.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(self.label_value_dict.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(self.by_id.len() as u64).to_le_bytes());
+        append_u16(&mut bytes, REGISTRY_INDEX_VERSION);
+        append_u16(&mut bytes, 0u16);
+        append_u64(&mut bytes, self.next_series_id);
+        append_u32(&mut bytes, self.metric_dict.len() as u32);
+        append_u32(&mut bytes, self.label_name_dict.len() as u32);
+        append_u32(&mut bytes, self.label_value_dict.len() as u32);
+        append_u64(&mut bytes, self.by_id.len() as u64);
         // Reserved for future index sections.
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
+        append_u64(&mut bytes, 0u64);
+        append_u64(&mut bytes, 0u64);
 
         for (id, value) in self.metric_dict.entries() {
             write_dict_entry(&mut bytes, id, value)?;
@@ -565,33 +535,22 @@ impl SeriesRegistry {
         let mut series = self.by_id.values().cloned().collect::<Vec<_>>();
         series.sort_by_key(|entry| entry.series_id);
         for entry in &series {
-            bytes.extend_from_slice(&entry.series_id.to_le_bytes());
-            bytes.extend_from_slice(&entry.metric_id.to_le_bytes());
+            append_u64(&mut bytes, entry.series_id);
+            append_u32(&mut bytes, entry.metric_id);
             let pair_count = u16::try_from(entry.label_pairs.len()).map_err(|_| {
                 TsinkError::InvalidConfiguration(
                     "series label pair count exceeds u16 in registry index".to_string(),
                 )
             })?;
-            bytes.extend_from_slice(&pair_count.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
+            append_u16(&mut bytes, pair_count);
+            append_u16(&mut bytes, 0u16);
             for pair in &entry.label_pairs {
-                bytes.extend_from_slice(&pair.name_id.to_le_bytes());
-                bytes.extend_from_slice(&pair.value_id.to_le_bytes());
+                append_u32(&mut bytes, pair.name_id);
+                append_u32(&mut bytes, pair.value_id);
             }
         }
 
-        let tmp_path = path.with_extension("tmp");
-        {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp_path, path)?;
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        write_file_atomically_and_sync_parent(path, &bytes)?;
         Ok(())
     }
 
@@ -704,8 +663,8 @@ fn write_dict_entry(out: &mut Vec<u8>, id: u32, value: &str) -> Result<()> {
     let len = u32::try_from(value_bytes.len()).map_err(|_| {
         TsinkError::InvalidConfiguration("registry dictionary string exceeds u32".to_string())
     })?;
-    out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
+    append_u32(out, id);
+    append_u32(out, len);
     out.extend_from_slice(value_bytes);
     Ok(())
 }
@@ -727,44 +686,6 @@ fn parse_dictionary(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<S
         values.push(value);
     }
     Ok(values)
-}
-
-fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
-    let mut raw = [0u8; 2];
-    raw.copy_from_slice(read_bytes(bytes, pos, 2)?);
-    Ok(u16::from_le_bytes(raw))
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(read_bytes(bytes, pos, 4)?);
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(read_bytes(bytes, pos, 8)?);
-    Ok(u64::from_le_bytes(raw))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N]> {
-    let mut raw = [0u8; N];
-    raw.copy_from_slice(read_bytes(bytes, pos, N)?);
-    Ok(raw)
-}
-
-fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = pos.saturating_add(len);
-    if end > bytes.len() {
-        return Err(TsinkError::DataCorruption(format!(
-            "registry payload truncated: need {} bytes, have {}",
-            len,
-            bytes.len().saturating_sub(*pos)
-        )));
-    }
-    let out = &bytes[*pos..end];
-    *pos = end;
-    Ok(out)
 }
 
 #[cfg(test)]
