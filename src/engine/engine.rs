@@ -884,6 +884,177 @@ impl ChunkStorage {
         end: i64,
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
+        if self.try_collect_points_for_series_with_merge(series_id, start, end, out)? {
+            return Ok(());
+        }
+        self.collect_points_for_series_append_sort_path(series_id, start, end, out)
+    }
+
+    fn try_collect_points_for_series_with_merge(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<bool> {
+        let _visibility_guard = self.flush_visibility_lock.read();
+        let mut has_previous_chunk = false;
+        let mut has_previous_persisted_chunk = false;
+        let mut previous_max_ts = i64::MIN;
+        let mut previous_persisted_max_ts = i64::MIN;
+        let mut requires_output_validation = false;
+        let mut requires_timestamp_dedupe = false;
+        let mut requires_exact_dedupe = false;
+        let mut persisted_source_sorted = true;
+        let mut sealed_source_sorted = true;
+        let mut estimated_points = 0usize;
+
+        {
+            let persisted_index = self.persisted_index.read();
+            let mut persisted_chunks = Vec::<PersistedChunkRef>::new();
+
+            if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
+                let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
+                persisted_chunks.reserve(end_idx);
+
+                let mut previous_persisted_source_max_ts = i64::MIN;
+                let mut has_previous_persisted_source_chunk = false;
+                for chunk_ref in &chunks[..end_idx] {
+                    if chunk_ref.max_ts < start {
+                        continue;
+                    }
+
+                    if has_previous_chunk
+                        && chunk_ref.min_ts <= previous_max_ts
+                        && has_previous_persisted_chunk
+                        && chunk_ref.min_ts <= previous_persisted_max_ts
+                    {
+                        requires_timestamp_dedupe = true;
+                    }
+                    if has_previous_persisted_source_chunk
+                        && chunk_ref.min_ts < previous_persisted_source_max_ts
+                    {
+                        persisted_source_sorted = false;
+                    }
+
+                    has_previous_chunk = true;
+                    has_previous_persisted_chunk = true;
+                    previous_max_ts = previous_max_ts.max(chunk_ref.max_ts);
+                    previous_persisted_max_ts = previous_persisted_max_ts.max(chunk_ref.max_ts);
+                    previous_persisted_source_max_ts =
+                        previous_persisted_source_max_ts.max(chunk_ref.max_ts);
+                    has_previous_persisted_source_chunk = true;
+                    estimated_points =
+                        estimated_points.saturating_add(chunk_ref.point_count as usize);
+                    persisted_chunks.push(*chunk_ref);
+                }
+            }
+            // Hold active read lock while reading sealed+active to prevent observing a transient
+            // "moved out of active but not yet visible in sealed" flush transition.
+            let active = self.active_shard(series_id).read();
+            let sealed = self.sealed_shard(series_id).read();
+            let mut sealed_chunks = Vec::<&Chunk>::new();
+            if let Some(chunks) = sealed.get(&series_id) {
+                let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
+                let mut previous_sealed_source_max_ts = i64::MIN;
+                let mut has_previous_sealed_source_chunk = false;
+                for (_, chunk) in chunks.range(..end_bound) {
+                    if chunk.header.max_ts < start {
+                        continue;
+                    }
+
+                    if has_previous_chunk
+                        && chunk.header.min_ts <= previous_max_ts
+                        && has_previous_persisted_chunk
+                        && chunk.header.min_ts <= previous_persisted_max_ts
+                    {
+                        requires_exact_dedupe = true;
+                    }
+                    if has_previous_sealed_source_chunk
+                        && chunk.header.min_ts < previous_sealed_source_max_ts
+                    {
+                        sealed_source_sorted = false;
+                    }
+
+                    has_previous_chunk = true;
+                    previous_max_ts = previous_max_ts.max(chunk.header.max_ts);
+                    previous_sealed_source_max_ts =
+                        previous_sealed_source_max_ts.max(chunk.header.max_ts);
+                    has_previous_sealed_source_chunk = true;
+
+                    // Chunks without encoded payload may be ad-hoc/manual and not guaranteed sorted.
+                    if chunk.points.len() > 1 && chunk.encoded_payload.is_empty() {
+                        requires_output_validation = true;
+                    }
+                    estimated_points =
+                        estimated_points.saturating_add(chunk.header.point_count as usize);
+                    sealed_chunks.push(chunk);
+                }
+            }
+
+            let mut active_points: &[ChunkPoint] = &[];
+            if let Some(state) = active.get(&series_id) {
+                active_points = state.builder.points();
+                let mut previous_active_ts = i64::MIN;
+                let mut has_previous_active = false;
+
+                for point in state.builder.points() {
+                    if point.ts < start || point.ts >= end {
+                        continue;
+                    }
+
+                    if has_previous_persisted_chunk && point.ts <= previous_persisted_max_ts {
+                        requires_exact_dedupe = true;
+                    }
+                    if has_previous_active && point.ts < previous_active_ts {
+                        requires_output_validation = true;
+                    }
+
+                    has_previous_active = true;
+                    previous_active_ts = point.ts;
+                    estimated_points = estimated_points.saturating_add(1);
+                }
+            }
+            if requires_output_validation || !persisted_source_sorted || !sealed_source_sorted {
+                return Ok(false);
+            }
+
+            out.clear();
+            out.reserve(estimated_points);
+
+            let mut persisted_cursor = PersistedSourceMergeCursor::new(
+                persisted_chunks,
+                persisted_index.segment_maps.as_slice(),
+                start,
+                end,
+            );
+            let mut sealed_cursor = SealedSourceMergeCursor::new(sealed_chunks, start, end);
+            let mut active_cursor = ActiveSourceMergeCursor::new(active_points, start, end);
+
+            merge_sorted_query_sources_into(
+                &mut persisted_cursor,
+                &mut sealed_cursor,
+                &mut active_cursor,
+                out,
+            )?;
+        }
+
+        self.apply_retention_filter(out);
+        if requires_timestamp_dedupe {
+            dedupe_last_value_per_timestamp(out);
+        } else if requires_exact_dedupe {
+            dedupe_exact_duplicate_points(out);
+        }
+        Ok(true)
+    }
+
+    fn collect_points_for_series_append_sort_path(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<()> {
         let _visibility_guard = self.flush_visibility_lock.read();
         out.clear();
         let mut has_overlap = false;
@@ -2275,6 +2446,234 @@ fn merge_loaded_segment_indexes(
         indexed_segments,
         wal_replay_highwater: replay_highwater,
     })
+}
+
+struct PersistedSourceMergeCursor<'a> {
+    chunk_refs: Vec<PersistedChunkRef>,
+    segment_maps: &'a [Arc<PlatformMmap>],
+    start: i64,
+    end: i64,
+    next_chunk_idx: usize,
+    current_points: Vec<DataPoint>,
+    next_point_idx: usize,
+}
+
+impl<'a> PersistedSourceMergeCursor<'a> {
+    fn new(
+        chunk_refs: Vec<PersistedChunkRef>,
+        segment_maps: &'a [Arc<PlatformMmap>],
+        start: i64,
+        end: i64,
+    ) -> Self {
+        Self {
+            chunk_refs,
+            segment_maps,
+            start,
+            end,
+            next_chunk_idx: 0,
+            current_points: Vec::new(),
+            next_point_idx: 0,
+        }
+    }
+
+    fn ensure_head(&mut self) -> Result<Option<&DataPoint>> {
+        loop {
+            if self.next_point_idx < self.current_points.len() {
+                return Ok(self.current_points.get(self.next_point_idx));
+            }
+            if self.next_chunk_idx >= self.chunk_refs.len() {
+                return Ok(None);
+            }
+
+            let chunk_ref = self.chunk_refs[self.next_chunk_idx];
+            self.next_chunk_idx = self.next_chunk_idx.saturating_add(1);
+            self.current_points.clear();
+            self.next_point_idx = 0;
+
+            let payload = persisted_chunk_payload(self.segment_maps, &chunk_ref)?;
+            decode_encoded_chunk_payload_in_range_into(
+                EncodedChunkDescriptor {
+                    lane: chunk_ref.lane,
+                    ts_codec: chunk_ref.ts_codec,
+                    value_codec: chunk_ref.value_codec,
+                    point_count: chunk_ref.point_count as usize,
+                },
+                payload,
+                self.start,
+                self.end,
+                &mut self.current_points,
+            )?;
+        }
+    }
+
+    fn peek_timestamp(&mut self) -> Result<Option<i64>> {
+        Ok(self.ensure_head()?.map(|point| point.timestamp))
+    }
+
+    fn pop_point(&mut self) -> Result<Option<DataPoint>> {
+        if self.ensure_head()?.is_none() {
+            return Ok(None);
+        }
+
+        let point = self.current_points[self.next_point_idx].clone();
+        self.next_point_idx = self.next_point_idx.saturating_add(1);
+        Ok(Some(point))
+    }
+}
+
+struct SealedSourceMergeCursor<'a> {
+    chunks: Vec<&'a Chunk>,
+    start: i64,
+    end: i64,
+    next_chunk_idx: usize,
+    current_points: Vec<DataPoint>,
+    next_point_idx: usize,
+}
+
+impl<'a> SealedSourceMergeCursor<'a> {
+    fn new(chunks: Vec<&'a Chunk>, start: i64, end: i64) -> Self {
+        Self {
+            chunks,
+            start,
+            end,
+            next_chunk_idx: 0,
+            current_points: Vec::new(),
+            next_point_idx: 0,
+        }
+    }
+
+    fn ensure_head(&mut self) -> Result<Option<&DataPoint>> {
+        loop {
+            if self.next_point_idx < self.current_points.len() {
+                return Ok(self.current_points.get(self.next_point_idx));
+            }
+            if self.next_chunk_idx >= self.chunks.len() {
+                return Ok(None);
+            }
+
+            let chunk = self.chunks[self.next_chunk_idx];
+            self.next_chunk_idx = self.next_chunk_idx.saturating_add(1);
+            self.current_points.clear();
+            self.next_point_idx = 0;
+            decode_chunk_points_in_range_into(
+                chunk,
+                self.start,
+                self.end,
+                &mut self.current_points,
+            )?;
+        }
+    }
+
+    fn peek_timestamp(&mut self) -> Result<Option<i64>> {
+        Ok(self.ensure_head()?.map(|point| point.timestamp))
+    }
+
+    fn pop_point(&mut self) -> Result<Option<DataPoint>> {
+        if self.ensure_head()?.is_none() {
+            return Ok(None);
+        }
+
+        let point = self.current_points[self.next_point_idx].clone();
+        self.next_point_idx = self.next_point_idx.saturating_add(1);
+        Ok(Some(point))
+    }
+}
+
+struct ActiveSourceMergeCursor<'a> {
+    points: &'a [ChunkPoint],
+    start: i64,
+    end: i64,
+    next_point_idx: usize,
+}
+
+impl<'a> ActiveSourceMergeCursor<'a> {
+    fn new(points: &'a [ChunkPoint], start: i64, end: i64) -> Self {
+        Self {
+            points,
+            start,
+            end,
+            next_point_idx: 0,
+        }
+    }
+
+    fn seek_in_range(&mut self) {
+        while self.next_point_idx < self.points.len()
+            && self.points[self.next_point_idx].ts < self.start
+        {
+            self.next_point_idx = self.next_point_idx.saturating_add(1);
+        }
+    }
+
+    fn peek_timestamp(&mut self) -> Option<i64> {
+        self.seek_in_range();
+        let point = self.points.get(self.next_point_idx)?;
+        (point.ts < self.end).then_some(point.ts)
+    }
+
+    fn pop_point(&mut self) -> Option<DataPoint> {
+        self.seek_in_range();
+        let point = self.points.get(self.next_point_idx)?;
+        if point.ts >= self.end {
+            return None;
+        }
+        self.next_point_idx = self.next_point_idx.saturating_add(1);
+        Some(DataPoint::new(point.ts, point.value.clone()))
+    }
+}
+
+fn merge_sorted_query_sources_into(
+    persisted: &mut PersistedSourceMergeCursor<'_>,
+    sealed: &mut SealedSourceMergeCursor<'_>,
+    active: &mut ActiveSourceMergeCursor<'_>,
+    out: &mut Vec<DataPoint>,
+) -> Result<()> {
+    enum Source {
+        Persisted,
+        Sealed,
+        Active,
+    }
+
+    loop {
+        let mut selected = None;
+        let mut selected_ts = i64::MAX;
+
+        if let Some(ts) = persisted.peek_timestamp()? {
+            selected = Some(Source::Persisted);
+            selected_ts = ts;
+        }
+        if let Some(ts) = sealed.peek_timestamp()? {
+            if selected.is_none() || ts < selected_ts {
+                selected = Some(Source::Sealed);
+                selected_ts = ts;
+            }
+        }
+        if let Some(ts) = active.peek_timestamp() {
+            if selected.is_none() || ts < selected_ts {
+                selected = Some(Source::Active);
+            }
+        }
+
+        match selected {
+            Some(Source::Persisted) => {
+                if let Some(point) = persisted.pop_point()? {
+                    out.push(point);
+                }
+            }
+            Some(Source::Sealed) => {
+                if let Some(point) = sealed.pop_point()? {
+                    out.push(point);
+                }
+            }
+            Some(Source::Active) => {
+                if let Some(point) = active.pop_point() {
+                    out.push(point);
+                }
+            }
+            None => break,
+        }
+    }
+
+    Ok(())
 }
 
 fn persisted_chunk_payload<'a>(
