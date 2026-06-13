@@ -143,8 +143,8 @@ jobs:
           args: --release --out dist ${{ matrix.args }}
           working-directory: crates/tsink-uniffi
           before-script-linux: |
-            env -u CARGO_BUILD_TARGET cargo build -p tsink-uniffi --bin uniffi-bindgen
-            cp target/debug/uniffi-bindgen /usr/local/bin/
+            env -u CARGO_BUILD_TARGET cargo build -p tsink-uniffi --bin uniffi-bindgen --target-dir /tmp/uniffi-build
+            cp /tmp/uniffi-build/debug/uniffi-bindgen /usr/local/bin/
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
