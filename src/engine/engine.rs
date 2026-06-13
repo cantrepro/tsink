@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
@@ -863,20 +863,44 @@ impl ChunkStorage {
     }
 
     fn reload_persisted_indexes_from_disk(&self) -> Result<()> {
+        self.reload_persisted_indexes_from_disk_with_exclusions(None, None)
+    }
+
+    fn reload_persisted_indexes_from_disk_with_exclusions(
+        &self,
+        numeric_exclusions: Option<&HashSet<PathBuf>>,
+        blob_exclusions: Option<&HashSet<PathBuf>>,
+    ) -> Result<()> {
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
             return Ok(());
         }
 
-        let loaded_numeric = if let Some(path) = &self.numeric_lane_path {
+        let mut loaded_numeric = if let Some(path) = &self.numeric_lane_path {
             load_segment_indexes(path)?
         } else {
             crate::engine::segment::LoadedSegmentIndexes::default()
         };
-        let loaded_blob = if let Some(path) = &self.blob_lane_path {
+        let mut loaded_blob = if let Some(path) = &self.blob_lane_path {
             load_segment_indexes(path)?
         } else {
             crate::engine::segment::LoadedSegmentIndexes::default()
         };
+
+        if let Some(exclusions) = numeric_exclusions {
+            if !exclusions.is_empty() {
+                loaded_numeric
+                    .indexed_segments
+                    .retain(|segment| !exclusions.contains(&segment.root));
+            }
+        }
+        if let Some(exclusions) = blob_exclusions {
+            if !exclusions.is_empty() {
+                loaded_blob
+                    .indexed_segments
+                    .retain(|segment| !exclusions.contains(&segment.root));
+            }
+        }
+
         let loaded_segments = merge_loaded_segment_indexes(
             loaded_numeric,
             loaded_blob,
@@ -906,39 +930,37 @@ impl ChunkStorage {
         let _visibility_guard = self.flush_visibility_lock.write();
 
         let mut expired_dirs = Vec::new();
+        let mut expired_numeric_dirs = HashSet::new();
+        let mut expired_blob_dirs = HashSet::new();
         if let Some(path) = &self.numeric_lane_path {
-            expired_dirs.extend(collect_expired_segment_dirs(path, cutoff)?);
+            let numeric_expired = collect_expired_segment_dirs(path, cutoff)?;
+            expired_numeric_dirs.extend(numeric_expired.iter().cloned());
+            expired_dirs.extend(numeric_expired);
         }
         if let Some(path) = &self.blob_lane_path {
-            expired_dirs.extend(collect_expired_segment_dirs(path, cutoff)?);
+            let blob_expired = collect_expired_segment_dirs(path, cutoff)?;
+            expired_blob_dirs.extend(blob_expired.iter().cloned());
+            expired_dirs.extend(blob_expired);
         }
 
         if expired_dirs.is_empty() {
             return Ok(0);
         }
 
-        {
-            // Drop mmaps before deleting segment files so removal works across platforms.
-            let mut persisted_index = self.persisted_index.write();
-            persisted_index.chunk_refs.clear();
-            persisted_index.segment_maps.clear();
-        }
+        // Drop mmaps for just-expired segments while preserving retained persisted visibility.
+        self.reload_persisted_indexes_from_disk_with_exclusions(
+            Some(&expired_numeric_dirs),
+            Some(&expired_blob_dirs),
+        )?;
+        self.evict_persisted_sealed_chunks();
 
         let mut removed = 0usize;
         for dir in expired_dirs {
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => removed = removed.saturating_add(1),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    let _ = self.reload_persisted_indexes_from_disk();
-                    return Err(err.into());
-                }
+                Err(err) => return Err(err.into()),
             }
-        }
-
-        if removed > 0 {
-            self.reload_persisted_indexes_from_disk()?;
-            self.evict_persisted_sealed_chunks();
         }
 
         Ok(removed)
@@ -5245,6 +5267,102 @@ mod tests {
         );
 
         storage.close().unwrap();
+    }
+
+    #[test]
+    fn retention_sweep_reload_failure_keeps_existing_persisted_data_visible() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert("retention_reload_visibility_metric", &labels)
+            .unwrap()
+            .series_id;
+
+        let mut expired_chunks = HashMap::new();
+        expired_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(1, 1.0), (2, 2.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 0, 1)
+            .unwrap()
+            .write_segment(&registry, &expired_chunks)
+            .unwrap();
+
+        let mut retained_chunks = HashMap::new();
+        retained_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(100, 100.0), (101, 101.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 2, 2)
+            .unwrap()
+            .write_segment(&registry, &retained_chunks)
+            .unwrap();
+
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            Some(lane_path.clone()),
+            None,
+            3,
+            ChunkStorageOptions {
+                retention_window: 10,
+                retention_enforced: true,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(1),
+                memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: false,
+            },
+        );
+        storage
+            .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap())
+            .unwrap();
+
+        let before = storage
+            .select("retention_reload_visibility_metric", &labels, 0, 200)
+            .unwrap();
+        assert_eq!(
+            before,
+            vec![DataPoint::new(100, 100.0), DataPoint::new(101, 101.0)]
+        );
+
+        // Introduce an on-disk conflict that makes future index reloads fail.
+        let mut conflicting_registry = SeriesRegistry::new();
+        conflicting_registry
+            .register_series_with_id(series_id, "retention_reload_conflict_metric", &labels)
+            .unwrap();
+        let mut conflicting_chunks = HashMap::new();
+        conflicting_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(series_id, &[(150, 150.0)])],
+        );
+        SegmentWriter::new(&lane_path, 1, 10)
+            .unwrap()
+            .write_segment(&conflicting_registry, &conflicting_chunks)
+            .unwrap();
+
+        let err = storage.sweep_expired_persisted_segments().unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(_)));
+
+        let after = storage
+            .select("retention_reload_visibility_metric", &labels, 0, 200)
+            .unwrap();
+        assert_eq!(
+            after,
+            vec![DataPoint::new(100, 100.0), DataPoint::new(101, 101.0)]
+        );
     }
 
     #[test]
