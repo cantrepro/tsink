@@ -138,7 +138,7 @@ pub mod unix {
 
     /// Advises the kernel about memory access patterns
     pub fn madvise_sequential(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_SEQUENTIAL, madvise};
+        use libc::{madvise, MADV_SEQUENTIAL};
 
         let ret = unsafe {
             madvise(
@@ -157,7 +157,7 @@ pub mod unix {
 
     /// Advises the kernel to expect random access patterns
     pub fn madvise_random(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_RANDOM, madvise};
+        use libc::{madvise, MADV_RANDOM};
 
         let ret = unsafe { madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), MADV_RANDOM) };
 
@@ -170,7 +170,7 @@ pub mod unix {
 
     /// Advises the kernel that we will need this memory soon
     pub fn madvise_willneed(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_WILLNEED, madvise};
+        use libc::{madvise, MADV_WILLNEED};
 
         let ret = unsafe {
             madvise(

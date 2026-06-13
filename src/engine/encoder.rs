@@ -107,29 +107,40 @@ impl Encoder {
     }
 
     pub fn decode_chunk_points(encoded: &EncodedChunk) -> Result<Vec<ChunkPoint>> {
-        if encoded.point_count == 0 {
+        Self::decode_chunk_points_from_payload(
+            encoded.lane,
+            encoded.ts_codec,
+            encoded.value_codec,
+            encoded.point_count,
+            &encoded.payload,
+        )
+    }
+
+    pub fn decode_chunk_points_from_payload(
+        lane: ValueLane,
+        ts_codec: TimestampCodecId,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        payload: &[u8],
+    ) -> Result<Vec<ChunkPoint>> {
+        if point_count == 0 {
             return Ok(Vec::new());
         }
 
         let mut pos = 0usize;
-        let ts_len = read_u32(&encoded.payload, &mut pos)? as usize;
-        let ts_payload = read_bytes(&encoded.payload, &mut pos, ts_len)?;
-        let value_len = read_u32(&encoded.payload, &mut pos)? as usize;
-        let value_payload = read_bytes(&encoded.payload, &mut pos, value_len)?;
+        let ts_len = read_u32(payload, &mut pos)? as usize;
+        let ts_payload = read_bytes(payload, &mut pos, ts_len)?;
+        let value_len = read_u32(payload, &mut pos)? as usize;
+        let value_payload = read_bytes(payload, &mut pos, value_len)?;
 
-        if pos != encoded.payload.len() {
+        if pos != payload.len() {
             return Err(TsinkError::DataCorruption(
                 "encoded chunk payload has trailing bytes".to_string(),
             ));
         }
 
-        let timestamps = decode_timestamps(encoded.ts_codec, ts_payload, encoded.point_count)?;
-        let values = decode_values(
-            encoded.value_codec,
-            encoded.lane,
-            value_payload,
-            encoded.point_count,
-        )?;
+        let timestamps = decode_timestamps(ts_codec, ts_payload, point_count)?;
+        let values = decode_values(value_codec, lane, value_payload, point_count)?;
 
         if timestamps.len() != values.len() {
             return Err(TsinkError::DataCorruption(
@@ -148,17 +159,17 @@ impl Encoder {
 fn choose_best_timestamp_codec(points: &[ChunkPoint]) -> Result<(TimestampCodecId, Vec<u8>)> {
     let mut candidates = Vec::with_capacity(3);
 
-    if let Some(payload) = encode_timestamps_fixed_step_rle(points) {
+    if let Some(payload) = encode_timestamps_fixed_step_rle(points)? {
         candidates.push((TimestampCodecId::FixedStepRle, payload));
     }
 
     candidates.push((
         TimestampCodecId::DeltaOfDeltaBitpack,
-        encode_timestamps_delta_of_delta(points),
+        encode_timestamps_delta_of_delta(points)?,
     ));
     candidates.push((
         TimestampCodecId::DeltaVarint,
-        encode_timestamps_delta_varint(points),
+        encode_timestamps_delta_varint(points)?,
     ));
 
     choose_smallest(candidates)
@@ -275,58 +286,91 @@ fn infer_value_family(points: &[ChunkPoint], lane: ValueLane) -> Result<ValueFam
     Ok(first_family)
 }
 
-fn encode_timestamps_fixed_step_rle(points: &[ChunkPoint]) -> Option<Vec<u8>> {
-    let first_ts = points.first()?.ts;
+fn encode_timestamps_fixed_step_rle(points: &[ChunkPoint]) -> Result<Option<Vec<u8>>> {
+    let Some(first) = points.first() else {
+        return Ok(None);
+    };
+    let first_ts = first.ts;
     let step = if points.len() > 1 {
-        points[1].ts.saturating_sub(points[0].ts)
+        points[1].ts.checked_sub(points[0].ts).ok_or_else(|| {
+            TsinkError::Codec(
+                "timestamp delta overflow while encoding fixed-step timestamps".to_string(),
+            )
+        })?
     } else {
         0
     };
 
-    if points
-        .windows(2)
-        .all(|window| window[1].ts.saturating_sub(window[0].ts) == step)
-    {
+    let mut is_fixed_step = true;
+    for window in points.windows(2) {
+        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+            TsinkError::Codec(
+                "timestamp delta overflow while encoding fixed-step timestamps".to_string(),
+            )
+        })?;
+        if delta != step {
+            is_fixed_step = false;
+            break;
+        }
+    }
+
+    if is_fixed_step {
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&first_ts.to_le_bytes());
         out.extend_from_slice(&step.to_le_bytes());
-        Some(out)
+        Ok(Some(out))
     } else {
-        None
+        Ok(None)
     }
 }
 
-fn encode_timestamps_delta_of_delta(points: &[ChunkPoint]) -> Vec<u8> {
+fn encode_timestamps_delta_of_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&points[0].ts.to_le_bytes());
 
     if points.len() == 1 {
-        return out;
+        return Ok(out);
     }
 
-    let mut prev_delta = points[1].ts.saturating_sub(points[0].ts);
+    let mut prev_delta = points[1].ts.checked_sub(points[0].ts).ok_or_else(|| {
+        TsinkError::Codec(
+            "timestamp delta overflow while encoding delta-of-delta timestamps".to_string(),
+        )
+    })?;
     out.extend_from_slice(&prev_delta.to_le_bytes());
 
     for window in points.windows(2).skip(1) {
-        let delta = window[1].ts.saturating_sub(window[0].ts);
-        let dod = delta.saturating_sub(prev_delta);
+        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+            TsinkError::Codec(
+                "timestamp delta overflow while encoding delta-of-delta timestamps".to_string(),
+            )
+        })?;
+        let dod = delta.checked_sub(prev_delta).ok_or_else(|| {
+            TsinkError::Codec(
+                "timestamp delta-of-delta overflow while encoding timestamps".to_string(),
+            )
+        })?;
         encode_svarint(dod, &mut out);
         prev_delta = delta;
     }
 
-    out
+    Ok(out)
 }
 
-fn encode_timestamps_delta_varint(points: &[ChunkPoint]) -> Vec<u8> {
+fn encode_timestamps_delta_varint(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&points[0].ts.to_le_bytes());
 
     for window in points.windows(2) {
-        let delta = window[1].ts.saturating_sub(window[0].ts);
+        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+            TsinkError::Codec(
+                "timestamp delta overflow while encoding delta-varint timestamps".to_string(),
+            )
+        })?;
         encode_svarint(delta, &mut out);
     }
 
-    out
+    Ok(out)
 }
 
 fn decode_timestamps(
@@ -355,7 +399,16 @@ fn decode_timestamps_fixed_step_rle(payload: &[u8], point_count: usize) -> Resul
 
     let mut out = Vec::with_capacity(point_count);
     for i in 0..point_count {
-        out.push(first_ts.saturating_add(step.saturating_mul(i as i64)));
+        let idx = i64::try_from(i).map_err(|_| {
+            TsinkError::DataCorruption("fixed-step payload index exceeds i64 range".to_string())
+        })?;
+        let offset = step.checked_mul(idx).ok_or_else(|| {
+            TsinkError::DataCorruption("fixed-step timestamp overflow while decoding".to_string())
+        })?;
+        let ts = first_ts.checked_add(offset).ok_or_else(|| {
+            TsinkError::DataCorruption("fixed-step timestamp overflow while decoding".to_string())
+        })?;
+        out.push(ts);
     }
     Ok(out)
 }
@@ -386,16 +439,26 @@ fn decode_timestamps_delta_of_delta(payload: &[u8], point_count: usize) -> Resul
     }
 
     let mut prev_delta = read_i64(payload, &mut pos)?;
-    out.push(first_ts.saturating_add(prev_delta));
+    let second = first_ts.checked_add(prev_delta).ok_or_else(|| {
+        TsinkError::DataCorruption("delta-of-delta timestamp overflow while decoding".to_string())
+    })?;
+    out.push(second);
 
     while out.len() < point_count {
         let dod = decode_svarint(payload, &mut pos)?;
-        let delta = prev_delta.saturating_add(dod);
+        let delta = prev_delta.checked_add(dod).ok_or_else(|| {
+            TsinkError::DataCorruption("delta-of-delta delta overflow while decoding".to_string())
+        })?;
         let next = out
             .last()
             .copied()
             .unwrap_or(first_ts)
-            .saturating_add(delta);
+            .checked_add(delta)
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(
+                    "delta-of-delta timestamp overflow while decoding".to_string(),
+                )
+            })?;
         out.push(next);
         prev_delta = delta;
     }
@@ -430,7 +493,12 @@ fn decode_timestamps_delta_varint(payload: &[u8], point_count: usize) -> Result<
             .last()
             .copied()
             .unwrap_or(first_ts)
-            .saturating_add(delta);
+            .checked_add(delta)
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(
+                    "delta-varint timestamp overflow while decoding".to_string(),
+                )
+            })?;
         out.push(next);
     }
 
@@ -514,7 +582,9 @@ fn encode_values_i64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
             });
         };
 
-        let delta = v.saturating_sub(prev);
+        let delta = v.checked_sub(prev).ok_or_else(|| {
+            TsinkError::Codec("i64 delta overflow while encoding values".to_string())
+        })?;
         encode_svarint(delta, &mut out);
         prev = v;
     }
@@ -549,11 +619,8 @@ fn encode_values_u64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
             });
         };
 
-        let delta_i128 = (v as i128) - (prev as i128);
-        let delta = i64::try_from(delta_i128).map_err(|_| {
-            TsinkError::Codec("u64 delta exceeds i64 range for delta codec".to_string())
-        })?;
-
+        // Encode deltas in wrapping u64 space so every valid transition is representable.
+        let delta = v.wrapping_sub(prev) as i64;
         encode_svarint(delta, &mut out);
         prev = v;
     }
@@ -685,7 +752,9 @@ fn decode_values_i64_delta(payload: &[u8], point_count: usize) -> Result<Vec<Val
 
     while out.len() < point_count {
         let delta = decode_svarint(payload, &mut pos)?;
-        let next = prev.saturating_add(delta);
+        let next = prev.checked_add(delta).ok_or_else(|| {
+            TsinkError::DataCorruption("i64 delta overflow while decoding values".to_string())
+        })?;
         out.push(Value::I64(next));
         prev = next;
     }
@@ -718,10 +787,7 @@ fn decode_values_u64_delta(payload: &[u8], point_count: usize) -> Result<Vec<Val
 
     while out.len() < point_count {
         let delta = decode_svarint(payload, &mut pos)?;
-        let next_i128 = (prev as i128) + (delta as i128);
-        let next = u64::try_from(next_i128).map_err(|_| {
-            TsinkError::DataCorruption("u64 delta decode produced negative value".to_string())
-        })?;
+        let next = prev.wrapping_add(delta as u64);
 
         out.push(Value::U64(next));
         prev = next;
@@ -982,7 +1048,7 @@ fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
 mod tests {
     use super::Encoder;
     use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
-    use crate::{DataPoint, Value};
+    use crate::{DataPoint, TsinkError, Value};
 
     fn chunk_points(ts: &[i64], values: Vec<Value>) -> Vec<ChunkPoint> {
         ts.iter()
@@ -1058,6 +1124,23 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_u64_values_with_large_deltas() {
+        let points = vec![
+            DataPoint::new(1, Value::U64(0)),
+            DataPoint::new(2, Value::U64(u64::MAX)),
+            DataPoint::new(3, Value::U64(0)),
+            DataPoint::new(4, Value::U64(1u64 << 63)),
+            DataPoint::new(5, Value::U64(0)),
+        ];
+
+        let encoded = Encoder::encode(&points).unwrap();
+        assert_eq!(encoded.value_codec, ValueCodecId::DeltaBitpackU64);
+
+        let decoded = Encoder::decode(&encoded).unwrap();
+        assert_eq!(decoded, points);
+    }
+
+    #[test]
     fn roundtrip_bool_values() {
         let points = vec![
             DataPoint::new(1, Value::Bool(true)),
@@ -1086,5 +1169,27 @@ mod tests {
 
         let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
+    }
+
+    #[test]
+    fn rejects_timestamp_delta_overflow() {
+        let points = vec![
+            DataPoint::new(i64::MIN, Value::I64(1)),
+            DataPoint::new(i64::MAX, Value::I64(2)),
+        ];
+
+        let err = Encoder::encode(&points).unwrap_err();
+        assert!(matches!(err, TsinkError::Codec(_)));
+    }
+
+    #[test]
+    fn rejects_i64_delta_overflow() {
+        let points = vec![
+            DataPoint::new(1, Value::I64(i64::MIN)),
+            DataPoint::new(2, Value::I64(i64::MAX)),
+        ];
+
+        let err = Encoder::encode(&points).unwrap_err();
+        assert!(matches!(err, TsinkError::Codec(_)));
     }
 }

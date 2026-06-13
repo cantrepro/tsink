@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -10,12 +10,14 @@ use crate::concurrency::Semaphore;
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
 use crate::engine::compactor::Compactor;
 use crate::engine::encoder::Encoder;
-use crate::engine::query::{ChunkSeriesCursor, decode_chunk_points_in_range_into};
-use crate::engine::segment::{SegmentWriter, load_segments};
-use crate::engine::series_registry::{SeriesId, SeriesRegistry, validate_labels, validate_metric};
+use crate::engine::query::decode_chunk_points_in_range_into;
+use crate::engine::segment::{load_segments, SegmentWriter};
+use crate::engine::series_registry::{
+    validate_labels, validate_metric, SeriesId, SeriesRegistry, SeriesResolution,
+};
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
 use crate::storage::{
-    TimestampPrecision, aggregate_series, downsample_points, downsample_points_with_custom,
+    aggregate_series, downsample_points, downsample_points_with_custom, TimestampPrecision,
 };
 use crate::{
     Aggregation, DataPoint, Label, MetricSeries, QueryOptions, Result, Row, Storage,
@@ -45,7 +47,7 @@ impl Default for ChunkStorageOptions {
                 DEFAULT_RETENTION,
                 TimestampPrecision::Nanoseconds,
             ),
-            retention_enforced: false,
+            retention_enforced: true,
             partition_window: duration_to_timestamp_units(
                 DEFAULT_PARTITION_DURATION,
                 TimestampPrecision::Nanoseconds,
@@ -156,6 +158,34 @@ struct PendingPoint {
     value: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SealedChunkKey {
+    min_ts: i64,
+    max_ts: i64,
+    point_count: u16,
+    sequence: u64,
+}
+
+impl SealedChunkKey {
+    fn from_chunk(chunk: &Chunk, sequence: u64) -> Self {
+        Self {
+            min_ts: chunk.header.min_ts,
+            max_ts: chunk.header.max_ts,
+            point_count: chunk.header.point_count,
+            sequence,
+        }
+    }
+
+    fn upper_bound_for_min_ts(min_ts_exclusive: i64) -> Self {
+        Self {
+            min_ts: min_ts_exclusive,
+            max_ts: i64::MIN,
+            point_count: 0,
+            sequence: 0,
+        }
+    }
+}
+
 const NUMERIC_LANE_ROOT: &str = "lane_numeric";
 const BLOB_LANE_ROOT: &str = "lane_blob";
 const WAL_DIR_NAME: &str = "wal";
@@ -163,8 +193,9 @@ const WAL_DIR_NAME: &str = "wal";
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
     active_builders: RwLock<HashMap<SeriesId, ActiveSeriesState>>,
-    sealed_chunks: RwLock<HashMap<SeriesId, Vec<Chunk>>>,
-    persisted_chunk_counts: RwLock<HashMap<SeriesId, usize>>,
+    sealed_chunks: RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>,
+    persisted_chunk_watermarks: RwLock<HashMap<SeriesId, u64>>,
+    next_chunk_sequence: AtomicU64,
     chunk_point_cap: usize,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
@@ -222,7 +253,8 @@ impl ChunkStorage {
             registry: RwLock::new(SeriesRegistry::new()),
             active_builders: RwLock::new(HashMap::new()),
             sealed_chunks: RwLock::new(HashMap::new()),
-            persisted_chunk_counts: RwLock::new(HashMap::new()),
+            persisted_chunk_watermarks: RwLock::new(HashMap::new()),
+            next_chunk_sequence: AtomicU64::new(1),
             chunk_point_cap: chunk_point_cap.clamp(1, u16::MAX as usize),
             numeric_compactor: numeric_lane_path
                 .as_ref()
@@ -315,22 +347,10 @@ impl ChunkStorage {
     }
 
     fn append_sealed_chunk(&self, series_id: SeriesId, chunk: Chunk) {
+        let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
+        let key = SealedChunkKey::from_chunk(&chunk, sequence);
         let mut sealed = self.sealed_chunks.write();
-        let entry = sealed.entry(series_id).or_default();
-        let key = (
-            chunk.header.min_ts,
-            chunk.header.max_ts,
-            chunk.header.point_count,
-        );
-        // Maintain sorted chunk order with binary insertion.
-        let insert_at = entry.partition_point(|existing| {
-            (
-                existing.header.min_ts,
-                existing.header.max_ts,
-                existing.header.point_count,
-            ) <= key
-        });
-        entry.insert(insert_at, chunk);
+        sealed.entry(series_id).or_default().insert(key, chunk);
     }
 
     fn flush_all_active(&self) -> Result<()> {
@@ -372,7 +392,11 @@ impl ChunkStorage {
         {
             let sealed = self.sealed_chunks.read();
             if let Some(chunks) = sealed.get(&series_id) {
-                for chunk in ChunkSeriesCursor::new(chunks, start, end) {
+                let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
+                for (_, chunk) in chunks.range(..end_bound) {
+                    if chunk.header.max_ts < start {
+                        continue;
+                    }
                     if has_previous_chunk && chunk.header.min_ts <= previous_max_ts {
                         has_overlap = true;
                     }
@@ -453,48 +477,18 @@ impl ChunkStorage {
         end: i64,
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
-        if !labels.is_empty() {
-            // Exact series identity query path.
-            let Some(series_id) = self
-                .registry
-                .read()
-                .resolve_existing(metric, labels)
-                .map(|resolution| resolution.series_id)
-            else {
-                out.clear();
-                return Ok(());
-            };
-            return self.collect_points_for_series_into(series_id, start, end, out);
-        }
-
-        let (single_series, candidate_series) = {
-            let registry = self.registry.read();
-            let Some(series_ids) = registry.series_id_postings_for_metric(metric) else {
-                out.clear();
-                return Ok(());
-            };
-
-            if series_ids.len() == 1 {
-                (series_ids.iter().next().copied(), Vec::new())
-            } else {
-                (None, series_ids.iter().copied().collect::<Vec<_>>())
-            }
+        // `select`/`select_into` resolve a single exact series identity (metric + labels).
+        // Use `select_all` when callers want results across every label set for a metric.
+        let Some(series_id) = self
+            .registry
+            .read()
+            .resolve_existing(metric, labels)
+            .map(|resolution| resolution.series_id)
+        else {
+            out.clear();
+            return Ok(());
         };
-
-        if let Some(series_id) = single_series {
-            return self.collect_points_for_series_into(series_id, start, end, out);
-        }
-
-        out.clear();
-        let mut scratch = Vec::new();
-        for series_id in candidate_series {
-            self.collect_points_for_series_into(series_id, start, end, &mut scratch)?;
-            out.append(&mut scratch);
-        }
-        if !points_are_sorted_by_timestamp(out) {
-            out.sort_by_key(|point| point.timestamp);
-        }
-        Ok(())
+        self.collect_points_for_series_into(series_id, start, end, out)
     }
 
     fn validate_series_lane_compatible(&self, series_id: SeriesId, lane: ValueLane) -> Result<()> {
@@ -503,29 +497,99 @@ impl ChunkStorage {
             .read()
             .get(&series_id)
             .map(|state| state.lane)
-            && active_lane != lane
         {
-            return Err(TsinkError::ValueTypeMismatch {
-                expected: lane_name(active_lane).to_string(),
-                actual: lane_name(lane).to_string(),
-            });
+            if active_lane != lane {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: lane_name(active_lane).to_string(),
+                    actual: lane_name(lane).to_string(),
+                });
+            }
         }
 
         if let Some(sealed_lane) = self
             .sealed_chunks
             .read()
             .get(&series_id)
-            .and_then(|chunks| chunks.last())
+            .and_then(|chunks| chunks.last_key_value().map(|(_, chunk)| chunk))
             .map(|chunk| chunk.header.lane)
-            && sealed_lane != lane
         {
-            return Err(TsinkError::ValueTypeMismatch {
-                expected: lane_name(sealed_lane).to_string(),
-                actual: lane_name(lane).to_string(),
-            });
+            if sealed_lane != lane {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: lane_name(sealed_lane).to_string(),
+                    actual: lane_name(lane).to_string(),
+                });
+            }
         }
 
         Ok(())
+    }
+
+    fn collect_pending_series_lanes(
+        points: &[PendingPoint],
+    ) -> Result<BTreeMap<SeriesId, ValueLane>> {
+        let mut series_lanes = BTreeMap::new();
+
+        for point in points {
+            if let Some(existing_lane) = series_lanes.get(&point.series_id) {
+                if *existing_lane != point.lane {
+                    return Err(TsinkError::ValueTypeMismatch {
+                        expected: lane_name(*existing_lane).to_string(),
+                        actual: lane_name(point.lane).to_string(),
+                    });
+                }
+            } else {
+                series_lanes.insert(point.series_id, point.lane);
+            }
+        }
+
+        Ok(series_lanes)
+    }
+
+    fn reserve_series_lanes(&self, points: &[PendingPoint]) -> Result<Vec<SeriesId>> {
+        let series_lanes = Self::collect_pending_series_lanes(points)?;
+        let mut active = self.active_builders.write();
+
+        for (series_id, lane) in &series_lanes {
+            if let Some(state) = active.get(series_id) {
+                if state.lane != *lane {
+                    return Err(TsinkError::ValueTypeMismatch {
+                        expected: lane_name(state.lane).to_string(),
+                        actual: lane_name(*lane).to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut reserved = Vec::new();
+        for (series_id, lane) in series_lanes {
+            if active.contains_key(&series_id) {
+                continue;
+            }
+            active.insert(
+                series_id,
+                ActiveSeriesState::new(series_id, lane, self.chunk_point_cap),
+            );
+            reserved.push(series_id);
+        }
+
+        Ok(reserved)
+    }
+
+    fn rollback_empty_series_lane_reservations(&self, series_ids: &[SeriesId]) {
+        if series_ids.is_empty() {
+            return;
+        }
+
+        let mut active = self.active_builders.write();
+        for series_id in series_ids {
+            let should_remove = active
+                .get(series_id)
+                .map(|state| state.builder.is_empty())
+                .unwrap_or(false);
+            if should_remove {
+                active.remove(series_id);
+            }
+        }
     }
 
     fn append_point_to_series(
@@ -574,12 +638,12 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn group_pending_points_by_series(
+    fn group_pending_point_indexes_by_series(
         points: &[PendingPoint],
-    ) -> Result<BTreeMap<SeriesId, (ValueLane, Vec<ChunkPoint>)>> {
-        let mut grouped: BTreeMap<SeriesId, (ValueLane, Vec<ChunkPoint>)> = BTreeMap::new();
+    ) -> Result<BTreeMap<SeriesId, (ValueLane, Vec<usize>)>> {
+        let mut grouped: BTreeMap<SeriesId, (ValueLane, Vec<usize>)> = BTreeMap::new();
 
-        for point in points {
+        for (idx, point) in points.iter().enumerate() {
             let entry = grouped
                 .entry(point.series_id)
                 .or_insert_with(|| (point.lane, Vec::new()));
@@ -591,40 +655,72 @@ impl ChunkStorage {
                 });
             }
 
-            entry.1.push(ChunkPoint {
-                ts: point.ts,
-                value: point.value.clone(),
-            });
+            entry.1.push(idx);
         }
 
         Ok(grouped)
     }
 
-    fn validate_pending_point_families(&self, points: &[PendingPoint]) -> Result<()> {
-        let mut grouped = Self::group_pending_points_by_series(points)?;
+    fn validate_pending_point_families(
+        &self,
+        points: &[PendingPoint],
+        grouped: &BTreeMap<SeriesId, (ValueLane, Vec<usize>)>,
+    ) -> Result<()> {
         let active = self.active_builders.read();
 
-        for (series_id, (lane, chunk_points)) in grouped.iter_mut() {
+        for (series_id, (lane, indexes)) in grouped {
+            let Some((&first_idx, remaining)) = indexes.split_first() else {
+                continue;
+            };
+
+            let first_point = &points[first_idx];
+            let first_family = value_family_for_lane(&first_point.value, *lane)?;
+
+            for idx in remaining {
+                let point = &points[*idx];
+                let family = value_family_for_lane(&point.value, *lane)?;
+                if family != first_family {
+                    return Err(TsinkError::ValueTypeMismatch {
+                        expected: value_family_name(first_family).to_string(),
+                        actual: point.value.kind().to_string(),
+                    });
+                }
+            }
+
             if let Some(existing_point) = active
                 .get(series_id)
                 .and_then(|state| state.builder.first_point())
             {
-                chunk_points.insert(0, existing_point.clone());
+                let existing_family = value_family_for_lane(&existing_point.value, *lane)?;
+                if existing_family != first_family {
+                    return Err(TsinkError::ValueTypeMismatch {
+                        expected: value_family_name(existing_family).to_string(),
+                        actual: first_point.value.kind().to_string(),
+                    });
+                }
             }
-
-            Encoder::validate_chunk_points(chunk_points, *lane)?;
         }
         Ok(())
     }
 
-    fn encode_wal_batches(points: &[PendingPoint]) -> Result<Vec<SamplesBatchFrame>> {
-        let grouped = Self::group_pending_points_by_series(points)?;
-
+    fn encode_wal_batches(
+        points: &[PendingPoint],
+        grouped: &BTreeMap<SeriesId, (ValueLane, Vec<usize>)>,
+    ) -> Result<Vec<SamplesBatchFrame>> {
         let mut batches = Vec::with_capacity(grouped.len());
-        for (series_id, (lane, chunk_points)) in grouped {
+        for (series_id, (lane, indexes)) in grouped {
+            let mut chunk_points = Vec::with_capacity(indexes.len());
+            for idx in indexes {
+                let point = &points[*idx];
+                chunk_points.push(ChunkPoint {
+                    ts: point.ts,
+                    value: point.value.clone(),
+                });
+            }
+
             batches.push(SamplesBatchFrame::from_points(
-                series_id,
-                lane,
+                *series_id,
+                *lane,
                 &chunk_points,
             )?);
         }
@@ -681,21 +777,14 @@ impl ChunkStorage {
         {
             let mut sealed = self.sealed_chunks.write();
             let mut loaded_max_timestamp = i64::MIN;
-            for (series_id, mut chunks) in loaded.chunks_by_series {
-                for chunk in &chunks {
+            for (series_id, chunks) in loaded.chunks_by_series {
+                let entry = sealed.entry(series_id).or_default();
+                for chunk in chunks {
                     loaded_max_timestamp = loaded_max_timestamp.max(chunk.header.max_ts);
+                    let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
+                    let key = SealedChunkKey::from_chunk(&chunk, sequence);
+                    entry.insert(key, chunk);
                 }
-                sealed.entry(series_id).or_default().append(&mut chunks);
-            }
-
-            for chunks in sealed.values_mut() {
-                chunks.sort_by(|a, b| {
-                    (a.header.min_ts, a.header.max_ts, a.header.point_count).cmp(&(
-                        b.header.min_ts,
-                        b.header.max_ts,
-                        b.header.point_count,
-                    ))
-                });
             }
 
             if loaded_max_timestamp != i64::MIN {
@@ -705,10 +794,15 @@ impl ChunkStorage {
 
         {
             let sealed = self.sealed_chunks.read();
-            let mut persisted = self.persisted_chunk_counts.write();
+            let mut persisted = self.persisted_chunk_watermarks.write();
             persisted.clear();
             for (series_id, chunks) in sealed.iter() {
-                persisted.insert(*series_id, chunks.len());
+                let watermark = chunks
+                    .keys()
+                    .next_back()
+                    .map(|key| key.sequence)
+                    .unwrap_or(0);
+                persisted.insert(*series_id, watermark);
             }
         }
 
@@ -724,16 +818,19 @@ impl ChunkStorage {
 
         let delta_chunks = {
             let sealed = self.sealed_chunks.read();
-            let persisted = self.persisted_chunk_counts.read();
+            let persisted = self.persisted_chunk_watermarks.read();
 
             let mut delta = HashMap::new();
             for (series_id, chunks) in sealed.iter() {
-                let already_persisted = persisted.get(series_id).copied().unwrap_or(0);
-                if already_persisted >= chunks.len() {
-                    continue;
+                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                let updates = chunks
+                    .iter()
+                    .filter(|(key, _)| key.sequence > persisted_sequence)
+                    .map(|(_, chunk)| chunk.clone())
+                    .collect::<Vec<_>>();
+                if !updates.is_empty() {
+                    delta.insert(*series_id, updates);
                 }
-
-                delta.insert(*series_id, chunks[already_persisted..].to_vec());
             }
             delta
         };
@@ -780,9 +877,15 @@ impl ChunkStorage {
 
         {
             let sealed = self.sealed_chunks.read();
-            let mut persisted = self.persisted_chunk_counts.write();
+            let mut persisted = self.persisted_chunk_watermarks.write();
+            persisted.clear();
             for (series_id, chunks) in sealed.iter() {
-                persisted.insert(*series_id, chunks.len());
+                let watermark = chunks
+                    .keys()
+                    .next_back()
+                    .map(|key| key.sequence)
+                    .unwrap_or(0);
+                persisted.insert(*series_id, watermark);
             }
         }
 
@@ -814,16 +917,19 @@ impl Storage for ChunkStorage {
 
         let mut pending_points = Vec::with_capacity(rows.len());
         let mut new_series_defs = Vec::new();
+        let mut reserved_series = Vec::new();
+        let mut created_series = Vec::<SeriesResolution>::new();
+        let mut registry = self.registry.write();
+        let registry_checkpoint = registry.checkpoint();
 
-        {
-            let mut registry = self.registry.write();
-
+        let write_result = (|| -> Result<()> {
             for row in rows {
                 let data_point = row.data_point();
                 let lane = lane_for_value(&data_point.value);
                 let resolution = registry.resolve_or_insert(row.metric(), row.labels())?;
 
                 if resolution.created {
+                    created_series.push(resolution.clone());
                     new_series_defs.push(SeriesDefinitionFrame {
                         series_id: resolution.series_id,
                         metric: row.metric().to_string(),
@@ -838,26 +944,35 @@ impl Storage for ChunkStorage {
                     value: data_point.value.clone(),
                 });
             }
-        }
 
-        for point in &pending_points {
-            self.validate_series_lane_compatible(point.series_id, point.lane)?;
-        }
-
-        self.validate_pending_point_families(&pending_points)?;
-        self.validate_points_against_retention(&pending_points)?;
-
-        if let Some(wal) = &self.wal {
-            let batches = Self::encode_wal_batches(&pending_points)?;
-
-            for definition in &new_series_defs {
-                wal.append_series_definition(definition)?;
+            for point in &pending_points {
+                self.validate_series_lane_compatible(point.series_id, point.lane)?;
             }
 
-            wal.append_samples(&batches)?;
+            let grouped_points = Self::group_pending_point_indexes_by_series(&pending_points)?;
+            self.validate_pending_point_families(&pending_points, &grouped_points)?;
+            self.validate_points_against_retention(&pending_points)?;
+            reserved_series = self.reserve_series_lanes(&pending_points)?;
+
+            if let Some(wal) = &self.wal {
+                let batches = Self::encode_wal_batches(&pending_points, &grouped_points)?;
+
+                for definition in &new_series_defs {
+                    wal.append_series_definition(definition)?;
+                }
+
+                wal.append_samples(&batches)?;
+            }
+
+            self.ingest_pending_points(std::mem::take(&mut pending_points))
+        })();
+
+        if write_result.is_err() {
+            self.rollback_empty_series_lane_reservations(&reserved_series);
+            registry.rollback_created_series(&created_series, registry_checkpoint);
         }
 
-        self.ingest_pending_points(pending_points)
+        write_result
     }
 
     fn select(
@@ -900,12 +1015,12 @@ impl Storage for ChunkStorage {
             });
         }
 
-        if let Some(downsample) = opts.downsample
-            && downsample.interval <= 0
-        {
-            return Err(TsinkError::InvalidConfiguration(
-                "downsample interval must be positive".to_string(),
-            ));
+        if let Some(downsample) = opts.downsample {
+            if downsample.interval <= 0 {
+                return Err(TsinkError::InvalidConfiguration(
+                    "downsample interval must be positive".to_string(),
+                ));
+            }
         }
 
         let mut points = Vec::new();
@@ -1212,19 +1327,15 @@ fn dedupe_last_value_per_timestamp(points: &mut Vec<DataPoint>) {
         return;
     }
 
-    let mut deduped: Vec<DataPoint> = Vec::with_capacity(points.len());
-
-    for point in points.drain(..) {
-        if let Some(last) = deduped.last_mut()
-            && last.timestamp == point.timestamp
-        {
-            *last = point;
-            continue;
+    points.dedup_by(|current, next| {
+        if current.timestamp == next.timestamp {
+            // `dedup_by` removes `next`; swap first so the latest value survives.
+            std::mem::swap(current, next);
+            true
+        } else {
+            false
         }
-        deduped.push(point);
-    }
-
-    *points = deduped;
+    });
 }
 
 fn lane_for_value(value: &Value) -> ValueLane {
@@ -1241,6 +1352,43 @@ fn lane_name(lane: ValueLane) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingValueFamily {
+    F64,
+    I64,
+    U64,
+    Bool,
+    Blob,
+}
+
+fn value_family_for_lane(value: &Value, lane: ValueLane) -> Result<PendingValueFamily> {
+    match (value, lane) {
+        (Value::F64(_), ValueLane::Numeric) => Ok(PendingValueFamily::F64),
+        (Value::I64(_), ValueLane::Numeric) => Ok(PendingValueFamily::I64),
+        (Value::U64(_), ValueLane::Numeric) => Ok(PendingValueFamily::U64),
+        (Value::Bool(_), ValueLane::Numeric) => Ok(PendingValueFamily::Bool),
+        (Value::Bytes(_) | Value::String(_), ValueLane::Blob) => Ok(PendingValueFamily::Blob),
+        (_, ValueLane::Numeric) => Err(TsinkError::ValueTypeMismatch {
+            expected: "numeric lane value".to_string(),
+            actual: value.kind().to_string(),
+        }),
+        (_, ValueLane::Blob) => Err(TsinkError::ValueTypeMismatch {
+            expected: "blob lane value".to_string(),
+            actual: value.kind().to_string(),
+        }),
+    }
+}
+
+fn value_family_name(family: PendingValueFamily) -> &'static str {
+    match family {
+        PendingValueFamily::F64 => "f64",
+        PendingValueFamily::I64 => "i64",
+        PendingValueFamily::U64 => "u64",
+        PendingValueFamily::Bool => "bool",
+        PendingValueFamily::Blob => "bytes/string",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1249,7 +1397,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BLOB_LANE_ROOT, ChunkStorage, ChunkStorageOptions, NUMERIC_LANE_ROOT, WAL_DIR_NAME,
+        ChunkStorage, ChunkStorageOptions, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT, WAL_DIR_NAME,
     };
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
@@ -1286,7 +1434,7 @@ mod tests {
             .series_id;
 
         let sealed = storage.sealed_chunks.read();
-        let chunks = sealed.get(&series_id).unwrap();
+        let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].header.point_count, 2);
         assert_eq!(chunks[1].header.point_count, 2);
@@ -1401,9 +1549,9 @@ mod tests {
             .unwrap()
             .series_id;
 
-        storage.sealed_chunks.write().insert(
+        storage.append_sealed_chunk(
             series_id,
-            vec![Chunk {
+            Chunk {
                 header: ChunkHeader {
                     series_id,
                     lane: ValueLane::Numeric,
@@ -1428,7 +1576,7 @@ mod tests {
                     },
                 ],
                 encoded_payload: Vec::new(),
-            }],
+            },
         );
 
         let points = storage.select("manual", &labels, 0, 10).unwrap();
@@ -1549,6 +1697,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_insert_rolls_back_new_series_metadata_immediately() {
+        let storage = ChunkStorage::new(4, None);
+        let labels = vec![Label::new("host", "a")];
+
+        let err = storage
+            .insert_rows(&[
+                Row::with_labels("phantom_metric", labels.clone(), DataPoint::new(1, 1.0)),
+                Row::with_labels("phantom_metric", labels.clone(), DataPoint::new(2, 2_i64)),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+
+        let has_phantom_metric = storage
+            .list_metrics()
+            .unwrap()
+            .into_iter()
+            .any(|series| series.name == "phantom_metric" && series.labels == labels);
+        assert!(!has_phantom_metric);
+    }
+
+    #[test]
     fn failed_mixed_numeric_insert_does_not_resurrect_series_after_reopen() {
         let temp_dir = TempDir::new().unwrap();
         let labels = vec![Label::new("host", "a")];
@@ -1587,6 +1756,124 @@ mod tests {
         assert!(!has_mixed_metric);
 
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn concurrent_lane_mismatch_does_not_log_failed_write_to_wal() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+        use std::time::Instant;
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal =
+            FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(2),
+            },
+        ));
+        let labels = vec![Label::new("host", "a")];
+        let start = Arc::new(Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+
+        let active_read_guard = storage.active_builders.read();
+
+        let thread_storage = Arc::clone(&storage);
+        let thread_labels = labels.clone();
+        let thread_start = Arc::clone(&start);
+        let thread_tx = tx.clone();
+        let numeric_writer = thread::spawn(move || {
+            thread_start.wait();
+            let result = thread_storage.insert_rows(&[Row::with_labels(
+                "lane_race_metric",
+                thread_labels,
+                DataPoint::new(1, 1.0),
+            )]);
+            thread_tx.send(result).unwrap();
+        });
+
+        let thread_storage = Arc::clone(&storage);
+        let thread_labels = labels.clone();
+        let thread_start = Arc::clone(&start);
+        let blob_writer = thread::spawn(move || {
+            thread_start.wait();
+            let result = thread_storage.insert_rows(&[Row::with_labels(
+                "lane_race_metric",
+                thread_labels,
+                DataPoint::new(2, "blob"),
+            )]);
+            tx.send(result).unwrap();
+        });
+
+        start.wait();
+
+        let mut pre_release_sample_batches = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            pre_release_sample_batches = storage
+                .wal
+                .as_ref()
+                .unwrap()
+                .replay_frames()
+                .unwrap()
+                .into_iter()
+                .map(|frame| match frame {
+                    ReplayFrame::Samples(batches) => batches.len(),
+                    ReplayFrame::SeriesDefinition(_) => 0,
+                })
+                .sum();
+            if pre_release_sample_batches > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(pre_release_sample_batches, 0);
+
+        drop(active_read_guard);
+
+        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let mut ok_count = 0usize;
+        let mut mismatch_count = 0usize;
+        for result in [first, second] {
+            match result {
+                Ok(()) => ok_count += 1,
+                Err(TsinkError::ValueTypeMismatch { .. }) => mismatch_count += 1,
+                Err(other) => panic!("unexpected insert result: {other}"),
+            }
+        }
+        assert_eq!(ok_count, 1);
+        assert_eq!(mismatch_count, 1);
+
+        numeric_writer.join().unwrap();
+        blob_writer.join().unwrap();
+
+        let final_sample_batches: usize = storage
+            .wal
+            .as_ref()
+            .unwrap()
+            .replay_frames()
+            .unwrap()
+            .into_iter()
+            .map(|frame| match frame {
+                ReplayFrame::Samples(batches) => batches.len(),
+                ReplayFrame::SeriesDefinition(_) => 0,
+            })
+            .sum();
+        assert_eq!(final_sample_batches, 1);
     }
 
     #[test]
@@ -2117,7 +2404,7 @@ mod tests {
             .series_id;
 
         let sealed = storage.sealed_chunks.read();
-        let chunks = sealed.get(&series_id).unwrap();
+        let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
         assert_eq!(
             chunks.len(),
             1,
@@ -2128,6 +2415,16 @@ mod tests {
 
         let active = storage.active_builders.read();
         assert_eq!(active.get(&series_id).unwrap().builder.len(), 1);
+    }
+
+    #[test]
+    fn chunk_storage_default_retention_enforcement_matches_builder_default() {
+        let chunk_defaults = ChunkStorageOptions::default();
+        let builder_default = StorageBuilder::new();
+        assert_eq!(
+            chunk_defaults.retention_enforced,
+            builder_default.retention_enforced()
+        );
     }
 
     #[test]
@@ -2288,8 +2585,8 @@ mod tests {
 
     #[test]
     fn close_blocks_until_in_flight_writer_releases_permit() {
-        use std::sync::Arc;
         use std::sync::mpsc;
+        use std::sync::Arc;
         use std::thread;
 
         let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(

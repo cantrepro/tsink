@@ -81,6 +81,14 @@ impl StringDictionary {
             .enumerate()
             .map(|(idx, value)| (idx as DictionaryId, value.as_str()))
     }
+
+    fn truncate(&mut self, len: usize) {
+        while self.by_id.len() > len {
+            if let Some(value) = self.by_id.pop() {
+                self.by_value.remove(&value);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +101,14 @@ pub struct SeriesRegistry {
     by_id: HashMap<SeriesId, SeriesDefinition>,
     metric_postings: HashMap<DictionaryId, BTreeSet<SeriesId>>,
     postings: BTreeMap<LabelPairId, BTreeSet<SeriesId>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegistryCheckpoint {
+    next_series_id: SeriesId,
+    metric_dict_len: usize,
+    label_name_dict_len: usize,
+    label_value_dict_len: usize,
 }
 
 pub(crate) fn validate_metric(metric: &str) -> Result<()> {
@@ -205,6 +221,63 @@ impl SeriesRegistry {
             resolutions.push(self.resolve_or_insert(row.metric(), row.labels())?);
         }
         Ok(resolutions)
+    }
+
+    pub(crate) fn checkpoint(&self) -> RegistryCheckpoint {
+        RegistryCheckpoint {
+            next_series_id: self.next_series_id,
+            metric_dict_len: self.metric_dict.len(),
+            label_name_dict_len: self.label_name_dict.len(),
+            label_value_dict_len: self.label_value_dict.len(),
+        }
+    }
+
+    pub(crate) fn rollback_created_series(
+        &mut self,
+        created: &[SeriesResolution],
+        checkpoint: RegistryCheckpoint,
+    ) {
+        if created.is_empty() {
+            return;
+        }
+
+        for resolution in created {
+            self.by_id.remove(&resolution.series_id);
+            self.by_key.remove(&SeriesKeyIds {
+                metric_id: resolution.metric_id,
+                label_pairs: resolution.label_pairs.clone(),
+            });
+
+            let remove_metric_posting =
+                if let Some(series_ids) = self.metric_postings.get_mut(&resolution.metric_id) {
+                    series_ids.remove(&resolution.series_id);
+                    series_ids.is_empty()
+                } else {
+                    false
+                };
+            if remove_metric_posting {
+                self.metric_postings.remove(&resolution.metric_id);
+            }
+
+            for pair in &resolution.label_pairs {
+                let remove_posting = if let Some(series_ids) = self.postings.get_mut(pair) {
+                    series_ids.remove(&resolution.series_id);
+                    series_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_posting {
+                    self.postings.remove(pair);
+                }
+            }
+        }
+
+        self.next_series_id = checkpoint.next_series_id;
+        self.metric_dict.truncate(checkpoint.metric_dict_len);
+        self.label_name_dict
+            .truncate(checkpoint.label_name_dict_len);
+        self.label_value_dict
+            .truncate(checkpoint.label_value_dict_len);
     }
 
     pub fn register_series_with_id(
@@ -589,6 +662,45 @@ mod tests {
             decoded.labels,
             vec![Label::new("host", "a"), Label::new("service", "api")]
         );
+    }
+
+    #[test]
+    fn rollback_created_series_restores_checkpointed_metadata() {
+        let mut registry = SeriesRegistry::new();
+        registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap();
+
+        let baseline_series = registry.series_count();
+        let baseline_metric_dict_len = registry.metric_dictionary_len();
+        let baseline_label_name_dict_len = registry.label_name_dictionary_len();
+        let baseline_label_value_dict_len = registry.label_value_dictionary_len();
+        let checkpoint = registry.checkpoint();
+
+        let phantom_labels = vec![Label::new("zone", "use1"), Label::new("env", "prod")];
+        let created = registry
+            .resolve_or_insert("phantom_metric", &phantom_labels)
+            .unwrap();
+        assert!(created.created);
+        assert!(registry
+            .resolve_existing("phantom_metric", &phantom_labels)
+            .is_some());
+
+        registry.rollback_created_series(&[created], checkpoint);
+
+        assert_eq!(registry.series_count(), baseline_series);
+        assert_eq!(registry.metric_dictionary_len(), baseline_metric_dict_len);
+        assert_eq!(
+            registry.label_name_dictionary_len(),
+            baseline_label_name_dict_len
+        );
+        assert_eq!(
+            registry.label_value_dictionary_len(),
+            baseline_label_value_dict_len
+        );
+        assert!(registry
+            .resolve_existing("phantom_metric", &phantom_labels)
+            .is_none());
     }
 
     #[test]

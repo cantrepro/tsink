@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
-use crate::engine::encoder::{EncodedChunk, Encoder};
+use crate::engine::encoder::Encoder;
 use crate::engine::segment::{
-    LoadedSegment, PersistedSeries, SegmentWriter, load_segments, load_segments_for_level,
+    load_segments, load_segments_for_level, LoadedSegment, PersistedSeries, SegmentWriter,
 };
 use crate::engine::series_registry::{SeriesId, SeriesRegistry};
 use crate::{Result, TsinkError};
@@ -228,24 +228,24 @@ fn decode_chunk_points_for_compaction(chunk: &Chunk) -> Result<Vec<ChunkPoint>> 
         return Ok(Vec::new());
     }
 
-    Encoder::decode_chunk_points(&EncodedChunk {
-        lane: chunk.header.lane,
-        ts_codec: chunk.header.ts_codec,
-        value_codec: chunk.header.value_codec,
-        point_count: chunk.header.point_count as usize,
-        payload: chunk.encoded_payload.clone(),
-    })
+    Encoder::decode_chunk_points_from_payload(
+        chunk.header.lane,
+        chunk.header.ts_codec,
+        chunk.header.value_codec,
+        chunk.header.point_count as usize,
+        &chunk.encoded_payload,
+    )
 }
 
 fn dedupe_last_value_per_timestamp(points: Vec<ChunkPoint>) -> Vec<ChunkPoint> {
     let mut out: Vec<ChunkPoint> = Vec::with_capacity(points.len());
 
     for point in points {
-        if let Some(last) = out.last_mut()
-            && last.ts == point.ts
-        {
-            *last = point;
-            continue;
+        if let Some(last) = out.last_mut() {
+            if last.ts == point.ts {
+                *last = point;
+                continue;
+            }
         }
 
         out.push(point);
@@ -300,7 +300,7 @@ mod tests {
     use super::Compactor;
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
-    use crate::engine::segment::{SegmentWriter, load_segments, load_segments_for_level};
+    use crate::engine::segment::{load_segments, load_segments_for_level, SegmentWriter};
     use crate::engine::series_registry::SeriesRegistry;
     use crate::{Label, Value};
 

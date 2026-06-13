@@ -585,12 +585,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF, FramedWal, ReplayFrame,
-        SamplesBatchFrame, SeriesDefinitionFrame, WAL_FILE_NAME, checksum32,
-        encode_series_definition, replay_from_path, scan_last_seq,
+        checksum32, encode_series_definition, replay_from_path, scan_last_seq, FramedWal,
+        ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame, FRAME_HEADER_LEN, FRAME_MAGIC,
+        FRAME_TYPE_SERIES_DEF, WAL_FILE_NAME,
     };
     use crate::engine::chunk::{ChunkPoint, ValueLane};
-    use crate::{Label, Value, wal::WalSyncMode};
+    use crate::{wal::WalSyncMode, Label, Value};
 
     #[test]
     fn samples_batch_roundtrip_preserves_points() {

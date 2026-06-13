@@ -117,17 +117,20 @@ impl Default for StorageBuilder {
 
 impl StorageBuilder {
     /// Creates a new StorageBuilder with default settings.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the data path for persistent storage.
+    #[must_use]
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.data_path = Some(path.as_ref().to_path_buf());
         self
     }
 
     /// Sets the retention period.
+    #[must_use]
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
         self
@@ -136,24 +139,28 @@ impl StorageBuilder {
     /// Enables or disables retention enforcement.
     ///
     /// When disabled, points are never rejected or filtered due to retention.
+    #[must_use]
     pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
         self.retention_enforced = enforced;
         self
     }
 
     /// Sets the timestamp precision.
+    #[must_use]
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.timestamp_precision = precision;
         self
     }
 
     /// Sets the target points-per-chunk for the storage engine.
+    #[must_use]
     pub fn with_chunk_points(mut self, points: usize) -> Self {
         self.chunk_points = points.clamp(1, u16::MAX as usize);
         self
     }
 
     /// Sets the maximum number of concurrent writers.
+    #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
         self.max_writers = if max_writers == 0 {
             crate::cgroup::default_workers_limit().max(1)
@@ -164,30 +171,35 @@ impl StorageBuilder {
     }
 
     /// Sets the write timeout.
+    #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
     }
 
     /// Sets the partition duration.
+    #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.partition_duration = duration;
         self
     }
 
     /// Enables or disables WAL.
+    #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
         self
     }
 
     /// Sets the WAL buffer size.
+    #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
         self.wal_buffer_size = size;
         self
     }
 
     /// Sets WAL fsync policy.
+    #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.wal_sync_mode = mode;
         self
@@ -281,6 +293,7 @@ pub struct QueryOptions {
 
 impl QueryOptions {
     /// Create query options for a time range.
+    #[must_use]
     pub fn new(start: i64, end: i64) -> Self {
         Self {
             labels: Vec::new(),
@@ -295,12 +308,14 @@ impl QueryOptions {
     }
 
     /// Attach labels to filter the series.
+    #[must_use]
     pub fn with_labels(mut self, labels: Vec<Label>) -> Self {
         self.labels = labels;
         self
     }
 
     /// Apply pagination.
+    #[must_use]
     pub fn with_pagination(mut self, offset: usize, limit: Option<usize>) -> Self {
         self.offset = offset;
         self.limit = limit;
@@ -308,6 +323,7 @@ impl QueryOptions {
     }
 
     /// Apply downsampling using the given interval and aggregation.
+    #[must_use]
     pub fn with_downsample(mut self, interval: i64, aggregation: Aggregation) -> Self {
         self.downsample = Some(DownsampleOptions { interval });
         self.aggregation = aggregation;
@@ -315,12 +331,14 @@ impl QueryOptions {
     }
 
     /// Apply aggregation without downsampling (reduces the whole series to one point).
+    #[must_use]
     pub fn with_aggregation(mut self, aggregation: Aggregation) -> Self {
         self.aggregation = aggregation;
         self
     }
 
     /// Apply a custom bytes aggregation by providing a codec and typed aggregator.
+    #[must_use]
     pub fn with_custom_bytes_aggregation<C, A>(mut self, codec: C, aggregator: A) -> Self
     where
         C: Codec + 'static,
@@ -749,8 +767,12 @@ fn aggregate_bucket(
 
     let aggregated = match aggregation {
         Aggregation::None => None,
-        Aggregation::First => return Ok(points.first().cloned()),
-        Aggregation::Last => return Ok(points.last().cloned()),
+        Aggregation::First => points
+            .first()
+            .map(|point| DataPoint::new(bucket_start, point.value.clone())),
+        Aggregation::Last => points
+            .last()
+            .map(|point| DataPoint::new(bucket_start, point.value.clone())),
         Aggregation::Count => Some(DataPoint::new(
             bucket_start,
             Value::U64(

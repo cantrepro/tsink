@@ -271,7 +271,7 @@ fn test_aggregation_count_median_whole_series_ignore_nan() {
 }
 
 #[test]
-fn test_downsample_first_count_median() {
+fn test_downsample_first_last_count_median() {
     let temp_dir = TempDir::new().unwrap();
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -296,7 +296,17 @@ fn test_downsample_first_count_median() {
         .unwrap();
     assert_eq!(first_points.len(), 2);
     assert_eq!(first_points[0], DataPoint::new(1_000, 10.0));
-    assert_eq!(first_points[1], DataPoint::new(3_100, 100.0));
+    assert_eq!(first_points[1], DataPoint::new(3_000, 100.0));
+
+    let last_points = storage
+        .select_with_options(
+            "ds_new_aggs",
+            QueryOptions::new(1_000, 5_000).with_downsample(2_000, Aggregation::Last),
+        )
+        .unwrap();
+    assert_eq!(last_points.len(), 2);
+    assert_eq!(last_points[0], DataPoint::new(1_000, 30.0));
+    assert_eq!(last_points[1], DataPoint::new(3_000, 200.0));
 
     let count_points = storage
         .select_with_options(

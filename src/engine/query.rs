@@ -1,7 +1,7 @@
 use crate::{DataPoint, Label, Result};
 
 use super::chunk::Chunk;
-use super::encoder::{EncodedChunk, Encoder};
+use super::encoder::Encoder;
 use super::series_registry::SeriesId;
 
 #[derive(Debug, Clone)]
@@ -75,13 +75,13 @@ pub fn decode_chunk_points_in_range_into(
     out: &mut Vec<DataPoint>,
 ) -> Result<()> {
     if chunk.points.is_empty() && !chunk.encoded_payload.is_empty() {
-        let decoded = Encoder::decode_chunk_points(&EncodedChunk {
-            lane: chunk.header.lane,
-            ts_codec: chunk.header.ts_codec,
-            value_codec: chunk.header.value_codec,
-            point_count: chunk.header.point_count as usize,
-            payload: chunk.encoded_payload.clone(),
-        })?;
+        let decoded = Encoder::decode_chunk_points_from_payload(
+            chunk.header.lane,
+            chunk.header.ts_codec,
+            chunk.header.value_codec,
+            chunk.header.point_count as usize,
+            &chunk.encoded_payload,
+        )?;
         append_sorted_owned_chunk_points_in_range(decoded, start, end, out);
         return Ok(());
     }
@@ -159,7 +159,7 @@ fn points_are_sorted_by_timestamp(points: &[super::chunk::ChunkPoint]) -> bool {
 mod tests {
     use crate::Value;
 
-    use super::{ChunkSeriesCursor, decode_chunk_points_in_range};
+    use super::{decode_chunk_points_in_range, ChunkSeriesCursor};
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };

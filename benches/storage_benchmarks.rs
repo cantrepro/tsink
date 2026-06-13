@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

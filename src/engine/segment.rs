@@ -1544,7 +1544,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{SegmentWriter, load_segments};
+    use super::{load_segments, SegmentWriter};
     use crate::engine::chunk::{Chunk, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::series_registry::SeriesRegistry;

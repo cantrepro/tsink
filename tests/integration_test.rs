@@ -521,12 +521,10 @@ fn test_wal_disabled_does_not_replay_stale_segments() {
         .with_wal_enabled(false)
         .build()
         .unwrap();
-    assert!(
-        storage
-            .select("stale_metric", &[], 0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(storage
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
     assert!(storage.list_metrics().unwrap().is_empty());
     storage.close().unwrap();
 
@@ -535,12 +533,10 @@ fn test_wal_disabled_does_not_replay_stale_segments() {
         .with_wal_enabled(false)
         .build()
         .unwrap();
-    assert!(
-        storage
-            .select("stale_metric", &[], 0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(storage
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
     assert!(storage.list_metrics().unwrap().is_empty());
 }
 
@@ -570,12 +566,10 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
         .build()
         .unwrap();
 
-    assert!(
-        reopened
-            .select("stale_metric", &[], 0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(reopened
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
     let fresh = reopened.select("fresh_metric", &[], 0, 10).unwrap();
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].timestamp, 6);
@@ -843,14 +837,10 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
 
     let points = storage.select("collision_metric", &[], 0, 20).unwrap();
     assert_eq!(points.len(), 2);
-    assert!(
-        points
-            .iter()
-            .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12)
-    );
-    assert!(
-        points
-            .iter()
-            .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 2.0).abs() < 1e-12)
-    );
+    assert!(points
+        .iter()
+        .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12));
+    assert!(points
+        .iter()
+        .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 2.0).abs() < 1e-12));
 }

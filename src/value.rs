@@ -7,7 +7,7 @@ use std::iter::Sum;
 use std::ops::{Div, Sub};
 
 /// Typed payload value stored in a data point.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     F64(f64),
     I64(i64),
@@ -16,6 +16,22 @@ pub enum Value {
     Bytes(Vec<u8>),
     String(String),
 }
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::F64(a), Value::F64(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Value::I64(a), Value::I64(b)) => a == b,
+            (Value::U64(a), Value::U64(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
 
 impl Value {
     /// Returns the value kind name.
@@ -373,6 +389,12 @@ mod tests {
         assert_eq!(Value::Bool(true).as_bool(), Some(true));
         assert_eq!(Value::Bytes(vec![1, 2]).as_bytes(), Some(&[1, 2][..]));
         assert_eq!(Value::String("x".to_string()).as_str(), Some("x"));
+    }
+
+    #[test]
+    fn value_equality_treats_nan_values_as_equal() {
+        assert_eq!(Value::F64(f64::NAN), Value::F64(f64::NAN));
+        assert_ne!(Value::F64(f64::NAN), Value::F64(1.0));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Concurrency utilities for tsink.
 
 use parking_lot::{Condvar, Mutex};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument};
 

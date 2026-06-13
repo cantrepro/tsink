@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Represents a data point, the smallest unit of time series data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPoint {
     /// The actual value.
     pub value: Value,
@@ -50,19 +50,6 @@ impl DataPoint {
     /// Returns the value as a borrowed byte slice for raw payloads.
     pub fn value_as_bytes(&self) -> Option<&[u8]> {
         self.value.as_bytes()
-    }
-}
-
-impl PartialEq for DataPoint {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp == other.timestamp && values_equal_for_datapoint(&self.value, &other.value)
-    }
-}
-
-fn values_equal_for_datapoint(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::F64(a), Value::F64(b)) => a == b || (a.is_nan() && b.is_nan()),
-        _ => left == right,
     }
 }
 

@@ -78,22 +78,18 @@ fn test_select_all_with_multiple_labels() {
         {
             found_server1 = true;
             assert_eq!(points.len(), 2);
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.name == "region" && l.value == "us-west")
-            );
+            assert!(labels
+                .iter()
+                .any(|l| l.name == "region" && l.value == "us-west"));
         } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server2")
         {
             found_server2 = true;
             assert_eq!(points.len(), 2);
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.name == "region" && l.value == "us-east")
-            );
+            assert!(labels
+                .iter()
+                .any(|l| l.name == "region" && l.value == "us-east"));
         } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server3")
@@ -183,6 +179,65 @@ fn test_select_all_mixed_labels_and_no_labels() {
 
     assert!(found_unlabeled, "Should find unlabeled data");
     assert!(found_labeled, "Should find labeled data");
+}
+
+#[test]
+fn test_select_with_empty_labels_returns_only_unlabeled_series() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::new("requests", DataPoint::new(1000, 100.0)),
+            Row::new("requests", DataPoint::new(2000, 110.0)),
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/core")],
+                DataPoint::new(1500, 150.0),
+            ),
+        ])
+        .unwrap();
+
+    let unlabeled = storage.select("requests", &[], 0, 3000).unwrap();
+    assert_eq!(unlabeled.len(), 2);
+    assert_eq!(unlabeled[0].timestamp, 1000);
+    assert_eq!(unlabeled[1].timestamp, 2000);
+
+    let labeled = storage
+        .select("requests", &[Label::new("endpoint", "/api/core")], 0, 3000)
+        .unwrap();
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].timestamp, 1500);
+}
+
+#[test]
+fn test_select_with_empty_labels_returns_empty_when_only_labeled_series_exist() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/core")],
+                DataPoint::new(1000, 100.0),
+            ),
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/admin")],
+                DataPoint::new(2000, 200.0),
+            ),
+        ])
+        .unwrap();
+
+    let unlabeled = storage.select("requests", &[], 0, 3000).unwrap();
+    assert!(unlabeled.is_empty());
 }
 
 #[test]
