@@ -1464,11 +1464,17 @@ mod tests {
     fn tolerate_test_client_disconnect(result: Result<(), String>) -> Result<(), String> {
         match result {
             Ok(()) => Ok(()),
-            Err(err) if err.contains("Broken pipe") || err.contains("Connection reset by peer") => {
-                Ok(())
-            }
+            Err(err) if is_test_client_disconnect(&err) => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn is_test_client_disconnect(err: &str) -> bool {
+        let err = err.to_ascii_lowercase();
+        err.contains("broken pipe")
+            || err.contains("connection reset by peer")
+            || err.contains("connection was aborted")
+            || err.contains("os error 10053")
     }
 
     async fn spawn_timeout_ingest_server(delay: Duration) -> (String, JoinHandle<()>) {
