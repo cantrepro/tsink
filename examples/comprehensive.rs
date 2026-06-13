@@ -110,10 +110,11 @@ fn example_concurrent_operations() -> tsink::Result<()> {
             for _ in 0..10 {
                 match storage.select("concurrent_metric", &[], 1600000000, 1600000100) {
                     Ok(points) => {
-                        println!("Reader {} read {} points", reader_id, points.len());
-                    }
-                    Err(tsink::TsinkError::NoDataPoints { .. }) => {
-                        println!("Reader {} found no data points yet", reader_id);
+                        if points.is_empty() {
+                            println!("Reader {} found no data points yet", reader_id);
+                        } else {
+                            println!("Reader {} read {} points", reader_id, points.len());
+                        }
                     }
                     Err(e) => {
                         eprintln!("Reader {} error: {}", reader_id, e);

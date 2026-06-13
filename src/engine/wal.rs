@@ -180,6 +180,7 @@ impl FramedWal {
         let payload_crc32 = checksum32(payload);
 
         let mut writer = self.writer.lock();
+        let frame_start_len = writer.get_ref().metadata()?.len();
         let frame_seq = self.next_seq.load(Ordering::SeqCst);
 
         let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
@@ -190,9 +191,20 @@ impl FramedWal {
         header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         header.extend_from_slice(&payload_crc32.to_le_bytes());
 
-        writer.write_all(&header)?;
-        writer.write_all(payload)?;
-        writer.flush()?;
+        let write_result = writer
+            .write_all(&header)
+            .and_then(|_| writer.write_all(payload))
+            .and_then(|_| writer.flush());
+        if let Err(write_err) = write_result {
+            if let Err(recovery_err) = self.rollback_partial_append(&mut writer, frame_start_len) {
+                return Err(TsinkError::Wal {
+                    operation: "append frame rollback".to_string(),
+                    details: format!("append failed: {write_err}; rollback failed: {recovery_err}"),
+                });
+            }
+
+            return Err(write_err.into());
+        }
 
         match self.sync_mode {
             WalSyncMode::PerAppend => {
@@ -210,6 +222,25 @@ impl FramedWal {
 
         self.next_seq
             .store(frame_seq.saturating_add(1), Ordering::SeqCst);
+
+        Ok(())
+    }
+
+    fn rollback_partial_append(
+        &self,
+        writer: &mut BufWriter<File>,
+        frame_start_len: u64,
+    ) -> Result<()> {
+        writer.get_mut().set_len(frame_start_len)?;
+        writer.get_mut().sync_data()?;
+
+        let replacement = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let capacity = writer.capacity();
+        let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));
+        let _ = old_writer.into_parts();
 
         Ok(())
     }
@@ -832,5 +863,57 @@ mod tests {
 
         assert!(err.is_err());
         assert_eq!(wal.next_seq.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn rollback_partial_append_clears_buffered_bytes_and_preserves_next_frame() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open_with_buffer_size(temp_dir.path(), WalSyncMode::PerAppend, 4096)
+            .unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+
+        let len_before_failure = std::fs::metadata(wal.path()).unwrap().len();
+
+        {
+            let mut writer = wal.writer.lock();
+            writer.write_all(b"TSFRpartial").unwrap();
+            assert!(!writer.buffer().is_empty());
+            wal.rollback_partial_append(&mut writer, len_before_failure)
+                .unwrap();
+            assert!(writer.buffer().is_empty());
+        }
+
+        assert_eq!(
+            std::fs::metadata(wal.path()).unwrap().len(),
+            len_before_failure
+        );
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 2,
+            metric: "mem".to_string(),
+            labels: vec![Label::new("host", "b")],
+        })
+        .unwrap();
+
+        let replay = wal.replay_frames().unwrap();
+        assert_eq!(replay.len(), 2);
+
+        let first = match &replay[0] {
+            ReplayFrame::SeriesDefinition(frame) => frame,
+            _ => panic!("expected series definition frame"),
+        };
+        let second = match &replay[1] {
+            ReplayFrame::SeriesDefinition(frame) => frame,
+            _ => panic!("expected series definition frame"),
+        };
+
+        assert_eq!(first.series_id, 1);
+        assert_eq!(second.series_id, 2);
     }
 }

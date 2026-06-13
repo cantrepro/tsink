@@ -1,5 +1,6 @@
 //! Main storage API and query helpers for tsink.
 
+use crate::value::{i64_to_f64_exact, u64_to_f64_exact};
 use crate::wal::WalSyncMode;
 use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
@@ -421,8 +422,30 @@ fn numeric_values_f64(points: &[DataPoint], aggregation: Aggregation) -> Result<
         match &point.value {
             Value::F64(v) if v.is_nan() => {}
             Value::F64(v) => values.push(*v),
-            Value::I64(v) => values.push(*v as f64),
-            Value::U64(v) => values.push(*v as f64),
+            Value::I64(v) => {
+                let Some(value) = i64_to_f64_exact(*v) else {
+                    return Err(TsinkError::UnsupportedAggregation {
+                        aggregation: aggregation_name(aggregation).to_string(),
+                        value_type: format!(
+                            "{} (cannot be represented exactly as f64)",
+                            point.value.kind()
+                        ),
+                    });
+                };
+                values.push(value);
+            }
+            Value::U64(v) => {
+                let Some(value) = u64_to_f64_exact(*v) else {
+                    return Err(TsinkError::UnsupportedAggregation {
+                        aggregation: aggregation_name(aggregation).to_string(),
+                        value_type: format!(
+                            "{} (cannot be represented exactly as f64)",
+                            point.value.kind()
+                        ),
+                    });
+                };
+                values.push(value);
+            }
             _ => {
                 return Err(TsinkError::UnsupportedAggregation {
                     aggregation: aggregation_name(aggregation).to_string(),
@@ -434,15 +457,91 @@ fn numeric_values_f64(points: &[DataPoint], aggregation: Aggregation) -> Result<
     Ok(values)
 }
 
+fn integral_f64_to_i128(value: f64) -> Option<i128> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    let bits = value.to_bits();
+    let sign = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+
+    let magnitude = if exponent_bits == 0 {
+        if fraction == 0 {
+            0u128
+        } else {
+            return None;
+        }
+    } else {
+        let exponent = exponent_bits - 1023;
+        let significand = ((1u64 << 52) | fraction) as u128;
+
+        if exponent < 0 {
+            return None;
+        }
+
+        if exponent >= 52 {
+            let shift = (exponent - 52) as u32;
+            significand.checked_shl(shift)?
+        } else {
+            let shift = (52 - exponent) as u32;
+            let mask = (1u128 << shift) - 1;
+            if (significand & mask) != 0 {
+                return None;
+            }
+            significand >> shift
+        }
+    };
+
+    if sign {
+        let min_abs = (i128::MAX as u128) + 1;
+        if magnitude == min_abs {
+            Some(i128::MIN)
+        } else if magnitude <= i128::MAX as u128 {
+            Some(-(magnitude as i128))
+        } else {
+            None
+        }
+    } else if magnitude <= i128::MAX as u128 {
+        Some(magnitude as i128)
+    } else {
+        None
+    }
+}
+
+fn cmp_f64_with_i128(value: f64, integer: i128) -> std::cmp::Ordering {
+    if value.is_nan() {
+        return value.total_cmp(&(integer as f64));
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+    }
+
+    let rounded = integer as f64;
+    let ord = value.total_cmp(&rounded);
+    if !ord.is_eq() {
+        return ord;
+    }
+
+    integral_f64_to_i128(value)
+        .map(|parsed| parsed.cmp(&integer))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 fn value_cmp(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering> {
     match (lhs, rhs) {
         (Value::F64(a), Value::F64(b)) => Ok(a.total_cmp(b)),
-        (Value::F64(a), Value::I64(b)) => Ok(a.total_cmp(&(*b as f64))),
-        (Value::F64(a), Value::U64(b)) => Ok(a.total_cmp(&(*b as f64))),
-        (Value::I64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
+        (Value::F64(a), Value::I64(b)) => Ok(cmp_f64_with_i128(*a, *b as i128)),
+        (Value::F64(a), Value::U64(b)) => Ok(cmp_f64_with_i128(*a, *b as i128)),
+        (Value::I64(a), Value::F64(b)) => Ok(cmp_f64_with_i128(*b, *a as i128).reverse()),
         (Value::I64(a), Value::I64(b)) => Ok(a.cmp(b)),
         (Value::I64(a), Value::U64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
-        (Value::U64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
+        (Value::U64(a), Value::F64(b)) => Ok(cmp_f64_with_i128(*b, *a as i128).reverse()),
         (Value::U64(a), Value::I64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
         (Value::U64(a), Value::U64(b)) => Ok(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
@@ -727,30 +826,27 @@ pub(crate) fn aggregate_series(
                     .count() as u64,
             ),
         )),
-        Aggregation::Sum => sum_numeric(points)?
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
-        Aggregation::Avg => average_numeric(points)?
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
-        Aggregation::Min => min_point(points)?.or_else(|| Some(last.clone())),
-        Aggregation::Max => max_point(points)?.or_else(|| Some(last.clone())),
-        Aggregation::Median => median_numeric(points)?
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
-        Aggregation::Range => range_numeric(points)?
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
-        Aggregation::Variance => population_variance_numeric(points)?
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
+        Aggregation::Sum => sum_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value)),
+        Aggregation::Avg => {
+            average_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Min => min_point(points)?,
+        Aggregation::Max => max_point(points)?,
+        Aggregation::Median => {
+            median_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Range => {
+            range_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Variance => {
+            population_variance_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
         Aggregation::StdDev => population_variance_numeric(points)?
             .and_then(|value| match value {
                 Value::F64(v) => Some(Value::F64(v.sqrt())),
                 _ => None,
             })
-            .map(|value| DataPoint::new(last.timestamp, value))
-            .or_else(|| Some(last.clone())),
+            .map(|value| DataPoint::new(last.timestamp, value)),
     };
 
     Ok(aggregated)
@@ -761,9 +857,9 @@ fn aggregate_bucket(
     aggregation: Aggregation,
     bucket_start: i64,
 ) -> Result<Option<DataPoint>> {
-    let Some(last) = points.last() else {
+    if points.is_empty() {
         return Ok(None);
-    };
+    }
 
     let aggregated = match aggregation {
         Aggregation::None => None,
@@ -782,34 +878,31 @@ fn aggregate_bucket(
                     .count() as u64,
             ),
         )),
-        Aggregation::Sum => sum_numeric(points)?
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Avg => average_numeric(points)?
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Min => min_point(points)?
-            .map(|point| DataPoint::new(bucket_start, point.value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Max => max_point(points)?
-            .map(|point| DataPoint::new(bucket_start, point.value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Median => median_numeric(points)?
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Range => range_numeric(points)?
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
-        Aggregation::Variance => population_variance_numeric(points)?
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Sum => sum_numeric(points)?.map(|value| DataPoint::new(bucket_start, value)),
+        Aggregation::Avg => {
+            average_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Min => {
+            min_point(points)?.map(|point| DataPoint::new(bucket_start, point.value))
+        }
+        Aggregation::Max => {
+            max_point(points)?.map(|point| DataPoint::new(bucket_start, point.value))
+        }
+        Aggregation::Median => {
+            median_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Range => {
+            range_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Variance => {
+            population_variance_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
         Aggregation::StdDev => population_variance_numeric(points)?
             .and_then(|value| match value {
                 Value::F64(v) => Some(Value::F64(v.sqrt())),
                 _ => None,
             })
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+            .map(|value| DataPoint::new(bucket_start, value)),
     };
 
     Ok(aggregated)
@@ -909,8 +1002,8 @@ pub(crate) fn downsample_points_with_custom(
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate_series;
-    use crate::{Aggregation, DataPoint, Value};
+    use super::{aggregate_bucket, aggregate_series};
+    use crate::{Aggregation, DataPoint, TsinkError, Value};
 
     #[test]
     fn mixed_i64_u64_min_max_use_integer_order_for_large_values() {
@@ -947,5 +1040,111 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(range.value, Value::F64(1.0));
+    }
+
+    #[test]
+    fn mixed_i64_f64_min_max_preserve_order_for_large_values() {
+        let larger_f64 = i64::MAX as f64;
+        let smaller_i64 = i64::MAX - 1;
+
+        let min_points = vec![
+            DataPoint::new(1, Value::F64(larger_f64)),
+            DataPoint::new(2, Value::I64(smaller_i64)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
+            .unwrap()
+            .unwrap();
+        assert_eq!(min.value, Value::I64(smaller_i64));
+
+        let max_points = vec![
+            DataPoint::new(1, Value::I64(smaller_i64)),
+            DataPoint::new(2, Value::F64(larger_f64)),
+        ];
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::F64(larger_f64));
+    }
+
+    #[test]
+    fn mixed_u64_f64_min_max_preserve_order_for_large_values() {
+        let larger_f64 = u64::MAX as f64;
+        let smaller_u64 = u64::MAX - 1;
+
+        let min_points = vec![
+            DataPoint::new(1, Value::F64(larger_f64)),
+            DataPoint::new(2, Value::U64(smaller_u64)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
+            .unwrap()
+            .unwrap();
+        assert_eq!(min.value, Value::U64(smaller_u64));
+
+        let max_points = vec![
+            DataPoint::new(1, Value::U64(smaller_u64)),
+            DataPoint::new(2, Value::F64(larger_f64)),
+        ];
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::F64(larger_f64));
+    }
+
+    #[test]
+    fn variance_rejects_non_representable_large_integers() {
+        let points = vec![
+            DataPoint::new(1, Value::I64(i64::MAX - 1)),
+            DataPoint::new(2, Value::I64(i64::MAX)),
+        ];
+
+        let err = aggregate_series(&points, Aggregation::Variance).unwrap_err();
+        assert!(matches!(err, TsinkError::UnsupportedAggregation { .. }));
+        assert!(err
+            .to_string()
+            .contains("cannot be represented exactly as f64"));
+    }
+
+    #[test]
+    fn all_nan_numeric_aggregations_return_none_for_series() {
+        let points = vec![
+            DataPoint::new(1, Value::F64(f64::NAN)),
+            DataPoint::new(2, Value::F64(f64::NAN)),
+        ];
+
+        for aggregation in [
+            Aggregation::Sum,
+            Aggregation::Avg,
+            Aggregation::Min,
+            Aggregation::Max,
+            Aggregation::Median,
+            Aggregation::Range,
+            Aggregation::Variance,
+            Aggregation::StdDev,
+        ] {
+            assert!(aggregate_series(&points, aggregation).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn all_nan_numeric_aggregations_return_none_for_bucket() {
+        let points = vec![
+            DataPoint::new(1, Value::F64(f64::NAN)),
+            DataPoint::new(2, Value::F64(f64::NAN)),
+        ];
+
+        for aggregation in [
+            Aggregation::Sum,
+            Aggregation::Avg,
+            Aggregation::Min,
+            Aggregation::Max,
+            Aggregation::Median,
+            Aggregation::Range,
+            Aggregation::Variance,
+            Aggregation::StdDev,
+        ] {
+            assert!(aggregate_bucket(&points, aggregation, 1_000)
+                .unwrap()
+                .is_none());
+        }
     }
 }

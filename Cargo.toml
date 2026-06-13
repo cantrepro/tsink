@@ -15,9 +15,7 @@ readme = "README.md"
 # Core dependencies
 thiserror = "2.0"
 parking_lot = "0.12"
-dashmap = "6.1"
 crossbeam-channel = "0.5"
-bytes = "1.9"
 num_cpus = "1.16"
 crc32fast = "1.5"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
@@ -45,6 +43,7 @@ env_logger = "0.11"
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 anyhow = "1.0"
 chrono = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []

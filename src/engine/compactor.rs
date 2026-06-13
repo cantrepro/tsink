@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
@@ -29,6 +31,7 @@ pub struct Compactor {
     point_cap: usize,
     l0_trigger: usize,
     l1_trigger: usize,
+    next_segment_id: Option<Arc<AtomicU64>>,
 }
 
 impl Compactor {
@@ -38,6 +41,21 @@ impl Compactor {
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            next_segment_id: None,
+        }
+    }
+
+    pub fn new_with_segment_id_allocator(
+        data_path: impl AsRef<Path>,
+        point_cap: usize,
+        next_segment_id: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            data_path: data_path.as_ref().to_path_buf(),
+            point_cap: point_cap.clamp(1, u16::MAX as usize),
+            l0_trigger: DEFAULT_L0_TRIGGER,
+            l1_trigger: DEFAULT_L1_TRIGGER,
+            next_segment_id: Some(next_segment_id),
         }
     }
 
@@ -98,7 +116,10 @@ impl Compactor {
 
         let repacked = repack_chunks(chunks_by_series, self.point_cap)?;
 
-        let next_segment_id = load_segments(&self.data_path)?.next_segment_id;
+        let next_segment_id = match &self.next_segment_id {
+            Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
+            None => load_segments(&self.data_path)?.next_segment_id,
+        };
         let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
         writer.write_segment(&registry, &repacked)?;
 
@@ -294,6 +315,8 @@ fn level_to_u8(level: CompactionLevel) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
@@ -349,6 +372,49 @@ mod tests {
         let decoded = super::decode_chunk_points_for_compaction(&chunks[0]).unwrap();
         assert_eq!(decoded[0].ts, 10);
         assert_eq!(decoded[3].ts, 30);
+    }
+
+    #[test]
+    fn compactor_uses_shared_segment_id_allocator() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+
+        let series_id = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap()
+            .series_id;
+
+        let first_chunk = make_numeric_chunk(series_id, &[(10, 1.0), (20, 2.0)]);
+        let second_chunk = make_numeric_chunk(series_id, &[(15, 3.0), (30, 4.0)]);
+
+        let mut seg1_chunks = HashMap::new();
+        seg1_chunks.insert(series_id, vec![first_chunk]);
+
+        let mut seg2_chunks = HashMap::new();
+        seg2_chunks.insert(series_id, vec![second_chunk]);
+
+        SegmentWriter::new(temp_dir.path(), 0, 1)
+            .unwrap()
+            .write_segment(&registry, &seg1_chunks)
+            .unwrap();
+
+        SegmentWriter::new(temp_dir.path(), 0, 2)
+            .unwrap()
+            .write_segment(&registry, &seg2_chunks)
+            .unwrap();
+
+        let next_segment_id = Arc::new(AtomicU64::new(100));
+        let compactor = Compactor::new_with_segment_id_allocator(
+            temp_dir.path(),
+            8,
+            Arc::clone(&next_segment_id),
+        );
+        compactor.compact_once().unwrap();
+
+        let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].manifest.segment_id, 100);
+        assert_eq!(next_segment_id.load(Ordering::SeqCst), 101);
     }
 
     fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {

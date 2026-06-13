@@ -69,12 +69,12 @@ fn get_cpu_quota_unified() -> Option<f64> {
 }
 
 /// Returns the memory limit in bytes from cgroup settings
-pub fn get_memory_limit() -> Option<i64> {
+pub fn get_memory_limit() -> Option<u64> {
     get_memory_limit_unified()
 }
 
 /// Gets memory limit from cgroup unified hierarchy
-fn get_memory_limit_unified() -> Option<i64> {
+fn get_memory_limit_unified() -> Option<u64> {
     let mem_max_path = "/sys/fs/cgroup/memory.max";
     if !Path::new(mem_max_path).exists() {
         return None;
@@ -87,7 +87,7 @@ fn get_memory_limit_unified() -> Option<i64> {
         return None;
     }
 
-    trimmed.parse().ok()
+    trimmed.parse::<u64>().ok()
 }
 
 /// Returns the default number of workers based on available CPUs

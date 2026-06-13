@@ -153,8 +153,8 @@ impl Semaphore {
         let previous = self.permits.fetch_add(1, Ordering::AcqRel);
         debug!("Released semaphore permit, {} now available", previous + 1);
 
-        // Wake up all waiters to avoid starvation
-        self.condvar.notify_all();
+        // One released permit can only satisfy one waiter.
+        self.condvar.notify_one();
     }
 
     /// Returns the number of available permits.

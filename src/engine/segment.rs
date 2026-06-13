@@ -52,6 +52,10 @@ impl SegmentLayout {
             .join("segments")
             .join(format!("L{level}"))
             .join(format!("seg-{segment_id:016x}"));
+        Self::from_root(root)
+    }
+
+    fn from_root(root: PathBuf) -> Self {
         Self {
             chunks_path: root.join("chunks.bin"),
             chunk_index_path: root.join("chunk_index.bin"),
@@ -99,6 +103,7 @@ pub struct LoadedSegment {
 #[derive(Debug)]
 pub struct SegmentWriter {
     layout: SegmentLayout,
+    staging_layout: SegmentLayout,
     segment_id: u64,
     level: u8,
 }
@@ -147,9 +152,13 @@ struct ParsedSeriesFile {
 impl SegmentWriter {
     pub fn new(base: impl AsRef<Path>, level: u8, segment_id: u64) -> Result<Self> {
         let layout = SegmentLayout::new(base, level, segment_id);
-        fs::create_dir_all(&layout.root)?;
+        let staging_root = layout
+            .root
+            .with_file_name(format!(".tmp-seg-{segment_id:016x}"));
+        let staging_layout = SegmentLayout::from_root(staging_root);
         Ok(Self {
             layout,
+            staging_layout,
             segment_id,
             level,
         })
@@ -164,6 +173,8 @@ impl SegmentWriter {
         registry: &SeriesRegistry,
         chunks_by_series: &HashMap<SeriesId, Vec<Chunk>>,
     ) -> Result<SegmentManifest> {
+        prepare_staging_dir(&self.staging_layout.root)?;
+
         let (chunks_bytes, mut chunk_index, chunk_count, point_count, min_ts, max_ts) =
             build_chunks_and_index(self.level, chunks_by_series)?;
         let (series_bytes, postings, series_count) = build_series_file(registry, chunks_by_series)?;
@@ -171,10 +182,10 @@ impl SegmentWriter {
         let chunk_index_bytes = build_chunk_index_file(&mut chunk_index)?;
 
         let data_files = [
-            (&self.layout.chunks_path, chunks_bytes),
-            (&self.layout.chunk_index_path, chunk_index_bytes),
-            (&self.layout.series_path, series_bytes),
-            (&self.layout.postings_path, postings_bytes),
+            (&self.staging_layout.chunks_path, chunks_bytes),
+            (&self.staging_layout.chunk_index_path, chunk_index_bytes),
+            (&self.staging_layout.series_path, series_bytes),
+            (&self.staging_layout.postings_path, postings_bytes),
         ];
 
         for (path, bytes) in &data_files {
@@ -195,13 +206,24 @@ impl SegmentWriter {
             max_ts,
         };
 
-        let manifest_bytes = build_manifest_file(&self.layout, &manifest)?;
-        write_tmp_and_sync(&self.layout.manifest_path, &manifest_bytes)?;
-        rename_tmp(&self.layout.manifest_path)?;
+        let manifest_bytes = build_manifest_file(&self.staging_layout, &manifest)?;
+        write_tmp_and_sync(&self.staging_layout.manifest_path, &manifest_bytes)?;
+        rename_tmp(&self.staging_layout.manifest_path)?;
+
+        if let Ok(dir) = File::open(&self.staging_layout.root) {
+            let _ = dir.sync_all();
+        }
+        ensure_publish_target_clear(&self.layout)?;
+        fs::rename(&self.staging_layout.root, &self.layout.root)?;
 
         // Best effort directory sync for crash safety.
         if let Ok(dir) = File::open(&self.layout.root) {
             let _ = dir.sync_all();
+        }
+        if let Some(level_root) = self.layout.root.parent() {
+            if let Ok(dir) = File::open(level_root) {
+                let _ = dir.sync_all();
+            }
         }
 
         Ok(manifest)
@@ -1433,6 +1455,48 @@ fn rename_tmp(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn prepare_staging_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(TsinkError::InvalidConfiguration(
+            "staging directory has no parent".to_string(),
+        ));
+    };
+    fs::create_dir_all(parent)?;
+    remove_path_if_exists(path)?;
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn ensure_publish_target_clear(layout: &SegmentLayout) -> Result<()> {
+    if !layout.root.exists() {
+        return Ok(());
+    }
+
+    if !layout.manifest_path.exists() {
+        remove_path_if_exists(&layout.root)?;
+        return Ok(());
+    }
+
+    Err(TsinkError::InvalidConfiguration(format!(
+        "segment directory already exists: {}",
+        layout.root.display()
+    )))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn tmp_path_for(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -1541,11 +1605,12 @@ fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
 
     use tempfile::TempDir;
 
     use super::{load_segments, SegmentWriter};
-    use crate::engine::chunk::{Chunk, ChunkPoint, ValueLane};
+    use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::series_registry::SeriesRegistry;
     use crate::{Label, Value};
@@ -1553,7 +1618,50 @@ mod tests {
     #[test]
     fn segment_roundtrip_preserves_series_and_chunks() {
         let tmp = TempDir::new().unwrap();
+        let (registry, chunks_by_series) = sample_segment_input();
 
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        writer.write_segment(&registry, &chunks_by_series).unwrap();
+
+        let loaded = load_segments(tmp.path()).unwrap();
+        assert_eq!(loaded.series.len(), 1);
+        assert_eq!(loaded.series[0].metric, "cpu");
+        assert_eq!(loaded.next_segment_id, 2);
+        assert_eq!(loaded.chunks_by_series.len(), 1);
+    }
+
+    #[test]
+    fn segment_writer_defers_final_dir_creation_until_publish() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        assert!(!writer.layout().root.exists());
+
+        let (registry, chunks_by_series) = sample_segment_input();
+        writer.write_segment(&registry, &chunks_by_series).unwrap();
+
+        assert!(writer.layout().root.exists());
+        assert!(writer.layout().manifest_path.exists());
+    }
+
+    #[test]
+    fn segment_writer_replaces_stale_root_missing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        fs::create_dir_all(&writer.layout().root).unwrap();
+        let stale_file = writer.layout().root.join("stale.bin");
+        fs::write(&stale_file, b"partial").unwrap();
+        assert!(!writer.layout().manifest_path.exists());
+
+        let (registry, chunks_by_series) = sample_segment_input();
+        writer.write_segment(&registry, &chunks_by_series).unwrap();
+
+        assert!(!stale_file.exists());
+        assert!(writer.layout().manifest_path.exists());
+        let loaded = load_segments(tmp.path()).unwrap();
+        assert_eq!(loaded.next_segment_id, 2);
+    }
+
+    fn sample_segment_input() -> (SeriesRegistry, HashMap<u64, Vec<Chunk>>) {
         let mut registry = SeriesRegistry::new();
         let series = registry
             .resolve_or_insert("cpu", &[Label::new("host", "a")])
@@ -1571,7 +1679,7 @@ mod tests {
         ];
         let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
         let chunk = Chunk {
-            header: crate::engine::chunk::ChunkHeader {
+            header: ChunkHeader {
                 series_id: series.series_id,
                 lane: ValueLane::Numeric,
                 point_count: points.len() as u16,
@@ -1586,14 +1694,6 @@ mod tests {
 
         let mut chunks_by_series = HashMap::new();
         chunks_by_series.insert(series.series_id, vec![chunk]);
-
-        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
-        writer.write_segment(&registry, &chunks_by_series).unwrap();
-
-        let loaded = load_segments(tmp.path()).unwrap();
-        assert_eq!(loaded.series.len(), 1);
-        assert_eq!(loaded.series[0].metric, "cpu");
-        assert_eq!(loaded.next_segment_id, 2);
-        assert_eq!(loaded.chunks_by_series.len(), 1);
+        (registry, chunks_by_series)
     }
 }

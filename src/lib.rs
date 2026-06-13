@@ -42,7 +42,7 @@ impl DataPoint {
         }
     }
 
-    /// Returns the value as f64 when numeric.
+    /// Returns the value as f64 when numeric and exactly representable.
     pub fn value_as_f64(&self) -> Option<f64> {
         self.value.as_f64()
     }

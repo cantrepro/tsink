@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::concurrency::Semaphore;
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
@@ -192,14 +192,16 @@ const WAL_DIR_NAME: &str = "wal";
 
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
+    registry_write_txn: Mutex<()>,
     active_builders: RwLock<HashMap<SeriesId, ActiveSeriesState>>,
     sealed_chunks: RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>,
     persisted_chunk_watermarks: RwLock<HashMap<SeriesId, u64>>,
+    loaded_chunk_sequence_watermark: AtomicU64,
     next_chunk_sequence: AtomicU64,
     chunk_point_cap: usize,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
-    next_segment_id: AtomicU64,
+    next_segment_id: Arc<AtomicU64>,
     numeric_compactor: Option<Compactor>,
     blob_compactor: Option<Compactor>,
     wal: Option<FramedWal>,
@@ -249,22 +251,33 @@ impl ChunkStorage {
         next_segment_id: u64,
         options: ChunkStorageOptions,
     ) -> Self {
+        let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
+            registry_write_txn: Mutex::new(()),
             active_builders: RwLock::new(HashMap::new()),
             sealed_chunks: RwLock::new(HashMap::new()),
             persisted_chunk_watermarks: RwLock::new(HashMap::new()),
+            loaded_chunk_sequence_watermark: AtomicU64::new(0),
             next_chunk_sequence: AtomicU64::new(1),
             chunk_point_cap: chunk_point_cap.clamp(1, u16::MAX as usize),
-            numeric_compactor: numeric_lane_path
-                .as_ref()
-                .map(|path| Compactor::new(path, chunk_point_cap)),
-            blob_compactor: blob_lane_path
-                .as_ref()
-                .map(|path| Compactor::new(path, chunk_point_cap)),
+            numeric_compactor: numeric_lane_path.as_ref().map(|path| {
+                Compactor::new_with_segment_id_allocator(
+                    path,
+                    chunk_point_cap,
+                    Arc::clone(&next_segment_id),
+                )
+            }),
+            blob_compactor: blob_lane_path.as_ref().map(|path| {
+                Compactor::new_with_segment_id_allocator(
+                    path,
+                    chunk_point_cap,
+                    Arc::clone(&next_segment_id),
+                )
+            }),
             numeric_lane_path,
             blob_lane_path,
-            next_segment_id: AtomicU64::new(next_segment_id.max(1)),
+            next_segment_id,
             wal,
             retention_window: options.retention_window.max(0),
             retention_enforced: options.retention_enforced,
@@ -386,22 +399,54 @@ impl ChunkStorage {
         out.clear();
         let mut has_overlap = false;
         let mut has_previous_chunk = false;
+        let mut has_previous_loaded_chunk = false;
+        let mut has_previous_runtime_chunk = false;
         let mut previous_max_ts = i64::MIN;
+        let mut previous_loaded_max_ts = i64::MIN;
+        let mut previous_runtime_max_ts = i64::MIN;
         let mut requires_output_validation = false;
+        let mut requires_timestamp_dedupe = false;
+        let mut requires_exact_dedupe = false;
+        let loaded_chunk_sequence_watermark =
+            self.loaded_chunk_sequence_watermark.load(Ordering::Relaxed);
 
         {
             let sealed = self.sealed_chunks.read();
             if let Some(chunks) = sealed.get(&series_id) {
                 let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
-                for (_, chunk) in chunks.range(..end_bound) {
+                for (key, chunk) in chunks.range(..end_bound) {
                     if chunk.header.max_ts < start {
                         continue;
                     }
+                    let chunk_is_loaded = key.sequence <= loaded_chunk_sequence_watermark;
                     if has_previous_chunk && chunk.header.min_ts <= previous_max_ts {
                         has_overlap = true;
+                        if chunk_is_loaded {
+                            if has_previous_loaded_chunk
+                                && chunk.header.min_ts <= previous_loaded_max_ts
+                            {
+                                requires_timestamp_dedupe = true;
+                            }
+                            if has_previous_runtime_chunk
+                                && chunk.header.min_ts <= previous_runtime_max_ts
+                            {
+                                requires_exact_dedupe = true;
+                            }
+                        } else if has_previous_loaded_chunk
+                            && chunk.header.min_ts <= previous_loaded_max_ts
+                        {
+                            requires_exact_dedupe = true;
+                        }
                     }
                     has_previous_chunk = true;
                     previous_max_ts = previous_max_ts.max(chunk.header.max_ts);
+                    if chunk_is_loaded {
+                        has_previous_loaded_chunk = true;
+                        previous_loaded_max_ts = previous_loaded_max_ts.max(chunk.header.max_ts);
+                    } else {
+                        has_previous_runtime_chunk = true;
+                        previous_runtime_max_ts = previous_runtime_max_ts.max(chunk.header.max_ts);
+                    }
 
                     // Chunks without encoded payload may be ad-hoc/manual and not guaranteed sorted.
                     if chunk.points.len() > 1 && chunk.encoded_payload.is_empty() {
@@ -427,6 +472,9 @@ impl ChunkStorage {
                     if has_previous_chunk && point.ts <= previous_max_ts {
                         has_overlap = true;
                     }
+                    if has_previous_loaded_chunk && point.ts <= previous_loaded_max_ts {
+                        requires_exact_dedupe = true;
+                    }
                     if has_previous_active && point.ts < previous_active_ts {
                         requires_output_validation = true;
                     }
@@ -444,7 +492,11 @@ impl ChunkStorage {
             if !points_are_sorted_by_timestamp(out) {
                 out.sort_by_key(|point| point.timestamp);
             }
-            dedupe_last_value_per_timestamp(out);
+            if requires_timestamp_dedupe {
+                dedupe_last_value_per_timestamp(out);
+            } else if requires_exact_dedupe {
+                dedupe_exact_duplicate_points(out);
+            }
         }
         Ok(())
     }
@@ -806,6 +858,13 @@ impl ChunkStorage {
             }
         }
 
+        let loaded_chunk_watermark = self
+            .next_chunk_sequence
+            .load(Ordering::SeqCst)
+            .saturating_sub(1);
+        self.loaded_chunk_sequence_watermark
+            .store(loaded_chunk_watermark, Ordering::SeqCst);
+
         self.next_segment_id
             .store(loaded.next_segment_id.max(1), Ordering::SeqCst);
         Ok(())
@@ -914,37 +973,49 @@ impl Storage for ChunkStorage {
         // A write may pass the first lifecycle check and then block on permits while close starts.
         // Re-check after acquiring a permit so shutdown cannot race new writes through.
         self.ensure_open()?;
+        // Preserve checkpoint-based registry rollback semantics while allowing readers to proceed
+        // during WAL and ingestion work.
+        let _registry_write_txn = self.registry_write_txn.lock();
 
         let mut pending_points = Vec::with_capacity(rows.len());
         let mut new_series_defs = Vec::new();
         let mut reserved_series = Vec::new();
         let mut created_series = Vec::<SeriesResolution>::new();
-        let mut registry = self.registry.write();
-        let registry_checkpoint = registry.checkpoint();
+        let registry_checkpoint = {
+            let mut registry = self.registry.write();
+            let registry_checkpoint = registry.checkpoint();
 
-        let write_result = (|| -> Result<()> {
-            for row in rows {
-                let data_point = row.data_point();
-                let lane = lane_for_value(&data_point.value);
-                let resolution = registry.resolve_or_insert(row.metric(), row.labels())?;
+            if let Err(err) = (|| -> Result<()> {
+                for row in rows {
+                    let data_point = row.data_point();
+                    let lane = lane_for_value(&data_point.value);
+                    let resolution = registry.resolve_or_insert(row.metric(), row.labels())?;
 
-                if resolution.created {
-                    created_series.push(resolution.clone());
-                    new_series_defs.push(SeriesDefinitionFrame {
+                    if resolution.created {
+                        created_series.push(resolution.clone());
+                        new_series_defs.push(SeriesDefinitionFrame {
+                            series_id: resolution.series_id,
+                            metric: row.metric().to_string(),
+                            labels: row.labels().to_vec(),
+                        });
+                    }
+
+                    pending_points.push(PendingPoint {
                         series_id: resolution.series_id,
-                        metric: row.metric().to_string(),
-                        labels: row.labels().to_vec(),
+                        lane,
+                        ts: data_point.timestamp,
+                        value: data_point.value.clone(),
                     });
                 }
-
-                pending_points.push(PendingPoint {
-                    series_id: resolution.series_id,
-                    lane,
-                    ts: data_point.timestamp,
-                    value: data_point.value.clone(),
-                });
+                Ok(())
+            })() {
+                registry.rollback_created_series(&created_series, registry_checkpoint);
+                return Err(err);
             }
+            registry_checkpoint
+        };
 
+        let write_result = (|| -> Result<()> {
             for point in &pending_points {
                 self.validate_series_lane_compatible(point.series_id, point.lane)?;
             }
@@ -967,12 +1038,14 @@ impl Storage for ChunkStorage {
             self.ingest_pending_points(std::mem::take(&mut pending_points))
         })();
 
-        if write_result.is_err() {
+        if let Err(err) = write_result {
             self.rollback_empty_series_lane_reservations(&reserved_series);
+            let mut registry = self.registry.write();
             registry.rollback_created_series(&created_series, registry_checkpoint);
+            return Err(err);
         }
 
-        write_result
+        Ok(())
     }
 
     fn select(
@@ -1338,6 +1411,16 @@ fn dedupe_last_value_per_timestamp(points: &mut Vec<DataPoint>) {
     });
 }
 
+fn dedupe_exact_duplicate_points(points: &mut Vec<DataPoint>) {
+    if points.len() < 2 {
+        return;
+    }
+
+    points.dedup_by(|current, next| {
+        current.timestamp == next.timestamp && current.value == next.value
+    });
+}
+
 fn lane_for_value(value: &Value) -> ValueLane {
     match value {
         Value::Bytes(_) | Value::String(_) => ValueLane::Blob,
@@ -1535,6 +1618,36 @@ mod tests {
             .map(|point| point.timestamp)
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn select_preserves_duplicate_timestamps_across_overlapping_chunks() {
+        let storage = ChunkStorage::new(2, None);
+        let labels = vec![Label::new("host", "a")];
+
+        storage
+            .insert_rows(&[
+                Row::with_labels("latency", labels.clone(), DataPoint::new(1, 1.0)),
+                Row::with_labels("latency", labels.clone(), DataPoint::new(3, 3.0)),
+                Row::with_labels("latency", labels.clone(), DataPoint::new(2, 2.0)),
+                Row::with_labels("latency", labels.clone(), DataPoint::new(3, 30.0)),
+            ])
+            .unwrap();
+
+        let points = storage.select("latency", &labels, 0, 10).unwrap();
+        let timestamps = points
+            .iter()
+            .map(|point| point.timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![1, 2, 3, 3]);
+
+        let mut values_at_timestamp_three = points
+            .iter()
+            .filter(|point| point.timestamp == 3)
+            .filter_map(|point| point.value_as_f64())
+            .collect::<Vec<_>>();
+        values_at_timestamp_three.sort_by(f64::total_cmp);
+        assert_eq!(values_at_timestamp_three, vec![3.0, 30.0]);
     }
 
     #[test]
@@ -1756,6 +1869,61 @@ mod tests {
         assert!(!has_mixed_metric);
 
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn list_metrics_remains_available_while_writer_waits_on_active_lock() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::thread;
+
+        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(2),
+            },
+        ));
+
+        let active_read_guard = storage.active_builders.read();
+
+        let writer_storage = Arc::clone(&storage);
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result = writer_storage
+                .insert_rows(&[Row::new("read_concurrency_metric", DataPoint::new(1, 1.0))]);
+            writer_tx.send(result).unwrap();
+        });
+
+        // Give the writer enough time to resolve the series and block on lane reservation.
+        thread::sleep(Duration::from_millis(75));
+
+        let reader_storage = Arc::clone(&storage);
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = reader_storage.list_metrics();
+            reader_tx.send(result).unwrap();
+        });
+
+        let reader_result = reader_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("list_metrics should not block on in-flight WAL/ingest work");
+        assert!(reader_result.is_ok());
+
+        drop(active_read_guard);
+
+        let writer_result = writer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(writer_result.is_ok());
+
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[test]

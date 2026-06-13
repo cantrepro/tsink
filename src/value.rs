@@ -17,6 +17,35 @@ pub enum Value {
     String(String),
 }
 
+const F64_EXACT_INT_BITS: u32 = f64::MANTISSA_DIGITS;
+
+fn u64_is_exact_in_f64(value: u64) -> bool {
+    if value <= (1u64 << F64_EXACT_INT_BITS) {
+        return true;
+    }
+
+    let bit_len = u64::BITS - value.leading_zeros();
+    let shift = bit_len - F64_EXACT_INT_BITS;
+    let mask = (1u64 << shift) - 1;
+    (value & mask) == 0
+}
+
+pub(crate) fn u64_to_f64_exact(value: u64) -> Option<f64> {
+    if u64_is_exact_in_f64(value) {
+        Some(value as f64)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn i64_to_f64_exact(value: i64) -> Option<f64> {
+    if u64_is_exact_in_f64(value.unsigned_abs()) {
+        Some(value as f64)
+    } else {
+        None
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -46,12 +75,12 @@ impl Value {
         }
     }
 
-    /// Returns the value converted to f64 when numeric.
+    /// Returns the value converted to f64 when numeric and exactly representable.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::F64(v) => Some(*v),
-            Value::I64(v) => Some(*v as f64),
-            Value::U64(v) => Some(*v as f64),
+            Value::I64(v) => i64_to_f64_exact(*v),
+            Value::U64(v) => u64_to_f64_exact(*v),
             _ => None,
         }
     }
@@ -392,6 +421,16 @@ mod tests {
     }
 
     #[test]
+    fn as_f64_rejects_non_representable_large_integers() {
+        assert_eq!(Value::I64(i64::MAX).as_f64(), None);
+        assert_eq!(Value::I64(i64::MAX - 1).as_f64(), None);
+        assert_eq!(Value::U64(u64::MAX).as_f64(), None);
+
+        assert_eq!(Value::I64(i64::MIN).as_f64(), Some(i64::MIN as f64));
+        assert_eq!(Value::U64(1u64 << 63).as_f64(), Some((1u64 << 63) as f64));
+    }
+
+    #[test]
     fn value_equality_treats_nan_values_as_equal() {
         assert_eq!(Value::F64(f64::NAN), Value::F64(f64::NAN));
         assert_ne!(Value::F64(f64::NAN), Value::F64(1.0));
@@ -433,7 +472,7 @@ mod tests {
 
     #[test]
     fn sum_over_value_ref_iter_ignores_non_numeric_values() {
-        let values = vec![
+        let values = [
             Value::U64(2),
             Value::Bytes(vec![1, 2, 3]),
             Value::String("y".to_string()),
@@ -446,7 +485,7 @@ mod tests {
     #[test]
     fn codec_aggregator_aggregates_series_and_buckets() {
         let adapter = CodecAggregator::new(U32Codec, SumU32);
-        let points = vec![
+        let points = [
             DataPoint::new(100, Value::Bytes(10u32.to_le_bytes().to_vec())),
             DataPoint::new(110, Value::Bytes(20u32.to_le_bytes().to_vec())),
         ];
