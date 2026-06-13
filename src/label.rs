@@ -22,31 +22,14 @@ pub struct Label {
 }
 
 impl Label {
-    fn truncate_utf8(s: &mut String, max_len: usize) {
-        if s.len() <= max_len {
-            return;
-        }
-
-        let mut trunc_at = max_len;
-        while trunc_at > 0 && !s.is_char_boundary(trunc_at) {
-            trunc_at -= 1;
-        }
-        s.truncate(trunc_at);
-    }
-
-    /// Creates a new label.
+    /// Creates a new label without mutating the provided bytes.
+    ///
+    /// Validation of emptiness/length limits is enforced at ingest/query boundaries.
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        let mut name = name.into();
-        let mut value = value.into();
-
-        if name.len() > MAX_LABEL_NAME_LEN {
-            Self::truncate_utf8(&mut name, MAX_LABEL_NAME_LEN);
+        Self {
+            name: name.into(),
+            value: value.into(),
         }
-        if value.len() > MAX_LABEL_VALUE_LEN {
-            Self::truncate_utf8(&mut value, MAX_LABEL_VALUE_LEN);
-        }
-
-        Self { name, value }
     }
 
     /// Checks if the label is valid (both name and value are non-empty).
@@ -204,13 +187,13 @@ mod tests {
     }
 
     #[test]
-    fn test_label_truncation() {
+    fn test_label_new_preserves_oversized_input() {
         let long_name = "a".repeat(MAX_LABEL_NAME_LEN + 100);
         let long_value = "b".repeat(MAX_LABEL_VALUE_LEN + 100);
 
-        let label = Label::new(long_name, long_value);
-        assert_eq!(label.name.len(), MAX_LABEL_NAME_LEN);
-        assert_eq!(label.value.len(), MAX_LABEL_VALUE_LEN);
+        let label = Label::new(long_name.clone(), long_value.clone());
+        assert_eq!(label.name, long_name);
+        assert_eq!(label.value, long_value);
     }
 
     #[test]
@@ -252,15 +235,26 @@ mod tests {
     }
 
     #[test]
-    fn test_label_truncation_preserves_utf8_boundaries() {
-        let long_name = "é".repeat(MAX_LABEL_NAME_LEN);
+    fn test_label_new_preserves_utf8_input() {
+        let long_name = "é".repeat(MAX_LABEL_NAME_LEN + 1);
         let long_value = "😀".repeat((MAX_LABEL_VALUE_LEN / 4) + 10);
 
-        let label = Label::new(long_name, long_value);
+        let label = Label::new(long_name.clone(), long_value.clone());
         assert!(label.name.is_char_boundary(label.name.len()));
         assert!(label.value.is_char_boundary(label.value.len()));
-        assert!(label.name.len() <= MAX_LABEL_NAME_LEN);
-        assert!(label.value.len() <= MAX_LABEL_VALUE_LEN);
+        assert_eq!(label.name, long_name);
+        assert_eq!(label.value, long_value);
+    }
+
+    #[test]
+    fn test_oversized_values_with_common_prefix_remain_distinct() {
+        let common_prefix = "x".repeat(MAX_LABEL_VALUE_LEN);
+        let label_a = Label::new("k", format!("{common_prefix}a"));
+        let label_b = Label::new("k", format!("{common_prefix}b"));
+
+        assert_ne!(label_a, label_b);
+        assert_eq!(label_a.value.len(), MAX_LABEL_VALUE_LEN + 1);
+        assert_eq!(label_b.value.len(), MAX_LABEL_VALUE_LEN + 1);
     }
 
     #[test]

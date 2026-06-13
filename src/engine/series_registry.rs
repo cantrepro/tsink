@@ -690,5 +690,9 @@ mod tests {
             .resolve_or_insert("m", &[Label::new("", "x")])
             .unwrap_err();
         assert!(matches!(label_err, TsinkError::InvalidLabel(_)));
+
+        let oversized = Label::new("k", "x".repeat(crate::label::MAX_LABEL_VALUE_LEN + 1));
+        let oversized_err = registry.resolve_or_insert("m", &[oversized]).unwrap_err();
+        assert!(matches!(oversized_err, TsinkError::InvalidLabel(_)));
     }
 }
