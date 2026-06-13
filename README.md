@@ -154,7 +154,9 @@ storage.close().await?;
 
 ## Server Mode (Prometheus Wire Compatible)
 
-This workspace includes a binary crate at `crates/tsink-server` that runs tsink as a network service and accepts Prometheus remote storage wire format (protobuf + snappy).
+> **Experimental:** tsink-server is still experimental and under development.
+
+This workspace includes a binary crate at `crates/tsink-server` that runs tsink as an async network service (tokio-based) with Prometheus remote storage wire format, PromQL HTTP API, TLS, and Bearer token authentication.
 
 Run the server:
 
@@ -162,7 +164,7 @@ Run the server:
 cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-data
 ```
 
-Full CLI options:
+### CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
@@ -171,13 +173,65 @@ Full CLI options:
 | `--wal-enabled <BOOL>` | `true` | Enable WAL. |
 | `--no-wal` | — | Disable WAL (shorthand). |
 | `--timestamp-precision <s\|ms\|us\|ns>` | `ms` | Timestamp precision (server defaults to milliseconds). |
+| `--retention <DURATION>` | 14d | Data retention period (e.g. `14d`, `720h`). |
+| `--memory-limit <BYTES>` | Unlimited | Memory budget (e.g. `1G`, `1073741824`). |
+| `--cardinality-limit <N>` | Unlimited | Max unique series. |
+| `--chunk-points <N>` | 2048 | Target points per chunk. |
+| `--max-writers <N>` | Available CPUs | Concurrent writer threads. |
+| `--wal-sync-mode <MODE>` | `periodic` | WAL fsync policy (`per-append` or `periodic`). |
+| `--tls-cert <PATH>` | — | TLS certificate file (PEM). Requires `--tls-key`. |
+| `--tls-key <PATH>` | — | TLS private key file (PEM). Requires `--tls-cert`. |
+| `--auth-token <TOKEN>` | — | Require Bearer token on all endpoints except health probes. |
 
-Supported endpoints:
-- `GET /healthz` — health check (returns `ok`)
-- `POST /api/v1/write` — Prometheus remote write
-- `POST /api/v1/read` — Prometheus remote read
+### Endpoints
 
-Example Prometheus config:
+| Method | Path | Description |
+|---|---|---|
+| GET | `/healthz` | Health check (returns `ok`). |
+| GET | `/ready` | Readiness probe (returns `ready`). |
+| GET | `/metrics` | Self-monitoring metrics (Prometheus exposition format). |
+| GET/POST | `/api/v1/query` | PromQL instant query. |
+| GET/POST | `/api/v1/query_range` | PromQL range query. |
+| GET | `/api/v1/series` | Series metadata (accepts `match[]` selectors). |
+| GET | `/api/v1/labels` | All label names. |
+| GET | `/api/v1/label/<name>/values` | Values for a given label. |
+| POST | `/api/v1/write` | Prometheus remote write (protobuf + snappy). |
+| POST | `/api/v1/read` | Prometheus remote read (protobuf + snappy). |
+| POST | `/api/v1/import/prometheus` | Prometheus text exposition format ingestion. |
+| GET | `/api/v1/status/tsdb` | TSDB stats (JSON). |
+| POST | `/api/v1/admin/delete_series` | Delete series (stub, returns 501). |
+
+### TLS
+
+Provide both `--tls-cert` and `--tls-key` to enable TLS:
+
+```bash
+cargo run -p tsink-server -- server \
+  --tls-cert /path/to/cert.pem \
+  --tls-key /path/to/key.pem
+```
+
+### Authentication
+
+When `--auth-token` is set, all requests except `GET /healthz` and `GET /ready` must include the header `Authorization: Bearer <TOKEN>`. Unauthenticated requests receive a `401 Unauthorized` response.
+
+### Graceful Shutdown
+
+The server handles `SIGTERM` and `SIGINT` signals. On receipt it stops accepting new connections, waits up to 10 seconds for in-flight requests to complete, then closes storage cleanly.
+
+### PromQL HTTP API
+
+The query endpoints follow the [Prometheus HTTP API](https://prometheus.io/docs/prometheus/latest/querying/api/) response format:
+
+```bash
+# Instant query
+curl 'http://localhost:9201/api/v1/query?query=up&time=1700000000'
+
+# Range query
+curl 'http://localhost:9201/api/v1/query_range?query=up&start=1700000000&end=1700000060&step=15s'
+```
+
+### Prometheus Integration
 
 ```yaml
 remote_write:
@@ -185,6 +239,16 @@ remote_write:
 
 remote_read:
   - url: http://127.0.0.1:9201/api/v1/read
+```
+
+### Text Format Ingestion
+
+Post Prometheus exposition format text directly:
+
+```bash
+curl -X POST http://localhost:9201/api/v1/import/prometheus \
+  -H 'Content-Type: text/plain' \
+  --data-binary @metrics.txt
 ```
 
 ## Query APIs
