@@ -2,15 +2,15 @@
   <!-- Background gradient -->
   <defs>
     <linearGradient id="waveGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#ff6b35;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#f7931e;stop-opacity:1" />
+      <stop offset="0%" style="stop-color:#ff6b35;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#f7931e;stop-opacity:1"/>
     </linearGradient>
-    
+
     <linearGradient id="textGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#2c3e50;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#34495e;stop-opacity:1" />
+      <stop offset="0%" style="stop-color:#2c3e50;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#34495e;stop-opacity:1"/>
     </linearGradient>
-    
+
     <!-- Drop shadow filter -->
     <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
       <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
@@ -23,17 +23,12 @@
       </feMerge>
     </filter>
   </defs>
-  
+
   <!-- Time-series wave visualization -->
   <g transform="translate(10, 40)">
     <!-- Data points connected by curves -->
-    <path d="M 0,0 Q 8,-15 16,-8 T 32,-20 T 48,-5 T 64,-18 T 80,-10" 
-          stroke="url(#waveGradient)" 
-          stroke-width="3" 
-          fill="none" 
-          stroke-linecap="round"
-          opacity="0.9"/>
-    
+    <path d="M 0,0 Q 8,-15 16,-8 T 32,-20 T 48,-5 T 64,-18 T 80,-10" stroke="url(#waveGradient)" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.9"/>
+
     <!-- Data points -->
     <circle cx="0" cy="0" r="3" fill="#ff6b35"/>
     <circle cx="16" cy="-8" r="3" fill="#ff6b35"/>
@@ -41,30 +36,25 @@
     <circle cx="48" cy="-5" r="3" fill="#ff6b35"/>
     <circle cx="64" cy="-18" r="3" fill="#ff6b35"/>
     <circle cx="80" cy="-10" r="3" fill="#ff6b35"/>
-    
+
     <!-- Vertical lines representing time partitions -->
     <line x1="16" y1="5" x2="16" y2="-25" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2" opacity="0.5"/>
     <line x1="32" y1="5" x2="32" y2="-25" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2" opacity="0.5"/>
     <line x1="48" y1="5" x2="48" y2="-25" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2" opacity="0.5"/>
     <line x1="64" y1="5" x2="64" y2="-25" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2" opacity="0.5"/>
   </g>
-  
+
   <!-- Text "tsink" -->
   <text x="100" y="50" font-family="'Segoe UI', 'Arial', sans-serif" font-size="32" font-weight="600" fill="url(#textGradient)">
     tsink
   </text>
-  
+
   <!-- Database/storage indicator - stylized brackets -->
   <g transform="translate(93, 30)" opacity="0.7">
     <path d="M 0,0 L -3,0 L -3,25 L 0,25" stroke="#34495e" stroke-width="2" fill="none" stroke-linecap="round"/>
   </g>
-  
-  <g transform="translate(188, 30)" opacity="0.7">
+
+  <g transform="translate(181, 30)" opacity="0.7">
     <path d="M 0,0 L 3,0 L 3,25 L 0,25" stroke="#34495e" stroke-width="2" fill="none" stroke-linecap="round"/>
-  </g>
-  
-  <!-- Small performance indicator -->
-  <g transform="translate(170, 18)">
-    <path d="M 0,0 L 4,-4 L 2,0 L 4,4 Z" fill="#f7931e" opacity="0.8"/>
   </g>
 </svg>
