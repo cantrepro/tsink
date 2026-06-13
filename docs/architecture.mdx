@@ -1,4 +1,4 @@
-# tsink — Architecture Overview
+# Architecture Overview
 
 This document describes the high-level design of tsink, the component interactions, and the end-to-end data flow for writes and reads.
 
@@ -6,15 +6,15 @@ This document describes the high-level design of tsink, the component interactio
 
 ## Table of Contents
 
-1. [Deployment modes](#1-deployment-modes)
-2. [Repository layout](#2-repository-layout)
-3. [Public API surface](#3-public-api-surface)
-4. [Storage engine overview](#4-storage-engine-overview)
-5. [Write path](#5-write-path)
-6. [Read path](#6-read-path)
-7. [Write-Ahead Log (WAL)](#7-write-ahead-log-wal)
-8. [Chunk encoding](#8-chunk-encoding)
-9. [Segments and on-disk index](#9-segments-and-on-disk-index)
+ 1. [Deployment modes](#1-deployment-modes)
+ 2. [Repository layout](#2-repository-layout)
+ 3. [Public API surface](#3-public-api-surface)
+ 4. [Storage engine overview](#4-storage-engine-overview)
+ 5. [Write path](#5-write-path)
+ 6. [Read path](#6-read-path)
+ 7. [Write-Ahead Log (WAL)](#7-write-ahead-log-wal)
+ 8. [Chunk encoding](#8-chunk-encoding)
+ 9. [Segments and on-disk index](#9-segments-and-on-disk-index)
 10. [Series registry](#10-series-registry)
 11. [Compaction](#11-compaction)
 12. [Tiered storage and lifecycle](#12-tiered-storage-and-lifecycle)
@@ -33,11 +33,11 @@ This document describes the high-level design of tsink, the component interactio
 
 tsink ships as three interconnected Rust crates in a single workspace.
 
-| Crate | Purpose |
-|---|---|
-| `tsink` (root `src/`) | Embeddable library — the complete storage engine with no async runtime dependency. |
-| `tsink-server` (`crates/tsink-server/`) | Standalone HTTP server binary with protocol ingest, clustering, and RBAC. |
-| `tsink-uniffi` (`crates/tsink-uniffi/`) | UniFFI-generated Python bindings that wrap the library crate. |
+| Crate                                   | Purpose                                                                            |
+| --------------------------------------- | ---------------------------------------------------------------------------------- |
+| `tsink` (root `src/`)                   | Embeddable library — the complete storage engine with no async runtime dependency. |
+| `tsink-server` (`crates/tsink-server/`) | Standalone HTTP server binary with protocol ingest, clustering, and RBAC.          |
+| `tsink-uniffi` (`crates/tsink-uniffi/`) | UniFFI-generated Python bindings that wrap the library crate.                      |
 
 All three share the same engine code. The server and Python bindings call into the same `Storage` trait that application code uses directly.
 
@@ -45,7 +45,7 @@ All three share the same engine code. The server and Python bindings call into t
 
 ## 2. Repository layout
 
-```
+```text
 src/
   lib.rs                 — public re-exports
   storage.rs             — Storage trait, StorageBuilder, public DTOs
@@ -77,20 +77,20 @@ crates/
 
 All interaction with the engine goes through the `Storage` trait. Key methods:
 
-| Method | Description |
-|---|---|
-| `insert_rows(&[Row])` | Synchronous batch write. |
-| `insert_rows_with_result` | Batch write returning per-row `WriteResult`. |
-| `select(metric, labels, start, end)` | Range read for a single series. |
-| `select_with_options` | Range read with `QueryOptions` (aggregation, downsampling, pagination). |
-| `select_all` | Bulk range read across all series matching a selector. |
-| `list_metrics` | Enumerate stored metric names. |
-| `select_series` | Enumerate series matching a label selector with time-range filtering. |
-| `scan_series_rows` / `scan_metric_rows` | Paginated scan for large result sets. |
-| `delete_series` | Tombstone-based deletion with optional time range. |
-| `snapshot` | Atomic directory snapshot. |
-| `add_rollup_policy` / `run_rollup_pass` | Manage persistent downsampling policies. |
-| `observability_snapshot` | Current internal counters and health state. |
+| Method                                  | Description                                                             |
+| --------------------------------------- | ----------------------------------------------------------------------- |
+| `insert_rows(&[Row])`                   | Synchronous batch write.                                                |
+| `insert_rows_with_result`               | Batch write returning per-row `WriteResult`.                            |
+| `select(metric, labels, start, end)`    | Range read for a single series.                                         |
+| `select_with_options`                   | Range read with `QueryOptions` (aggregation, downsampling, pagination). |
+| `select_all`                            | Bulk range read across all series matching a selector.                  |
+| `list_metrics`                          | Enumerate stored metric names.                                          |
+| `select_series`                         | Enumerate series matching a label selector with time-range filtering.   |
+| `scan_series_rows` / `scan_metric_rows` | Paginated scan for large result sets.                                   |
+| `delete_series`                         | Tombstone-based deletion with optional time range.                      |
+| `snapshot`                              | Atomic directory snapshot.                                              |
+| `add_rollup_policy` / `run_rollup_pass` | Manage persistent downsampling policies.                                |
+| `observability_snapshot`                | Current internal counters and health state.                             |
 
 ### Key data types
 
@@ -115,58 +115,61 @@ All interaction with the engine goes through the `Storage` trait. Key methods:
 The engine lives in `src/engine/` and is structured in three layers.
 
 ### Layer 1 — Foundation libraries
+
 Pure data-structure and codec modules with no cross-cutting concerns:
 
-| Module | Role |
-|---|---|
-| `chunk` | In-memory chunk builder and sealed `EncodedChunk`. |
-| `encoder` | Timestamp and value codec selection and execution. |
-| `segment` | On-disk segment format, reader, writer, index postings. |
-| `series` | Series identity, interned string dictionaries, Roaring Bitmap postings. |
-| `wal` | WAL frame format, segmented log files, replay stream. |
-| `index` | In-memory `ChunkIndex` and `PostingsIndex`. |
-| `query` | Core query primitives: `QueryPlan`, `ChunkSeriesCursor`, chunk decoding. |
-| `compactor` | L0/L1/L2 compaction planning and execution. |
+| Module      | Role                                                                     |
+| ----------- | ------------------------------------------------------------------------ |
+| `chunk`     | In-memory chunk builder and sealed `EncodedChunk`.                       |
+| `encoder`   | Timestamp and value codec selection and execution.                       |
+| `segment`   | On-disk segment format, reader, writer, index postings.                  |
+| `series`    | Series identity, interned string dictionaries, Roaring Bitmap postings.  |
+| `wal`       | WAL frame format, segmented log files, replay stream.                    |
+| `index`     | In-memory `ChunkIndex` and `PostingsIndex`.                              |
+| `query`     | Core query primitives: `QueryPlan`, `ChunkSeriesCursor`, chunk decoding. |
+| `compactor` | L0/L1/L2 compaction planning and execution.                              |
 
 ### Layer 2 — Shared shell
+
 State containers and cross-cutting services that the owner modules operate on:
 
-| Module | Role |
-|---|---|
-| `engine.rs` | `ChunkStorage` — the top-level struct with five state buckets. |
-| `state` | All internal state type definitions. |
-| `visibility` | MVCC fence and per-series visibility summaries. |
-| `runtime` | Background thread management and supervision. |
-| `metrics` / `observability` | Lockless counters and snapshot generation. |
-| `shard_routing` | Maps series IDs to 1-of-64 shards; dead-lock-safe lock ordering. |
-| `metadata_lookup` | Distributed-shard series resolution. |
-| `process_lock` | Exclusive-open file lock. |
+| Module                      | Role                                                             |
+| --------------------------- | ---------------------------------------------------------------- |
+| `engine.rs`                 | `ChunkStorage` — the top-level struct with five state buckets.   |
+| `state`                     | All internal state type definitions.                             |
+| `visibility`                | MVCC fence and per-series visibility summaries.                  |
+| `runtime`                   | Background thread management and supervision.                    |
+| `metrics` / `observability` | Lockless counters and snapshot generation.                       |
+| `shard_routing`             | Maps series IDs to 1-of-64 shards; dead-lock-safe lock ordering. |
+| `metadata_lookup`           | Distributed-shard series resolution.                             |
+| `process_lock`              | Exclusive-open file lock.                                        |
 
 ### Layer 3 — Owner modules
+
 Higher-level operations that drive the shell:
 
-| Module | Role |
-|---|---|
-| `bootstrap` | Six-phase startup: discovery → recovery → WAL open → hydrate → replay → finalize. |
-| `ingest` + `ingest_pipeline` | Five-phase write pipeline (resolve → prepare → apply → commit). |
-| `write_buffer` | Active-head flush policies. |
-| `lifecycle` | Flush, persist, replay, and shutdown orchestration. |
-| `query_exec` + `query_read` | High-level query execution and low-level read path. |
-| `deletion` | Tombstone-based series deletion. |
-| `rollups` | Persistent downsampling materialization. |
-| `maintenance` + `tiering` + `registry_catalog` | Tier lifecycle, catalog validation. |
+| Module                                         | Role                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------------------- |
+| `bootstrap`                                    | Six-phase startup: discovery → recovery → WAL open → hydrate → replay → finalize. |
+| `ingest` + `ingest_pipeline`                   | Five-phase write pipeline (resolve → prepare → apply → commit).                   |
+| `write_buffer`                                 | Active-head flush policies.                                                       |
+| `lifecycle`                                    | Flush, persist, replay, and shutdown orchestration.                               |
+| `query_exec` + `query_read`                    | High-level query execution and low-level read path.                               |
+| `deletion`                                     | Tombstone-based series deletion.                                                  |
+| `rollups`                                      | Persistent downsampling materialization.                                          |
+| `maintenance` + `tiering` + `registry_catalog` | Tier lifecycle, catalog validation.                                               |
 
 ### State buckets in `ChunkStorage`
 
 To contain lock contention, `ChunkStorage` organises mutable state into five separate structs:
 
-| Struct | Contents |
-|---|---|
-| `CatalogState` | `SeriesRegistry`, 64 `write_txn_shards` (`Mutex`), pending series IDs, persistence lock. |
-| `ChunkBufferState` | 64-shard active builders, 64-shard sealed chunks, persisted-chunk watermarks, monotone chunk sequence counter. |
-| `VisibilityState` | Tombstones, materialized series, per-series visibility summaries, flush visibility RwLock. |
-| `PersistedStorageState` | `PersistedIndexState`, WAL handle, compactors, tiered-storage config, pending segment diff. |
-| `RuntimeConfigState` | Retention/partition/skew windows, memory budget, cardinality limit, WAL size limit, concurrency bounds. |
+| Struct                  | Contents                                                                                                       |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `CatalogState`          | `SeriesRegistry`, 64 `write_txn_shards` (`Mutex`), pending series IDs, persistence lock.                       |
+| `ChunkBufferState`      | 64-shard active builders, 64-shard sealed chunks, persisted-chunk watermarks, monotone chunk sequence counter. |
+| `VisibilityState`       | Tombstones, materialized series, per-series visibility summaries, flush visibility RwLock.                     |
+| `PersistedStorageState` | `PersistedIndexState`, WAL handle, compactors, tiered-storage config, pending segment diff.                    |
+| `RuntimeConfigState`    | Retention/partition/skew windows, memory budget, cardinality limit, WAL size limit, concurrency bounds.        |
 
 ---
 
@@ -174,7 +177,7 @@ To contain lock contention, `ChunkStorage` organises mutable state into five sep
 
 A single `insert_rows` call traverses six steps before returning to the caller.
 
-```
+```text
 insert_rows(&[Row])
     │
     ▼
@@ -202,6 +205,7 @@ insert_rows(&[Row])
 Each `Row` carries a `metric`, `Vec<Label>`, and a `DataPoint`. The 64-shard split means that independent series in the same batch can be admitted concurrently.
 
 **Admission control** in the prepare phase enforces:
+
 - `memory_budget_bytes` — total in-memory chunk bytes.
 - `cardinality_limit` — maximum unique series count.
 - WAL size limit — maximum outstanding un-flushed WAL bytes.
@@ -212,7 +216,7 @@ Admission failures return a per-Row `WriteResult` when calling `insert_rows_with
 
 ## 6. Read path
 
-```
+```text
 select / select_all / select_with_options
     │
     ▼
@@ -253,7 +257,7 @@ The WAL lives under `<data_path>/wal/` and is managed by the `FramedWal` struct.
 
 ### Frame wire format
 
-```
+```text
 Offset  Size  Field
      0     4  Magic = b"TSFR"
      4     1  Frame type (1 = SeriesDef, 2 = Samples)
@@ -269,17 +273,17 @@ Offset  Size  Field
 
 ### Durability modes
 
-| Mode | Behavior |
-|---|---|
-| `WalSyncMode::PerAppend` | `fsync` on every frame append. Crash-safe; throughput-limited. |
+| Mode                       | Behavior                                                                                               |
+| -------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `WalSyncMode::PerAppend`   | `fsync` on every frame append. Crash-safe; throughput-limited.                                         |
 | `WalSyncMode::Periodic(d)` | Background `fsync` every duration `d`. Higher throughput; up to `d` of data can be lost on hard crash. |
 
 ### Replay modes
 
-| Mode | Behavior |
-|---|---|
-| `WalReplayMode::Strict` | Abort if any WAL segment is corrupted or unreadable. |
-| `WalReplayMode::Salvage` | Skip damaged segments and continue replay. |
+| Mode                     | Behavior                                             |
+| ------------------------ | ---------------------------------------------------- |
+| `WalReplayMode::Strict`  | Abort if any WAL segment is corrupted or unreadable. |
+| `WalReplayMode::Salvage` | Skip damaged segments and continue replay.           |
 
 ### High-water mark
 
@@ -293,7 +297,7 @@ The published high-water file (`wal.published`) uses magic `b"TSHW"`.
 
 ### Chunk lifecycle
 
-```
+```text
 ChunkBuilder (active)
     │  accumulates ChunkPoints in 64-point frozen blocks + mutable tail
     │  sealed when point count reaches DEFAULT_CHUNK_POINTS (2048)
@@ -307,24 +311,24 @@ SegmentWriter → persisted segment file
 
 ### Timestamp codecs
 
-| Codec | Use case |
-|---|---|
-| `FixedStepRle` | Constant-interval series (e.g. scrape-interval metrics). |
-| `DeltaVarint` | Variable-interval series with small deltas. |
+| Codec                 | Use case                                                          |
+| --------------------- | ----------------------------------------------------------------- |
+| `FixedStepRle`        | Constant-interval series (e.g. scrape-interval metrics).          |
+| `DeltaVarint`         | Variable-interval series with small deltas.                       |
 | `DeltaOfDeltaBitpack` | Gorilla-style double-delta with bit-packing for irregular series. |
 
 The encoder auto-selects the best codec via `choose_best_timestamp_codec` after inspecting the actual delta distribution.
 
 ### Value codecs
 
-| Codec | Use case |
-|---|---|
-| `GorillaXorF64` | XOR floating-point compression (Gorilla paper). |
-| `ZigZagDeltaBitpackI64` | Signed integer delta + bit-packing. |
-| `DeltaBitpackU64` | Unsigned integer delta + bit-packing. |
-| `ConstantRle` | Run-length encoding for constant-value series. |
-| `BoolBitpack` | 1-bit packing for boolean streams. |
-| `BytesDeltaBlock` | Block delta encoding for byte-string payloads. |
+| Codec                   | Use case                                        |
+| ----------------------- | ----------------------------------------------- |
+| `GorillaXorF64`         | XOR floating-point compression (Gorilla paper). |
+| `ZigZagDeltaBitpackI64` | Signed integer delta + bit-packing.             |
+| `DeltaBitpackU64`       | Unsigned integer delta + bit-packing.           |
+| `ConstantRle`           | Run-length encoding for constant-value series.  |
+| `BoolBitpack`           | 1-bit packing for boolean streams.              |
+| `BytesDeltaBlock`       | Block delta encoding for byte-string payloads.  |
 
 ### Timestamp search index
 
@@ -336,7 +340,7 @@ Each sealed chunk builds a `TimestampSearchIndex` — an array of anchor entries
 
 ### Directory structure
 
-```
+```text
 <data_path>/
   lane_numeric/          — float/int/bool/histogram chunks
     l0/                  — freshly flushed segments
@@ -355,6 +359,7 @@ Each sealed chunk builds a `TimestampSearchIndex` — an array of anchor entries
 ### Segment manifest
 
 Each segment directory contains:
+
 - Encoded chunk files (one per series × value lane).
 - A `SegmentManifest` (`segment_id, level, chunk/point/series counts, min/max timestamps, wal_highwater`).
 - A `SegmentPostingsIndex` for label/metric lookups within the segment.
@@ -393,7 +398,7 @@ The registry is persisted as a binary RIDX v2 file (`series_index.bin`) with inc
 
 tsink uses a three-level LSM-inspired compaction scheme.
 
-```
+```text
 Active chunks
     │  background flush (250 ms default)
     ▼
@@ -405,6 +410,7 @@ L2 segments    (cold-compacted, largest, longest time span)
 ```
 
 Each compaction pass:
+
 1. **Planning** (`compactor/planning.rs`) — selects a window of up to 8 source segments at the triggering level.
 2. **Execution** (`compactor/execution.rs`) — merge-sorts all chunks, deduplicates overlapping samples, re-encodes with optimal codecs, writes new target-level segment.
 3. **Atomic replacement** — the replacement is staged in `.compaction-replacements/` and renamed into place. If the process crashes mid-replacement, `finalize_pending_compaction_replacements` cleans up the staging area at next startup.
@@ -417,15 +423,16 @@ Compaction is tombstone-aware: tombstoned time ranges are excluded from the outp
 
 ### Tiers
 
-| Tier | Location | Access |
-|---|---|---|
-| Hot | Local filesystem (`lane_numeric/`, `lane_blob/`) | Direct mmap reads. |
-| Warm | Configurable local path or object store | Loaded on demand. |
-| Cold | Object store | Loaded on demand; full fetch before query. |
+| Tier | Location                                         | Access                                     |
+| ---- | ------------------------------------------------ | ------------------------------------------ |
+| Hot  | Local filesystem (`lane_numeric/`, `lane_blob/`) | Direct mmap reads.                         |
+| Warm | Configurable local path or object store          | Loaded on demand.                          |
+| Cold | Object store                                     | Loaded on demand; full fetch before query. |
 
 ### Tier lifecycle
 
 A background maintenance pass computes a `PostFlushMaintenancePolicyPlan` from `RetentionTierPolicy`:
+
 - **`expired_actions`** — delete segments that fall outside the retention window.
 - **`rewrite_actions`** — trim segment boundaries at time-split points.
 - **`move_actions`** — promote segments from Hot → Warm or Warm → Cold when they cross the configured retention cutoffs.
@@ -445,6 +452,7 @@ A flush publishes many new segment entries and visibility summaries at once. Wit
 ### The solution
 
 `flush_visibility_lock` is a `RwLock<()>`:
+
 - **Writers** acquire the exclusive `write` lock for the entire duration of flush publication.
 - **Readers** acquire a shared `read` lock during snapshot capture (step 3 of the read path).
 
@@ -455,6 +463,7 @@ This is a brief, bounded mutual-exclusion window — not a per-operation lock. N
 `SeriesVisibilitySummary` tracks up to `SERIES_VISIBILITY_SUMMARY_MAX_RANGES = 32` disjoint time ranges per series. This handles series with gaps (e.g. intermittently reporting nodes) efficiently: readers can skip time ranges that are known to be empty without scanning segment files.
 
 Fields per summary:
+
 - `latest_visible_timestamp` — highest timestamp ingested for this series.
 - `latest_bounded_visible_timestamp` — highest timestamp whose containing chunk has been sealed and persisted.
 - `exhaustive_floor_inclusive` — data below this timestamp is complete (no more writes expected).
@@ -469,12 +478,12 @@ tsink includes a full in-process PromQL evaluator in `src/promql/`.
 
 ### Components
 
-| Module | Role |
-|---|---|
-| `lexer.rs` | Hand-written lexer; produces `Vec<Token>`. |
-| `parser.rs` | Recursive-descent Pratt parser; produces `ast::Expr`. |
-| `ast.rs` | Complete AST: `VectorSelector`, `MatrixSelector`, `SubqueryExpr`, `BinaryExpr`, `AggregationExpr`, `CallExpr`, `AtModifier`, all operators. |
-| `eval/` | Evaluator; implements all PromQL functions and aggregations. |
+| Module      | Role                                                                                                                                        |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lexer.rs`  | Hand-written lexer; produces `Vec<Token>`.                                                                                                  |
+| `parser.rs` | Recursive-descent Pratt parser; produces `ast::Expr`.                                                                                       |
+| `ast.rs`    | Complete AST: `VectorSelector`, `MatrixSelector`, `SubqueryExpr`, `BinaryExpr`, `AggregationExpr`, `CallExpr`, `AtModifier`, all operators. |
+| `eval/`     | Evaluator; implements all PromQL functions and aggregations.                                                                                |
 
 ### Evaluator
 
@@ -496,6 +505,7 @@ Rollup policies define persistent, automated downsampling of raw data.
 ### Policy structure
 
 `RollupPolicy`:
+
 - `policy_id` — stable identifier.
 - Source selector — metric name + optional label matchers.
 - `aggregation` — `Sum | Min | Max | Avg | Count | ...`.
@@ -516,17 +526,17 @@ The `tsink-server` crate wraps the library engine in a full HTTP server.
 
 ### Protocol support
 
-| Protocol | Endpoint |
-|---|---|
-| Prometheus Remote Write | `POST /api/v1/write` (Snappy-framed protobuf) |
-| Prometheus Remote Read | `POST /api/v1/read` |
-| Prometheus Text Exposition | `POST /api/v1/import/prometheus` |
-| InfluxDB Line Protocol v1/v2 | `POST /write`, `POST /api/v2/write` |
-| OTLP HTTP | `POST /v1/metrics` (protobuf; gauges, sums, histograms, summaries) |
-| StatsD | UDP (counter, gauge, timer, set) |
-| Graphite | TCP (plaintext) |
-| PromQL instant query | `GET /api/v1/query` |
-| PromQL range query | `GET /api/v1/query_range` |
+| Protocol                     | Endpoint                                                           |
+| ---------------------------- | ------------------------------------------------------------------ |
+| Prometheus Remote Write      | `POST /api/v1/write` (Snappy-framed protobuf)                      |
+| Prometheus Remote Read       | `POST /api/v1/read`                                                |
+| Prometheus Text Exposition   | `POST /api/v1/import/prometheus`                                   |
+| InfluxDB Line Protocol v1/v2 | `POST /write`, `POST /api/v2/write`                                |
+| OTLP HTTP                    | `POST /v1/metrics` (protobuf; gauges, sums, histograms, summaries) |
+| StatsD                       | UDP (counter, gauge, timer, set)                                   |
+| Graphite                     | TCP (plaintext)                                                    |
+| PromQL instant query         | `GET /api/v1/query`                                                |
+| PromQL range query           | `GET /api/v1/query_range`                                          |
 
 ### Connection handling
 
@@ -546,7 +556,7 @@ Clustering is an opt-in layer over the single-node server. All cluster logic liv
 
 ### Topology
 
-```
+```text
 Client
   │  writes / reads
   ▼
@@ -563,6 +573,7 @@ Any cluster node (HTTP)
 ### Consistent hash ring (`cluster/ring.rs`)
 
 `ShardRing { shard_count, replication_factor, virtual_nodes_per_node = 128 }`:
+
 - Each node contributes 128 virtual tokens distributed by xxh64 hash around the ring.
 - Each shard is pre-assigned to `replication_factor` owner nodes.
 - `stable_series_identity_hash(metric, labels)` → deterministic shard selection — the same series always lands on the same shard regardless of which node receives the write.
@@ -576,6 +587,7 @@ Any cluster node (HTTP)
 ### Control plane (`cluster/consensus.rs`)
 
 A custom Raft-like log replication layer manages cluster membership and control state:
+
 - Tick interval: 2 s; max append entries: 64; snapshot every 128 entries.
 - Leader election with suspect timeout: 6 s; dead timeout: 20 s; leader lease: 6 s.
 - Control log persisted as NDJSON to `tsink-control-log`.
@@ -583,6 +595,7 @@ A custom Raft-like log replication layer manages cluster membership and control 
 ### Anti-entropy repair (`cluster/repair.rs`)
 
 `DigestExchangeRuntime` runs background anti-entropy:
+
 - Every 30 s, each node exchanges window digest hashes with its peers for up to 64 shards per tick.
 - A digest mismatch triggers a `InternalRepairBackfillRequest` to re-replicate missing data.
 - Rebalance moves shard ownership between nodes in 5 s intervals with configurable row-per-tick limits.
@@ -604,6 +617,7 @@ Internal cluster traffic uses mTLS with a dedicated cluster CA to authenticate p
 ### Authentication
 
 Two methods are supported:
+
 1. **Bearer tokens** — loaded from a file or via an exec command; verified on every request.
 2. **OIDC JWT** — RS256, ES256, or HS256 tokens issued by a configured identity provider; JWKS fetched at startup with 60 s clock skew tolerance.
 
@@ -616,6 +630,7 @@ An in-memory ring buffer retains the last 256 RBAC decisions for audit review.
 ### Secret rotation
 
 `SecurityManager` supports runtime rotation of:
+
 - Public and admin auth tokens.
 - Cluster internal auth token.
 - TLS listener certificate/key.
@@ -631,15 +646,15 @@ A 300 s overlap grace period (configurable) allows in-flight requests to complet
 
 `StorageObservabilityCounters` provides lockless `AtomicU64` counters grouped by subsystem:
 
-| Counter group | What it tracks |
-|---|---|
-| `WalObservabilityCounters` | Replay runs, frames, points, errors, durations. |
-| `FlushObservabilityCounters` | Flush runs, backpressure events, active chunk stats. |
-| `CompactionObservabilityCounters` | Runs, source/output segment/chunk/point counts. |
-| `QueryObservabilityCounters` | Hot/warm/cold tier plans, chunks read, fetch durations. |
-| `RollupObservabilityCounters` | Materialization runs, points produced. |
-| `RetentionObservabilityCounters` | Expired series, segments, points. |
-| `HealthObservabilityState` | `fail_fast_triggered`, last error strings. |
+| Counter group                     | What it tracks                                          |
+| --------------------------------- | ------------------------------------------------------- |
+| `WalObservabilityCounters`        | Replay runs, frames, points, errors, durations.         |
+| `FlushObservabilityCounters`      | Flush runs, backpressure events, active chunk stats.    |
+| `CompactionObservabilityCounters` | Runs, source/output segment/chunk/point counts.         |
+| `QueryObservabilityCounters`      | Hot/warm/cold tier plans, chunks read, fetch durations. |
+| `RollupObservabilityCounters`     | Materialization runs, points produced.                  |
+| `RetentionObservabilityCounters`  | Expired series, segments, points.                       |
+| `HealthObservabilityState`        | `fail_fast_triggered`, last error strings.              |
 
 `observability_snapshot()` converts raw counters + runtime state into the public `StorageObservabilitySnapshot` DTO.
 
@@ -649,11 +664,11 @@ The server exposes `/metrics` in Prometheus exposition format and `/healthz` / `
 
 The runtime (`src/engine/runtime.rs`) manages three background workers:
 
-| Worker | Interval | Activity |
-|---|---|---|
-| Flush | 250 ms | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
-| Compaction | 5 s (+ triggered) | Runs `Compactor::compact_once` for numeric and blob lanes. |
-| Rollup | 5 s | Executes pending rollup materializations. |
+| Worker     | Interval          | Activity                                                                               |
+| ---------- | ----------------- | -------------------------------------------------------------------------------------- |
+| Flush      | 250 ms            | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
+| Compaction | 5 s (+ triggered) | Runs `Compactor::compact_once` for numeric and blob lanes.                             |
+| Rollup     | 5 s               | Executes pending rollup materializations.                                              |
 
 Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and stop themselves when the engine begins shutdown. If `background_fail_fast = true` (default), a background worker panic sets `fail_fast_triggered` and causes subsequent writes to return an error.
 
@@ -663,20 +678,20 @@ Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and sto
 
 Key engine knobs and their defaults:
 
-| Option | Default | Notes |
-|---|---|---|
-| `timestamp_precision` | Nanoseconds | `Ns | µs | ms | s` |
-| `retention_window` | 14 days | Data older than this is eligible for expiry. |
-| `future_skew_window` | 15 min | Writes with future timestamps beyond this are rejected. |
-| `partition_window` | 1 hour | Time-bucket width for active partition heads. |
-| `max_active_partition_heads_per_series` | 8 | Maximum concurrent open partitions per series. |
-| `max_writers` | cgroup CPU count | Write parallelism gate (`Semaphore` permits). |
-| `write_timeout` | 30 s | Maximum wait time for a write permit. |
-| `memory_budget_bytes` | `u64::MAX` (no limit) | Total in-memory chunk budget. |
-| `cardinality_limit` | `usize::MAX` (no limit) | Maximum unique series count. |
-| `chunk_points` | 2048 | Points per sealed chunk. |
-| `compaction_interval` | 5 s | Background compaction frequency. |
-| `flush_interval` | 250 ms | Background flush frequency. |
-| `background_fail_fast` | `true` | Worker panic triggers engine failure mode. |
+| Option                                  | Default                 | Notes                                                   |    |    |     |
+| --------------------------------------- | ----------------------- | ------------------------------------------------------- | --- | --- | --- |
+| `timestamp_precision`                   | Nanoseconds             | \`Ns                                                    | µs | ms | s\` |
+| `retention_window`                      | 14 days                 | Data older than this is eligible for expiry.            |    |    |     |
+| `future_skew_window`                    | 15 min                  | Writes with future timestamps beyond this are rejected. |    |    |     |
+| `partition_window`                      | 1 hour                  | Time-bucket width for active partition heads.           |    |    |     |
+| `max_active_partition_heads_per_series` | 8                       | Maximum concurrent open partitions per series.          |    |    |     |
+| `max_writers`                           | cgroup CPU count        | Write parallelism gate (`Semaphore` permits).           |    |    |     |
+| `write_timeout`                         | 30 s                    | Maximum wait time for a write permit.                   |    |    |     |
+| `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Total in-memory chunk budget.                           |    |    |     |
+| `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                            |    |    |     |
+| `chunk_points`                          | 2048                    | Points per sealed chunk.                                |    |    |     |
+| `compaction_interval`                   | 5 s                     | Background compaction frequency.                        |    |    |     |
+| `flush_interval`                        | 250 ms                  | Background flush frequency.                             |    |    |     |
+| `background_fail_fast`                  | `true`                  | Worker panic triggers engine failure mode.              |    |    |     |
 
 Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.

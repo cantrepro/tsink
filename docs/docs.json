@@ -6,11 +6,31 @@
     "primary": "#0D9373"
   },
   "navigation": {
-    "groups": [
-      {
-        "group": "Getting Started",
-        "pages": []
-      }
+    "pages": [
+      "architecture",
+      "cluster-setup",
+      "clustering-internals",
+      "compaction",
+      "configuration",
+      "data-types",
+      "embedded-library",
+      "exemplars",
+      "http-api",
+      "ingestion-protocols",
+      "migration",
+      "monitoring",
+      "multi-tenancy",
+      "performance-tuning",
+      "promql-reference",
+      "promql",
+      "python-bindings",
+      "rollups",
+      "rules",
+      "secret-rotation",
+      "security",
+      "server-deployment",
+      "storage-engine",
+      "tiered-storage"
     ]
   }
 }
