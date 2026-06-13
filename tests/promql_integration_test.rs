@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tsink::{
-    promql::{Engine, PromqlValue, Sample, Series},
+    promql::{Engine, PromqlError, PromqlValue, Sample, Series},
     DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision,
 };
 
@@ -228,4 +228,75 @@ fn range_query_step_iteration_works() {
     for (_, v) in &series[0].samples {
         assert!((*v - 1.0).abs() < 1e-9);
     }
+}
+
+#[test]
+fn metric_name_matcher_with_empty_matching_label_regex_keeps_series() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query(r#"{__name__="http_requests_total",foo=~".*"}"#, 600)
+            .unwrap(),
+    );
+
+    assert_eq!(samples.len(), 2);
+}
+
+#[test]
+fn arithmetic_vector_scalar_drops_metric_name() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query("http_requests_total / 60", 600)
+            .unwrap(),
+    );
+    assert_eq!(samples.len(), 2);
+    assert!(samples.iter().all(|sample| sample.metric.is_empty()));
+}
+
+#[test]
+fn comparison_bool_vector_scalar_drops_metric_name() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query("http_requests_total > bool 0", 600)
+            .unwrap(),
+    );
+    assert_eq!(samples.len(), 2);
+    assert!(samples.iter().all(|sample| sample.metric.is_empty()));
+}
+
+#[test]
+fn comparison_on_modifier_drops_metric_name_without_bool() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query(
+                "http_requests_total{method=\"GET\"} == on(status) http_requests_total{method=\"GET\"}",
+                600,
+            )
+            .unwrap(),
+    );
+
+    assert_eq!(samples.len(), 1);
+    assert!(samples[0].metric.is_empty());
+}
+
+#[test]
+fn vector_vector_many_to_many_matching_is_rejected_without_group_modifiers() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let err = engine
+        .instant_query("http_requests_total == on(status) http_requests_total", 600)
+        .unwrap_err();
+    assert!(matches!(err, PromqlError::Eval(msg) if msg.contains("many-to-many")));
 }

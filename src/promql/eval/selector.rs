@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{DataPoint, Label, SeriesMatcher, SeriesMatcherOp, SeriesSelection};
+use crate::{DataPoint, Label, SeriesMatcher, SeriesSelection};
 use regex::Regex;
 
 use crate::promql::ast::{MatchOp, MatrixSelector, VectorSelector};
@@ -95,12 +95,12 @@ fn candidate_metrics(engine: &Engine, selector: &VectorSelector) -> Result<Vec<S
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine
-        .storage()
-        .select_series(&series_selection_from_matchers(None, &selector.matchers)?)?;
+    let all = engine.storage().list_metrics()?;
     let mut metrics = BTreeSet::new();
     for series in all {
-        metrics.insert(series.name);
+        if matchers_match(&series.name, &series.labels, &selector.matchers)? {
+            metrics.insert(series.name);
+        }
     }
     Ok(metrics.into_iter().collect())
 }
@@ -110,15 +110,12 @@ fn candidate_metrics_for_matrix(engine: &Engine, selector: &MatrixSelector) -> R
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine
-        .storage()
-        .select_series(&series_selection_from_matchers(
-            None,
-            &selector.vector.matchers,
-        )?)?;
+    let all = engine.storage().list_metrics()?;
     let mut metrics = BTreeSet::new();
     for series in all {
-        metrics.insert(series.name);
+        if matchers_match(&series.name, &series.labels, &selector.vector.matchers)? {
+            metrics.insert(series.name);
+        }
     }
     Ok(metrics.into_iter().collect())
 }
@@ -288,34 +285,6 @@ fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<b
     }
 
     Ok(false)
-}
-
-fn series_selection_from_matchers(
-    metric: Option<&str>,
-    matchers: &[crate::promql::ast::LabelMatcher],
-) -> Result<SeriesSelection> {
-    let mut selection = if let Some(metric) = metric {
-        SeriesSelection::new().with_metric(metric.to_string())
-    } else {
-        SeriesSelection::new()
-    };
-
-    for matcher in matchers {
-        let op = match matcher.op {
-            MatchOp::Equal => SeriesMatcherOp::Equal,
-            MatchOp::NotEqual => SeriesMatcherOp::NotEqual,
-            MatchOp::RegexMatch => SeriesMatcherOp::RegexMatch,
-            MatchOp::RegexNoMatch => SeriesMatcherOp::RegexNoMatch,
-        };
-
-        selection = selection.with_matcher(SeriesMatcher::new(
-            matcher.name.clone(),
-            op,
-            matcher.value.clone(),
-        ));
-    }
-
-    Ok(selection)
 }
 
 pub(crate) fn matchers_match(

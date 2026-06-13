@@ -24,6 +24,7 @@ tsink
 - Strengthen fsync durability boundaries for snapshot/restore rename flows and WAL reset/rotation directory mutations
 - Add configurable WAL replay policy (`Salvage` default, `Strict` optional) for mid-log corruption handling during startup replay
 - Expand failure-mode verification with deterministic corruption fuzz tests for WAL replay tails and segment decoding robustness
+- PromQL: fix metricless selector matcher semantics, enforce one-to-one vector matching for binary ops, and align metric-name dropping in vector binary results
 tsink-server
 - Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges
 - Deepen `/api/v1/status/tsdb` response with nested internal observability sections (`wal`, `flush`, `compaction`, `query`)

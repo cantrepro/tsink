@@ -93,6 +93,7 @@ fn eval_vector_scalar(
         if op.is_comparison() {
             let matched = compare(op, lhs, rhs)?;
             if return_bool {
+                sample.metric.clear();
                 sample.value = if matched { 1.0 } else { 0.0 };
                 out.push(sample);
             } else if matched {
@@ -101,6 +102,7 @@ fn eval_vector_scalar(
             continue;
         }
 
+        sample.metric.clear();
         sample.value = arithmetic(op, lhs, rhs)?;
         out.push(sample);
     }
@@ -117,6 +119,7 @@ fn eval_vector_vector(
         return eval_set_op(expr.op, lhs, rhs, expr.matching.as_ref());
     }
 
+    ensure_one_to_one(&lhs, &rhs, expr.matching.as_ref())?;
     let rhs_map = build_sample_map(&rhs, expr.matching.as_ref());
     let mut out = Vec::new();
 
@@ -133,6 +136,9 @@ fn eval_vector_vector(
                 sample.value = if matched { 1.0 } else { 0.0 };
                 out.push(sample);
             } else if matched {
+                if expr.matching.as_ref().is_some_and(|m| m.on) {
+                    sample.metric.clear();
+                }
                 out.push(sample);
             }
         } else {
@@ -143,6 +149,35 @@ fn eval_vector_vector(
     }
 
     Ok(PromqlValue::InstantVector(out))
+}
+
+fn ensure_one_to_one(
+    lhs: &[Sample],
+    rhs: &[Sample],
+    matching: Option<&VectorMatching>,
+) -> Result<()> {
+    let lhs_counts = build_sample_count_map(lhs, matching);
+    let rhs_counts = build_sample_count_map(rhs, matching);
+
+    for (key, lhs_count) in &lhs_counts {
+        if *lhs_count > 1 && rhs_counts.get(key).copied().unwrap_or(0) > 0 {
+            return Err(PromqlError::Eval(
+                "many-to-many matching not allowed: matching labels must be unique on one side"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for (key, rhs_count) in &rhs_counts {
+        if *rhs_count > 1 && lhs_counts.get(key).copied().unwrap_or(0) > 0 {
+            return Err(PromqlError::Eval(
+                "many-to-many matching not allowed: matching labels must be unique on one side"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn eval_set_op(
@@ -204,6 +239,17 @@ fn build_sample_map(
     for sample in samples {
         out.entry(sample_key(sample, matching))
             .or_insert_with(|| sample.clone());
+    }
+    out
+}
+
+fn build_sample_count_map(
+    samples: &[Sample],
+    matching: Option<&VectorMatching>,
+) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for sample in samples {
+        *out.entry(sample_key(sample, matching)).or_insert(0) += 1;
     }
     out
 }
