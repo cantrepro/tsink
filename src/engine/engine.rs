@@ -408,14 +408,27 @@ impl ChunkStorage {
     }
 
     fn lock_registry_write_shards_for_rows<'a>(&'a self, rows: &[Row]) -> Vec<MutexGuard<'a, ()>> {
-        let mut shard_idxs = BTreeSet::new();
+        let mut shard_bits = [0u64; REGISTRY_TXN_SHARD_COUNT.div_ceil(u64::BITS as usize)];
         for row in rows {
-            shard_idxs.insert(Self::registry_metric_shard_idx(row.metric()));
+            let shard_idx = Self::registry_metric_shard_idx(row.metric());
+            let word_idx = shard_idx / (u64::BITS as usize);
+            let bit_idx = shard_idx % (u64::BITS as usize);
+            shard_bits[word_idx] |= 1u64 << bit_idx;
         }
 
-        let mut guards = Vec::with_capacity(shard_idxs.len());
-        for shard_idx in shard_idxs {
-            guards.push(self.registry_write_txn_shards[shard_idx].lock());
+        let guard_count = shard_bits
+            .iter()
+            .map(|bits| bits.count_ones() as usize)
+            .sum();
+        let mut guards = Vec::with_capacity(guard_count);
+        for (word_idx, bits) in shard_bits.into_iter().enumerate() {
+            let mut remaining = bits;
+            while remaining != 0 {
+                let bit_idx = remaining.trailing_zeros() as usize;
+                let shard_idx = word_idx * (u64::BITS as usize) + bit_idx;
+                guards.push(self.registry_write_txn_shards[shard_idx].lock());
+                remaining &= remaining - 1;
+            }
         }
         guards
     }
@@ -711,25 +724,31 @@ impl ChunkStorage {
     }
 
     fn compute_memory_usage_bytes(&self) -> usize {
-        let mut total = 0usize;
+        let active_total = self
+            .active_builders
+            .par_iter()
+            .map(|shard| {
+                let active = shard.read();
+                active.values().fold(0usize, |acc, state| {
+                    acc.saturating_add(Self::active_state_memory_usage_bytes(state))
+                })
+            })
+            .reduce(|| 0usize, |acc, bytes| acc.saturating_add(bytes));
 
-        for shard in &self.active_builders {
-            let active = shard.read();
-            for state in active.values() {
-                total = total.saturating_add(Self::active_state_memory_usage_bytes(state));
-            }
-        }
+        let sealed_total = self
+            .sealed_chunks
+            .par_iter()
+            .map(|shard| {
+                let sealed = shard.read();
+                sealed.values().fold(0usize, |series_acc, chunks| {
+                    series_acc.saturating_add(chunks.values().fold(0usize, |chunk_acc, chunk| {
+                        chunk_acc.saturating_add(Self::chunk_memory_usage_bytes(chunk))
+                    }))
+                })
+            })
+            .reduce(|| 0usize, |acc, bytes| acc.saturating_add(bytes));
 
-        for shard in &self.sealed_chunks {
-            let sealed = shard.read();
-            for chunks in sealed.values() {
-                for chunk in chunks.values() {
-                    total = total.saturating_add(Self::chunk_memory_usage_bytes(chunk));
-                }
-            }
-        }
-
-        total
+        active_total.saturating_add(sealed_total)
     }
 
     fn refresh_memory_usage(&self) -> usize {
@@ -1062,41 +1081,45 @@ impl ChunkStorage {
         Ok(removed)
     }
 
-    fn sealed_chunk_is_present_in_persisted_index(
-        &self,
-        series_id: SeriesId,
+    fn sealed_chunk_is_present_in_persisted_chunks(
+        persisted_chunks: Option<&[PersistedChunkRef]>,
         key: SealedChunkKey,
         chunk: &Chunk,
     ) -> bool {
-        self.persisted_index
-            .read()
-            .chunk_refs
-            .get(&series_id)
-            .is_some_and(|persisted_chunks| {
-                persisted_chunks.iter().any(|chunk_ref| {
-                    chunk_ref.min_ts == key.min_ts
-                        && chunk_ref.max_ts == key.max_ts
-                        && chunk_ref.point_count == key.point_count
-                        && chunk_ref.lane == chunk.header.lane
-                        && chunk_ref.ts_codec == chunk.header.ts_codec
-                        && chunk_ref.value_codec == chunk.header.value_codec
-                })
+        persisted_chunks.is_some_and(|persisted_chunks| {
+            persisted_chunks.iter().any(|chunk_ref| {
+                chunk_ref.min_ts == key.min_ts
+                    && chunk_ref.max_ts == key.max_ts
+                    && chunk_ref.point_count == key.point_count
+                    && chunk_ref.lane == chunk.header.lane
+                    && chunk_ref.ts_codec == chunk.header.ts_codec
+                    && chunk_ref.value_codec == chunk.header.value_codec
             })
+        })
     }
 
     fn find_oldest_evictable_sealed_chunk(&self) -> Option<(usize, SeriesId, SealedChunkKey)> {
         let persisted = self.persisted_chunk_watermarks.read();
+        let persisted_index = self.persisted_index.read();
         let mut oldest: Option<(usize, SeriesId, SealedChunkKey)> = None;
 
         for (shard_idx, shard) in self.sealed_chunks.iter().enumerate() {
             let sealed = shard.read();
             for (series_id, chunks) in sealed.iter() {
                 let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                let persisted_chunks = persisted_index
+                    .chunk_refs
+                    .get(series_id)
+                    .map(|chunks| chunks.as_slice());
                 for (key, chunk) in chunks {
                     if key.sequence > persisted_sequence {
                         continue;
                     }
-                    if !self.sealed_chunk_is_present_in_persisted_index(*series_id, *key, chunk) {
+                    if !Self::sealed_chunk_is_present_in_persisted_chunks(
+                        persisted_chunks,
+                        *key,
+                        chunk,
+                    ) {
                         continue;
                     }
                     let replace = oldest
@@ -1130,10 +1153,36 @@ impl ChunkStorage {
     }
 
     fn evict_persisted_sealed_chunks(&self) -> usize {
+        let persisted = self.persisted_chunk_watermarks.read();
+        let persisted_index = self.persisted_index.read();
         let mut evicted = 0usize;
-        while self.evict_oldest_persisted_sealed_chunk() {
-            evicted = evicted.saturating_add(1);
+
+        for shard in &self.sealed_chunks {
+            let mut sealed = shard.write();
+            sealed.retain(|series_id, chunks| {
+                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                let persisted_chunks = persisted_index
+                    .chunk_refs
+                    .get(series_id)
+                    .map(|chunks| chunks.as_slice());
+
+                chunks.retain(|key, chunk| {
+                    let remove = key.sequence <= persisted_sequence
+                        && Self::sealed_chunk_is_present_in_persisted_chunks(
+                            persisted_chunks,
+                            *key,
+                            chunk,
+                        );
+                    if remove {
+                        evicted = evicted.saturating_add(1);
+                    }
+                    !remove
+                });
+
+                !chunks.is_empty()
+            });
         }
+
         evicted
     }
 

@@ -569,27 +569,34 @@ impl FramedWal {
             return Err(write_err.into());
         }
 
-        match self.sync_mode {
-            WalSyncMode::PerAppend => {
-                writer.get_mut().sync_data()?;
-                *self.last_sync.lock() = Instant::now();
-            }
-            WalSyncMode::Periodic(interval) => {
-                let mut last_sync = self.last_sync.lock();
-                if last_sync.elapsed() >= interval {
-                    writer.get_mut().sync_data()?;
-                    *last_sync = Instant::now();
-                }
-            }
-        }
-
         self.next_seq
             .store(frame_seq.saturating_add(1), Ordering::SeqCst);
         *self.last_highwater.lock() = WalHighWatermark {
             segment: active_segment,
             frame: frame_seq,
         };
-        self.rotate_if_needed(&mut writer)?;
+        let rotated = self.rotate_if_needed(&mut writer)?;
+        let sync_target = if rotated {
+            None
+        } else {
+            match self.sync_mode {
+                WalSyncMode::PerAppend => Some(writer.get_ref().try_clone()?),
+                WalSyncMode::Periodic(interval) => {
+                    let should_sync = self.last_sync.lock().elapsed() >= interval;
+                    if should_sync {
+                        Some(writer.get_ref().try_clone()?)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        drop(writer);
+
+        if let Some(sync_target) = sync_target {
+            sync_target.sync_data()?;
+            *self.last_sync.lock() = Instant::now();
+        }
 
         Ok(())
     }
@@ -614,9 +621,9 @@ impl FramedWal {
         Ok(())
     }
 
-    fn rotate_if_needed(&self, writer: &mut BufWriter<File>) -> Result<()> {
+    fn rotate_if_needed(&self, writer: &mut BufWriter<File>) -> Result<bool> {
         if writer.get_ref().metadata()?.len() < self.segment_max_bytes {
-            return Ok(());
+            return Ok(false);
         }
 
         writer.get_mut().sync_data()?;
@@ -636,7 +643,7 @@ impl FramedWal {
         self.next_seq.store(1, Ordering::SeqCst);
         *self.path.lock() = next_path;
 
-        Ok(())
+        Ok(true)
     }
 }
 
