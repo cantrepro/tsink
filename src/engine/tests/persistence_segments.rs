@@ -131,6 +131,83 @@ fn reopens_from_segment_files_without_wal() {
 }
 
 #[test]
+fn reopen_rejects_registry_snapshot_that_conflicts_with_segment_series_metadata() {
+    let temp_dir = TempDir::new().unwrap();
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let labels = vec![Label::new("host", "a")];
+    let series_id = {
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                timestamp_precision: TimestampPrecision::Seconds,
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::with_labels("seg", labels.clone(), DataPoint::new(1, 1.0)),
+                Row::with_labels("seg", labels.clone(), DataPoint::new(2, 2.0)),
+            ])
+            .unwrap();
+
+        let series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing("seg", &labels)
+            .unwrap()
+            .series_id;
+        storage.close().unwrap();
+        series_id
+    };
+
+    let conflicting_registry = SeriesRegistry::new();
+    conflicting_registry
+        .register_series_with_id(series_id, "wrong_metric", &[Label::new("host", "wrong")])
+        .unwrap();
+    conflicting_registry
+        .persist_to_path(&checkpoint_path)
+        .unwrap();
+    let conflicting_checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select("seg", &labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+    );
+    assert_ne!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        conflicting_checkpoint_bytes
+    );
+    let loaded_registry = SeriesRegistry::load_persisted_state(&checkpoint_path)
+        .unwrap()
+        .expect("healed checkpoint should reload after reopen");
+    assert!(loaded_registry
+        .registry
+        .resolve_existing("seg", &labels)
+        .is_some());
+    assert!(loaded_registry
+        .registry
+        .resolve_existing("wrong_metric", &[Label::new("host", "wrong")])
+        .is_none());
+    reopened.close().unwrap();
+}
+
+#[test]
 fn isolates_numeric_and_blob_segments_and_merges_in_queries() {
     let temp_dir = TempDir::new().unwrap();
     let numeric_labels = vec![Label::new("kind", "numeric")];
@@ -199,7 +276,7 @@ fn replay_highwater_is_conservative_when_one_configured_lane_has_no_segments() {
     let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
     let labels = vec![Label::new("kind", "numeric")];
-    let mut registry = SeriesRegistry::new();
+    let registry = SeriesRegistry::new();
     let series_id = registry
         .resolve_or_insert("watermark_gap", &labels)
         .unwrap()
@@ -262,14 +339,14 @@ fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
         .unwrap();
     storage.flush_all_active().unwrap();
 
-    assert!(storage.persist_segment(true).is_err());
+    assert!(storage.persist_segment().is_err());
     assert!(load_segments_for_level(&numeric_lane_path, 0)
         .unwrap()
         .is_empty());
 }
 
 #[test]
-fn persist_segment_stamps_wal_highwater_even_when_flag_is_false() {
+fn persist_segment_stamps_wal_highwater_when_wal_is_enabled() {
     let temp_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
@@ -282,7 +359,10 @@ fn persist_segment_stamps_wal_highwater_even_when_flag_is_false() {
         Some(lane_path.clone()),
         None,
         1,
-        ChunkStorageOptions::default(),
+        ChunkStorageOptions {
+            retention_enforced: false,
+            ..ChunkStorageOptions::default()
+        },
     )
     .unwrap();
 
@@ -294,7 +374,7 @@ fn persist_segment_stamps_wal_highwater_even_when_flag_is_false() {
         )])
         .unwrap();
     storage.flush_all_active().unwrap();
-    storage.persist_segment(false).unwrap();
+    storage.persist_segment().unwrap();
 
     let segments = load_segments_for_level(&lane_path, 0).unwrap();
     assert!(!segments.is_empty());
@@ -309,7 +389,57 @@ fn persist_segment_stamps_wal_highwater_even_when_flag_is_false() {
 }
 
 #[test]
-fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
+fn close_reconciles_compacted_segments_before_checkpointing_registry() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join("lane_numeric");
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let labels = vec![Label::new("host", "bench")];
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    for offset in 0..64 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "close_compaction_checkpoint_metric",
+                labels.clone(),
+                DataPoint::new(1_000_000_000 + offset, offset as f64),
+            )])
+            .unwrap();
+        storage.flush().unwrap();
+    }
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "close_compaction_checkpoint_metric",
+            labels.clone(),
+            DataPoint::new(1_000_000_064, 64.0),
+        )])
+        .unwrap();
+    storage.flush().unwrap();
+    storage.close().unwrap();
+
+    let loaded_registry = SeriesRegistry::load_persisted_state(&checkpoint_path)
+        .unwrap()
+        .expect("close should checkpoint the reconciled registry");
+    assert!(loaded_registry
+        .registry
+        .resolve_existing("close_compaction_checkpoint_metric", &labels)
+        .is_some());
+}
+
+#[test]
+fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
     let storage = ChunkStorage::new_with_data_path_and_options(
         8,
         None,
@@ -317,9 +447,14 @@ fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
         None,
         1,
         ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
             retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: 1,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             max_writers: 2,
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
@@ -329,6 +464,12 @@ fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
             background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            #[cfg(test)]
+            current_time_override: None,
         },
     )
     .unwrap();
@@ -340,24 +481,26 @@ fn partition_window_rotates_chunks_before_reaching_chunk_cap() {
             Row::with_labels("partitioned", labels.clone(), DataPoint::new(2, 2.0)),
         ])
         .unwrap();
+    storage.flush_background_eligible_active().unwrap();
 
     let series_id = storage
+        .catalog
         .registry
         .read()
         .resolve_existing("partitioned", &labels)
         .unwrap()
         .series_id;
 
-    let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
+    let sealed = storage.chunks.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
     let chunks = sealed.get(&series_id).unwrap().values().collect::<Vec<_>>();
     assert_eq!(
         chunks.len(),
         1,
-        "partition transition should seal current chunk"
+        "background flush should seal the non-current partition head before chunk cap"
     );
     assert_eq!(chunks[0].header.min_ts, 1);
     assert_eq!(chunks[0].header.max_ts, 1);
 
-    let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
-    assert_eq!(active.get(&series_id).unwrap().builder.len(), 1);
+    let active = storage.chunks.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
+    assert_eq!(active.get(&series_id).unwrap().point_count(), 1);
 }

@@ -75,3 +75,22 @@ jobs:
         run: bash scripts/measure_perf.sh quick
       - name: Check for regressions (>50%)
         run: bash scripts/check_bench_regression.sh 50
+
+  server-single-node-bench:
+    name: tsink-server single-node regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore server benchmark baseline
+        uses: actions/cache@v4
+        with:
+          path: target/server-bench
+          key: server-bench-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            server-bench-${{ runner.os }}-
+      - name: Run tsink-server single-node benchmark (quick)
+        run: bash scripts/measure_server_single_node.sh quick
+      - name: Check tsink-server regression thresholds
+        run: bash scripts/check_server_single_node_regression.sh

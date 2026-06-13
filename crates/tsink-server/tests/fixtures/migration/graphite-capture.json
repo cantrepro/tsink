@@ -1,0 +1,6 @@
+[
+  {
+    "received_at_ms": 1700000000999,
+    "body": "servers.api.latency;env=prod;region=us-west 42.5 1700000000\nservers.api.errors 1 1700000001"
+  }
+]

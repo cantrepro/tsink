@@ -1,6 +1,7 @@
 use crate::promql::ast::{
-    AggregationExpr, AggregationOp, BinaryExpr, BinaryOp, CallExpr, Expr, Grouping, LabelMatcher,
-    MatchOp, MatrixSelector, UnaryExpr, UnaryOp, VectorMatching, VectorSelector,
+    AggregationExpr, AggregationOp, AtModifier, BinaryExpr, BinaryOp, CallExpr, Expr, Grouping,
+    LabelMatcher, MatchOp, MatrixSelector, SubqueryExpr, UnaryExpr, UnaryOp,
+    VectorMatchCardinality, VectorMatching, VectorSelector,
 };
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::lexer::{Lexer, Token, TokenKind};
@@ -91,13 +92,29 @@ impl Parser {
 
             if matches!(self.peek().kind, TokenKind::On) {
                 self.advance();
-                matching = Some(self.parse_vector_matching(true)?);
+                let parsed = self.parse_vector_matching(true)?;
+                merge_vector_matching(&mut matching, parsed)?;
                 continue;
             }
 
             if matches!(self.peek().kind, TokenKind::Ignoring) {
                 self.advance();
-                matching = Some(self.parse_vector_matching(false)?);
+                let parsed = self.parse_vector_matching(false)?;
+                merge_vector_matching(&mut matching, parsed)?;
+                continue;
+            }
+
+            if matches!(self.peek().kind, TokenKind::GroupLeft) {
+                self.advance();
+                let parsed = self.parse_group_modifier(VectorMatchCardinality::ManyToOne)?;
+                merge_vector_matching(&mut matching, parsed)?;
+                continue;
+            }
+
+            if matches!(self.peek().kind, TokenKind::GroupRight) {
+                self.advance();
+                let parsed = self.parse_group_modifier(VectorMatchCardinality::OneToMany)?;
+                merge_vector_matching(&mut matching, parsed)?;
                 continue;
             }
 
@@ -110,27 +127,57 @@ impl Parser {
             ));
         }
 
+        if matching
+            .as_ref()
+            .is_some_and(|m| m.cardinality != VectorMatchCardinality::OneToOne)
+            && op.is_set()
+        {
+            return Err(PromqlError::Parse(
+                "group_left/group_right modifiers cannot be used with set operators".to_string(),
+            ));
+        }
+
         Ok((return_bool, matching))
     }
 
     fn parse_vector_matching(&mut self, on: bool) -> Result<VectorMatching> {
-        self.expect(TokenExpect::LParen)?;
-        let mut labels = Vec::new();
-        if !matches!(self.peek().kind, TokenKind::RParen) {
-            loop {
-                labels.push(self.expect_ident()?);
-                if matches!(self.peek().kind, TokenKind::Comma) {
-                    self.advance();
-                    continue;
-                }
-                break;
-            }
-        }
-        self.expect(TokenExpect::RParen)?;
-        Ok(VectorMatching { on, labels })
+        let labels = self.parse_label_list()?;
+        Ok(VectorMatching {
+            on,
+            labels,
+            cardinality: VectorMatchCardinality::OneToOne,
+            include_labels: Vec::new(),
+        })
+    }
+
+    fn parse_group_modifier(
+        &mut self,
+        cardinality: VectorMatchCardinality,
+    ) -> Result<VectorMatching> {
+        let include_labels = if matches!(self.peek().kind, TokenKind::LParen) {
+            self.parse_label_list()?
+        } else {
+            Vec::new()
+        };
+
+        Ok(VectorMatching {
+            on: false,
+            labels: Vec::new(),
+            cardinality,
+            include_labels,
+        })
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        if matches!(self.peek().kind, TokenKind::Plus) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary(UnaryExpr {
+                op: UnaryOp::Pos,
+                expr: Box::new(expr),
+            }));
+        }
+
         if matches!(self.peek().kind, TokenKind::Minus) {
             self.advance();
             let expr = self.parse_unary()?;
@@ -202,7 +249,12 @@ impl Parser {
         self.expect(TokenExpect::LParen)?;
 
         let (param, expr) = match op {
-            AggregationOp::TopK | AggregationOp::BottomK => {
+            AggregationOp::TopK
+            | AggregationOp::BottomK
+            | AggregationOp::Quantile
+            | AggregationOp::CountValues
+            | AggregationOp::LimitK
+            | AggregationOp::LimitRatio => {
                 let p = self.parse_expr(0)?;
                 self.expect(TokenExpect::Comma)?;
                 let e = self.parse_expr(0)?;
@@ -255,6 +307,23 @@ impl Parser {
         Ok(Some(Grouping { without, labels }))
     }
 
+    fn parse_label_list(&mut self) -> Result<Vec<String>> {
+        self.expect(TokenExpect::LParen)?;
+        let mut labels = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RParen) {
+            loop {
+                labels.push(self.expect_ident()?);
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(TokenExpect::RParen)?;
+        Ok(labels)
+    }
+
     fn parse_call(&mut self, func: String) -> Result<Expr> {
         self.expect(TokenExpect::LParen)?;
         let mut args = Vec::new();
@@ -283,43 +352,110 @@ impl Parser {
             metric_name,
             matchers,
             offset: 0,
+            at: None,
         };
         Ok(Expr::VectorSelector(vector))
     }
 
     fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr> {
-        if matches!(self.peek().kind, TokenKind::LBracket) {
-            self.advance();
-            let range = self.expect_duration()?;
-            self.expect(TokenExpect::RBracket)?;
-
-            expr = match expr {
-                Expr::VectorSelector(vector) => {
-                    Expr::MatrixSelector(MatrixSelector { vector, range })
-                }
-                other => {
-                    return Err(PromqlError::Type(format!(
-                        "range selectors can only apply to vectors, got {other:?}"
-                    )));
-                }
-            };
-        }
-
-        if matches!(self.peek().kind, TokenKind::Offset) {
-            self.advance();
-            let offset = self.expect_duration()?;
-            match &mut expr {
-                Expr::VectorSelector(vector) => vector.offset = offset,
-                Expr::MatrixSelector(matrix) => matrix.vector.offset = offset,
-                _ => {
-                    return Err(PromqlError::Type(
-                        "offset modifier can only apply to vector/matrix selectors".to_string(),
-                    ));
-                }
+        loop {
+            if matches!(self.peek().kind, TokenKind::LBracket) {
+                expr = self.parse_bracket_postfix(expr)?;
+                continue;
             }
+
+            if matches!(self.peek().kind, TokenKind::Offset) {
+                self.advance();
+                let offset = self.expect_signed_duration()?;
+                apply_offset_modifier(&mut expr, offset)?;
+                continue;
+            }
+
+            if matches!(self.peek().kind, TokenKind::At) {
+                self.advance();
+                let at = self.parse_at_modifier()?;
+                apply_at_modifier(&mut expr, at)?;
+                continue;
+            }
+
+            break;
         }
 
         Ok(expr)
+    }
+
+    fn parse_bracket_postfix(&mut self, expr: Expr) -> Result<Expr> {
+        self.advance();
+        let range = self.expect_duration()?;
+
+        if matches!(self.peek().kind, TokenKind::Colon) {
+            self.advance();
+            let step = if matches!(self.peek().kind, TokenKind::RBracket) {
+                None
+            } else {
+                Some(self.expect_duration()?)
+            };
+            self.expect(TokenExpect::RBracket)?;
+
+            return Ok(Expr::Subquery(SubqueryExpr {
+                expr: Box::new(expr),
+                range,
+                step,
+                offset: 0,
+                at: None,
+            }));
+        }
+
+        self.expect(TokenExpect::RBracket)?;
+        match expr {
+            Expr::VectorSelector(vector) => {
+                Ok(Expr::MatrixSelector(MatrixSelector { vector, range }))
+            }
+            other => Err(PromqlError::Type(format!(
+                "range selectors can only apply to vectors, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_at_modifier(&mut self) -> Result<AtModifier> {
+        let sign = if matches!(self.peek().kind, TokenKind::Minus) {
+            self.advance();
+            -1.0
+        } else if matches!(self.peek().kind, TokenKind::Plus) {
+            self.advance();
+            1.0
+        } else {
+            1.0
+        };
+
+        match self.peek().kind.clone() {
+            TokenKind::Number(value) => {
+                self.advance();
+                Ok(AtModifier::Timestamp(sign * value))
+            }
+            TokenKind::Inf => {
+                self.advance();
+                Ok(AtModifier::Timestamp(sign * f64::INFINITY))
+            }
+            TokenKind::Nan => {
+                self.advance();
+                Ok(AtModifier::Timestamp(f64::NAN))
+            }
+            TokenKind::Ident(name) if sign == 1.0 && (name == "start" || name == "end") => {
+                self.advance();
+                self.expect(TokenExpect::LParen)?;
+                self.expect(TokenExpect::RParen)?;
+                if name == "start" {
+                    Ok(AtModifier::Start)
+                } else {
+                    Ok(AtModifier::End)
+                }
+            }
+            _ => Err(PromqlError::UnexpectedToken {
+                expected: "timestamp, start(), or end()".to_string(),
+                found: self.peek().kind.display(),
+            }),
+        }
     }
 
     fn parse_label_matchers(&mut self) -> Result<Vec<LabelMatcher>> {
@@ -390,6 +526,7 @@ impl Parser {
             TokenKind::Star => Some((BinaryOp::Mul, 5, false)),
             TokenKind::Slash => Some((BinaryOp::Div, 5, false)),
             TokenKind::Percent => Some((BinaryOp::Mod, 5, false)),
+            TokenKind::Atan2 => Some((BinaryOp::Atan2, 5, false)),
             TokenKind::Caret => Some((BinaryOp::Pow, 6, true)),
             _ => None,
         }
@@ -466,6 +603,134 @@ impl Parser {
             unreachable!()
         }
     }
+
+    fn expect_signed_duration(&mut self) -> Result<i64> {
+        let sign = if matches!(self.peek().kind, TokenKind::Minus) {
+            self.advance();
+            -1
+        } else if matches!(self.peek().kind, TokenKind::Plus) {
+            self.advance();
+            1
+        } else {
+            1
+        };
+
+        Ok(self.expect_duration()?.saturating_mul(sign))
+    }
+}
+
+fn apply_offset_modifier(expr: &mut Expr, offset: i64) -> Result<()> {
+    match expr {
+        Expr::VectorSelector(vector) => {
+            if vector.offset != 0 {
+                return Err(PromqlError::Parse(
+                    "offset modifier can only be specified once".to_string(),
+                ));
+            }
+            vector.offset = offset;
+            Ok(())
+        }
+        Expr::MatrixSelector(matrix) => {
+            if matrix.vector.offset != 0 {
+                return Err(PromqlError::Parse(
+                    "offset modifier can only be specified once".to_string(),
+                ));
+            }
+            matrix.vector.offset = offset;
+            Ok(())
+        }
+        Expr::Subquery(subquery) => {
+            if subquery.offset != 0 {
+                return Err(PromqlError::Parse(
+                    "offset modifier can only be specified once".to_string(),
+                ));
+            }
+            subquery.offset = offset;
+            Ok(())
+        }
+        _ => Err(PromqlError::Type(
+            "offset modifier can only apply to vector/matrix selectors or subqueries".to_string(),
+        )),
+    }
+}
+
+fn apply_at_modifier(expr: &mut Expr, at: AtModifier) -> Result<()> {
+    match expr {
+        Expr::VectorSelector(vector) => {
+            if vector.at.is_some() {
+                return Err(PromqlError::Parse(
+                    "@ modifier can only be specified once".to_string(),
+                ));
+            }
+            vector.at = Some(at);
+            Ok(())
+        }
+        Expr::MatrixSelector(matrix) => {
+            if matrix.vector.at.is_some() {
+                return Err(PromqlError::Parse(
+                    "@ modifier can only be specified once".to_string(),
+                ));
+            }
+            matrix.vector.at = Some(at);
+            Ok(())
+        }
+        Expr::Subquery(subquery) => {
+            if subquery.at.is_some() {
+                return Err(PromqlError::Parse(
+                    "@ modifier can only be specified once".to_string(),
+                ));
+            }
+            subquery.at = Some(at);
+            Ok(())
+        }
+        _ => Err(PromqlError::Type(
+            "@ modifier can only apply to vector/matrix selectors or subqueries".to_string(),
+        )),
+    }
+}
+
+fn merge_vector_matching(
+    matching: &mut Option<VectorMatching>,
+    parsed: VectorMatching,
+) -> Result<()> {
+    if matching.is_none() {
+        *matching = Some(parsed);
+        return Ok(());
+    }
+
+    let current = matching
+        .as_mut()
+        .expect("matching was initialized in the branch above");
+
+    if parsed.cardinality != VectorMatchCardinality::OneToOne {
+        if current.cardinality != VectorMatchCardinality::OneToOne {
+            return Err(PromqlError::Parse(
+                "vector matching can only include one group_left/group_right modifier".to_string(),
+            ));
+        }
+        current.cardinality = parsed.cardinality;
+        current.include_labels = parsed.include_labels;
+    } else {
+        if !current.labels.is_empty() || current.on {
+            return Err(PromqlError::Parse(
+                "vector matching can only include one on()/ignoring() modifier".to_string(),
+            ));
+        }
+        current.on = parsed.on;
+        current.labels = parsed.labels;
+    }
+
+    let overlap = current
+        .labels
+        .iter()
+        .find(|label| current.include_labels.iter().any(|extra| extra == *label));
+    if let Some(label) = overlap {
+        return Err(PromqlError::Parse(format!(
+            "label '{label}' cannot appear in both vector matching and group modifier lists"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

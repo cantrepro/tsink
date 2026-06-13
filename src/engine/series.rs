@@ -1,20 +1,48 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::engine::binio::{
-    append_u16, append_u32, append_u64, read_array, read_bytes, read_u16, read_u32, read_u64,
-};
-use crate::engine::fs_utils::write_file_atomically_and_sync_parent;
-use crate::validation::{validate_labels, validate_metric};
-use crate::{Label, Result, Row, TsinkError};
+use parking_lot::RwLock;
 use roaring::RoaringTreemap;
+
+use crate::Label;
+
+mod dictionary;
+mod identity;
+mod persistence;
+mod postings;
+#[cfg(test)]
+mod tests;
+mod value_family;
 
 pub type SeriesId = u64;
 pub type DictionaryId = u32;
 
 const REGISTRY_INDEX_MAGIC: [u8; 4] = *b"RIDX";
 const REGISTRY_INDEX_VERSION: u16 = 2;
+const REGISTRY_SECTION_VALUE_FAMILY: u64 = 0b0000_0001;
+pub const REGISTRY_INCREMENTAL_FILE_NAME: &str = "series_index.delta.bin";
+pub const REGISTRY_INCREMENTAL_DIR_NAME: &str = "series_index.delta.d";
+const REGISTRY_INCREMENTAL_SEGMENT_PREFIX: &str = "delta-";
+const REGISTRY_INCREMENTAL_SEGMENT_SUFFIX: &str = ".bin";
+static REGISTRY_INCREMENTAL_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const SERIES_REGISTRY_SHARD_COUNT: usize = 64;
+
+#[derive(Debug)]
+pub struct LoadedSeriesRegistry {
+    pub registry: SeriesRegistry,
+    pub delta_series_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeriesValueFamily {
+    F64,
+    I64,
+    U64,
+    Bool,
+    Blob,
+    Histogram,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LabelPairId {
@@ -53,849 +81,247 @@ pub struct SeriesResolution {
 struct StringDictionary {
     by_value: HashMap<String, DictionaryId>,
     by_id: Vec<String>,
-}
-
-impl StringDictionary {
-    fn intern(&mut self, value: &str, dict_name: &str) -> Result<DictionaryId> {
-        if let Some(id) = self.by_value.get(value) {
-            return Ok(*id);
-        }
-
-        let id = DictionaryId::try_from(self.by_id.len()).map_err(|_| {
-            TsinkError::InvalidConfiguration(format!(
-                "{dict_name} dictionary exhausted u32 id space"
-            ))
-        })?;
-
-        let owned = value.to_string();
-        self.by_value.insert(owned.clone(), id);
-        self.by_id.push(owned);
-
-        Ok(id)
-    }
-
-    fn get_id(&self, value: &str) -> Option<DictionaryId> {
-        self.by_value.get(value).copied()
-    }
-
-    fn get_value(&self, id: DictionaryId) -> Option<&str> {
-        self.by_id.get(id as usize).map(|value| value.as_str())
-    }
-
-    fn len(&self) -> usize {
-        self.by_id.len()
-    }
-
-    fn entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {
-        self.by_id
-            .iter()
-            .enumerate()
-            .map(|(idx, value)| (idx as DictionaryId, value.as_str()))
-    }
-
-    fn from_values(values: Vec<String>, dict_name: &str) -> Result<Self> {
-        if values.len() > DictionaryId::MAX as usize + 1 {
-            return Err(TsinkError::InvalidConfiguration(format!(
-                "{dict_name} dictionary exceeded u32 id space"
-            )));
-        }
-
-        let mut by_value = HashMap::with_capacity(values.len());
-        for (idx, value) in values.iter().enumerate() {
-            by_value.insert(value.clone(), idx as DictionaryId);
-        }
-
-        Ok(Self {
-            by_value,
-            by_id: values,
-        })
-    }
+    estimated_heap_bytes: usize,
 }
 
 #[derive(Debug, Default)]
-pub struct SeriesRegistry {
-    next_series_id: SeriesId,
-    metric_dict: StringDictionary,
-    label_name_dict: StringDictionary,
-    label_value_dict: StringDictionary,
+struct SeriesRegistryShard {
     by_key: HashMap<SeriesKeyIds, SeriesId>,
     by_id: HashMap<SeriesId, SeriesDefinition>,
+    value_families: HashMap<SeriesId, SeriesValueFamily>,
+    estimated_series_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct SeriesIdShardIndex {
+    series_id_to_registry_shard: HashMap<SeriesId, usize>,
+}
+
+#[derive(Debug, Default)]
+struct AllSeriesPostingsShard {
+    series_ids: RoaringTreemap,
+    estimated_postings_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MissingLabelPostingsCacheEntry {
+    bitmap: RoaringTreemap,
+    postings_generation: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LabelNamePostingsState {
+    present: RoaringTreemap,
+    missing_cache: Option<MissingLabelPostingsCacheEntry>,
+    bucket_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct MetricPostingsShard {
     metric_postings: HashMap<DictionaryId, RoaringTreemap>,
+    estimated_postings_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct LabelPostingsShard {
+    label_name_states: HashMap<DictionaryId, LabelNamePostingsState>,
     postings: BTreeMap<LabelPairId, RoaringTreemap>,
+    estimated_postings_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct SeriesRegistry {
+    next_series_id: AtomicU64,
+    pending_series_reservations: AtomicUsize,
+    estimated_total_bytes: AtomicUsize,
+    postings_generation: AtomicU64,
+    metric_dict: RwLock<StringDictionary>,
+    label_name_dict: RwLock<StringDictionary>,
+    label_value_dict: RwLock<StringDictionary>,
+    series_shards: [RwLock<SeriesRegistryShard>; SERIES_REGISTRY_SHARD_COUNT],
+    series_id_shards: [RwLock<SeriesIdShardIndex>; SERIES_REGISTRY_SHARD_COUNT],
+    all_series_shards: [RwLock<AllSeriesPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
+    metric_postings_shards: [RwLock<MetricPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
+    label_postings_shards: [RwLock<LabelPostingsShard>; SERIES_REGISTRY_SHARD_COUNT],
+    series_count: AtomicUsize,
+}
+
+impl Default for SeriesRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SeriesRegistry {
     pub fn new() -> Self {
         Self {
-            next_series_id: 1,
-            ..Self::default()
+            next_series_id: AtomicU64::new(1),
+            pending_series_reservations: AtomicUsize::new(0),
+            estimated_total_bytes: AtomicUsize::new(0),
+            postings_generation: AtomicU64::new(0),
+            metric_dict: RwLock::new(StringDictionary::default()),
+            label_name_dict: RwLock::new(StringDictionary::default()),
+            label_value_dict: RwLock::new(StringDictionary::default()),
+            series_shards: std::array::from_fn(|_| RwLock::new(SeriesRegistryShard::default())),
+            series_id_shards: std::array::from_fn(|_| RwLock::new(SeriesIdShardIndex::default())),
+            all_series_shards: std::array::from_fn(|_| {
+                RwLock::new(AllSeriesPostingsShard::default())
+            }),
+            metric_postings_shards: std::array::from_fn(|_| {
+                RwLock::new(MetricPostingsShard::default())
+            }),
+            label_postings_shards: std::array::from_fn(|_| {
+                RwLock::new(LabelPostingsShard::default())
+            }),
+            series_count: AtomicUsize::new(0),
         }
     }
 
-    pub fn resolve_or_insert(
-        &mut self,
-        metric: &str,
-        labels: &[Label],
-    ) -> Result<SeriesResolution> {
-        validate_metric(metric)?;
-        validate_labels(labels)?;
+    fn series_label_pairs_memory_bytes(label_pairs: &[LabelPairId]) -> usize {
+        label_pairs
+            .len()
+            .saturating_mul(std::mem::size_of::<LabelPairId>())
+            .saturating_mul(2)
+    }
 
-        let metric_id = self.metric_dict.intern(metric, "metric")?;
-        let label_pairs = self.intern_label_pairs(labels)?;
+    pub(crate) fn value_family_entry_bytes() -> usize {
+        std::mem::size_of::<SeriesId>() + std::mem::size_of::<SeriesValueFamily>()
+    }
 
-        let key = SeriesKeyIds {
-            metric_id,
-            label_pairs: label_pairs.clone(),
-        };
+    fn label_name_postings_count_entry_bytes() -> usize {
+        std::mem::size_of::<DictionaryId>() + std::mem::size_of::<usize>()
+    }
 
-        if let Some(existing) = self.by_key.get(&key) {
-            return Ok(SeriesResolution {
-                series_id: *existing,
-                metric_id,
-                label_pairs,
-                created: false,
+    fn bitmap_memory_usage_bytes(bitmap: &RoaringTreemap) -> usize {
+        if bitmap.is_empty() {
+            0
+        } else {
+            bitmap.serialized_size()
+        }
+    }
+
+    fn recompute_series_bytes(&self) -> usize {
+        self.series_shards.iter().fold(0usize, |acc, shard| {
+            acc.saturating_add(shard.read().estimated_series_bytes)
+        })
+    }
+
+    fn recompute_postings_bytes(&self) -> usize {
+        let all_series_bytes = self.all_series_shards.iter().fold(0usize, |acc, shard| {
+            acc.saturating_add(shard.read().estimated_postings_bytes)
+        });
+        let metric_bytes = self
+            .metric_postings_shards
+            .iter()
+            .fold(0usize, |acc, shard| {
+                acc.saturating_add(shard.read().estimated_postings_bytes)
             });
-        }
-
-        let series_id = self.alloc_series_id()?;
-        let definition = SeriesDefinition {
-            series_id,
-            metric_id,
-            label_pairs: label_pairs.clone(),
-        };
-
-        self.by_key.insert(key, series_id);
-        self.by_id.insert(series_id, definition);
-        self.update_metric_postings(metric_id, series_id);
-        self.update_postings(series_id, &label_pairs);
-
-        Ok(SeriesResolution {
-            series_id,
-            metric_id,
-            label_pairs,
-            created: true,
-        })
+        let label_bytes = self
+            .label_postings_shards
+            .iter()
+            .fold(0usize, |acc, shard| {
+                acc.saturating_add(shard.read().estimated_postings_bytes)
+            });
+        all_series_bytes
+            .saturating_add(metric_bytes)
+            .saturating_add(label_bytes)
     }
 
-    pub fn resolve_existing(&self, metric: &str, labels: &[Label]) -> Option<SeriesResolution> {
-        let metric_id = self.metric_dict.get_id(metric)?;
-        let label_pairs = self.lookup_label_pairs(labels)?;
-        let key = SeriesKeyIds {
-            metric_id,
-            label_pairs: label_pairs.clone(),
-        };
-
-        let series_id = *self.by_key.get(&key)?;
-        Some(SeriesResolution {
-            series_id,
-            metric_id,
-            label_pairs,
-            created: false,
-        })
+    fn key_shard_idx_for_key(key: &SeriesKeyIds) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % SERIES_REGISTRY_SHARD_COUNT
     }
 
-    pub fn resolve_rows(&mut self, rows: &[Row]) -> Result<Vec<SeriesResolution>> {
-        let mut resolutions = Vec::with_capacity(rows.len());
-        for row in rows {
-            resolutions.push(self.resolve_or_insert(row.metric(), row.labels())?);
-        }
-        Ok(resolutions)
+    fn metric_postings_shard_idx(metric_id: DictionaryId) -> usize {
+        (metric_id as usize) % SERIES_REGISTRY_SHARD_COUNT
     }
 
-    pub(crate) fn rollback_created_series(&mut self, created: &[SeriesResolution]) {
-        if created.is_empty() {
+    fn label_postings_shard_idx(name_id: DictionaryId) -> usize {
+        (name_id as usize) % SERIES_REGISTRY_SHARD_COUNT
+    }
+
+    fn all_series_shard_idx(series_id: SeriesId) -> usize {
+        (series_id as usize) % SERIES_REGISTRY_SHARD_COUNT
+    }
+
+    fn series_id_index_shard_idx(series_id: SeriesId) -> usize {
+        (series_id as usize) % SERIES_REGISTRY_SHARD_COUNT
+    }
+
+    fn next_series_id_value(&self) -> SeriesId {
+        self.next_series_id.load(Ordering::Acquire).max(1)
+    }
+
+    fn load_series_registry_shard_idx(&self, series_id: SeriesId) -> Option<usize> {
+        self.series_id_shards[Self::series_id_index_shard_idx(series_id)]
+            .read()
+            .series_id_to_registry_shard
+            .get(&series_id)
+            .copied()
+    }
+
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.estimated_total_bytes.load(Ordering::Acquire)
+    }
+
+    fn recompute_memory_usage_bytes(&self) -> usize {
+        self.metric_dict
+            .read()
+            .memory_usage_bytes()
+            .saturating_add(self.label_name_dict.read().memory_usage_bytes())
+            .saturating_add(self.label_value_dict.read().memory_usage_bytes())
+            .saturating_add(self.recompute_series_bytes())
+            .saturating_add(self.recompute_postings_bytes())
+    }
+
+    fn add_estimated_memory_bytes(&self, bytes: usize) {
+        if bytes == 0 {
             return;
         }
 
-        for resolution in created {
-            self.by_id.remove(&resolution.series_id);
-            self.by_key.remove(&SeriesKeyIds {
-                metric_id: resolution.metric_id,
-                label_pairs: resolution.label_pairs.clone(),
-            });
-
-            let remove_metric_posting =
-                if let Some(series_ids) = self.metric_postings.get_mut(&resolution.metric_id) {
-                    series_ids.remove(resolution.series_id);
-                    series_ids.is_empty()
-                } else {
-                    false
-                };
-            if remove_metric_posting {
-                self.metric_postings.remove(&resolution.metric_id);
-            }
-
-            for pair in &resolution.label_pairs {
-                let remove_posting = if let Some(series_ids) = self.postings.get_mut(pair) {
-                    series_ids.remove(resolution.series_id);
-                    series_ids.is_empty()
-                } else {
-                    false
-                };
-                if remove_posting {
-                    self.postings.remove(pair);
-                }
+        let mut current = self.estimated_total_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(bytes);
+            match self.estimated_total_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
             }
         }
     }
 
-    pub fn register_series_with_id(
-        &mut self,
-        series_id: SeriesId,
-        metric: &str,
-        labels: &[Label],
-    ) -> Result<SeriesResolution> {
-        validate_metric(metric)?;
-        validate_labels(labels)?;
+    fn bump_postings_generation(&self) {
+        self.postings_generation.fetch_add(1, Ordering::AcqRel);
+    }
 
-        let metric_id = self.metric_dict.intern(metric, "metric")?;
-        let label_pairs = self.intern_label_pairs(labels)?;
-        let key = SeriesKeyIds {
-            metric_id,
-            label_pairs: label_pairs.clone(),
-        };
-
-        if let Some(existing_id) = self.by_key.get(&key) {
-            if *existing_id != series_id {
-                return Err(TsinkError::DataCorruption(format!(
-                    "series key already bound to id {}, replay tried to bind {}",
-                    existing_id, series_id
-                )));
-            }
-
-            return Ok(SeriesResolution {
-                series_id,
-                metric_id,
-                label_pairs,
-                created: false,
-            });
+    fn sub_estimated_memory_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
         }
 
-        if let Some(existing) = self.by_id.get(&series_id) {
-            if existing.metric_id != metric_id || existing.label_pairs != label_pairs {
-                return Err(TsinkError::DataCorruption(format!(
-                    "series id {} already exists with a different series definition",
-                    series_id
-                )));
-            }
-
-            return Ok(SeriesResolution {
-                series_id,
-                metric_id,
-                label_pairs,
-                created: false,
-            });
-        }
-
-        let definition = SeriesDefinition {
-            series_id,
-            metric_id,
-            label_pairs: label_pairs.clone(),
-        };
-        self.by_key.insert(key, series_id);
-        self.by_id.insert(series_id, definition);
-        self.update_metric_postings(metric_id, series_id);
-        self.update_postings(series_id, &label_pairs);
-
-        self.next_series_id =
-            self.next_series_id
-                .max(series_id.checked_add(1).ok_or_else(|| {
-                    TsinkError::InvalidConfiguration(
-                        "series id space exhausted (u64 overflow)".to_string(),
-                    )
-                })?);
-
-        Ok(SeriesResolution {
-            series_id,
-            metric_id,
-            label_pairs,
-            created: true,
-        })
-    }
-
-    pub fn series_ids_for_metric(&self, metric: &str) -> Vec<SeriesId> {
-        let Some(metric_id) = self.metric_dict.get_id(metric) else {
-            return Vec::new();
-        };
-
-        self.metric_postings
-            .get(&metric_id)
-            .map(|ids| ids.iter().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn series_id_postings_for_metric(&self, metric: &str) -> Option<&RoaringTreemap> {
-        let metric_id = self.metric_dict.get_id(metric)?;
-        self.metric_postings.get(&metric_id)
-    }
-
-    pub fn all_series_ids(&self) -> Vec<SeriesId> {
-        let mut ids = self.by_id.keys().copied().collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
-    }
-
-    pub fn get_by_id(&self, series_id: SeriesId) -> Option<&SeriesDefinition> {
-        self.by_id.get(&series_id)
-    }
-
-    pub fn decode_series_key(&self, series_id: SeriesId) -> Option<SeriesKey> {
-        let series = self.by_id.get(&series_id)?;
-        let metric = self.metric_dict.get_value(series.metric_id)?.to_string();
-
-        let mut labels = Vec::with_capacity(series.label_pairs.len());
-        for pair in &series.label_pairs {
-            let name = self.label_name_dict.get_value(pair.name_id)?;
-            let value = self.label_value_dict.get_value(pair.value_id)?;
-            labels.push(Label::new(name, value));
-        }
-        labels.sort();
-
-        Some(SeriesKey { metric, labels })
-    }
-
-    pub fn postings_for_ids(&self, pair: LabelPairId) -> Option<&RoaringTreemap> {
-        self.postings.get(&pair)
-    }
-
-    pub fn postings_for_label(
-        &self,
-        label_name: &str,
-        label_value: &str,
-    ) -> Option<&RoaringTreemap> {
-        let name_id = self.label_name_dict.get_id(label_name)?;
-        let value_id = self.label_value_dict.get_id(label_value)?;
-        self.postings_for_ids(LabelPairId { name_id, value_id })
-    }
-
-    pub fn metric_id(&self, metric: &str) -> Option<DictionaryId> {
-        self.metric_dict.get_id(metric)
-    }
-
-    pub fn label_name_id(&self, label_name: &str) -> Option<DictionaryId> {
-        self.label_name_dict.get_id(label_name)
-    }
-
-    pub fn label_value_id(&self, label_value: &str) -> Option<DictionaryId> {
-        self.label_value_dict.get_id(label_value)
-    }
-
-    pub fn label_value_by_id(&self, value_id: DictionaryId) -> Option<&str> {
-        self.label_value_dict.get_value(value_id)
-    }
-
-    pub fn metric_entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {
-        self.metric_dict.entries()
-    }
-
-    pub fn metric_postings_entries(&self) -> impl Iterator<Item = (&str, &RoaringTreemap)> {
-        self.metric_postings
-            .iter()
-            .filter_map(|(metric_id, series_ids)| {
-                self.metric_dict
-                    .get_value(*metric_id)
-                    .map(|metric| (metric, series_ids))
-            })
-    }
-
-    pub fn label_name_entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {
-        self.label_name_dict.entries()
-    }
-
-    pub fn label_value_entries(&self) -> impl Iterator<Item = (DictionaryId, &str)> {
-        self.label_value_dict.entries()
-    }
-
-    pub fn postings_entries(&self) -> impl Iterator<Item = (LabelPairId, &RoaringTreemap)> {
-        self.postings.iter().map(|(pair, ids)| (*pair, ids))
-    }
-
-    pub fn series_count(&self) -> usize {
-        self.by_id.len()
-    }
-
-    pub fn metric_dictionary_len(&self) -> usize {
-        self.metric_dict.len()
-    }
-
-    pub fn label_name_dictionary_len(&self) -> usize {
-        self.label_name_dict.len()
-    }
-
-    pub fn label_value_dictionary_len(&self) -> usize {
-        self.label_value_dict.len()
-    }
-
-    pub fn postings_count(&self) -> usize {
-        self.postings.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
-    }
-
-    fn intern_label_pairs(&mut self, labels: &[Label]) -> Result<Vec<LabelPairId>> {
-        let mut pairs = Vec::with_capacity(labels.len());
-        for label in labels {
-            let name_id = self.label_name_dict.intern(&label.name, "label name")?;
-            let value_id = self.label_value_dict.intern(&label.value, "label value")?;
-            pairs.push(LabelPairId { name_id, value_id });
-        }
-        pairs.sort_unstable();
-        pairs.dedup();
-        Ok(pairs)
-    }
-
-    fn lookup_label_pairs(&self, labels: &[Label]) -> Option<Vec<LabelPairId>> {
-        let mut pairs = Vec::with_capacity(labels.len());
-        for label in labels {
-            let name_id = self.label_name_dict.get_id(&label.name)?;
-            let value_id = self.label_value_dict.get_id(&label.value)?;
-            pairs.push(LabelPairId { name_id, value_id });
-        }
-        pairs.sort_unstable();
-        pairs.dedup();
-        Some(pairs)
-    }
-
-    fn update_postings(&mut self, series_id: SeriesId, label_pairs: &[LabelPairId]) {
-        for pair in label_pairs {
-            self.postings.entry(*pair).or_default().insert(series_id);
-        }
-    }
-
-    fn update_metric_postings(&mut self, metric_id: DictionaryId, series_id: SeriesId) {
-        self.metric_postings
-            .entry(metric_id)
-            .or_default()
-            .insert(series_id);
-    }
-
-    fn rebuild_postings_indexes(&mut self) {
-        self.metric_postings.clear();
-        self.postings.clear();
-
-        for series in self.by_id.values() {
-            self.metric_postings
-                .entry(series.metric_id)
-                .or_default()
-                .insert(series.series_id);
-            for pair in &series.label_pairs {
-                self.postings
-                    .entry(*pair)
-                    .or_default()
-                    .insert(series.series_id);
+        let mut current = self.estimated_total_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.estimated_total_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
             }
         }
     }
 
-    pub fn retain_series_ids(&mut self, keep: &BTreeSet<SeriesId>) {
-        self.by_id.retain(|series_id, _| keep.contains(series_id));
-        self.by_key.retain(|_, series_id| keep.contains(series_id));
-        self.rebuild_postings_indexes();
-
-        let next = self
-            .by_id
-            .keys()
-            .copied()
-            .max()
-            .and_then(|max_id| max_id.checked_add(1))
-            .unwrap_or(1);
-        self.next_series_id = next;
-    }
-
-    pub fn persist_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&REGISTRY_INDEX_MAGIC);
-        append_u16(&mut bytes, REGISTRY_INDEX_VERSION);
-        append_u16(&mut bytes, 0u16);
-        append_u64(&mut bytes, self.next_series_id);
-        append_u32(&mut bytes, self.metric_dict.len() as u32);
-        append_u32(&mut bytes, self.label_name_dict.len() as u32);
-        append_u32(&mut bytes, self.label_value_dict.len() as u32);
-        append_u64(&mut bytes, self.by_id.len() as u64);
-        // Reserved for future index sections.
-        append_u64(&mut bytes, 0u64);
-        append_u64(&mut bytes, 0u64);
-
-        for (id, value) in self.metric_dict.entries() {
-            write_dict_entry(&mut bytes, id, value)?;
-        }
-        for (id, value) in self.label_name_dict.entries() {
-            write_dict_entry(&mut bytes, id, value)?;
-        }
-        for (id, value) in self.label_value_dict.entries() {
-            write_dict_entry(&mut bytes, id, value)?;
-        }
-
-        let mut series = self.by_id.values().cloned().collect::<Vec<_>>();
-        series.sort_by_key(|entry| entry.series_id);
-        for entry in &series {
-            append_u64(&mut bytes, entry.series_id);
-            append_u32(&mut bytes, entry.metric_id);
-            let pair_count = u16::try_from(entry.label_pairs.len()).map_err(|_| {
-                TsinkError::InvalidConfiguration(
-                    "series label pair count exceeds u16 in registry index".to_string(),
-                )
-            })?;
-            append_u16(&mut bytes, pair_count);
-            append_u16(&mut bytes, 0u16);
-            for pair in &entry.label_pairs {
-                append_u32(&mut bytes, pair.name_id);
-                append_u32(&mut bytes, pair.value_id);
-            }
-        }
-
-        write_file_atomically_and_sync_parent(path, &bytes)?;
-        Ok(())
-    }
-
-    pub fn load_from_path(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)?;
-        if bytes.len() < 52 {
-            return Err(TsinkError::DataCorruption(
-                "series index file is too short".to_string(),
-            ));
-        }
-
-        let mut pos = 0usize;
-        let magic = read_array::<4>(&bytes, &mut pos)?;
-        if magic != REGISTRY_INDEX_MAGIC {
-            return Err(TsinkError::DataCorruption(
-                "series index magic mismatch".to_string(),
-            ));
-        }
-
-        let version = read_u16(&bytes, &mut pos)?;
-        if version != REGISTRY_INDEX_VERSION {
-            return Err(TsinkError::DataCorruption(format!(
-                "unsupported series index version {version}"
-            )));
-        }
-
-        let _flags = read_u16(&bytes, &mut pos)?;
-        let next_series_id = read_u64(&bytes, &mut pos)?;
-        let metric_count = read_u32(&bytes, &mut pos)? as usize;
-        let label_name_count = read_u32(&bytes, &mut pos)? as usize;
-        let label_value_count = read_u32(&bytes, &mut pos)? as usize;
-        let series_count = read_u64(&bytes, &mut pos)? as usize;
-        let _reserved_metric_postings_count = read_u64(&bytes, &mut pos)? as usize;
-        let _reserved_postings_count = read_u64(&bytes, &mut pos)? as usize;
-
-        let metric_values = parse_dictionary(&bytes, &mut pos, metric_count)?;
-        let label_name_values = parse_dictionary(&bytes, &mut pos, label_name_count)?;
-        let label_value_values = parse_dictionary(&bytes, &mut pos, label_value_count)?;
-
-        let metric_dict = StringDictionary::from_values(metric_values, "metric")?;
-        let label_name_dict = StringDictionary::from_values(label_name_values, "label name")?;
-        let label_value_dict = StringDictionary::from_values(label_value_values, "label value")?;
-
-        let mut by_id = HashMap::<SeriesId, SeriesDefinition>::with_capacity(series_count);
-        let mut by_key = HashMap::<SeriesKeyIds, SeriesId>::with_capacity(series_count);
-        for _ in 0..series_count {
-            let series_id = read_u64(&bytes, &mut pos)?;
-            let metric_id = read_u32(&bytes, &mut pos)?;
-            let pair_count = read_u16(&bytes, &mut pos)? as usize;
-            let _reserved = read_u16(&bytes, &mut pos)?;
-            let mut label_pairs = Vec::with_capacity(pair_count);
-            for _ in 0..pair_count {
-                let name_id = read_u32(&bytes, &mut pos)?;
-                let value_id = read_u32(&bytes, &mut pos)?;
-                label_pairs.push(LabelPairId { name_id, value_id });
-            }
-            label_pairs.sort_unstable();
-            label_pairs.dedup();
-
-            let key = SeriesKeyIds {
-                metric_id,
-                label_pairs: label_pairs.clone(),
-            };
-            by_key.insert(key, series_id);
-            by_id.insert(
-                series_id,
-                SeriesDefinition {
-                    series_id,
-                    metric_id,
-                    label_pairs,
-                },
-            );
-        }
-
-        if pos != bytes.len() {
-            return Err(TsinkError::DataCorruption(
-                "series index has trailing bytes".to_string(),
-            ));
-        }
-
-        let mut registry = Self {
-            next_series_id: next_series_id.max(1),
-            metric_dict,
-            label_name_dict,
-            label_value_dict,
-            by_key,
-            by_id,
-            metric_postings: HashMap::new(),
-            postings: BTreeMap::new(),
-        };
-
-        registry.rebuild_postings_indexes();
-        if registry.next_series_id == 0 {
-            registry.next_series_id = 1;
-        }
-        Ok(registry)
-    }
-
-    fn alloc_series_id(&mut self) -> Result<SeriesId> {
-        let id = self.next_series_id;
-        self.next_series_id = self.next_series_id.checked_add(1).ok_or_else(|| {
-            TsinkError::InvalidConfiguration("series id space exhausted (u64 overflow)".to_string())
-        })?;
-        Ok(id)
-    }
-}
-
-fn write_dict_entry(out: &mut Vec<u8>, id: u32, value: &str) -> Result<()> {
-    let value_bytes = value.as_bytes();
-    let len = u32::try_from(value_bytes.len()).map_err(|_| {
-        TsinkError::InvalidConfiguration("registry dictionary string exceeds u32".to_string())
-    })?;
-    append_u32(out, id);
-    append_u32(out, len);
-    out.extend_from_slice(value_bytes);
-    Ok(())
-}
-
-fn parse_dictionary(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<String>> {
-    let mut values = Vec::with_capacity(count);
-    for expected_id in 0..count {
-        let id = read_u32(bytes, pos)? as usize;
-        if id != expected_id {
-            return Err(TsinkError::DataCorruption(format!(
-                "registry dictionary id {} is not dense at expected {}",
-                id, expected_id
-            )));
-        }
-
-        let len = read_u32(bytes, pos)? as usize;
-        let value_bytes = read_bytes(bytes, pos, len)?;
-        let value = String::from_utf8(value_bytes.to_vec())?;
-        values.push(value);
-    }
-    Ok(values)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SeriesRegistry;
-    use crate::{DataPoint, Label, Row, TsinkError};
-
-    #[test]
-    fn resolves_same_series_to_same_id_regardless_of_label_order() {
-        let mut registry = SeriesRegistry::new();
-
-        let r1 = registry
-            .resolve_or_insert(
-                "cpu",
-                &[Label::new("host", "a"), Label::new("region", "use1")],
-            )
-            .unwrap();
-        let r2 = registry
-            .resolve_or_insert(
-                "cpu",
-                &[Label::new("region", "use1"), Label::new("host", "a")],
-            )
-            .unwrap();
-
-        assert_eq!(r1.series_id, r2.series_id);
-        assert!(r1.created);
-        assert!(!r2.created);
-        assert_eq!(registry.series_count(), 1);
-    }
-
-    #[test]
-    fn interns_metric_and_label_dictionaries_once() {
-        let mut registry = SeriesRegistry::new();
-
-        for _ in 0..100 {
-            registry
-                .resolve_or_insert(
-                    "http_requests_total",
-                    &[
-                        Label::new("method", "GET"),
-                        Label::new("status", "200"),
-                        Label::new("route", "/users"),
-                    ],
-                )
-                .unwrap();
-        }
-
-        assert_eq!(registry.series_count(), 1);
-        assert_eq!(registry.metric_dictionary_len(), 1);
-        assert_eq!(registry.label_name_dictionary_len(), 3);
-        assert_eq!(registry.label_value_dictionary_len(), 3);
-    }
-
-    #[test]
-    fn postings_track_all_series_for_same_label_pair() {
-        let mut registry = SeriesRegistry::new();
-
-        let a = registry
-            .resolve_or_insert(
-                "cpu",
-                &[Label::new("host", "h1"), Label::new("region", "use1")],
-            )
-            .unwrap();
-        let b = registry
-            .resolve_or_insert(
-                "cpu",
-                &[Label::new("host", "h2"), Label::new("region", "use1")],
-            )
-            .unwrap();
-
-        let postings = registry.postings_for_label("region", "use1").unwrap();
-        assert_eq!(postings.len(), 2);
-        assert!(postings.contains(a.series_id));
-        assert!(postings.contains(b.series_id));
-    }
-
-    #[test]
-    fn resolve_rows_returns_series_ids_for_batch_inserts() {
-        let mut registry = SeriesRegistry::new();
-        let rows = vec![
-            Row::with_labels(
-                "latency",
-                vec![Label::new("host", "a"), Label::new("path", "/")],
-                DataPoint::new(1, 1.0),
-            ),
-            Row::with_labels(
-                "latency",
-                vec![Label::new("path", "/"), Label::new("host", "a")],
-                DataPoint::new(2, 2.0),
-            ),
-            Row::with_labels(
-                "latency",
-                vec![Label::new("host", "b"), Label::new("path", "/")],
-                DataPoint::new(3, 3.0),
-            ),
-        ];
-
-        let resolutions = registry.resolve_rows(&rows).unwrap();
-
-        assert_eq!(resolutions.len(), 3);
-        assert_eq!(resolutions[0].series_id, resolutions[1].series_id);
-        assert_ne!(resolutions[0].series_id, resolutions[2].series_id);
-        assert_eq!(registry.series_count(), 2);
-    }
-
-    #[test]
-    fn resolve_existing_and_series_ids_for_metric_work() {
-        let mut registry = SeriesRegistry::new();
-        let labels_a = vec![Label::new("host", "a")];
-        let labels_b = vec![Label::new("host", "b")];
-
-        let a = registry.resolve_or_insert("cpu", &labels_a).unwrap();
-        let b = registry.resolve_or_insert("cpu", &labels_b).unwrap();
-
-        let resolved = registry.resolve_existing("cpu", &labels_a).unwrap();
-        assert_eq!(resolved.series_id, a.series_id);
-
-        let ids = registry.series_ids_for_metric("cpu");
-        assert_eq!(ids, vec![a.series_id, b.series_id]);
-    }
-
-    #[test]
-    fn register_series_with_id_restores_series_identity() {
-        let mut registry = SeriesRegistry::new();
-        let labels = vec![Label::new("host", "a"), Label::new("region", "use1")];
-
-        let registered = registry
-            .register_series_with_id(42, "cpu", &labels)
-            .unwrap();
-        assert_eq!(registered.series_id, 42);
-        assert!(registered.created);
-
-        let resolved = registry.resolve_existing("cpu", &labels).unwrap();
-        assert_eq!(resolved.series_id, 42);
-
-        let fresh = registry
-            .resolve_or_insert("cpu", &[Label::new("host", "b")])
-            .unwrap();
-        assert!(fresh.series_id > 42);
-    }
-
-    #[test]
-    fn decode_series_key_recovers_metric_and_labels() {
-        let mut registry = SeriesRegistry::new();
-        let resolution = registry
-            .resolve_or_insert(
-                "memory_usage",
-                &[Label::new("host", "a"), Label::new("service", "api")],
-            )
-            .unwrap();
-
-        let decoded = registry.decode_series_key(resolution.series_id).unwrap();
-        assert_eq!(decoded.metric, "memory_usage");
-        assert_eq!(
-            decoded.labels,
-            vec![Label::new("host", "a"), Label::new("service", "api")]
-        );
-    }
-
-    #[test]
-    fn rollback_created_series_removes_series_without_rewinding_ids_or_dictionaries() {
-        let mut registry = SeriesRegistry::new();
-        registry
-            .resolve_or_insert("cpu", &[Label::new("host", "a")])
-            .unwrap();
-
-        let baseline_series = registry.series_count();
-        let baseline_metric_dict_len = registry.metric_dictionary_len();
-        let baseline_label_name_dict_len = registry.label_name_dictionary_len();
-        let baseline_label_value_dict_len = registry.label_value_dictionary_len();
-
-        let phantom_labels = vec![Label::new("zone", "use1"), Label::new("env", "prod")];
-        let created = registry
-            .resolve_or_insert("phantom_metric", &phantom_labels)
-            .unwrap();
-        assert!(created.created);
-        assert!(registry
-            .resolve_existing("phantom_metric", &phantom_labels)
-            .is_some());
-
-        registry.rollback_created_series(std::slice::from_ref(&created));
-
-        assert_eq!(registry.series_count(), baseline_series);
-        assert!(registry.metric_dictionary_len() >= baseline_metric_dict_len);
-        assert!(registry.label_name_dictionary_len() >= baseline_label_name_dict_len);
-        assert!(registry.label_value_dictionary_len() >= baseline_label_value_dict_len);
-        assert!(registry
-            .resolve_existing("phantom_metric", &phantom_labels)
-            .is_none());
-
-        let next = registry
-            .resolve_or_insert("cpu", &[Label::new("host", "b")])
-            .unwrap();
-        assert!(next.series_id > created.series_id);
-    }
-
-    #[test]
-    fn rejects_invalid_input() {
-        let mut registry = SeriesRegistry::new();
-
-        let metric_err = registry.resolve_or_insert("", &[]).unwrap_err();
-        assert!(matches!(metric_err, TsinkError::MetricRequired));
-
-        let label_err = registry
-            .resolve_or_insert("m", &[Label::new("", "x")])
-            .unwrap_err();
-        assert!(matches!(label_err, TsinkError::InvalidLabel(_)));
-
-        let oversized = Label::new("k", "x".repeat(crate::label::MAX_LABEL_VALUE_LEN + 1));
-        let oversized_err = registry.resolve_or_insert("m", &[oversized]).unwrap_err();
-        assert!(matches!(oversized_err, TsinkError::InvalidLabel(_)));
+    fn refresh_estimated_memory_usage_bytes(&self) -> usize {
+        let total = self.recompute_memory_usage_bytes();
+        self.estimated_total_bytes.store(total, Ordering::Release);
+        total
     }
 }

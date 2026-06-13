@@ -1,0 +1,40 @@
+{
+  "metadata": [],
+  "timeseries": [
+    {
+      "exemplars": [
+        {
+          "labels": [
+            {
+              "name": "trace_id",
+              "value": "4bf92f3577b34da6a3ce929d0e0e4736"
+            },
+            {
+              "name": "span_id",
+              "value": "00f067aa0ba902b7"
+            }
+          ],
+          "timestamp": 1700000120000,
+          "value": 0.423
+        }
+      ],
+      "histograms": [],
+      "labels": [
+        {
+          "name": "__name__",
+          "value": "http_request_duration_seconds"
+        },
+        {
+          "name": "job",
+          "value": "frontend"
+        }
+      ],
+      "samples": [
+        {
+          "timestamp": 1700000120000,
+          "value": 0.423
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "metadata": [],
+  "timeseries": [
+    {
+      "exemplars": [],
+      "histograms": [
+        {
+          "count": {
+            "kind": "countInt",
+            "value": 42
+          },
+          "customValues": [],
+          "negativeCounts": [],
+          "negativeDeltas": [],
+          "negativeSpans": [],
+          "positiveCounts": [],
+          "positiveDeltas": [
+            3,
+            1
+          ],
+          "positiveSpans": [
+            {
+              "length": 2,
+              "offset": 0
+            }
+          ],
+          "resetHint": "No",
+          "schema": 1,
+          "sum": 17.5,
+          "timestamp": 1700000180000,
+          "zeroCount": {
+            "kind": "zeroCountInt",
+            "value": 7
+          },
+          "zeroThreshold": 0.001
+        }
+      ],
+      "labels": [
+        {
+          "name": "__name__",
+          "value": "rpc_duration_seconds"
+        },
+        {
+          "name": "job",
+          "value": "backend"
+        }
+      ],
+      "samples": []
+    }
+  ]
+}

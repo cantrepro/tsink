@@ -1,0 +1,6 @@
+[
+  {
+    "received_at_ms": 1700000000000,
+    "body": "jobs.completed:4|c|#env:prod\nworkers.active:2|g|#env:prod"
+  }
+]

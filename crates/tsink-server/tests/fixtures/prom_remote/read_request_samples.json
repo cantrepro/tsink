@@ -1,0 +1,35 @@
+{
+  "acceptedResponseTypes": [
+    "Samples",
+    "StreamedXorChunks"
+  ],
+  "queries": [
+    {
+      "endTimestampMs": 1700000300000,
+      "hints": {
+        "by": true,
+        "endMs": 1700000300000,
+        "func": "rate",
+        "grouping": [
+          "job"
+        ],
+        "rangeMs": 60000,
+        "startMs": 1700000000000,
+        "stepMs": 15000
+      },
+      "matchers": [
+        {
+          "name": "__name__",
+          "type": "Eq",
+          "value": "http_requests_total"
+        },
+        {
+          "name": "job",
+          "type": "Re",
+          "value": "api|worker"
+        }
+      ],
+      "startTimestampMs": 1700000000000
+    }
+  ]
+}

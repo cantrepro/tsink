@@ -198,6 +198,10 @@ fn value_cmp(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering> {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
         (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+        (Value::Histogram(_), _) | (_, Value::Histogram(_)) => Err(TsinkError::ValueTypeMismatch {
+            expected: "comparable scalar value".to_string(),
+            actual: "histogram".to_string(),
+        }),
         _ => Err(TsinkError::ValueTypeMismatch {
             expected: lhs.kind().to_string(),
             actual: rhs.kind().to_string(),
@@ -210,6 +214,12 @@ fn min_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
     for point in points {
         if is_nan_f64(&point.value) {
             continue;
+        }
+        if matches!(point.value, Value::Histogram(_)) {
+            return Err(TsinkError::UnsupportedAggregation {
+                aggregation: aggregation_name(Aggregation::Min).to_string(),
+                value_type: point.value.kind().to_string(),
+            });
         }
 
         match &best {
@@ -228,6 +238,12 @@ fn max_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
     for point in points {
         if is_nan_f64(&point.value) {
             continue;
+        }
+        if matches!(point.value, Value::Histogram(_)) {
+            return Err(TsinkError::UnsupportedAggregation {
+                aggregation: aggregation_name(Aggregation::Max).to_string(),
+                value_type: point.value.kind().to_string(),
+            });
         }
 
         match &best {
@@ -559,9 +575,9 @@ fn aggregate_bucket(
     Ok(aggregated)
 }
 
-fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
-    let rel = ts as i128 - start as i128;
-    let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
+pub(crate) fn bucket_start_for_origin(ts: i64, origin: i64, interval: i64) -> i64 {
+    let rel = ts as i128 - origin as i128;
+    let bucket = origin as i128 + rel.div_euclid(interval as i128) * interval as i128;
     bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
@@ -569,6 +585,17 @@ pub(crate) fn downsample_points(
     points: &[DataPoint],
     interval: i64,
     aggregation: Aggregation,
+    start: i64,
+    end: i64,
+) -> Result<Vec<DataPoint>> {
+    downsample_points_with_origin(points, interval, aggregation, start, start, end)
+}
+
+pub(crate) fn downsample_points_with_origin(
+    points: &[DataPoint],
+    interval: i64,
+    aggregation: Aggregation,
+    origin: i64,
     start: i64,
     end: i64,
 ) -> Result<Vec<DataPoint>> {
@@ -588,7 +615,7 @@ pub(crate) fn downsample_points(
             break;
         }
 
-        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
+        let bucket_start = bucket_start_for_origin(points[idx].timestamp, origin, interval);
         let bucket_end = bucket_start.saturating_add(interval);
         let bucket_begin = idx;
 
@@ -631,7 +658,7 @@ pub(crate) fn downsample_points_with_custom(
             break;
         }
 
-        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
+        let bucket_start = bucket_start_for_origin(points[idx].timestamp, start, interval);
         let bucket_end = bucket_start.saturating_add(interval);
         let bucket_begin = idx;
 

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::Label;
+use crate::{label::canonical_series_identity, Label};
 
-use crate::promql::ast::{BinaryExpr, BinaryOp, VectorMatching};
+use crate::promql::ast::{BinaryExpr, BinaryOp, VectorMatchCardinality, VectorMatching};
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::types::{PromqlValue, Sample};
 
@@ -50,18 +50,13 @@ fn eval_scalar_scalar(
     }
 
     if op.is_comparison() {
+        if !return_bool {
+            return Err(PromqlError::Type(
+                "scalar-to-scalar comparison requires the bool modifier".to_string(),
+            ));
+        }
         let matched = compare(op, lhs, rhs)?;
-        let value = if return_bool {
-            if matched {
-                1.0
-            } else {
-                0.0
-            }
-        } else if matched {
-            lhs
-        } else {
-            f64::NAN
-        };
+        let value = if matched { 1.0 } else { 0.0 };
         return Ok(PromqlValue::Scalar(value, ts));
     }
 
@@ -80,6 +75,12 @@ fn eval_vector_scalar(
         return Err(PromqlError::Type(
             "set operators require vector-vector operands".to_string(),
         ));
+    }
+    if samples.iter().any(|sample| sample.histogram.is_some()) {
+        return Err(PromqlError::Eval(format!(
+            "binary operator '{}' does not support histogram samples yet",
+            binary_op_name(op)
+        )));
     }
 
     let mut out = Vec::with_capacity(samples.len());
@@ -116,42 +117,65 @@ fn eval_vector_vector(
     rhs: Vec<Sample>,
 ) -> Result<PromqlValue> {
     if expr.op.is_set() {
+        if expr
+            .matching
+            .as_ref()
+            .is_some_and(|m| m.cardinality != VectorMatchCardinality::OneToOne)
+        {
+            return Err(PromqlError::Type(
+                "group_left/group_right modifiers cannot be used with set operators".to_string(),
+            ));
+        }
         return eval_set_op(expr.op, lhs, rhs, expr.matching.as_ref());
     }
+    if lhs.iter().any(|sample| sample.histogram.is_some())
+        || rhs.iter().any(|sample| sample.histogram.is_some())
+    {
+        return Err(PromqlError::Eval(format!(
+            "binary operator '{}' does not support histogram samples yet",
+            binary_op_name(expr.op)
+        )));
+    }
 
-    ensure_one_to_one(&lhs, &rhs, expr.matching.as_ref())?;
-    let rhs_map = build_sample_map(&rhs, expr.matching.as_ref());
+    ensure_matching_cardinality(&lhs, &rhs, expr.matching.as_ref())?;
+    let lhs_groups = build_sample_groups(&lhs, expr.matching.as_ref());
+    let rhs_groups = build_sample_groups(&rhs, expr.matching.as_ref());
     let mut out = Vec::new();
 
-    for mut sample in lhs {
-        let key = sample_key(&sample, expr.matching.as_ref());
-        let Some(rhs_sample) = rhs_map.get(&key) else {
-            continue;
-        };
+    match matching_cardinality(expr.matching.as_ref()) {
+        VectorMatchCardinality::OneToOne | VectorMatchCardinality::ManyToOne => {
+            for lhs_sample in lhs {
+                let key = sample_key(&lhs_sample, expr.matching.as_ref());
+                let Some(rhs_sample) = rhs_groups.get(&key).and_then(|samples| samples.first())
+                else {
+                    continue;
+                };
 
-        if expr.op.is_comparison() {
-            let matched = compare(expr.op, sample.value, rhs_sample.value)?;
-            if expr.return_bool {
-                sample.metric.clear();
-                sample.value = if matched { 1.0 } else { 0.0 };
-                out.push(sample);
-            } else if matched {
-                if expr.matching.as_ref().is_some_and(|m| m.on) {
-                    sample.metric.clear();
+                if let Some(result) = combine_vector_samples(expr, &lhs_sample, rhs_sample, false)?
+                {
+                    out.push(result);
                 }
-                out.push(sample);
             }
-        } else {
-            sample.metric.clear();
-            sample.value = arithmetic(expr.op, sample.value, rhs_sample.value)?;
-            out.push(sample);
+        }
+        VectorMatchCardinality::OneToMany => {
+            for rhs_sample in rhs {
+                let key = sample_key(&rhs_sample, expr.matching.as_ref());
+                let Some(lhs_sample) = lhs_groups.get(&key).and_then(|samples| samples.first())
+                else {
+                    continue;
+                };
+
+                if let Some(result) = combine_vector_samples(expr, lhs_sample, &rhs_sample, true)? {
+                    out.push(result);
+                }
+            }
         }
     }
 
     Ok(PromqlValue::InstantVector(out))
 }
 
-fn ensure_one_to_one(
+fn ensure_matching_cardinality(
     lhs: &[Sample],
     rhs: &[Sample],
     matching: Option<&VectorMatching>,
@@ -159,21 +183,43 @@ fn ensure_one_to_one(
     let lhs_counts = build_sample_count_map(lhs, matching);
     let rhs_counts = build_sample_count_map(rhs, matching);
 
-    for (key, lhs_count) in &lhs_counts {
-        if *lhs_count > 1 && rhs_counts.get(key).copied().unwrap_or(0) > 0 {
-            return Err(PromqlError::Eval(
-                "many-to-many matching not allowed: matching labels must be unique on one side"
-                    .to_string(),
-            ));
-        }
-    }
+    match matching_cardinality(matching) {
+        VectorMatchCardinality::OneToOne => {
+            for (key, lhs_count) in &lhs_counts {
+                if *lhs_count > 1 && rhs_counts.get(key).copied().unwrap_or(0) > 0 {
+                    return Err(PromqlError::Eval(
+                        "many-to-many matching not allowed: matching labels must be unique on one side"
+                            .to_string(),
+                    ));
+                }
+            }
 
-    for (key, rhs_count) in &rhs_counts {
-        if *rhs_count > 1 && lhs_counts.get(key).copied().unwrap_or(0) > 0 {
-            return Err(PromqlError::Eval(
-                "many-to-many matching not allowed: matching labels must be unique on one side"
-                    .to_string(),
-            ));
+            for (key, rhs_count) in &rhs_counts {
+                if *rhs_count > 1 && lhs_counts.get(key).copied().unwrap_or(0) > 0 {
+                    return Err(PromqlError::Eval(
+                        "many-to-many matching not allowed: matching labels must be unique on one side"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        VectorMatchCardinality::ManyToOne => {
+            for (key, rhs_count) in &rhs_counts {
+                if *rhs_count > 1 && lhs_counts.get(key).copied().unwrap_or(0) > 0 {
+                    return Err(PromqlError::Eval(
+                        "group_left requires unique matches on the right-hand side".to_string(),
+                    ));
+                }
+            }
+        }
+        VectorMatchCardinality::OneToMany => {
+            for (key, lhs_count) in &lhs_counts {
+                if *lhs_count > 1 && rhs_counts.get(key).copied().unwrap_or(0) > 0 {
+                    return Err(PromqlError::Eval(
+                        "group_right requires unique matches on the left-hand side".to_string(),
+                    ));
+                }
+            }
         }
     }
 
@@ -231,10 +277,48 @@ fn eval_set_op(
     Ok(PromqlValue::InstantVector(out))
 }
 
+fn combine_vector_samples(
+    expr: &BinaryExpr,
+    lhs: &Sample,
+    rhs: &Sample,
+    result_on_rhs: bool,
+) -> Result<Option<Sample>> {
+    let mut sample = if result_on_rhs {
+        rhs.clone()
+    } else {
+        lhs.clone()
+    };
+
+    if expr.op.is_comparison() {
+        let matched = compare(expr.op, lhs.value, rhs.value)?;
+        if expr.return_bool {
+            sample.metric.clear();
+            sample.value = if matched { 1.0 } else { 0.0 };
+        } else if !matched {
+            return Ok(None);
+        } else if !result_on_rhs && expr.matching.as_ref().is_some_and(|m| m.on) {
+            sample.metric.clear();
+        }
+    } else {
+        sample.metric.clear();
+        sample.value = arithmetic(expr.op, lhs.value, rhs.value)?;
+    }
+
+    if let Some(matching) = expr.matching.as_ref() {
+        if result_on_rhs {
+            include_labels_from_one_side(&mut sample.labels, lhs, &matching.include_labels);
+        } else if matching.cardinality == VectorMatchCardinality::ManyToOne {
+            include_labels_from_one_side(&mut sample.labels, rhs, &matching.include_labels);
+        }
+    }
+
+    Ok(Some(sample))
+}
+
 fn build_sample_map(
     samples: &[Sample],
     matching: Option<&VectorMatching>,
-) -> BTreeMap<String, Sample> {
+) -> BTreeMap<Vec<u8>, Sample> {
     let mut out = BTreeMap::new();
     for sample in samples {
         out.entry(sample_key(sample, matching))
@@ -243,10 +327,23 @@ fn build_sample_map(
     out
 }
 
+fn build_sample_groups(
+    samples: &[Sample],
+    matching: Option<&VectorMatching>,
+) -> BTreeMap<Vec<u8>, Vec<Sample>> {
+    let mut out = BTreeMap::new();
+    for sample in samples {
+        out.entry(sample_key(sample, matching))
+            .or_insert_with(Vec::new)
+            .push(sample.clone());
+    }
+    out
+}
+
 fn build_sample_count_map(
     samples: &[Sample],
     matching: Option<&VectorMatching>,
-) -> BTreeMap<String, usize> {
+) -> BTreeMap<Vec<u8>, usize> {
     let mut out = BTreeMap::new();
     for sample in samples {
         *out.entry(sample_key(sample, matching)).or_insert(0) += 1;
@@ -254,37 +351,79 @@ fn build_sample_count_map(
     out
 }
 
-fn sample_key(sample: &Sample, matching: Option<&VectorMatching>) -> String {
-    let mut labels = sample.labels.clone();
-    labels.sort();
-
+fn sample_key(sample: &Sample, matching: Option<&VectorMatching>) -> Vec<u8> {
     match matching {
-        None => key_from_labels(&labels),
+        None => canonical_series_identity("", &sample.labels),
         Some(m) if m.on => {
             let wanted: BTreeSet<&str> = m.labels.iter().map(|s| s.as_str()).collect();
-            let selected = labels
-                .into_iter()
+            let selected = sample
+                .labels
+                .iter()
                 .filter(|l| wanted.contains(l.name.as_str()))
+                .cloned()
                 .collect::<Vec<_>>();
-            key_from_labels(&selected)
+            canonical_series_identity("", &selected)
         }
         Some(m) => {
             let ignored: BTreeSet<&str> = m.labels.iter().map(|s| s.as_str()).collect();
-            let selected = labels
-                .into_iter()
+            let selected = sample
+                .labels
+                .iter()
                 .filter(|l| !ignored.contains(l.name.as_str()))
+                .cloned()
                 .collect::<Vec<_>>();
-            key_from_labels(&selected)
+            canonical_series_identity("", &selected)
         }
     }
 }
 
-fn key_from_labels(labels: &[Label]) -> String {
-    labels
-        .iter()
-        .map(|l| format!("{}={}", l.name, l.value))
-        .collect::<Vec<_>>()
-        .join("\u{1f}")
+fn binary_op_name(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Atan2 => "atan2",
+        BinaryOp::Pow => "^",
+        BinaryOp::Eq => "==",
+        BinaryOp::NotEq => "!=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Gt => ">",
+        BinaryOp::Lte => "<=",
+        BinaryOp::Gte => ">=",
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Unless => "unless",
+    }
+}
+
+fn matching_cardinality(matching: Option<&VectorMatching>) -> VectorMatchCardinality {
+    matching
+        .map(|matching| matching.cardinality)
+        .unwrap_or(VectorMatchCardinality::OneToOne)
+}
+
+fn include_labels_from_one_side(base: &mut Vec<Label>, source: &Sample, labels: &[String]) {
+    for label_name in labels {
+        if let Some(value) = source
+            .labels
+            .iter()
+            .find(|label| label.name == *label_name)
+            .map(|label| label.value.clone())
+        {
+            set_label(base, label_name, &value);
+        }
+    }
+}
+
+fn set_label(labels: &mut Vec<Label>, name: &str, value: &str) {
+    if let Some(label) = labels.iter_mut().find(|label| label.name == name) {
+        label.value = value.to_string();
+    } else {
+        labels.push(Label::new(name.to_string(), value.to_string()));
+        labels.sort();
+    }
 }
 
 fn arithmetic(op: BinaryOp, lhs: f64, rhs: f64) -> Result<f64> {
@@ -294,6 +433,7 @@ fn arithmetic(op: BinaryOp, lhs: f64, rhs: f64) -> Result<f64> {
         BinaryOp::Mul => Ok(lhs * rhs),
         BinaryOp::Div => Ok(lhs / rhs),
         BinaryOp::Mod => Ok(lhs % rhs),
+        BinaryOp::Atan2 => Ok(lhs.atan2(rhs)),
         BinaryOp::Pow => Ok(lhs.powf(rhs)),
         _ => Err(PromqlError::Type(format!(
             "operator {:?} is not an arithmetic operator",

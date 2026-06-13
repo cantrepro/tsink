@@ -4,17 +4,14 @@ use crate::TsinkError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-/// Maximum length of label name.
 pub const MAX_LABEL_NAME_LEN: usize = 256;
 
-/// Maximum length of label value.
 pub const MAX_LABEL_VALUE_LEN: usize = 16 * 1024;
 
 /// Maximum metric-name length that can be marshaled losslessly by the current binary format.
 pub const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 
-/// A time-series label.
-/// A label with missing name or value is invalid.
+/// Metric label. Empty names or values are invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Label {
     pub name: String,
@@ -22,9 +19,7 @@ pub struct Label {
 }
 
 impl Label {
-    /// Creates a new label without mutating the provided bytes.
-    ///
-    /// Validation of emptiness/length limits is enforced at ingest/query boundaries.
+    /// Validation of emptiness and length limits happens at ingest/query boundaries.
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -32,7 +27,6 @@ impl Label {
         }
     }
 
-    /// Checks if the label is valid (both name and value are non-empty).
     pub fn is_valid(&self) -> bool {
         !self.name.is_empty() && !self.value.is_empty()
     }
@@ -51,6 +45,27 @@ impl PartialOrd for Label {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Computes a collision-safe canonical binary identity for a metric series.
+pub fn canonical_series_identity(metric: &str, labels: &[Label]) -> Vec<u8> {
+    marshal_metric_name(metric, labels)
+}
+
+/// Computes a collision-safe canonical string key for a metric series.
+pub fn canonical_series_identity_key(metric: &str, labels: &[Label]) -> String {
+    fn push_hex_byte(out: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+
+    let canonical = canonical_series_identity(metric, labels);
+    let mut encoded = String::with_capacity(canonical.len() * 2);
+    for byte in canonical {
+        push_hex_byte(&mut encoded, byte);
+    }
+    encoded
 }
 
 /// Marshals a metric name and labels into a unique binary identifier.
@@ -89,6 +104,17 @@ pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> Vec<u8> {
     }
 
     out
+}
+
+/// Computes a stable 64-bit hash for a metric series identity.
+pub fn stable_series_identity_hash(metric: &str, labels: &[Label]) -> u64 {
+    let canonical = canonical_series_identity(metric, labels);
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in canonical {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Unmarshals a metric name back into metric and labels.
@@ -304,5 +330,42 @@ mod tests {
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].name.len(), 1000);
         assert_eq!(labels[0].value, "v");
+    }
+
+    #[test]
+    fn stable_series_hash_is_order_invariant_for_labels() {
+        let left =
+            stable_series_identity_hash("metric", &[Label::new("b", "2"), Label::new("a", "1")]);
+        let right =
+            stable_series_identity_hash("metric", &[Label::new("a", "1"), Label::new("b", "2")]);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn canonical_series_identity_key_is_order_invariant_for_labels() {
+        let left =
+            canonical_series_identity_key("metric", &[Label::new("b", "2"), Label::new("a", "1")]);
+        let right =
+            canonical_series_identity_key("metric", &[Label::new("a", "1"), Label::new("b", "2")]);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn canonical_series_identity_key_distinguishes_delimiter_collision_cases() {
+        let left = canonical_series_identity_key(
+            "metric",
+            &[Label::new("job", "api,zone=west|prod\u{1f}blue")],
+        );
+        let right = canonical_series_identity_key(
+            "metric",
+            &[
+                Label::new("job", "api"),
+                Label::new("zone", "west|prod\u{1f}blue"),
+            ],
+        );
+
+        assert_ne!(left, right);
     }
 }

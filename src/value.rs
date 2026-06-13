@@ -6,6 +6,100 @@ use std::fmt;
 use std::iter::Sum;
 use std::ops::{Div, Sub};
 
+fn f64_eq(lhs: f64, rhs: f64) -> bool {
+    lhs == rhs || (lhs.is_nan() && rhs.is_nan())
+}
+
+fn f64_slice_eq(lhs: &[f64], rhs: &[f64]) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs)
+            .all(|(left, right)| f64_eq(*left, *right))
+}
+
+/// Count representation for a native histogram sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HistogramCount {
+    Int(u64),
+    Float(f64),
+}
+
+impl PartialEq for HistogramCount {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(lhs), Self::Int(rhs)) => lhs == rhs,
+            (Self::Float(lhs), Self::Float(rhs)) => f64_eq(*lhs, *rhs),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HistogramCount {}
+
+impl HistogramCount {
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            Self::Int(value) => *value as f64,
+            Self::Float(value) => *value,
+        }
+    }
+}
+
+/// Sparse bucket span used by native histogram payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistogramBucketSpan {
+    pub offset: i32,
+    pub length: u32,
+}
+
+/// Reset hint attached to a native histogram sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistogramResetHint {
+    Unknown,
+    Yes,
+    No,
+    Gauge,
+}
+
+/// First-class native histogram payload stored inside a data point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeHistogram {
+    pub count: Option<HistogramCount>,
+    pub sum: f64,
+    pub schema: i32,
+    pub zero_threshold: f64,
+    pub zero_count: Option<HistogramCount>,
+    pub negative_spans: Vec<HistogramBucketSpan>,
+    pub negative_deltas: Vec<i64>,
+    pub negative_counts: Vec<f64>,
+    pub positive_spans: Vec<HistogramBucketSpan>,
+    pub positive_deltas: Vec<i64>,
+    pub positive_counts: Vec<f64>,
+    pub reset_hint: HistogramResetHint,
+    pub custom_values: Vec<f64>,
+}
+
+impl PartialEq for NativeHistogram {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count
+            && f64_eq(self.sum, other.sum)
+            && self.schema == other.schema
+            && f64_eq(self.zero_threshold, other.zero_threshold)
+            && self.zero_count == other.zero_count
+            && self.negative_spans == other.negative_spans
+            && self.negative_deltas == other.negative_deltas
+            && f64_slice_eq(&self.negative_counts, &other.negative_counts)
+            && self.positive_spans == other.positive_spans
+            && self.positive_deltas == other.positive_deltas
+            && f64_slice_eq(&self.positive_counts, &other.positive_counts)
+            && self.reset_hint == other.reset_hint
+            && f64_slice_eq(&self.custom_values, &other.custom_values)
+    }
+}
+
+impl Eq for NativeHistogram {}
+
 /// Typed payload value stored in a data point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
@@ -15,6 +109,7 @@ pub enum Value {
     Bool(bool),
     Bytes(Vec<u8>),
     String(String),
+    Histogram(Box<NativeHistogram>),
 }
 
 const F64_EXACT_INT_BITS: u32 = f64::MANTISSA_DIGITS;
@@ -49,12 +144,13 @@ pub(crate) fn i64_to_f64_exact(value: i64) -> Option<f64> {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::F64(a), Value::F64(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Value::F64(a), Value::F64(b)) => f64_eq(*a, *b),
             (Value::I64(a), Value::I64(b)) => a == b,
             (Value::U64(a), Value::U64(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
+            (Value::Histogram(a), Value::Histogram(b)) => a == b,
             _ => false,
         }
     }
@@ -63,7 +159,6 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl Value {
-    /// Returns the value kind name.
     pub fn kind(&self) -> &'static str {
         match self {
             Value::F64(_) => "f64",
@@ -72,10 +167,10 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Bytes(_) => "bytes",
             Value::String(_) => "string",
+            Value::Histogram(_) => "histogram",
         }
     }
 
-    /// Returns the value converted to f64 when numeric and exactly representable.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::F64(v) => Some(*v),
@@ -85,7 +180,6 @@ impl Value {
         }
     }
 
-    /// Returns the value as i64 when exactly representable.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::I64(v) => Some(*v),
@@ -94,7 +188,6 @@ impl Value {
         }
     }
 
-    /// Returns the value as u64 when exactly representable.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::U64(v) => Some(*v),
@@ -103,7 +196,6 @@ impl Value {
         }
     }
 
-    /// Returns the value as bool.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(v) => Some(*v),
@@ -111,7 +203,6 @@ impl Value {
         }
     }
 
-    /// Returns the value as a borrowed byte slice.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Bytes(v) => Some(v.as_slice()),
@@ -119,10 +210,16 @@ impl Value {
         }
     }
 
-    /// Returns the value as a borrowed string slice.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_histogram(&self) -> Option<&NativeHistogram> {
+        match self {
+            Value::Histogram(histogram) => Some(histogram.as_ref()),
             _ => None,
         }
     }
@@ -153,6 +250,7 @@ impl fmt::Display for Value {
             Value::Bool(v) => write!(f, "{v}"),
             Value::Bytes(v) => write!(f, "bytes(len={})", v.len()),
             Value::String(v) => write!(f, "{v}"),
+            Value::Histogram(_) => write!(f, "histogram"),
         }
     }
 }
@@ -220,6 +318,12 @@ impl From<String> for Value {
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
         Value::String(value.to_string())
+    }
+}
+
+impl From<NativeHistogram> for Value {
+    fn from(value: NativeHistogram) -> Self {
+        Value::Histogram(Box::new(value))
     }
 }
 
@@ -399,6 +503,27 @@ mod tests {
 
     #[test]
     fn value_accessors_and_kind_cover_all_variants() {
+        let histogram = NativeHistogram {
+            count: Some(HistogramCount::Int(3)),
+            sum: 1.5,
+            schema: 1,
+            zero_threshold: 0.0,
+            zero_count: Some(HistogramCount::Float(f64::NAN)),
+            negative_spans: vec![HistogramBucketSpan {
+                offset: -1,
+                length: 2,
+            }],
+            negative_deltas: vec![1, -2],
+            negative_counts: vec![1.0, f64::NAN],
+            positive_spans: vec![HistogramBucketSpan {
+                offset: 0,
+                length: 1,
+            }],
+            positive_deltas: vec![3],
+            positive_counts: vec![2.5],
+            reset_hint: HistogramResetHint::No,
+            custom_values: vec![0.25, f64::NAN],
+        };
         let cases = [
             (Value::F64(1.5), "f64"),
             (Value::I64(-7), "i64"),
@@ -406,6 +531,7 @@ mod tests {
             (Value::Bool(true), "bool"),
             (Value::Bytes(vec![1, 2]), "bytes"),
             (Value::String("x".to_string()), "string"),
+            (Value::from(histogram.clone()), "histogram"),
         ];
 
         for (value, expected_kind) in cases {
@@ -418,6 +544,10 @@ mod tests {
         assert_eq!(Value::Bool(true).as_bool(), Some(true));
         assert_eq!(Value::Bytes(vec![1, 2]).as_bytes(), Some(&[1, 2][..]));
         assert_eq!(Value::String("x".to_string()).as_str(), Some("x"));
+        assert_eq!(
+            Value::from(histogram.clone()).as_histogram(),
+            Some(&histogram)
+        );
     }
 
     #[test]
@@ -434,6 +564,31 @@ mod tests {
     fn value_equality_treats_nan_values_as_equal() {
         assert_eq!(Value::F64(f64::NAN), Value::F64(f64::NAN));
         assert_ne!(Value::F64(f64::NAN), Value::F64(1.0));
+
+        let left = NativeHistogram {
+            count: Some(HistogramCount::Float(f64::NAN)),
+            sum: f64::NAN,
+            schema: 4,
+            zero_threshold: f64::NAN,
+            zero_count: Some(HistogramCount::Float(f64::NAN)),
+            negative_spans: vec![HistogramBucketSpan {
+                offset: -2,
+                length: 1,
+            }],
+            negative_deltas: vec![1],
+            negative_counts: vec![f64::NAN],
+            positive_spans: vec![HistogramBucketSpan {
+                offset: 1,
+                length: 2,
+            }],
+            positive_deltas: vec![2, 3],
+            positive_counts: vec![f64::NAN, 4.0],
+            reset_hint: HistogramResetHint::Gauge,
+            custom_values: vec![f64::NAN],
+        };
+        let right = left.clone();
+
+        assert_eq!(Value::from(left), Value::from(right));
     }
 
     #[test]

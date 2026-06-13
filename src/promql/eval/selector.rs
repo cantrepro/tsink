@@ -5,18 +5,23 @@ use regex::Regex;
 
 use crate::promql::ast::{MatchOp, MatrixSelector, VectorSelector};
 use crate::promql::error::{PromqlError, Result};
-use crate::promql::types::{value_to_f64, PromqlValue, Sample, Series};
+use crate::promql::types::{is_stale_nan_value, value_to_f64, PromqlValue, Sample, Series};
 
 use super::time::duration_to_units;
-use super::{Engine, QueryParams};
+use super::{resolve_at_modifier, Engine, QueryParams};
 
 pub(crate) fn eval_vector_selector(
     engine: &Engine,
     selector: &VectorSelector,
     params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
+    let base_eval = resolve_at_modifier(
+        selector.at.as_ref(),
+        params,
+        engine.timestamp_units_per_second(),
+    )?;
     let offset = duration_to_units(selector.offset, engine.timestamp_units_per_second());
-    let eval_at = params.eval_time.saturating_sub(offset);
+    let eval_at = base_eval.saturating_sub(offset);
     let start = eval_at.saturating_sub(engine.default_lookback_delta());
     let end = eval_at.saturating_add(1);
 
@@ -50,8 +55,13 @@ pub(crate) fn eval_matrix_selector(
     selector: &MatrixSelector,
     params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
+    let base_eval = resolve_at_modifier(
+        selector.vector.at.as_ref(),
+        params,
+        engine.timestamp_units_per_second(),
+    )?;
     let offset = duration_to_units(selector.vector.offset, engine.timestamp_units_per_second());
-    let eval_at = params.eval_time.saturating_sub(offset);
+    let eval_at = base_eval.saturating_sub(offset);
     let range = duration_to_units(selector.range, engine.timestamp_units_per_second());
     let start = eval_at.saturating_sub(range);
     let end = eval_at.saturating_add(1);
@@ -65,14 +75,21 @@ pub(crate) fn eval_matrix_selector(
                 let samples = points
                     .into_iter()
                     .filter(|p| p.timestamp >= start && p.timestamp < end)
-                    .map(|p| (p.timestamp, value_to_f64(&p.value)))
-                    .collect::<Vec<_>>();
-                if !samples.is_empty() {
-                    out.push(Series {
-                        metric: metric.clone(),
-                        labels,
-                        samples,
+                    .filter(|p| !is_stale_nan_value(&p.value))
+                    .fold(Series::new(metric.clone(), labels), |mut series, point| {
+                        if let Some(histogram) = point.value.as_histogram() {
+                            series
+                                .histograms
+                                .push((point.timestamp, Box::new(histogram.clone())));
+                        } else {
+                            series
+                                .samples
+                                .push((point.timestamp, value_to_f64(&point.value)));
+                        }
+                        series
                     });
+                if !samples.samples.is_empty() || !samples.histograms.is_empty() {
+                    out.push(samples);
                 }
                 return Ok(PromqlValue::RangeVector(out));
             }
@@ -95,12 +112,12 @@ fn candidate_metrics(engine: &Engine, selector: &VectorSelector) -> Result<Vec<S
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine.storage().list_metrics()?;
+    let all = engine
+        .storage()
+        .select_series(&selection_from_promql_matchers(&selector.matchers))?;
     let mut metrics = BTreeSet::new();
     for series in all {
-        if matchers_match(&series.name, &series.labels, &selector.matchers)? {
-            metrics.insert(series.name);
-        }
+        metrics.insert(series.name);
     }
     Ok(metrics.into_iter().collect())
 }
@@ -110,12 +127,12 @@ fn candidate_metrics_for_matrix(engine: &Engine, selector: &MatrixSelector) -> R
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine.storage().list_metrics()?;
+    let all = engine
+        .storage()
+        .select_series(&selection_from_promql_matchers(&selector.vector.matchers))?;
     let mut metrics = BTreeSet::new();
     for series in all {
-        if matchers_match(&series.name, &series.labels, &selector.vector.matchers)? {
-            metrics.insert(series.name);
-        }
+        metrics.insert(series.name);
     }
     Ok(metrics.into_iter().collect())
 }
@@ -134,17 +151,22 @@ fn collect_instant_samples_for_metric(
         if !matchers_match(metric, &labels, &selector.matchers)? {
             continue;
         }
-        if let Some(point) = points
-            .into_iter()
-            .filter(|p| p.timestamp >= start && p.timestamp < end)
-            .max_by_key(|p| p.timestamp)
-        {
-            out.push(Sample {
-                metric: metric.to_string(),
-                labels,
-                timestamp: point.timestamp,
-                value: value_to_f64(&point.value),
-            });
+        if let Some(point) = latest_instant_point(points, start, end) {
+            if let Some(histogram) = point.value.as_histogram() {
+                out.push(Sample::from_histogram(
+                    metric.to_string(),
+                    labels,
+                    point.timestamp,
+                    histogram.clone(),
+                ));
+            } else {
+                out.push(Sample::from_float(
+                    metric.to_string(),
+                    labels,
+                    point.timestamp,
+                    value_to_f64(&point.value),
+                ));
+            }
         }
     }
 
@@ -166,18 +188,28 @@ fn collect_range_series_for_metric(
             continue;
         }
 
-        let samples = points
+        let series = points
             .into_iter()
             .filter(|p| p.timestamp >= start && p.timestamp < end)
-            .map(|p| (p.timestamp, value_to_f64(&p.value)))
-            .collect::<Vec<_>>();
+            .filter(|p| !is_stale_nan_value(&p.value))
+            .fold(
+                Series::new(metric.to_string(), labels),
+                |mut series, point| {
+                    if let Some(histogram) = point.value.as_histogram() {
+                        series
+                            .histograms
+                            .push((point.timestamp, Box::new(histogram.clone())));
+                    } else {
+                        series
+                            .samples
+                            .push((point.timestamp, value_to_f64(&point.value)));
+                    }
+                    series
+                },
+            );
 
-        if !samples.is_empty() {
-            out.push(Series {
-                metric: metric.to_string(),
-                labels,
-                samples,
-            });
+        if !series.samples.is_empty() || !series.histograms.is_empty() {
+            out.push(series);
         }
     }
 
@@ -225,16 +257,44 @@ fn latest_point_as_sample(
     start: i64,
     end: i64,
 ) -> Option<Sample> {
-    points
-        .into_iter()
-        .filter(|p| p.timestamp >= start && p.timestamp < end)
-        .max_by_key(|p| p.timestamp)
-        .map(|point| Sample {
-            metric: metric.to_string(),
-            labels,
-            timestamp: point.timestamp,
-            value: value_to_f64(&point.value),
-        })
+    latest_instant_point(points, start, end).map(|point| {
+        if let Some(histogram) = point.value.as_histogram() {
+            Sample::from_histogram(
+                metric.to_string(),
+                labels,
+                point.timestamp,
+                histogram.clone(),
+            )
+        } else {
+            Sample::from_float(
+                metric.to_string(),
+                labels,
+                point.timestamp,
+                value_to_f64(&point.value),
+            )
+        }
+    })
+}
+
+fn latest_instant_point(points: Vec<DataPoint>, start: i64, end: i64) -> Option<DataPoint> {
+    let mut latest: Option<DataPoint> = None;
+    for point in points {
+        if point.timestamp < start || point.timestamp >= end {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_some_and(|current| current.timestamp >= point.timestamp)
+        {
+            continue;
+        }
+        latest = Some(point);
+    }
+
+    match latest {
+        Some(point) if is_stale_nan_value(&point.value) => None,
+        other => other,
+    }
 }
 
 fn exact_equal_labels(
@@ -265,6 +325,26 @@ fn exact_equal_labels(
     }
     out.sort();
     Some(out)
+}
+
+fn selection_from_promql_matchers(
+    matchers: &[crate::promql::ast::LabelMatcher],
+) -> SeriesSelection {
+    let mut selection = SeriesSelection::new();
+    for matcher in matchers {
+        let op = match matcher.op {
+            MatchOp::Equal => crate::storage::SeriesMatcherOp::Equal,
+            MatchOp::NotEqual => crate::storage::SeriesMatcherOp::NotEqual,
+            MatchOp::RegexMatch => crate::storage::SeriesMatcherOp::RegexMatch,
+            MatchOp::RegexNoMatch => crate::storage::SeriesMatcherOp::RegexNoMatch,
+        };
+        selection = selection.with_matcher(SeriesMatcher::new(
+            matcher.name.clone(),
+            op,
+            matcher.value.clone(),
+        ));
+    }
+    selection
 }
 
 fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<bool> {

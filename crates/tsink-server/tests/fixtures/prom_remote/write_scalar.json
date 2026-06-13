@@ -1,0 +1,33 @@
+{
+  "metadata": [],
+  "timeseries": [
+    {
+      "exemplars": [],
+      "histograms": [],
+      "labels": [
+        {
+          "name": "__name__",
+          "value": "cpu_usage_seconds_total"
+        },
+        {
+          "name": "job",
+          "value": "api"
+        },
+        {
+          "name": "instance",
+          "value": "node-a"
+        }
+      ],
+      "samples": [
+        {
+          "timestamp": 1700000000000,
+          "value": 123.5
+        },
+        {
+          "timestamp": 1700000060000,
+          "value": 124.0
+        }
+      ]
+    }
+  ]
+}

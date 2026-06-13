@@ -1,13 +1,9 @@
-//! Architecture-specific memory-mapped file support
-//!
-//! This module provides platform and architecture-specific memory mapping
-//! implementations with appropriate size limits.
+//! Platform-aware memory-mapped file helpers.
 
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::io;
 
-/// Maximum map size for different architectures
 #[cfg(target_arch = "x86")]
 pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
@@ -28,20 +24,15 @@ pub const MAX_MAP_SIZE: usize = usize::MAX;
 )))]
 pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
-/// Platform-specific memory mapping
 pub struct PlatformMmap {
     mmap: Mmap,
-    #[allow(dead_code)]
-    file: File,
 }
 
 impl PlatformMmap {
-    /// Creates a new memory-mapped file with architecture-specific limits
     pub fn new(file: File, length: usize) -> io::Result<Self> {
         Self::create_map(file, length)
     }
 
-    /// Creates a read-only memory-mapped file
     pub fn new_readonly(file: File, length: usize) -> io::Result<Self> {
         Self::create_map(file, length)
     }
@@ -62,38 +53,33 @@ impl PlatformMmap {
         }
 
         let mmap = unsafe { MmapOptions::new().len(length).map(&file)? };
+        drop(file);
 
-        Ok(PlatformMmap { mmap, file })
+        Ok(PlatformMmap { mmap })
     }
 
-    /// Returns the memory-mapped data as a byte slice
     pub fn as_slice(&self) -> &[u8] {
         &self.mmap[..]
     }
 
-    /// Returns the length of the mapped region
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
 
-    /// Checks if the mapped region is empty
     pub fn is_empty(&self) -> bool {
         self.mmap.is_empty()
     }
 }
 
-/// Platform-specific optimizations for Windows
 #[cfg(target_os = "windows")]
 pub mod windows {
     use super::*;
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
-    /// Windows-specific flags for file access
     pub const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
     pub const FILE_FLAG_RANDOM_ACCESS: u32 = 0x10000000;
 
-    /// Opens a file optimized for sequential scanning
     pub fn open_sequential(path: &std::path::Path) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -101,7 +87,6 @@ pub mod windows {
             .open(path)
     }
 
-    /// Opens a file optimized for random access
     pub fn open_random(path: &std::path::Path) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -110,21 +95,18 @@ pub mod windows {
     }
 }
 
-/// Platform-specific optimizations for Unix-like systems
 #[cfg(unix)]
 pub mod unix {
     use super::*;
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
-    /// Unix-specific flags for file access
     #[cfg(target_os = "linux")]
     pub const O_NOATIME: i32 = 0o1000000;
 
     #[cfg(not(target_os = "linux"))]
     pub const O_NOATIME: i32 = 0;
 
-    /// Opens a file with platform-specific optimizations
     pub fn open_optimized(path: &std::path::Path) -> io::Result<File> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -135,7 +117,6 @@ pub mod unix {
         options.open(path)
     }
 
-    /// Advises the kernel about memory access patterns
     pub fn madvise_sequential(mmap: &Mmap) -> io::Result<()> {
         use libc::{madvise, MADV_SEQUENTIAL};
 
@@ -154,7 +135,6 @@ pub mod unix {
         Ok(())
     }
 
-    /// Advises the kernel to expect random access patterns
     pub fn madvise_random(mmap: &Mmap) -> io::Result<()> {
         use libc::{madvise, MADV_RANDOM};
 
@@ -167,7 +147,6 @@ pub mod unix {
         Ok(())
     }
 
-    /// Advises the kernel that we will need this memory soon
     pub fn madvise_willneed(mmap: &Mmap) -> io::Result<()> {
         use libc::{madvise, MADV_WILLNEED};
 
@@ -187,7 +166,6 @@ pub mod unix {
     }
 }
 
-/// Helper function to create an appropriate memory map for the current platform
 pub fn create_mmap(file: File) -> io::Result<PlatformMmap> {
     let metadata = file.metadata()?;
     let file_len = metadata.len();
@@ -205,7 +183,6 @@ pub fn create_mmap(file: File) -> io::Result<PlatformMmap> {
     PlatformMmap::new(file, length)
 }
 
-/// Helper function to get the maximum safe mmap size for the current platform
 pub fn get_max_mmap_size() -> usize {
     MAX_MAP_SIZE
 }
@@ -213,7 +190,9 @@ pub fn get_max_mmap_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
+    use std::os::unix::io::AsRawFd;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -237,6 +216,31 @@ mod tests {
 
         assert_eq!(mmap.len(), data.len());
         assert_eq!(mmap.as_slice(), data);
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_platform_mmap_does_not_retain_file_descriptor() -> io::Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        let data = b"fd-leak-regression";
+        temp_file.write_all(data)?;
+        temp_file.flush()?;
+
+        let file = temp_file.reopen()?;
+        let reopened_fd = file.as_raw_fd();
+        let reopened_fd_path = format!("/proc/self/fd/{reopened_fd}");
+        let reopened_target = fs::read_link(&reopened_fd_path)?;
+        let mmap = PlatformMmap::new(file, data.len())?;
+
+        assert_eq!(mmap.as_slice(), data);
+        if let Ok(current_target) = fs::read_link(&reopened_fd_path) {
+            assert_ne!(
+                current_target, reopened_target,
+                "memory-mapped segments should not retain an open file descriptor"
+            );
+        }
 
         Ok(())
     }

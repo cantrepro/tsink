@@ -2,12 +2,13 @@ mod aggregation;
 mod binary;
 mod functions;
 mod selector;
+mod subquery;
 pub mod time;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::promql::ast::{Expr, MatrixSelector, UnaryOp, VectorSelector};
+use crate::promql::ast::{AtModifier, Expr, MatrixSelector, SubqueryExpr, UnaryOp, VectorSelector};
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::types::{PromqlValue, Series};
 use crate::{DataPoint, Label, Storage, TimestampPrecision};
@@ -15,11 +16,12 @@ use crate::{DataPoint, Label, Storage, TimestampPrecision};
 use self::time::{duration_to_units, step_times};
 
 const DEFAULT_LOOKBACK_DELTA_MS: i64 = 5 * 60 * 1_000;
+const DEFAULT_SUBQUERY_STEP_MS: i64 = 60 * 1_000;
 
 type LabelPoints = (Vec<Label>, Vec<DataPoint>);
 type MetricPrefetchRows = Vec<LabelPoints>;
 type RangeSeriesKey = (String, Vec<Label>);
-type RangeSeriesSamples = Vec<(i64, f64)>;
+type RangeSeriesAccumulator = Series;
 
 pub struct Engine {
     storage: Arc<dyn Storage>,
@@ -31,6 +33,9 @@ pub struct Engine {
 pub(crate) struct QueryParams<'a> {
     pub eval_time: i64,
     pub prefetch: Option<&'a PrefetchCache>,
+    pub query_start: i64,
+    pub query_end: i64,
+    pub query_step: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -73,6 +78,9 @@ impl Engine {
         let params = QueryParams {
             eval_time: time,
             prefetch: None,
+            query_start: time,
+            query_end: time,
+            query_step: None,
         };
         self.eval(&expr, &params)
     }
@@ -94,57 +102,77 @@ impl Engine {
         }
 
         let expr = crate::promql::parse(query_str)?;
-        let prefetch = self.build_prefetch_cache(&expr, start, end)?;
+        let prefetch = if self.supports_prefetch(&expr) {
+            Some(self.build_prefetch_cache(&expr, start, end)?)
+        } else {
+            None
+        };
 
-        let mut out: BTreeMap<RangeSeriesKey, RangeSeriesSamples> = BTreeMap::new();
+        let mut out: BTreeMap<RangeSeriesKey, RangeSeriesAccumulator> = BTreeMap::new();
         for ts in step_times(start, end, step) {
             let params = QueryParams {
                 eval_time: ts,
-                prefetch: Some(&prefetch),
+                prefetch: prefetch.as_ref(),
+                query_start: start,
+                query_end: end,
+                query_step: Some(step),
             };
             let val = self.eval(&expr, &params)?;
             Self::append_step_value(&mut out, ts, val);
         }
 
-        let series = out
-            .into_iter()
-            .map(|((metric, labels), samples)| Series {
-                metric,
-                labels,
-                samples,
-            })
-            .collect();
+        let series = out.into_values().collect();
 
         Ok(PromqlValue::RangeVector(series))
     }
 
     fn append_step_value(
-        out: &mut BTreeMap<RangeSeriesKey, RangeSeriesSamples>,
+        out: &mut BTreeMap<RangeSeriesKey, RangeSeriesAccumulator>,
         step_ts: i64,
         value: PromqlValue,
     ) {
         match value {
             PromqlValue::Scalar(v, _) => {
                 out.entry((String::new(), Vec::new()))
-                    .or_default()
+                    .or_insert_with(|| Series::new(String::new(), Vec::new()))
+                    .samples
                     .push((step_ts, v));
             }
             PromqlValue::InstantVector(samples) => {
                 for sample in samples {
-                    let mut labels = sample.labels;
+                    let metric = sample.metric;
+                    let labels = sample.labels;
+                    let histogram = sample.histogram;
+                    let value = sample.value;
+                    let mut labels = labels;
                     labels.sort();
-                    out.entry((sample.metric, labels))
-                        .or_default()
-                        .push((step_ts, sample.value));
+                    let entry = out
+                        .entry((metric.clone(), labels.clone()))
+                        .or_insert_with(|| Series::new(metric, labels));
+                    if let Some(histogram) = histogram {
+                        entry.histograms.push((step_ts, histogram));
+                    } else {
+                        entry.samples.push((step_ts, value));
+                    }
                 }
             }
             PromqlValue::RangeVector(series) => {
-                for mut s in series {
-                    if let Some((_, v)) = s.samples.pop() {
-                        s.labels.sort();
-                        out.entry((s.metric, s.labels))
-                            .or_default()
-                            .push((step_ts, v));
+                for mut series in series {
+                    let latest_float = series.samples.last().cloned();
+                    let latest_histogram = series.histograms.last().cloned();
+                    let Some(latest_point) = latest_series_point(latest_float, latest_histogram)
+                    else {
+                        continue;
+                    };
+                    series.labels.sort();
+                    let entry = out
+                        .entry((series.metric.clone(), series.labels.clone()))
+                        .or_insert_with(|| Series::new(series.metric, series.labels));
+                    match latest_point {
+                        LatestSeriesPoint::Float(value) => entry.samples.push((step_ts, value)),
+                        LatestSeriesPoint::Histogram(histogram) => {
+                            entry.histograms.push((step_ts, histogram))
+                        }
                     }
                 }
             }
@@ -163,10 +191,12 @@ impl Engine {
             Expr::MatrixSelector(selector) => {
                 selector::eval_matrix_selector(self, selector, params)
             }
+            Expr::Subquery(subquery) => subquery::eval_subquery(self, subquery, params),
             Expr::Unary(unary) => {
                 let value = self.eval(&unary.expr, params)?;
                 match unary.op {
-                    UnaryOp::Neg => Ok(negate_value(value)),
+                    UnaryOp::Pos => Ok(value),
+                    UnaryOp::Neg => negate_value(value),
                 }
             }
             Expr::Binary(binary) => binary::eval_binary(self, binary, params),
@@ -187,6 +217,10 @@ impl Engine {
         self.timestamp_units_per_second
     }
 
+    pub(crate) fn default_subquery_step(&self) -> i64 {
+        duration_to_units(DEFAULT_SUBQUERY_STEP_MS, self.timestamp_units_per_second)
+    }
+
     fn build_prefetch_cache(&self, expr: &Expr, start: i64, end: i64) -> Result<PrefetchCache> {
         let mut metrics = BTreeSet::new();
         let mut max_window = self.default_lookback_delta;
@@ -202,6 +236,10 @@ impl Engine {
         }
 
         Ok(cache)
+    }
+
+    fn supports_prefetch(&self, expr: &Expr) -> bool {
+        !expr_uses_dynamic_time(expr)
     }
 
     fn collect_prefetch_requirements(
@@ -250,29 +288,117 @@ impl Engine {
                     self.collect_prefetch_requirements(arg, metrics, max_window);
                 }
             }
+            Expr::Subquery(SubqueryExpr { expr, .. }) => {
+                self.collect_prefetch_requirements(expr, metrics, max_window)
+            }
             Expr::Paren(inner) => self.collect_prefetch_requirements(inner, metrics, max_window),
             Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
         }
     }
 }
 
-fn negate_value(value: PromqlValue) -> PromqlValue {
+fn expr_uses_dynamic_time(expr: &Expr) -> bool {
+    match expr {
+        Expr::VectorSelector(selector) => selector.at.is_some(),
+        Expr::MatrixSelector(selector) => selector.vector.at.is_some(),
+        Expr::Subquery(_) => true,
+        Expr::Unary(unary) => expr_uses_dynamic_time(&unary.expr),
+        Expr::Binary(binary) => {
+            expr_uses_dynamic_time(&binary.lhs) || expr_uses_dynamic_time(&binary.rhs)
+        }
+        Expr::Aggregation(aggregation) => {
+            aggregation
+                .param
+                .as_ref()
+                .is_some_and(|param| expr_uses_dynamic_time(param))
+                || expr_uses_dynamic_time(&aggregation.expr)
+        }
+        Expr::Call(call) => call.args.iter().any(expr_uses_dynamic_time),
+        Expr::Paren(inner) => expr_uses_dynamic_time(inner),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+    }
+}
+
+pub(crate) fn resolve_at_modifier(
+    at: Option<&AtModifier>,
+    params: &QueryParams<'_>,
+    units_per_second: i64,
+) -> Result<i64> {
+    match at {
+        None => Ok(params.eval_time),
+        Some(AtModifier::Start) => Ok(params.query_start),
+        Some(AtModifier::End) => Ok(params.query_end),
+        Some(AtModifier::Timestamp(timestamp)) => timestamp_to_units(*timestamp, units_per_second),
+    }
+}
+
+pub(crate) fn timestamp_to_units(timestamp: f64, units_per_second: i64) -> Result<i64> {
+    if !timestamp.is_finite() {
+        return Err(PromqlError::Eval(
+            "@ timestamp must be a finite numeric value".to_string(),
+        ));
+    }
+
+    let scaled = timestamp * units_per_second as f64;
+    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+        return Err(PromqlError::Eval(
+            "@ timestamp is out of supported range".to_string(),
+        ));
+    }
+
+    Ok(scaled.round() as i64)
+}
+
+fn negate_value(value: PromqlValue) -> Result<PromqlValue> {
     match value {
-        PromqlValue::Scalar(v, ts) => PromqlValue::Scalar(-v, ts),
+        PromqlValue::Scalar(v, ts) => Ok(PromqlValue::Scalar(-v, ts)),
         PromqlValue::InstantVector(mut samples) => {
             for s in &mut samples {
+                if s.histogram.is_some() {
+                    return Err(PromqlError::Eval(
+                        "unary '-' does not support histogram samples yet".to_string(),
+                    ));
+                }
                 s.value = -s.value;
             }
-            PromqlValue::InstantVector(samples)
+            Ok(PromqlValue::InstantVector(samples))
         }
         PromqlValue::RangeVector(mut series) => {
             for s in &mut series {
+                if !s.histograms.is_empty() {
+                    return Err(PromqlError::Eval(
+                        "unary '-' does not support histogram samples yet".to_string(),
+                    ));
+                }
                 for (_, v) in &mut s.samples {
                     *v = -*v;
                 }
             }
-            PromqlValue::RangeVector(series)
+            Ok(PromqlValue::RangeVector(series))
         }
-        PromqlValue::String(v, ts) => PromqlValue::String(v, ts),
+        PromqlValue::String(v, ts) => Ok(PromqlValue::String(v, ts)),
+    }
+}
+
+enum LatestSeriesPoint {
+    Float(f64),
+    Histogram(Box<crate::NativeHistogram>),
+}
+
+fn latest_series_point(
+    latest_float: Option<(i64, f64)>,
+    latest_histogram: Option<(i64, Box<crate::NativeHistogram>)>,
+) -> Option<LatestSeriesPoint> {
+    match (latest_float, latest_histogram) {
+        (Some((float_ts, value)), Some((hist_ts, histogram))) => {
+            if hist_ts > float_ts {
+                Some(LatestSeriesPoint::Histogram(histogram))
+            } else {
+                Some(LatestSeriesPoint::Float(value))
+            }
+        }
+        (Some((_, value)), None) => Some(LatestSeriesPoint::Float(value)),
+        (None, Some((_, histogram))) => Some(LatestSeriesPoint::Histogram(histogram)),
+        (None, None) => None,
     }
 }

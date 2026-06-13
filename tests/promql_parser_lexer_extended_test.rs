@@ -1,6 +1,6 @@
-#![cfg(feature = "promql")]
-
-use tsink::promql::ast::{AggregationOp, BinaryOp, Expr, MatchOp};
+use tsink::promql::ast::{
+    AggregationOp, AtModifier, BinaryOp, Expr, MatchOp, VectorMatchCardinality,
+};
 use tsink::promql::lexer::{Lexer, Token, TokenKind};
 use tsink::promql::{parse, PromqlError};
 
@@ -35,7 +35,7 @@ fn lexer_03_identifier_allows_colon_underscore_and_digits() {
 
 #[test]
 fn lexer_04_keywords_are_case_insensitive() {
-    let tokens = lex("By WITHOUT OffSet BoOl AnD Or UNLESS On Ignoring");
+    let tokens = lex("By WITHOUT OffSet BoOl AnD Or UNLESS On Ignoring Group_Left GROUP_RIGHT");
     assert!(matches!(tokens[0].kind, TokenKind::By));
     assert!(matches!(tokens[1].kind, TokenKind::Without));
     assert!(matches!(tokens[2].kind, TokenKind::Offset));
@@ -45,6 +45,8 @@ fn lexer_04_keywords_are_case_insensitive() {
     assert!(matches!(tokens[6].kind, TokenKind::Unless));
     assert!(matches!(tokens[7].kind, TokenKind::On));
     assert!(matches!(tokens[8].kind, TokenKind::Ignoring));
+    assert!(matches!(tokens[9].kind, TokenKind::GroupLeft));
+    assert!(matches!(tokens[10].kind, TokenKind::GroupRight));
 }
 
 #[test]
@@ -158,7 +160,7 @@ fn lexer_19_standalone_exclamation_is_error() {
 
 #[test]
 fn lexer_20_punctuation_tokens_are_recognized() {
-    let tokens = lex("(){}[],");
+    let tokens = lex("(){}[],:@");
     assert!(matches!(tokens[0].kind, TokenKind::LParen));
     assert!(matches!(tokens[1].kind, TokenKind::RParen));
     assert!(matches!(tokens[2].kind, TokenKind::LBrace));
@@ -166,6 +168,8 @@ fn lexer_20_punctuation_tokens_are_recognized() {
     assert!(matches!(tokens[4].kind, TokenKind::LBracket));
     assert!(matches!(tokens[5].kind, TokenKind::RBracket));
     assert!(matches!(tokens[6].kind, TokenKind::Comma));
+    assert!(matches!(tokens[7].kind, TokenKind::Colon));
+    assert!(matches!(tokens[8].kind, TokenKind::At));
 }
 
 #[test]
@@ -181,8 +185,8 @@ fn lexer_21_span_tracks_positions_after_whitespace() {
 
 #[test]
 fn lexer_22_unexpected_byte_error_mentions_character() {
-    let err = Lexer::new("@").tokenize().unwrap_err();
-    assert!(matches!(err, PromqlError::Parse(msg) if msg.contains("unexpected byte '@'")));
+    let err = Lexer::new("`").tokenize().unwrap_err();
+    assert!(matches!(err, PromqlError::Parse(msg) if msg.contains("unexpected byte '`'")));
 }
 
 #[test]
@@ -209,6 +213,14 @@ fn lexer_25_stream_always_ends_with_eof() {
         tokens.last().map(|t| &t.kind),
         Some(TokenKind::Eof)
     ));
+}
+
+#[test]
+fn lexer_26_skips_hash_comments() {
+    let tokens = lex("up # trailing comment\n+ 1");
+    assert!(matches!(&tokens[0].kind, TokenKind::Ident(name) if name == "up"));
+    assert!(matches!(tokens[1].kind, TokenKind::Plus));
+    assert!(matches!(tokens[2].kind, TokenKind::Number(v) if (v - 1.0).abs() < 1e-12));
 }
 
 #[test]
@@ -248,6 +260,18 @@ fn parser_05_parses_unary_minus_expression() {
 }
 
 #[test]
+fn parser_05b_parses_unary_plus_expression() {
+    let expr = parse("+5").unwrap();
+    match expr {
+        Expr::Unary(unary) => {
+            assert_eq!(unary.op, tsink::promql::ast::UnaryOp::Pos);
+            assert!(matches!(*unary.expr, Expr::NumberLiteral(v) if (v - 5.0).abs() < 1e-12));
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
 fn parser_06_parses_parenthesized_binary_expression() {
     let expr = parse("(1 + 2)").unwrap();
     match expr {
@@ -270,6 +294,7 @@ fn parser_07_parses_vector_selector_with_metric_only() {
             assert_eq!(sel.metric_name.as_deref(), Some("up"));
             assert!(sel.matchers.is_empty());
             assert_eq!(sel.offset, 0);
+            assert!(sel.at.is_none());
         }
         other => panic!("unexpected expression: {other:?}"),
     }
@@ -365,7 +390,7 @@ fn parser_14_rejects_range_selector_on_scalar() {
 fn parser_15_rejects_offset_modifier_on_scalar() {
     let err = parse("1 offset 5m").unwrap_err();
     assert!(
-        matches!(err, PromqlError::Type(msg) if msg.contains("offset modifier can only apply to vector/matrix selectors"))
+        matches!(err, PromqlError::Type(msg) if msg.contains("offset modifier can only apply to vector/matrix selectors or subqueries"))
     );
 }
 
@@ -508,6 +533,172 @@ fn parser_25_parses_topk_with_parameter_expression() {
                 None => panic!("topk should have a parameter"),
             }
             assert!(matches!(*agg.expr, Expr::VectorSelector(_)));
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_26_parses_group_left_modifier_with_included_labels() {
+    let expr = parse("a / on(job) group_left(team) b").unwrap();
+    match expr {
+        Expr::Binary(b) => {
+            let matching = b.matching.expect("matching should be present");
+            assert!(matching.on);
+            assert_eq!(matching.labels, vec!["job"]);
+            assert_eq!(matching.cardinality, VectorMatchCardinality::ManyToOne);
+            assert_eq!(matching.include_labels, vec!["team"]);
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_27_parses_group_right_modifier_without_matching_clause() {
+    let expr = parse("a == group_right(region) b").unwrap();
+    match expr {
+        Expr::Binary(b) => {
+            let matching = b.matching.expect("matching should be present");
+            assert!(!matching.on);
+            assert!(matching.labels.is_empty());
+            assert_eq!(matching.cardinality, VectorMatchCardinality::OneToMany);
+            assert_eq!(matching.include_labels, vec!["region"]);
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_28_rejects_group_modifier_for_set_operator() {
+    let err = parse("a and on(job) group_left(team) b").unwrap_err();
+    assert!(
+        matches!(err, PromqlError::Parse(msg) if msg.contains("group_left/group_right modifiers cannot be used with set operators"))
+    );
+}
+
+#[test]
+fn parser_29_parses_quantile_aggregation_with_scalar_parameter() {
+    let expr = parse("quantile(0.9, up)").unwrap();
+    match expr {
+        Expr::Aggregation(agg) => {
+            assert_eq!(agg.op, AggregationOp::Quantile);
+            match agg.param {
+                Some(param) => {
+                    assert!(matches!(*param, Expr::NumberLiteral(v) if (v - 0.9).abs() < 1e-12));
+                }
+                None => panic!("quantile should have a parameter"),
+            }
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_30_parses_count_values_aggregation_with_string_parameter() {
+    let expr = parse(r#"count_values("version", up)"#).unwrap();
+    match expr {
+        Expr::Aggregation(agg) => {
+            assert_eq!(agg.op, AggregationOp::CountValues);
+            match agg.param {
+                Some(param) => {
+                    assert!(matches!(*param, Expr::StringLiteral(ref s) if s == "version"));
+                }
+                None => panic!("count_values should have a parameter"),
+            }
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_31_parses_limitk_with_scalar_parameter() {
+    let expr = parse("limitk(2, up)").unwrap();
+    match expr {
+        Expr::Aggregation(agg) => {
+            assert_eq!(agg.op, AggregationOp::LimitK);
+            assert!(agg.param.is_some());
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_32_parses_limit_ratio_with_scalar_parameter() {
+    let expr = parse("limit_ratio(-0.5, up)").unwrap();
+    match expr {
+        Expr::Aggregation(agg) => {
+            assert_eq!(agg.op, AggregationOp::LimitRatio);
+            assert!(agg.param.is_some());
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_33_parses_at_modifier_with_numeric_timestamp() {
+    let expr = parse("up @ 123.5").unwrap();
+    match expr {
+        Expr::VectorSelector(sel) => {
+            assert!(matches!(sel.at, Some(AtModifier::Timestamp(v)) if (v - 123.5).abs() < 1e-12));
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_34_parses_at_modifier_with_start_call_and_signed_offset() {
+    let expr = parse("up[5m] @ start() offset -1m").unwrap();
+    match expr {
+        Expr::MatrixSelector(sel) => {
+            assert!(matches!(sel.vector.at, Some(AtModifier::Start)));
+            assert_eq!(sel.vector.offset, -60_000);
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_35_parses_subquery_with_explicit_step() {
+    let expr = parse("rate(up[1m])[5m:30s]").unwrap();
+    match expr {
+        Expr::Subquery(subquery) => {
+            assert_eq!(subquery.range, 300_000);
+            assert_eq!(subquery.step, Some(30_000));
+            assert_eq!(subquery.offset, 0);
+            assert!(subquery.at.is_none());
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_36_parses_subquery_with_default_step_and_end_modifier() {
+    let expr = parse("up[5m:] @ end()").unwrap();
+    match expr {
+        Expr::Subquery(subquery) => {
+            assert_eq!(subquery.range, 300_000);
+            assert_eq!(subquery.step, None);
+            assert!(matches!(subquery.at, Some(AtModifier::End)));
+        }
+        other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_37_rejects_duplicate_at_modifier() {
+    let err = parse("up @ 1 @ 2").unwrap_err();
+    assert!(
+        matches!(err, PromqlError::Parse(msg) if msg.contains("@ modifier can only be specified once"))
+    );
+}
+
+#[test]
+fn parser_38_parses_atan2_as_binary_operator() {
+    let expr = parse("a atan2 b + c").unwrap();
+    match expr {
+        Expr::Binary(b) => {
+            assert_eq!(b.op, BinaryOp::Add);
+            assert!(matches!(*b.lhs, Expr::Binary(ref lhs) if lhs.op == BinaryOp::Atan2));
         }
         other => panic!("unexpected expression: {other:?}"),
     }

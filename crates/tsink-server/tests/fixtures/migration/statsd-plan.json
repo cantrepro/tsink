@@ -1,0 +1,21 @@
+{
+  "source": {
+    "kind": "statsd",
+    "capture_manifest_path": "statsd-capture.json"
+  },
+  "target": {
+    "write_url": "http://127.0.0.1:9201/api/v1/write",
+    "read_url": "http://127.0.0.1:9201/api/v1/read",
+    "metadata_url": "http://127.0.0.1:9201/api/v1/metadata",
+    "status_url": "http://127.0.0.1:9201/api/v1/status/tsdb",
+    "tenant": "default"
+  },
+  "selectors": [
+    "jobs_completed{env=\"prod\"}",
+    "workers_active{env=\"prod\"}"
+  ],
+  "metadata_metrics": [
+    "jobs_completed",
+    "workers_active"
+  ]
+}

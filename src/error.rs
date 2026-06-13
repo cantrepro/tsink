@@ -1,12 +1,8 @@
-//! Error types for tsink.
-
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Result type alias for tsink operations.
 pub type Result<T> = std::result::Result<T, TsinkError>;
 
-/// Main error type for tsink operations.
 #[derive(Error, Debug)]
 pub enum TsinkError {
     #[error("No data points found for metric '{metric}' in range [{start}, {end})")]
@@ -64,6 +60,12 @@ pub enum TsinkError {
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
 
+    #[error("Unsupported operation '{operation}': {reason}")]
+    UnsupportedOperation {
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Data corruption detected: {0}")]
     DataCorruption(String),
 
@@ -118,6 +120,17 @@ pub enum TsinkError {
 
     #[error("Data point with timestamp {timestamp} is outside the retention window")]
     OutOfRetention { timestamp: i64 },
+
+    #[error(
+        "Late write at timestamp {timestamp} would open partition {partition_id} beyond the active-head limit {max_active_partition_heads_per_series} (active range {oldest_active_partition_id}..={newest_active_partition_id})"
+    )]
+    LateWritePartitionFanoutExceeded {
+        timestamp: i64,
+        partition_id: i64,
+        max_active_partition_heads_per_series: usize,
+        oldest_active_partition_id: i64,
+        newest_active_partition_id: i64,
+    },
 
     #[error("Unsupported aggregation '{aggregation}' for value type '{value_type}'")]
     UnsupportedAggregation {

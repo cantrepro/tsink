@@ -1,110 +1,66 @@
 use super::*;
-use tracing::warn;
-
 use crate::engine::fs_utils::{
-    copy_dir_contents, remove_path_if_exists, remove_path_if_exists_and_sync_parent,
+    copy_dir_contents, path_exists_no_follow, remove_path_if_exists_and_sync_parent,
     rename_and_sync_parents, stage_dir_path, sync_dir,
 };
-use crate::engine::segment::load_segment_indexes_with_series;
+use crate::engine::segment::{LoadedSegmentIndexes, WalHighWatermark};
+
+#[path = "bootstrap/discovery.rs"]
+mod discovery;
+#[path = "bootstrap/finalize.rs"]
+mod finalize;
+#[path = "bootstrap/hydrate.rs"]
+mod hydrate;
+#[path = "bootstrap/planning.rs"]
+mod planning;
+#[path = "bootstrap/recovery.rs"]
+mod recovery;
+#[path = "bootstrap/wal_open.rs"]
+mod wal_open;
+
+#[cfg(test)]
+#[path = "bootstrap/tests.rs"]
+mod tests;
+
+use discovery::StartupDiscoveryPhase;
+use finalize::StartupFinalizePhase;
+use hydrate::StartupHydrationPhase;
+use planning::StartupPlanningPhase;
+use recovery::StartupRecoveryPhase;
+use wal_open::StartupWalOpenPhase;
 
 pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
-    let wal_enabled = builder.wal_enabled();
-    let storage_options = ChunkStorageOptions::from(&builder);
-    let data_path_process_lock = builder
-        .data_path()
-        .map(process_lock::DataPathProcessLock::acquire)
-        .transpose()?;
-    let config::StoragePathLayout {
-        numeric_lane_path,
-        blob_lane_path,
-        series_index_path,
-        wal_path,
-    } = config::StoragePathLayout::from(&builder);
-    let persisted_registry = if let Some(index_path) = &series_index_path {
-        match SeriesRegistry::load_from_path(index_path) {
-            Ok(registry) => Some(registry),
-            Err(TsinkError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                warn!(
-                    path = %index_path.display(),
-                    error = %err,
-                    "Failed to load persisted series registry index; rebuilding from segments"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let load_series_from_segments = persisted_registry.is_none();
+    let plan = StartupPlanningPhase::prepare(&builder)?;
+    let discovered = StartupDiscoveryPhase::discover(&builder, &plan)?;
+    let recovered = StartupRecoveryPhase::recover(&plan, discovered)?;
+    let finalize_state = recovered.finalize_state();
+    let replay_highwater = recovered.loaded_segments().wal_replay_highwater;
+    let next_segment_id = recovered.loaded_segments().next_segment_id;
 
-    if let Some(path) = &numeric_lane_path {
-        crate::engine::compactor::finalize_pending_compaction_replacements(path)?;
-    }
-    if let Some(path) = &blob_lane_path {
-        crate::engine::compactor::finalize_pending_compaction_replacements(path)?;
-    }
+    let wal = StartupWalOpenPhase::open(&builder, &plan, replay_highwater)?;
+    let storage_options = plan.storage_options().clone();
+    let paths = plan.paths().clone();
+    let runtime_inputs = plan.into_runtime_inputs();
 
-    let loaded_numeric = if let Some(path) = &numeric_lane_path {
-        load_segment_indexes_with_series(path, load_series_from_segments)?
-    } else {
-        crate::engine::segment::LoadedSegmentIndexes::default()
-    };
-    let loaded_blob = if let Some(path) = &blob_lane_path {
-        load_segment_indexes_with_series(path, load_series_from_segments)?
-    } else {
-        crate::engine::segment::LoadedSegmentIndexes::default()
-    };
-    let loaded_segments = merge_loaded_segment_indexes(
-        loaded_numeric,
-        loaded_blob,
-        numeric_lane_path.is_some(),
-        blob_lane_path.is_some(),
-    )?;
-    let replay_highwater = loaded_segments.wal_replay_highwater;
-
-    let wal = if let Some(wal_path) = wal_path {
-        if wal_enabled {
-            let wal = FramedWal::open_with_buffer_size(
-                wal_path,
-                builder.wal_sync_mode(),
-                builder.wal_buffer_size(),
-            )?;
-            wal.ensure_min_highwater(replay_highwater)?;
-            Some(wal)
-        } else {
-            remove_path_if_exists(&wal_path)?;
-            None
-        }
-    } else {
-        None
-    };
-
-    let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+    let storage = StartupHydrationPhase::create_storage(
         builder.chunk_points(),
-        wal,
-        numeric_lane_path,
-        blob_lane_path,
-        loaded_segments.next_segment_id,
         storage_options,
-    )?);
-    if let Some(data_path_process_lock) = data_path_process_lock {
-        storage.install_data_path_process_lock(data_path_process_lock);
-    }
-    if let Some(registry) = persisted_registry {
-        storage.replace_registry_from_snapshot(registry);
-    }
-    storage.apply_loaded_segment_indexes(loaded_segments, !load_series_from_segments)?;
-    storage.replay_from_wal(replay_highwater, builder.wal_replay_mode())?;
-    storage.sweep_expired_persisted_segments()?;
-    storage.persist_series_registry_index()?;
-    if storage.memory_budget_value() != usize::MAX {
-        storage.refresh_memory_usage();
-        storage.enforce_memory_budget_if_needed()?;
-    }
-    if storage_options.background_threads_enabled {
-        storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL)?;
-    }
+        &paths,
+        next_segment_id,
+        wal,
+    )?;
+    StartupHydrationPhase::hydrate(
+        storage.as_ref(),
+        &builder,
+        recovered,
+        runtime_inputs.data_path_process_lock,
+    )?;
+    StartupFinalizePhase::run(
+        &storage,
+        finalize_state,
+        runtime_inputs.background_threads_enabled,
+        runtime_inputs.background_fail_fast,
+    )?;
 
     Ok(storage as Arc<dyn Storage>)
 }
@@ -116,10 +72,11 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
         ));
     }
 
-    let snapshot_meta = std::fs::metadata(snapshot_path).map_err(|err| TsinkError::IoWithPath {
-        path: snapshot_path.to_path_buf(),
-        source: err,
-    })?;
+    let snapshot_meta =
+        std::fs::symlink_metadata(snapshot_path).map_err(|err| TsinkError::IoWithPath {
+            path: snapshot_path.to_path_buf(),
+            source: err,
+        })?;
     if !snapshot_meta.is_dir() {
         return Err(TsinkError::InvalidConfiguration(format!(
             "snapshot path is not a directory: {}",
@@ -144,7 +101,7 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
 
     sync_dir(&staging)?;
 
-    let backup = if data_path.exists() {
+    let backup = if path_exists_no_follow(data_path)? {
         Some(stage_dir_path(data_path, "restore-backup")?)
     } else {
         None
@@ -187,11 +144,11 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
 }
 
 pub(super) fn merge_loaded_segment_indexes(
-    mut numeric: crate::engine::segment::LoadedSegmentIndexes,
-    mut blob: crate::engine::segment::LoadedSegmentIndexes,
+    mut numeric: LoadedSegmentIndexes,
+    mut blob: LoadedSegmentIndexes,
     numeric_lane_enabled: bool,
     blob_lane_enabled: bool,
-) -> Result<crate::engine::segment::LoadedSegmentIndexes> {
+) -> Result<LoadedSegmentIndexes> {
     let mut series_by_id = BTreeMap::new();
     for series in numeric.series.drain(..) {
         series_by_id.insert(series.series_id, series);
@@ -222,9 +179,6 @@ pub(super) fn merge_loaded_segment_indexes(
 
     let replay_highwater = match (numeric_lane_enabled, blob_lane_enabled) {
         (true, true) => match (numeric_has_segments, blob_has_segments) {
-            // Both lane families are configured, so one-sided segment visibility can be a
-            // failed/crashed split persist. Fall back to full WAL replay to avoid skipping
-            // frames needed by the missing lane.
             (true, true) => numeric.wal_replay_highwater.min(blob.wal_replay_highwater),
             _ => WalHighWatermark::default(),
         },
@@ -233,7 +187,7 @@ pub(super) fn merge_loaded_segment_indexes(
         (false, false) => WalHighWatermark::default(),
     };
 
-    Ok(crate::engine::segment::LoadedSegmentIndexes {
+    Ok(LoadedSegmentIndexes {
         next_segment_id: numeric.next_segment_id.max(blob.next_segment_id).max(1),
         series: series_by_id.into_values().collect(),
         indexed_segments,

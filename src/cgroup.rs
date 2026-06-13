@@ -1,7 +1,4 @@
-//! cgroup support for container-aware resource management
-//!
-//! This module provides functionality to detect CPU and memory limits
-//! within containerized environments by reading cgroup information.
+//! Container-aware CPU and memory limit helpers.
 
 use std::fs;
 use std::path::Path;
@@ -9,13 +6,11 @@ use std::sync::OnceLock;
 
 static AVAILABLE_CPUS: OnceLock<usize> = OnceLock::new();
 
-/// Returns the number of available CPU cores for the application.
-/// This takes into account cgroup CPU quotas if running in a container.
+/// Returns the CPU budget visible to the current process, including cgroup limits.
 pub fn available_cpus() -> usize {
     *AVAILABLE_CPUS.get_or_init(detect_cpu_quota)
 }
 
-/// Detects CPU quota from cgroup settings
 fn detect_cpu_quota() -> usize {
     if let Some(n) = parse_cpu_override_env("TSINK_MAX_CPUS") {
         return n;
@@ -40,12 +35,10 @@ fn parse_cpu_override_env(var_name: &str) -> Option<usize> {
     (parsed > 0).then_some(parsed)
 }
 
-/// Gets CPU quota from cgroup unified hierarchy.
 fn get_cpu_quota() -> Option<f64> {
     get_cpu_quota_unified()
 }
 
-/// Gets CPU quota from cgroup unified hierarchy
 fn get_cpu_quota_unified() -> Option<f64> {
     let cpu_max_path = "/sys/fs/cgroup/cpu.max";
     if !Path::new(cpu_max_path).exists() {
@@ -68,12 +61,10 @@ fn get_cpu_quota_unified() -> Option<f64> {
     Some(quota / period)
 }
 
-/// Returns the memory limit in bytes from cgroup settings
 pub fn get_memory_limit() -> Option<u64> {
     get_memory_limit_unified()
 }
 
-/// Gets memory limit from cgroup unified hierarchy
 fn get_memory_limit_unified() -> Option<u64> {
     let mem_max_path = "/sys/fs/cgroup/memory.max";
     if !Path::new(mem_max_path).exists() {
@@ -90,7 +81,6 @@ fn get_memory_limit_unified() -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
-/// Returns the default number of workers based on available CPUs
 pub fn default_workers_limit() -> usize {
     available_cpus()
 }

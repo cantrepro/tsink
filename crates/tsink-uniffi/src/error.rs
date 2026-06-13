@@ -44,11 +44,15 @@ impl From<TsinkError> for TsinkUniFFIError {
             | TsinkError::InvalidMetricName(_)
             | TsinkError::InvalidLabel(_)
             | TsinkError::InvalidConfiguration(_)
+            | TsinkError::UnsupportedOperation { .. }
             | TsinkError::InvalidPartition { .. }
             | TsinkError::InvalidOffset { .. }
             | TsinkError::UnsupportedAggregation { .. }
             | TsinkError::ValueTypeMismatch { .. }
-            | TsinkError::OutOfRetention { .. } => TsinkUniFFIError::InvalidInput { msg },
+            | TsinkError::OutOfRetention { .. }
+            | TsinkError::LateWritePartitionFanoutExceeded { .. } => {
+                TsinkUniFFIError::InvalidInput { msg }
+            }
 
             TsinkError::Io(_)
             | TsinkError::IoWithPath { .. }

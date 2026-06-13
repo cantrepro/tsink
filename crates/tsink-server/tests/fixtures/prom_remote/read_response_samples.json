@@ -1,0 +1,78 @@
+{
+  "results": [
+    {
+      "timeseries": [
+        {
+          "exemplars": [],
+          "histograms": [],
+          "labels": [
+            {
+              "name": "__name__",
+              "value": "http_requests_total"
+            },
+            {
+              "name": "job",
+              "value": "api"
+            }
+          ],
+          "samples": [
+            {
+              "timestamp": 1700000000000,
+              "value": 10.0
+            },
+            {
+              "timestamp": 1700000060000,
+              "value": 11.0
+            }
+          ]
+        },
+        {
+          "exemplars": [],
+          "histograms": [
+            {
+              "count": {
+                "kind": "countInt",
+                "value": 9
+              },
+              "customValues": [],
+              "negativeCounts": [],
+              "negativeDeltas": [],
+              "negativeSpans": [],
+              "positiveCounts": [],
+              "positiveDeltas": [
+                1,
+                2
+              ],
+              "positiveSpans": [
+                {
+                  "length": 2,
+                  "offset": 0
+                }
+              ],
+              "resetHint": "No",
+              "schema": 0,
+              "sum": 4.0,
+              "timestamp": 1700000060000,
+              "zeroCount": {
+                "kind": "zeroCountInt",
+                "value": 1
+              },
+              "zeroThreshold": 0.0
+            }
+          ],
+          "labels": [
+            {
+              "name": "__name__",
+              "value": "rpc_duration_seconds"
+            },
+            {
+              "name": "job",
+              "value": "backend"
+            }
+          ],
+          "samples": []
+        }
+      ]
+    }
+  ]
+}

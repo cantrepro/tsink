@@ -1,0 +1,2 @@
+{"metric":{"__name__":"http_requests_total","job":"edge","instance":"node-a"},"values":[12,14],"timestamps":[1700000000000,1700000060000]}
+{"metric":{"__name__":"node_cpu_seconds_total","instance":"node-a","mode":"idle"},"values":[101.5,102.0],"timestamps":[1700000000000,1700000060000]}

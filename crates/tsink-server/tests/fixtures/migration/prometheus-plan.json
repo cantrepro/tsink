@@ -1,0 +1,57 @@
+{
+  "source": {
+    "kind": "prometheus",
+    "remote_read_url": "http://127.0.0.1:9090/api/v1/read",
+    "query_range_url": "http://127.0.0.1:9090/api/v1/query_range",
+    "metadata_url": "http://127.0.0.1:9090/api/v1/metadata",
+    "exemplar_url": "http://127.0.0.1:9090/api/v1/query_exemplars",
+    "headers": {
+      "Authorization": "Bearer source-token"
+    }
+  },
+  "target": {
+    "write_url": "http://127.0.0.1:9201/api/v1/write",
+    "read_url": "http://127.0.0.1:9201/api/v1/read",
+    "query_range_url": "http://127.0.0.1:9201/api/v1/query_range",
+    "metadata_url": "http://127.0.0.1:9201/api/v1/metadata",
+    "exemplar_url": "http://127.0.0.1:9201/api/v1/query_exemplars",
+    "status_url": "http://127.0.0.1:9201/api/v1/status/tsdb",
+    "tenant": "default",
+    "headers": {
+      "Authorization": "Bearer target-token"
+    }
+  },
+  "selectors": [
+    "up{job=\"node\"}",
+    "http_requests_total{job=~\"api|worker\"}"
+  ],
+  "metadata_metrics": [
+    "up",
+    "http_requests_total"
+  ],
+  "exemplar_checks": [
+    {
+      "query": "http_request_duration_seconds_bucket{job=\"api\"}",
+      "limit": 200
+    }
+  ],
+  "promql_checks": [
+    {
+      "query": "sum(rate(http_requests_total[5m])) by (job)",
+      "step": "30s"
+    },
+    {
+      "query": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+      "step": "30s"
+    }
+  ],
+  "batch": {
+    "max_series_per_write": 200,
+    "max_points_per_write": 25000,
+    "http_timeout_secs": 30
+  },
+  "compare": {
+    "max_absolute_value_delta": 1e-12,
+    "max_relative_value_delta": 1e-9
+  }
+}

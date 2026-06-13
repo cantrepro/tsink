@@ -4,6 +4,7 @@ pub enum Expr {
     StringLiteral(String),
     VectorSelector(VectorSelector),
     MatrixSelector(MatrixSelector),
+    Subquery(SubqueryExpr),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Aggregation(AggregationExpr),
@@ -16,12 +17,29 @@ pub struct VectorSelector {
     pub metric_name: Option<String>,
     pub matchers: Vec<LabelMatcher>,
     pub offset: i64,
+    pub at: Option<AtModifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatrixSelector {
     pub vector: VectorSelector,
     pub range: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryExpr {
+    pub expr: Box<Expr>,
+    pub range: i64,
+    pub step: Option<i64>,
+    pub offset: i64,
+    pub at: Option<AtModifier>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtModifier {
+    Timestamp(f64),
+    Start,
+    End,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +65,7 @@ pub struct UnaryExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
+    Pos,
     Neg,
 }
 
@@ -66,6 +85,7 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    Atan2,
     Pow,
     Eq,
     NotEq,
@@ -95,6 +115,15 @@ impl BinaryOp {
 pub struct VectorMatching {
     pub on: bool,
     pub labels: Vec<String>,
+    pub cardinality: VectorMatchCardinality,
+    pub include_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorMatchCardinality {
+    OneToOne,
+    ManyToOne,
+    OneToMany,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +141,13 @@ pub enum AggregationOp {
     Min,
     Max,
     Count,
+    Group,
+    CountValues,
+    Quantile,
+    Stddev,
+    Stdvar,
+    LimitK,
+    LimitRatio,
     TopK,
     BottomK,
 }
@@ -124,6 +160,13 @@ impl AggregationOp {
             "min" => Some(Self::Min),
             "max" => Some(Self::Max),
             "count" => Some(Self::Count),
+            "group" => Some(Self::Group),
+            "count_values" => Some(Self::CountValues),
+            "quantile" => Some(Self::Quantile),
+            "stddev" => Some(Self::Stddev),
+            "stdvar" => Some(Self::Stdvar),
+            "limitk" => Some(Self::LimitK),
+            "limit_ratio" => Some(Self::LimitRatio),
             "topk" => Some(Self::TopK),
             "bottomk" => Some(Self::BottomK),
             _ => None,

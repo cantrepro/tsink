@@ -33,6 +33,42 @@ impl QueryPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TieredQueryPlan {
+    pub(super) start: i64,
+    pub(super) end: i64,
+    include_warm: bool,
+    include_cold: bool,
+}
+
+impl TieredQueryPlan {
+    pub(super) fn from_cutoffs(
+        start: i64,
+        end: i64,
+        hot_cutoff: Option<i64>,
+        warm_cutoff: Option<i64>,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            include_warm: hot_cutoff.is_some_and(|cutoff| start < cutoff),
+            include_cold: warm_cutoff.is_some_and(|cutoff| start < cutoff),
+        }
+    }
+
+    pub(super) fn is_hot_only(self) -> bool {
+        !self.include_warm && !self.include_cold
+    }
+
+    pub(super) fn includes_warm(self) -> bool {
+        self.include_warm
+    }
+
+    pub(super) fn includes_cold(self) -> bool {
+        self.include_cold
+    }
+}
+
 pub struct ChunkSeriesCursor<'a> {
     chunks: &'a [Chunk],
     pos: usize,
@@ -173,11 +209,13 @@ fn points_are_sorted_by_timestamp(points: &[super::chunk::ChunkPoint]) -> bool {
 mod tests {
     use crate::Value;
 
-    use super::{decode_chunk_points_in_range, ChunkSeriesCursor};
+    use super::{decode_chunk_points_in_range, ChunkSeriesCursor, TieredQueryPlan};
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
     use crate::engine::encoder::Encoder;
+    use crate::engine::segment::WalHighWatermark;
+    use crate::engine::series::SeriesValueFamily;
 
     #[test]
     fn chunk_cursor_binary_searches_range() {
@@ -220,6 +258,7 @@ mod tests {
             header: ChunkHeader {
                 series_id: 7,
                 lane: ValueLane::Numeric,
+                value_family: Some(SeriesValueFamily::F64),
                 point_count: points.len() as u16,
                 min_ts: 1,
                 max_ts: 3,
@@ -228,6 +267,7 @@ mod tests {
             },
             points: Vec::new(),
             encoded_payload: encoded.payload,
+            wal_highwater: WalHighWatermark::default(),
         };
 
         let decoded = decode_chunk_points_in_range(&chunk, 2, 4).unwrap();
@@ -236,11 +276,33 @@ mod tests {
         assert_eq!(decoded[1], crate::DataPoint::new(3, 3.0));
     }
 
+    #[test]
+    fn tiered_query_plan_keeps_recent_queries_on_hot_tier_only() {
+        let plan = TieredQueryPlan::from_cutoffs(91, 100, Some(90), Some(50));
+
+        assert!(plan.is_hot_only());
+        assert!(!plan.includes_warm());
+        assert!(!plan.includes_cold());
+    }
+
+    #[test]
+    fn tiered_query_plan_adds_warm_and_cold_tiers_monotonically() {
+        let warm_plan = TieredQueryPlan::from_cutoffs(70, 100, Some(90), Some(50));
+        assert!(!warm_plan.is_hot_only());
+        assert!(warm_plan.includes_warm());
+        assert!(!warm_plan.includes_cold());
+
+        let cold_plan = TieredQueryPlan::from_cutoffs(20, 100, Some(90), Some(50));
+        assert!(cold_plan.includes_warm());
+        assert!(cold_plan.includes_cold());
+    }
+
     fn chunk_with_bounds(series_id: u64, min_ts: i64, max_ts: i64) -> Chunk {
         Chunk {
             header: ChunkHeader {
                 series_id,
                 lane: ValueLane::Numeric,
+                value_family: Some(SeriesValueFamily::F64),
                 point_count: 1,
                 min_ts,
                 max_ts,
@@ -252,6 +314,7 @@ mod tests {
                 value: Value::F64(1.0),
             }],
             encoded_payload: Vec::new(),
+            wal_highwater: WalHighWatermark::default(),
         }
     }
 }

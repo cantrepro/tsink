@@ -46,7 +46,7 @@ fn segment_loading_tolerates_random_corruption_without_panics() {
     let base_dir = TempDir::new().unwrap();
     let lane_path = base_dir.path().join(NUMERIC_LANE_ROOT);
     let labels = vec![Label::new("host", "fuzz")];
-    let mut registry = SeriesRegistry::new();
+    let registry = SeriesRegistry::new();
     let series_id = registry
         .resolve_or_insert("segment_fuzz", &labels)
         .unwrap()

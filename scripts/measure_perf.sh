@@ -23,12 +23,13 @@ case "$MODE" in
     ;;
 esac
 
-FILTER='^(insert_rows|select)/'
+FILTER='^(insert_rows|select|persist_refresh_long_history)/'
 
 cat <<INFO
 Running storage performance matrix ($MODE):
   insert_rows: 1, 10, 1000
   select: 1, 10, 1000, 1000000
+  persist_refresh_long_history: 64, 256, 1024
 INFO
 
 cargo bench --bench storage_benchmarks -- "$FILTER" "${CRITERION_ARGS[@]}" "${EXTRA_ARGS[@]}"

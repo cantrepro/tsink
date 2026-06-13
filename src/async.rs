@@ -3,8 +3,8 @@
 use crate::cgroup;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
-    DataPoint, Label, MetricSeries, QueryOptions, Result, Row, SeriesSelection, Storage,
-    StorageBuilder, TimestampPrecision, TsinkError,
+    DataPoint, Label, MetricSeries, QueryOptions, QueryRowsPage, QueryRowsScanOptions, Result, Row,
+    SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, WriteResult,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -48,9 +48,21 @@ impl AsyncRuntimeOptions {
 type Reply<T> = async_channel::Sender<Result<T>>;
 
 enum WriteCommand {
-    InsertRows { rows: Vec<Row>, reply: Reply<()> },
-    Snapshot { path: PathBuf, reply: Reply<()> },
-    Close { reply: Reply<()> },
+    InsertRows {
+        rows: Vec<Row>,
+        reply: Reply<()>,
+    },
+    InsertRowsWithResult {
+        rows: Vec<Row>,
+        reply: Reply<WriteResult>,
+    },
+    Snapshot {
+        path: PathBuf,
+        reply: Reply<()>,
+    },
+    Close {
+        reply: Reply<()>,
+    },
 }
 
 enum ReadCommand {
@@ -78,6 +90,20 @@ enum ReadCommand {
     SelectSeries {
         selection: SeriesSelection,
         reply: Reply<Vec<MetricSeries>>,
+    },
+    ScanSeriesRows {
+        series: Vec<MetricSeries>,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        reply: Reply<QueryRowsPage>,
+    },
+    ScanMetricRows {
+        metric: String,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        reply: Reply<QueryRowsPage>,
     },
 }
 
@@ -152,12 +178,10 @@ pub struct AsyncStorage {
 }
 
 impl AsyncStorage {
-    /// Wrap an existing storage handle with default async runtime options.
     pub fn from_storage(storage: Arc<dyn Storage>) -> Result<Self> {
         Self::from_storage_with_options(storage, AsyncRuntimeOptions::default())
     }
 
-    /// Wrap an existing storage handle with explicit async runtime options.
     pub fn from_storage_with_options(
         storage: Arc<dyn Storage>,
         options: AsyncRuntimeOptions,
@@ -167,17 +191,14 @@ impl AsyncStorage {
         })
     }
 
-    /// Returns the underlying sync storage handle.
     pub fn inner(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.runtime.storage)
     }
 
-    /// Consumes the async wrapper and returns a cloned sync storage handle.
     pub fn into_inner(self) -> Arc<dyn Storage> {
         Arc::clone(&self.runtime.storage)
     }
 
-    /// Inserts rows using the dedicated write worker.
     pub async fn insert_rows(&self, rows: Vec<Row>) -> Result<()> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -189,7 +210,18 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Select points for a metric + label set.
+    /// Inserts rows and returns the durability guarantee established when the call succeeds.
+    pub async fn insert_rows_with_result(&self, rows: Vec<Row>) -> Result<WriteResult> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .write_tx
+            .send(WriteCommand::InsertRowsWithResult { rows, reply })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
     pub async fn select(
         &self,
         metric: impl Into<String>,
@@ -213,7 +245,6 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Select points with query options.
     pub async fn select_with_options(
         &self,
         metric: impl Into<String>,
@@ -233,7 +264,6 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Select all label sets for a metric.
     pub async fn select_all(
         &self,
         metric: impl Into<String>,
@@ -255,7 +285,52 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// List all known metric series.
+    pub async fn scan_series_rows(
+        &self,
+        series: Vec<MetricSeries>,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+    ) -> Result<QueryRowsPage> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .read_tx
+            .send(ReadCommand::ScanSeriesRows {
+                series,
+                start,
+                end,
+                options,
+                reply,
+            })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
+    pub async fn scan_metric_rows(
+        &self,
+        metric: impl Into<String>,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+    ) -> Result<QueryRowsPage> {
+        self.ensure_open()?;
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .read_tx
+            .send(ReadCommand::ScanMetricRows {
+                metric: metric.into(),
+                start,
+                end,
+                options,
+                reply,
+            })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
     pub async fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -267,7 +342,6 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Select series using structured matchers.
     pub async fn select_series(&self, selection: SeriesSelection) -> Result<Vec<MetricSeries>> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -279,12 +353,10 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Returns currently estimated in-memory bytes owned by the storage engine.
     pub fn memory_used(&self) -> usize {
         self.runtime.storage.memory_used()
     }
 
-    /// Returns configured in-memory byte budget.
     pub fn memory_budget(&self) -> usize {
         self.runtime.storage.memory_budget()
     }
@@ -357,118 +429,109 @@ impl Default for AsyncStorageBuilder {
 }
 
 impl AsyncStorageBuilder {
-    /// Creates a new async builder with default options.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Configure the command queue capacity.
     #[must_use]
     pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
         self.async_options.queue_capacity = capacity.max(1);
         self
     }
 
-    /// Configure the number of read worker threads.
     #[must_use]
     pub fn with_read_workers(mut self, workers: usize) -> Self {
         self.async_options.read_workers = workers.max(1);
         self
     }
 
-    /// Sets the data path for persistent storage.
     #[must_use]
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.inner = self.inner.with_data_path(path);
         self
     }
 
-    /// Sets the retention period.
     #[must_use]
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.inner = self.inner.with_retention(retention);
         self
     }
 
-    /// Enables or disables retention enforcement.
     #[must_use]
     pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
         self.inner = self.inner.with_retention_enforced(enforced);
         self
     }
 
-    /// Sets timestamp precision.
     #[must_use]
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.inner = self.inner.with_timestamp_precision(precision);
         self
     }
 
-    /// Sets target points per chunk.
     #[must_use]
     pub fn with_chunk_points(mut self, points: usize) -> Self {
         self.inner = self.inner.with_chunk_points(points);
         self
     }
 
-    /// Sets maximum concurrent writers.
     #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
         self.inner = self.inner.with_max_writers(max_writers);
         self
     }
 
-    /// Sets write timeout.
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.inner = self.inner.with_write_timeout(timeout);
         self
     }
 
-    /// Sets partition duration.
     #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.inner = self.inner.with_partition_duration(duration);
         self
     }
 
-    /// Sets global in-memory byte budget for the underlying storage.
+    #[must_use]
+    pub fn with_max_active_partition_heads_per_series(mut self, max_heads: usize) -> Self {
+        self.inner = self
+            .inner
+            .with_max_active_partition_heads_per_series(max_heads);
+        self
+    }
+
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.inner = self.inner.with_memory_limit(bytes);
         self
     }
 
-    /// Sets a hard upper bound for total series cardinality.
     #[must_use]
     pub fn with_cardinality_limit(mut self, series: usize) -> Self {
         self.inner = self.inner.with_cardinality_limit(series);
         self
     }
 
-    /// Enables or disables WAL.
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.inner = self.inner.with_wal_enabled(enabled);
         self
     }
 
-    /// Sets a hard upper bound for on-disk WAL bytes.
     #[must_use]
     pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
         self.inner = self.inner.with_wal_size_limit(bytes);
         self
     }
 
-    /// Sets WAL buffer size.
     #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
         self.inner = self.inner.with_wal_buffer_size(size);
         self
     }
 
-    /// Sets WAL fsync policy.
     #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.inner = self.inner.with_wal_sync_mode(mode);
@@ -476,20 +539,23 @@ impl AsyncStorageBuilder {
     }
 
     /// Sets WAL replay policy when corruption is encountered mid-log.
+    ///
+    /// The underlying storage builder defaults to [`WalReplayMode::Strict`].
     #[must_use]
     pub fn with_wal_replay_mode(mut self, mode: WalReplayMode) -> Self {
         self.inner = self.inner.with_wal_replay_mode(mode);
         self
     }
 
-    /// Enables fail-fast mode when background flush/compaction workers hit errors.
+    /// Controls whether background durability worker failures fence service.
+    ///
+    /// The underlying storage builder defaults to `true`.
     #[must_use]
     pub fn with_background_fail_fast(mut self, enabled: bool) -> Self {
         self.inner = self.inner.with_background_fail_fast(enabled);
         self
     }
 
-    /// Builds an async storage facade with dedicated workers.
     pub fn build(self) -> Result<AsyncStorage> {
         let storage = self.inner.build()?;
         AsyncStorage::from_storage_with_options(storage, self.async_options)
@@ -507,6 +573,10 @@ fn write_worker_loop(
                 // Writes are side-effecting: once accepted into the queue they must run,
                 // even if the caller drops/cancels the awaiting future.
                 let result = storage.insert_rows(&rows);
+                let _ = reply.send_blocking(result);
+            }
+            WriteCommand::InsertRowsWithResult { rows, reply } => {
+                let result = storage.insert_rows_with_result(&rows);
                 let _ = reply.send_blocking(result);
             }
             WriteCommand::Snapshot { path, reply } => {
@@ -579,6 +649,32 @@ fn read_worker_loop(storage: Arc<dyn Storage>, receiver: async_channel::Receiver
                     continue;
                 }
                 let result = storage.select_series(&selection);
+                let _ = reply.send_blocking(result);
+            }
+            ReadCommand::ScanSeriesRows {
+                series,
+                start,
+                end,
+                options,
+                reply,
+            } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                let result = storage.scan_series_rows(&series, start, end, options);
+                let _ = reply.send_blocking(result);
+            }
+            ReadCommand::ScanMetricRows {
+                metric,
+                start,
+                end,
+                options,
+                reply,
+            } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                let result = storage.scan_metric_rows(&metric, start, end, options);
                 let _ = reply.send_blocking(result);
             }
         }

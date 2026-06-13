@@ -9,22 +9,22 @@ pub(crate) struct PreparedSeriesSelection {
 }
 
 pub(crate) trait SeriesSelectionBackend {
-    type Candidate;
+    type Candidates;
 
     fn candidate_items(
         &self,
         selection: &SeriesSelection,
         prepared: &PreparedSeriesSelection,
-    ) -> Result<Vec<Self::Candidate>>;
+    ) -> Result<Self::Candidates>;
 
     fn retain_items_in_time_range(
         &self,
-        items: &mut Vec<Self::Candidate>,
+        items: &mut Self::Candidates,
         start: i64,
         end: i64,
     ) -> Result<()>;
 
-    fn materialize_items(&self, items: Vec<Self::Candidate>) -> Result<Vec<MetricSeries>>;
+    fn materialize_items(&self, items: Self::Candidates) -> Result<Vec<MetricSeries>>;
 }
 
 pub(crate) fn validate_series_selection(selection: &SeriesSelection) -> Result<Option<(i64, i64)>> {
@@ -94,13 +94,13 @@ struct ScanSeriesSelectionBackend<'a, S: Storage + ?Sized> {
 }
 
 impl<S: Storage + ?Sized> SeriesSelectionBackend for ScanSeriesSelectionBackend<'_, S> {
-    type Candidate = MetricSeries;
+    type Candidates = Vec<MetricSeries>;
 
     fn candidate_items(
         &self,
         selection: &SeriesSelection,
         prepared: &PreparedSeriesSelection,
-    ) -> Result<Vec<Self::Candidate>> {
+    ) -> Result<Self::Candidates> {
         let mut series = self.storage.list_metrics()?;
         retain_series_matching_selection(&mut series, selection, prepared);
         Ok(series)
@@ -108,7 +108,7 @@ impl<S: Storage + ?Sized> SeriesSelectionBackend for ScanSeriesSelectionBackend<
 
     fn retain_items_in_time_range(
         &self,
-        items: &mut Vec<Self::Candidate>,
+        items: &mut Self::Candidates,
         start: i64,
         end: i64,
     ) -> Result<()> {
@@ -129,7 +129,7 @@ impl<S: Storage + ?Sized> SeriesSelectionBackend for ScanSeriesSelectionBackend<
         Ok(())
     }
 
-    fn materialize_items(&self, items: Vec<Self::Candidate>) -> Result<Vec<MetricSeries>> {
+    fn materialize_items(&self, items: Self::Candidates) -> Result<Vec<MetricSeries>> {
         Ok(items)
     }
 }

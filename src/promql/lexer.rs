@@ -28,6 +28,9 @@ pub enum TokenKind {
     Unless,
     On,
     Ignoring,
+    GroupLeft,
+    GroupRight,
+    Atan2,
     Inf,
     Nan,
     Plus,
@@ -52,6 +55,8 @@ pub enum TokenKind {
     LBracket,
     RBracket,
     Comma,
+    Colon,
+    At,
     Eof,
 }
 
@@ -71,6 +76,9 @@ impl TokenKind {
             TokenKind::Unless => "unless".to_string(),
             TokenKind::On => "on".to_string(),
             TokenKind::Ignoring => "ignoring".to_string(),
+            TokenKind::GroupLeft => "group_left".to_string(),
+            TokenKind::GroupRight => "group_right".to_string(),
+            TokenKind::Atan2 => "atan2".to_string(),
             TokenKind::Inf => "inf".to_string(),
             TokenKind::Nan => "nan".to_string(),
             TokenKind::Plus => "+".to_string(),
@@ -95,6 +103,8 @@ impl TokenKind {
             TokenKind::LBracket => "[".to_string(),
             TokenKind::RBracket => "]".to_string(),
             TokenKind::Comma => ",".to_string(),
+            TokenKind::Colon => ":".to_string(),
+            TokenKind::At => "@".to_string(),
             TokenKind::Eof => "EOF".to_string(),
         }
     }
@@ -130,7 +140,7 @@ impl<'a> Lexer<'a> {
 
             let kind = match self.peek_byte() {
                 b'0'..=b'9' => self.lex_number_or_duration()?,
-                b'a'..=b'z' | b'A'..=b'Z' | b'_' | b':' => self.lex_ident_or_keyword(),
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(),
                 b'"' => self.lex_string()?,
                 b'+' => {
                     self.pos += 1;
@@ -219,9 +229,27 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     TokenKind::RBracket
                 }
+                b':' => {
+                    if self.pos + 1 < self.input.len() {
+                        let next = self.input.as_bytes()[self.pos + 1];
+                        if next.is_ascii_alphabetic() || next == b'_' || next == b':' {
+                            self.lex_ident_or_keyword()
+                        } else {
+                            self.pos += 1;
+                            TokenKind::Colon
+                        }
+                    } else {
+                        self.pos += 1;
+                        TokenKind::Colon
+                    }
+                }
                 b',' => {
                     self.pos += 1;
                     TokenKind::Comma
+                }
+                b'@' => {
+                    self.pos += 1;
+                    TokenKind::At
                 }
                 other => {
                     return Err(PromqlError::Parse(format!(
@@ -260,8 +288,19 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while !self.is_eof() && self.peek_byte().is_ascii_whitespace() {
-            self.pos += 1;
+        loop {
+            while !self.is_eof() && self.peek_byte().is_ascii_whitespace() {
+                self.pos += 1;
+            }
+
+            if !self.is_eof() && self.peek_byte() == b'#' {
+                while !self.is_eof() && self.peek_byte() != b'\n' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+
+            break;
         }
     }
 
@@ -288,6 +327,9 @@ impl<'a> Lexer<'a> {
             "unless" => TokenKind::Unless,
             "on" => TokenKind::On,
             "ignoring" => TokenKind::Ignoring,
+            "group_left" => TokenKind::GroupLeft,
+            "group_right" => TokenKind::GroupRight,
+            "atan2" => TokenKind::Atan2,
             "inf" => TokenKind::Inf,
             "nan" => TokenKind::Nan,
             _ => TokenKind::Ident(raw.to_string()),

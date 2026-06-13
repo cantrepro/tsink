@@ -1,0 +1,101 @@
+{
+  "metadata": [
+    {
+      "help": "RPC latency represented as a native histogram.",
+      "metricFamilyName": "rpc_duration_seconds",
+      "type": "Histogram",
+      "unit": "seconds"
+    }
+  ],
+  "timeseries": [
+    {
+      "exemplars": [
+        {
+          "labels": [
+            {
+              "name": "trace_id",
+              "value": "7d3ce929d0e0e47364bf92f3577b34da"
+            }
+          ],
+          "timestamp": 1700000240000,
+          "value": 0.851
+        }
+      ],
+      "histograms": [],
+      "labels": [
+        {
+          "name": "__name__",
+          "value": "http_request_duration_seconds"
+        },
+        {
+          "name": "job",
+          "value": "frontend"
+        },
+        {
+          "name": "route",
+          "value": "/checkout"
+        }
+      ],
+      "samples": [
+        {
+          "timestamp": 1700000240000,
+          "value": 0.851
+        }
+      ]
+    },
+    {
+      "exemplars": [],
+      "histograms": [
+        {
+          "count": {
+            "kind": "countFloat",
+            "value": 14.5
+          },
+          "customValues": [
+            0.25,
+            0.5
+          ],
+          "negativeCounts": [],
+          "negativeDeltas": [],
+          "negativeSpans": [],
+          "positiveCounts": [
+            1.0,
+            4.5,
+            6.5
+          ],
+          "positiveDeltas": [],
+          "positiveSpans": [
+            {
+              "length": 3,
+              "offset": 1
+            }
+          ],
+          "resetHint": "Gauge",
+          "schema": 2,
+          "sum": 6.75,
+          "timestamp": 1700000240000,
+          "zeroCount": {
+            "kind": "zeroCountFloat",
+            "value": 2.5
+          },
+          "zeroThreshold": 0.0
+        }
+      ],
+      "labels": [
+        {
+          "name": "__name__",
+          "value": "rpc_duration_seconds"
+        },
+        {
+          "name": "job",
+          "value": "backend"
+        },
+        {
+          "name": "method",
+          "value": "POST"
+        }
+      ],
+      "samples": []
+    }
+  ]
+}

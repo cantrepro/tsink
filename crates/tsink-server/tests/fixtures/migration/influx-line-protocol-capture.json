@@ -1,0 +1,10 @@
+[
+  {
+    "received_at_ms": 1700000000000,
+    "query_params": {
+      "db": "telegraf",
+      "precision": "ms"
+    },
+    "body": "cpu,host=node-a value=1.5,temp=3.0 1700000000000\nmem,host=node-a used=42 1700000005000"
+  }
+]

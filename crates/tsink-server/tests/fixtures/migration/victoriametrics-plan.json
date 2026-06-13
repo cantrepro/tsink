@@ -1,0 +1,30 @@
+{
+  "source": {
+    "kind": "victoriametrics",
+    "export_url": "http://127.0.0.1:8428/api/v1/export",
+    "query_range_url": "http://127.0.0.1:8428/prometheus/api/v1/query_range",
+    "metadata_url": "http://127.0.0.1:8428/prometheus/api/v1/metadata"
+  },
+  "target": {
+    "write_url": "http://127.0.0.1:9201/api/v1/write",
+    "read_url": "http://127.0.0.1:9201/api/v1/read",
+    "query_range_url": "http://127.0.0.1:9201/api/v1/query_range",
+    "metadata_url": "http://127.0.0.1:9201/api/v1/metadata",
+    "status_url": "http://127.0.0.1:9201/api/v1/status/tsdb",
+    "tenant": "default"
+  },
+  "selectors": [
+    "node_cpu_seconds_total{mode=\"idle\"}",
+    "http_requests_total{job=\"edge\"}"
+  ],
+  "metadata_metrics": [
+    "node_cpu_seconds_total",
+    "http_requests_total"
+  ],
+  "promql_checks": [
+    {
+      "query": "sum(rate(node_cpu_seconds_total[5m])) by (instance)",
+      "step": "30s"
+    }
+  ]
+}

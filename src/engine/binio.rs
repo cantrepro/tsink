@@ -1,5 +1,9 @@
 use crate::{Result, TsinkError};
 
+pub(crate) const FILE_FLAG_ZSTD_BODY: u16 = 0b0000_0001;
+const FILE_ZSTD_ORIGINAL_LEN_PREFIX_BYTES: usize = 4;
+const FILE_ZSTD_LEVEL_FAST: i32 = 1;
+
 pub(crate) fn checksum32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
@@ -127,4 +131,98 @@ pub(crate) fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Re
     let out = &bytes[*pos..end];
     *pos = end;
     Ok(out)
+}
+
+pub(crate) fn encode_optional_zstd_framed_file(logical_bytes: &[u8]) -> Result<Vec<u8>> {
+    if logical_bytes.len() < 8 {
+        return Err(TsinkError::InvalidConfiguration(
+            "framed file is too short to compress".to_string(),
+        ));
+    }
+
+    let original_flags = u16::from_le_bytes([logical_bytes[6], logical_bytes[7]]);
+    let body = &logical_bytes[8..];
+    if body.is_empty() {
+        return Ok(logical_bytes.to_vec());
+    }
+
+    let compressed = zstd::bulk::compress(body, FILE_ZSTD_LEVEL_FAST).map_err(|err| {
+        TsinkError::Compression(format!("zstd compress framed file failed: {err}"))
+    })?;
+    let original_len = u32::try_from(body.len()).map_err(|_| {
+        TsinkError::InvalidConfiguration("framed file body exceeds u32 length".to_string())
+    })?;
+
+    if compressed
+        .len()
+        .saturating_add(FILE_ZSTD_ORIGINAL_LEN_PREFIX_BYTES)
+        >= body.len()
+    {
+        return Ok(logical_bytes.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(
+        8usize
+            .saturating_add(FILE_ZSTD_ORIGINAL_LEN_PREFIX_BYTES)
+            .saturating_add(compressed.len()),
+    );
+    out.extend_from_slice(&logical_bytes[..6]);
+    append_u16(&mut out, original_flags | FILE_FLAG_ZSTD_BODY);
+    append_u32(&mut out, original_len);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+pub(crate) fn decode_optional_zstd_framed_file(
+    bytes: &[u8],
+    expected_magic: [u8; 4],
+    expected_version: u16,
+    file_name: &str,
+) -> Result<Vec<u8>> {
+    if bytes.len() < 8 {
+        return Err(TsinkError::DataCorruption(format!(
+            "{file_name} is too short"
+        )));
+    }
+
+    let mut pos = 0usize;
+    let magic = read_array::<4>(bytes, &mut pos)?;
+    if magic != expected_magic {
+        return Err(TsinkError::DataCorruption(format!(
+            "{file_name} magic mismatch"
+        )));
+    }
+
+    let version = read_u16(bytes, &mut pos)?;
+    if version != expected_version {
+        return Err(TsinkError::DataCorruption(format!(
+            "unsupported {file_name} version {version}"
+        )));
+    }
+
+    let flags = read_u16(bytes, &mut pos)?;
+
+    let body = if flags & FILE_FLAG_ZSTD_BODY != 0 {
+        let expected_len = usize::try_from(read_u32(bytes, &mut pos)?).unwrap_or(usize::MAX);
+        let compressed = &bytes[pos..];
+        let decoded = zstd::bulk::decompress(compressed, expected_len).map_err(|err| {
+            TsinkError::Compression(format!("zstd decompress {file_name} failed: {err}"))
+        })?;
+        if decoded.len() != expected_len {
+            return Err(TsinkError::DataCorruption(format!(
+                "{file_name} decompressed length mismatch: expected {expected_len}, got {}",
+                decoded.len()
+            )));
+        }
+        decoded
+    } else {
+        bytes[pos..].to_vec()
+    };
+
+    let mut logical = Vec::with_capacity(8usize.saturating_add(body.len()));
+    logical.extend_from_slice(&expected_magic);
+    append_u16(&mut logical, expected_version);
+    append_u16(&mut logical, flags & !FILE_FLAG_ZSTD_BODY);
+    logical.extend_from_slice(&body);
+    Ok(logical)
 }

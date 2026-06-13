@@ -47,11 +47,35 @@ fn test_memory_mapped_bounds_checking() {
         .build()
         .unwrap();
 
-    let result = storage.select("test_metric", &[], 1, 4000);
     assert!(
-        result.is_err() || result.unwrap().is_empty(),
-        "corrupted on-disk data should not produce stale decoded points"
+        storage
+            .select("test_metric", &[], 0, 4000)
+            .unwrap()
+            .is_empty(),
+        "corrupted startup segment should be quarantined instead of remaining queryable"
     );
+    assert!(
+        !segment_dir.exists(),
+        "corrupted startup segment root should be moved out of the visible inventory"
+    );
+    let quarantined = segment_dir
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tmp-tsink-startup-segment-quarantine-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantined.len(), 1);
+
+    storage.close().unwrap();
 }
 
 #[test]

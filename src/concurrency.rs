@@ -18,7 +18,6 @@ pub struct Semaphore {
 }
 
 impl Semaphore {
-    /// Creates a new semaphore with the specified number of permits.
     pub fn new(permits: usize) -> Self {
         let permits = permits.max(1);
         Self {
@@ -29,7 +28,6 @@ impl Semaphore {
         }
     }
 
-    /// Acquires a permit from the semaphore.
     #[instrument(skip(self))]
     pub fn acquire(&self) -> SemaphoreGuard<'_> {
         loop {
@@ -57,7 +55,6 @@ impl Semaphore {
         }
     }
 
-    /// Tries to acquire a permit without blocking.
     pub fn try_acquire(&self) -> Option<SemaphoreGuard<'_>> {
         let mut current = self.permits.load(Ordering::Acquire);
         loop {
@@ -77,7 +74,6 @@ impl Semaphore {
         }
     }
 
-    /// Tries to acquire a permit, waiting up to the provided timeout.
     pub fn try_acquire_for(&self, timeout: Duration) -> Result<SemaphoreGuard<'_>> {
         if timeout.is_zero() {
             return self.try_acquire().ok_or(TsinkError::WriteTimeout {
@@ -121,7 +117,6 @@ impl Semaphore {
         }
     }
 
-    /// Acquires all permits, waiting up to timeout.
     pub fn acquire_all(&self, timeout: Duration) -> Result<Vec<SemaphoreGuard<'_>>> {
         let timeout_err = || TsinkError::WriteTimeout {
             timeout_ms: timeout.as_millis() as u64,
@@ -178,12 +173,10 @@ impl Semaphore {
         }
     }
 
-    /// Returns the semaphore capacity.
     pub fn capacity(&self) -> usize {
         self.max_permits
     }
 
-    /// Releases a permit back to the semaphore.
     fn release(&self) {
         let previous = self.permits.fetch_add(1, Ordering::AcqRel);
         debug!("Released semaphore permit, {} now available", previous + 1);
@@ -191,7 +184,6 @@ impl Semaphore {
         self.condvar.notify_one();
     }
 
-    /// Returns the number of available permits.
     pub fn available_permits(&self) -> usize {
         self.permits.load(Ordering::Acquire)
     }

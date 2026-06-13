@@ -1,5 +1,3 @@
-#![cfg(feature = "async-storage")]
-
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,7 +7,7 @@ use tokio::sync::Notify;
 use tempfile::TempDir;
 use tsink::{
     Aggregation, AsyncStorage, AsyncStorageBuilder, DataPoint, Label, QueryOptions, Result, Row,
-    Storage, StorageBuilder, TsinkError,
+    Storage, StorageBuilder, TsinkError, WalSyncMode, WriteAcknowledgement,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -27,6 +25,25 @@ async fn basic_insert_and_select_roundtrip() -> Result<()> {
     assert_eq!(points.len(), 2);
     assert_eq!(points[0].value_as_f64(), Some(1.0));
     assert_eq!(points[1].value_as_f64(), Some(2.0));
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_rows_with_result_reports_periodic_acknowledgement() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let storage = AsyncStorageBuilder::new()
+        .with_data_path(dir.path())
+        .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(3600)))
+        .build()?;
+
+    let result = storage
+        .insert_rows_with_result(vec![Row::new("periodic_async_ack", DataPoint::new(1, 1.0))])
+        .await?;
+
+    assert_eq!(result.acknowledgement, WriteAcknowledgement::Appended);
+    assert!(!result.is_durable());
 
     storage.close().await?;
     Ok(())

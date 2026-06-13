@@ -1,0 +1,11 @@
+{
+  "metadata": [
+    {
+      "help": "Total HTTP requests processed.",
+      "metricFamilyName": "http_requests_total",
+      "type": "Counter",
+      "unit": "requests"
+    }
+  ],
+  "timeseries": []
+}

@@ -1,16 +1,39 @@
 //! Integration tests for tsink.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use tsink::engine::chunk::ValueLane;
-use tsink::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
+use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
-    DataPoint, Label, MetricSeries, QueryOptions, Row, StorageBuilder, TimestampPrecision,
-    TsinkError, Value, WalSyncMode,
+    DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, MetricSeries,
+    NativeHistogram, QueryOptions, Row, SeriesMatcher, SeriesSelection, StorageBuilder,
+    TimestampPrecision, TsinkError, Value, WalSyncMode, WriteAcknowledgement,
 };
+
+fn sample_histogram() -> NativeHistogram {
+    NativeHistogram {
+        count: Some(HistogramCount::Int(9)),
+        sum: 12.5,
+        schema: 2,
+        zero_threshold: 0.0,
+        zero_count: Some(HistogramCount::Int(1)),
+        negative_spans: vec![],
+        negative_deltas: vec![],
+        negative_counts: vec![],
+        positive_spans: vec![HistogramBucketSpan {
+            offset: 1,
+            length: 2,
+        }],
+        positive_deltas: vec![4, 2],
+        positive_counts: vec![],
+        reset_hint: HistogramResetHint::Gauge,
+        custom_values: vec![0.25, 0.5],
+    }
+}
 
 #[test]
 fn test_basic_insert_and_select() {
@@ -136,7 +159,7 @@ fn test_persistence() {
 }
 
 #[test]
-fn test_snapshot_and_restore_recover_wal_backed_data() {
+fn test_snapshot_and_restore_recover_live_data() {
     let temp_dir = TempDir::new().unwrap();
     let source_path = temp_dir.path().join("source");
     let snapshot_path = temp_dir.path().join("snapshot");
@@ -160,53 +183,6 @@ fn test_snapshot_and_restore_recover_wal_backed_data() {
         storage.snapshot(&snapshot_path).unwrap();
         storage.close().unwrap();
     }
-
-    // Force a WAL-only restore path to verify replay-aware recovery.
-    let _ = fs::remove_dir_all(snapshot_path.join("lane_numeric"));
-    let _ = fs::remove_dir_all(snapshot_path.join("lane_blob"));
-
-    let snapshot_wal_dir = snapshot_path.join("wal");
-    assert!(snapshot_wal_dir.is_dir());
-
-    let snapshot_wal = FramedWal::open(&snapshot_wal_dir, WalSyncMode::PerAppend).unwrap();
-    let wal_frames = snapshot_wal.replay_frames().unwrap();
-    let wal_has_samples = wal_frames
-        .iter()
-        .any(|frame| matches!(frame, ReplayFrame::Samples(_)));
-    if !wal_has_samples {
-        let existing_series_id = wal_frames.iter().find_map(|frame| match frame {
-            ReplayFrame::SeriesDefinition(definition)
-                if definition.metric == "snapshot_metric" && definition.labels.is_empty() =>
-            {
-                Some(definition.series_id)
-            }
-            _ => None,
-        });
-        let series_id = existing_series_id.unwrap_or(10_001);
-
-        if existing_series_id.is_none() {
-            // When the WAL is empty due to a background flush winning the snapshot race,
-            // drop the index and seed a minimal WAL stream so restore still exercises replay.
-            let _ = fs::remove_file(snapshot_path.join("series_index.bin"));
-            snapshot_wal
-                .append_series_definition(&SeriesDefinitionFrame {
-                    series_id,
-                    metric: "snapshot_metric".to_string(),
-                    labels: vec![],
-                })
-                .unwrap();
-        }
-
-        let values = [Value::from(11.0), Value::from(22.0)];
-        let samples = SamplesBatchFrame::from_timestamp_value_refs(
-            series_id,
-            ValueLane::Numeric,
-            &[(1, &values[0]), (2, &values[1])],
-        )
-        .unwrap();
-        snapshot_wal.append_samples(&[samples]).unwrap();
-    }
-    drop(snapshot_wal);
 
     StorageBuilder::restore_from_snapshot(&snapshot_path, &restore_path).unwrap();
 
@@ -274,12 +250,99 @@ fn test_restore_from_snapshot_replaces_existing_target_contents() {
 }
 
 #[test]
+fn test_snapshot_and_restore_preserve_histogram_values() {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("source");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let restore_path = temp_dir.path().join("restore");
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::new(
+                    "snapshot_histogram",
+                    DataPoint::new(1, Value::from(sample_histogram())),
+                ),
+                Row::new(
+                    "snapshot_histogram",
+                    DataPoint::new(2, Value::from(sample_histogram())),
+                ),
+            ])
+            .unwrap();
+
+        storage.snapshot(&snapshot_path).unwrap();
+        storage.close().unwrap();
+    }
+
+    StorageBuilder::restore_from_snapshot(&snapshot_path, &restore_path).unwrap();
+
+    let restored = StorageBuilder::new()
+        .with_data_path(&restore_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let points = restored.select("snapshot_histogram", &[], 0, 10).unwrap();
+    assert_eq!(
+        points,
+        vec![
+            DataPoint::new(1, Value::from(sample_histogram())),
+            DataPoint::new(2, Value::from(sample_histogram()))
+        ]
+    );
+    restored.close().unwrap();
+}
+
+#[test]
 fn test_snapshot_requires_persistent_storage() {
     let storage = StorageBuilder::new().build().unwrap();
     let temp_dir = TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("snapshot");
 
     let err = storage.snapshot(&snapshot_path).unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_rejects_dangling_symlink_destination() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let snapshot_path = temp_dir.path().join("snapshot-link");
+    symlink(
+        temp_dir.path().join("missing-snapshot-target"),
+        &snapshot_path,
+    )
+    .unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .build()
+        .unwrap();
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_restore_rejects_symlink_snapshot_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let real_snapshot = temp_dir.path().join("real-snapshot");
+    let snapshot_link = temp_dir.path().join("snapshot-link");
+    let restore_path = temp_dir.path().join("restore");
+
+    fs::create_dir_all(&real_snapshot).unwrap();
+    symlink(&real_snapshot, &snapshot_link).unwrap();
+
+    let err = StorageBuilder::restore_from_snapshot(&snapshot_link, &restore_path).unwrap_err();
+
     assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
 }
 
@@ -328,6 +391,137 @@ fn test_future_data_is_not_expired_by_partition_age() {
     let points = storage.select("future_metric", &[], 0, i64::MAX).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, future_ts);
+}
+
+#[test]
+fn test_far_future_write_does_not_reject_current_data_or_hide_history() {
+    let storage = StorageBuilder::new()
+        .with_retention(Duration::from_secs(12 * 3600))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let current = now;
+    let older = now - 60;
+    let future = now + 30 * 24 * 3600;
+
+    storage
+        .insert_rows(&[Row::new("future_skew_metric", DataPoint::new(future, 3.0))])
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::new("future_skew_metric", DataPoint::new(older, 1.0)),
+            Row::new("future_skew_metric", DataPoint::new(current, 2.0)),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .select("future_skew_metric", &[], older - 1, future + 1)
+            .unwrap(),
+        vec![
+            DataPoint::new(older, 1.0),
+            DataPoint::new(current, 2.0),
+            DataPoint::new(future, 3.0),
+        ]
+    );
+
+    let snapshot = storage.observability_snapshot();
+    assert_eq!(snapshot.retention.max_observed_timestamp, Some(future));
+    assert_eq!(
+        snapshot.retention.recency_reference_timestamp,
+        Some(current)
+    );
+    assert_eq!(snapshot.retention.future_skew_points_total, 1);
+    assert_eq!(snapshot.retention.future_skew_max_timestamp, Some(future));
+}
+
+#[test]
+fn test_full_delete_recomputes_retention_reference_across_series() {
+    let storage = StorageBuilder::new()
+        .with_retention(Duration::from_secs(60))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let hidden = now - 30;
+    let anchor = now + 31;
+    let hidden_labels = vec![Label::new("host", "hidden")];
+    let anchor_labels = vec![Label::new("host", "anchor")];
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "delete_retention_metric",
+            hidden_labels.clone(),
+            DataPoint::new(hidden, 1.0),
+        )])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::with_labels(
+            "delete_retention_metric",
+            anchor_labels.clone(),
+            DataPoint::new(anchor, 2.0),
+        )])
+        .unwrap();
+
+    assert!(storage
+        .select(
+            "delete_retention_metric",
+            &hidden_labels,
+            hidden - 1,
+            anchor + 1
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .retention
+            .recency_reference_timestamp,
+        Some(anchor)
+    );
+
+    storage
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("delete_retention_metric")
+                .with_matcher(SeriesMatcher::equal("host", "anchor")),
+        )
+        .unwrap();
+
+    assert!(storage
+        .observability_snapshot()
+        .retention
+        .recency_reference_timestamp
+        .is_some_and(|ts| ts < anchor));
+    assert_eq!(
+        storage
+            .select(
+                "delete_retention_metric",
+                &hidden_labels,
+                hidden - 1,
+                anchor + 1
+            )
+            .unwrap(),
+        vec![DataPoint::new(hidden, 1.0)]
+    );
+    assert!(storage
+        .select(
+            "delete_retention_metric",
+            &anchor_labels,
+            hidden - 1,
+            anchor + 1
+        )
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -618,7 +812,7 @@ fn test_list_metrics_ignores_runtime_wal_only_series() {
 }
 
 #[test]
-fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
+fn test_list_metrics_with_wal_ignores_uncommitted_series_definitions() {
     let temp_dir = TempDir::new().unwrap();
     let wal_only_metric = "wal_only_metric";
     let wal_only_labels = vec![Label::new("source", "wal")];
@@ -642,11 +836,7 @@ fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
         .unwrap();
 
     let metrics = storage.list_metrics_with_wal().unwrap();
-    let expected = vec![MetricSeries {
-        name: wal_only_metric.to_string(),
-        labels: wal_only_labels,
-    }];
-    assert_eq!(metrics, expected);
+    assert!(metrics.is_empty());
 
     storage.close().unwrap();
 }
@@ -844,6 +1034,49 @@ fn test_wal_sync_mode_can_be_switched() {
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].timestamp, 1);
         assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn write_result_reports_volatile_without_wal() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let result = storage
+        .insert_rows_with_result(&[Row::new("volatile_write", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    assert_eq!(result.acknowledgement, WriteAcknowledgement::Volatile);
+    assert!(!result.is_durable());
+}
+
+#[test]
+fn write_result_reports_wal_acknowledgement_level() {
+    for (mode, expected) in [
+        (WalSyncMode::PerAppend, WriteAcknowledgement::Durable),
+        (
+            WalSyncMode::Periodic(Duration::from_secs(3600)),
+            WriteAcknowledgement::Appended,
+        ),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(true)
+            .with_wal_sync_mode(mode)
+            .build()
+            .unwrap();
+
+        let result = storage
+            .insert_rows_with_result(&[Row::new("ack_write", DataPoint::new(1, 1.0))])
+            .unwrap();
+
+        assert_eq!(result.acknowledgement, expected);
+        assert_eq!(result.is_durable(), expected.is_durable());
     }
 }
 

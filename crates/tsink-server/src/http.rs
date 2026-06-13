@@ -36,7 +36,7 @@ impl HttpRequest {
             } else {
                 (pair, "")
             };
-            if key == name {
+            if decoded_component_matches(key, name) {
                 return Some(percent_decode(value));
             }
         }
@@ -56,7 +56,7 @@ impl HttpRequest {
                 } else {
                     (pair, "")
                 };
-                if key == name {
+                if decoded_component_matches(key, name) {
                     Some(percent_decode(value))
                 } else {
                     None
@@ -88,10 +88,7 @@ impl HttpRequest {
         if let Some(val) = self.query_param(name) {
             return Some(val);
         }
-        if self
-            .header("content-type")
-            .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"))
-        {
+        if self.has_form_urlencoded_body() {
             for (k, v) in self.form_params() {
                 if k == name {
                     return Some(v);
@@ -104,10 +101,7 @@ impl HttpRequest {
     /// Get all values for a parameter from query string and form body.
     pub fn param_all(&self, name: &str) -> Vec<String> {
         let mut values = self.query_param_all(name);
-        if self
-            .header("content-type")
-            .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"))
-        {
+        if self.has_form_urlencoded_body() {
             let Ok(body_str) = std::str::from_utf8(&self.body) else {
                 return values;
             };
@@ -120,12 +114,21 @@ impl HttpRequest {
                 } else {
                     (pair, "")
                 };
-                if key == name {
+                if decoded_component_matches(key, name) {
                     values.push(percent_decode(value));
                 }
             }
         }
         values
+    }
+
+    fn has_form_urlencoded_body(&self) -> bool {
+        self.header("content-type")
+            .and_then(|content_type| content_type.split(';').next())
+            .is_some_and(|mime| {
+                mime.trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
     }
 }
 
@@ -146,7 +149,18 @@ impl HttpResponse {
     }
 
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        let name = name.into();
+        let value = value.into();
+        if let Some((existing_name, existing_value)) = self
+            .headers
+            .iter_mut()
+            .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(&name))
+        {
+            *existing_name = name;
+            *existing_value = value;
+        } else {
+            self.headers.push((name, value));
+        }
         self
     }
 }
@@ -199,9 +213,15 @@ pub async fn read_http_request<R: AsyncRead + Unpin>(
         .next()
         .ok_or_else(|| "missing HTTP path".to_string())?
         .to_string();
-    let _version = parts
+    let version = parts
         .next()
         .ok_or_else(|| "missing HTTP version".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed request line".to_string());
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(format!("unsupported HTTP version: {version}"));
+    }
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -211,7 +231,22 @@ pub async fn read_http_request<R: AsyncRead + Unpin>(
         let Some((name, value)) = line.split_once(':') else {
             return Err(format!("malformed header line: {line}"));
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("malformed header line: {line}"));
+        }
+        let name = name.to_ascii_lowercase();
+        let value = value.trim().to_string();
+        match name.as_str() {
+            "content-length" if headers.contains_key("content-length") => {
+                return Err("duplicate content-length header".to_string());
+            }
+            "transfer-encoding" => {
+                return Err("transfer-encoding is not supported".to_string());
+            }
+            _ => {}
+        }
+        headers.insert(name, value);
     }
 
     let content_length = headers
@@ -266,6 +301,11 @@ pub async fn write_http_response<W: AsyncWrite + Unpin>(
     );
 
     for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
         let _ = write!(&mut header_buf, "{}: {}\r\n", name, value);
     }
 
@@ -291,13 +331,24 @@ fn find_sequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+fn decoded_component_matches(raw: &str, expected: &str) -> bool {
+    raw == expected
+        || ((raw.as_bytes().contains(&b'%') || raw.as_bytes().contains(&b'+'))
+            && percent_decode(raw) == expected)
+}
+
 pub fn status_reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
         422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -352,7 +403,30 @@ fn hex_digit(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn query_and_form_params_decode_percent_encoded_keys() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/series?match%5B%5D=up&match%5B%5D=node_cpu_seconds_total".to_string(),
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                "Application/X-Www-Form-Urlencoded; charset=utf-8".to_string(),
+            )]),
+            body: b"match%5B%5D=process_cpu_seconds_total".to_vec(),
+        };
+
+        assert_eq!(request.query_param("match[]").as_deref(), Some("up"));
+        assert_eq!(
+            request.param_all("match[]"),
+            vec![
+                "up".to_string(),
+                "node_cpu_seconds_total".to_string(),
+                "process_cpu_seconds_total".to_string(),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn read_http_request_preserves_pipelined_bytes() {
@@ -377,5 +451,111 @@ mod tests {
         assert_eq!(first.path, "/one");
         assert_eq!(second.method, "GET");
         assert_eq!(second.path, "/two");
+    }
+
+    #[tokio::test]
+    async fn read_http_request_rejects_transfer_encoding() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                b"POST /write HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n",
+            )
+            .await
+            .expect("write should work");
+        drop(client);
+
+        let mut read_buffer = Vec::new();
+        let err = read_http_request(&mut server, &mut read_buffer)
+            .await
+            .expect_err("chunked request should be rejected");
+        assert_eq!(err, "transfer-encoding is not supported");
+    }
+
+    #[tokio::test]
+    async fn read_http_request_rejects_duplicate_content_length() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                b"POST /write HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ntest!",
+            )
+            .await
+            .expect("write should work");
+        drop(client);
+
+        let mut read_buffer = Vec::new();
+        let err = read_http_request(&mut server, &mut read_buffer)
+            .await
+            .expect_err("duplicate content-length should be rejected");
+        assert_eq!(err, "duplicate content-length header");
+    }
+
+    #[tokio::test]
+    async fn read_http_request_rejects_malformed_request_line() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET / HTTP/1.1 unexpected\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write should work");
+        drop(client);
+
+        let mut read_buffer = Vec::new();
+        let err = read_http_request(&mut server, &mut read_buffer)
+            .await
+            .expect_err("extra request-line token should be rejected");
+        assert_eq!(err, "malformed request line");
+    }
+
+    #[test]
+    fn with_header_replaces_existing_header_case_insensitively() {
+        let response = HttpResponse::new(200, Vec::<u8>::new())
+            .with_header("content-type", "text/plain")
+            .with_header("Content-Type", "application/json");
+
+        assert_eq!(
+            response.headers,
+            vec![("Content-Type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_http_response_ignores_conflicting_framing_headers() {
+        let response = HttpResponse::new(200, b"ok".to_vec())
+            .with_header("Content-Length", "999")
+            .with_header("Transfer-Encoding", "chunked")
+            .with_header("content-type", "text/plain")
+            .with_header("Content-Type", "application/json");
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        let write_task = tokio::spawn(async move {
+            write_http_response(&mut server, &response)
+                .await
+                .expect("response write should succeed");
+        });
+
+        let mut raw = Vec::new();
+        client
+            .read_to_end(&mut raw)
+            .await
+            .expect("response should be readable");
+        write_task.await.expect("writer task should not panic");
+
+        let response_text = String::from_utf8(raw).expect("response should be utf8");
+        assert!(response_text.contains("Content-Length: 2\r\n"));
+        assert!(!response_text.contains("Content-Length: 999\r\n"));
+        assert!(!response_text.contains("Transfer-Encoding: chunked\r\n"));
+
+        let content_type_headers = response_text
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+            .collect::<Vec<_>>();
+        assert_eq!(content_type_headers, vec!["Content-Type: application/json"]);
+    }
+
+    #[test]
+    fn status_reason_covers_emitted_statuses() {
+        assert_eq!(status_reason(204), "No Content");
+        assert_eq!(status_reason(403), "Forbidden");
+        assert_eq!(status_reason(413), "Payload Too Large");
+        assert_eq!(status_reason(429), "Too Many Requests");
     }
 }

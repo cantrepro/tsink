@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::types::UNativeHistogram;
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum UValue {
     F64 { v: f64 },
@@ -8,6 +10,21 @@ pub enum UValue {
     Bool { v: bool },
     Bytes { v: Vec<u8> },
     Str { v: String },
+    Histogram { v: UNativeHistogram },
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UHistogramCount {
+    Int { v: u64 },
+    Float { v: f64 },
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UHistogramResetHint {
+    Unknown,
+    Yes,
+    No,
+    Gauge,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -35,6 +52,17 @@ pub enum UTimestampPrecision {
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
+pub enum UStorageRuntimeMode {
+    ReadWrite,
+    ComputeOnly,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum URemoteSegmentCachePolicy {
+    MetadataOnly,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum USeriesMatcherOp {
     Equal,
     NotEqual,
@@ -46,4 +74,17 @@ pub enum USeriesMatcherOp {
 pub enum UWalSyncMode {
     PerAppend,
     Periodic { interval: Duration },
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UWalReplayMode {
+    Strict,
+    Salvage,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UWriteAcknowledgement {
+    Volatile,
+    Appended,
+    Durable,
 }

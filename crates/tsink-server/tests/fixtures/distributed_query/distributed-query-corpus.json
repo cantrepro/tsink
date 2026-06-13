@@ -1,0 +1,117 @@
+{
+  "localRows": [
+    {
+      "metric": "up",
+      "labels": {
+        "instance": "node-a",
+        "job": "api"
+      },
+      "points": [
+        { "timestamp": 1700000000000, "value": 1.0 },
+        { "timestamp": 1700000015000, "value": 2.0 }
+      ]
+    },
+    {
+      "metric": "http_requests_total",
+      "labels": {
+        "instance": "node-a",
+        "method": "GET"
+      },
+      "points": [
+        { "timestamp": 1700000005000, "value": 10.0 }
+      ]
+    }
+  ],
+  "remoteRows": [
+    {
+      "metric": "up",
+      "labels": {
+        "instance": "node-b",
+        "job": "api"
+      },
+      "points": [
+        { "timestamp": 1700000000000, "value": 3.0 },
+        { "timestamp": 1700000015000, "value": 4.0 }
+      ]
+    },
+    {
+      "metric": "http_requests_total",
+      "labels": {
+        "instance": "node-b",
+        "method": "POST"
+      },
+      "points": [
+        { "timestamp": 1700000005000, "value": 20.0 }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "labels",
+      "method": "GET",
+      "path": "/api/v1/labels",
+      "expectedData": ["__name__", "instance", "job", "method"]
+    },
+    {
+      "name": "series_up",
+      "method": "GET",
+      "path": "/api/v1/series?match[]=up",
+      "expectedData": [
+        { "__name__": "up", "instance": "node-a", "job": "api" },
+        { "__name__": "up", "instance": "node-b", "job": "api" }
+      ]
+    },
+    {
+      "name": "query_up_instant",
+      "method": "GET",
+      "path": "/api/v1/query?query=up&time=1700000015000",
+      "expectedData": {
+        "resultType": "vector",
+        "result": [
+          {
+            "metric": {
+              "__name__": "up",
+              "instance": "node-a",
+              "job": "api"
+            },
+            "value": [1700000015.0, "2"]
+          },
+          {
+            "metric": {
+              "__name__": "up",
+              "instance": "node-b",
+              "job": "api"
+            },
+            "value": [1700000015.0, "4"]
+          }
+        ]
+      }
+    },
+    {
+      "name": "query_up_range_single_step",
+      "method": "GET",
+      "path": "/api/v1/query_range?query=up&start=1700000015000&end=1700000015000&step=15s",
+      "expectedData": {
+        "resultType": "matrix",
+        "result": [
+          {
+            "metric": {
+              "__name__": "up",
+              "instance": "node-a",
+              "job": "api"
+            },
+            "values": [[1700000015.0, "2"]]
+          },
+          {
+            "metric": {
+              "__name__": "up",
+              "instance": "node-b",
+              "job": "api"
+            },
+            "values": [[1700000015.0, "4"]]
+          }
+        ]
+      }
+    }
+  ]
+}

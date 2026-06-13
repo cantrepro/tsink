@@ -8,7 +8,7 @@ mod error;
 mod query;
 mod types;
 
-pub use builder::TsinkStorageBuilder;
+pub use builder::{restore_from_snapshot, TsinkStorageBuilder};
 pub use db::TsinkDB;
 pub use enums::*;
 pub use error::TsinkUniFFIError;
