@@ -173,7 +173,6 @@ fn test_future_data_is_not_expired_by_partition_age() {
         .insert_rows(&[Row::new("future_metric", DataPoint::new(future_ts, 1.0))])
         .unwrap();
 
-    // Wait long enough that age-based expiration would have dropped this partition.
     thread::sleep(Duration::from_secs(2));
 
     let points = storage.select("future_metric", &[], 0, i64::MAX).unwrap();
@@ -203,7 +202,6 @@ fn test_concurrent_writes() {
     assert_eq!(test_points.len(), 1);
     assert_eq!(test_points[0].value_as_f64().unwrap_or(f64::NAN), 42.0);
 
-    // Now test concurrent writes with a shared metric name
     let mut handles = vec![];
     let base_timestamp = 2_000_000;
 
@@ -211,7 +209,7 @@ fn test_concurrent_writes() {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
             let rows = vec![Row::new(
-                "concurrent_metric", // Use same metric name for all
+                "concurrent_metric",
                 DataPoint::new(base_timestamp + i as i64, i as f64),
             )];
             storage.insert_rows(&rows).unwrap();
@@ -545,7 +543,6 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
 
-    // Seed malformed WAL bytes that should not create any recovered rows.
     fs::create_dir_all(&wal_dir).unwrap();
     fs::write(wal_dir.join("wal.log"), [0xAA, 0xBB, 0xCC]).unwrap();
 
@@ -559,7 +556,6 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
         .unwrap();
     storage.close().unwrap();
 
-    // Re-enabling WAL must not replay stale rows from the disabled run.
     let reopened = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_wal_enabled(true)
@@ -609,7 +605,6 @@ fn test_wal_buffer_size_zero_still_recovers() {
         storage
             .insert_rows(&[Row::new("zero_buf_wal", DataPoint::new(1, 1.0))])
             .unwrap();
-        // Drop without close to simulate abrupt shutdown and rely on WAL recovery.
     }
 
     let storage = StorageBuilder::new()
@@ -639,7 +634,6 @@ fn test_drop_without_close_persists_when_wal_disabled() {
         storage
             .insert_rows(&[Row::new("drop_persist_metric", DataPoint::new(1, 1.0))])
             .unwrap();
-        // Intentionally rely on Drop; no explicit close call.
     }
 
     let storage = StorageBuilder::new()
@@ -703,10 +697,8 @@ fn test_close_handles_partition_name_conflict() {
         .insert_rows(&[Row::new("close_flush", DataPoint::new(1, 1.0))])
         .unwrap();
 
-    // Force a path conflict for partition flush directory creation.
     fs::write(temp_dir.path().join("p-1-1"), b"conflict").unwrap();
 
-    // Close should succeed by selecting an alternate directory name.
     storage.close().unwrap();
 }
 
@@ -757,7 +749,6 @@ fn test_select_across_multiple_partitions_persistent() {
         .build()
         .unwrap();
 
-    // Insert out-of-order but spanning multiple partitions
     let rows = vec![
         Row::new("multi_part", DataPoint::new(10, 1.0)),
         Row::new("multi_part", DataPoint::new(13, 2.0)),

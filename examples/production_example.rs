@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(
         StorageBuilder::new()
             .with_data_path("./tsink-data")
-            .with_retention(Duration::from_secs(7 * 24 * 3600)) // 7 days
+            .with_retention(Duration::from_secs(7 * 24 * 3600))
             .with_chunk_points(4096)
             .with_timestamp_precision(TimestampPrecision::Nanoseconds)
             .with_write_timeout(Duration::from_secs(30))
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reader_handle = thread::spawn(move || {
         info!("Reader thread started");
 
-        thread::sleep(Duration::from_secs(2)); // Wait for some data
+        thread::sleep(Duration::from_secs(2));
 
         for iteration in 0..20 {
             let start = std::time::Instant::now();
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as i64;
-            let start_time = end_time - 60_000_000_000; // Last 60 seconds
+            let start_time = end_time - 60_000_000_000;
 
             match storage_reader.select(
                 "cpu_usage",

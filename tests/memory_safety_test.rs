@@ -42,7 +42,6 @@ fn test_memory_mapped_bounds_checking() {
     let chunks_file = segment_dir.join("chunks.bin");
     fs::write(&chunks_file, vec![0u8; 1]).unwrap();
 
-    // Reopen and try to query - should handle corruption without panicking.
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .build()
@@ -113,7 +112,6 @@ fn test_malformed_metadata_handling() {
     let data_dir = temp_dir.path().join("p-0-1000");
     fs::create_dir_all(&data_dir).unwrap();
 
-    // Write malformed metadata
     fs::write(data_dir.join("meta.json"), b"not valid json").unwrap();
     fs::write(data_dir.join("data"), vec![0u8; 100]).unwrap();
 

@@ -529,8 +529,6 @@ impl ChunkStorage {
         end: i64,
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
-        // `select`/`select_into` resolve a single exact series identity (metric + labels).
-        // Use `select_all` when callers want results across every label set for a metric.
         let Some(series_id) = self
             .registry
             .read()
@@ -1902,7 +1900,6 @@ mod tests {
             writer_tx.send(result).unwrap();
         });
 
-        // Give the writer enough time to resolve the series and block on lane reservation.
         thread::sleep(Duration::from_millis(75));
 
         let reader_storage = Arc::clone(&storage);
@@ -2348,7 +2345,6 @@ mod tests {
         let stale_labels = vec![Label::new("host", "stale")];
         let fresh_labels = vec![Label::new("host", "fresh")];
 
-        // Seed a stale WAL generation directly so no segment files are created.
         let stale_series_id = 1;
         let wal =
             FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
@@ -2376,7 +2372,6 @@ mod tests {
         wal.append_samples(&[stale_batch]).unwrap();
         drop(wal);
 
-        // Run with WAL disabled: no replay should occur, and existing WAL must be cleared.
         {
             let storage = StorageBuilder::new()
                 .with_data_path(temp_dir.path())
@@ -2396,7 +2391,6 @@ mod tests {
             storage.close().unwrap();
         }
 
-        // Re-enabling WAL should no longer replay stale frames into the new id space.
         let reopened = StorageBuilder::new()
             .with_data_path(temp_dir.path())
             .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -2787,7 +2781,6 @@ mod tests {
             writer_tx.send(result).unwrap();
         });
 
-        // Writer should be blocked waiting for permit acquisition.
         assert!(writer_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         let close_storage = Arc::clone(&storage);
@@ -2797,7 +2790,6 @@ mod tests {
             close_tx.send(result).unwrap();
         });
 
-        // Close should wait until in-flight writers release permits.
         assert!(close_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         drop(held_permit);

@@ -258,10 +258,7 @@ pub fn load_segments(base: impl AsRef<Path>) -> Result<LoadedSegments> {
         for series in segment.series {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
-                    if existing.metric == series.metric && existing.labels == series.labels =>
-                {
-                    // no-op
-                }
+                    if existing.metric == series.metric && existing.labels == series.labels => {}
                 Some(_) => {
                     return Err(TsinkError::DataCorruption(format!(
                         "series id {} conflicts across segments",

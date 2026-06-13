@@ -244,7 +244,6 @@ mod tests {
 
     #[test]
     fn test_size_limit() {
-        // This should fail on 32-bit architectures if we try to map too much
         #[cfg(all(target_arch = "x86", unix))]
         {
             use std::fs::File;

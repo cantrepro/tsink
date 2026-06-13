@@ -295,7 +295,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_string(&mut self) -> Result<TokenKind> {
-        self.pos += 1; // opening quote
+        self.pos += 1;
         let mut out = String::new();
 
         while !self.is_eof() {

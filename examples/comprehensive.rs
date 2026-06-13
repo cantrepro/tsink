@@ -30,7 +30,7 @@ fn example_with_chunk_points() -> tsink::Result<()> {
     let storage = StorageBuilder::new().with_chunk_points(512).build()?;
 
     for i in 0..10 {
-        let timestamp = 1600000000 + (i * 3600 * 2); // 2 hour intervals
+        let timestamp = 1600000000 + (i * 3600 * 2);
         let row = Row::new("metric", DataPoint::new(timestamp, i as f64));
         storage.insert_rows(&[row])?;
     }
@@ -105,7 +105,7 @@ fn example_concurrent_operations() -> tsink::Result<()> {
     for reader_id in 0..2 {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50)); // Let some writes happen first
+            thread::sleep(Duration::from_millis(50));
 
             for _ in 0..10 {
                 match storage.select("concurrent_metric", &[], 1600000000, 1600000100) {
@@ -179,7 +179,7 @@ fn example_expired_data() -> tsink::Result<()> {
     println!("\n=== Example: Expired Data Handling ===");
 
     let storage = StorageBuilder::new()
-        .with_retention(Duration::from_secs(3600)) // 1 hour retention
+        .with_retention(Duration::from_secs(3600))
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .build()?;
 
@@ -188,7 +188,7 @@ fn example_expired_data() -> tsink::Result<()> {
         .unwrap()
         .as_secs() as i64;
 
-    let old_timestamp = now - 7200; // 2 hours ago
+    let old_timestamp = now - 7200;
     let old_row = Row::new("expired_metric", DataPoint::new(old_timestamp, 100.0));
 
     match storage.insert_rows(&[old_row]) {

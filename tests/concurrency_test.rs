@@ -10,7 +10,7 @@ fn test_high_contention_concurrent_writes() {
     let storage = Arc::new(
         StorageBuilder::new()
             .with_data_path(temp_dir.path())
-            .with_max_writers(4) // Limit writers to force contention
+            .with_max_writers(4)
             .with_write_timeout(Duration::from_secs(10))
             .build()
             .unwrap(),

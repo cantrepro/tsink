@@ -74,10 +74,9 @@ fn bench_select_among_thousand_points(c: &mut Criterion) {
 
 /// Benchmark selecting among millions of points
 fn bench_select_among_million_points(c: &mut Criterion) {
-    // 1M seconds = ~278 hours, so use 150 hour partitions (2 partitions total)
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
-        .with_partition_duration(Duration::from_secs(150 * 3600)) // 150 hours per partition
+        .with_partition_duration(Duration::from_secs(150 * 3600))
         .build()
         .unwrap();
 
@@ -106,8 +105,8 @@ fn bench_select_among_million_points(c: &mut Criterion) {
                 .select_into(
                     black_box("million_metric"),
                     black_box(&[]),
-                    black_box(1600500000), // Select from middle (500k to 501k)
-                    black_box(1600501000), // 1000 points
+                    black_box(1600500000),
+                    black_box(1600501000),
                     &mut points,
                 )
                 .unwrap();

@@ -265,7 +265,6 @@ async fn canceled_insert_still_commits_after_queue_accept() -> Result<()> {
 
     storage.insert_started.notified().await;
 
-    // Cancel while write worker is blocked; this drops the response receiver.
     write_task.abort();
     let _ = write_task.await;
 

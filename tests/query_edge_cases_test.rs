@@ -9,7 +9,6 @@ fn test_query_empty_database() {
         .build()
         .unwrap();
 
-    // Query on empty database
     let points = storage.select("nonexistent", &[], 1, 1000).unwrap();
     assert_eq!(points.len(), 0);
 }
@@ -23,7 +22,6 @@ fn test_query_with_extreme_timestamps() {
         .build()
         .unwrap();
 
-    // Insert with extreme timestamps
     let rows = vec![
         Row::new("extreme", DataPoint::new(i64::MIN + 1, 1.0)),
         Row::new("extreme", DataPoint::new(1, 2.0)),
@@ -62,12 +60,10 @@ fn test_query_boundary_conditions() {
     ];
     storage.insert_rows(&rows).unwrap();
 
-    // Test exclusive end boundary
     let points = storage.select("boundary", &[], 100, 200).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 100);
 
-    // Test inclusive start boundary
     let points = storage.select("boundary", &[], 200, 301).unwrap();
     assert_eq!(points.len(), 2);
 
@@ -75,7 +71,6 @@ fn test_query_boundary_conditions() {
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 200);
 
-    // Test no overlap
     let points = storage.select("boundary", &[], 201, 299).unwrap();
     assert_eq!(points.len(), 0);
 }
@@ -88,7 +83,6 @@ fn test_query_with_nan_and_infinity() {
         .build()
         .unwrap();
 
-    // Insert special float values
     let rows = vec![
         Row::new("special", DataPoint::new(100, f64::NAN)),
         Row::new("special", DataPoint::new(200, f64::INFINITY)),
@@ -120,7 +114,6 @@ fn test_query_with_duplicate_timestamps() {
         .build()
         .unwrap();
 
-    // Insert duplicate timestamps
     let rows = vec![
         Row::new("duplicates", DataPoint::new(100, 1.0)),
         Row::new("duplicates", DataPoint::new(100, 2.0)),
@@ -132,7 +125,6 @@ fn test_query_with_duplicate_timestamps() {
     let points = storage.select("duplicates", &[], 100, 201).unwrap();
     assert_eq!(points.len(), 4);
 
-    // All duplicate timestamps should be preserved
     let count_100 = points.iter().filter(|p| p.timestamp == 100).count();
     assert_eq!(count_100, 3);
 }
@@ -142,7 +134,7 @@ fn test_query_after_partition_rotation() {
     let temp_dir = TempDir::new().unwrap();
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
-        .with_partition_duration(std::time::Duration::from_millis(100)) // Small partition to force rotation
+        .with_partition_duration(std::time::Duration::from_millis(100))
         .build()
         .unwrap();
 
@@ -180,7 +172,7 @@ fn test_query_with_complex_labels() {
             Label::new("key1", "value1"),
             Label::new("key2", "value2"),
             Label::new("key3", "value3"),
-        ], // Multiple labels
+        ],
     ];
 
     for (i, labels) in labels_sets.iter().enumerate() {

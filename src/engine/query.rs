@@ -41,9 +41,7 @@ impl<'a> ChunkSeriesCursor<'a> {
             };
         }
 
-        // First chunk where max_ts >= start.
         let first = chunks.partition_point(|chunk| chunk.header.max_ts < start);
-        // First chunk where min_ts >= end (exclusive bound).
         let end_idx = chunks.partition_point(|chunk| chunk.header.min_ts < end);
 
         Self {

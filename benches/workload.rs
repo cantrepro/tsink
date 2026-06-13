@@ -14,10 +14,10 @@ use tempfile::TempDir;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision, Value};
 
 const SUITE_ACTIVE_SERIES_TARGET: usize = 1_000_000;
-const GAUGE_WEIGHT: u16 = 600; // 60%
-const COUNTER_WEIGHT: u16 = 200; // 20%
-const SPARSE_WEIGHT: u16 = 100; // 10%
-const SHORT_LIVED_WEIGHT: u16 = 50; // 5%
+const GAUGE_WEIGHT: u16 = 600;
+const COUNTER_WEIGHT: u16 = 200;
+const SPARSE_WEIGHT: u16 = 100;
+const SHORT_LIVED_WEIGHT: u16 = 50;
 const WEIGHT_SCALE: u16 = 1000;
 
 #[derive(Debug, Clone)]

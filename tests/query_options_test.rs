@@ -89,7 +89,6 @@ fn test_downsample_fast_forward_aligns_to_query_start() {
     ];
     storage.insert_rows(&rows).unwrap();
 
-    // start is not interval-aligned; buckets should be [1000,3000), [3000,5000), [5000,7000)
     let opts = QueryOptions::new(1_000, 7_000).with_downsample(2_000, Aggregation::Avg);
     let points = storage.select_with_options("ds_align", opts).unwrap();
 

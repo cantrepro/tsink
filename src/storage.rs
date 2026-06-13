@@ -102,7 +102,7 @@ impl Default for StorageBuilder {
     fn default() -> Self {
         Self {
             data_path: None,
-            retention: Duration::from_secs(14 * 24 * 3600), // 14 days
+            retention: Duration::from_secs(14 * 24 * 3600),
             retention_enforced: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             chunk_points: crate::engine::DEFAULT_CHUNK_POINTS,

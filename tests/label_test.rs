@@ -51,7 +51,7 @@ fn test_select_all_with_multiple_labels() {
 
     let rows3 = vec![Row::with_labels(
         "cpu_usage",
-        vec![Label::new("host", "server3")], // Only one label
+        vec![Label::new("host", "server3")],
         DataPoint::new(1200, 12.0),
     )];
     storage.insert_rows(&rows3).unwrap();

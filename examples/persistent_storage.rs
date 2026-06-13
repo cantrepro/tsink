@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
 
     let storage = StorageBuilder::new()
         .with_data_path(data_path)
-        .with_retention(Duration::from_secs(24 * 3600)) // 24 hour retention
+        .with_retention(Duration::from_secs(24 * 3600))
         .with_chunk_points(2048)
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
         .build()?;
@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
             "humidity",
             DataPoint::new(current_time, 60.0 + (i as f64 * 0.05)),
         ));
-        current_time += 60; // Add 60 milliseconds
+        current_time += 60;
     }
 
     storage.insert_rows(&rows)?;

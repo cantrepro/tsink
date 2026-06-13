@@ -77,12 +77,12 @@ pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> Vec<u8> {
 
     let metric_bytes = metric.as_bytes();
     let metric_len = metric_bytes.len().min(MAX_METRIC_NAME_LEN);
-    let mut size = metric_len + 2; // 2 bytes for metric length
+    let mut size = metric_len + 2;
     for label in &sorted_labels {
         if label.is_valid() {
             size += label.name.len().min(u16::MAX as usize);
             size += label.value.len().min(u16::MAX as usize);
-            size += 4; // 4 bytes for lengths
+            size += 4;
         }
     }
 

@@ -142,7 +142,7 @@ mod tests {
     fn test_available_cpus() {
         let cpus = available_cpus();
         assert!(cpus > 0);
-        assert!(cpus <= 1024); // Reasonable upper bound
+        assert!(cpus <= 1024);
     }
 
     #[test]
