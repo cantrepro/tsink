@@ -709,7 +709,7 @@ After lane encoding, chunk payloads are optionally compressed with fast zstd (le
 
 ### Compression
 
-The adaptive codec selection (Gorilla XOR, delta-of-delta, RLE, bitpacking) achieves **~0.68 bytes per data point** for typical `f64` time-series workloads — down from 16 bytes uncompressed (8-byte timestamp + 8-byte value), a **~23x** compression ratio.
+The adaptive codec selection (Gorilla XOR, delta-of-delta, RLE, bitpacking) achieves **~0.4 bytes per data point** for typical `f64` time-series workloads — down from 16 bytes uncompressed (8-byte timestamp + 8-byte value), a **~40x** compression ratio.
 
 ### Throughput
 
