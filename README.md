@@ -27,7 +27,7 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - **Optional PromQL engine** — instant and range queries with 20+ built-in functions; enable with the `promql` Cargo feature.
 - **LSM-style compaction** — tiered L0 → L1 → L2 segment compaction reduces read amplification.
 - **Gorilla compression** — Gorilla XOR encoding for floats, delta-of-delta for timestamps, and per-type codecs for other value types.
-- **Cgroup-aware defaults** — worker thread counts and memory limits respect container CPU/memory quotas.
+- **cgroup-aware defaults** — worker thread counts and memory limits respect container CPU/memory quotas.
 - **Resource limits** — configurable memory budget, series cardinality cap, and WAL size limit with admission backpressure.
 
 ## Table of Contents
