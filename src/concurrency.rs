@@ -1,7 +1,6 @@
 //! Concurrency utilities for tsink.
 
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument};
@@ -11,67 +10,41 @@ use crate::{Result, TsinkError};
 /// A semaphore implementation for limiting concurrent operations.
 #[derive(Clone)]
 pub struct Semaphore {
-    permits: Arc<AtomicUsize>,
+    permits: Arc<Mutex<usize>>,
     max_permits: usize,
     condvar: Arc<Condvar>,
-    mutex: Arc<Mutex<()>>,
 }
 
 impl Semaphore {
     pub fn new(permits: usize) -> Self {
         let permits = permits.max(1);
         Self {
-            permits: Arc::new(AtomicUsize::new(permits)),
+            permits: Arc::new(Mutex::new(permits)),
             max_permits: permits,
             condvar: Arc::new(Condvar::new()),
-            mutex: Arc::new(Mutex::new(())),
         }
     }
 
     #[instrument(skip(self))]
     pub fn acquire(&self) -> SemaphoreGuard<'_> {
-        loop {
-            let current = self.permits.load(Ordering::Acquire);
-            if current > 0 {
-                if self
-                    .permits
-                    .compare_exchange_weak(
-                        current,
-                        current - 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    debug!("Acquired semaphore permit, {} remaining", current - 1);
-                    return SemaphoreGuard { semaphore: self };
-                }
-            } else {
-                let mut lock = self.mutex.lock();
-                while self.permits.load(Ordering::Acquire) == 0 {
-                    self.condvar.wait(&mut lock);
-                }
-            }
+        let mut permits = self.permits.lock();
+        while *permits == 0 {
+            self.condvar.wait(&mut permits);
         }
+
+        *permits -= 1;
+        debug!("Acquired semaphore permit, {} remaining", *permits);
+        SemaphoreGuard { semaphore: self }
     }
 
     pub fn try_acquire(&self) -> Option<SemaphoreGuard<'_>> {
-        let mut current = self.permits.load(Ordering::Acquire);
-        loop {
-            if current == 0 {
-                return None;
-            }
-
-            match self.permits.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(SemaphoreGuard { semaphore: self }),
-                Err(actual) => current = actual,
-            }
+        let mut permits = self.permits.lock();
+        if *permits == 0 {
+            return None;
         }
+
+        *permits -= 1;
+        Some(SemaphoreGuard { semaphore: self })
     }
 
     pub fn try_acquire_for(&self, timeout: Duration) -> Result<SemaphoreGuard<'_>> {
@@ -83,36 +56,26 @@ impl Semaphore {
         }
 
         let deadline = Instant::now() + timeout;
+        let mut permits = self.permits.lock();
         loop {
-            if let Some(guard) = self.try_acquire() {
-                return Ok(guard);
+            if *permits > 0 {
+                *permits -= 1;
+                return Ok(SemaphoreGuard { semaphore: self });
             }
 
-            let now = Instant::now();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(TsinkError::WriteTimeout {
                     timeout_ms: timeout.as_millis() as u64,
                     workers: self.max_permits,
                 });
             }
 
-            let mut lock = self.mutex.lock();
-            while self.permits.load(Ordering::Acquire) == 0 {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(TsinkError::WriteTimeout {
-                        timeout_ms: timeout.as_millis() as u64,
-                        workers: self.max_permits,
-                    });
-                }
-                if self.condvar.wait_for(&mut lock, remaining).timed_out()
-                    && self.permits.load(Ordering::Acquire) == 0
-                {
-                    return Err(TsinkError::WriteTimeout {
-                        timeout_ms: timeout.as_millis() as u64,
-                        workers: self.max_permits,
-                    });
-                }
+            if self.condvar.wait_for(&mut permits, remaining).timed_out() && *permits == 0 {
+                return Err(TsinkError::WriteTimeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                    workers: self.max_permits,
+                });
             }
         }
     }
@@ -124,13 +87,11 @@ impl Semaphore {
         };
 
         if timeout.is_zero() {
-            if self
-                .permits
-                .compare_exchange(self.max_permits, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            let mut permits = self.permits.lock();
+            if *permits != self.max_permits {
                 return Err(timeout_err());
             }
+            *permits = 0;
 
             let mut guards = Vec::with_capacity(self.max_permits);
             for _ in 0..self.max_permits {
@@ -140,12 +101,10 @@ impl Semaphore {
         }
 
         let deadline = Instant::now() + timeout;
+        let mut permits = self.permits.lock();
         loop {
-            if self
-                .permits
-                .compare_exchange(self.max_permits, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            if *permits == self.max_permits {
+                *permits = 0;
                 let mut guards = Vec::with_capacity(self.max_permits);
                 for _ in 0..self.max_permits {
                     guards.push(SemaphoreGuard { semaphore: self });
@@ -153,22 +112,15 @@ impl Semaphore {
                 return Ok(guards);
             }
 
-            let now = Instant::now();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(timeout_err());
             }
 
-            let mut lock = self.mutex.lock();
-            while self.permits.load(Ordering::Acquire) != self.max_permits {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(timeout_err());
-                }
-                if self.condvar.wait_for(&mut lock, remaining).timed_out()
-                    && self.permits.load(Ordering::Acquire) != self.max_permits
-                {
-                    return Err(timeout_err());
-                }
+            if self.condvar.wait_for(&mut permits, remaining).timed_out()
+                && *permits != self.max_permits
+            {
+                return Err(timeout_err());
             }
         }
     }
@@ -178,14 +130,21 @@ impl Semaphore {
     }
 
     fn release(&self) {
-        let previous = self.permits.fetch_add(1, Ordering::AcqRel);
-        debug!("Released semaphore permit, {} now available", previous + 1);
+        let mut permits = self.permits.lock();
+        debug_assert!(
+            *permits < self.max_permits,
+            "semaphore released more permits than its capacity"
+        );
+        if *permits < self.max_permits {
+            *permits += 1;
+        }
+        debug!("Released semaphore permit, {} now available", *permits);
 
         self.condvar.notify_one();
     }
 
     pub fn available_permits(&self) -> usize {
-        self.permits.load(Ordering::Acquire)
+        *self.permits.lock()
     }
 }
 
