@@ -209,7 +209,7 @@ This means a data point that would normally take 16 bytes (8 bytes timestamp + 8
 
 ## Performance
 
-Benchmarks on AMD Ryzen 7940HS:
+Benchmarks on AMD Ryzen 7940HS (single core):
 
 | Operation | Throughput | Latency |
 |-----------|------------|---------|
