@@ -1051,7 +1051,7 @@ fn background_flush_publishes_current_heads_to_compute_only_readers() {
 
     assert_eq!(
         load_segments_for_level(
-            &object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT),
+            object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT),
             0
         )
         .unwrap()

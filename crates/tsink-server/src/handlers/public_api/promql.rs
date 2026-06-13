@@ -639,10 +639,13 @@ mod tests {
     use crate::exemplar_store::{ExemplarSample, ExemplarSeries};
     use tsink::Label;
 
+    type LabelPair<'a> = (&'a str, &'a str);
+    type ExemplarInput<'a> = (i64, f64, &'a [LabelPair<'a>]);
+
     fn exemplar_series(
         metric: &str,
-        labels: &[(&str, &str)],
-        exemplars: &[(i64, f64, &[(&str, &str)])],
+        labels: &[LabelPair<'_>],
+        exemplars: &[ExemplarInput<'_>],
     ) -> ExemplarSeries {
         ExemplarSeries {
             metric: metric.to_string(),

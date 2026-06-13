@@ -124,7 +124,7 @@ fn repeated_failed_high_cardinality_inserts_keep_registry_memory_accounting_alig
         if series_idx % 32 == 0 {
             let snapshot = storage.observability_snapshot();
             assert_eq!(
-                snapshot.memory.registry_bytes as usize,
+                snapshot.memory.registry_bytes,
                 storage.catalog.registry.read().memory_usage_bytes(),
                 "series-churn rollback path should keep exposed registry memory in sync",
             );
@@ -138,7 +138,7 @@ fn repeated_failed_high_cardinality_inserts_keep_registry_memory_accounting_alig
 
     let snapshot = storage.observability_snapshot();
     assert_eq!(
-        snapshot.memory.registry_bytes as usize,
+        snapshot.memory.registry_bytes,
         storage.catalog.registry.read().memory_usage_bytes(),
     );
     assert!(

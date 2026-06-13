@@ -722,8 +722,8 @@ mod tests {
             " cluster-secret ".to_string(),
         ];
 
-        let config = parse_server_args(args.into_iter())
-            .expect("shared config path should normalize and validate");
+        let config =
+            parse_server_args(args).expect("shared config path should normalize and validate");
         assert_eq!(config.listen, "127.0.0.1:9201");
         assert_eq!(config.auth_token.as_deref(), Some("public-secret"));
         assert_eq!(config.admin_auth_token.as_deref(), Some("admin-secret"));
@@ -748,15 +748,14 @@ mod tests {
     #[test]
     fn tls_cert_requires_tls_key_during_parse() {
         let args = vec!["--tls-cert".to_string(), "/tmp/server.pem".to_string()];
-        let err = parse_server_args(args.into_iter()).expect_err("tls key should be required");
+        let err = parse_server_args(args).expect_err("tls key should be required");
         assert!(err.contains("--tls-cert requires --tls-key"));
     }
 
     #[test]
     fn admin_api_requires_auth_token() {
         let args = vec!["--enable-admin-api".to_string()];
-        let err =
-            parse_server_args(args.into_iter()).expect_err("admin API without auth must fail");
+        let err = parse_server_args(args).expect_err("admin API without auth must fail");
         assert!(err.contains(
             "--enable-admin-api requires --admin-auth-token, --auth-token, or --rbac-config"
         ));
@@ -769,8 +768,8 @@ mod tests {
             "--admin-auth-token".to_string(),
             "admin-secret".to_string(),
         ];
-        let config = parse_server_args(args.into_iter())
-            .expect("admin token should satisfy admin API auth requirement");
+        let config =
+            parse_server_args(args).expect("admin token should satisfy admin API auth requirement");
         assert_eq!(config.admin_auth_token.as_deref(), Some("admin-secret"));
         assert!(config.auth_token.is_none());
     }
@@ -782,8 +781,7 @@ mod tests {
             "--rbac-config".to_string(),
             "/tmp/rbac.json".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("rbac config should satisfy admin auth");
+        let config = parse_server_args(args).expect("rbac config should satisfy admin auth");
         assert_eq!(
             config.rbac_config_path.as_deref(),
             Some(std::path::Path::new("/tmp/rbac.json"))
@@ -798,7 +796,7 @@ mod tests {
             "--tenant-config".to_string(),
             "/tmp/tenant-policy.json".to_string(),
         ];
-        let config = parse_server_args(args.into_iter()).expect("tenant config path should parse");
+        let config = parse_server_args(args).expect("tenant config path should parse");
         assert_eq!(
             config.tenant_config_path,
             Some(PathBuf::from("/tmp/tenant-policy.json"))
@@ -813,8 +811,7 @@ mod tests {
             "--auth-token".to_string(),
             "secret".to_string(),
         ];
-        let err =
-            parse_server_args(args.into_iter()).expect_err("admin path prefix without admin API");
+        let err = parse_server_args(args).expect_err("admin path prefix without admin API");
         assert!(err.contains("--admin-path-prefix requires --enable-admin-api"));
     }
 
@@ -832,8 +829,7 @@ mod tests {
             "--edge-sync-static-tenant".to_string(),
             "tenant-central".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("edge sync args should parse successfully");
+        let config = parse_server_args(args).expect("edge sync args should parse successfully");
         assert_eq!(
             config.edge_sync_upstream_endpoint.as_deref(),
             Some("127.0.0.1:9301")
@@ -854,8 +850,8 @@ mod tests {
             "--edge-sync-upstream".to_string(),
             "127.0.0.1:9301".to_string(),
         ];
-        let err = parse_server_args(args.into_iter())
-            .expect_err("edge sync upstream without auth token must fail");
+        let err =
+            parse_server_args(args).expect_err("edge sync upstream without auth token must fail");
         assert!(err.contains("--edge-sync-upstream requires --edge-sync-auth-token"));
     }
 
@@ -867,7 +863,7 @@ mod tests {
             "--cluster-bind".to_string(),
             "127.0.0.1:9301".to_string(),
         ];
-        let err = parse_server_args(args.into_iter()).expect_err("node id must be required");
+        let err = parse_server_args(args).expect_err("node id must be required");
         assert!(err.contains("--cluster-node-id"));
     }
 
@@ -879,7 +875,7 @@ mod tests {
             "--cluster-node-id".to_string(),
             "node-a".to_string(),
         ];
-        let err = parse_server_args(args.into_iter()).expect_err("bind must be required");
+        let err = parse_server_args(args).expect_err("bind must be required");
         assert!(err.contains("--cluster-bind"));
     }
 
@@ -901,7 +897,7 @@ mod tests {
             "--cluster-internal-mtls-enabled".to_string(),
             "true".to_string(),
         ];
-        let config = parse_server_args(args.into_iter())
+        let config = parse_server_args(args)
             .expect("cluster-disabled mode should ignore cluster validation");
         assert!(!config.cluster.enabled);
         assert_eq!(config.cluster.node_id.as_deref(), Some("node-a"));
@@ -932,8 +928,7 @@ mod tests {
             "--cluster-internal-mtls-key".to_string(),
             "/tmp/node-a.key".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("consistency flags should parse cleanly");
+        let config = parse_server_args(args).expect("consistency flags should parse cleanly");
         assert_eq!(
             config.cluster.write_consistency,
             ClusterWriteConsistency::All
@@ -965,8 +960,7 @@ mod tests {
             "--cluster-internal-auth-token".to_string(),
             "cluster-secret".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("cluster internal auth token should parse");
+        let config = parse_server_args(args).expect("cluster internal auth token should parse");
         assert_eq!(
             config.cluster.internal_auth_token.as_deref(),
             Some("cluster-secret")
@@ -979,15 +973,14 @@ mod tests {
             "--cluster-internal-auth-token".to_string(),
             "   ".to_string(),
         ];
-        let err = parse_server_args(args.into_iter()).expect_err("empty token should fail");
+        let err = parse_server_args(args).expect_err("empty token should fail");
         assert!(err.contains("--cluster-internal-auth-token must not be empty"));
     }
 
     #[test]
     fn compute_only_storage_mode_requires_object_store_path() {
         let args = vec!["--storage-mode".to_string(), "compute-only".to_string()];
-        let err = parse_server_args(args.into_iter())
-            .expect_err("compute-only mode without object store");
+        let err = parse_server_args(args).expect_err("compute-only mode without object store");
         assert!(err.contains("--storage-mode=compute-only requires --object-store-path"));
     }
 
@@ -1009,8 +1002,7 @@ mod tests {
             "--object-store-path".to_string(),
             "/tmp/object-store".to_string(),
         ];
-        let err = parse_server_args(args.into_iter())
-            .expect_err("query role should require compute-only mode");
+        let err = parse_server_args(args).expect_err("query role should require compute-only mode");
         assert!(err.contains("--cluster-node-role=query requires --storage-mode=compute-only"));
     }
 
@@ -1034,8 +1026,7 @@ mod tests {
             "--cluster-internal-auth-token".to_string(),
             "cluster-secret".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("query-only compute node should parse");
+        let config = parse_server_args(args).expect("query-only compute node should parse");
         assert_eq!(config.storage_mode, StorageRuntimeMode::ComputeOnly);
         assert_eq!(config.cluster.node_role, ClusterNodeRole::Query);
         assert_eq!(
@@ -1056,8 +1047,7 @@ mod tests {
             "--graphite-tenant".to_string(),
             "graphite-team".to_string(),
         ];
-        let config =
-            parse_server_args(args.into_iter()).expect("legacy listener flags should parse");
+        let config = parse_server_args(args).expect("legacy listener flags should parse");
         assert_eq!(config.statsd_listen.as_deref(), Some("127.0.0.1:8125"));
         assert_eq!(config.statsd_tenant_id, "statsd-team");
         assert_eq!(config.graphite_listen.as_deref(), Some("127.0.0.1:2003"));
@@ -1067,7 +1057,7 @@ mod tests {
     #[test]
     fn rejects_empty_legacy_listener_tenant_ids() {
         let args = vec!["--statsd-tenant".to_string(), "   ".to_string()];
-        let err = parse_server_args(args.into_iter()).expect_err("empty statsd tenant should fail");
+        let err = parse_server_args(args).expect_err("empty statsd tenant should fail");
         assert!(err.contains("--statsd-tenant must not be empty"));
     }
 }
