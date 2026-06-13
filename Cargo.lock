@@ -2512,7 +2512,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tsink"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "tsink-server"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "base64",
  "chrono",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "tsink-uniffi"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "parking_lot",
  "tempfile",

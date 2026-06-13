@@ -1,6 +1,6 @@
 [package]
 name = "tsink-uniffi"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "UniFFI bindings for tsink time-series database"
 license = "MIT"
@@ -10,7 +10,7 @@ crate-type = ["cdylib", "lib"]
 name = "tsink"
 
 [dependencies]
-tsink_core = { package = "tsink", version = "0.10.1", path = "../.." }
+tsink_core = { package = "tsink", version = "0.10.2", path = "../.." }
 uniffi = { version = "0.31", features = ["cli"] }
 parking_lot = "0.12"
 thiserror = "2.0"
