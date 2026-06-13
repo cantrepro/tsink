@@ -34,7 +34,7 @@ pub struct MemoryPartition {
     /// Timestamp precision
     #[allow(dead_code)]
     timestamp_precision: TimestampPrecision,
-    /// Retention configuration
+    /// Retention configuration.
     retention: Duration,
     /// Retention window in timestamp units
     retention_units: i64,
@@ -99,14 +99,6 @@ impl MemoryPartition {
         }
     }
 
-    fn get_or_create_plain_metric(&self, metric: &str) -> Arc<MemoryMetric> {
-        if let Some(existing) = self.metrics.get(metric.as_bytes()) {
-            existing.clone()
-        } else {
-            self.get_or_create_metric(metric.as_bytes().to_vec())
-        }
-    }
-
     fn update_min_timestamp(&self, timestamp: i64) {
         loop {
             let current = self.min_t.load(Ordering::Acquire);
@@ -132,6 +124,12 @@ impl MemoryPartition {
         }
     }
 
+    fn disk_metric_name(marshaled_key: &[u8], encoded_key: &str) -> String {
+        unmarshal_metric_name(marshaled_key)
+            .map(|(metric, _)| metric)
+            .unwrap_or_else(|_| encoded_key.to_string())
+    }
+
     /// Encodes all points in the partition to a writer and returns metadata.
     pub fn flush_to_disk(
         &self,
@@ -140,10 +138,8 @@ impl MemoryPartition {
     ) -> Result<DiskPartition> {
         let dir_path = dir_path.as_ref();
 
-        // Create directory
         fs::create_dir_all(dir_path)?;
 
-        // Create data file
         let data_path = dir_path.join(crate::disk::DATA_FILE_NAME);
         let mut data_file = fs::File::create(&data_path)?;
 
@@ -152,24 +148,22 @@ impl MemoryPartition {
         for entry in self.metrics.iter() {
             let (name, metric) = (entry.key(), entry.value());
 
-            // Get current position in file
             let offset = data_file.stream_position()?;
 
-            // Encode metric data
             let mut encoder = GorillaEncoder::new(&mut data_file);
             metric.encode_all_points(&mut encoder)?;
             encoder.flush()?;
 
-            // Track encoded byte size for accurate slicing
             let end = data_file.stream_position()?;
             let encoded_size = end.saturating_sub(offset);
 
             // Add to metadata with lossless key encoding
             let encoded_key = encode_metric_key(name);
+            let metric_name = Self::disk_metric_name(name, &encoded_key);
             metrics_map.insert(
                 encoded_key.clone(),
                 DiskMetric {
-                    name: encoded_key,
+                    name: metric_name,
                     offset,
                     encoded_size,
                     min_timestamp: metric.min_timestamp(),
@@ -181,7 +175,6 @@ impl MemoryPartition {
 
         data_file.sync_all()?;
 
-        // Create metadata
         let meta = PartitionMeta {
             min_timestamp: Partition::min_timestamp(self),
             max_timestamp: Partition::max_timestamp(self),
@@ -195,13 +188,12 @@ impl MemoryPartition {
         let meta_path = dir_path.join(crate::disk::META_FILE_NAME);
         crate::disk::write_meta_atomic(&meta_path, &meta)?;
 
-        // Open the created partition
         DiskPartition::open(dir_path, retention)
     }
 
     fn insert_rows_impl(&self, rows: &[Row], append_wal: bool) -> Result<Vec<Row>> {
         if rows.is_empty() {
-            return Err(TsinkError::Other("No rows given".to_string()));
+            return Ok(Vec::new());
         }
 
         if self.flush_sealed.load(Ordering::Acquire) {
@@ -253,8 +245,6 @@ impl MemoryPartition {
 
         let partition_min = self.min_t.load(Ordering::Acquire);
         let allowed_min = if partition_min == 0 {
-            // For a fresh partition, anchor this batch to its newest timestamp so that very old
-            // rows are cascaded to older partitions instead of stretching the new head window.
             batch_max_timestamp.saturating_sub(self.partition_duration)
         } else {
             partition_min.saturating_sub(self.partition_duration)
@@ -282,7 +272,6 @@ impl MemoryPartition {
             return Ok(outdated_rows);
         }
 
-        // Write only the rows this partition will actually store to WAL.
         // During recovery, WAL appends must be skipped to avoid replay duplication.
         if append_wal {
             self.wal.append_rows(&accepted_rows)?;
@@ -295,15 +284,9 @@ impl MemoryPartition {
 
             self.update_min_timestamp(timestamp);
 
-            // Get or create metric
-            let metric = if row.labels().is_empty() {
-                self.get_or_create_plain_metric(row.metric())
-            } else {
-                let metric_name = marshal_metric_name(row.metric(), row.labels());
-                self.get_or_create_metric(metric_name)
-            };
+            let metric_name = marshal_metric_name(row.metric(), row.labels());
+            let metric = self.get_or_create_metric(metric_name);
 
-            // Insert the point
             metric.insert_point(DataPoint::new(timestamp, row.data_point().value));
             rows_added += 1;
         }
@@ -317,7 +300,6 @@ impl MemoryPartition {
             );
         }
 
-        // Update counters
         self.num_points.fetch_add(rows_added, Ordering::SeqCst);
 
         if rows_added > 0 {
@@ -383,13 +365,6 @@ impl crate::partition::Partition for MemoryPartition {
             return Ok(Vec::new());
         }
 
-        if labels.is_empty() {
-            return Ok(self
-                .metrics
-                .get(metric.as_bytes())
-                .map_or_else(Vec::new, |m| m.select_points(start, end)));
-        }
-
         let metric_name = marshal_metric_name(metric, labels);
 
         match self.metrics.get(&metric_name) {
@@ -406,13 +381,10 @@ impl crate::partition::Partition for MemoryPartition {
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
         let mut results = Vec::new();
 
-        // Iterate through all metrics to find ones matching the base metric name
         for entry in self.metrics.iter() {
             let (marshaled_name, metric_ref) = entry.pair();
 
-            // Unmarshal the metric name to extract the base name and labels
             if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_name) {
-                // Check if this is the metric we're looking for
                 if base_metric == metric {
                     let points = metric_ref.select_points(start, end);
                     if !points.is_empty() {
@@ -472,43 +444,36 @@ impl crate::partition::Partition for MemoryPartition {
             now_in_precision(self.timestamp_precision).saturating_sub(self.retention_units);
         let timestamp_expired = max_ts < cutoff;
         let age = self.created_at.elapsed().unwrap_or(Duration::ZERO);
-        let age_expired = age > self.retention;
-        let stale_by_timestamp = timestamp_expired && age >= Duration::from_secs(1);
-
-        stale_by_timestamp || age_expired
+        let grace = self.retention.min(Duration::from_secs(1));
+        timestamp_expired && age >= grace
     }
 
     fn clean(&self) -> Result<()> {
-        // Memory is automatically cleaned by dropping
         Ok(())
     }
 
     fn flush_to_disk(&self) -> Result<Option<(Vec<u8>, crate::disk::PartitionMeta)>> {
-        // Flush WAL first
         self.wal.flush()?;
 
-        // Create data buffer
         let mut data = Vec::new();
         let mut metrics_map = HashMap::new();
 
-        // Encode each metric's data
         for entry in self.metrics.iter() {
             let (name, metric) = entry.pair();
             let offset = data.len() as u64;
 
-            // Encode metric data using Gorilla compression
             let mut encoder = GorillaEncoder::new(&mut data);
             metric.encode_all_points(&mut encoder)?;
             encoder.flush()?;
 
             let encoded_size = (data.len() as u64).saturating_sub(offset);
 
-            // Add to metadata
             let encoded_key = encode_metric_key(name);
+            let metric_name = Self::disk_metric_name(name, &encoded_key);
             metrics_map.insert(
                 encoded_key.clone(),
                 DiskMetric {
-                    name: encoded_key,
+                    name: metric_name,
                     offset,
                     encoded_size,
                     min_timestamp: metric.min_timestamp(),
@@ -518,7 +483,6 @@ impl crate::partition::Partition for MemoryPartition {
             );
         }
 
-        // Create partition metadata
         let meta = crate::disk::PartitionMeta {
             min_timestamp: self.min_timestamp(),
             max_timestamp: self.max_timestamp(),
@@ -578,14 +542,12 @@ impl MemoryMetric {
     }
 
     fn insert_point(&self, point: DataPoint) {
-        // Check if this is the first insertion using a more reliable approach
         let is_first = self.size.load(Ordering::Acquire) == 0;
 
         if is_first {
             // Acquire write lock first to ensure atomicity
             let mut points = self.points.write();
 
-            // Double-check inside the lock
             if self.size.load(Ordering::Acquire) == 0 {
                 points.push(point);
                 self.min_timestamp.store(point.timestamp, Ordering::Release);
@@ -593,27 +555,22 @@ impl MemoryMetric {
                 self.size.store(1, Ordering::Release);
                 return;
             }
-            // If we're here, another thread beat us to it
             drop(points);
         }
 
-        // Not the first insertion - normal path
         // Use upgradeable read lock to avoid lock thrashing
         let points = self.points.upgradable_read();
         if !points.is_empty() && points[points.len() - 1].timestamp < point.timestamp {
-            // Upgrade to write lock only when needed
             let mut points = parking_lot::RwLockUpgradableReadGuard::upgrade(points);
             points.push(point);
             self.max_timestamp.store(point.timestamp, Ordering::SeqCst);
             self.size.fetch_add(1, Ordering::SeqCst);
         } else {
             drop(points);
-            // Out of order point
             let mut ooo_points = self.out_of_order_points.lock();
             ooo_points.push(point);
             self.size.fetch_add(1, Ordering::SeqCst);
 
-            // Update min/max if needed
             let current_min = self.min_timestamp.load(Ordering::SeqCst);
             let current_max = self.max_timestamp.load(Ordering::SeqCst);
             if point.timestamp < current_min {
@@ -714,40 +671,6 @@ impl MemoryMetric {
     }
 }
 
-/// Metadata for metrics in a partition.
-pub struct MetricsMetadata {
-    pub metrics: Vec<MetricMetadata>,
-}
-
-impl MetricsMetadata {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self {
-            metrics: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn add_metric(&mut self, name: String, offset: u64, min_ts: i64, max_ts: i64, size: usize) {
-        self.metrics.push(MetricMetadata {
-            name,
-            offset,
-            min_timestamp: min_ts,
-            max_timestamp: max_ts,
-            num_data_points: size,
-        });
-    }
-}
-
-/// Metadata for a single metric.
-pub struct MetricMetadata {
-    pub name: String,
-    pub offset: u64,
-    pub min_timestamp: i64,
-    pub max_timestamp: i64,
-    pub num_data_points: usize,
-}
-
 /// Flushes a memory partition to disk.
 /// This function uses the partition's flush_to_disk method to properly encode and save data.
 pub fn flush_memory_partition_to_disk(
@@ -755,19 +678,74 @@ pub fn flush_memory_partition_to_disk(
     dir_path: impl AsRef<Path>,
     retention: Duration,
 ) -> Result<DiskPartition> {
-    // Use the partition's flush_to_disk method
+    struct FlushGuard {
+        partition: SharedPartition,
+    }
+
+    impl Drop for FlushGuard {
+        fn drop(&mut self) {
+            self.partition.end_flush();
+        }
+    }
+
+    if !partition.begin_flush() {
+        return Err(TsinkError::Other(
+            "Partition is already being flushed or does not support flush sealing".to_string(),
+        ));
+    }
+    let _flush_guard = FlushGuard {
+        partition: partition.clone(),
+    };
+
     let flush_result = partition.flush_to_disk()?;
 
     match flush_result {
         Some((data, meta)) => {
-            // Create the disk partition with the flushed data
             DiskPartition::create(dir_path, meta, data, retention)
         }
         None => {
-            // This partition doesn't support flushing (e.g., already a disk partition)
             Err(TsinkError::Other(
                 "Partition does not support flushing to disk".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition::Partition;
+    use crate::wal::NopWal;
+
+    #[test]
+    fn flush_metadata_uses_human_metric_name() {
+        let wal: Arc<dyn Wal> = Arc::new(NopWal);
+        let partition = MemoryPartition::new(
+            wal,
+            Duration::from_secs(60),
+            TimestampPrecision::Seconds,
+            Duration::from_secs(3600),
+        );
+
+        Partition::insert_rows(
+            &partition,
+            &[Row::with_labels(
+                "cpu_usage",
+                vec![Label::new("host", "server-a")],
+                DataPoint::new(1, 1.0),
+            )],
+        )
+        .expect("insert should succeed");
+
+        let (_, meta) = Partition::flush_to_disk(&partition)
+            .expect("flush should succeed")
+            .expect("memory partition should return flush payload");
+        let disk_metric = meta
+            .metrics
+            .values()
+            .next()
+            .expect("expected one metric in metadata");
+
+        assert_eq!(disk_metric.name, "cpu_usage");
     }
 }

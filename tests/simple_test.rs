@@ -9,11 +9,9 @@ fn test_simple_insert() {
         .build()
         .unwrap();
 
-    // Insert a single row
     let rows = vec![Row::new("test_metric", DataPoint::new(1000, 1.0))];
     storage.insert_rows(&rows).unwrap();
 
-    // Query it back
     let points = storage.select("test_metric", &[], 500, 1500).unwrap();
     println!("Found {} points", points.len());
     assert_eq!(points.len(), 1);
@@ -29,7 +27,6 @@ fn test_multiple_inserts() {
         .build()
         .unwrap();
 
-    // Insert multiple rows
     for i in 0..10 {
         let rows = vec![Row::new(
             "test_metric",
@@ -38,7 +35,6 @@ fn test_multiple_inserts() {
         storage.insert_rows(&rows).unwrap();
     }
 
-    // Query them back
     match storage.select("test_metric", &[], 500, 11000) {
         Ok(points) => {
             println!("Found {} points", points.len());

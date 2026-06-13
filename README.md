@@ -136,6 +136,12 @@ let all_series = storage.list_metrics()?;
 for series in all_series {
     println!("Metric: {}, Labels: {:?}", series.name, series.labels);
 }
+
+// Optional: include WAL segments as well (diagnostic/expensive path)
+let all_series_with_wal = storage.list_metrics_with_wal()?;
+for series in all_series_with_wal {
+    println!("(WAL+partitions) Metric: {}, Labels: {:?}", series.name, series.labels);
+}
 ```
 
 ### Query Options: Downsampling, Aggregation, Pagination

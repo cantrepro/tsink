@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tsink::wal::{DiskWal, Wal, WalReader};
-use tsink::{DataPoint, Label, Row, StorageBuilder, WalSyncMode};
+use tsink::{DataPoint, Label, Row, StorageBuilder, TsinkError, WalSyncMode};
 
 fn wal_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
@@ -66,7 +66,6 @@ fn disk_wal_persists_rotates_and_recovers() {
             && (row.data_point().value - 2.5).abs() < 1e-12
     }));
 
-    // Rotate and add a second batch
     wal_trait.punctuate().unwrap();
     let batch_two = vec![Row::new("wal_metric", DataPoint::new(3, 5.0))];
     wal_trait.append_rows(&batch_two).unwrap();
@@ -76,7 +75,6 @@ fn disk_wal_persists_rotates_and_recovers() {
     assert_eq!(all_rows.len(), batch_one.len() + batch_two.len());
     assert!(all_rows.iter().any(|row| row.data_point().timestamp == 3));
 
-    // Remove oldest segment and confirm only the newer entries remain
     wal_trait.remove_oldest().unwrap();
     let files_after_removal = wal_files(temp_dir.path());
     assert_eq!(files_after_removal.len(), 1);
@@ -88,7 +86,6 @@ fn disk_wal_persists_rotates_and_recovers() {
             .all(|row| row.data_point().timestamp >= 3)
     );
 
-    // Refresh should clear all segments
     wal_trait.refresh().unwrap();
     assert!(wal_files(temp_dir.path()).is_empty());
 }
@@ -103,7 +100,6 @@ fn disk_wal_flush_with_buffer_persists() {
     wal_trait.append_rows(&batch).unwrap();
     wal_trait.flush().unwrap();
 
-    // Ensure a wal file was written and can be recovered
     let files = wal_files(temp_dir.path());
     assert_eq!(files.len(), 1, "wal segment should exist after flush");
 
@@ -119,8 +115,7 @@ fn wal_reader_accepts_valid_short_segments() {
     let temp_dir = TempDir::new().unwrap();
     let segment = temp_dir.path().join("000001.wal");
 
-    // op=insert, metric_len=1, metric='a', ts=0, value=0.0 bits
-    fs::write(segment, vec![1, 1, b'a', 0, 0]).unwrap();
+    fs::write(segment, vec![1, 3, 1, 0, b'a', 0, 0]).unwrap();
 
     let recovered = WalReader::new(temp_dir.path()).unwrap().read_all().unwrap();
     assert_eq!(recovered.len(), 1);
@@ -149,7 +144,6 @@ fn wal_reader_ignores_non_wal_files_even_if_numeric() {
 fn wal_recovery_does_not_reappend_rows_when_replaying_multiple_windows() {
     let temp_dir = TempDir::new().unwrap();
 
-    // Seed one persisted disk partition so replay includes both on-disk and in-memory partitions.
     let seeded = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_wal_enabled(false)
@@ -180,7 +174,6 @@ fn wal_recovery_does_not_reappend_rows_when_replaying_multiple_windows() {
     }
     wal_trait.append_rows(&valid_rows).unwrap();
 
-    // Include a much older row so recovery must create additional writable windows.
     wal_trait
         .append_rows(&[Row::new("recover_metric", DataPoint::new(1, 1.0))])
         .unwrap();
@@ -198,13 +191,11 @@ fn wal_recovery_does_not_reappend_rows_when_replaying_multiple_windows() {
     let points = reopened.select("recover_metric", &[], 0, i64::MAX).unwrap();
     assert_eq!(points.len(), 1001);
 
-    // Recovery must not append replayed rows back into WAL.
     let after_first_reopen = total_wal_size(&wal_dir);
     assert!(after_first_reopen <= before);
 
     reopened.close().unwrap();
 
-    // Reopen again and ensure replay does not duplicate recovered rows.
     let reopened_again = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_wal_enabled(true)
@@ -237,4 +228,21 @@ fn disk_wal_supports_per_append_and_periodic_sync_modes() {
         assert_eq!(recovered[0].metric(), "mode_metric");
         assert_eq!(recovered[0].data_point().timestamp, 1);
     }
+}
+
+#[test]
+fn disk_wal_new_fails_when_max_segment_index_exists() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("4294967295.wal"), []).unwrap();
+
+    let result = DiskWal::new(temp_dir.path(), 0);
+    assert!(result.is_err(), "should fail on max-index segment");
+    let err = result.err().unwrap();
+    assert!(matches!(
+        err,
+        TsinkError::Wal {
+            operation,
+            details
+        } if operation == "init" && details.contains("maximum WAL segment index")
+    ));
 }

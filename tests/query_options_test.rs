@@ -131,3 +131,75 @@ fn test_min_max_aggregation_ignores_nan_when_possible() {
     assert_eq!(max_points.len(), 1);
     assert_eq!(max_points[0].value, 3.0);
 }
+
+#[test]
+fn test_sum_avg_aggregation_ignores_nan_when_possible() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    let rows = vec![
+        Row::new("nan_sum_avg", DataPoint::new(1_000, f64::NAN)),
+        Row::new("nan_sum_avg", DataPoint::new(2_000, 3.0)),
+        Row::new("nan_sum_avg", DataPoint::new(3_000, 1.5)),
+    ];
+    storage.insert_rows(&rows).unwrap();
+
+    let sum_points = storage
+        .select_with_options(
+            "nan_sum_avg",
+            QueryOptions::new(0, 4_000).with_aggregation(Aggregation::Sum),
+        )
+        .unwrap();
+    assert_eq!(sum_points.len(), 1);
+    assert_eq!(sum_points[0].timestamp, 3_000);
+    assert!((sum_points[0].value - 4.5).abs() < 1e-9);
+
+    let avg_points = storage
+        .select_with_options(
+            "nan_sum_avg",
+            QueryOptions::new(0, 4_000).with_aggregation(Aggregation::Avg),
+        )
+        .unwrap();
+    assert_eq!(avg_points.len(), 1);
+    assert_eq!(avg_points[0].timestamp, 3_000);
+    assert!((avg_points[0].value - 2.25).abs() < 1e-9);
+}
+
+#[test]
+fn test_downsample_sum_avg_ignores_nan_when_possible() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    let rows = vec![
+        Row::new("nan_downsample_sum_avg", DataPoint::new(1_000, 1.0)),
+        Row::new("nan_downsample_sum_avg", DataPoint::new(1_500, f64::NAN)),
+        Row::new("nan_downsample_sum_avg", DataPoint::new(1_900, 2.0)),
+    ];
+    storage.insert_rows(&rows).unwrap();
+
+    let sum_points = storage
+        .select_with_options(
+            "nan_downsample_sum_avg",
+            QueryOptions::new(1_000, 3_000).with_downsample(2_000, Aggregation::Sum),
+        )
+        .unwrap();
+    assert_eq!(sum_points.len(), 1);
+    assert_eq!(sum_points[0].timestamp, 1_000);
+    assert!((sum_points[0].value - 3.0).abs() < 1e-9);
+
+    let avg_points = storage
+        .select_with_options(
+            "nan_downsample_sum_avg",
+            QueryOptions::new(1_000, 3_000).with_downsample(2_000, Aggregation::Avg),
+        )
+        .unwrap();
+    assert_eq!(avg_points.len(), 1);
+    assert_eq!(avg_points[0].timestamp, 1_000);
+    assert!((avg_points[0].value - 1.5).abs() < 1e-9);
+}

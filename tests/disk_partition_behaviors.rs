@@ -7,6 +7,15 @@ use tsink::disk::{DiskMetric, DiskPartition, PartitionMeta};
 use tsink::partition::Partition;
 use tsink::{DataPoint, Row, TimestampPrecision, TsinkError};
 
+fn encode_metric_key(metric: &str) -> String {
+    let marshaled = tsink::label::marshal_metric_name(metric, &[]);
+    let mut out = String::with_capacity(marshaled.len() * 2);
+    for byte in marshaled {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn make_meta(metrics: HashMap<String, DiskMetric>) -> PartitionMeta {
     PartitionMeta {
         min_timestamp: 0,
@@ -23,10 +32,11 @@ fn disk_partition_reports_invalid_offsets() {
     let temp_dir = TempDir::new().unwrap();
 
     let mut metrics = HashMap::new();
+    let encoded_key = encode_metric_key("bad_metric");
     metrics.insert(
-        "bad_metric".to_string(),
+        encoded_key.clone(),
         DiskMetric {
-            name: "bad_metric".to_string(),
+            name: encoded_key,
             offset: 1024,
             encoded_size: 16,
             min_timestamp: 0,
@@ -143,7 +153,7 @@ fn disk_partition_clean_removes_files() {
 }
 
 #[test]
-fn disk_partition_select_all_supports_legacy_hex_plain_metric_keys() {
+fn disk_partition_select_all_uses_encoded_metric_keys() {
     let temp_dir = TempDir::new().unwrap();
 
     let data = {
@@ -168,10 +178,11 @@ fn disk_partition_select_all_supports_legacy_hex_plain_metric_keys() {
     };
 
     let mut metrics = HashMap::new();
+    let encoded_key = encode_metric_key("deadbeef");
     metrics.insert(
-        "deadbeef".to_string(),
+        encoded_key.clone(),
         DiskMetric {
-            name: "deadbeef".to_string(),
+            name: encoded_key,
             offset: 0,
             encoded_size: data.len() as u64,
             min_timestamp: 1,
@@ -207,7 +218,7 @@ fn disk_partition_select_all_supports_legacy_hex_plain_metric_keys() {
 }
 
 #[test]
-fn disk_partition_list_metric_series_supports_legacy_hex_plain_metric_keys() {
+fn disk_partition_list_metric_series_uses_encoded_metric_keys() {
     let temp_dir = TempDir::new().unwrap();
 
     let data = {
@@ -232,10 +243,11 @@ fn disk_partition_list_metric_series_supports_legacy_hex_plain_metric_keys() {
     };
 
     let mut metrics = HashMap::new();
+    let encoded_key = encode_metric_key("deadbeef");
     metrics.insert(
-        "deadbeef".to_string(),
+        encoded_key.clone(),
         DiskMetric {
-            name: "deadbeef".to_string(),
+            name: encoded_key,
             offset: 0,
             encoded_size: data.len() as u64,
             min_timestamp: 1,

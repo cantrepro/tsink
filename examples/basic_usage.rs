@@ -3,12 +3,10 @@
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 
 fn main() -> anyhow::Result<()> {
-    // Create an in-memory storage
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .build()?;
 
-    // Insert some data points
     let rows = vec![
         Row::new("cpu_usage", DataPoint::new(1600000000, 45.5)),
         Row::new("cpu_usage", DataPoint::new(1600000060, 47.2)),
@@ -19,14 +17,12 @@ fn main() -> anyhow::Result<()> {
 
     storage.insert_rows(&rows)?;
 
-    // Query data points
     let cpu_points = storage.select("cpu_usage", &[], 1600000000, 1600000121)?;
     println!("CPU usage data points:");
     for point in &cpu_points {
         println!("  Timestamp: {}, Value: {}", point.timestamp, point.value);
     }
 
-    // Insert labeled metrics
     let labeled_rows = vec![
         Row::with_labels(
             "http_requests",
@@ -42,7 +38,6 @@ fn main() -> anyhow::Result<()> {
 
     storage.insert_rows(&labeled_rows)?;
 
-    // Query labeled metrics
     let get_requests = storage.select(
         "http_requests",
         &[Label::new("method", "GET"), Label::new("status", "200")],
@@ -55,7 +50,6 @@ fn main() -> anyhow::Result<()> {
         println!("  Timestamp: {}, Count: {}", point.timestamp, point.value);
     }
 
-    // Close storage gracefully
     storage.close()?;
 
     Ok(())

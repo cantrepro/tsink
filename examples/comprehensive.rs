@@ -14,11 +14,9 @@ fn example_with_data_path() -> tsink::Result<()> {
         .with_data_path("/tmp/tsink-data")
         .build()?;
 
-    // Insert some data
     let row = Row::new("temperature", DataPoint::new(1600000000, 23.5));
     storage.insert_rows(&[row])?;
 
-    // Data will be persisted to /tmp/tsink-data
     storage.close()?;
 
     println!("Data persisted to /tmp/tsink-data");
@@ -33,7 +31,6 @@ fn example_with_partition_duration() -> tsink::Result<()> {
         .with_partition_duration(Duration::from_secs(3600 * 5)) // 5 hours
         .build()?;
 
-    // Insert data across multiple partitions
     for i in 0..10 {
         let timestamp = 1600000000 + (i * 3600 * 2); // 2 hour intervals
         let row = Row::new("metric", DataPoint::new(timestamp, i as f64));
@@ -53,7 +50,6 @@ fn example_insert_and_select() -> tsink::Result<()> {
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .build()?;
 
-    // Insert multiple data points
     let rows = vec![
         Row::new("cpu_usage", DataPoint::new(1600000000, 45.2)),
         Row::new("cpu_usage", DataPoint::new(1600000010, 47.8)),
@@ -67,7 +63,6 @@ fn example_insert_and_select() -> tsink::Result<()> {
 
     storage.insert_rows(&rows)?;
 
-    // Select data
     let points = storage.select("cpu_usage", &[], 1600000000, 1600000025)?;
 
     println!("Selected {} data points:", points.len());
@@ -89,7 +84,6 @@ fn example_concurrent_operations() -> tsink::Result<()> {
 
     let mut handles = vec![];
 
-    // Start write workers
     for worker_id in 0..3 {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
@@ -110,7 +104,6 @@ fn example_concurrent_operations() -> tsink::Result<()> {
         handles.push(handle);
     }
 
-    // Start read workers
     for reader_id in 0..2 {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
@@ -134,7 +127,6 @@ fn example_concurrent_operations() -> tsink::Result<()> {
         handles.push(handle);
     }
 
-    // Wait for all workers
     for handle in handles {
         handle.join().unwrap();
     }
@@ -152,7 +144,6 @@ fn example_out_of_order_insertion() -> tsink::Result<()> {
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
         .build()?;
 
-    // Insert data points out of order
     let rows = vec![
         Row::new("unordered", DataPoint::new(1600000500, 5.0)),
         Row::new("unordered", DataPoint::new(1600000100, 1.0)),
@@ -165,7 +156,6 @@ fn example_out_of_order_insertion() -> tsink::Result<()> {
         storage.insert_rows(&[row])?;
     }
 
-    // Select and verify ordering
     let points = storage.select("unordered", &[], 1600000000, 1600001000)?;
 
     println!("Points retrieved (should be in timestamp order):");
@@ -173,7 +163,6 @@ fn example_out_of_order_insertion() -> tsink::Result<()> {
         println!("  Timestamp: {}, Value: {}", point.timestamp, point.value);
     }
 
-    // Verify they're actually sorted
     for i in 1..points.len() {
         assert!(
             points[i].timestamp >= points[i - 1].timestamp,
@@ -200,17 +189,14 @@ fn example_expired_data() -> tsink::Result<()> {
         .unwrap()
         .as_secs() as i64;
 
-    // Try to insert old data (beyond retention)
     let old_timestamp = now - 7200; // 2 hours ago
     let old_row = Row::new("expired_metric", DataPoint::new(old_timestamp, 100.0));
 
-    // This might be rejected or stored temporarily
     match storage.insert_rows(&[old_row]) {
         Ok(_) => println!("Old data inserted (may be cleaned up later)"),
         Err(e) => println!("Old data rejected: {}", e),
     }
 
-    // Insert current data
     let current_row = Row::new("current_metric", DataPoint::new(now, 200.0));
     storage.insert_rows(&[current_row])?;
 
@@ -225,7 +211,6 @@ fn example_with_labels() -> tsink::Result<()> {
 
     let storage = StorageBuilder::new().build()?;
 
-    // Insert metrics with different label combinations
     let rows = vec![
         Row::with_labels(
             "http_requests",
@@ -248,7 +233,6 @@ fn example_with_labels() -> tsink::Result<()> {
         storage.insert_rows(&[row])?;
     }
 
-    // Query specific label combination
     let get_200 = storage.select(
         "http_requests",
         &[Label::new("method", "GET"), Label::new("status", "200")],
@@ -256,10 +240,11 @@ fn example_with_labels() -> tsink::Result<()> {
         i64::MAX,
     )?;
 
-    println!(
-        "GET requests with 200 status: {} requests",
-        get_200[0].value
-    );
+    if let Some(point) = get_200.first() {
+        println!("GET requests with 200 status: {} requests", point.value);
+    } else {
+        println!("GET requests with 200 status: no matching data");
+    }
 
     storage.close()?;
     Ok(())
@@ -275,7 +260,6 @@ async fn example_high_throughput() -> tsink::Result<()> {
 
     let mut tasks = vec![];
 
-    // Launch many concurrent write tasks
     for task_id in 0..10 {
         let storage = storage.clone();
         let task = tokio::spawn(async move {
@@ -294,7 +278,6 @@ async fn example_high_throughput() -> tsink::Result<()> {
         tasks.push(task);
     }
 
-    // Wait for all tasks
     for task in tasks {
         task.await.unwrap();
     }
@@ -314,7 +297,6 @@ fn main() -> tsink::Result<()> {
     println!("tsink Comprehensive Examples");
     println!("============================");
 
-    // Run all examples
     example_with_data_path()?;
     example_with_partition_duration()?;
     example_insert_and_select()?;

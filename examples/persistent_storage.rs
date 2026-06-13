@@ -5,13 +5,11 @@ use tempfile::TempDir;
 use tsink::{DataPoint, Row, StorageBuilder, TimestampPrecision};
 
 fn main() -> anyhow::Result<()> {
-    // Create a temporary directory for data
     let temp_dir = TempDir::new()?;
     let data_path = temp_dir.path();
 
     println!("Using data directory: {:?}", data_path);
 
-    // Create storage with disk persistence
     let storage = StorageBuilder::new()
         .with_data_path(data_path)
         .with_partition_duration(Duration::from_secs(3600)) // 1 hour partitions
@@ -19,7 +17,6 @@ fn main() -> anyhow::Result<()> {
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
         .build()?;
 
-    // Generate sample data over time
     let mut current_time = 1600000000i64;
     let mut rows = Vec::new();
 
@@ -35,18 +32,15 @@ fn main() -> anyhow::Result<()> {
         current_time += 60; // Add 60 milliseconds
     }
 
-    // Insert data
     storage.insert_rows(&rows)?;
     println!("Inserted {} rows", rows.len());
 
-    // Query recent data
     let start = 1600000000;
     let end = current_time;
 
     let temp_points = storage.select("temperature", &[], start, end)?;
     println!("\nTemperature readings: {} points", temp_points.len());
 
-    // Show first and last points
     if let Some(first) = temp_points.first() {
         println!(
             "  First: timestamp={}, value={:.2}",
@@ -60,11 +54,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Close storage (will flush to disk)
     storage.close()?;
     println!("\nStorage closed and data persisted to disk");
 
-    // Reopen storage to verify persistence
     let storage2 = StorageBuilder::new()
         .with_data_path(data_path)
         .with_timestamp_precision(TimestampPrecision::Milliseconds)

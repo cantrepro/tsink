@@ -39,7 +39,6 @@ fn test_high_contention_concurrent_writes() {
         handle.join().unwrap();
     }
 
-    // Verify all writes succeeded
     let points = storage
         .select("contention_metric", &[], 1, i64::MAX)
         .unwrap();
@@ -60,7 +59,6 @@ fn test_concurrent_reads_during_writes() {
             .unwrap(),
     );
 
-    // Start writer thread
     let storage_writer = storage.clone();
     let writer = thread::spawn(move || {
         for i in 0..1000 {
@@ -75,7 +73,6 @@ fn test_concurrent_reads_during_writes() {
         }
     });
 
-    // Start multiple reader threads
     let mut readers = vec![];
     for reader_id in 0..5 {
         let storage = storage.clone();
@@ -86,7 +83,6 @@ fn test_concurrent_reads_during_writes() {
                 let points = storage
                     .select("concurrent_metric", &[], 1, i64::MAX)
                     .unwrap();
-                // Points should only increase or stay same, never decrease
                 assert!(
                     points.len() >= last_count,
                     "Reader {} saw decreasing points: {} -> {}",
@@ -119,7 +115,6 @@ fn test_concurrent_different_metrics() {
 
     let mut handles = vec![];
 
-    // Each thread writes to its own metric
     for thread_id in 0..10 {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
@@ -139,7 +134,6 @@ fn test_concurrent_different_metrics() {
         handle.join().unwrap();
     }
 
-    // Verify each metric has exactly 100 points
     for thread_id in 0..10 {
         let metric_name = format!("metric_{}", thread_id);
         let points = storage.select(&metric_name, &[], 1, i64::MAX).unwrap();
@@ -183,7 +177,6 @@ fn test_concurrent_labeled_metrics() {
         handle.join().unwrap();
     }
 
-    // Query with different label combinations
     for thread_id in 0..8 {
         let labels = vec![
             Label::new("thread", thread_id.to_string()),

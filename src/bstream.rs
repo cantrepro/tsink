@@ -57,10 +57,8 @@ impl BitStreamWriter {
 
         let i = self.stream.len() - 1;
 
-        // Fill up current byte with count bits from byte
         self.stream[i] |= byte >> (8 - self.count);
 
-        // Add new byte with remaining bits
         self.stream.put_u8(byte << self.count);
     }
 
@@ -170,7 +168,6 @@ impl<'a> BitStreamReader<'a> {
             return self.read_bits_fast(nbits);
         }
 
-        // Read all remaining valid bits and part from next buffer
         let bitmask = (1u64 << self.valid) - 1;
         let remaining_bits = nbits - self.valid;
         let v = (self.buffer & bitmask) << remaining_bits;
@@ -215,7 +212,6 @@ impl<'a> BitStreamReader<'a> {
             return false;
         }
 
-        // Try to load 8 bytes if possible (common case)
         if self.stream_offset + 8 <= self.stream.len() {
             self.buffer = u64::from_be_bytes([
                 self.stream[self.stream_offset],
@@ -232,7 +228,6 @@ impl<'a> BitStreamReader<'a> {
             return true;
         }
 
-        // Load remaining bytes
         let nbytes = ((min_bits / 8) + 1) as usize;
         let nbytes = nbytes.min(self.stream.len() - self.stream_offset);
 
@@ -269,14 +264,12 @@ mod tests {
     fn test_bit_stream_write_read() {
         let mut writer = BitStreamWriter::new();
 
-        // Write some bits
         writer.write_bit(true);
         writer.write_bit(false);
         writer.write_bit(true);
         writer.write_bits(0b1010, 4);
         writer.write_byte(0xFF);
 
-        // Read them back
         let bytes = writer.into_bytes();
         let mut reader = BitStreamReader::new(bytes);
 

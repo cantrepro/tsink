@@ -135,12 +135,30 @@ impl From<crossbeam_channel::RecvError> for TsinkError {
 impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
     fn from(e: crossbeam_channel::RecvTimeoutError) -> Self {
         match e {
-            crossbeam_channel::RecvTimeoutError::Timeout => TsinkError::ChannelReceive {
-                channel: "recv_timeout: duration unavailable".to_string(),
+            crossbeam_channel::RecvTimeoutError::Timeout => TsinkError::ChannelTimeout {
+                timeout_ms: 0,
             },
             crossbeam_channel::RecvTimeoutError::Disconnected => TsinkError::ChannelReceive {
                 channel: "timeout: channel disconnected".to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TsinkError;
+    use crossbeam_channel::RecvTimeoutError;
+
+    #[test]
+    fn recv_timeout_error_timeout_maps_to_channel_timeout() {
+        let err: TsinkError = RecvTimeoutError::Timeout.into();
+        assert!(matches!(err, TsinkError::ChannelTimeout { timeout_ms: 0 }));
+    }
+
+    #[test]
+    fn recv_timeout_error_disconnected_maps_to_channel_receive() {
+        let err: TsinkError = RecvTimeoutError::Disconnected.into();
+        assert!(matches!(err, TsinkError::ChannelReceive { .. }));
     }
 }

@@ -67,11 +67,19 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
 
-    /// Lists all known metric series across partitions and WAL.
+    /// Lists all known metric series currently present in storage partitions.
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         Err(TsinkError::Other(
             "list_metrics is not implemented for this storage backend".to_string(),
         ))
+    }
+
+    /// Lists known metric series and also scans on-disk WAL segments.
+    ///
+    /// This is an opt-in, expensive operation intended for diagnostics.
+    /// It can observe only a prefix of concurrently written WAL entries.
+    fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
+        self.list_metrics()
     }
 
     /// Closes the storage gracefully.
@@ -113,7 +121,6 @@ impl StorageBuilder {
         Self::default()
     }
 
-    // Storage configuration methods
 
     /// Sets the data path for persistent storage.
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
@@ -180,7 +187,6 @@ impl StorageBuilder {
     }
 
     fn build_impl(self) -> Result<Arc<StorageImpl>> {
-        // Check file descriptor limits on Unix systems
         #[cfg(unix)]
         {
             let mut rlim = libc::rlimit {
@@ -226,11 +232,13 @@ impl StorageBuilder {
         if let Some(ref data_path) = self.data_path {
             // Ensure persistent storage path exists even when WAL is disabled.
             fs::create_dir_all(data_path)?;
+            if !self.wal_enabled {
+                Self::cleanup_disabled_wal(data_path)?;
+            }
         }
 
         let use_disk_wal = self.data_path.is_some() && self.wal_enabled;
 
-        // Create WAL based on configuration
         let wal: Arc<dyn Wal> = if let Some(ref data_path) = self.data_path {
             if use_disk_wal {
                 DiskWal::new_with_sync_mode(
@@ -248,6 +256,7 @@ impl StorageBuilder {
         let storage = Arc::new(StorageImpl {
             partition_list: Arc::new(PartitionList::new()),
             data_path: self.data_path.clone(),
+            use_disk_wal,
             partition_duration: self.partition_duration,
             retention: self.retention,
             timestamp_precision: self.timestamp_precision,
@@ -260,26 +269,31 @@ impl StorageBuilder {
             expiry_thread: Arc::new(parking_lot::Mutex::new(None)),
             expiry_stop_tx: Arc::new(parking_lot::Mutex::new(None)),
             flush_thread: Arc::new(parking_lot::Mutex::new(None)),
+            primary_instance: true,
         });
 
-        // Load existing partitions from disk if data path is set
         if let Some(ref data_path) = self.data_path {
             storage.load_disk_partitions(data_path)?;
 
-            // Recover from WAL if it exists
             let wal_dir = data_path.join("wal");
             if use_disk_wal && wal_dir.exists() {
                 storage.recover_from_wal(&wal_dir)?;
             }
         }
 
-        // Create initial memory partition
         storage.new_partition(None)?;
 
-        // Start background tasks
         storage.start_background_tasks();
 
         Ok(storage)
+    }
+
+    fn cleanup_disabled_wal(data_path: &Path) -> Result<()> {
+        let wal_dir = data_path.join("wal");
+        if wal_dir.exists() {
+            fs::remove_dir_all(&wal_dir)?;
+        }
+        Ok(())
     }
 }
 
@@ -357,6 +371,7 @@ impl QueryOptions {
 struct StorageImpl {
     partition_list: Arc<PartitionList>,
     data_path: Option<PathBuf>,
+    use_disk_wal: bool,
     partition_duration: Duration,
     retention: Duration,
     timestamp_precision: TimestampPrecision,
@@ -369,12 +384,73 @@ struct StorageImpl {
     expiry_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
     expiry_stop_tx: Arc<parking_lot::Mutex<Option<Sender<()>>>>,
     flush_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
+    primary_instance: bool,
 }
 
 impl StorageImpl {
     fn canonical_series(name: String, mut labels: Vec<Label>) -> MetricSeries {
         labels.sort();
         MetricSeries { name, labels }
+    }
+
+    fn list_metrics_internal(&self, include_wal: bool) -> Result<Vec<MetricSeries>> {
+        self.ensure_operational()?;
+
+        let mut unique = BTreeSet::new();
+        let mut skipped_invalid = 0usize;
+
+        {
+            let _partition_ops_guard = self.partition_ops_lock.read();
+
+            for partition in self.partition_list.iter() {
+                if partition.size() == 0 || partition.expired() {
+                    continue;
+                }
+
+                for (name, labels) in partition.list_metric_series()? {
+                    if Self::validate_metric_name(&name).is_err()
+                        || Self::validate_labels(&labels).is_err()
+                    {
+                        skipped_invalid += 1;
+                        continue;
+                    }
+
+                    unique.insert(Self::canonical_series(name, labels));
+                }
+            }
+        }
+
+        if include_wal
+            && self.use_disk_wal
+            && let Some(data_path) = &self.data_path
+        {
+            let wal_dir = data_path.join("wal");
+            if wal_dir.exists() {
+                let rows = WalReader::new(&wal_dir)?.read_all()?;
+                for row in rows {
+                    if Self::validate_metric_name(row.metric()).is_err()
+                        || Self::validate_labels(row.labels()).is_err()
+                    {
+                        skipped_invalid += 1;
+                        continue;
+                    }
+
+                    unique.insert(Self::canonical_series(
+                        row.metric().to_string(),
+                        row.labels().to_vec(),
+                    ));
+                }
+            }
+        }
+
+        if skipped_invalid > 0 {
+            warn!(
+                count = skipped_invalid,
+                "Skipping invalid metric series while listing metrics"
+            );
+        }
+
+        Ok(unique.into_iter().collect())
     }
 
     fn ensure_operational(&self) -> Result<()> {
@@ -400,13 +476,23 @@ impl StorageImpl {
     }
 
     fn validate_labels(labels: &[Label]) -> Result<()> {
-        if labels.iter().all(Label::is_valid) {
-            Ok(())
-        } else {
-            Err(TsinkError::InvalidLabel(
-                "label name and value must be non-empty".to_string(),
-            ))
+        for label in labels {
+            if !label.is_valid() {
+                return Err(TsinkError::InvalidLabel(
+                    "label name and value must be non-empty".to_string(),
+                ));
+            }
+            if label.name.len() > crate::label::MAX_LABEL_NAME_LEN
+                || label.value.len() > crate::label::MAX_LABEL_VALUE_LEN
+            {
+                return Err(TsinkError::InvalidLabel(format!(
+                    "label name/value must be within limits (name <= {}, value <= {})",
+                    crate::label::MAX_LABEL_NAME_LEN,
+                    crate::label::MAX_LABEL_VALUE_LEN
+                )));
+            }
         }
+        Ok(())
     }
 
     fn validate_rows(rows: &[Row]) -> Result<()> {
@@ -451,7 +537,6 @@ impl StorageImpl {
         let replay_result = if valid_rows.is_empty() {
             Ok(())
         } else {
-            // Insert recovered rows.
             let mut replay_result = Ok(());
             for chunk in valid_rows.chunks(1000) {
                 if let Err(e) = self.insert_rows_recovery(chunk) {
@@ -462,21 +547,16 @@ impl StorageImpl {
             replay_result
         };
 
-        // Always refresh the WAL after replay attempt to avoid duplicate replays on restart.
-        let refresh_result = self.wal.refresh();
-        match (replay_result, refresh_result) {
-            (Err(replay_err), Err(refresh_err)) => {
-                warn!(
-                    replay_error = %replay_err,
-                    refresh_error = %refresh_err,
-                    "WAL replay failed and WAL refresh also failed"
-                );
-                Err(replay_err)
-            }
-            (Err(replay_err), Ok(())) => Err(replay_err),
-            (Ok(()), Err(refresh_err)) => Err(refresh_err),
-            (Ok(()), Ok(())) => Ok(()),
+        // Keep WAL segments intact on replay failure so unreplayed rows can be retried.
+        if let Err(replay_err) = replay_result {
+            warn!(
+                replay_error = %replay_err,
+                "WAL replay failed; retaining WAL segments for retry"
+            );
+            return Err(replay_err);
         }
+
+        self.wal.refresh()
     }
 
     fn insert_rows_internal(&self, rows: &[Row]) -> Result<()> {
@@ -494,7 +574,6 @@ impl StorageImpl {
 
         let mut pending_rows = rows.to_vec();
         let mut extra_partitions = 0usize;
-        // A partition can accept at least one row from a non-empty batch; cap growth by batch size.
         let max_extra_partitions = rows.len().saturating_add(WRITABLE_PARTITIONS_NUM);
 
         while !pending_rows.is_empty() {
@@ -571,7 +650,6 @@ impl StorageImpl {
             }
         }
 
-        // Sort by min timestamp and insert into list
         partitions.sort_by_key(|p| p.min_timestamp());
         for partition in partitions {
             self.partition_list.insert(partition);
@@ -597,7 +675,6 @@ impl StorageImpl {
 
     fn new_partition(&self, partition: Option<SharedPartition>) -> Result<()> {
         let partition = self.build_partition(partition);
-        // Rotate WAL first so a punctuate failure does not mutate partition state.
         self.wal.punctuate()?;
         self.partition_list.insert(partition);
         Ok(())
@@ -632,7 +709,6 @@ impl StorageImpl {
         }
 
         if created > 0 {
-            // Trigger flush in background to free older partitions
             if self.data_path.is_some() {
                 self.schedule_flush_partitions();
             }
@@ -713,10 +789,7 @@ impl StorageImpl {
                 };
 
                 match swapped {
-                    Ok(()) => {
-                        // Remove oldest WAL segment only when a memory partition was persisted.
-                        self.wal.remove_oldest()?;
-                    }
+                    Ok(()) => {}
                     Err(TsinkError::PartitionNotFound { .. }) => {
                         partition.end_flush();
                         let _ = flushed_partition.clean();
@@ -728,7 +801,6 @@ impl StorageImpl {
                     }
                 }
             } else {
-                // In-memory mode - just remove old partitions.
                 let remove_result = {
                     let _partition_ops_guard = self.partition_ops_lock.write();
                     self.partition_list.remove(&partition)
@@ -806,7 +878,6 @@ impl StorageImpl {
                 Ok(Some(Arc::new(disk_partition) as SharedPartition))
             }
             None => {
-                // Already on disk, nothing to do.
                 Ok(None)
             }
         }
@@ -899,13 +970,21 @@ impl StorageImpl {
         }
 
         if let Some(handle) = self.expiry_thread.lock().take() {
-            let _ = handle.join();
+            if handle.thread().id() == thread::current().id() {
+                drop(handle);
+            } else {
+                let _ = handle.join();
+            }
         }
     }
 
     fn stop_flush_worker(&self) {
         if let Some(handle) = self.flush_thread.lock().take() {
-            let _ = handle.join();
+            if handle.thread().id() == thread::current().id() {
+                drop(handle);
+            } else {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -913,6 +992,7 @@ impl StorageImpl {
         Arc::new(StorageImpl {
             partition_list: self.partition_list.clone(),
             data_path: self.data_path.clone(),
+            use_disk_wal: self.use_disk_wal,
             partition_duration: self.partition_duration,
             retention: self.retention,
             timestamp_precision: self.timestamp_precision,
@@ -925,6 +1005,7 @@ impl StorageImpl {
             expiry_thread: self.expiry_thread.clone(),
             expiry_stop_tx: self.expiry_stop_tx.clone(),
             flush_thread: self.flush_thread.clone(),
+            primary_instance: false,
         })
     }
 }
@@ -933,7 +1014,6 @@ impl Storage for StorageImpl {
     fn insert_rows(&self, rows: &[Row]) -> Result<()> {
         self.ensure_operational()?;
 
-        // Try to acquire worker slot with timeout
         let _guard = match self.workers_semaphore.try_acquire_for(self.write_timeout) {
             Ok(guard) => guard,
             Err(TsinkError::WriteTimeout { .. }) => {
@@ -1008,10 +1088,8 @@ impl Storage for StorageImpl {
             ));
         }
 
-        // Reuse the existing select for raw points.
         let points = self.select(metric, &opts.labels, opts.start, opts.end)?;
 
-        // Downsample or aggregate if requested.
         let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
             (true, Aggregation::None) => Aggregation::Last, // sensible default for downsampling
             _ => opts.aggregation,
@@ -1033,7 +1111,6 @@ impl Storage for StorageImpl {
             points
         };
 
-        // Apply pagination.
         if opts.offset > 0 && opts.offset < processed.len() {
             processed.drain(0..opts.offset);
         } else if opts.offset >= processed.len() {
@@ -1065,7 +1142,6 @@ impl Storage for StorageImpl {
             std::collections::HashMap::new();
 
         for partition in self.partition_list.iter() {
-            // Skip only if partition is truly empty (size == 0)
             if partition.size() == 0 {
                 continue;
             }
@@ -1074,7 +1150,6 @@ impl Storage for StorageImpl {
                 continue;
             }
 
-            // Perform selection
             match partition.select_all_labels(metric, start, end) {
                 Ok(partition_results) => {
                     for (labels, points) in partition_results {
@@ -1086,7 +1161,6 @@ impl Storage for StorageImpl {
             }
         }
 
-        // Sort points within each label set
         let mut results: Vec<(Vec<Label>, Vec<DataPoint>)> = results_map
             .into_iter()
             .map(|(labels, mut points)| {
@@ -1095,67 +1169,17 @@ impl Storage for StorageImpl {
             })
             .collect();
 
-        // Sort by label sets for consistent output
         results.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(results)
     }
 
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
-        self.ensure_operational()?;
+        self.list_metrics_internal(false)
+    }
 
-        let mut unique = BTreeSet::new();
-        let mut skipped_invalid = 0usize;
-
-        {
-            let _partition_ops_guard = self.partition_ops_lock.read();
-
-            for partition in self.partition_list.iter() {
-                if partition.size() == 0 || partition.expired() {
-                    continue;
-                }
-
-                for (name, labels) in partition.list_metric_series()? {
-                    if Self::validate_metric_name(&name).is_err()
-                        || Self::validate_labels(&labels).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(name, labels));
-                }
-            }
-        }
-
-        if let Some(data_path) = &self.data_path {
-            let wal_dir = data_path.join("wal");
-            if wal_dir.exists() {
-                let rows = WalReader::new(&wal_dir)?.read_all()?;
-                for row in rows {
-                    if Self::validate_metric_name(row.metric()).is_err()
-                        || Self::validate_labels(row.labels()).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(
-                        row.metric().to_string(),
-                        row.labels().to_vec(),
-                    ));
-                }
-            }
-        }
-
-        if skipped_invalid > 0 {
-            warn!(
-                count = skipped_invalid,
-                "Skipping invalid metric series while listing metrics"
-            );
-        }
-
-        Ok(unique.into_iter().collect())
+    fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
+        self.list_metrics_internal(true)
     }
 
     fn close(&self) -> Result<()> {
@@ -1176,32 +1200,25 @@ impl Storage for StorageImpl {
         self.stop_background_tasks();
 
         let close_result = (|| -> Result<()> {
-            // Block until all in-flight writers have completed.
             let _writer_guards = self.workers_semaphore.acquire_all(self.write_timeout)?;
 
             // Ensure no flush worker is racing with close-time flush/removal.
             self.stop_flush_worker();
 
-            // Flush WAL
             self.wal.flush()?;
 
-            // For in-memory mode, just return
             if self.data_path.is_none() {
                 return Ok(());
             }
 
-            // Create final partitions to make all writable ones read-only
             for _ in 0..WRITABLE_PARTITIONS_NUM {
                 self.new_partition(None)?;
             }
 
-            // Flush all partitions
             self.flush_all_partitions()?;
 
-            // Remove expired partitions
             self.remove_expired_partitions()?;
 
-            // Remove WAL
             self.wal.remove_all()?;
 
             Ok(())
@@ -1218,6 +1235,18 @@ impl Storage for StorageImpl {
                 Err(err)
             }
         }
+    }
+}
+
+impl Drop for StorageImpl {
+    fn drop(&mut self) {
+        if !self.primary_instance {
+            return;
+        }
+
+        self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
+        self.stop_background_tasks();
+        self.stop_flush_worker();
     }
 }
 
@@ -1251,6 +1280,19 @@ fn max_non_nan_point(points: &[DataPoint]) -> Option<DataPoint> {
     best
 }
 
+fn sum_and_count_non_nan(points: &[DataPoint]) -> Option<(f64, usize)> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for point in points {
+        if point.value.is_nan() {
+            continue;
+        }
+        sum += point.value;
+        count += 1;
+    }
+    if count == 0 { None } else { Some((sum, count)) }
+}
+
 fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<DataPoint> {
     if points.is_empty() {
         return None;
@@ -1259,19 +1301,16 @@ fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<Da
     match aggregation {
         Aggregation::None => None,
         Aggregation::Last => points.last().copied(),
-        Aggregation::Sum | Aggregation::Avg => {
-            let mut sum = 0.0;
-            for p in points {
-                sum += p.value;
-            }
-            let value = if aggregation == Aggregation::Avg {
-                sum / points.len() as f64
-            } else {
-                sum
-            };
-
-            Some(DataPoint::new(points.last().unwrap().timestamp, value))
-        }
+        Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
+            .map(|(sum, count)| {
+                let value = if aggregation == Aggregation::Avg {
+                    sum / count as f64
+                } else {
+                    sum
+                };
+                DataPoint::new(points.last().unwrap().timestamp, value)
+            })
+            .or_else(|| points.last().copied()),
         Aggregation::Min => min_non_nan_point(points).or_else(|| points.last().copied()),
         Aggregation::Max => max_non_nan_point(points).or_else(|| points.last().copied()),
     }
@@ -1289,18 +1328,16 @@ fn aggregate_bucket(
     match aggregation {
         Aggregation::None => None,
         Aggregation::Last => points.last().copied(),
-        Aggregation::Sum | Aggregation::Avg => {
-            let mut sum = 0.0;
-            for p in points {
-                sum += p.value;
-            }
-            let value = if aggregation == Aggregation::Avg {
-                sum / points.len() as f64
-            } else {
-                sum
-            };
-            Some(DataPoint::new(bucket_start, value))
-        }
+        Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
+            .map(|(sum, count)| {
+                let value = if aggregation == Aggregation::Avg {
+                    sum / count as f64
+                } else {
+                    sum
+                };
+                DataPoint::new(bucket_start, value)
+            })
+            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
         Aggregation::Min => min_non_nan_point(points)
             .map(|p| DataPoint::new(bucket_start, p.value))
             .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
@@ -1317,34 +1354,43 @@ fn downsample_points(
     start: i64,
     end: i64,
 ) -> Vec<DataPoint> {
-    if points.is_empty() {
+    if points.is_empty() || interval <= 0 || start >= end {
         return Vec::new();
     }
+
+    fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
+        let rel = ts as i128 - start as i128;
+        let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
+        bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
     let mut result = Vec::new();
     let mut idx = 0;
-    let mut bucket_start = start;
 
-    while bucket_start < end {
+    // Skip points that are outside the query window lower bound.
+    while idx < points.len() && points[idx].timestamp < start {
+        idx += 1;
+    }
+
+    while idx < points.len() {
+        if points[idx].timestamp >= end {
+            break;
+        }
+
+        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
         let bucket_end = bucket_start.saturating_add(interval);
-        let mut bucket_points = Vec::new();
+        let bucket_begin = idx;
 
-        while idx < points.len() && points[idx].timestamp < bucket_end {
-            bucket_points.push(points[idx]);
+        while idx < points.len() {
+            let ts = points[idx].timestamp;
+            if ts >= end || ts >= bucket_end {
+                break;
+            }
             idx += 1;
         }
 
-        if let Some(dp) = aggregate_bucket(&bucket_points, aggregation, bucket_start) {
+        if let Some(dp) = aggregate_bucket(&points[bucket_begin..idx], aggregation, bucket_start) {
             result.push(dp);
-        }
-
-        // Fast-forward if points are sparse
-        if idx < points.len() && points[idx].timestamp >= bucket_end {
-            let rel = points[idx].timestamp as i128 - start as i128;
-            let next_bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
-            let next_bucket = next_bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            bucket_start = std::cmp::max(bucket_end, next_bucket);
-        } else {
-            bucket_start = bucket_end;
         }
     }
 
@@ -1354,8 +1400,94 @@ fn downsample_points(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    struct RecoveryTestPartition {
+        fail_recovery: bool,
+    }
+
+    impl RecoveryTestPartition {
+        fn new(fail_recovery: bool) -> Self {
+            Self { fail_recovery }
+        }
+    }
+
+    impl crate::partition::Partition for RecoveryTestPartition {
+        fn insert_rows(&self, _rows: &[Row]) -> Result<Vec<Row>> {
+            Ok(Vec::new())
+        }
+
+        fn insert_rows_recovery(&self, _rows: &[Row]) -> Result<Vec<Row>> {
+            if self.fail_recovery {
+                return Err(TsinkError::Other("forced replay failure".to_string()));
+            }
+
+            Ok(Vec::new())
+        }
+
+        fn select_data_points(
+            &self,
+            _metric: &str,
+            _labels: &[Label],
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<DataPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn select_all_labels(
+            &self,
+            _metric: &str,
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            Ok(Vec::new())
+        }
+
+        fn list_metric_series(&self) -> Result<Vec<(String, Vec<Label>)>> {
+            Ok(Vec::new())
+        }
+
+        fn min_timestamp(&self) -> i64 {
+            1
+        }
+
+        fn max_timestamp(&self) -> i64 {
+            1
+        }
+
+        fn size(&self) -> usize {
+            0
+        }
+
+        fn active(&self) -> bool {
+            true
+        }
+
+        fn expired(&self) -> bool {
+            false
+        }
+
+        fn clean(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush_to_disk(&self) -> Result<Option<(Vec<u8>, crate::disk::PartitionMeta)>> {
+            Ok(None)
+        }
+    }
+
+    fn wal_segment_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
+            .count()
+    }
 
     #[test]
     fn memory_mode_removes_expired_partitions_in_background() {
@@ -1515,5 +1647,133 @@ mod tests {
         storage.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
         drop(permit);
         storage.close().unwrap();
+    }
+
+    #[test]
+    fn replay_failure_does_not_clear_wal_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+
+        let disk_wal = DiskWal::new(&wal_dir, 0).unwrap();
+        let wal: Arc<dyn Wal> = disk_wal;
+        wal.append_rows(&[Row::new("recover_metric", DataPoint::new(1, 1.0))])
+            .unwrap();
+        wal.flush().unwrap();
+        let segments_before = wal_segment_count(&wal_dir);
+        assert!(segments_before > 0);
+
+        let storage = StorageImpl {
+            partition_list: Arc::new(PartitionList::new()),
+            data_path: None,
+            use_disk_wal: false,
+            partition_duration: Duration::from_secs(60),
+            retention: Duration::from_secs(3600),
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            write_timeout: Duration::from_secs(1),
+            wal: wal.clone(),
+            workers_semaphore: Arc::new(Semaphore::new(1)),
+            lifecycle: Arc::new(AtomicU8::new(STORAGE_OPEN)),
+            partition_creation_lock: Arc::new(parking_lot::Mutex::new(())),
+            partition_ops_lock: Arc::new(parking_lot::RwLock::new(())),
+            expiry_thread: Arc::new(parking_lot::Mutex::new(None)),
+            expiry_stop_tx: Arc::new(parking_lot::Mutex::new(None)),
+            flush_thread: Arc::new(parking_lot::Mutex::new(None)),
+            primary_instance: true,
+        };
+
+        storage.partition_list.insert(
+            Arc::new(RecoveryTestPartition::new(false)) as crate::partition::SharedPartition
+        );
+        storage.partition_list.insert(
+            Arc::new(RecoveryTestPartition::new(true)) as crate::partition::SharedPartition,
+        );
+
+        let replay_result = storage.recover_from_wal(&wal_dir);
+        assert!(matches!(replay_result, Err(TsinkError::Other(_))));
+        assert_eq!(wal_segment_count(&wal_dir), segments_before);
+    }
+
+    #[test]
+    fn drop_without_close_stops_background_workers() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .build_impl()
+            .unwrap();
+
+        storage.schedule_flush_partitions();
+
+        let lifecycle = storage.lifecycle.clone();
+        let expiry_thread = storage.expiry_thread.clone();
+        let expiry_stop_tx = storage.expiry_stop_tx.clone();
+        let flush_thread = storage.flush_thread.clone();
+
+        drop(storage);
+
+        assert_eq!(lifecycle.load(Ordering::SeqCst), STORAGE_CLOSED);
+        assert!(expiry_stop_tx.lock().is_none());
+        assert!(expiry_thread.lock().is_none());
+        assert!(flush_thread.lock().is_none());
+    }
+
+    #[test]
+    fn crash_recovery_keeps_rows_when_partial_flush_persists_only_oldest_partition() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_partition_duration(Duration::from_secs(60))
+            .build_impl()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::new("wal_gc_guard", DataPoint::new(300, 1.0)),
+                Row::new("wal_gc_guard", DataPoint::new(230, 2.0)),
+                Row::new("wal_gc_guard", DataPoint::new(160, 3.0)),
+            ])
+            .unwrap();
+
+        // Make flush progression deterministic for this test.
+        storage.stop_flush_worker();
+        storage.flush_partitions().unwrap();
+        storage.stop_flush_worker();
+
+        // Simulate abrupt shutdown: drop without close() so recovery relies on WAL.
+        drop(storage);
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_partition_duration(Duration::from_secs(60))
+            .build_impl()
+            .unwrap();
+
+        let points = reopened.select("wal_gc_guard", &[], 0, 1_000).unwrap();
+        let timestamps: std::collections::BTreeSet<i64> =
+            points.iter().map(|point| point.timestamp).collect();
+
+        assert!(timestamps.contains(&300));
+        assert!(timestamps.contains(&230));
+        assert!(timestamps.contains(&160));
+
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn downsample_sparse_points_skips_empty_buckets() {
+        let points = vec![
+            DataPoint::new(5, 1.0),
+            DataPoint::new(1_000_005, 2.0),
+            DataPoint::new(2_000_005, 3.0),
+        ];
+
+        let result = downsample_points(&points, 1, Aggregation::Last, 0, 3_000_000);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], DataPoint::new(5, 1.0));
+        assert_eq!(result[1], DataPoint::new(1_000_005, 2.0));
+        assert_eq!(result[2], DataPoint::new(2_000_005, 3.0));
     }
 }

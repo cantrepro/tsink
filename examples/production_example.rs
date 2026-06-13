@@ -9,7 +9,6 @@ use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting tsink production example");
 
-    // Create storage with production settings
     let storage = Arc::new(
         StorageBuilder::new()
             .with_data_path("./tsink-data")
@@ -22,10 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
     );
 
-    // Simulate production workload
     info!("Starting production workload simulation");
 
-    // Spawn multiple writer threads
     let mut writer_handles = vec![];
     for thread_id in 0..4 {
         let storage_clone = Arc::clone(&storage);
@@ -37,14 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let start = std::time::Instant::now();
                 let mut rows = Vec::new();
 
-                // Generate batch of metrics
                 for i in 0..100 {
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_nanos() as i64;
 
-                    // CPU metrics
                     rows.push(Row::with_labels(
                         "cpu_usage",
                         vec![
@@ -54,7 +49,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         DataPoint::new(timestamp, 50.0 + (i as f64) * 0.1),
                     ));
 
-                    // Memory metrics
                     rows.push(Row::with_labels(
                         "memory_usage",
                         vec![
@@ -64,7 +58,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         DataPoint::new(timestamp, 1024.0 * (1000.0 + i as f64)),
                     ));
 
-                    // Network metrics
                     rows.push(Row::with_labels(
                         "network_bytes",
                         vec![
@@ -76,7 +69,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
 
-                // Insert batch
                 match storage_clone.insert_rows(&rows) {
                     Ok(_) => {
                         let duration = start.elapsed();
@@ -98,7 +90,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Small delay between batches
                 thread::sleep(Duration::from_millis(100));
             }
 
@@ -108,7 +99,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer_handles.push(handle);
     }
 
-    // Spawn reader thread
     let storage_reader = Arc::clone(&storage);
 
     let reader_handle = thread::spawn(move || {
@@ -124,7 +114,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_nanos() as i64;
             let start_time = end_time - 60_000_000_000; // Last 60 seconds
 
-            // Query CPU metrics
             match storage_reader.select(
                 "cpu_usage",
                 &[Label::new("host", "server-0")],
@@ -150,7 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Query memory metrics
             match storage_reader.select(
                 "memory_usage",
                 &[Label::new("host", "server-1"), Label::new("type", "used")],
@@ -177,14 +165,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Reader thread completed");
     });
 
-    // Wait for all threads to complete
     for handle in writer_handles {
         handle.join().expect("Writer thread panicked");
     }
 
     reader_handle.join().expect("Reader thread panicked");
 
-    // Graceful shutdown
     info!("Shutting down storage");
     storage.close()?;
 

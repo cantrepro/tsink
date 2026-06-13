@@ -191,7 +191,17 @@ pub mod unix {
 /// Helper function to create an appropriate memory map for the current platform
 pub fn create_mmap(file: File) -> io::Result<PlatformMmap> {
     let metadata = file.metadata()?;
-    let length = metadata.len() as usize;
+    let file_len = metadata.len();
+    let length = usize::try_from(file_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file length {} exceeds usize::MAX ({}) on this platform",
+                file_len,
+                usize::MAX
+            ),
+        )
+    })?;
 
     PlatformMmap::new(file, length)
 }
@@ -209,13 +219,11 @@ mod tests {
 
     #[test]
     fn test_max_map_size() {
-        let max_size = get_max_mmap_size();
-
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(max_size, usize::MAX);
+        assert_eq!(get_max_mmap_size(), usize::MAX);
 
         #[cfg(target_arch = "x86")]
-        assert_eq!(max_size, 0x7FFFFFFF);
+        assert_eq!(get_max_mmap_size(), 0x7FFFFFFF);
     }
 
     #[test]

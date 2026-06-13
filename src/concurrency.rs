@@ -51,7 +51,6 @@ impl Semaphore {
                     return SemaphoreGuard { semaphore: self };
                 }
             } else {
-                // Wait for a permit to become available using condition variable
                 let mut lock = self.mutex.lock();
                 while self.permits.load(Ordering::Acquire) == 0 {
                     self.condvar.wait(&mut lock);
@@ -62,16 +61,22 @@ impl Semaphore {
 
     /// Tries to acquire a permit without blocking.
     pub fn try_acquire(&self) -> Option<SemaphoreGuard<'_>> {
-        let current = self.permits.load(Ordering::Acquire);
-        if current > 0
-            && self
-                .permits
-                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return Some(SemaphoreGuard { semaphore: self });
+        let mut current = self.permits.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return None;
+            }
+
+            match self.permits.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(SemaphoreGuard { semaphore: self }),
+                Err(actual) => current = actual,
+            }
         }
-        None
     }
 
     /// Tries to acquire a permit, waiting up to the provided timeout.
@@ -368,15 +373,12 @@ impl<T: Send + 'static> WorkerPool<T> {
         info!("Shutting down worker pool");
         self.shutdown.store(true, Ordering::Release);
 
-        // Drain queued tasks before sending shutdown so enqueued work is not dropped.
         self.wait_for_completion(Duration::from_secs(30))?;
 
-        // Send shutdown messages to all workers
         for _ in &self.workers {
             let _ = self.sender.send(Message::Shutdown);
         }
 
-        // Wait for all workers to finish
         for worker in &mut self.workers {
             if let Some(thread) = worker.thread.take() {
                 match thread.join() {
@@ -420,7 +422,6 @@ impl RateLimiter {
             let now = std::time::Instant::now();
             let mut window_start = self.window_start.lock();
 
-            // Reset window if a second has passed
             if now.duration_since(*window_start) >= Duration::from_secs(1) {
                 *window_start = now;
                 self.ops_in_window.store(0, Ordering::Release);
@@ -432,7 +433,6 @@ impl RateLimiter {
                 break;
             }
 
-            // Wait for the next window
             drop(window_start);
             thread::sleep(Duration::from_millis(10));
         }
@@ -443,7 +443,6 @@ impl RateLimiter {
         let now = std::time::Instant::now();
         let mut window_start = self.window_start.lock();
 
-        // Reset window if a second has passed
         if now.duration_since(*window_start) >= Duration::from_secs(1) {
             *window_start = now;
             self.ops_in_window.store(1, Ordering::Release);
@@ -487,7 +486,6 @@ mod tests {
 
         let pool = WorkerPool::new(4, move |value: usize| {
             counter_clone.fetch_add(value, Ordering::AcqRel);
-            // Add small delay to ensure task is processed
             thread::sleep(Duration::from_millis(1));
         });
 
@@ -495,12 +493,10 @@ mod tests {
             pool.submit(i).unwrap();
         }
 
-        // Wait a bit longer to ensure all tasks are processed
         thread::sleep(Duration::from_millis(100));
         pool.wait_for_completion(Duration::from_secs(5)).unwrap();
 
         let result = counter.load(Ordering::Acquire);
-        // Allow some tolerance in case of timing issues
         assert!(result >= 55, "Expected at least 55, got {}", result);
 
         pool.shutdown().unwrap();
@@ -528,12 +524,10 @@ mod tests {
     fn test_rate_limiter() {
         let limiter = RateLimiter::new(5);
 
-        // Should allow 5 operations immediately
         for _ in 0..5 {
             assert!(limiter.try_acquire());
         }
 
-        // 6th operation should be blocked
         assert!(!limiter.try_acquire());
     }
 

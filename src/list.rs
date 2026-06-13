@@ -70,7 +70,6 @@ impl PartitionList {
         let _mutation_guard = self.mutation_lock.lock();
         let mut head = self.head.write();
 
-        // Check if removing head
         if let Some(head_node) = head.clone()
             && Self::same_partitions(&head_node.partition, target)
         {
@@ -80,7 +79,6 @@ impl PartitionList {
             return Ok(());
         }
 
-        // Search for the node to remove
         let current = head.clone();
         drop(head); // Release the write lock
 
@@ -91,7 +89,6 @@ impl PartitionList {
             if let Some(ref next_node) = next_opt
                 && Self::same_partitions(&next_node.partition, target)
             {
-                // Remove next node
                 let new_next = next_node.next.read().clone();
                 *node.next.write() = new_next;
                 self.num_partitions.fetch_sub(1, Ordering::SeqCst);
@@ -112,7 +109,6 @@ impl PartitionList {
         let _mutation_guard = self.mutation_lock.lock();
         let mut head = self.head.write();
 
-        // Check if swapping head
         if let Some(head_node) = head.clone()
             && Self::same_partitions(&head_node.partition, old)
         {
@@ -124,7 +120,6 @@ impl PartitionList {
             return Ok(());
         }
 
-        // Search for the node to swap
         let current = head.clone();
         drop(head); // Release the write lock
 
@@ -135,7 +130,6 @@ impl PartitionList {
             if let Some(ref next_node) = next_opt
                 && Self::same_partitions(&next_node.partition, old)
             {
-                // Swap next node
                 let new_node = Arc::new(PartitionNode {
                     partition: new,
                     next: RwLock::new(next_node.next.read().clone()),

@@ -11,7 +11,6 @@ fn test_memory_mapped_bounds_checking() {
             .build()
             .unwrap();
 
-        // Insert data
         let rows = vec![
             Row::new("test_metric", DataPoint::new(1000, 1.0)),
             Row::new("test_metric", DataPoint::new(2000, 2.0)),
@@ -21,7 +20,6 @@ fn test_memory_mapped_bounds_checking() {
         storage.close().unwrap();
     }
 
-    // Corrupt the first persisted partition data file.
     let partition_dir = fs::read_dir(temp_dir.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -61,7 +59,6 @@ fn test_large_offset_bounds_check() {
         .build()
         .unwrap();
 
-    // Insert enough data to create multiple partitions
     let mut rows = Vec::new();
     for i in 0..200 {
         rows.push(Row::new(
@@ -71,7 +68,6 @@ fn test_large_offset_bounds_check() {
     }
     storage.insert_rows(&rows).unwrap();
 
-    // Query with large time range to test bounds
     let result = storage.select("metric_0", &[], i64::MIN, i64::MAX);
     assert!(result.is_ok());
 }
@@ -80,17 +76,16 @@ fn test_large_offset_bounds_check() {
 fn test_empty_partition_handling() {
     let temp_dir = TempDir::new().unwrap();
 
-    // Create empty data file
     let data_dir = temp_dir.path().join("p-0-1000");
     fs::create_dir_all(&data_dir).unwrap();
     fs::write(data_dir.join("data"), []).unwrap();
 
-    // Write valid but minimal metadata
     let meta = r#"{
         "min_timestamp": 0,
         "max_timestamp": 1000,
         "num_data_points": 0,
         "metrics": {},
+        "timestamp_precision": "Nanoseconds",
         "created_at": {"secs_since_epoch": 0, "nanos_since_epoch": 0}
     }"#;
     fs::write(data_dir.join("meta.json"), meta).unwrap();
@@ -100,7 +95,6 @@ fn test_empty_partition_handling() {
         .build()
         .unwrap();
 
-    // Should handle empty partition gracefully
     let result = storage.select("any_metric", &[], 1, 2000);
     match result {
         Ok(points) => assert_eq!(points.len(), 0),

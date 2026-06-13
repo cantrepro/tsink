@@ -12,7 +12,6 @@ use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 fn bench_insert_rows(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_rows");
 
-    // Test different batch sizes
     for size in [1, 10, 100, 1000].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let storage = StorageBuilder::new()
@@ -45,7 +44,6 @@ fn bench_select_among_thousand_points(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    // Insert 1000 data points
     let rows: Vec<Row> = (0..1000)
         .map(|i| {
             Row::new(
@@ -74,7 +72,6 @@ fn bench_select_among_thousand_points(c: &mut Criterion) {
 
 /// Benchmark selecting among millions of points
 fn bench_select_among_million_points(c: &mut Criterion) {
-    // Create storage with much larger partition duration to fit 1M points
     // 1M seconds = ~278 hours, so use 150 hour partitions (2 partitions total)
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -82,7 +79,6 @@ fn bench_select_among_million_points(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    // Insert 1 million data points in batches
     for batch in 0..1000 {
         let rows: Vec<Row> = (0..1000)
             .map(|i| {
@@ -97,7 +93,6 @@ fn bench_select_among_million_points(c: &mut Criterion) {
         storage.insert_rows(&rows).unwrap();
     }
 
-    // Verify we actually have 1M points
     let _all_points = storage
         .select("million_metric", &[], 1600000000, 1700000000)
         .unwrap();
@@ -155,7 +150,6 @@ fn bench_concurrent_insertions(c: &mut Criterion) {
 fn bench_with_labels(c: &mut Criterion) {
     let mut group = c.benchmark_group("with_labels");
 
-    // Benchmark insertion with labels
     group.bench_function("insert_with_labels", |b| {
         let storage = StorageBuilder::new().build().unwrap();
 
@@ -173,11 +167,9 @@ fn bench_with_labels(c: &mut Criterion) {
         });
     });
 
-    // Benchmark selection with labels
     group.bench_function("select_with_labels", |b| {
         let storage = StorageBuilder::new().build().unwrap();
 
-        // Insert test data with various label combinations
         for i in 0..100 {
             let row = Row::with_labels(
                 "labeled_metric",
@@ -249,7 +241,6 @@ fn bench_timestamp_precisions(c: &mut Criterion) {
 fn bench_partition_types(c: &mut Criterion) {
     let mut group = c.benchmark_group("partition_types");
 
-    // Memory-only storage
     group.bench_function("memory_partition", |b| {
         let storage = StorageBuilder::new().build().unwrap();
 
@@ -267,7 +258,6 @@ fn bench_partition_types(c: &mut Criterion) {
         });
     });
 
-    // Disk-backed storage
     group.bench_function("disk_partition", |b| {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage = StorageBuilder::new()

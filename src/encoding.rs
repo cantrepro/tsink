@@ -9,14 +9,11 @@ pub struct GorillaEncoder<W: Write> {
     writer: W,
     buf: BitStreamWriter,
 
-    // Number of points encoded in the current stream
     num_points: u64,
 
-    // Timestamp tracking
     t: i64,
     t_delta: u64,
 
-    // Value tracking
     v: f64,
     leading: u8,
     trailing: u8,
@@ -41,13 +38,11 @@ impl<W: Write> GorillaEncoder<W> {
     pub fn encode_point(&mut self, point: &DataPoint) -> Result<()> {
         match self.num_points {
             0 => {
-                // First point - write timestamp and value directly
                 self.write_varint(point.timestamp)?;
                 self.buf.write_bits(point.value.to_bits(), 64);
                 self.t = point.timestamp;
             }
             1 => {
-                // Second point - write delta of timestamp
                 let delta = point.timestamp.checked_sub(self.t).ok_or_else(|| {
                     TsinkError::Compression(
                         "timestamps must be non-decreasing for Gorilla encoding".to_string(),
@@ -65,7 +60,6 @@ impl<W: Write> GorillaEncoder<W> {
                 self.t = point.timestamp;
             }
             _ => {
-                // Subsequent points - write delta-of-delta
                 let delta = point.timestamp.checked_sub(self.t).ok_or_else(|| {
                     TsinkError::Compression(
                         "timestamps must be non-decreasing for Gorilla encoding".to_string(),
@@ -139,7 +133,6 @@ impl<W: Write> GorillaEncoder<W> {
             self.buf.write_bit(true);
             self.buf.write_bits(leading as u64, 5);
 
-            // Handle edge case where all 64 bits are significant
             let mut sigbits = 64 - leading - trailing;
             if sigbits == 64 {
                 sigbits = 0; // Encode as 0, decode as 64
@@ -157,7 +150,6 @@ impl<W: Write> GorillaEncoder<W> {
         self.writer.write_all(self.buf.bytes())?;
         self.writer.flush()?;
 
-        // Reset state
         self.buf.reset();
         self.num_points = 0;
         self.t = 0;
@@ -195,11 +187,9 @@ pub struct GorillaDecoder<'a> {
     reader: BitStreamReader<'a>,
     num_read: u16,
 
-    // Timestamp tracking
     t: i64,
     t_delta: u64,
 
-    // Value tracking
     v: f64,
     leading: u8,
     trailing: u8,
@@ -236,7 +226,6 @@ impl<'a> GorillaDecoder<'a> {
     pub fn decode_point(&mut self) -> Result<DataPoint> {
         match self.num_read {
             0 => {
-                // First point
                 self.t = self.read_varint()?;
                 let v_bits = self.reader.read_bits(64)?;
                 self.v = f64::from_bits(v_bits);
@@ -244,7 +233,6 @@ impl<'a> GorillaDecoder<'a> {
                 Ok(DataPoint::new(self.t, self.v))
             }
             1 => {
-                // Second point
                 self.t_delta = self.read_uvarint()?;
                 self.t += self.t_delta as i64;
                 self.read_value()?;
@@ -252,7 +240,6 @@ impl<'a> GorillaDecoder<'a> {
                 Ok(DataPoint::new(self.t, self.v))
             }
             _ => {
-                // Subsequent points - read delta-of-delta
                 let mut delimiter = 0u8;
                 for _ in 0..4 {
                     delimiter <<= 1;
@@ -326,7 +313,6 @@ impl<'a> GorillaDecoder<'a> {
             .or_else(|_| self.reader.read_bit())?;
 
         if !bit {
-            // Value unchanged
             return Ok(());
         }
 
@@ -336,9 +322,7 @@ impl<'a> GorillaDecoder<'a> {
             .or_else(|_| self.reader.read_bit())?;
 
         if !bit {
-            // Reuse leading/trailing
         } else {
-            // Read new leading/trailing
             let bits = self
                 .reader
                 .read_bits_fast(5)
@@ -351,7 +335,6 @@ impl<'a> GorillaDecoder<'a> {
                 .or_else(|_| self.reader.read_bits(6))?;
             let mut mbits = bits as u8;
 
-            // 0 means 64 significant bits
             if mbits == 0 {
                 mbits = 64;
             }
@@ -441,7 +424,6 @@ mod tests {
             DataPoint::new(1240, 1.25),
         ];
 
-        // Encode
         let mut buf = Vec::new();
         let mut encoder = GorillaEncoder::new(&mut buf);
         for point in &points {
@@ -449,7 +431,6 @@ mod tests {
         }
         encoder.flush().unwrap();
 
-        // Decode
         let mut decoder = GorillaDecoder::new(buf);
         for expected in &points {
             let decoded = decoder.decode_point().unwrap();
@@ -495,15 +476,12 @@ mod tests {
     fn test_varint_encoding() {
         let mut buf = [0u8; 10];
 
-        // Test positive number
         let len = encode_varint(300, &mut buf);
         assert!(len <= 10);
 
-        // Test negative number
         let len = encode_varint(-300, &mut buf);
         assert!(len <= 10);
 
-        // Test zero
         let len = encode_varint(0, &mut buf);
         assert_eq!(len, 1);
     }
