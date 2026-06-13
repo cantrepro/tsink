@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rayon::prelude::*;
 
-use crate::concurrency::Semaphore;
+use crate::concurrency::{Semaphore, SemaphoreGuard};
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
 use crate::engine::compactor::Compactor;
 use crate::engine::encoder::Encoder;
@@ -754,14 +754,34 @@ impl ChunkStorage {
         Ok((required > limit).then_some((limit, required)))
     }
 
+    fn acquire_write_permits_excluding_current_writer(&self) -> Result<Vec<SemaphoreGuard<'_>>> {
+        let permits_needed = self.write_limiter.capacity().saturating_sub(1);
+        if permits_needed == 0 {
+            return Ok(Vec::new());
+        }
+
+        let deadline = Instant::now() + self.write_timeout;
+        let mut guards = Vec::with_capacity(permits_needed);
+        for _ in 0..permits_needed {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            guards.push(self.write_limiter.try_acquire_for(remaining)?);
+        }
+
+        Ok(guards)
+    }
+
     fn relieve_pressure_once(&self) -> Result<()> {
         let _backpressure_guard = self.admission_backpressure_lock.lock();
+        // `relieve_pressure_once` is entered while the caller already holds one writer permit.
+        // Drain the remaining permits so WAL reset/truncate cannot race in-flight writers.
+        let _drained_writers = self.acquire_write_permits_excluding_current_writer()?;
         self.flush_all_active()?;
         self.prune_empty_active_series();
         if self.persist_segment(true)? {
             self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
         }
-        self.enforce_memory_budget_if_needed()?;
+        self.enforce_memory_budget_if_needed_with_writers_already_drained()?;
         Ok(())
     }
 
@@ -994,6 +1014,21 @@ impl ChunkStorage {
         evicted
     }
 
+    fn enforce_memory_budget_if_needed_with_writers_already_drained(&self) -> Result<()> {
+        let budget = self.memory_budget_value();
+        if budget == usize::MAX || self.memory_used_value() <= budget {
+            return Ok(());
+        }
+
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            // In-memory-only mode cannot spill to L0 segments.
+            return Ok(());
+        }
+
+        let _backpressure_guard = self.memory_backpressure_lock.lock();
+        self.enforce_memory_budget_locked(budget)
+    }
+
     fn enforce_memory_budget_if_needed(&self) -> Result<()> {
         let budget = self.memory_budget_value();
         if budget == usize::MAX || self.memory_used_value() <= budget {
@@ -1006,6 +1041,17 @@ impl ChunkStorage {
         }
 
         let _backpressure_guard = self.memory_backpressure_lock.lock();
+        let used = self.refresh_memory_usage();
+        if used <= budget {
+            return Ok(());
+        }
+
+        // Drain all writers before any flush/persist path that may reset or truncate WAL.
+        let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
+        self.enforce_memory_budget_locked(budget)
+    }
+
+    fn enforce_memory_budget_locked(&self, budget: usize) -> Result<()> {
         let mut used = self.refresh_memory_usage();
         if used <= budget {
             return Ok(());
@@ -2242,7 +2288,7 @@ impl ChunkStorage {
 impl Storage for ChunkStorage {
     fn insert_rows(&self, rows: &[Row]) -> Result<()> {
         self.ensure_open()?;
-        let _write_permit = self.write_limiter.try_acquire_for(self.write_timeout)?;
+        let write_permit = self.write_limiter.try_acquire_for(self.write_timeout)?;
         // A write may pass the first lifecycle check and then block on permits while close starts.
         // Re-check after acquiring a permit so shutdown cannot race new writes through.
         self.ensure_open()?;
@@ -2349,6 +2395,7 @@ impl Storage for ChunkStorage {
         }
 
         if self.memory_budget_value() != usize::MAX {
+            drop(write_permit);
             self.refresh_memory_usage();
             self.enforce_memory_budget_if_needed()?;
         }
@@ -5176,6 +5223,85 @@ mod tests {
                 workers: 1
             }
         ));
+    }
+
+    #[test]
+    fn admission_pressure_drain_times_out_when_another_writer_is_in_flight() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal =
+            FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_millis(100),
+                memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: 1,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
+            },
+        );
+
+        let _held_permit = storage.write_limiter.acquire();
+        let err = storage
+            .insert_rows(&[Row::new(
+                "wal_pressure_drain_metric",
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::WriteTimeout { workers: 2, .. }));
+    }
+
+    #[test]
+    fn memory_pressure_drain_times_out_when_another_writer_is_in_flight() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal =
+            FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_millis(100),
+                memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: u64::MAX,
+                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: true,
+            },
+        );
+
+        storage
+            .insert_rows(&[
+                Row::new("memory_pressure_drain_metric", DataPoint::new(1, 1.0)),
+                Row::new("memory_pressure_drain_metric", DataPoint::new(2, 2.0)),
+            ])
+            .unwrap();
+
+        storage
+            .memory_budget_bytes
+            .store(1, std::sync::atomic::Ordering::Release);
+        storage.refresh_memory_usage();
+
+        let _held_permit = storage.write_limiter.acquire();
+        let err = storage.enforce_memory_budget_if_needed().unwrap_err();
+        assert!(matches!(err, TsinkError::WriteTimeout { workers: 2, .. }));
     }
 
     #[test]
