@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use tsink::disk::{DiskMetric, DiskPartition, PartitionMeta};
 use tsink::partition::Partition;
-use tsink::{DataPoint, Row, TsinkError};
+use tsink::{DataPoint, Row, TimestampPrecision, TsinkError};
 
 fn make_meta(metrics: HashMap<String, DiskMetric>) -> PartitionMeta {
     PartitionMeta {
@@ -13,6 +13,7 @@ fn make_meta(metrics: HashMap<String, DiskMetric>) -> PartitionMeta {
         max_timestamp: 100,
         num_data_points: metrics.values().map(|m| m.num_data_points).sum(),
         metrics,
+        timestamp_precision: TimestampPrecision::Nanoseconds,
         created_at: SystemTime::now(),
     }
 }
@@ -116,6 +117,7 @@ fn disk_partition_clean_removes_files() {
                 wal,
                 Duration::from_secs(60),
                 tsink::TimestampPrecision::Seconds,
+                Duration::from_secs(3600),
             ));
         partition.insert_rows(&rows).unwrap();
         tsink::memory::flush_memory_partition_to_disk(

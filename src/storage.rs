@@ -321,13 +321,25 @@ impl StorageImpl {
 
         let mut rows_to_insert = rows.to_vec();
 
-        for (idx, partition) in self.partition_list.iter().enumerate() {
-            if idx >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
+        for partition in self.partition_list.iter() {
+            if rows_to_insert.is_empty() {
                 break;
+            }
+
+            if partition.expired() {
+                continue;
             }
 
             let outdated = partition.insert_rows(&rows_to_insert)?;
             rows_to_insert = outdated;
+        }
+
+        if let Some(ts) = rows_to_insert
+            .iter()
+            .map(|r| r.data_point().timestamp)
+            .min()
+        {
+            return Err(TsinkError::OutOfRetention { timestamp: ts });
         }
 
         Ok(())
@@ -375,6 +387,7 @@ impl StorageImpl {
                 self.wal.clone(),
                 self.partition_duration,
                 self.timestamp_precision,
+                self.retention,
             ));
 
             // Store reference to memory partition
@@ -388,31 +401,37 @@ impl StorageImpl {
         Ok(())
     }
 
+    fn active_partition_count(&self) -> usize {
+        self.partition_list
+            .iter()
+            .filter(|p| p.active() && !p.expired())
+            .count()
+    }
+
     fn ensure_active_head(&self) -> Result<()> {
-        if let Some(head) = self.partition_list.get_head()
-            && head.active()
-        {
+        if self.active_partition_count() >= WRITABLE_PARTITIONS_NUM {
             return Ok(());
         }
 
         let _guard = self.partition_creation_lock.lock();
 
-        if let Some(head) = self.partition_list.get_head()
-            && head.active()
-        {
-            return Ok(());
+        let mut created = 0usize;
+        while self.active_partition_count() < WRITABLE_PARTITIONS_NUM {
+            self.new_partition(None)?;
+            created += 1;
         }
 
-        // Need to create a new partition
-        self.new_partition(None)?;
-
-        // Trigger flush in background
-        let storage = self.clone_refs();
-        thread::spawn(move || {
-            if let Err(e) = storage.flush_partitions() {
-                error!("Failed to flush partitions: {}", e);
+        if created > 0 {
+            // Trigger flush in background to free older partitions
+            if self.data_path.is_some() {
+                let storage = self.clone_refs();
+                thread::spawn(move || {
+                    if let Err(e) = storage.flush_partitions() {
+                        error!("Failed to flush partitions: {}", e);
+                    }
+                });
             }
-        });
+        }
 
         Ok(())
     }
@@ -428,7 +447,7 @@ impl StorageImpl {
             }
 
             // Check if it's a memory partition that needs flushing
-            if partition.min_timestamp() == 0 {
+            if partition.size() == 0 {
                 continue;
             }
 
@@ -456,37 +475,60 @@ impl StorageImpl {
         Ok(())
     }
 
+    fn flush_all_partitions(&self) -> Result<()> {
+        let mut partitions_to_flush = Vec::new();
+
+        for partition in self.partition_list.iter() {
+            if partition.size() == 0 {
+                continue;
+            }
+
+            partitions_to_flush.push(partition);
+        }
+
+        for partition in partitions_to_flush {
+            if let Some(data_path) = &self.data_path {
+                let result = self.flush_memory_partition_to_disk(&partition, data_path);
+
+                if let Err(e) = result {
+                    error!("Failed to flush partition: {}", e);
+                    continue;
+                }
+            } else {
+                // In-memory mode - just remove old partitions
+                self.partition_list.remove(&partition)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn flush_memory_partition_to_disk(
         &self,
         partition: &SharedPartition,
         data_path: &Path,
     ) -> Result<()> {
-        // Check if partition has data
-        if partition.min_timestamp() == 0 || partition.size() == 0 {
+        if partition.size() == 0 {
             return Ok(());
         }
 
-        // Find the memory partition
-        let memory_partitions = self.memory_partitions.lock();
-        let mem_partition = memory_partitions.iter().find(|p| {
-            let p_shared: SharedPartition = (*p).clone();
-            Arc::ptr_eq(&p_shared, partition)
-        });
+        let dir_name = format!(
+            "p-{}-{}",
+            partition.min_timestamp(),
+            partition.max_timestamp()
+        );
+        let dir_path = data_path.join(dir_name);
 
-        if let Some(mem_partition) = mem_partition {
-            let dir_name = format!(
-                "p-{}-{}",
-                partition.min_timestamp(),
-                partition.max_timestamp()
-            );
-            let dir_path = data_path.join(dir_name);
-
-            // Use the memory partition's flush_to_disk method
-            let disk_partition = mem_partition.flush_to_disk(&dir_path, self.retention)?;
-
-            // Swap in partition list
-            self.partition_list
-                .swap(partition, Arc::new(disk_partition) as SharedPartition)?;
+        match partition.flush_to_disk()? {
+            Some((data, meta)) => {
+                let disk_partition =
+                    crate::disk::DiskPartition::create(&dir_path, meta, data, self.retention)?;
+                self.partition_list
+                    .swap(partition, Arc::new(disk_partition) as SharedPartition)?;
+            }
+            None => {
+                // Already on disk, nothing to do
+            }
         }
 
         Ok(())
@@ -550,13 +592,25 @@ impl Storage for StorageImpl {
 
             let mut rows_to_insert = rows.to_vec();
 
-            for (idx, partition) in self.partition_list.iter().enumerate() {
-                if idx >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
+            for partition in self.partition_list.iter() {
+                if rows_to_insert.is_empty() {
                     break;
+                }
+
+                if partition.expired() {
+                    continue;
                 }
 
                 let outdated = partition.insert_rows(&rows_to_insert)?;
                 rows_to_insert = outdated;
+            }
+
+            if let Some(ts) = rows_to_insert
+                .iter()
+                .map(|r| r.data_point().timestamp)
+                .min()
+            {
+                return Err(TsinkError::OutOfRetention { timestamp: ts });
             }
 
             Ok(())
@@ -591,30 +645,18 @@ impl Storage for StorageImpl {
         let mut all_points = Vec::new();
 
         for partition in self.partition_list.iter() {
-            // Skip only if partition is truly empty (size == 0)
-            if partition.size() == 0 {
-                continue; // Skip empty partition
-            }
-
-            if partition.max_timestamp() < start {
-                break; // No need to continue
-            }
-
-            if partition.min_timestamp() > end {
+            if partition.size() == 0 || partition.expired() {
                 continue;
             }
 
             match partition.select_data_points(metric, labels, start, end) {
-                Ok(points) => {
-                    // Prepend to maintain order (newest partition first)
-                    let mut combined = points;
-                    combined.append(&mut all_points);
-                    all_points = combined;
-                }
+                Ok(points) => all_points.extend(points),
                 Err(TsinkError::NoDataPoints { .. }) => continue,
                 Err(e) => return Err(e),
             }
         }
+
+        all_points.sort_by_key(|p| p.timestamp);
 
         Ok(all_points)
     }
@@ -701,6 +743,10 @@ impl Storage for StorageImpl {
                 continue;
             }
 
+            if partition.expired() {
+                continue;
+            }
+
             // Perform selection
             match partition.select_all_labels(metric, start, end) {
                 Ok(partition_results) => {
@@ -745,7 +791,7 @@ impl Storage for StorageImpl {
         }
 
         // Flush all partitions
-        self.flush_partitions()?;
+        self.flush_all_partitions()?;
 
         // Remove expired partitions
         self.remove_expired_partitions()?;

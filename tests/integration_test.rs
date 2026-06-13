@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision, TsinkError};
 
@@ -198,4 +199,131 @@ fn test_concurrent_writes() {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let expected: Vec<f64> = (0..10).map(|i| i as f64).collect();
     assert_eq!(values, expected);
+}
+
+#[test]
+fn test_select_returns_sorted_points() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(2))
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let rows = vec![
+        Row::new("sorted_metric", DataPoint::new(5, 1.0)),
+        Row::new("sorted_metric", DataPoint::new(1, 2.0)),
+        Row::new("sorted_metric", DataPoint::new(3, 3.0)),
+    ];
+
+    storage.insert_rows(&rows).unwrap();
+
+    let points = storage
+        .select("sorted_metric", &[], 0, 10)
+        .expect("select should succeed");
+
+    assert_eq!(points.len(), 3);
+    assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
+}
+
+#[test]
+fn test_persistence_with_existing_partitions_still_allows_writes() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create initial on-disk partitions
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_partition_duration(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[
+                Row::new("persist", DataPoint::new(0, 1.0)),
+                Row::new("persist", DataPoint::new(2, 2.0)),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    // Reopen; there will be disk partitions already loaded
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    // Should still accept new writes
+    storage
+        .insert_rows(&[Row::new("persist", DataPoint::new(3, 3.0))])
+        .unwrap();
+
+    // Verify the new point is visible before close
+    let mut live_points = storage.select("persist", &[], 0, 10).unwrap();
+    live_points.sort_by_key(|p| p.timestamp);
+    assert!(
+        live_points
+            .iter()
+            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+        "newly inserted point should be present before close"
+    );
+    storage.close().unwrap();
+
+    // Reopen and ensure the new point is still present
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let points = storage.select("persist", &[], 0, 10).unwrap();
+    assert!(
+        points
+            .iter()
+            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+        "newly inserted point should survive close/reopen even with existing disk partitions"
+    );
+}
+
+#[test]
+fn test_select_across_multiple_partitions_persistent() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(2))
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    // Insert out-of-order but spanning multiple partitions
+    let rows = vec![
+        Row::new("multi_part", DataPoint::new(10, 1.0)),
+        Row::new("multi_part", DataPoint::new(13, 2.0)),
+        Row::new("multi_part", DataPoint::new(11, 3.0)),
+    ];
+    storage.insert_rows(&rows).unwrap();
+    storage.close().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(2))
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    let points = storage.select("multi_part", &[], 0, 20).unwrap();
+    assert_eq!(
+        points.len(),
+        3,
+        "should read all points across partitions, got {:?}",
+        points
+    );
+    assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
 }

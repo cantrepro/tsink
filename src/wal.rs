@@ -220,6 +220,7 @@ impl Wal for DiskWal {
     fn flush(&self) -> Result<()> {
         if let Some(ref mut segment) = *self.current_segment.lock() {
             segment.writer.flush()?;
+            segment.writer.get_ref().sync_all()?;
         }
         Ok(())
     }
@@ -229,6 +230,7 @@ impl Wal for DiskWal {
         let mut current = self.current_segment.lock();
         if let Some(ref mut segment) = *current {
             segment.writer.flush()?;
+            segment.writer.get_ref().sync_all()?;
         }
 
         // Force creation of new segment on next write

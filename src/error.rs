@@ -98,6 +98,9 @@ pub enum TsinkError {
     #[error("Checksum mismatch: expected {expected:?}, got {actual:?}")]
     ChecksumMismatch { expected: Vec<u8>, actual: Vec<u8> },
 
+    #[error("Data point with timestamp {timestamp} is outside the retention window")]
+    OutOfRetention { timestamp: i64 },
+
     #[error("Other error: {0}")]
     Other(String),
 }

@@ -4,6 +4,7 @@ use crate::disk::{DiskMetric, DiskPartition, PartitionMeta, encode_metric_key};
 use crate::encoding::GorillaEncoder;
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::partition::{Partition, SharedPartition};
+use crate::time::{duration_to_units, now_in_precision};
 use crate::wal::Wal;
 use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
 use dashmap::DashMap;
@@ -33,6 +34,12 @@ pub struct MemoryPartition {
     /// Timestamp precision
     #[allow(dead_code)]
     timestamp_precision: TimestampPrecision,
+    /// Retention configuration
+    retention: Duration,
+    /// Retention window in timestamp units
+    retention_units: i64,
+    /// Creation time to gate retention on wall clock
+    created_at: SystemTime,
     /// Flag to ensure min_t is set only once
     min_t_set: AtomicUsize,
 }
@@ -43,13 +50,11 @@ impl MemoryPartition {
         wal: Arc<dyn Wal>,
         partition_duration: Duration,
         timestamp_precision: TimestampPrecision,
+        retention: Duration,
     ) -> Self {
-        let duration = match timestamp_precision {
-            TimestampPrecision::Nanoseconds => partition_duration.as_nanos() as i64,
-            TimestampPrecision::Microseconds => partition_duration.as_micros() as i64,
-            TimestampPrecision::Milliseconds => partition_duration.as_millis() as i64,
-            TimestampPrecision::Seconds => partition_duration.as_secs() as i64,
-        };
+        let duration = duration_to_units(partition_duration, timestamp_precision);
+        let retention_units = duration_to_units(retention, timestamp_precision);
+        let created_at = SystemTime::now();
 
         Self {
             num_points: AtomicUsize::new(0),
@@ -59,6 +64,9 @@ impl MemoryPartition {
             wal,
             partition_duration: duration,
             timestamp_precision,
+            retention,
+            retention_units,
+            created_at,
             min_t_set: AtomicUsize::new(0),
         }
     }
@@ -143,19 +151,21 @@ impl MemoryPartition {
             );
         }
 
+        data_file.sync_all()?;
+
         // Create metadata
         let meta = PartitionMeta {
             min_timestamp: Partition::min_timestamp(self),
             max_timestamp: Partition::max_timestamp(self),
             num_data_points: Partition::size(self),
             metrics: metrics_map,
-            created_at: SystemTime::now(),
+            timestamp_precision: self.timestamp_precision,
+            created_at: self.created_at,
         };
 
-        // Write metadata
+        // Write metadata atomically
         let meta_path = dir_path.join(crate::disk::META_FILE_NAME);
-        let meta_file = fs::File::create(&meta_path)?;
-        serde_json::to_writer_pretty(meta_file, &meta)?;
+        crate::disk::write_meta_atomic(&meta_path, &meta)?;
 
         // Open the created partition
         DiskPartition::open(dir_path, retention)
@@ -172,7 +182,7 @@ impl crate::partition::Partition for MemoryPartition {
         let mut normalized_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let timestamp = if row.data_point().timestamp == 0 {
-                let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let now = now_in_precision(self.timestamp_precision);
                 tracing::warn!(
                     "Replacing zero timestamp with current time {} for metric {}",
                     now,
@@ -190,29 +200,53 @@ impl crate::partition::Partition for MemoryPartition {
             ));
         }
 
-        // Write to WAL first using normalized rows
-        self.wal.append_rows(&normalized_rows)?;
-
+        let mut accepted_rows = Vec::new();
         let mut outdated_rows = Vec::new();
         let mut max_timestamp = i64::MIN;
-        let mut rows_added = 0usize;
+
+        let mut provisional_min = self.min_t.load(Ordering::Acquire);
 
         for row in &normalized_rows {
             let timestamp = row.data_point().timestamp;
-            let current_min = self.min_t.load(Ordering::Acquire);
-            if current_min != 0 && timestamp < current_min {
-                let diff = current_min.saturating_sub(timestamp);
+            if provisional_min != 0 && timestamp < provisional_min {
+                let diff = provisional_min.saturating_sub(timestamp);
                 if diff > self.partition_duration {
                     outdated_rows.push(row.clone()); // return normalized row
                     continue;
                 }
             }
 
-            self.update_min_timestamp(timestamp);
-
-            if timestamp > max_timestamp {
-                max_timestamp = timestamp;
+            if provisional_min == 0 {
+                provisional_min = timestamp;
+            } else {
+                provisional_min = provisional_min.min(timestamp);
             }
+
+            max_timestamp = max_timestamp.max(timestamp);
+            accepted_rows.push(row.clone());
+        }
+
+        if accepted_rows.is_empty() {
+            if !outdated_rows.is_empty() {
+                tracing::debug!(
+                    count = outdated_rows.len(),
+                    partition_min = self.min_t.load(Ordering::Relaxed),
+                    partition_duration = self.partition_duration,
+                    "memory_partition_outdated_rows"
+                );
+            }
+            return Ok(outdated_rows);
+        }
+
+        // Write only the rows this partition will actually store to WAL
+        self.wal.append_rows(&accepted_rows)?;
+
+        let mut rows_added = 0usize;
+
+        for row in &accepted_rows {
+            let timestamp = row.data_point().timestamp;
+
+            self.update_min_timestamp(timestamp);
 
             // Get or create metric
             let metric_name = marshal_metric_name(row.metric(), row.labels());
@@ -334,7 +368,25 @@ impl crate::partition::Partition for MemoryPartition {
     }
 
     fn expired(&self) -> bool {
-        false // Memory partitions don't expire
+        if self.retention_units <= 0 {
+            return false;
+        }
+
+        let max_ts = self.max_timestamp();
+        if max_ts == 0 {
+            return false;
+        }
+
+        let cutoff =
+            now_in_precision(self.timestamp_precision).saturating_sub(self.retention_units);
+        let timestamp_expired = max_ts < cutoff;
+        let age_expired = self
+            .created_at
+            .elapsed()
+            .map(|elapsed| elapsed > self.retention)
+            .unwrap_or(false);
+
+        timestamp_expired && age_expired
     }
 
     fn clean(&self) -> Result<()> {
@@ -383,7 +435,8 @@ impl crate::partition::Partition for MemoryPartition {
             max_timestamp: self.max_timestamp(),
             num_data_points: self.size(),
             metrics: metrics_map,
-            created_at: SystemTime::now(),
+            timestamp_precision: self.timestamp_precision,
+            created_at: self.created_at,
         };
 
         Ok(Some((data, meta)))

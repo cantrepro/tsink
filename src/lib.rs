@@ -14,6 +14,7 @@ pub mod memory;
 pub mod mmap;
 pub mod partition;
 pub mod storage;
+pub(crate) mod time;
 pub mod wal;
 
 pub use error::{Result, TsinkError};

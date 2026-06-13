@@ -10,7 +10,12 @@ use tsink::{DataPoint, Label, Row, TimestampPrecision};
 
 fn new_memory_partition(duration: Duration, precision: TimestampPrecision) -> SharedPartition {
     let wal: Arc<dyn Wal> = Arc::new(NopWal);
-    Arc::new(MemoryPartition::new(wal, duration, precision))
+    Arc::new(MemoryPartition::new(
+        wal,
+        duration,
+        precision,
+        Duration::from_secs(24 * 3600),
+    ))
 }
 
 #[test]

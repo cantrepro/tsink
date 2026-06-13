@@ -79,3 +79,24 @@ fn disk_wal_persists_rotates_and_recovers() {
     wal_trait.refresh().unwrap();
     assert!(wal_files(temp_dir.path()).is_empty());
 }
+
+#[test]
+fn disk_wal_flush_with_buffer_persists() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = DiskWal::new(temp_dir.path(), 4096).unwrap();
+    let wal_trait: Arc<dyn Wal> = wal.clone();
+
+    let batch = vec![Row::new("buffered_metric", DataPoint::new(1, 1.5))];
+    wal_trait.append_rows(&batch).unwrap();
+    wal_trait.flush().unwrap();
+
+    // Ensure a wal file was written and can be recovered
+    let files = wal_files(temp_dir.path());
+    assert_eq!(files.len(), 1, "wal segment should exist after flush");
+
+    let recovered = WalReader::new(temp_dir.path()).unwrap().read_all().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].metric(), "buffered_metric");
+    assert_eq!(recovered[0].data_point().timestamp, 1);
+    assert!((recovered[0].data_point().value - 1.5).abs() < 1e-12);
+}

@@ -3,12 +3,13 @@
 use crate::encoding::GorillaDecoder;
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::mmap::PlatformMmap;
-use crate::{DataPoint, Label, Result, Row, TsinkError};
+use crate::time::{duration_to_units, now_in_precision};
+use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{Cursor, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -22,6 +23,8 @@ pub struct PartitionMeta {
     pub max_timestamp: i64,
     pub num_data_points: usize,
     pub metrics: HashMap<String, DiskMetric>,
+    #[serde(default = "default_timestamp_precision")]
+    pub timestamp_precision: TimestampPrecision,
     pub created_at: SystemTime,
 }
 
@@ -43,6 +46,8 @@ pub struct DiskPartition {
     meta: PartitionMeta,
     mapped_file: PlatformMmap,
     retention: Duration,
+    timestamp_precision: TimestampPrecision,
+    retention_units: i64,
 }
 
 impl DiskPartition {
@@ -137,12 +142,16 @@ impl DiskPartition {
 
         let file_len = data_file.metadata()?.len() as usize;
         let mapped_file = PlatformMmap::new_readonly(data_file, file_len)?;
+        let timestamp_precision = meta.timestamp_precision;
+        let retention_units = duration_to_units(retention, timestamp_precision);
 
         Ok(Self {
             dir_path: dir_path.to_path_buf(),
             meta,
             mapped_file,
             retention,
+            timestamp_precision,
+            retention_units,
         })
     }
 
@@ -160,12 +169,15 @@ impl DiskPartition {
 
         // Write data file
         let data_path = dir_path.join(DATA_FILE_NAME);
-        fs::write(&data_path, &data)?;
+        {
+            let mut file = File::create(&data_path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+        }
 
         // Write metadata file (write last to indicate valid partition)
         let meta_path = dir_path.join(META_FILE_NAME);
-        let meta_file = File::create(&meta_path)?;
-        serde_json::to_writer_pretty(meta_file, &meta)?;
+        write_meta_atomic(&meta_path, &meta)?;
 
         // Open the created partition
         Self::open(dir_path, retention)
@@ -270,11 +282,21 @@ impl crate::partition::Partition for DiskPartition {
     }
 
     fn expired(&self) -> bool {
-        if let Ok(elapsed) = self.meta.created_at.elapsed() {
-            elapsed > self.retention
-        } else {
-            false
+        if self.retention_units <= 0 {
+            return false;
         }
+
+        let cutoff =
+            now_in_precision(self.timestamp_precision).saturating_sub(self.retention_units);
+        let timestamp_expired = self.meta.max_timestamp < cutoff;
+        let age_expired = self
+            .meta
+            .created_at
+            .elapsed()
+            .map(|elapsed| elapsed > self.retention)
+            .unwrap_or(false);
+
+        timestamp_expired && age_expired
     }
 
     fn clean(&self) -> Result<()> {
@@ -320,4 +342,17 @@ pub(crate) fn decode_metric_key(key: &str) -> Vec<u8> {
 
 const fn default_encoded_size() -> u64 {
     0
+}
+
+const fn default_timestamp_precision() -> TimestampPrecision {
+    TimestampPrecision::Nanoseconds
+}
+
+pub(crate) fn write_meta_atomic(path: &Path, meta: &PartitionMeta) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let file = File::create(&tmp)?;
+    serde_json::to_writer_pretty(&file, meta)?;
+    file.sync_all()?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
