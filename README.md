@@ -4,8 +4,8 @@
 
 **A high-performance embedded time-series database for Rust**
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/h2337/tsink/refs/heads/master/logo.svg">
+<p align="right">
+  <img src="https://raw.githubusercontent.com/h2337/tsink/refs/heads/master/logo.svg" width="250" height="250">
 </p>
 
 </div>
