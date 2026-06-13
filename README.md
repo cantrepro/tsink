@@ -712,14 +712,14 @@ let storage = StorageBuilder::new()
     .with_data_path("/var/lib/tsink")
     .with_timestamp_precision(TimestampPrecision::Milliseconds)
     .with_retention(Duration::from_secs(30 * 24 * 3600))        // 30 days
-    .with_partition_duration(Duration::from_secs(6 * 3600))      // 6-hour partitions
+    .with_partition_duration(Duration::from_secs(6 * 3600))     // 6-hour partitions
     .with_chunk_points(4096)
     .with_max_writers(16)
     .with_write_timeout(Duration::from_secs(60))
     .with_memory_limit(1024 * 1024 * 1024)                      // 1 GB
     .with_cardinality_limit(500_000)
     .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1)))
-    .with_wal_buffer_size(16384)                                 // 16 KB
+    .with_wal_buffer_size(16384)                                // 16 KB
     .build()?;
 ```
 
@@ -742,11 +742,11 @@ cargo run --example comprehensive
 ## Benchmarks and Tests
 
 ```bash
-cargo test                         # Run all tests
-cargo test --features promql       # Include PromQL tests
+cargo test                          # Run all tests
+cargo test --features promql        # Include PromQL tests
 cargo test --features async-storage # Include async tests
 
-cargo bench                        # Run all benchmarks
+cargo bench                         # Run all benchmarks
 cargo bench --bench storage_benchmarks -- '^concurrent_rw/' --quick --noplot
 ```
 
