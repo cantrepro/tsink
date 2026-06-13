@@ -12,6 +12,8 @@ Every HTTP request carries the tenant ID in a header:
 x-tsink-tenant: <tenant-id>
 ```
 
+Prometheus Remote Write and Remote Read also accept `X-Scope-OrgID` as a compatibility alias. If both headers are present they must match.
+
 If the header is absent the request is attributed to the built-in `"default"` tenant. Tenant IDs are validated on each request: they must be non-empty, not exceed the maximum label value length, and contain no control characters.
 
 ### Protocol-specific identification
@@ -20,7 +22,7 @@ Sources that do not use HTTP headers resolve a tenant statically:
 
 | Source | How the tenant is set |
 |---|---|
-| Prometheus Remote Write / Remote Read | `X-Scope-OrgID` or `x-tsink-tenant` header |
+| Prometheus Remote Write / Remote Read | `X-Scope-OrgID` or `x-tsink-tenant` header (must match if both are set) |
 | StatsD (UDP) | `--statsd-tenant <id>` server flag (default: `"default"`) |
 | Graphite (TCP) | `--graphite-tenant <id>` server flag (default: `"default"`) |
 | Edge-sync upstream | `--edge-sync-static-tenant <id>` rewrites all tenant labels before forwarding |
@@ -337,6 +339,6 @@ curl 'http://127.0.0.1:9201/api/v1/series?match[]=http_requests_total' \
 
 ## Clustering considerations
 
-In a cluster deployment, tenant-scoped queries are fanned out to the relevant shards with the `__tsink_tenant__` matcher injected automatically. The `"default"` tenant skips the matcher injection during fanout to avoid double-scoping unlabeled legacy series.
+In a cluster deployment, tenant-scoped queries are fanned out to the relevant shards with the `__tsink_tenant__` matcher injected automatically. The `"default"` tenant keeps that scoped fanout and adds a second unlabeled-only fallback selector so legacy series remain visible without widening the primary read across every tenant.
 
 The hotspot tracker accumulates per-tenant write skew counters. Tenants with a write skew factor exceeding 4× the cluster average are flagged in the cluster snapshot, which can inform rebalancing decisions. See the [clustering internals](clustering-internals.md) guide for details.

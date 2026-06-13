@@ -1,10 +1,41 @@
 use super::super::*;
+use crate::cluster::query::ReadFanoutResponse;
+
+async fn fanout_select_series_union(
+    storage: &Arc<dyn Storage>,
+    cluster_context: &ClusterRequestContext,
+    read_fanout: &ReadFanoutExecutor,
+    selections: &[SeriesSelection],
+    ring_version: u64,
+) -> Result<ReadFanoutResponse<Vec<MetricSeries>>, ReadFanoutError> {
+    let mut metadata = default_read_response_metadata(read_fanout);
+    let mut merged = BTreeSet::new();
+
+    for selection in selections {
+        let response = read_fanout
+            .select_series_with_ring_version_detailed(
+                storage,
+                &cluster_context.rpc_client,
+                selection,
+                ring_version,
+            )
+            .await?;
+        merge_read_response_metadata(&mut metadata, &response.metadata);
+        merged.extend(response.value);
+    }
+
+    Ok(ReadFanoutResponse {
+        value: merged.into_iter().collect(),
+        metadata,
+    })
+}
 
 pub(crate) async fn handle_series(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
@@ -16,6 +47,7 @@ pub(crate) async fn handle_series(
         request,
         cluster_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         read_admission,
     )
@@ -27,6 +59,7 @@ pub(crate) async fn handle_series_with_admission(
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
@@ -37,6 +70,7 @@ pub(crate) async fn handle_series_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -58,9 +92,10 @@ pub(crate) async fn handle_series_with_admission(
         );
         return promql_error_response("bad_data", &err);
     }
-    let _tenant_request = match tenant_plan.admit(
+    let _tenant_request = match tenant_plan.admit_with_usage(
         tenant::TenantAdmissionSurface::Metadata,
         matcher_count.max(1),
+        usage_accounting,
     ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
@@ -116,19 +151,19 @@ pub(crate) async fn handle_series_with_admission(
                     )
                 }
             };
-            let selection = match tenant::fanout_selection_for_tenant(&selection, &tenant_id) {
-                Ok(selection) => selection,
+            let selections = match tenant::read_selections_for_tenant(&selection, &tenant_id) {
+                Ok(selections) => selections,
                 Err(err) => return promql_error_response("bad_data", &err),
             };
 
-            let series_response = match read_fanout
-                .select_series_with_ring_version_detailed(
-                    storage,
-                    &cluster_context.rpc_client,
-                    &selection,
-                    ring_version,
-                )
-                .await
+            let series_response = match fanout_select_series_union(
+                storage,
+                cluster_context,
+                &read_fanout,
+                &selections,
+                ring_version,
+            )
+            .await
             {
                 Ok(response) => response,
                 Err(err) => return fanout_error_response(err),
@@ -243,6 +278,7 @@ pub(crate) async fn handle_labels(
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
@@ -254,6 +290,7 @@ pub(crate) async fn handle_labels(
         request,
         cluster_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         read_admission,
     )
@@ -265,6 +302,7 @@ pub(crate) async fn handle_labels_with_admission(
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
@@ -275,6 +313,7 @@ pub(crate) async fn handle_labels_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -282,7 +321,11 @@ pub(crate) async fn handle_labels_with_admission(
         Ok(tenant_request) => tenant_request,
         Err(response) => return response,
     };
-    let _tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Metadata, 1) {
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Metadata,
+        1,
+        usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };
@@ -319,19 +362,19 @@ pub(crate) async fn handle_labels_with_admission(
             Ok(fanout) => fanout,
             Err(err) => return promql_error_response("bad_data", &err),
         };
-        let selection =
-            match tenant::fanout_selection_for_tenant(&SeriesSelection::new(), &tenant_id) {
-                Ok(selection) => selection,
+        let selections =
+            match tenant::read_selections_for_tenant(&SeriesSelection::new(), &tenant_id) {
+                Ok(selections) => selections,
                 Err(err) => return promql_error_response("bad_data", &err),
             };
-        let series_response = match read_fanout
-            .select_series_with_ring_version_detailed(
-                storage,
-                &cluster_context.rpc_client,
-                &selection,
-                ring_version,
-            )
-            .await
+        let series_response = match fanout_select_series_union(
+            storage,
+            cluster_context,
+            &read_fanout,
+            &selections,
+            ring_version,
+        )
+        .await
         {
             Ok(series) => series,
             Err(err) => return fanout_error_response(err),
@@ -409,6 +452,7 @@ pub(crate) async fn handle_metadata(
     metadata_store: &Arc<MetricMetadataStore>,
     request: &HttpRequest,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
@@ -419,6 +463,7 @@ pub(crate) async fn handle_metadata(
         metadata_store,
         request,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         read_admission,
     )
@@ -429,6 +474,7 @@ pub(crate) async fn handle_metadata_with_admission(
     metadata_store: &Arc<MetricMetadataStore>,
     request: &HttpRequest,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
@@ -439,6 +485,7 @@ pub(crate) async fn handle_metadata_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -460,11 +507,14 @@ pub(crate) async fn handle_metadata_with_admission(
         Ok(limit) => limit,
         Err(response) => return response,
     };
-    let _tenant_request =
-        match tenant_plan.admit(tenant::TenantAdmissionSurface::Metadata, limit.max(1)) {
-            Ok(guard) => guard,
-            Err(err) => return err.to_http_response(),
-        };
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Metadata,
+        limit.max(1),
+        usage_accounting,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return err.to_http_response(),
+    };
     let _read_admission = match read_admission.admit_request(1).await {
         Ok(lease) => lease,
         Err(err) => {
@@ -508,33 +558,20 @@ pub(crate) async fn handle_label_values(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     label_name: &str,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
         Ok(controller) => controller,
         Err(err) => return text_response(500, &format!("read admission unavailable: {err}")),
     };
-    handle_label_values_with_admission(
-        storage,
-        request,
-        label_name,
-        cluster_context,
-        tenant_registry,
-        usage_accounting,
-        read_admission,
-    )
-    .await
+    handle_label_values_with_admission(storage, request, label_name, context, read_admission).await
 }
 
 pub(crate) async fn handle_label_values_with_admission(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     label_name: &str,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
     let started = Instant::now();
@@ -543,7 +580,8 @@ pub(crate) async fn handle_label_values_with_admission(
         Err(response) => return response,
     };
     let tenant_plan = match prepare_tenant_request(
-        tenant_registry,
+        context.tenant_registry,
+        context.managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -551,7 +589,11 @@ pub(crate) async fn handle_label_values_with_admission(
         Ok(tenant_request) => tenant_request,
         Err(response) => return response,
     };
-    let _tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Metadata, 1) {
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Metadata,
+        1,
+        context.usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };
@@ -566,8 +608,9 @@ pub(crate) async fn handle_label_values_with_admission(
             return read_admission_error_response(err);
         }
     };
-    if let Some(cluster_context) =
-        cluster_context.filter(|context| !context.runtime.local_reads_serve_global_queries)
+    if let Some(cluster_context) = context
+        .cluster_context
+        .filter(|context| !context.runtime.local_reads_serve_global_queries)
     {
         let ring_version = cluster_ring_version(Some(cluster_context));
         let read_fanout = match effective_read_fanout(cluster_context) {
@@ -588,19 +631,19 @@ pub(crate) async fn handle_label_values_with_admission(
             Ok(fanout) => fanout,
             Err(err) => return promql_error_response("bad_data", &err),
         };
-        let selection =
-            match tenant::fanout_selection_for_tenant(&SeriesSelection::new(), &tenant_id) {
-                Ok(selection) => selection,
+        let selections =
+            match tenant::read_selections_for_tenant(&SeriesSelection::new(), &tenant_id) {
+                Ok(selections) => selections,
                 Err(err) => return promql_error_response("bad_data", &err),
             };
-        let series_response = match read_fanout
-            .select_series_with_ring_version_detailed(
-                storage,
-                &cluster_context.rpc_client,
-                &selection,
-                ring_version,
-            )
-            .await
+        let series_response = match fanout_select_series_union(
+            storage,
+            cluster_context,
+            &read_fanout,
+            &selections,
+            ring_version,
+        )
+        .await
         {
             Ok(series) => series,
             Err(err) => return fanout_error_response(err),
@@ -625,7 +668,7 @@ pub(crate) async fn handle_label_values_with_admission(
         let result_units = values.len();
         record_query_pressure(&tenant_id, 1, result_units);
         record_query_usage(
-            usage_accounting,
+            context.usage_accounting,
             &tenant_id,
             "label_values",
             request.path_without_query(),
@@ -666,7 +709,7 @@ pub(crate) async fn handle_label_values_with_admission(
             let result_units = data.len();
             record_query_pressure(&tenant_id, 1, result_units);
             record_query_usage(
-                usage_accounting,
+                context.usage_accounting,
                 &tenant_id,
                 "label_values",
                 request.path_without_query(),

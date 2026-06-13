@@ -9,6 +9,7 @@ pub(crate) async fn handle_remote_write(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let write_admission = match admission::global_public_write_admission() {
@@ -23,6 +24,7 @@ pub(crate) async fn handle_remote_write(
         cluster_context,
         edge_sync_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         write_admission,
     )
@@ -38,6 +40,7 @@ pub(crate) async fn handle_remote_write_with_admission(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     write_admission: &WriteAdmissionController,
 ) -> HttpResponse {
@@ -48,6 +51,7 @@ pub(crate) async fn handle_remote_write_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,
@@ -113,11 +117,14 @@ pub(crate) async fn handle_remote_write_with_admission(
         );
         return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
     }
-    let tenant_request =
-        match tenant_plan.admit(tenant::TenantAdmissionSurface::Ingest, ingest_units) {
-            Ok(guard) => guard,
-            Err(err) => return err.to_http_response(),
-        };
+    let tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Ingest,
+        ingest_units,
+        usage_accounting,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return err.to_http_response(),
+    };
     let request_slot = match write_admission.acquire_request_slot().await {
         Ok(lease) => lease,
         Err(err) => {
@@ -235,6 +242,7 @@ pub(crate) async fn handle_otlp_metrics(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let write_admission = match admission::global_public_write_admission() {
@@ -250,6 +258,7 @@ pub(crate) async fn handle_otlp_metrics(
         cluster_context,
         edge_sync_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         write_admission,
     )
@@ -266,6 +275,7 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     write_admission: &WriteAdmissionController,
 ) -> HttpResponse {
@@ -295,6 +305,7 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,
@@ -371,11 +382,14 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
         );
         return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
     }
-    let tenant_request =
-        match tenant_plan.admit(tenant::TenantAdmissionSurface::Ingest, ingest_units) {
-            Ok(guard) => guard,
-            Err(err) => return err.to_http_response(),
-        };
+    let tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Ingest,
+        ingest_units,
+        usage_accounting,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return err.to_http_response(),
+    };
     let request_slot = match write_admission.acquire_request_slot().await {
         Ok(lease) => lease,
         Err(err) => {
@@ -487,6 +501,7 @@ pub(crate) async fn handle_prometheus_import(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let write_admission = match admission::global_public_write_admission() {
@@ -501,6 +516,7 @@ pub(crate) async fn handle_prometheus_import(
         cluster_context,
         edge_sync_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         write_admission,
     )
@@ -516,6 +532,7 @@ pub(crate) async fn handle_prometheus_import_with_admission(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     write_admission: &WriteAdmissionController,
 ) -> HttpResponse {
@@ -526,6 +543,7 @@ pub(crate) async fn handle_prometheus_import_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,
@@ -584,8 +602,11 @@ pub(crate) async fn handle_prometheus_import_with_admission(
         );
         return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
     }
-    let tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Ingest, rows.len())
-    {
+    let tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Ingest,
+        rows.len(),
+        usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };

@@ -138,6 +138,7 @@ pub(crate) async fn handle_admin_delete_series(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        None,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,

@@ -109,6 +109,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(response.status, 200);
@@ -172,6 +173,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
             assert_eq!(response.status, 200);
@@ -188,6 +190,7 @@ mod tests {
                 )]),
                 body: Vec::new(),
             },
+            None,
             None,
             None,
         )
@@ -224,9 +227,7 @@ mod tests {
                 body: Vec::new(),
             },
             TimestampPrecision::Milliseconds,
-            None,
-            None,
-            None,
+            super::super::PublicReadContext::new(None, None, None, None),
         )
         .await;
         assert_eq!(response.status, 200);

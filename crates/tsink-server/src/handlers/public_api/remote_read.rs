@@ -1,10 +1,41 @@
 use super::super::*;
+use crate::cluster::query::ReadFanoutResponse;
+
+async fn fanout_select_series_union(
+    storage: &Arc<dyn Storage>,
+    cluster_context: &ClusterRequestContext,
+    read_fanout: &ReadFanoutExecutor,
+    selections: &[SeriesSelection],
+    ring_version: u64,
+) -> Result<ReadFanoutResponse<Vec<MetricSeries>>, ReadFanoutError> {
+    let mut metadata = default_read_response_metadata(read_fanout);
+    let mut merged = BTreeSet::new();
+
+    for selection in selections {
+        let response = read_fanout
+            .select_series_with_ring_version_detailed(
+                storage,
+                &cluster_context.rpc_client,
+                selection,
+                ring_version,
+            )
+            .await?;
+        merge_read_response_metadata(&mut metadata, &response.metadata);
+        merged.extend(response.value);
+    }
+
+    Ok(ReadFanoutResponse {
+        value: merged.into_iter().collect(),
+        metadata,
+    })
+}
 
 pub(crate) async fn handle_remote_read(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
@@ -16,6 +47,7 @@ pub(crate) async fn handle_remote_read(
         request,
         cluster_context,
         tenant_registry,
+        managed_control_plane,
         usage_accounting,
         read_admission,
     )
@@ -27,6 +59,7 @@ pub(crate) async fn handle_remote_read_with_admission(
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
@@ -37,6 +70,7 @@ pub(crate) async fn handle_remote_read_with_admission(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -67,9 +101,10 @@ pub(crate) async fn handle_remote_read_with_admission(
         );
         return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
     }
-    let _tenant_request = match tenant_plan.admit(
+    let _tenant_request = match tenant_plan.admit_with_usage(
         tenant::TenantAdmissionSurface::Query,
         read_query_count.max(1),
+        usage_accounting,
     ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
@@ -232,25 +267,25 @@ async fn execute_query_distributed(
     tenant_id: &str,
 ) -> Result<(QueryResult, ReadFanoutResponseMetadata), ReadFanoutError> {
     let ring_version = cluster_ring_version(Some(cluster_context));
-    let selection = series_selection_from_remote_matchers(&query.matchers)
+    let selections = series_selection_from_remote_matchers(&query.matchers)
         .map_err(|err| ReadFanoutError::InvalidRequest {
             message: format!("invalid remote-read matchers: {err}"),
         })
         .and_then(|selection| {
-            tenant::fanout_selection_for_tenant(&selection, tenant_id).map_err(|err| {
+            tenant::read_selections_for_tenant(&selection, tenant_id).map_err(|err| {
                 ReadFanoutError::InvalidRequest {
                     message: format!("invalid remote-read matchers: {err}"),
                 }
             })
         })?;
-    let series_response = read_fanout
-        .select_series_with_ring_version_detailed(
-            storage,
-            &cluster_context.rpc_client,
-            &selection,
-            ring_version,
-        )
-        .await?;
+    let series_response = fanout_select_series_union(
+        storage,
+        cluster_context,
+        read_fanout,
+        &selections,
+        ring_version,
+    )
+    .await?;
     let mut read_metadata = series_response.metadata.clone();
 
     let end = query.end_timestamp_ms.saturating_add(1);

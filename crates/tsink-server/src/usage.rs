@@ -487,7 +487,6 @@ impl UsageAccounting {
             })
     }
 
-    #[cfg(test)]
     pub fn latest_storage_snapshot_for(&self, tenant_id: &str) -> Option<UsageStorageSnapshot> {
         let state = self
             .state

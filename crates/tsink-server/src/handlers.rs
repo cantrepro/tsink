@@ -339,6 +339,30 @@ pub(crate) struct AppContext<'a> {
     pub managed_control_plane: Option<&'a ManagedControlPlane>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PublicReadContext<'a> {
+    pub cluster_context: Option<&'a ClusterRequestContext>,
+    pub tenant_registry: Option<&'a tenant::TenantRegistry>,
+    pub managed_control_plane: Option<&'a ManagedControlPlane>,
+    pub usage_accounting: Option<&'a UsageAccounting>,
+}
+
+impl<'a> PublicReadContext<'a> {
+    pub(crate) fn new(
+        cluster_context: Option<&'a ClusterRequestContext>,
+        tenant_registry: Option<&'a tenant::TenantRegistry>,
+        managed_control_plane: Option<&'a ManagedControlPlane>,
+        usage_accounting: Option<&'a UsageAccounting>,
+    ) -> Self {
+        Self {
+            cluster_context,
+            tenant_registry,
+            managed_control_plane,
+            usage_accounting,
+        }
+    }
+}
+
 pub(crate) struct RequestContext<'a> {
     pub request: HttpRequest,
     pub server_start: Instant,
@@ -884,12 +908,19 @@ fn tenant_runtime_status_json(snapshot: &tenant::TenantRuntimeStatusSnapshot) ->
 
 fn prepare_tenant_request(
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     request: &HttpRequest,
     tenant_id: &str,
     access: tenant::TenantAccessScope,
 ) -> Result<tenant::TenantRequestPlan, HttpResponse> {
-    tenant::prepare_request_plan(tenant_registry, request, tenant_id, access)
-        .map_err(|err| err.to_http_response())
+    tenant::prepare_request_plan(
+        tenant_registry,
+        managed_control_plane,
+        request,
+        tenant_id,
+        access,
+    )
+    .map_err(|err| err.to_http_response())
 }
 
 #[cfg(test)]
@@ -2049,6 +2080,7 @@ async fn handle_tsdb_status(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -2056,7 +2088,11 @@ async fn handle_tsdb_status(
         Ok(tenant_request) => tenant_request,
         Err(response) => return response,
     };
-    let _tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Metadata, 1) {
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Metadata,
+        1,
+        usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };
@@ -5560,6 +5596,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
     exemplar_store: &Arc<ExemplarStore>,
     cluster_context: Option<&ClusterRequestContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     usage_accounting: Option<&UsageAccounting>,
     tenant_id: &str,
@@ -5573,6 +5610,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
     let ingest_units = envelope_row_units(&envelope);
     let tenant_plan = tenant::prepare_trusted_request_plan(
         tenant_registry,
+        managed_control_plane,
         tenant_id,
         tenant::TenantAccessScope::Write,
     )
@@ -5586,7 +5624,11 @@ pub(crate) async fn ingest_adapter_write_envelope(
         return Err(err);
     }
     let tenant_request = tenant_plan
-        .admit(tenant::TenantAdmissionSurface::Ingest, ingest_units)
+        .admit_with_usage(
+            tenant::TenantAdmissionSurface::Ingest,
+            ingest_units,
+            usage_accounting,
+        )
         .map_err(|err| http_response_message(err.to_http_response()))?;
     let request_slot = match write_admission.acquire_request_slot().await {
         Ok(lease) => lease,
@@ -5675,6 +5717,7 @@ async fn handle_influx_line_protocol(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
     let started = Instant::now();
@@ -5694,6 +5737,7 @@ async fn handle_influx_line_protocol(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,
@@ -5759,9 +5803,10 @@ async fn handle_influx_line_protocol(
         );
         return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
     }
-    let tenant_request = match tenant_plan.admit(
+    let tenant_request = match tenant_plan.admit_with_usage(
         tenant::TenantAdmissionSurface::Ingest,
         normalized.request_units,
+        usage_accounting,
     ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
@@ -6545,6 +6590,7 @@ mod tests {
         WriteRequest,
     };
     use crate::rules::{AlertRuleSpec, RuleGroupSpec, RuleSpec};
+    use crate::usage::{UsageCategory, UsageRecordInput};
     use serde::Deserialize;
     use std::cmp::Ordering as CmpOrdering;
     use std::collections::{BTreeMap, HashMap};
@@ -11042,6 +11088,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &write_admission,
         )
         .await;
@@ -12180,9 +12227,7 @@ mod tests {
             &storage,
             &request,
             TimestampPrecision::Milliseconds,
-            None,
-            None,
-            None,
+            PublicReadContext::new(None, None, None, None),
             &read_admission,
         )
         .await;
@@ -12211,9 +12256,16 @@ mod tests {
             body: Vec::new(),
         };
 
-        let response =
-            handle_series_with_admission(&storage, &request, None, None, None, &read_admission)
-                .await;
+        let response = handle_series_with_admission(
+            &storage,
+            &request,
+            None,
+            None,
+            None,
+            None,
+            &read_admission,
+        )
+        .await;
         assert_eq!(response.status, 413);
         assert_eq!(
             response_header(&response, READ_ERROR_CODE_HEADER),
@@ -12223,7 +12275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_header_isolates_write_read_and_query_apis() {
+    async fn tenant_headers_isolate_write_read_and_query_apis() {
         let storage = make_storage();
         let engine = make_engine(&storage);
 
@@ -12268,7 +12320,10 @@ mod tests {
             metadata: Vec::new(),
         };
 
-        for (write, tenant_id) in [(default_write, None), (team_b_write, Some("team-b"))] {
+        for (write, tenant_header) in [
+            (default_write, None),
+            (team_b_write, Some((tenant::SCOPE_ORG_ID_HEADER, "team-b"))),
+        ] {
             let mut encoded = Vec::new();
             write
                 .encode(&mut encoded)
@@ -12280,8 +12335,8 @@ mod tests {
                     "application/x-protobuf".to_string(),
                 ),
             ]);
-            if let Some(tenant_id) = tenant_id {
-                headers.insert(tenant::TENANT_HEADER.to_string(), tenant_id.to_string());
+            if let Some((header_name, tenant_id)) = tenant_header {
+                headers.insert(header_name.to_string(), tenant_id.to_string());
             }
             let request = HttpRequest {
                 method: "POST".to_string(),
@@ -12324,7 +12379,10 @@ mod tests {
         read.encode(&mut encoded_read)
             .expect("protobuf encode should work");
 
-        for (tenant_id, expected_value) in [(None, 11.5), (Some("team-b"), 27.0)] {
+        for (tenant_header, expected_value) in [
+            (None, 11.5),
+            (Some((tenant::SCOPE_ORG_ID_HEADER, "team-b")), 27.0),
+        ] {
             let mut headers = HashMap::from([
                 ("content-encoding".to_string(), "snappy".to_string()),
                 (
@@ -12332,8 +12390,8 @@ mod tests {
                     "application/x-protobuf".to_string(),
                 ),
             ]);
-            if let Some(tenant_id) = tenant_id {
-                headers.insert(tenant::TENANT_HEADER.to_string(), tenant_id.to_string());
+            if let Some((header_name, tenant_id)) = tenant_header {
+                headers.insert(header_name.to_string(), tenant_id.to_string());
             }
             let request = HttpRequest {
                 method: "POST".to_string(),
@@ -12365,7 +12423,10 @@ mod tests {
         let labels_request = HttpRequest {
             method: "GET".to_string(),
             path: "/api/v1/labels".to_string(),
-            headers: HashMap::from([(tenant::TENANT_HEADER.to_string(), "team-b".to_string())]),
+            headers: HashMap::from([(
+                tenant::SCOPE_ORG_ID_HEADER.to_string(),
+                "team-b".to_string(),
+            )]),
             body: Vec::new(),
         };
         let labels_response = handle_request(
@@ -12389,7 +12450,10 @@ mod tests {
         let query_request = HttpRequest {
             method: "GET".to_string(),
             path: "/api/v1/query?query=cpu_usage{host=\"server-a\"}&time=1700000000000".to_string(),
-            headers: HashMap::from([(tenant::TENANT_HEADER.to_string(), "team-b".to_string())]),
+            headers: HashMap::from([(
+                tenant::SCOPE_ORG_ID_HEADER.to_string(),
+                "team-b".to_string(),
+            )]),
             body: Vec::new(),
         };
         let query_response = handle_request(
@@ -13698,6 +13762,99 @@ mod tests {
         assert_eq!(data[0]["job"], "prom");
         assert_eq!(data[0]["instance"], "localhost:9090");
         assert!(data[0].get(tenant::TENANT_LABEL).is_none());
+    }
+
+    #[tokio::test]
+    async fn cluster_remote_read_includes_legacy_default_tenant_series() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_single_node_control(&temp_dir);
+        storage
+            .insert_rows(&[Row::with_labels(
+                "up",
+                vec![
+                    Label::new("job", "prom"),
+                    Label::new("instance", "localhost:9090"),
+                ],
+                DataPoint::new(1_700_000_000_000, 1.0),
+            )])
+            .expect("insert should work");
+
+        let read = ReadRequest {
+            queries: vec![Query {
+                start_timestamp_ms: 1_700_000_000_000,
+                end_timestamp_ms: 1_700_000_000_001,
+                matchers: vec![
+                    LabelMatcher {
+                        r#type: MatcherType::Eq as i32,
+                        name: "__name__".to_string(),
+                        value: "up".to_string(),
+                    },
+                    LabelMatcher {
+                        r#type: MatcherType::Eq as i32,
+                        name: "job".to_string(),
+                        value: "prom".to_string(),
+                    },
+                ],
+                hints: None,
+            }],
+            accepted_response_types: Vec::new(),
+        };
+        let mut encoded = Vec::new();
+        read.encode(&mut encoded)
+            .expect("protobuf encode should work");
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/read".to_string(),
+            headers: HashMap::from([
+                ("content-encoding".to_string(), "snappy".to_string()),
+                (
+                    "content-type".to_string(),
+                    "application/x-protobuf".to_string(),
+                ),
+            ]),
+            body: snappy_encode(&encoded),
+        };
+
+        let response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            false,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let decoded = snappy_decode(&response.body);
+        let read_response =
+            ReadResponse::decode(decoded.as_slice()).expect("response should decode");
+        assert_eq!(read_response.results.len(), 1);
+        assert_eq!(read_response.results[0].timeseries.len(), 1);
+        let series = &read_response.results[0].timeseries[0];
+        assert!(series
+            .labels
+            .iter()
+            .any(|label| label.name == "__name__" && label.value == "up"));
+        assert!(series
+            .labels
+            .iter()
+            .any(|label| label.name == "job" && label.value == "prom"));
+        assert!(series
+            .labels
+            .iter()
+            .any(|label| label.name == "instance" && label.value == "localhost:9090"));
+        assert!(!series
+            .labels
+            .iter()
+            .any(|label| label.name == tenant::TENANT_LABEL));
+        assert_eq!(series.samples.len(), 1);
+        assert_eq!(series.samples[0].value, 1.0);
     }
 
     #[tokio::test]
@@ -16457,6 +16614,7 @@ mod tests {
         };
         let plan = tenant::prepare_request_plan(
             Some(&tenant_registry),
+            None,
             &prep_request,
             "team-b",
             tenant::TenantAccessScope::Read,
@@ -16515,6 +16673,191 @@ mod tests {
             body["data"]["admission"]["tenant"]["currentTenant"]["recentDecisions"]
                 .as_array()
                 .is_some_and(|entries| !entries.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_tenant_lifecycle_blocks_public_query_routes() {
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let usage_accounting = UsageAccounting::open(None).expect("usage store should open");
+        let engine = make_engine(&storage);
+        let managed_control_plane =
+            ManagedControlPlane::open(None).expect("control plane should open");
+        let actor = ManagedControlPlaneActor {
+            id: "test".to_string(),
+            scope: "test".to_string(),
+        };
+        managed_control_plane
+            .provision_deployment(
+                actor.clone(),
+                ManagedDeploymentProvisionRequest {
+                    deployment_id: "prod".to_string(),
+                    display_name: Some("Prod".to_string()),
+                    region: Some("test-region".to_string()),
+                    plan: Some("test-plan".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::DeploymentLifecycleState::Ready),
+                    ..ManagedDeploymentProvisionRequest::default()
+                },
+            )
+            .expect("deployment should provision");
+        managed_control_plane
+            .apply_tenant(
+                actor,
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-a".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    display_name: Some("Team A".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::TenantLifecycleState::Suspended),
+                    retention_days: None,
+                    storage_limit_bytes: None,
+                    ingest_rate_limit_per_sec: None,
+                    query_concurrency_limit: None,
+                    labels: None,
+                },
+            )
+            .expect("tenant should apply");
+
+        let response =
+            handle_request_with_admin_and_cluster_and_tenant_and_metadata_and_security_and_managed_control_plane(
+                &storage,
+                &metadata_store,
+                &exemplar_store,
+                None,
+                &engine,
+                HttpRequest {
+                    method: "GET".to_string(),
+                    path: "/api/v1/query?query=up".to_string(),
+                    headers: HashMap::from([(
+                        tenant::TENANT_HEADER.to_string(),
+                        "team-a".to_string(),
+                    )]),
+                    body: Vec::new(),
+                },
+                start_time(),
+                TimestampPrecision::Milliseconds,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(usage_accounting.as_ref()),
+                Some(&managed_control_plane),
+            )
+            .await;
+
+        assert_eq!(response.status, 403);
+        assert_eq!(
+            response_header(&response, "X-Tsink-Tenant-Error-Code"),
+            Some("tenant_managed_lifecycle_blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_tenant_storage_limit_blocks_public_write_routes() {
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let usage_accounting = UsageAccounting::open(None).expect("usage store should open");
+        let engine = make_engine(&storage);
+        let managed_control_plane =
+            ManagedControlPlane::open(None).expect("control plane should open");
+        let actor = ManagedControlPlaneActor {
+            id: "test".to_string(),
+            scope: "test".to_string(),
+        };
+        managed_control_plane
+            .provision_deployment(
+                actor.clone(),
+                ManagedDeploymentProvisionRequest {
+                    deployment_id: "prod".to_string(),
+                    display_name: Some("Prod".to_string()),
+                    region: Some("test-region".to_string()),
+                    plan: Some("test-plan".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::DeploymentLifecycleState::Ready),
+                    ..ManagedDeploymentProvisionRequest::default()
+                },
+            )
+            .expect("deployment should provision");
+        managed_control_plane
+            .apply_tenant(
+                actor,
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-a".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    display_name: Some("Team A".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::TenantLifecycleState::Active),
+                    retention_days: None,
+                    storage_limit_bytes: Some(128),
+                    ingest_rate_limit_per_sec: None,
+                    query_concurrency_limit: None,
+                    labels: None,
+                },
+            )
+            .expect("tenant should apply");
+        usage_accounting
+            .record(UsageRecordInput {
+                tenant_id: "team-a",
+                category: UsageCategory::Storage,
+                operation: "reconcile_storage",
+                source: "test",
+                status: "success",
+                request_units: 0,
+                result_units: 0,
+                rows: 0,
+                metadata_updates: 0,
+                exemplars_accepted: 0,
+                exemplars_dropped: 0,
+                histogram_series: 0,
+                matched_series: 0,
+                tombstones_applied: 0,
+                duration_nanos: 0,
+                request_bytes: 0,
+                logical_storage_series: 1,
+                logical_storage_samples: 8,
+                logical_storage_bytes: 128,
+            })
+            .expect("storage snapshot should record");
+
+        let response =
+            handle_request_with_admin_and_cluster_and_tenant_and_metadata_and_security_and_managed_control_plane(
+                &storage,
+                &metadata_store,
+                &exemplar_store,
+                None,
+                &engine,
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/api/v1/import/prometheus".to_string(),
+                    headers: HashMap::from([(
+                        tenant::TENANT_HEADER.to_string(),
+                        "team-a".to_string(),
+                    )]),
+                    body: b"cpu_usage{host=\"a\"} 1 1000\n".to_vec(),
+                },
+                start_time(),
+                TimestampPrecision::Milliseconds,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(usage_accounting.as_ref()),
+                Some(&managed_control_plane),
+            )
+            .await;
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, "X-Tsink-Tenant-Error-Code"),
+            Some("tenant_managed_storage_limit_exceeded")
         );
     }
 

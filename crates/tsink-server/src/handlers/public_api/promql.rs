@@ -5,33 +5,20 @@ pub(crate) async fn handle_instant_query(
     _engine: &Engine,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
         Ok(controller) => controller,
         Err(err) => return text_response(500, &format!("read admission unavailable: {err}")),
     };
-    handle_instant_query_with_admission(
-        storage,
-        request,
-        precision,
-        cluster_context,
-        tenant_registry,
-        usage_accounting,
-        read_admission,
-    )
-    .await
+    handle_instant_query_with_admission(storage, request, precision, context, read_admission).await
 }
 
 pub(crate) async fn handle_instant_query_with_admission(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
     let started = Instant::now();
@@ -40,7 +27,8 @@ pub(crate) async fn handle_instant_query_with_admission(
         Err(response) => return response,
     };
     let tenant_plan = match prepare_tenant_request(
-        tenant_registry,
+        context.tenant_registry,
+        context.managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -55,7 +43,11 @@ pub(crate) async fn handle_instant_query_with_admission(
         tenant_plan.record_rejected(tenant::TenantAdmissionSurface::Query, 1, err.clone());
         return promql_error_response("bad_data", &err);
     }
-    let _tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Query, 1) {
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Query,
+        1,
+        context.usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };
@@ -78,7 +70,7 @@ pub(crate) async fn handle_instant_query_with_admission(
     let (storage, distributed_storage) = match storage_for_promql_request(
         storage,
         request,
-        cluster_context,
+        context.cluster_context,
         &tenant_id,
         tenant_plan.policy(),
     ) {
@@ -93,7 +85,7 @@ pub(crate) async fn handle_instant_query_with_admission(
             let result_units = promql_value_units(&value);
             record_query_pressure(&tenant_id, 1, result_units);
             record_query_usage(
-                usage_accounting,
+                context.usage_accounting,
                 &tenant_id,
                 "instant_query",
                 request.path_without_query(),
@@ -121,33 +113,20 @@ pub(crate) async fn handle_range_query(
     _engine: &Engine,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
         Ok(controller) => controller,
         Err(err) => return text_response(500, &format!("read admission unavailable: {err}")),
     };
-    handle_range_query_with_admission(
-        storage,
-        request,
-        precision,
-        cluster_context,
-        tenant_registry,
-        usage_accounting,
-        read_admission,
-    )
-    .await
+    handle_range_query_with_admission(storage, request, precision, context, read_admission).await
 }
 
 pub(crate) async fn handle_range_query_with_admission(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
     let started = Instant::now();
@@ -156,7 +135,8 @@ pub(crate) async fn handle_range_query_with_admission(
         Err(response) => return response,
     };
     let tenant_plan = match prepare_tenant_request(
-        tenant_registry,
+        context.tenant_registry,
+        context.managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -200,7 +180,11 @@ pub(crate) async fn handle_range_query_with_admission(
         tenant_plan.record_rejected(tenant::TenantAdmissionSurface::Query, 1, err.clone());
         return promql_error_response("bad_data", &err);
     }
-    let _tenant_request = match tenant_plan.admit(tenant::TenantAdmissionSurface::Query, 1) {
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Query,
+        1,
+        context.usage_accounting,
+    ) {
         Ok(guard) => guard,
         Err(err) => return err.to_http_response(),
     };
@@ -215,7 +199,7 @@ pub(crate) async fn handle_range_query_with_admission(
     let (storage, distributed_storage) = match storage_for_promql_request(
         storage,
         request,
-        cluster_context,
+        context.cluster_context,
         &tenant_id,
         tenant_plan.policy(),
     ) {
@@ -231,7 +215,7 @@ pub(crate) async fn handle_range_query_with_admission(
             let result_units = promql_value_units(&value);
             record_query_pressure(&tenant_id, 1, result_units);
             record_query_usage(
-                usage_accounting,
+                context.usage_accounting,
                 &tenant_id,
                 "range_query",
                 request.path_without_query(),
@@ -425,9 +409,7 @@ pub(crate) async fn handle_query_exemplars(
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
 ) -> HttpResponse {
     let read_admission = match admission::global_public_read_admission() {
         Ok(controller) => controller,
@@ -437,9 +419,7 @@ pub(crate) async fn handle_query_exemplars(
         exemplar_store,
         request,
         precision,
-        cluster_context,
-        tenant_registry,
-        usage_accounting,
+        context,
         read_admission,
     )
     .await
@@ -449,9 +429,7 @@ pub(crate) async fn handle_query_exemplars_with_admission(
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
     precision: TimestampPrecision,
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_registry: Option<&tenant::TenantRegistry>,
-    usage_accounting: Option<&UsageAccounting>,
+    context: PublicReadContext<'_>,
     read_admission: &ReadAdmissionController,
 ) -> HttpResponse {
     let started = Instant::now();
@@ -460,7 +438,8 @@ pub(crate) async fn handle_query_exemplars_with_admission(
         Err(response) => return response,
     };
     let tenant_plan = match prepare_tenant_request(
-        tenant_registry,
+        context.tenant_registry,
+        context.managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Read,
@@ -559,11 +538,14 @@ pub(crate) async fn handle_query_exemplars_with_admission(
         Err(err) => return promql_error_response("bad_data", &err),
     };
 
-    let _tenant_request =
-        match tenant_plan.admit(tenant::TenantAdmissionSurface::Query, scoped.len().max(1)) {
-            Ok(guard) => guard,
-            Err(err) => return err.to_http_response(),
-        };
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Query,
+        scoped.len().max(1),
+        context.usage_accounting,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return err.to_http_response(),
+    };
     let _read_admission = match read_admission.admit_request(scoped.len()).await {
         Ok(lease) => lease,
         Err(err) => {
@@ -576,7 +558,7 @@ pub(crate) async fn handle_query_exemplars_with_admission(
         }
     };
 
-    let series = if let Some(cluster_context) = cluster_context {
+    let series = if let Some(cluster_context) = context.cluster_context {
         match query_exemplars_across_cluster(
             exemplar_store,
             cluster_context,
@@ -599,7 +581,7 @@ pub(crate) async fn handle_query_exemplars_with_admission(
     let result_units = exemplar_query_units(&series);
     record_query_pressure(&tenant_id, scoped.len(), result_units);
     record_query_usage(
-        usage_accounting,
+        context.usage_accounting,
         &tenant_id,
         "query_exemplars",
         request.path_without_query(),
@@ -618,7 +600,7 @@ pub(crate) async fn handle_query_exemplars_with_admission(
             .collect(),
     );
 
-    if let Some(cluster_context) = cluster_context {
+    if let Some(cluster_context) = context.cluster_context {
         let metadata = ReadFanoutResponseMetadata {
             consistency: cluster_context.runtime.read_consistency,
             partial_response_policy: cluster_context.runtime.read_partial_response,

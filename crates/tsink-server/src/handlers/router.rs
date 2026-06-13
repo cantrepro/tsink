@@ -27,18 +27,16 @@ pub(super) async fn route_request(
         internal_api,
     } = request_context;
     let path = request.path_without_query().to_owned();
+    let public_read_context = PublicReadContext::new(
+        cluster_context,
+        tenant_registry,
+        managed_control_plane,
+        usage_accounting,
+    );
 
     if request.method == "GET" {
         if let Some(label_name) = label_values_path(path.as_str()) {
-            return handle_label_values(
-                storage,
-                &request,
-                label_name,
-                cluster_context,
-                tenant_registry,
-                usage_accounting,
-            )
-            .await;
+            return handle_label_values(storage, &request, label_name, public_read_context).await;
         }
     }
 
@@ -136,9 +134,7 @@ pub(super) async fn route_request(
                 engine,
                 &request,
                 timestamp_precision,
-                cluster_context,
-                tenant_registry,
-                usage_accounting,
+                public_read_context,
             )
             .await
         }
@@ -148,9 +144,7 @@ pub(super) async fn route_request(
                 engine,
                 &request,
                 timestamp_precision,
-                cluster_context,
-                tenant_registry,
-                usage_accounting,
+                public_read_context,
             )
             .await
         }
@@ -160,6 +154,7 @@ pub(super) async fn route_request(
                 &request,
                 cluster_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -170,21 +165,27 @@ pub(super) async fn route_request(
                 &request,
                 cluster_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
         }
         ("GET", "/api/v1/metadata") => {
-            handle_metadata(metadata_store, &request, tenant_registry, usage_accounting).await
+            handle_metadata(
+                metadata_store,
+                &request,
+                tenant_registry,
+                managed_control_plane,
+                usage_accounting,
+            )
+            .await
         }
         ("GET" | "POST", "/api/v1/query_exemplars") => {
             handle_query_exemplars(
                 exemplar_store,
                 &request,
                 timestamp_precision,
-                cluster_context,
-                tenant_registry,
-                usage_accounting,
+                public_read_context,
             )
             .await
         }
@@ -197,6 +198,7 @@ pub(super) async fn route_request(
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -211,6 +213,7 @@ pub(super) async fn route_request(
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -225,6 +228,7 @@ pub(super) async fn route_request(
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -235,6 +239,7 @@ pub(super) async fn route_request(
                 &request,
                 cluster_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -248,6 +253,7 @@ pub(super) async fn route_request(
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await

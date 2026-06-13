@@ -327,7 +327,7 @@ All HTTP-based ingest endpoints respect the server's configured authentication:
 
 - **Bearer token auth** — set `--auth-token` or `--auth-token-file`. Requests must include `Authorization: Bearer <token>`.
 - **RBAC** — set `--rbac-config`. Requests must carry a valid RBAC bearer token or OIDC JWT.
-- **Multi-tenancy** — set a `--tenant-config` file and pass the `X-Scope-OrgID` (or `X-Tsink-Tenant-Id`) header to route writes to a specific tenant.
+- **Multi-tenancy** — set a `--tenant-config` file and pass the `X-Scope-OrgID` (or `x-tsink-tenant`) header to route writes to a specific tenant. If both headers are present they must match.
 
 StatsD and Graphite side-channel listeners write all data to a single tenant specified by `--statsd-tenant` and `--graphite-tenant` respectively. They do not support per-connection authentication.
 

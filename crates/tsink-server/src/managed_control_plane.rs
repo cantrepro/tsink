@@ -1,8 +1,10 @@
+use crate::tenant::{TenantAdmissionSurface, TenantRequestError};
+use crate::usage::UsageAccounting;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANAGED_CONTROL_PLANE_DIR: &str = "managed-control-plane";
@@ -12,11 +14,13 @@ const MANAGED_CONTROL_PLANE_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_BACKUP_RETENTION_COPIES: u32 = 7;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 100;
 const MAX_RESOURCE_ID_LEN: usize = 128;
+const MANAGED_TENANT_INGEST_WINDOW_MS: u64 = 1_000;
 
 #[derive(Debug)]
 pub struct ManagedControlPlane {
     state_path: Option<PathBuf>,
     state: Mutex<ManagedControlPlaneStateFile>,
+    request_runtimes: Mutex<BTreeMap<String, Arc<ManagedTenantRequestRuntime>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +48,51 @@ impl Default for ManagedControlPlaneStateFile {
             deployments: BTreeMap::new(),
             tenants: BTreeMap::new(),
             audit_entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ManagedTenantRequestRuntime {
+    active_query_units: Mutex<u64>,
+    recent_ingest_units: Mutex<VecDeque<ManagedTenantIngestWindowEntry>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedTenantIngestWindowEntry {
+    unix_ms: u64,
+    units: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedTenantRequestPolicy {
+    tenant: ManagedTenant,
+    runtime: Arc<ManagedTenantRequestRuntime>,
+}
+
+#[derive(Debug, Default)]
+pub struct ManagedTenantRequestGuard {
+    _permits: Vec<ManagedTenantAdmissionPermit>,
+}
+
+#[derive(Debug)]
+enum ManagedTenantAdmissionPermit {
+    QueryConcurrency {
+        runtime: Arc<ManagedTenantRequestRuntime>,
+        units: u64,
+    },
+}
+
+impl Drop for ManagedTenantAdmissionPermit {
+    fn drop(&mut self) {
+        match self {
+            Self::QueryConcurrency { runtime, units } => {
+                let mut active_units = runtime
+                    .active_query_units
+                    .lock()
+                    .expect("managed tenant query admission mutex should not be poisoned");
+                *active_units = active_units.saturating_sub(*units);
+            }
         }
     }
 }
@@ -455,7 +504,28 @@ impl ManagedControlPlane {
         Ok(Self {
             state_path,
             state: Mutex::new(state),
+            request_runtimes: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    pub fn tenant_request_policy(&self, tenant_id: &str) -> Option<ManagedTenantRequestPolicy> {
+        let tenant = self.tenant_snapshot(tenant_id)?;
+        Some(ManagedTenantRequestPolicy {
+            tenant,
+            runtime: self.request_runtime_for(tenant_id),
+        })
+    }
+
+    fn request_runtime_for(&self, tenant_id: &str) -> Arc<ManagedTenantRequestRuntime> {
+        let mut runtimes = self
+            .request_runtimes
+            .lock()
+            .expect("managed tenant runtime cache mutex should not be poisoned");
+        Arc::clone(
+            runtimes
+                .entry(tenant_id.to_string())
+                .or_insert_with(|| Arc::new(ManagedTenantRequestRuntime::default())),
+        )
     }
 
     pub fn state_snapshot(&self) -> ManagedControlPlaneStateSnapshot {
@@ -1117,6 +1187,162 @@ fn deployment_summaries_for_state(
             }
         })
         .collect()
+}
+
+impl ManagedTenantRequestPolicy {
+    pub fn authorize(&self) -> Result<(), TenantRequestError> {
+        match self.tenant.lifecycle {
+            TenantLifecycleState::Active => Ok(()),
+            TenantLifecycleState::Provisioning => Err(managed_tenant_rejected(
+                403,
+                "tenant_managed_lifecycle_blocked",
+                format!(
+                    "tenant '{}' is provisioning and not accepting data-plane traffic",
+                    self.tenant.id
+                ),
+            )),
+            TenantLifecycleState::Suspended => Err(managed_tenant_rejected(
+                403,
+                "tenant_managed_lifecycle_blocked",
+                format!(
+                    "tenant '{}' is suspended and not accepting data-plane traffic",
+                    self.tenant.id
+                ),
+            )),
+            TenantLifecycleState::Deleting => Err(managed_tenant_rejected(
+                403,
+                "tenant_managed_lifecycle_blocked",
+                format!(
+                    "tenant '{}' is deleting and not accepting data-plane traffic",
+                    self.tenant.id
+                ),
+            )),
+            TenantLifecycleState::Deleted => Err(managed_tenant_rejected(
+                403,
+                "tenant_managed_lifecycle_blocked",
+                format!(
+                    "tenant '{}' is deleted and not accepting data-plane traffic",
+                    self.tenant.id
+                ),
+            )),
+        }
+    }
+
+    pub fn admit(
+        &self,
+        surface: TenantAdmissionSurface,
+        requested_units: usize,
+        usage_accounting: Option<&UsageAccounting>,
+    ) -> Result<ManagedTenantRequestGuard, TenantRequestError> {
+        self.authorize()?;
+        let mut permits = Vec::new();
+        match surface {
+            TenantAdmissionSurface::Ingest => {
+                if let Some(limit) = self.tenant.storage_limit_bytes {
+                    let current_bytes = usage_accounting
+                        .and_then(|accounting| {
+                            accounting.latest_storage_snapshot_for(&self.tenant.id)
+                        })
+                        .map(|snapshot| snapshot.logical_storage_bytes)
+                        .unwrap_or(0);
+                    if current_bytes >= limit {
+                        return Err(managed_tenant_rejected(
+                            413,
+                            "tenant_managed_storage_limit_exceeded",
+                            format!(
+                                "tenant '{}' exceeded managed storage limit: {current_bytes} >= {limit}",
+                                self.tenant.id
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(limit) = self.tenant.ingest_rate_limit_per_sec {
+                    let now = unix_timestamp_millis();
+                    let mut recent = self
+                        .runtime
+                        .recent_ingest_units
+                        .lock()
+                        .expect("managed tenant ingest admission mutex should not be poisoned");
+                    trim_managed_ingest_window(&mut recent, now);
+                    let used_units = recent.iter().map(|entry| entry.units).sum::<u64>();
+                    let requested_units_u64 = u64::try_from(requested_units).unwrap_or(u64::MAX);
+                    if used_units.saturating_add(requested_units_u64) > limit {
+                        return Err(managed_tenant_rejected(
+                            429,
+                            "tenant_managed_ingest_rate_limit_exceeded",
+                            format!(
+                                "tenant '{}' exceeded managed ingest rate limit: {} > {} rows/sec",
+                                self.tenant.id,
+                                used_units.saturating_add(requested_units_u64),
+                                limit
+                            ),
+                        ));
+                    }
+                    if requested_units_u64 > 0 {
+                        recent.push_back(ManagedTenantIngestWindowEntry {
+                            unix_ms: now,
+                            units: requested_units_u64,
+                        });
+                    }
+                }
+            }
+            TenantAdmissionSurface::Query => {
+                if let Some(limit) = self.tenant.query_concurrency_limit {
+                    let limit = u64::from(limit);
+                    let requested_units_u64 =
+                        u64::try_from(requested_units.max(1)).unwrap_or(u64::MAX);
+                    let mut active_units = self
+                        .runtime
+                        .active_query_units
+                        .lock()
+                        .expect("managed tenant query admission mutex should not be poisoned");
+                    if active_units.saturating_add(requested_units_u64) > limit {
+                        return Err(managed_tenant_rejected(
+                            429,
+                            "tenant_managed_query_concurrency_limit_exceeded",
+                            format!(
+                                "tenant '{}' exceeded managed query concurrency limit: {} > {}",
+                                self.tenant.id,
+                                active_units.saturating_add(requested_units_u64),
+                                limit
+                            ),
+                        ));
+                    }
+                    *active_units = active_units.saturating_add(requested_units_u64);
+                    permits.push(ManagedTenantAdmissionPermit::QueryConcurrency {
+                        runtime: Arc::clone(&self.runtime),
+                        units: requested_units_u64,
+                    });
+                }
+            }
+            TenantAdmissionSurface::Metadata | TenantAdmissionSurface::Retention => {}
+        }
+
+        Ok(ManagedTenantRequestGuard { _permits: permits })
+    }
+}
+
+fn managed_tenant_rejected(status: u16, code: &'static str, message: String) -> TenantRequestError {
+    TenantRequestError::Rejected {
+        status,
+        code,
+        message,
+    }
+}
+
+fn trim_managed_ingest_window(
+    recent: &mut VecDeque<ManagedTenantIngestWindowEntry>,
+    now_unix_ms: u64,
+) {
+    while recent.front().is_some_and(|entry| {
+        entry
+            .unix_ms
+            .saturating_add(MANAGED_TENANT_INGEST_WINDOW_MS)
+            <= now_unix_ms
+    }) {
+        recent.pop_front();
+    }
 }
 
 struct ManagedControlPlaneAuditEntryInput {

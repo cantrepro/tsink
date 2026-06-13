@@ -2,7 +2,9 @@ use crate::cluster::config::{
     ClusterReadConsistency, ClusterReadPartialResponsePolicy, ClusterWriteConsistency,
 };
 use crate::http::{HttpRequest, HttpResponse};
+use crate::managed_control_plane::{ManagedControlPlane, ManagedTenantRequestPolicy};
 use crate::rbac::RBAC_AUTH_VERIFIED_HEADER;
+use crate::usage::UsageAccounting;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -13,11 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tsink::{
     DataPoint, DeleteSeriesResult, Label, MetadataShardScope, MetricSeries, QueryOptions,
-    Result as TsinkResult, Row, SeriesMatcher, SeriesSelection, Storage,
+    Result as TsinkResult, Row, SeriesMatcher, SeriesPoints, SeriesSelection, Storage,
     StorageObservabilitySnapshot, TsinkError,
 };
 
 pub const TENANT_HEADER: &str = "x-tsink-tenant";
+pub const SCOPE_ORG_ID_HEADER: &str = "x-scope-orgid";
 pub const TENANT_LABEL: &str = "__tsink_tenant__";
 pub const DEFAULT_TENANT_ID: &str = "default";
 pub const PUBLIC_AUTH_REQUIRED_HEADER: &str = "x-tsink-public-auth-required";
@@ -41,6 +44,7 @@ static TENANT_ADMISSION_RETENTION_ACTIVE_REQUESTS: AtomicU64 = AtomicU64::new(0)
 static TENANT_ADMISSION_RETENTION_ACTIVE_UNITS: AtomicU64 = AtomicU64::new(0);
 
 const TENANT_DECISION_HISTORY_LIMIT: usize = 16;
+const UNLABELED_TENANT_FALLBACK_REGEX: &str = ".+";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +92,7 @@ pub struct TenantRequestPolicy {
 pub struct TenantRequestGuard {
     policy: TenantRequestPolicy,
     _permits: Vec<TenantAdmissionPermit>,
+    _managed_guard: Option<crate::managed_control_plane::ManagedTenantRequestGuard>,
 }
 
 impl TenantRequestGuard {
@@ -102,6 +107,7 @@ pub struct TenantRequestPlan {
     access: TenantAccessScope,
     policy: TenantRequestPolicy,
     runtime: Option<Arc<TenantPolicyRuntime>>,
+    managed_policy: Option<ManagedTenantRequestPolicy>,
 }
 
 impl TenantRequestPlan {
@@ -119,13 +125,30 @@ impl TenantRequestPlan {
         surface: TenantAdmissionSurface,
         requested_units: usize,
     ) -> Result<TenantRequestGuard, TenantRequestError> {
+        self.admit_with_usage(surface, requested_units, None)
+    }
+
+    pub fn admit_with_usage(
+        &self,
+        surface: TenantAdmissionSurface,
+        requested_units: usize,
+        usage_accounting: Option<&UsageAccounting>,
+    ) -> Result<TenantRequestGuard, TenantRequestError> {
+        let managed_guard = self
+            .managed_policy
+            .as_ref()
+            .map(|managed| managed.admit(surface, requested_units, usage_accounting))
+            .transpose()?;
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(TenantRequestGuard {
                 policy: self.policy.clone(),
                 _permits: Vec::new(),
+                _managed_guard: managed_guard,
             });
         };
-        runtime.admit(&self.tenant_id, self.access, surface, requested_units)
+        let mut guard = runtime.admit(&self.tenant_id, self.access, surface, requested_units)?;
+        guard._managed_guard = managed_guard;
+        Ok(guard)
     }
 
     pub fn record_rejected(
@@ -169,6 +192,11 @@ pub enum TenantRequestError {
     Unauthorized(&'static str),
     Forbidden(&'static str),
     TooManyRequests(String),
+    Rejected {
+        status: u16,
+        code: &'static str,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +275,19 @@ impl TenantRequestError {
                     "X-Tsink-Tenant-Error-Code",
                     "tenant_admission_limit_exceeded",
                 ),
+            Self::Rejected {
+                status,
+                code,
+                message,
+            } => {
+                let mut response = HttpResponse::new(*status, message.clone())
+                    .with_header("Content-Type", "text/plain")
+                    .with_header("X-Tsink-Tenant-Error-Code", *code);
+                if *status == 429 {
+                    response = response.with_header("Retry-After", "1");
+                }
+                response
+            }
         }
     }
 }
@@ -854,6 +895,7 @@ impl TenantPolicyRuntime {
         Ok(TenantRequestGuard {
             policy: self.policy.clone(),
             _permits: permits,
+            _managed_guard: None,
         })
     }
 
@@ -1029,16 +1071,23 @@ pub fn public_request_access(request: &HttpRequest) -> Option<TenantAccessScope>
 
 pub fn prepare_trusted_request_plan(
     registry: Option<&TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     tenant_id: &str,
     access: TenantAccessScope,
 ) -> Result<TenantRequestPlan, TenantRequestError> {
     validate_tenant_id(tenant_id).map_err(TenantRequestError::BadRequest)?;
+    let managed_policy = managed_control_plane
+        .and_then(|control_plane| control_plane.tenant_request_policy(tenant_id));
+    if let Some(managed_policy) = managed_policy.as_ref() {
+        managed_policy.authorize()?;
+    }
     let Some(registry) = registry else {
         return Ok(TenantRequestPlan {
             tenant_id: tenant_id.to_string(),
             access,
             policy: TenantRequestPolicy::default(),
             runtime: None,
+            managed_policy,
         });
     };
 
@@ -1048,16 +1097,18 @@ pub fn prepare_trusted_request_plan(
         access,
         policy: runtime.policy.clone(),
         runtime: Some(runtime),
+        managed_policy,
     })
 }
 
 #[cfg(test)]
 pub fn prepare_trusted_request(
     registry: Option<&TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     tenant_id: &str,
     access: TenantAccessScope,
 ) -> Result<TenantRequestGuard, TenantRequestError> {
-    prepare_trusted_request_plan(registry, tenant_id, access)?
+    prepare_trusted_request_plan(registry, managed_control_plane, tenant_id, access)?
         .admit(default_surface_for_access(access), 1)
 }
 
@@ -1134,37 +1185,49 @@ fn track_tenant_surface_active_units(surface: TenantAdmissionSurface, increment:
 
 pub fn prepare_request_plan(
     registry: Option<&TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     request: &HttpRequest,
     tenant_id: &str,
     access: TenantAccessScope,
 ) -> Result<TenantRequestPlan, TenantRequestError> {
     validate_tenant_id(tenant_id).map_err(TenantRequestError::BadRequest)?;
+    let managed_policy = managed_control_plane
+        .and_then(|control_plane| control_plane.tenant_request_policy(tenant_id));
     let Some(registry) = registry else {
+        if let Some(managed_policy) = managed_policy.as_ref() {
+            managed_policy.authorize()?;
+        }
         return Ok(TenantRequestPlan {
             tenant_id: tenant_id.to_string(),
             access,
             policy: TenantRequestPolicy::default(),
             runtime: None,
+            managed_policy,
         });
     };
     let runtime = registry.runtime_for(tenant_id)?;
     runtime.authorize(request, access)?;
+    if let Some(managed_policy) = managed_policy.as_ref() {
+        managed_policy.authorize()?;
+    }
     Ok(TenantRequestPlan {
         tenant_id: tenant_id.to_string(),
         access,
         policy: runtime.policy.clone(),
         runtime: Some(runtime),
+        managed_policy,
     })
 }
 
 #[cfg(test)]
 pub fn prepare_request(
     registry: Option<&TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     request: &HttpRequest,
     tenant_id: &str,
     access: TenantAccessScope,
 ) -> Result<TenantRequestGuard, TenantRequestError> {
-    prepare_request_plan(registry, request, tenant_id, access)?
+    prepare_request_plan(registry, managed_control_plane, request, tenant_id, access)?
         .admit(default_surface_for_access(access), 1)
 }
 
@@ -1293,9 +1356,21 @@ fn bearer_token(request: &HttpRequest) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+fn tenant_header_value(request: &HttpRequest) -> Result<Option<&str>, String> {
+    let tenant_id = request.header(TENANT_HEADER).map(str::trim);
+    let scope_org_id = request.header(SCOPE_ORG_ID_HEADER).map(str::trim);
+    match (tenant_id, scope_org_id) {
+        (Some(tenant_id), Some(scope_org_id)) if tenant_id != scope_org_id => Err(format!(
+            "{TENANT_HEADER} and {SCOPE_ORG_ID_HEADER} must match when both headers are set"
+        )),
+        (Some(tenant_id), _) => Ok(Some(tenant_id)),
+        (None, Some(scope_org_id)) => Ok(Some(scope_org_id)),
+        (None, None) => Ok(None),
+    }
+}
+
 pub fn tenant_id_for_request(request: &HttpRequest) -> Result<String, String> {
-    let tenant_id = request
-        .header(TENANT_HEADER)
+    let tenant_id = tenant_header_value(request)?
         .unwrap_or(DEFAULT_TENANT_ID)
         .trim();
     validate_tenant_id(tenant_id)?;
@@ -1322,26 +1397,38 @@ pub fn selection_for_tenant(
     selection: &SeriesSelection,
     tenant_id: &str,
 ) -> Result<SeriesSelection, String> {
+    read_selections_for_tenant(selection, tenant_id).map(|mut selections| {
+        selections
+            .drain(..1)
+            .next()
+            .expect("tenant reads always produce a scoped primary selection")
+    })
+}
+
+pub fn read_selections_for_tenant(
+    selection: &SeriesSelection,
+    tenant_id: &str,
+) -> Result<Vec<SeriesSelection>, String> {
     validate_tenant_id(tenant_id)?;
     ensure_reserved_matcher_not_present(&selection.matchers)?;
+
+    let mut selections = Vec::with_capacity(1 + usize::from(tenant_id == DEFAULT_TENANT_ID));
     let mut scoped = selection.clone();
     scoped
         .matchers
         .push(SeriesMatcher::equal(TENANT_LABEL, tenant_id));
-    Ok(scoped)
-}
+    selections.push(scoped);
 
-pub fn fanout_selection_for_tenant(
-    selection: &SeriesSelection,
-    tenant_id: &str,
-) -> Result<SeriesSelection, String> {
-    validate_tenant_id(tenant_id)?;
-    ensure_reserved_matcher_not_present(&selection.matchers)?;
     if tenant_id == DEFAULT_TENANT_ID {
-        Ok(selection.clone())
-    } else {
-        selection_for_tenant(selection, tenant_id)
+        let mut legacy_fallback = selection.clone();
+        legacy_fallback.matchers.push(SeriesMatcher::regex_no_match(
+            TENANT_LABEL,
+            UNLABELED_TENANT_FALLBACK_REGEX,
+        ));
+        selections.push(legacy_fallback);
     }
+
+    Ok(selections)
 }
 
 pub fn visible_metric_series(series: MetricSeries, tenant_id: &str) -> Option<MetricSeries> {
@@ -1461,6 +1548,31 @@ impl TenantScopedStorage {
             .map_err(|err| TsinkError::InvalidLabel(err.to_string()))
     }
 
+    fn read_selections(&self, selection: &SeriesSelection) -> TsinkResult<Vec<SeriesSelection>> {
+        read_selections_for_tenant(selection, &self.tenant_id)
+            .map_err(|err| TsinkError::InvalidLabel(err.to_string()))
+    }
+
+    fn read_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
+        let mut merged = BTreeSet::new();
+        for scoped in self.read_selections(selection)? {
+            merged.extend(self.inner.select_series(&scoped)?);
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    fn read_series_in_shards(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        let mut merged = BTreeSet::new();
+        for scoped in self.read_selections(selection)? {
+            merged.extend(self.inner.select_series_in_shards(&scoped, scope)?);
+        }
+        Ok(merged.into_iter().collect())
+    }
+
     fn visible_series(&self, series: Vec<MetricSeries>) -> Vec<MetricSeries> {
         series
             .into_iter()
@@ -1470,13 +1582,16 @@ impl TenantScopedStorage {
             .collect()
     }
 
-    fn visible_select_all(
+    fn visible_selected_points(
         &self,
-        rows: Vec<(Vec<Label>, Vec<DataPoint>)>,
+        rows: Vec<SeriesPoints>,
     ) -> Vec<(Vec<Label>, Vec<DataPoint>)> {
         let mut merged = BTreeMap::<Vec<Label>, Vec<DataPoint>>::new();
-        for (labels, points) in rows {
-            let Some(labels) = visible_labels(labels, &self.tenant_id) else {
+        for SeriesPoints { series, points } in rows {
+            if points.is_empty() {
+                continue;
+            }
+            let Some(labels) = visible_labels(series.labels, &self.tenant_id) else {
                 continue;
             };
             merged.entry(labels).or_default().extend(points);
@@ -1544,12 +1659,16 @@ impl Storage for TenantScopedStorage {
         start: i64,
         end: i64,
     ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
-        let rows = self.inner.select_all(metric, start, end)?;
-        Ok(self.visible_select_all(rows))
+        let selection = SeriesSelection::new()
+            .with_metric(metric)
+            .with_time_range(start, end);
+        let series = self.read_series(&selection)?;
+        let rows = self.inner.select_many(&series, start, end)?;
+        Ok(self.visible_selected_points(rows))
     }
 
     fn list_metrics(&self) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self.visible_series(self.inner.list_metrics()?))
+        Ok(self.visible_series(self.read_series(&SeriesSelection::new())?))
     }
 
     fn list_metrics_with_wal(&self) -> TsinkResult<Vec<MetricSeries>> {
@@ -1557,17 +1676,11 @@ impl Storage for TenantScopedStorage {
     }
 
     fn list_metrics_in_shards(&self, scope: &MetadataShardScope) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self.visible_series(self.inner.list_metrics_in_shards(scope)?))
+        Ok(self.visible_series(self.read_series_in_shards(&SeriesSelection::new(), scope)?))
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
-        if self.is_default_tenant() {
-            ensure_reserved_matcher_not_present(&selection.matchers)
-                .map_err(|err| TsinkError::InvalidLabel(err.to_string()))?;
-            return Ok(self.visible_series(self.inner.select_series(selection)?));
-        }
-        let scoped = self.scoped_selection(selection)?;
-        Ok(self.visible_series(self.inner.select_series(&scoped)?))
+        Ok(self.visible_series(self.read_series(selection)?))
     }
 
     fn select_series_in_shards(
@@ -1575,30 +1688,19 @@ impl Storage for TenantScopedStorage {
         selection: &SeriesSelection,
         scope: &MetadataShardScope,
     ) -> TsinkResult<Vec<MetricSeries>> {
-        if self.is_default_tenant() {
-            ensure_reserved_matcher_not_present(&selection.matchers)
-                .map_err(|err| TsinkError::InvalidLabel(err.to_string()))?;
-            return Ok(self.visible_series(self.inner.select_series_in_shards(selection, scope)?));
-        }
-        let scoped = self.scoped_selection(selection)?;
-        Ok(self.visible_series(self.inner.select_series_in_shards(&scoped, scope)?))
+        Ok(self.visible_series(self.read_series_in_shards(selection, scope)?))
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> TsinkResult<DeleteSeriesResult> {
         if self.is_default_tenant() {
-            ensure_reserved_matcher_not_present(&selection.matchers)
-                .map_err(|err| TsinkError::InvalidLabel(err.to_string()))?;
             let time_range = match (selection.start, selection.end) {
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
             };
-            let series = self.inner.select_series(selection)?;
+            let series = self.read_series(selection)?;
             let mut matched_series = 0u64;
             let mut tombstones_applied = 0u64;
-            for series in series
-                .into_iter()
-                .filter(|series| visible_labels(series.labels.clone(), &self.tenant_id).is_some())
-            {
+            for series in series {
                 let outcome = self
                     .inner
                     .delete_series(&exact_selection_for_series(&series, time_range))?;
@@ -1649,6 +1751,11 @@ impl Storage for TenantScopedStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_control_plane::{
+        DeploymentLifecycleState, ManagedControlPlaneActor, ManagedDeploymentProvisionRequest,
+        ManagedTenantApplyRequest, ManagedTenantLifecycleRequest, TenantLifecycleState,
+    };
+    use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
     use std::collections::HashMap;
     use tsink::{StorageBuilder, TimestampPrecision};
 
@@ -1657,6 +1764,255 @@ mod tests {
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    fn managed_actor() -> ManagedControlPlaneActor {
+        ManagedControlPlaneActor {
+            id: "test".to_string(),
+            scope: "test".to_string(),
+        }
+    }
+
+    fn provision_ready_deployment(
+        control_plane: &ManagedControlPlane,
+        deployment_id: &str,
+    ) -> Result<(), String> {
+        control_plane
+            .provision_deployment(
+                managed_actor(),
+                ManagedDeploymentProvisionRequest {
+                    deployment_id: deployment_id.to_string(),
+                    display_name: Some(deployment_id.to_string()),
+                    region: Some("test-region".to_string()),
+                    plan: Some("test-plan".to_string()),
+                    lifecycle: Some(DeploymentLifecycleState::Ready),
+                    ..ManagedDeploymentProvisionRequest::default()
+                },
+            )
+            .map(|_| ())
+    }
+
+    struct RecordingMetadataStorage {
+        select_series_calls: Mutex<Vec<SeriesSelection>>,
+        select_series_in_shards_calls: Mutex<Vec<(SeriesSelection, MetadataShardScope)>>,
+        select_many_calls: Mutex<Vec<(Vec<MetricSeries>, i64, i64)>>,
+    }
+
+    impl RecordingMetadataStorage {
+        fn new() -> Self {
+            Self {
+                select_series_calls: Mutex::new(Vec::new()),
+                select_series_in_shards_calls: Mutex::new(Vec::new()),
+                select_many_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn scoped_series() -> MetricSeries {
+            MetricSeries {
+                name: "cpu_usage".to_string(),
+                labels: vec![
+                    Label::new("host", "current"),
+                    Label::new(TENANT_LABEL, DEFAULT_TENANT_ID),
+                ],
+            }
+        }
+
+        fn legacy_series() -> MetricSeries {
+            MetricSeries {
+                name: "cpu_usage".to_string(),
+                labels: vec![Label::new("host", "legacy")],
+            }
+        }
+
+        fn series_for_selection(
+            &self,
+            selection: &SeriesSelection,
+        ) -> TsinkResult<Vec<MetricSeries>> {
+            let tenant_matcher = selection
+                .matchers
+                .iter()
+                .find(|matcher| matcher.name == TENANT_LABEL)
+                .unwrap_or_else(|| panic!("tenant matcher missing from selection: {selection:?}"));
+            match (&tenant_matcher.op, tenant_matcher.value.as_str()) {
+                (tsink::SeriesMatcherOp::Equal, DEFAULT_TENANT_ID) => {
+                    Ok(vec![Self::scoped_series()])
+                }
+                (tsink::SeriesMatcherOp::RegexNoMatch, UNLABELED_TENANT_FALLBACK_REGEX) => {
+                    Ok(vec![Self::legacy_series()])
+                }
+                _ => panic!("unexpected tenant matcher in selection: {selection:?}"),
+            }
+        }
+    }
+
+    impl Storage for RecordingMetadataStorage {
+        fn insert_rows(&self, _rows: &[Row]) -> TsinkResult<()> {
+            Ok(())
+        }
+
+        fn select(
+            &self,
+            _metric: &str,
+            _labels: &[Label],
+            _start: i64,
+            _end: i64,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            panic!("exact select should not be used in this test");
+        }
+
+        fn select_with_options(
+            &self,
+            _metric: &str,
+            _opts: QueryOptions,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            panic!("select_with_options should not be used in this test");
+        }
+
+        fn select_all(
+            &self,
+            _metric: &str,
+            _start: i64,
+            _end: i64,
+        ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            panic!("unscoped select_all should not be used by tenant reads");
+        }
+
+        fn list_metrics(&self) -> TsinkResult<Vec<MetricSeries>> {
+            panic!("unscoped list_metrics should not be used by tenant reads");
+        }
+
+        fn list_metrics_in_shards(
+            &self,
+            _scope: &MetadataShardScope,
+        ) -> TsinkResult<Vec<MetricSeries>> {
+            panic!("unscoped list_metrics_in_shards should not be used by tenant reads");
+        }
+
+        fn select_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
+            self.select_series_calls
+                .lock()
+                .expect("select_series calls should record")
+                .push(selection.clone());
+            self.series_for_selection(selection)
+        }
+
+        fn select_series_in_shards(
+            &self,
+            selection: &SeriesSelection,
+            scope: &MetadataShardScope,
+        ) -> TsinkResult<Vec<MetricSeries>> {
+            self.select_series_in_shards_calls
+                .lock()
+                .expect("select_series_in_shards calls should record")
+                .push((selection.clone(), scope.clone()));
+            self.series_for_selection(selection)
+        }
+
+        fn select_many(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<SeriesPoints>> {
+            self.select_many_calls
+                .lock()
+                .expect("select_many calls should record")
+                .push((series.to_vec(), start, end));
+            Ok(series
+                .iter()
+                .map(|series| SeriesPoints {
+                    series: series.clone(),
+                    points: vec![DataPoint::new(
+                        start,
+                        if series.labels.iter().any(|label| label.name == TENANT_LABEL) {
+                            2.0
+                        } else {
+                            1.0
+                        },
+                    )],
+                })
+                .collect())
+        }
+
+        fn close(&self) -> TsinkResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tenant_id_for_request_accepts_scope_org_id_header() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/query".to_string(),
+            headers: HashMap::from([(SCOPE_ORG_ID_HEADER.to_string(), "team-b".to_string())]),
+            body: Vec::new(),
+        };
+
+        let tenant_id = tenant_id_for_request(&request).expect("scope org id should resolve");
+        assert_eq!(tenant_id, "team-b");
+    }
+
+    #[test]
+    fn tenant_id_for_request_defaults_when_tenant_headers_are_absent() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/query".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let tenant_id = tenant_id_for_request(&request).expect("default tenant should resolve");
+        assert_eq!(tenant_id, DEFAULT_TENANT_ID);
+    }
+
+    #[test]
+    fn tenant_id_for_request_rejects_conflicting_tenant_headers() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/query".to_string(),
+            headers: HashMap::from([
+                (TENANT_HEADER.to_string(), "team-a".to_string()),
+                (SCOPE_ORG_ID_HEADER.to_string(), "team-b".to_string()),
+            ]),
+            body: Vec::new(),
+        };
+
+        let err =
+            tenant_id_for_request(&request).expect_err("conflicting tenant headers must fail");
+        assert_eq!(
+            err,
+            format!(
+                "{TENANT_HEADER} and {SCOPE_ORG_ID_HEADER} must match when both headers are set"
+            )
+        );
+    }
+
+    #[test]
+    fn read_selections_for_default_tenant_adds_scoped_and_unlabeled_fallback_matchers() {
+        let selection = SeriesSelection::new()
+            .with_metric("cpu_usage")
+            .with_matcher(SeriesMatcher::equal("host", "a"));
+
+        let selections = read_selections_for_tenant(&selection, DEFAULT_TENANT_ID)
+            .expect("default tenant selections should build");
+
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].metric.as_deref(), Some("cpu_usage"));
+        assert!(selections[0]
+            .matchers
+            .contains(&SeriesMatcher::equal("host", "a")));
+        assert!(selections[0]
+            .matchers
+            .contains(&SeriesMatcher::equal(TENANT_LABEL, DEFAULT_TENANT_ID)));
+        assert!(selections[1]
+            .matchers
+            .contains(&SeriesMatcher::equal("host", "a")));
+        assert!(selections[1]
+            .matchers
+            .contains(&SeriesMatcher::regex_no_match(
+                TENANT_LABEL,
+                UNLABELED_TENANT_FALLBACK_REGEX,
+            )));
     }
 
     #[test]
@@ -1844,6 +2200,157 @@ mod tests {
     }
 
     #[test]
+    fn default_tenant_metadata_reads_use_scoped_series_discovery() {
+        let inner = Arc::new(RecordingMetadataStorage::new());
+        let storage: Arc<dyn Storage> = inner.clone();
+        let scoped = scoped_storage(storage, DEFAULT_TENANT_ID);
+        let selection = SeriesSelection::new()
+            .with_metric("cpu_usage")
+            .with_matcher(SeriesMatcher::equal("host", "a"));
+        let scope = MetadataShardScope::new(8, vec![1, 3]);
+
+        let metrics = scoped.list_metrics().expect("list_metrics should succeed");
+        assert_eq!(
+            metrics,
+            vec![
+                MetricSeries {
+                    name: "cpu_usage".to_string(),
+                    labels: vec![Label::new("host", "current")],
+                },
+                MetricSeries {
+                    name: "cpu_usage".to_string(),
+                    labels: vec![Label::new("host", "legacy")],
+                },
+            ]
+        );
+
+        let selected = scoped
+            .select_series(&selection)
+            .expect("select_series should succeed");
+        assert_eq!(selected, metrics);
+
+        let shard_metrics = scoped
+            .list_metrics_in_shards(&scope)
+            .expect("list_metrics_in_shards should succeed");
+        assert_eq!(shard_metrics, metrics);
+
+        let shard_selected = scoped
+            .select_series_in_shards(&selection, &scope)
+            .expect("select_series_in_shards should succeed");
+        assert_eq!(shard_selected, metrics);
+
+        let recorded = inner
+            .select_series_calls
+            .lock()
+            .expect("select_series calls should be readable")
+            .clone();
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(
+            recorded[0],
+            SeriesSelection::new()
+                .with_matcher(SeriesMatcher::equal(TENANT_LABEL, DEFAULT_TENANT_ID,))
+        );
+        assert_eq!(
+            recorded[1],
+            SeriesSelection::new().with_matcher(SeriesMatcher::regex_no_match(
+                TENANT_LABEL,
+                UNLABELED_TENANT_FALLBACK_REGEX,
+            ))
+        );
+        assert!(recorded[2]
+            .matchers
+            .contains(&SeriesMatcher::equal("host", "a")));
+        assert!(recorded[2]
+            .matchers
+            .contains(&SeriesMatcher::equal(TENANT_LABEL, DEFAULT_TENANT_ID)));
+        assert!(recorded[3]
+            .matchers
+            .contains(&SeriesMatcher::equal("host", "a")));
+        assert!(recorded[3]
+            .matchers
+            .contains(&SeriesMatcher::regex_no_match(
+                TENANT_LABEL,
+                UNLABELED_TENANT_FALLBACK_REGEX,
+            )));
+
+        let shard_recorded = inner
+            .select_series_in_shards_calls
+            .lock()
+            .expect("select_series_in_shards calls should be readable")
+            .clone();
+        assert_eq!(shard_recorded.len(), 4);
+        assert_eq!(shard_recorded[0].1, scope);
+        assert_eq!(shard_recorded[1].1, scope);
+        assert_eq!(shard_recorded[2].1, scope);
+        assert_eq!(shard_recorded[3].1, scope);
+    }
+
+    #[test]
+    fn default_tenant_select_all_uses_scoped_series_discovery() {
+        let inner = Arc::new(RecordingMetadataStorage::new());
+        let storage: Arc<dyn Storage> = inner.clone();
+        let scoped = scoped_storage(storage, DEFAULT_TENANT_ID);
+
+        let all = scoped
+            .select_all("cpu_usage", 10, 20)
+            .expect("select_all should succeed");
+
+        assert_eq!(
+            all,
+            vec![
+                (
+                    vec![Label::new("host", "current")],
+                    vec![DataPoint::new(10, 2.0)]
+                ),
+                (
+                    vec![Label::new("host", "legacy")],
+                    vec![DataPoint::new(10, 1.0)]
+                ),
+            ]
+        );
+
+        let recorded_series = inner
+            .select_series_calls
+            .lock()
+            .expect("select_series calls should be readable")
+            .clone();
+        assert_eq!(recorded_series.len(), 2);
+        assert_eq!(
+            recorded_series[0],
+            SeriesSelection::new()
+                .with_metric("cpu_usage")
+                .with_time_range(10, 20)
+                .with_matcher(SeriesMatcher::equal(TENANT_LABEL, DEFAULT_TENANT_ID))
+        );
+        assert_eq!(
+            recorded_series[1],
+            SeriesSelection::new()
+                .with_metric("cpu_usage")
+                .with_time_range(10, 20)
+                .with_matcher(SeriesMatcher::regex_no_match(
+                    TENANT_LABEL,
+                    UNLABELED_TENANT_FALLBACK_REGEX,
+                ))
+        );
+
+        let recorded_points = inner
+            .select_many_calls
+            .lock()
+            .expect("select_many calls should be readable")
+            .clone();
+        assert_eq!(recorded_points.len(), 1);
+        assert_eq!(recorded_points[0].1, 10);
+        assert_eq!(recorded_points[0].2, 20);
+        assert_eq!(
+            recorded_points[0].0,
+            vec![
+                RecordingMetadataStorage::scoped_series(),
+                RecordingMetadataStorage::legacy_series(),
+            ]
+        );
+    }
+
+    #[test]
     fn tenant_registry_enforces_scoped_tokens_and_merges_policies() {
         let registry = TenantRegistry::from_json_str(
             r#"{
@@ -1890,8 +2397,14 @@ mod tests {
             ]),
             body: Vec::new(),
         };
-        let guard = prepare_request(Some(&registry), &request, "team-a", TenantAccessScope::Read)
-            .expect("read token should authorize read");
+        let guard = prepare_request(
+            Some(&registry),
+            None,
+            &request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect("read token should authorize read");
         assert_eq!(guard.policy().max_query_length_bytes, Some(32));
         assert_eq!(guard.policy().max_range_points_per_query, Some(16));
         assert_eq!(
@@ -1909,6 +2422,7 @@ mod tests {
 
         let write_err = prepare_request(
             Some(&registry),
+            None,
             &request,
             "team-a",
             TenantAccessScope::Write,
@@ -1927,6 +2441,7 @@ mod tests {
         };
         let default_guard = prepare_request(
             Some(&registry),
+            None,
             &default_request,
             "dynamic-tenant",
             TenantAccessScope::Read,
@@ -1967,10 +2482,22 @@ mod tests {
         };
         let before = tenant_admission_metrics_snapshot();
 
-        let first = prepare_request(Some(&registry), &request, "team-a", TenantAccessScope::Read)
-            .expect("first read request should acquire permit");
-        let second = prepare_request(Some(&registry), &request, "team-a", TenantAccessScope::Read)
-            .expect_err("second read request should be limited");
+        let first = prepare_request(
+            Some(&registry),
+            None,
+            &request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect("first read request should acquire permit");
+        let second = prepare_request(
+            Some(&registry),
+            None,
+            &request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect_err("second read request should be limited");
         assert!(
             matches!(second, TenantRequestError::TooManyRequests(message) if message.contains("max inflight read requests"))
         );
@@ -1978,8 +2505,14 @@ mod tests {
         assert!(during.read_rejections_total >= before.read_rejections_total.saturating_add(1));
         assert!(during.active_reads >= before.active_reads.saturating_add(1));
         drop(first);
-        prepare_request(Some(&registry), &request, "team-a", TenantAccessScope::Read)
-            .expect("permit should be released after guard drop");
+        prepare_request(
+            Some(&registry),
+            None,
+            &request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect("permit should be released after guard drop");
     }
 
     #[test]
@@ -2008,9 +2541,14 @@ mod tests {
             body: Vec::new(),
         };
 
-        let plan =
-            prepare_request_plan(Some(&registry), &request, "team-a", TenantAccessScope::Read)
-                .expect("tenant request plan should prepare");
+        let plan = prepare_request_plan(
+            Some(&registry),
+            None,
+            &request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect("tenant request plan should prepare");
         assert_eq!(plan.tenant_id(), "team-a");
         let held = plan
             .admit(TenantAdmissionSurface::Query, 1)
@@ -2028,8 +2566,9 @@ mod tests {
             "tenant metadata matcher limit exceeded: 3 > 2",
         );
 
-        let trusted = prepare_trusted_request(Some(&registry), "team-a", TenantAccessScope::Write)
-            .expect("trusted retention request should bypass auth");
+        let trusted =
+            prepare_trusted_request(Some(&registry), None, "team-a", TenantAccessScope::Write)
+                .expect("trusted retention request should bypass auth");
         drop(trusted);
 
         let status = registry
@@ -2051,5 +2590,201 @@ mod tests {
             .iter()
             .any(|decision| decision.surface == "metadata" && decision.outcome == "rejected"));
         drop(held);
+    }
+
+    #[test]
+    fn managed_tenant_request_plan_enforces_lifecycle_query_concurrency_and_ingest_rate() {
+        let control_plane = ManagedControlPlane::open(None).expect("control plane should open");
+        provision_ready_deployment(&control_plane, "prod").expect("deployment should provision");
+        control_plane
+            .apply_tenant(
+                managed_actor(),
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-a".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    display_name: Some("Team A".to_string()),
+                    lifecycle: Some(TenantLifecycleState::Active),
+                    retention_days: None,
+                    storage_limit_bytes: None,
+                    ingest_rate_limit_per_sec: Some(2),
+                    query_concurrency_limit: Some(1),
+                    labels: None,
+                },
+            )
+            .expect("tenant should apply");
+
+        let read_request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/query?query=up".to_string(),
+            headers: HashMap::from([(TENANT_HEADER.to_string(), "team-a".to_string())]),
+            body: Vec::new(),
+        };
+        let read_plan = prepare_request_plan(
+            None,
+            Some(&control_plane),
+            &read_request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect("read plan should prepare");
+        let held_query = read_plan
+            .admit_with_usage(TenantAdmissionSurface::Query, 1, None)
+            .expect("first query should admit");
+        let query_err = read_plan
+            .admit_with_usage(TenantAdmissionSurface::Query, 1, None)
+            .expect_err("second query should be limited");
+        assert!(matches!(
+            query_err,
+            TenantRequestError::Rejected {
+                status: 429,
+                code: "tenant_managed_query_concurrency_limit_exceeded",
+                ..
+            }
+        ));
+        drop(held_query);
+
+        let usage_accounting = UsageAccounting::open(None).expect("usage store should open");
+        let write_request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/write".to_string(),
+            headers: HashMap::from([(TENANT_HEADER.to_string(), "team-a".to_string())]),
+            body: Vec::new(),
+        };
+        let write_plan = prepare_request_plan(
+            None,
+            Some(&control_plane),
+            &write_request,
+            "team-a",
+            TenantAccessScope::Write,
+        )
+        .expect("write plan should prepare");
+        let _first_write = write_plan
+            .admit_with_usage(
+                TenantAdmissionSurface::Ingest,
+                2,
+                Some(usage_accounting.as_ref()),
+            )
+            .expect("first ingest should admit");
+        let ingest_err = write_plan
+            .admit_with_usage(
+                TenantAdmissionSurface::Ingest,
+                1,
+                Some(usage_accounting.as_ref()),
+            )
+            .expect_err("second ingest should exceed the managed per-second rate");
+        assert!(matches!(
+            ingest_err,
+            TenantRequestError::Rejected {
+                status: 429,
+                code: "tenant_managed_ingest_rate_limit_exceeded",
+                ..
+            }
+        ));
+
+        control_plane
+            .apply_tenant_lifecycle(
+                managed_actor(),
+                ManagedTenantLifecycleRequest {
+                    tenant_id: "team-a".to_string(),
+                    lifecycle: TenantLifecycleState::Suspended,
+                    note: Some("billing".to_string()),
+                },
+            )
+            .expect("tenant lifecycle should update");
+
+        let suspended_err = prepare_request_plan(
+            None,
+            Some(&control_plane),
+            &read_request,
+            "team-a",
+            TenantAccessScope::Read,
+        )
+        .expect_err("suspended tenant should be rejected before admission");
+        assert!(matches!(
+            suspended_err,
+            TenantRequestError::Rejected {
+                status: 403,
+                code: "tenant_managed_lifecycle_blocked",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_tenant_request_plan_enforces_storage_limit() {
+        let control_plane = ManagedControlPlane::open(None).expect("control plane should open");
+        provision_ready_deployment(&control_plane, "prod").expect("deployment should provision");
+        control_plane
+            .apply_tenant(
+                managed_actor(),
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-b".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    display_name: Some("Team B".to_string()),
+                    lifecycle: Some(TenantLifecycleState::Active),
+                    retention_days: None,
+                    storage_limit_bytes: Some(128),
+                    ingest_rate_limit_per_sec: None,
+                    query_concurrency_limit: None,
+                    labels: None,
+                },
+            )
+            .expect("tenant should apply");
+
+        let usage_accounting = UsageAccounting::open(None).expect("usage store should open");
+        let storage_record = UsageRecordInput {
+            tenant_id: "team-b",
+            category: UsageCategory::Storage,
+            operation: "reconcile_storage",
+            source: "test",
+            status: "success",
+            request_units: 0,
+            result_units: 0,
+            rows: 0,
+            metadata_updates: 0,
+            exemplars_accepted: 0,
+            exemplars_dropped: 0,
+            histogram_series: 0,
+            matched_series: 0,
+            tombstones_applied: 0,
+            duration_nanos: 0,
+            request_bytes: 0,
+            logical_storage_series: 1,
+            logical_storage_samples: 8,
+            logical_storage_bytes: 128,
+        };
+        usage_accounting
+            .record(storage_record)
+            .expect("storage snapshot should record");
+
+        let write_request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/write".to_string(),
+            headers: HashMap::from([(TENANT_HEADER.to_string(), "team-b".to_string())]),
+            body: Vec::new(),
+        };
+        let write_plan = prepare_request_plan(
+            None,
+            Some(&control_plane),
+            &write_request,
+            "team-b",
+            TenantAccessScope::Write,
+        )
+        .expect("write plan should prepare");
+        let storage_err = write_plan
+            .admit_with_usage(
+                TenantAdmissionSurface::Ingest,
+                1,
+                Some(usage_accounting.as_ref()),
+            )
+            .expect_err("write should be rejected once the managed storage cap is reached");
+        assert!(matches!(
+            storage_err,
+            TenantRequestError::Rejected {
+                status: 413,
+                code: "tenant_managed_storage_limit_exceeded",
+                ..
+            }
+        ));
     }
 }
