@@ -81,14 +81,6 @@ impl StringDictionary {
             .enumerate()
             .map(|(idx, value)| (idx as DictionaryId, value.as_str()))
     }
-
-    fn truncate(&mut self, len: usize) {
-        while self.by_id.len() > len {
-            if let Some(value) = self.by_id.pop() {
-                self.by_value.remove(&value);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -101,14 +93,6 @@ pub struct SeriesRegistry {
     by_id: HashMap<SeriesId, SeriesDefinition>,
     metric_postings: HashMap<DictionaryId, BTreeSet<SeriesId>>,
     postings: BTreeMap<LabelPairId, BTreeSet<SeriesId>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RegistryCheckpoint {
-    next_series_id: SeriesId,
-    metric_dict_len: usize,
-    label_name_dict_len: usize,
-    label_value_dict_len: usize,
 }
 
 pub(crate) fn validate_metric(metric: &str) -> Result<()> {
@@ -223,20 +207,7 @@ impl SeriesRegistry {
         Ok(resolutions)
     }
 
-    pub(crate) fn checkpoint(&self) -> RegistryCheckpoint {
-        RegistryCheckpoint {
-            next_series_id: self.next_series_id,
-            metric_dict_len: self.metric_dict.len(),
-            label_name_dict_len: self.label_name_dict.len(),
-            label_value_dict_len: self.label_value_dict.len(),
-        }
-    }
-
-    pub(crate) fn rollback_created_series(
-        &mut self,
-        created: &[SeriesResolution],
-        checkpoint: RegistryCheckpoint,
-    ) {
+    pub(crate) fn rollback_created_series(&mut self, created: &[SeriesResolution]) {
         if created.is_empty() {
             return;
         }
@@ -271,13 +242,6 @@ impl SeriesRegistry {
                 }
             }
         }
-
-        self.next_series_id = checkpoint.next_series_id;
-        self.metric_dict.truncate(checkpoint.metric_dict_len);
-        self.label_name_dict
-            .truncate(checkpoint.label_name_dict_len);
-        self.label_value_dict
-            .truncate(checkpoint.label_value_dict_len);
     }
 
     pub fn register_series_with_id(
@@ -665,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_created_series_restores_checkpointed_metadata() {
+    fn rollback_created_series_removes_series_without_rewinding_ids_or_dictionaries() {
         let mut registry = SeriesRegistry::new();
         registry
             .resolve_or_insert("cpu", &[Label::new("host", "a")])
@@ -675,7 +639,6 @@ mod tests {
         let baseline_metric_dict_len = registry.metric_dictionary_len();
         let baseline_label_name_dict_len = registry.label_name_dictionary_len();
         let baseline_label_value_dict_len = registry.label_value_dictionary_len();
-        let checkpoint = registry.checkpoint();
 
         let phantom_labels = vec![Label::new("zone", "use1"), Label::new("env", "prod")];
         let created = registry
@@ -686,21 +649,20 @@ mod tests {
             .resolve_existing("phantom_metric", &phantom_labels)
             .is_some());
 
-        registry.rollback_created_series(&[created], checkpoint);
+        registry.rollback_created_series(&[created.clone()]);
 
         assert_eq!(registry.series_count(), baseline_series);
-        assert_eq!(registry.metric_dictionary_len(), baseline_metric_dict_len);
-        assert_eq!(
-            registry.label_name_dictionary_len(),
-            baseline_label_name_dict_len
-        );
-        assert_eq!(
-            registry.label_value_dictionary_len(),
-            baseline_label_value_dict_len
-        );
+        assert!(registry.metric_dictionary_len() >= baseline_metric_dict_len);
+        assert!(registry.label_name_dictionary_len() >= baseline_label_name_dict_len);
+        assert!(registry.label_value_dictionary_len() >= baseline_label_value_dict_len);
         assert!(registry
             .resolve_existing("phantom_metric", &phantom_labels)
             .is_none());
+
+        let next = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "b")])
+            .unwrap();
+        assert!(next.series_id > created.series_id);
     }
 
     #[test]

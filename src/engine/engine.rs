@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use rayon::prelude::*;
 
 use crate::concurrency::Semaphore;
@@ -37,6 +38,7 @@ const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PARTITION_DURATION: Duration = Duration::from_secs(3600);
 const DEFAULT_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 const IN_MEMORY_SHARD_COUNT: usize = 64;
+const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
 
 #[derive(Debug, Clone, Copy)]
 struct ChunkStorageOptions {
@@ -215,7 +217,7 @@ const WAL_DIR_NAME: &str = "wal";
 
 pub struct ChunkStorage {
     registry: RwLock<SeriesRegistry>,
-    registry_write_txn: Mutex<()>,
+    registry_write_txn_shards: [Mutex<()>; REGISTRY_TXN_SHARD_COUNT],
     active_builders: [RwLock<HashMap<SeriesId, ActiveSeriesState>>; IN_MEMORY_SHARD_COUNT],
     sealed_chunks:
         [RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>; IN_MEMORY_SHARD_COUNT],
@@ -305,7 +307,7 @@ impl ChunkStorage {
 
         Self {
             registry: RwLock::new(SeriesRegistry::new()),
-            registry_write_txn: Mutex::new(()),
+            registry_write_txn_shards: std::array::from_fn(|_| Mutex::new(())),
             active_builders: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             sealed_chunks: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             persisted_chunk_refs: RwLock::new(HashMap::new()),
@@ -333,6 +335,25 @@ impl ChunkStorage {
 
     fn series_shard_idx(series_id: SeriesId) -> usize {
         (series_id % IN_MEMORY_SHARD_COUNT as u64) as usize
+    }
+
+    fn registry_metric_shard_idx(metric: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        metric.hash(&mut hasher);
+        (hasher.finish() as usize) % REGISTRY_TXN_SHARD_COUNT
+    }
+
+    fn lock_registry_write_shards_for_rows<'a>(&'a self, rows: &[Row]) -> Vec<MutexGuard<'a, ()>> {
+        let mut shard_idxs = BTreeSet::new();
+        for row in rows {
+            shard_idxs.insert(Self::registry_metric_shard_idx(row.metric()));
+        }
+
+        let mut guards = Vec::with_capacity(shard_idxs.len());
+        for shard_idx in shard_idxs {
+            guards.push(self.registry_write_txn_shards[shard_idx].lock());
+        }
+        guards
     }
 
     fn active_shard(&self, series_id: SeriesId) -> &RwLock<HashMap<SeriesId, ActiveSeriesState>> {
@@ -1158,17 +1179,16 @@ impl Storage for ChunkStorage {
         // A write may pass the first lifecycle check and then block on permits while close starts.
         // Re-check after acquiring a permit so shutdown cannot race new writes through.
         self.ensure_open()?;
-        // Preserve checkpoint-based registry rollback semantics while allowing readers to proceed
-        // during WAL and ingestion work.
-        let _registry_write_txn = self.registry_write_txn.lock();
+        // Serialize writers that touch the same metric shard while allowing unrelated metrics
+        // to progress concurrently through WAL and ingestion work.
+        let _registry_write_txn_shards = self.lock_registry_write_shards_for_rows(rows);
 
         let mut pending_points = Vec::with_capacity(rows.len());
         let mut new_series_defs = Vec::new();
         let mut reserved_series = Vec::new();
         let mut created_series = Vec::<SeriesResolution>::new();
-        let registry_checkpoint = {
+        {
             let mut registry = self.registry.write();
-            let registry_checkpoint = registry.checkpoint();
 
             if let Err(err) = (|| -> Result<()> {
                 for row in rows {
@@ -1194,11 +1214,10 @@ impl Storage for ChunkStorage {
                 }
                 Ok(())
             })() {
-                registry.rollback_created_series(&created_series, registry_checkpoint);
+                registry.rollback_created_series(&created_series);
                 return Err(err);
             }
-            registry_checkpoint
-        };
+        }
 
         let write_result = (|| -> Result<()> {
             for point in &pending_points {
@@ -1226,7 +1245,7 @@ impl Storage for ChunkStorage {
         if let Err(err) = write_result {
             self.rollback_empty_series_lane_reservations(&reserved_series);
             let mut registry = self.registry.write();
-            registry.rollback_created_series(&created_series, registry_checkpoint);
+            registry.rollback_created_series(&created_series);
             return Err(err);
         }
 
@@ -2185,6 +2204,104 @@ mod tests {
 
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn writer_waiting_on_one_metric_shard_does_not_block_other_metric_shards() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::thread;
+
+        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(2),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            },
+        ));
+        let labels = vec![Label::new("host", "a")];
+        let metric_a = "registry_shard_metric_a";
+        let metric_a_shard = ChunkStorage::registry_metric_shard_idx(metric_a);
+        let metric_b = (0..1024)
+            .map(|idx| format!("registry_shard_metric_b_{idx}"))
+            .find(|candidate| ChunkStorage::registry_metric_shard_idx(candidate) != metric_a_shard)
+            .expect("expected to find a metric mapped to a different registry shard");
+
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric_a,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric_b.as_str(),
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+
+        let series_a = storage
+            .registry
+            .read()
+            .resolve_existing(metric_a, &labels)
+            .unwrap()
+            .series_id;
+        let active_shard_a = ChunkStorage::series_shard_idx(series_a);
+        let active_read_guard = storage.active_builders[active_shard_a].read();
+
+        let writer_a_storage = Arc::clone(&storage);
+        let writer_a_labels = labels.clone();
+        let writer_a_metric = metric_a.to_string();
+        let (writer_a_tx, writer_a_rx) = mpsc::channel();
+        let writer_a = thread::spawn(move || {
+            let result = writer_a_storage.insert_rows(&[Row::with_labels(
+                writer_a_metric.as_str(),
+                writer_a_labels,
+                DataPoint::new(2, 2.0),
+            )]);
+            writer_a_tx.send(result).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(75));
+
+        let writer_b_storage = Arc::clone(&storage);
+        let writer_b_labels = labels.clone();
+        let writer_b_metric = metric_b.clone();
+        let (writer_b_tx, writer_b_rx) = mpsc::channel();
+        let writer_b = thread::spawn(move || {
+            let result = writer_b_storage.insert_rows(&[Row::with_labels(
+                writer_b_metric.as_str(),
+                writer_b_labels,
+                DataPoint::new(2, 2.0),
+            )]);
+            writer_b_tx.send(result).unwrap();
+        });
+
+        let writer_b_result = writer_b_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("writer on a different metric shard should not block");
+        assert!(writer_b_result.is_ok());
+        assert!(writer_a_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+
+        drop(active_read_guard);
+
+        let writer_a_result = writer_a_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(writer_a_result.is_ok());
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
     }
 
     #[test]
