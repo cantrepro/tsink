@@ -32,7 +32,7 @@ Add tsink to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsink = "0.1.0"
+tsink = "0.2.0"
 ```
 
 ## Quick Start
