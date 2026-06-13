@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tracing::warn;
 
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
-use crate::engine::encoder::{EncodedChunk, TrialEncoder};
+use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::series_registry::SeriesId;
 use crate::wal::WalSyncMode;
 use crate::{Label, Result, TsinkError};
@@ -47,7 +47,7 @@ impl SamplesBatchFrame {
         lane: ValueLane,
         points: &[ChunkPoint],
     ) -> Result<Self> {
-        let encoded = TrialEncoder::encode_chunk_points(points, lane)?;
+        let encoded = Encoder::encode_chunk_points(points, lane)?;
         let (ts_payload, value_payload) = split_encoded_payload(&encoded.payload)?;
 
         let base_ts = points.first().map(|point| point.ts).ok_or_else(|| {
@@ -80,7 +80,7 @@ impl SamplesBatchFrame {
             payload,
         };
 
-        let points = TrialEncoder::decode_chunk_points(&encoded)?;
+        let points = Encoder::decode_chunk_points(&encoded)?;
         if points.first().map(|point| point.ts) != Some(self.base_ts) {
             return Err(TsinkError::DataCorruption(
                 "WAL batch base_ts does not match decoded timestamps".to_string(),

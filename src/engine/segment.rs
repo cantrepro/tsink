@@ -1566,7 +1566,7 @@ mod tests {
 
     use super::{SegmentWriter, load_segments};
     use crate::engine::chunk::{Chunk, ChunkPoint, ValueLane};
-    use crate::engine::encoder::TrialEncoder;
+    use crate::engine::encoder::Encoder;
     use crate::engine::series_registry::SeriesRegistry;
     use crate::{Label, Value};
 
@@ -1589,7 +1589,7 @@ mod tests {
                 value: Value::F64(2.0),
             },
         ];
-        let encoded = TrialEncoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
         let chunk = Chunk {
             header: crate::engine::chunk::ChunkHeader {
                 series_id: series.series_id,

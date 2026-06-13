@@ -1,7 +1,7 @@
 use crate::{DataPoint, Label, Result};
 
 use super::chunk::Chunk;
-use super::encoder::{EncodedChunk, TrialEncoder};
+use super::encoder::{EncodedChunk, Encoder};
 use super::series_registry::SeriesId;
 
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ pub fn decode_chunk_points_in_range_into(
     out: &mut Vec<DataPoint>,
 ) -> Result<()> {
     if chunk.points.is_empty() && !chunk.encoded_payload.is_empty() {
-        let decoded = TrialEncoder::decode_chunk_points(&EncodedChunk {
+        let decoded = Encoder::decode_chunk_points(&EncodedChunk {
             lane: chunk.header.lane,
             ts_codec: chunk.header.ts_codec,
             value_codec: chunk.header.value_codec,
@@ -163,7 +163,7 @@ mod tests {
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
-    use crate::engine::encoder::TrialEncoder;
+    use crate::engine::encoder::Encoder;
 
     #[test]
     fn chunk_cursor_binary_searches_range() {
@@ -201,7 +201,7 @@ mod tests {
             },
         ];
 
-        let encoded = TrialEncoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
         let chunk = Chunk {
             header: ChunkHeader {
                 series_id: 7,

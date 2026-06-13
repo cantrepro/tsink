@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
-use crate::engine::encoder::{EncodedChunk, TrialEncoder};
+use crate::engine::encoder::{EncodedChunk, Encoder};
 use crate::engine::segment::{
     LoadedSegment, PersistedSeries, SegmentWriter, load_segments, load_segments_for_level,
 };
@@ -169,7 +169,7 @@ fn repack_chunks(mut chunks_by_series: SeriesChunks, point_cap: usize) -> Result
                 continue;
             }
 
-            let encoded = TrialEncoder::encode_chunk_points(points, lane)?;
+            let encoded = Encoder::encode_chunk_points(points, lane)?;
             let point_count = u16::try_from(points.len()).map_err(|_| {
                 TsinkError::InvalidConfiguration(
                     "compacted chunk point_count exceeds u16".to_string(),
@@ -228,7 +228,7 @@ fn decode_chunk_points_for_compaction(chunk: &Chunk) -> Result<Vec<ChunkPoint>> 
         return Ok(Vec::new());
     }
 
-    TrialEncoder::decode_chunk_points(&EncodedChunk {
+    Encoder::decode_chunk_points(&EncodedChunk {
         lane: chunk.header.lane,
         ts_codec: chunk.header.ts_codec,
         value_codec: chunk.header.value_codec,
@@ -299,7 +299,7 @@ mod tests {
 
     use super::Compactor;
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
-    use crate::engine::encoder::TrialEncoder;
+    use crate::engine::encoder::Encoder;
     use crate::engine::segment::{SegmentWriter, load_segments, load_segments_for_level};
     use crate::engine::series_registry::SeriesRegistry;
     use crate::{Label, Value};
@@ -360,7 +360,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let encoded = TrialEncoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
 
         Chunk {
             header: ChunkHeader {

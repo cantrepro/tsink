@@ -20,9 +20,9 @@ enum ValueFamily {
     Blob,
 }
 
-pub struct TrialEncoder;
+pub struct Encoder;
 
-impl TrialEncoder {
+impl Encoder {
     pub fn choose_lane(points: &[DataPoint]) -> ValueLane {
         if points
             .iter()
@@ -980,7 +980,7 @@ fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
 
 #[cfg(test)]
 mod tests {
-    use super::TrialEncoder;
+    use super::Encoder;
     use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
     use crate::{DataPoint, Value};
 
@@ -1000,7 +1000,7 @@ mod tests {
             .collect::<Vec<_>>();
         let points = chunk_points(&timestamps, values);
 
-        let encoded = TrialEncoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
         assert_eq!(encoded.ts_codec, TimestampCodecId::FixedStepRle);
     }
 
@@ -1011,7 +1011,7 @@ mod tests {
             vec![Value::I64(7), Value::I64(7), Value::I64(7), Value::I64(7)],
         );
 
-        let encoded = TrialEncoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
         assert_eq!(encoded.value_codec, ValueCodecId::ConstantRle);
     }
 
@@ -1024,8 +1024,8 @@ mod tests {
             DataPoint::new(8, -0.25),
         ];
 
-        let encoded = TrialEncoder::encode(&points).unwrap();
-        let decoded = TrialEncoder::decode(&encoded).unwrap();
+        let encoded = Encoder::encode(&points).unwrap();
+        let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
     }
 
@@ -1038,8 +1038,8 @@ mod tests {
             DataPoint::new(18, Value::I64(2)),
         ];
 
-        let encoded = TrialEncoder::encode(&points).unwrap();
-        let decoded = TrialEncoder::decode(&encoded).unwrap();
+        let encoded = Encoder::encode(&points).unwrap();
+        let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
     }
 
@@ -1052,8 +1052,8 @@ mod tests {
             DataPoint::new(108, Value::U64(1900)),
         ];
 
-        let encoded = TrialEncoder::encode(&points).unwrap();
-        let decoded = TrialEncoder::decode(&encoded).unwrap();
+        let encoded = Encoder::encode(&points).unwrap();
+        let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
     }
 
@@ -1067,8 +1067,8 @@ mod tests {
             DataPoint::new(5, Value::Bool(true)),
         ];
 
-        let encoded = TrialEncoder::encode(&points).unwrap();
-        let decoded = TrialEncoder::decode(&encoded).unwrap();
+        let encoded = Encoder::encode(&points).unwrap();
+        let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
     }
 
@@ -1081,10 +1081,10 @@ mod tests {
             DataPoint::new(4, Value::String("longer-payload".to_string())),
         ];
 
-        let encoded = TrialEncoder::encode(&points).unwrap();
+        let encoded = Encoder::encode(&points).unwrap();
         assert_eq!(encoded.value_codec, ValueCodecId::BytesDeltaBlock);
 
-        let decoded = TrialEncoder::decode(&encoded).unwrap();
+        let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
     }
 }

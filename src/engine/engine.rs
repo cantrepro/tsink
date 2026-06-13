@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use crate::concurrency::Semaphore;
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
 use crate::engine::compactor::Compactor;
-use crate::engine::encoder::TrialEncoder;
+use crate::engine::encoder::Encoder;
 use crate::engine::query::{ChunkSeriesCursor, decode_chunk_points_in_range_into};
 use crate::engine::segment::{SegmentWriter, load_segments};
 use crate::engine::series_registry::{SeriesId, SeriesRegistry, validate_labels, validate_metric};
@@ -140,7 +140,7 @@ impl ActiveSeriesState {
         // Preserve a monotonic timestamp stream per chunk for better timestamp codec density.
         chunk.points.sort_by_key(|point| point.ts);
 
-        let encoded = TrialEncoder::encode_chunk_points(&chunk.points, self.lane)?;
+        let encoded = Encoder::encode_chunk_points(&chunk.points, self.lane)?;
         chunk.header.ts_codec = encoded.ts_codec;
         chunk.header.value_codec = encoded.value_codec;
         chunk.encoded_payload = encoded.payload;
@@ -612,7 +612,7 @@ impl ChunkStorage {
                 chunk_points.insert(0, existing_point.clone());
             }
 
-            TrialEncoder::validate_chunk_points(chunk_points, *lane)?;
+            Encoder::validate_chunk_points(chunk_points, *lane)?;
         }
         Ok(())
     }
@@ -1254,7 +1254,7 @@ mod tests {
     use crate::engine::chunk::{
         Chunk, ChunkHeader, ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane,
     };
-    use crate::engine::encoder::TrialEncoder;
+    use crate::engine::encoder::Encoder;
     use crate::engine::segment::SegmentWriter;
     use crate::engine::series_registry::SeriesRegistry;
     use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
@@ -2356,7 +2356,7 @@ mod tests {
                 value: Value::F64(*value),
             })
             .collect::<Vec<_>>();
-        let encoded = TrialEncoder::encode_chunk_points(&chunk_points, ValueLane::Numeric).unwrap();
+        let encoded = Encoder::encode_chunk_points(&chunk_points, ValueLane::Numeric).unwrap();
 
         Chunk {
             header: ChunkHeader {
