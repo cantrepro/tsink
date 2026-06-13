@@ -578,7 +578,7 @@ fn encode_values_constant_rle(points: &[ChunkPoint]) -> Option<Vec<u8>> {
 }
 
 fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(points.len() * 8);
+    let mut out = Vec::with_capacity(points.len().saturating_mul(8));
     let mut prev = match points.first() {
         Some(ChunkPoint {
             value: Value::F64(v),
@@ -595,6 +595,15 @@ fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
 
     out.extend_from_slice(&prev.to_le_bytes());
 
+    if points.len() <= 1 {
+        return Ok(out);
+    }
+
+    let mut writer = BitWriter::with_capacity(points.len().saturating_mul(2));
+    let mut prev_leading = 0u8;
+    let mut prev_trailing = 0u8;
+    let mut has_prev_window = false;
+
     for point in points.iter().skip(1) {
         let Value::F64(v) = &point.value else {
             return Err(TsinkError::ValueTypeMismatch {
@@ -605,9 +614,38 @@ fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
 
         let bits = v.to_bits();
         let xor = bits ^ prev;
-        out.extend_from_slice(&xor.to_le_bytes());
+
+        if xor == 0 {
+            writer.write_bit(false);
+            prev = bits;
+            continue;
+        }
+
+        writer.write_bit(true);
+        let leading = (xor.leading_zeros() as u8).min(31);
+        let trailing = xor.trailing_zeros() as u8;
+        let can_reuse = has_prev_window && leading >= prev_leading && trailing >= prev_trailing;
+
+        if can_reuse {
+            writer.write_bit(false);
+            let meaningful = 64u8.saturating_sub(prev_leading + prev_trailing);
+            writer.write_bits(xor >> prev_trailing, meaningful);
+        } else {
+            writer.write_bit(true);
+            let meaningful = 64u8.saturating_sub(leading + trailing);
+            writer.write_bits(u64::from(leading), 5);
+            let encoded_len = if meaningful == 64 { 0 } else { meaningful };
+            writer.write_bits(u64::from(encoded_len), 6);
+            writer.write_bits(xor >> trailing, meaningful);
+            prev_leading = leading;
+            prev_trailing = trailing;
+            has_prev_window = true;
+        }
+
         prev = bits;
     }
+
+    out.extend_from_slice(&writer.finish());
 
     Ok(out)
 }
@@ -814,32 +852,7 @@ fn decode_values_constant_rle_range(
 }
 
 fn decode_values_f64_xor(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
-    if point_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let expected_len = point_count.saturating_mul(8);
-    if payload.len() != expected_len {
-        return Err(TsinkError::DataCorruption(format!(
-            "f64 xor payload length mismatch: expected {expected_len}, got {}",
-            payload.len()
-        )));
-    }
-
-    let mut out = Vec::with_capacity(point_count);
-    let mut prev = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
-    out.push(Value::F64(f64::from_bits(prev)));
-
-    for idx in 1..point_count {
-        let start = idx * 8;
-        let end = start + 8;
-        let xor = u64::from_le_bytes(payload[start..end].try_into().unwrap_or([0; 8]));
-        let bits = prev ^ xor;
-        out.push(Value::F64(f64::from_bits(bits)));
-        prev = bits;
-    }
-
-    Ok(out)
+    decode_values_f64_xor_in_range(payload, point_count, 0, point_count)
 }
 
 fn decode_values_f64_xor_range(
@@ -848,33 +861,85 @@ fn decode_values_f64_xor_range(
     start_idx: usize,
     end_idx: usize,
 ) -> Result<Vec<Value>> {
+    decode_values_f64_xor_in_range(payload, point_count, start_idx, end_idx)
+}
+
+fn decode_values_f64_xor_in_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
     if point_count == 0 || start_idx >= end_idx {
         return Ok(Vec::new());
     }
-
-    let expected_len = point_count.saturating_mul(8);
-    if payload.len() != expected_len {
-        return Err(TsinkError::DataCorruption(format!(
-            "f64 xor payload length mismatch: expected {expected_len}, got {}",
-            payload.len()
-        )));
+    if payload.len() < 8 {
+        return Err(TsinkError::DataCorruption(
+            "f64 xor payload missing first value".to_string(),
+        ));
     }
 
     let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx));
-    let mut prev = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+    let mut pos = 0usize;
+    let mut prev = read_u64(payload, &mut pos)?;
     if start_idx == 0 {
         out.push(Value::F64(f64::from_bits(prev)));
     }
 
+    if point_count == 1 {
+        if payload.len() != pos {
+            return Err(TsinkError::DataCorruption(
+                "f64 xor payload has trailing bytes".to_string(),
+            ));
+        }
+        return Ok(out);
+    }
+
+    let mut reader = BitReader::new(&payload[pos..]);
+    let mut prev_leading = 0u8;
+    let mut prev_trailing = 0u8;
+    let mut has_prev_window = false;
+
     for idx in 1..end_idx {
-        let start = idx * 8;
-        let end = start + 8;
-        let xor = u64::from_le_bytes(payload[start..end].try_into().unwrap_or([0; 8]));
-        let bits = prev ^ xor;
+        let bits = if !reader.read_bit()? {
+            prev
+        } else {
+            let xor = if !reader.read_bit()? {
+                if !has_prev_window {
+                    return Err(TsinkError::DataCorruption(
+                        "f64 xor payload reused window before initialization".to_string(),
+                    ));
+                }
+                let meaningful = 64u8.saturating_sub(prev_leading + prev_trailing);
+                let significant = reader.read_bits(meaningful)?;
+                significant << prev_trailing
+            } else {
+                let leading = reader.read_bits(5)? as u8;
+                let encoded_len = reader.read_bits(6)? as u8;
+                let meaningful = if encoded_len == 0 { 64 } else { encoded_len };
+                if leading + meaningful > 64 {
+                    return Err(TsinkError::DataCorruption(
+                        "f64 xor payload has invalid significant-bit window".to_string(),
+                    ));
+                }
+                let trailing = 64u8.saturating_sub(leading + meaningful);
+                let significant = reader.read_bits(meaningful)?;
+                prev_leading = leading;
+                prev_trailing = trailing;
+                has_prev_window = true;
+                significant << trailing
+            };
+            prev ^ xor
+        };
+
         if idx >= start_idx {
             out.push(Value::F64(f64::from_bits(bits)));
         }
         prev = bits;
+    }
+
+    if end_idx == point_count {
+        reader.ensure_terminated()?;
     }
 
     Ok(out)
@@ -1365,9 +1430,104 @@ fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
     Ok(slice)
 }
 
+struct BitWriter {
+    bytes: Vec<u8>,
+    bit_in_byte: u8,
+}
+
+impl BitWriter {
+    fn with_capacity(bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            bit_in_byte: 0,
+        }
+    }
+
+    fn write_bit(&mut self, bit: bool) {
+        if self.bit_in_byte == 0 {
+            self.bytes.push(0);
+        }
+        if bit {
+            let byte_idx = self.bytes.len().saturating_sub(1);
+            self.bytes[byte_idx] |= 1 << (7 - self.bit_in_byte);
+        }
+        self.bit_in_byte = (self.bit_in_byte + 1) % 8;
+    }
+
+    fn write_bits(&mut self, bits: u64, bit_count: u8) {
+        let bit_count = usize::from(bit_count);
+        for shift in (0..bit_count).rev() {
+            self.write_bit(((bits >> shift) & 1) != 0);
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Result<bool> {
+        if self.bit_pos >= self.bytes.len().saturating_mul(8) {
+            return Err(TsinkError::DataCorruption(
+                "f64 xor payload is truncated while reading bits".to_string(),
+            ));
+        }
+
+        let byte_idx = self.bit_pos / 8;
+        let bit_in_byte = self.bit_pos % 8;
+        self.bit_pos += 1;
+
+        Ok(((self.bytes[byte_idx] >> (7 - bit_in_byte)) & 1) != 0)
+    }
+
+    fn read_bits(&mut self, bit_count: u8) -> Result<u64> {
+        let mut out = 0u64;
+        for _ in 0..bit_count {
+            out <<= 1;
+            if self.read_bit()? {
+                out |= 1;
+            }
+        }
+        Ok(out)
+    }
+
+    fn ensure_terminated(&self) -> Result<()> {
+        let consumed_bytes = self.bit_pos.div_ceil(8);
+        if consumed_bytes != self.bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "f64 xor payload has trailing bytes".to_string(),
+            ));
+        }
+
+        for bit in self.bit_pos..self.bytes.len().saturating_mul(8) {
+            let byte_idx = bit / 8;
+            let bit_in_byte = bit % 8;
+            if ((self.bytes[byte_idx] >> (7 - bit_in_byte)) & 1) != 0 {
+                return Err(TsinkError::DataCorruption(
+                    "f64 xor payload has non-zero trailing padding bits".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Encoder;
+    use super::{
+        decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor, Encoder,
+    };
     use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
     use crate::{DataPoint, TsinkError, Value};
 
@@ -1414,6 +1574,53 @@ mod tests {
         let encoded = Encoder::encode(&points).unwrap();
         let decoded = Encoder::decode(&encoded).unwrap();
         assert_eq!(decoded, points);
+    }
+
+    #[test]
+    fn gorilla_f64_bitpacking_reduces_payload_for_smooth_series() {
+        let mut bits = 1_000.0f64.to_bits();
+        let values = (0..256)
+            .map(|idx| {
+                if idx > 0 {
+                    bits = bits.wrapping_add(1);
+                }
+                Value::F64(f64::from_bits(bits))
+            })
+            .collect::<Vec<_>>();
+        let timestamps = (0..256).map(|idx| idx as i64).collect::<Vec<_>>();
+        let points = chunk_points(&timestamps, values);
+
+        let payload = encode_values_f64_xor(&points).unwrap();
+        assert!(
+            payload.len() < points.len().saturating_mul(8),
+            "expected Gorilla bitpacking to beat raw 8-byte/value XOR, got {} bytes for {} values",
+            payload.len(),
+            points.len()
+        );
+
+        let decoded = decode_values_f64_xor(&payload, points.len()).unwrap();
+        let expected = points
+            .iter()
+            .map(|point| point.value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn gorilla_f64_range_decode_matches_full_decode_slice() {
+        let values = (0..128)
+            .map(|idx| Value::F64(1_000.0 + (idx as f64) * 0.25))
+            .collect::<Vec<_>>();
+        let timestamps = (0..128).map(|idx| idx as i64).collect::<Vec<_>>();
+        let points = chunk_points(&timestamps, values);
+
+        let payload = encode_values_f64_xor(&points).unwrap();
+        let full = decode_values_f64_xor(&payload, points.len()).unwrap();
+        let start = 11usize;
+        let end = 97usize;
+        let ranged = decode_values_f64_xor_range(&payload, points.len(), start, end).unwrap();
+
+        assert_eq!(ranged, full[start..end].to_vec());
     }
 
     #[test]
