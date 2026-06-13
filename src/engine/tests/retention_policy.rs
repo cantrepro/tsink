@@ -8,6 +8,20 @@ fn current_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+fn wait_for_condition<F>(timeout: Duration, poll_interval: Duration, condition: F) -> bool
+where
+    F: Fn() -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(poll_interval);
+    }
+    condition()
+}
+
 fn chunk_storage_at_time(now: i64, retention_window: i64) -> ChunkStorage {
     ChunkStorage::new_with_data_path_and_options(
         8,
@@ -1829,16 +1843,6 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
     );
 
-    let warm_lane = object_store_dir.path().join("warm").join(NUMERIC_LANE_ROOT);
-    write_numeric_segment(
-        &warm_lane,
-        &registry,
-        series_id,
-        0,
-        2,
-        &[(30, 30.0), (31, 31.0)],
-    );
-
     let invalid_segment_root = object_store_dir
         .path()
         .join("cold")
@@ -1850,12 +1854,36 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
     // deterministically, which keeps the visible catalog stale until the retry succeeds.
     std::fs::create_dir_all(&invalid_segment_root).unwrap();
 
-    std::thread::sleep(Duration::from_millis(5));
+    let warm_lane = object_store_dir.path().join("warm").join(NUMERIC_LANE_ROOT);
+    write_numeric_segment(
+        &warm_lane,
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(30, 30.0), (31, 31.0)],
+    );
+
+    let expected_stale_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+    assert!(
+        wait_for_condition(Duration::from_secs(1), Duration::from_millis(5), || {
+            let selected = storage
+                .select("compute_only_refresh_stale_metric", &labels, 0, 200)
+                .unwrap();
+            let snapshot = storage.observability_snapshot();
+            selected == expected_stale_points
+                && !snapshot.remote.accessible
+                && snapshot.remote.catalog_refresh_errors_total >= 1
+                && snapshot.remote.consecutive_refresh_failures == 1
+                && snapshot.remote.backoff_active
+        }),
+        "timed out waiting for remote refresh backoff while the stale catalog stayed visible"
+    );
     assert_eq!(
         storage
             .select("compute_only_refresh_stale_metric", &labels, 0, 200)
             .unwrap(),
-        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+        expected_stale_points
     );
 
     let outage_snapshot = storage.observability_snapshot();
@@ -1892,17 +1920,32 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
 
     std::fs::remove_dir_all(&invalid_segment_root).unwrap();
 
-    std::thread::sleep(Duration::from_millis(150));
+    let expected_recovered_points = vec![
+        DataPoint::new(1, 1.0),
+        DataPoint::new(2, 2.0),
+        DataPoint::new(30, 30.0),
+        DataPoint::new(31, 31.0),
+    ];
+    assert!(
+        wait_for_condition(Duration::from_secs(2), Duration::from_millis(10), || {
+            let selected = storage
+                .select("compute_only_refresh_stale_metric", &labels, 0, 200)
+                .unwrap();
+            let snapshot = storage.observability_snapshot();
+            selected == expected_recovered_points
+                && snapshot.remote.accessible
+                && !snapshot.remote.backoff_active
+                && snapshot.remote.consecutive_refresh_failures == 0
+                && snapshot.remote.last_refresh_error.is_none()
+                && !snapshot.health.degraded
+        }),
+        "timed out waiting for remote catalog refresh recovery"
+    );
     assert_eq!(
         storage
             .select("compute_only_refresh_stale_metric", &labels, 0, 200)
             .unwrap(),
-        vec![
-            DataPoint::new(1, 1.0),
-            DataPoint::new(2, 2.0),
-            DataPoint::new(30, 30.0),
-            DataPoint::new(31, 31.0),
-        ]
+        expected_recovered_points
     );
     let recovered_snapshot = storage.observability_snapshot();
     assert!(recovered_snapshot.remote.accessible);
@@ -1914,12 +1957,7 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         storage
             .select("compute_only_refresh_stale_metric", &labels, 0, 200)
             .unwrap(),
-        vec![
-            DataPoint::new(1, 1.0),
-            DataPoint::new(2, 2.0),
-            DataPoint::new(30, 30.0),
-            DataPoint::new(31, 31.0),
-        ]
+        expected_recovered_points
     );
 
     storage.close().unwrap();
