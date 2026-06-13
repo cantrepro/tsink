@@ -2049,18 +2049,15 @@ impl ChunkStorage {
                 }
             }
 
-            if let Some(existing_point) = self
-                .active_shard(*series_id)
-                .read()
-                .get(series_id)
-                .and_then(|state| state.builder.first_point())
-            {
-                let existing_family = value_family_for_lane(&existing_point.value, *lane)?;
-                if existing_family != first_family {
-                    return Err(TsinkError::ValueTypeMismatch {
-                        expected: value_family_name(existing_family).to_string(),
-                        actual: first_point.value.kind().to_string(),
-                    });
+            if let Some(state) = self.active_shard(*series_id).read().get(series_id) {
+                for existing_point in state.builder.points() {
+                    let existing_family = value_family_for_lane(&existing_point.value, *lane)?;
+                    if existing_family != first_family {
+                        return Err(TsinkError::ValueTypeMismatch {
+                            expected: value_family_name(existing_family).to_string(),
+                            actual: first_point.value.kind().to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -2467,8 +2464,6 @@ impl Storage for ChunkStorage {
             )?;
             self.enforce_admission_controls(estimated_memory_growth, estimated_wal_growth)?;
             reserved_series = self.reserve_series_lanes(&pending_points)?;
-            self.ingest_pending_points(std::mem::take(&mut pending_points))?;
-            ingest_committed = true;
 
             if let (Some(wal), Some(batches)) = (&self.wal, wal_batches.as_deref()) {
                 for definition in &new_series_defs {
@@ -2477,6 +2472,8 @@ impl Storage for ChunkStorage {
 
                 wal.append_samples(batches)?;
             }
+            self.ingest_pending_points(std::mem::take(&mut pending_points))?;
+            ingest_committed = true;
             Ok(())
         })();
 
@@ -3700,6 +3697,54 @@ mod tests {
             .into_iter()
             .any(|series| series.name == "mixed_metric" && series.labels == labels);
         assert!(!has_mixed_metric);
+
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn wal_append_failure_does_not_ingest_points_or_survive_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let metric = "wal_append_atomicity";
+        let oversized_value = vec![0xAB; (64 * 1024 * 1024) + 1];
+
+        {
+            let storage = StorageBuilder::new()
+                .with_data_path(temp_dir.path())
+                .with_timestamp_precision(TimestampPrecision::Seconds)
+                .with_chunk_points(2)
+                .build()
+                .unwrap();
+
+            let err = storage
+                .insert_rows(&[Row::new(metric, DataPoint::new(1, oversized_value))])
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                TsinkError::InvalidConfiguration(message)
+                    if message.contains("WAL frame payload too large")
+            ));
+
+            let points = storage.select(metric, &[], 0, 10).unwrap();
+            assert!(
+                points.is_empty(),
+                "failed WAL append must not expose ingested points in memory"
+            );
+
+            storage.close().unwrap();
+        }
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(2)
+            .build()
+            .unwrap();
+
+        let points = reopened.select(metric, &[], 0, 10).unwrap();
+        assert!(
+            points.is_empty(),
+            "failed WAL append must not leave points durable after reopen"
+        );
 
         reopened.close().unwrap();
     }
