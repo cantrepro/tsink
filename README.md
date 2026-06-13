@@ -56,6 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     storage.insert_rows(&rows)?;
 
+    // Note: Using timestamp 0 will automatically use the current timestamp
+    // let row = Row::new("cpu_usage", DataPoint::new(0, 50.0));  // timestamp = current time
+
     // Query data points
     let points = storage.select("cpu_usage", &[], 1600000000, 1600000121)?;
     for point in points {
