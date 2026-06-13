@@ -9,13 +9,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// WAL operation types.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum WalOperation {
-    Insert = 0,
+    Insert = 1,
 }
 
 /// Trait for write-ahead log implementations.
@@ -69,14 +70,30 @@ impl Wal for NopWal {
 }
 
 const WAL_SEGMENT_EXTENSION: &str = ".wal";
+const MAX_WAL_METRIC_NAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Sync policy for WAL durability/performance tradeoffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalSyncMode {
+    /// Flush and fsync on every append call.
+    PerAppend,
+    /// Flush every append and fsync at most once per interval.
+    Periodic(Duration),
+}
+
+impl Default for WalSyncMode {
+    fn default() -> Self {
+        WalSyncMode::Periodic(Duration::from_secs(1))
+    }
+}
 
 fn parse_segment_index(name: &OsStr) -> Option<u32> {
     let name = name.to_str()?;
-    let trimmed = name
-        .strip_suffix(WAL_SEGMENT_EXTENSION)
-        .unwrap_or(name)
-        .trim();
+    let trimmed = name.strip_suffix(WAL_SEGMENT_EXTENSION)?.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     trimmed.parse::<u32>().ok()
@@ -88,11 +105,22 @@ pub struct DiskWal {
     current_segment: Mutex<Option<WalSegment>>,
     buffer_size: usize,
     segment_index: AtomicU32,
+    sync_mode: WalSyncMode,
+    last_sync: Mutex<Instant>,
 }
 
 impl DiskWal {
     /// Creates a new disk WAL.
     pub fn new(dir: impl AsRef<Path>, buffer_size: usize) -> Result<Arc<Self>> {
+        Self::new_with_sync_mode(dir, buffer_size, WalSyncMode::default())
+    }
+
+    /// Creates a new disk WAL with an explicit sync mode.
+    pub fn new_with_sync_mode(
+        dir: impl AsRef<Path>,
+        buffer_size: usize,
+        sync_mode: WalSyncMode,
+    ) -> Result<Arc<Self>> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -104,6 +132,8 @@ impl DiskWal {
             current_segment: Mutex::new(None),
             buffer_size,
             segment_index: AtomicU32::new(max_index + 1),
+            sync_mode,
+            last_sync: Mutex::new(Instant::now()),
         }))
     }
 
@@ -111,14 +141,12 @@ impl DiskWal {
     fn find_max_segment_index(dir: &Path) -> Result<u32> {
         let mut max_index = 0u32;
 
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries {
-                if let Ok(entry) = entry
-                    && entry.path().is_file()
-                    && let Some(index) = parse_segment_index(&entry.file_name())
-                {
-                    max_index = max_index.max(index);
-                }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.path().is_file()
+                && let Some(index) = parse_segment_index(&entry.file_name())
+            {
+                max_index = max_index.max(index);
             }
         }
 
@@ -174,10 +202,48 @@ impl DiskWal {
 
         Ok(segments.into_iter().map(|(_, path)| path).collect())
     }
+
+    fn maybe_sync_after_append(&self, writer: &mut BufWriter<File>) -> Result<()> {
+        // Always flush userspace buffer so data reaches the kernel page cache.
+        writer.flush()?;
+
+        match self.sync_mode {
+            WalSyncMode::PerAppend => {
+                writer.get_ref().sync_all()?;
+                *self.last_sync.lock() = Instant::now();
+            }
+            WalSyncMode::Periodic(interval) => {
+                if interval.is_zero() {
+                    writer.get_ref().sync_all()?;
+                    *self.last_sync.lock() = Instant::now();
+                    return Ok(());
+                }
+
+                let mut last_sync = self.last_sync.lock();
+                if last_sync.elapsed() >= interval {
+                    writer.get_ref().sync_all()?;
+                    *last_sync = Instant::now();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_segment_now(&self, writer: &mut BufWriter<File>) -> Result<()> {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        *self.last_sync.lock() = Instant::now();
+        Ok(())
+    }
 }
 
 impl Wal for DiskWal {
     fn append_rows(&self, rows: &[Row]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
         self.get_or_create_writer()?;
 
         let mut current = self.current_segment.lock();
@@ -209,9 +275,7 @@ impl Wal for DiskWal {
                 segment.writer.write_all(&val_buf[..val_size])?;
             }
 
-            if self.buffer_size == 0 {
-                segment.writer.flush()?;
-            }
+            self.maybe_sync_after_append(&mut segment.writer)?;
         }
 
         Ok(())
@@ -219,8 +283,7 @@ impl Wal for DiskWal {
 
     fn flush(&self) -> Result<()> {
         if let Some(ref mut segment) = *self.current_segment.lock() {
-            segment.writer.flush()?;
-            segment.writer.get_ref().sync_all()?;
+            self.sync_segment_now(&mut segment.writer)?;
         }
         Ok(())
     }
@@ -229,8 +292,7 @@ impl Wal for DiskWal {
         // Flush current segment and create a new one
         let mut current = self.current_segment.lock();
         if let Some(ref mut segment) = *current {
-            segment.writer.flush()?;
-            segment.writer.get_ref().sync_all()?;
+            self.sync_segment_now(&mut segment.writer)?;
         }
 
         // Force creation of new segment on next write
@@ -240,6 +302,11 @@ impl Wal for DiskWal {
 
     fn remove_oldest(&self) -> Result<()> {
         let segments = self.list_segments()?;
+        // Keep at least one segment so active/unflushed WAL data is never discarded.
+        if segments.len() <= 1 {
+            return Ok(());
+        }
+
         if let Some(oldest) = segments.first() {
             fs::remove_file(oldest)?;
         }
@@ -247,13 +314,15 @@ impl Wal for DiskWal {
     }
 
     fn remove_all(&self) -> Result<()> {
+        // Drop the currently open writer before removing files.
+        let current = self.current_segment.lock().take();
+        drop(current);
+
         let segments = self.list_segments()?;
         for segment in segments {
             fs::remove_file(segment)?;
         }
 
-        // Clear current segment
-        *self.current_segment.lock() = None;
         Ok(())
     }
 
@@ -289,16 +358,14 @@ impl WalReader {
     pub fn read_all(mut self) -> Result<Vec<Row>> {
         let mut segments = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            for entry in entries {
-                let entry = entry?;
-                let path = entry.path();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
 
-                if path.is_file()
-                    && let Some(index) = path.file_name().and_then(parse_segment_index)
-                {
-                    segments.push((index, path));
-                }
+            if path.is_file()
+                && let Some(index) = path.file_name().and_then(parse_segment_index)
+            {
+                segments.push((index, path));
             }
         }
 
@@ -306,7 +373,7 @@ impl WalReader {
         segments.sort_by_key(|(index, _)| *index);
 
         // Read each segment
-        let mut failed_segments = Vec::new();
+        let mut failed_segments = 0usize;
         debug!(
             segments = segments.len(),
             wal_dir = %self.dir.display(),
@@ -324,17 +391,17 @@ impl WalReader {
                 Err(e) => {
                     // Track failed segments for potential recovery
                     warn!("Error reading WAL segment {:?}: {}", segment_path, e);
-                    failed_segments.push((segment_path.clone(), e));
+                    failed_segments += 1;
                 }
             }
         }
 
-        // If too many segments failed, return an error
-        if failed_segments.len() > 1 {
-            return Err(TsinkError::Wal {
-                operation: "recovery".to_string(),
-                details: format!("{} WAL segments failed to load", failed_segments.len()),
-            });
+        if failed_segments > 0 {
+            warn!(
+                failed_segments,
+                recovered_rows = self.rows_to_insert.len(),
+                "WAL recovery completed with segment failures"
+            );
         }
 
         Ok(self.rows_to_insert)
@@ -345,12 +412,9 @@ impl WalReader {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
-        // Skip empty or suspiciously small files
-        if file_len < 8 {
-            warn!(
-                "Skipping WAL segment {:?}: file too small ({} bytes)",
-                path, file_len
-            );
+        // Skip truly empty files; short files can still contain valid varint-encoded records.
+        if file_len == 0 {
+            warn!("Skipping WAL segment {:?}: file is empty", path);
             return Ok(());
         }
 
@@ -410,10 +474,28 @@ impl WalReader {
             match op {
                 WalOperation::Insert => {
                     // Read metric name length
-                    let metric_len = match decode_uvarint(&mut reader) {
-                        Ok(len) => len as usize,
+                    let metric_len_u64 = match decode_uvarint(&mut reader) {
+                        Ok(len) => len,
                         Err(_) => break, // Incomplete record
                     };
+
+                    if metric_len_u64 > usize::MAX as u64
+                        || metric_len_u64 as usize > MAX_WAL_METRIC_NAME_BYTES
+                    {
+                        warn!(
+                            "Invalid WAL metric length {} at byte {}",
+                            metric_len_u64, entry_start
+                        );
+                        corrupted_entries += 1;
+                        if corrupted_entries > MAX_CORRUPTED {
+                            return Err(TsinkError::Wal {
+                                operation: "segment_read".to_string(),
+                                details: format!("Too many corrupted entries in {:?}", path),
+                            });
+                        }
+                        break;
+                    }
+                    let metric_len = metric_len_u64 as usize;
 
                     // Read metric name
                     let mut metric_buf = vec![0u8; metric_len];
@@ -452,6 +534,7 @@ impl WalReader {
 impl WalOperation {
     fn from_u8(value: u8) -> Option<Self> {
         match value {
+            // Accept legacy opcode 0 for backward compatibility with older WAL segments.
             0 | 1 => Some(WalOperation::Insert),
             _ => None,
         }

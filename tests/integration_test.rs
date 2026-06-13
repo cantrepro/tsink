@@ -1,10 +1,14 @@
 //! Integration tests for tsink.
 
+use std::fs;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision, TsinkError};
+use tsink::{
+    DataPoint, Label, QueryOptions, Row, StorageBuilder, TimestampPrecision, TsinkError,
+    WalSyncMode,
+};
 
 #[test]
 fn test_basic_insert_and_select() {
@@ -74,6 +78,26 @@ fn test_empty_metric_name() {
 
     let result = storage.select("", &[], 1000, 2000);
     assert!(matches!(result, Err(TsinkError::MetricRequired)));
+}
+
+#[test]
+fn test_insert_rejects_empty_metric_name() {
+    let storage = StorageBuilder::new().build().unwrap();
+
+    let result = storage.insert_rows(&[Row::new("", DataPoint::new(1000, 1.0))]);
+    assert!(matches!(result, Err(TsinkError::MetricRequired)));
+}
+
+#[test]
+fn test_insert_rejects_overlong_metric_name() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let metric = "m".repeat(u16::MAX as usize + 1);
+
+    let result = storage.insert_rows(&[Row::new(metric.clone(), DataPoint::new(1000, 1.0))]);
+    assert!(matches!(result, Err(TsinkError::InvalidMetricName(_))));
+
+    let result = storage.select(&metric, &[], 0, 2000);
+    assert!(matches!(result, Err(TsinkError::InvalidMetricName(_))));
 }
 
 #[test]
@@ -202,6 +226,48 @@ fn test_concurrent_writes() {
 }
 
 #[test]
+fn test_with_max_writers_zero_allows_writes() {
+    let storage = StorageBuilder::new()
+        .with_max_writers(0)
+        .with_write_timeout(Duration::from_millis(5))
+        .build()
+        .unwrap();
+
+    let result = storage.insert_rows(&[Row::new("auto_workers", DataPoint::new(1, 1.0))]);
+    assert!(
+        result.is_ok(),
+        "with_max_writers(0) should auto-detect workers instead of timing out"
+    );
+}
+
+#[test]
+fn test_operations_after_close_return_storage_closed() {
+    let storage = StorageBuilder::new().build().unwrap();
+    storage
+        .insert_rows(&[Row::new("closed_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+    storage.close().unwrap();
+
+    assert!(matches!(
+        storage.insert_rows(&[Row::new("closed_metric", DataPoint::new(2, 2.0))]),
+        Err(TsinkError::StorageClosed)
+    ));
+    assert!(matches!(
+        storage.select("closed_metric", &[], 0, 10),
+        Err(TsinkError::StorageClosed)
+    ));
+    assert!(matches!(
+        storage.select_all("closed_metric", 0, 10),
+        Err(TsinkError::StorageClosed)
+    ));
+    assert!(matches!(
+        storage.select_with_options("closed_metric", QueryOptions::new(0, 10)),
+        Err(TsinkError::StorageClosed)
+    ));
+    assert!(matches!(storage.close(), Err(TsinkError::StorageClosed)));
+}
+
+#[test]
 fn test_select_returns_sorted_points() {
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -292,6 +358,148 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
 }
 
 #[test]
+fn test_build_with_new_data_path_and_wal_disabled() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("fresh-data-path");
+
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("fresh_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+    let points = storage.select("fresh_metric", &[], 0, 10).unwrap();
+    assert_eq!(points.len(), 1);
+}
+
+#[test]
+fn test_wal_disabled_does_not_replay_stale_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+
+    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
+    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
+    wal_trait
+        .append_rows(&[Row::new("stale_metric", DataPoint::new(5, 5.0))])
+        .unwrap();
+    wal_trait.flush().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+    assert!(
+        storage
+            .select("stale_metric", &[], 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    storage.close().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+    assert!(
+        storage
+            .select("stale_metric", &[], 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_wal_buffer_size_zero_still_recovers() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(true)
+            .with_wal_buffer_size(0)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new("zero_buf_wal", DataPoint::new(1, 1.0))])
+            .unwrap();
+        // Drop without close to simulate abrupt shutdown and rely on WAL recovery.
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(true)
+        .with_wal_buffer_size(0)
+        .build()
+        .unwrap();
+
+    let points = storage.select("zero_buf_wal", &[], 0, 10).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, 1);
+    assert!((points[0].value - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn test_wal_sync_mode_can_be_switched() {
+    for mode in [
+        WalSyncMode::Periodic(Duration::from_millis(250)),
+        WalSyncMode::PerAppend,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+
+        {
+            let storage = StorageBuilder::new()
+                .with_data_path(temp_dir.path())
+                .with_wal_enabled(true)
+                .with_wal_sync_mode(mode)
+                .build()
+                .unwrap();
+
+            storage
+                .insert_rows(&[Row::new("sync_mode_metric", DataPoint::new(1, 1.0))])
+                .unwrap();
+            storage.close().unwrap();
+        }
+
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(true)
+            .with_wal_sync_mode(mode)
+            .build()
+            .unwrap();
+
+        let points = storage.select("sync_mode_metric", &[], 0, 10).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].timestamp, 1);
+        assert!((points[0].value - 1.0).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn test_close_handles_partition_name_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("close_flush", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    // Force a path conflict for partition flush directory creation.
+    fs::write(temp_dir.path().join("p-1-1"), b"conflict").unwrap();
+
+    // Close should succeed by selecting an alternate directory name.
+    storage.close().unwrap();
+}
+
+#[test]
 fn test_select_across_multiple_partitions_persistent() {
     let temp_dir = TempDir::new().unwrap();
 
@@ -326,4 +534,56 @@ fn test_select_across_multiple_partitions_persistent() {
         points
     );
     assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
+}
+
+#[test]
+fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_partition_duration(Duration::from_secs(1))
+            .with_wal_enabled(false)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new("collision_metric", DataPoint::new(10, 1.0))])
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("collision_metric", DataPoint::new(10, 2.0))])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let partition_dirs = fs::read_dir(temp_dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with("p-"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        partition_dirs >= 2,
+        "expected at least two partition directories, got {partition_dirs}"
+    );
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let points = storage.select("collision_metric", &[], 0, 20).unwrap();
+    assert_eq!(points.len(), 2);
+    assert!(points.iter().any(|p| (p.value - 1.0).abs() < 1e-12));
+    assert!(points.iter().any(|p| (p.value - 2.0).abs() < 1e-12));
 }

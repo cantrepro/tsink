@@ -22,6 +22,7 @@ pub use label::Label;
 pub use storage::{
     Aggregation, DownsampleOptions, QueryOptions, Storage, StorageBuilder, TimestampPrecision,
 };
+pub use wal::WalSyncMode;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

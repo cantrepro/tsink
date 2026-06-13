@@ -9,9 +9,10 @@ pub struct GorillaEncoder<W: Write> {
     writer: W,
     buf: BitStreamWriter,
 
+    // Number of points encoded in the current stream
+    num_points: u64,
+
     // Timestamp tracking
-    t0: i64,
-    t1: i64,
     t: i64,
     t_delta: u64,
 
@@ -27,36 +28,55 @@ impl<W: Write> GorillaEncoder<W> {
         Self {
             writer,
             buf: BitStreamWriter::with_capacity(4096),
-            t0: 0,
-            t1: 0,
+            num_points: 0,
             t: 0,
             t_delta: 0,
             v: 0.0,
-            leading: 0,
+            leading: 0xff,
             trailing: 0,
         }
     }
 
     /// Encodes a data point.
     pub fn encode_point(&mut self, point: &DataPoint) -> Result<()> {
-        match (self.t0, self.t1) {
-            (0, _) => {
+        match self.num_points {
+            0 => {
                 // First point - write timestamp and value directly
                 self.write_varint(point.timestamp)?;
                 self.buf.write_bits(point.value.to_bits(), 64);
-                self.t0 = point.timestamp;
+                self.t = point.timestamp;
             }
-            (_, 0) => {
+            1 => {
                 // Second point - write delta of timestamp
-                let t_delta = (point.timestamp - self.t0) as u64;
+                let delta = point.timestamp.checked_sub(self.t).ok_or_else(|| {
+                    TsinkError::Compression(
+                        "timestamps must be non-decreasing for Gorilla encoding".to_string(),
+                    )
+                })?;
+                if delta < 0 {
+                    return Err(TsinkError::Compression(
+                        "timestamps must be non-decreasing for Gorilla encoding".to_string(),
+                    ));
+                }
+                let t_delta = delta as u64;
                 self.write_uvarint(t_delta)?;
                 self.write_value_delta(point.value);
-                self.t1 = point.timestamp;
                 self.t_delta = t_delta;
+                self.t = point.timestamp;
             }
             _ => {
                 // Subsequent points - write delta-of-delta
-                let t_delta = (point.timestamp - self.t) as u64;
+                let delta = point.timestamp.checked_sub(self.t).ok_or_else(|| {
+                    TsinkError::Compression(
+                        "timestamps must be non-decreasing for Gorilla encoding".to_string(),
+                    )
+                })?;
+                if delta < 0 {
+                    return Err(TsinkError::Compression(
+                        "timestamps must be non-decreasing for Gorilla encoding".to_string(),
+                    ));
+                }
+                let t_delta = delta as u64;
                 let delta_of_delta = t_delta as i64 - self.t_delta as i64;
 
                 match delta_of_delta {
@@ -81,11 +101,12 @@ impl<W: Write> GorillaEncoder<W> {
 
                 self.write_value_delta(point.value);
                 self.t_delta = t_delta;
+                self.t = point.timestamp;
             }
         }
 
-        self.t = point.timestamp;
         self.v = point.value;
+        self.num_points = self.num_points.saturating_add(1);
         Ok(())
     }
 
@@ -138,12 +159,11 @@ impl<W: Write> GorillaEncoder<W> {
 
         // Reset state
         self.buf.reset();
-        self.t0 = 0;
-        self.t1 = 0;
+        self.num_points = 0;
         self.t = 0;
         self.t_delta = 0;
         self.v = 0.0;
-        self.leading = 0;
+        self.leading = 0xff;
         self.trailing = 0;
 
         Ok(())
@@ -171,8 +191,8 @@ impl<W: Write> GorillaEncoder<W> {
 }
 
 /// Decoder for time-series data using Gorilla compression.
-pub struct GorillaDecoder {
-    reader: BitStreamReader,
+pub struct GorillaDecoder<'a> {
+    reader: BitStreamReader<'a>,
     num_read: u16,
 
     // Timestamp tracking
@@ -185,11 +205,24 @@ pub struct GorillaDecoder {
     trailing: u8,
 }
 
-impl GorillaDecoder {
+impl<'a> GorillaDecoder<'a> {
     /// Creates a new GorillaDecoder from bytes.
     pub fn new(data: Vec<u8>) -> Self {
         Self {
             reader: BitStreamReader::new(data),
+            num_read: 0,
+            t: 0,
+            t_delta: 0,
+            v: 0.0,
+            leading: 0,
+            trailing: 0,
+        }
+    }
+
+    /// Creates a new GorillaDecoder borrowing an existing byte slice.
+    pub fn from_slice(data: &'a [u8]) -> Self {
+        Self {
+            reader: BitStreamReader::from_slice(data),
             num_read: 0,
             t: 0,
             t_delta: 0,
@@ -341,18 +374,7 @@ impl GorillaDecoder {
 
     /// Reads a variable-length signed integer.
     fn read_varint(&mut self) -> Result<i64> {
-        let mut result = 0u64;
-        let mut shift = 0;
-
-        loop {
-            let byte = self.reader.read_bits(8)? as u8;
-            result |= ((byte & 0x7F) as u64) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-
+        let result = self.read_uvarint()?;
         // Zigzag decode
         Ok(((result >> 1) as i64) ^ -((result & 1) as i64))
     }
@@ -360,18 +382,29 @@ impl GorillaDecoder {
     /// Reads a variable-length unsigned integer.
     fn read_uvarint(&mut self) -> Result<u64> {
         let mut result = 0u64;
-        let mut shift = 0;
+        let mut shift = 0u32;
 
-        loop {
+        for i in 0..10 {
             let byte = self.reader.read_bits(8)? as u8;
-            result |= ((byte & 0x7F) as u64) << shift;
+
             if byte & 0x80 == 0 {
-                break;
+                // Final byte must not overflow u64 encoding range.
+                if i == 9 && byte > 1 {
+                    return Err(TsinkError::DataCorruption(
+                        "uvarint overflow while decoding timestamp/value".to_string(),
+                    ));
+                }
+                result |= (byte as u64) << shift;
+                return Ok(result);
             }
+
+            result |= ((byte & 0x7F) as u64) << shift;
             shift += 7;
         }
 
-        Ok(result)
+        Err(TsinkError::DataCorruption(
+            "uvarint overflow while decoding timestamp/value".to_string(),
+        ))
     }
 }
 
@@ -426,6 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn test_gorilla_encode_decode_with_zero_timestamp() {
+        let points = vec![
+            DataPoint::new(0, 1.0),
+            DataPoint::new(10, 2.0),
+            DataPoint::new(20, 3.0),
+        ];
+
+        let mut buf = Vec::new();
+        let mut encoder = GorillaEncoder::new(&mut buf);
+        for point in &points {
+            encoder.encode_point(point).unwrap();
+        }
+        encoder.flush().unwrap();
+
+        let mut decoder = GorillaDecoder::new(buf);
+        for expected in &points {
+            let decoded = decoder.decode_point().unwrap();
+            assert_eq!(decoded.timestamp, expected.timestamp);
+            assert!((decoded.value - expected.value).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_encoder_rejects_decreasing_timestamps() {
+        let mut buf = Vec::new();
+        let mut encoder = GorillaEncoder::new(&mut buf);
+
+        encoder.encode_point(&DataPoint::new(10, 1.0)).unwrap();
+        let err = encoder.encode_point(&DataPoint::new(9, 2.0)).unwrap_err();
+        assert!(matches!(err, TsinkError::Compression(_)));
+    }
+
+    #[test]
     fn test_varint_encoding() {
         let mut buf = [0u8; 10];
 
@@ -440,5 +506,19 @@ mod tests {
         // Test zero
         let len = encode_varint(0, &mut buf);
         assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn test_decoder_rejects_varint_overflow_without_panic() {
+        // Invalid varint: continuation bit set for more than 10 bytes.
+        let mut decoder = GorillaDecoder::new(vec![0x80; 11]);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode_point()));
+
+        assert!(result.is_ok(), "decoder should return an error, not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(TsinkError::DataCorruption(_))
+        ));
     }
 }

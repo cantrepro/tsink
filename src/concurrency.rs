@@ -1,11 +1,11 @@
 //! Concurrency utilities for tsink.
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Sender, bounded};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{Result, TsinkError};
@@ -14,7 +14,6 @@ use crate::{Result, TsinkError};
 #[derive(Clone)]
 pub struct Semaphore {
     permits: Arc<AtomicUsize>,
-    #[allow(dead_code)]
     max_permits: usize,
     condvar: Arc<Condvar>,
     mutex: Arc<Mutex<()>>,
@@ -23,6 +22,7 @@ pub struct Semaphore {
 impl Semaphore {
     /// Creates a new semaphore with the specified number of permits.
     pub fn new(permits: usize) -> Self {
+        let permits = permits.max(1);
         Self {
             permits: Arc::new(AtomicUsize::new(permits)),
             max_permits: permits,
@@ -74,6 +74,77 @@ impl Semaphore {
         None
     }
 
+    /// Tries to acquire a permit, waiting up to the provided timeout.
+    pub fn try_acquire_for(&self, timeout: Duration) -> Result<SemaphoreGuard<'_>> {
+        if timeout.is_zero() {
+            return self.try_acquire().ok_or(TsinkError::WriteTimeout {
+                timeout_ms: 0,
+                workers: self.max_permits,
+            });
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(guard) = self.try_acquire() {
+                return Ok(guard);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TsinkError::WriteTimeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                    workers: self.max_permits,
+                });
+            }
+
+            let mut lock = self.mutex.lock();
+            while self.permits.load(Ordering::Acquire) == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(TsinkError::WriteTimeout {
+                        timeout_ms: timeout.as_millis() as u64,
+                        workers: self.max_permits,
+                    });
+                }
+                if self.condvar.wait_for(&mut lock, remaining).timed_out()
+                    && self.permits.load(Ordering::Acquire) == 0
+                {
+                    return Err(TsinkError::WriteTimeout {
+                        timeout_ms: timeout.as_millis() as u64,
+                        workers: self.max_permits,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Acquires all permits, waiting up to timeout.
+    pub fn acquire_all(&self, timeout: Duration) -> Result<Vec<SemaphoreGuard<'_>>> {
+        let deadline = Instant::now() + timeout;
+        let mut guards = Vec::with_capacity(self.max_permits);
+
+        for _ in 0..self.max_permits {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TsinkError::WriteTimeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                    workers: self.max_permits,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let guard = self.try_acquire_for(remaining)?;
+            guards.push(guard);
+        }
+
+        Ok(guards)
+    }
+
+    /// Returns the semaphore capacity.
+    pub fn capacity(&self) -> usize {
+        self.max_permits
+    }
+
     /// Releases a permit back to the semaphore.
     fn release(&self) {
         let previous = self.permits.fetch_add(1, Ordering::AcqRel);
@@ -104,10 +175,9 @@ impl<'a> Drop for SemaphoreGuard<'a> {
 pub struct WorkerPool<T: Send + 'static> {
     workers: Vec<Worker>,
     sender: Sender<Message<T>>,
-    #[allow(dead_code)]
-    receiver: Arc<Mutex<Receiver<Message<T>>>>,
     shutdown: Arc<AtomicBool>,
-    active_tasks: Arc<AtomicUsize>,
+    in_flight_tasks: Arc<AtomicUsize>,
+    inline_handler: Option<Arc<dyn Fn(T) + Send + Sync>>,
 }
 
 enum Message<T> {
@@ -126,49 +196,52 @@ impl<T: Send + 'static> WorkerPool<T> {
     where
         F: Fn(T) + Send + Sync + 'static,
     {
-        let (sender, receiver) = bounded::<Message<T>>(num_workers * 2);
-        let receiver = Arc::new(Mutex::new(receiver));
+        let num_workers = if num_workers == 0 {
+            warn!("WorkerPool::new called with 0 workers; defaulting to 1");
+            1
+        } else {
+            num_workers
+        };
+
+        let queue_capacity = num_workers.saturating_mul(2).max(1);
+        let (sender, receiver) = bounded::<Message<T>>(queue_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let active_tasks = Arc::new(AtomicUsize::new(0));
-        let task_handler = Arc::new(task_handler);
+        let in_flight_tasks = Arc::new(AtomicUsize::new(0));
+        let task_handler: Arc<dyn Fn(T) + Send + Sync> = Arc::new(task_handler);
 
         let mut workers = Vec::with_capacity(num_workers);
 
         for id in 0..num_workers {
-            let receiver = Arc::clone(&receiver);
-            let shutdown = Arc::clone(&shutdown);
-            let active_tasks = Arc::clone(&active_tasks);
+            let receiver = receiver.clone();
+            let in_flight_tasks = Arc::clone(&in_flight_tasks);
             let task_handler = Arc::clone(&task_handler);
 
-            let thread = thread::Builder::new()
+            let thread_result = thread::Builder::new()
                 .name(format!("tsink-worker-{}", id))
                 .spawn(move || {
                     info!("Worker {} started", id);
 
                     loop {
-                        if shutdown.load(Ordering::Acquire) {
-                            info!("Worker {} shutting down", id);
-                            break;
-                        }
-
-                        let message = {
-                            let receiver = receiver.lock();
-                            match receiver.recv_timeout(Duration::from_millis(100)) {
-                                Ok(msg) => msg,
-                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                    info!("Worker {} channel disconnected", id);
-                                    break;
-                                }
+                        let message = match receiver.recv_timeout(Duration::from_millis(100)) {
+                            Ok(msg) => msg,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                info!("Worker {} channel disconnected", id);
+                                break;
                             }
                         };
 
                         match message {
                             Message::Task(task) => {
-                                active_tasks.fetch_add(1, Ordering::AcqRel);
                                 debug!("Worker {} processing task", id);
-                                task_handler(task);
-                                active_tasks.fetch_sub(1, Ordering::AcqRel);
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        task_handler(task)
+                                    }));
+                                in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
+                                if result.is_err() {
+                                    error!("Worker {} task handler panicked", id);
+                                }
                             }
                             Message::Shutdown => {
                                 info!("Worker {} received shutdown signal", id);
@@ -176,21 +249,35 @@ impl<T: Send + 'static> WorkerPool<T> {
                             }
                         }
                     }
-                })
-                .expect("Failed to spawn worker thread");
+                });
 
-            workers.push(Worker {
-                id,
-                thread: Some(thread),
-            });
+            match thread_result {
+                Ok(thread) => workers.push(Worker {
+                    id,
+                    thread: Some(thread),
+                }),
+                Err(e) => {
+                    error!("Failed to spawn worker thread {}: {}", id, e);
+                    break;
+                }
+            }
         }
+
+        let inline_handler = if workers.is_empty() {
+            warn!(
+                "WorkerPool failed to spawn workers; tasks will execute inline on submit caller thread"
+            );
+            Some(task_handler)
+        } else {
+            None
+        };
 
         Self {
             workers,
             sender,
-            receiver,
             shutdown,
-            active_tasks,
+            in_flight_tasks,
+            inline_handler,
         }
     }
 
@@ -201,10 +288,26 @@ impl<T: Send + 'static> WorkerPool<T> {
             return Err(TsinkError::StorageShuttingDown);
         }
 
+        if let Some(handler) = &self.inline_handler {
+            self.in_flight_tasks.fetch_add(1, Ordering::AcqRel);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(task)));
+            self.in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
+            if result.is_err() {
+                return Err(TsinkError::Other(
+                    "worker_pool inline task handler panicked".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
+        self.in_flight_tasks.fetch_add(1, Ordering::AcqRel);
         self.sender
             .send(Message::Task(task))
             .map_err(|_| TsinkError::ChannelSend {
                 channel: "worker_pool".to_string(),
+            })
+            .inspect_err(|_| {
+                self.in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
             })?;
 
         Ok(())
@@ -216,6 +319,11 @@ impl<T: Send + 'static> WorkerPool<T> {
             return Err(TsinkError::StorageShuttingDown);
         }
 
+        if self.inline_handler.is_some() {
+            return self.submit(task);
+        }
+
+        self.in_flight_tasks.fetch_add(1, Ordering::AcqRel);
         self.sender
             .send_timeout(Message::Task(task), timeout)
             .map_err(|e| match e {
@@ -225,21 +333,24 @@ impl<T: Send + 'static> WorkerPool<T> {
                 crossbeam_channel::SendTimeoutError::Disconnected(_) => TsinkError::ChannelSend {
                     channel: "worker_pool".to_string(),
                 },
+            })
+            .inspect_err(|_| {
+                self.in_flight_tasks.fetch_sub(1, Ordering::AcqRel);
             })?;
 
         Ok(())
     }
 
-    /// Returns the number of active tasks.
+    /// Returns the number of in-flight tasks (queued or currently running).
     pub fn active_tasks(&self) -> usize {
-        self.active_tasks.load(Ordering::Acquire)
+        self.in_flight_tasks.load(Ordering::Acquire)
     }
 
-    /// Waits for all active tasks to complete with a timeout.
+    /// Waits for all in-flight tasks (queued or running) to complete with a timeout.
     pub fn wait_for_completion(&self, timeout: Duration) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
-        while self.active_tasks.load(Ordering::Acquire) > 0 {
+        while self.in_flight_tasks.load(Ordering::Acquire) > 0 {
             if start.elapsed() > timeout {
                 return Err(TsinkError::WriteTimeout {
                     timeout_ms: timeout.as_millis() as u64,
@@ -256,6 +367,9 @@ impl<T: Send + 'static> WorkerPool<T> {
     pub fn shutdown(mut self) -> Result<()> {
         info!("Shutting down worker pool");
         self.shutdown.store(true, Ordering::Release);
+
+        // Drain queued tasks before sending shutdown so enqueued work is not dropped.
+        self.wait_for_completion(Duration::from_secs(30))?;
 
         // Send shutdown messages to all workers
         for _ in &self.workers {
@@ -286,6 +400,13 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Creates a new rate limiter with the specified operations per second limit.
     pub fn new(max_ops_per_second: usize) -> Self {
+        let max_ops_per_second = if max_ops_per_second == 0 {
+            warn!("RateLimiter::new called with 0 ops/sec; defaulting to 1");
+            1
+        } else {
+            max_ops_per_second
+        };
+
         Self {
             max_ops_per_second,
             window_start: Arc::new(Mutex::new(std::time::Instant::now())),
@@ -386,6 +507,24 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_pool_shutdown_drains_queued_tasks() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let pool = WorkerPool::new(2, move |_value: usize| {
+            counter_clone.fetch_add(1, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(2));
+        });
+
+        for i in 0..32 {
+            pool.submit(i).unwrap();
+        }
+
+        pool.shutdown().unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 32);
+    }
+
+    #[test]
     fn test_rate_limiter() {
         let limiter = RateLimiter::new(5);
 
@@ -395,6 +534,31 @@ mod tests {
         }
 
         // 6th operation should be blocked
+        assert!(!limiter.try_acquire());
+    }
+
+    #[test]
+    fn test_worker_pool_zero_workers_defaults_to_one() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let pool = WorkerPool::new(0, move |_value: usize| {
+            counter_clone.fetch_add(1, Ordering::AcqRel);
+        });
+
+        for i in 0..4 {
+            pool.submit(i).unwrap();
+        }
+
+        pool.wait_for_completion(Duration::from_secs(2)).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 4);
+        pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_defaults_to_one() {
+        let limiter = RateLimiter::new(0);
+        assert!(limiter.try_acquire());
         assert!(!limiter.try_acquire());
     }
 }

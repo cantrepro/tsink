@@ -17,7 +17,7 @@ tsink is a lightweight, high-performance time-series database engine written in 
 ### Key Features
 
 - **🚀 High Performance**: Gorilla compression achieves ~1.37 bytes per data point
-- **🔒 Thread-Safe**: Lock-free reads and concurrent writes with configurable worker pools
+- **🔒 Thread-Safe**: Concurrent reads and writes with bounded writer concurrency
 - **💾 Flexible Storage**: Choose between in-memory or persistent disk storage
 - **📊 Time Partitioning**: Automatic data organization by configurable time ranges
 - **🏷️ Label Support**: Multi-dimensional metrics with key-value labels
@@ -32,7 +32,7 @@ Add tsink to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsink = "0.5.0"
+tsink = "0.6.1"
 ```
 
 ## Quick Start
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Persistent Storage
 
 ```rust
-use tsink::{StorageBuilder, Storage};
+use tsink::{StorageBuilder, Storage, WalSyncMode};
 use std::time::Duration;
 
 let storage = StorageBuilder::new()
@@ -81,6 +81,7 @@ let storage = StorageBuilder::new()
     .with_partition_duration(Duration::from_secs(3600))  // 1-hour partitions
     .with_retention(Duration::from_secs(7 * 24 * 3600))  // 7-day retention
     .with_wal_buffer_size(8192)                  // 8KB WAL buffer
+    .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1))) // default
     .build()?;
 ```
 
@@ -217,6 +218,7 @@ tsink uses a linear-order partition model that divides time-series data into tim
 | `with_partition_duration` | Time range per partition | 1 hour |
 | `with_wal_enabled` | Enable write-ahead logging | true |
 | `with_wal_buffer_size` | WAL buffer size in bytes | 4096 |
+| `with_wal_sync_mode` | WAL fsync strategy | `Periodic(1s)` |
 
 ### Example Configuration
 
@@ -229,6 +231,38 @@ let storage = StorageBuilder::new()
     .with_write_timeout(Duration::from_secs(60))
     .with_partition_duration(Duration::from_secs(6 * 3600))  // 6 hours
     .with_wal_buffer_size(16384)  // 16KB
+    .with_wal_sync_mode(tsink::WalSyncMode::Periodic(Duration::from_secs(1)))
+    .build()?;
+```
+
+### WAL Sync Modes
+
+`tsink` supports two WAL durability/performance modes:
+
+- `WalSyncMode::Periodic(Duration)` (default): WAL writes are flushed on append, and fsync runs at most once per interval.
+- `WalSyncMode::PerAppend`: every append is flushed and fsynced before returning.
+
+Choose based on workload:
+
+- `Periodic`: higher throughput, lower write latency, but a crash can lose up to roughly one sync interval of recently acknowledged WAL data.
+- `PerAppend`: strongest durability for acknowledged writes, with higher fsync overhead and lower write throughput.
+
+Switch modes with `StorageBuilder`:
+
+```rust
+use std::time::Duration;
+use tsink::{StorageBuilder, WalSyncMode};
+
+// Default (explicit): periodic sync every second
+let periodic = StorageBuilder::new()
+    .with_data_path("./tsink-data")
+    .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1)))
+    .build()?;
+
+// Strongest durability: sync every append
+let per_append = StorageBuilder::new()
+    .with_data_path("./tsink-data")
+    .with_wal_sync_mode(WalSyncMode::PerAppend)
     .build()?;
 ```
 

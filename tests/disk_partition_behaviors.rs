@@ -84,10 +84,10 @@ fn disk_partition_expires_and_prevents_reads() {
     .unwrap();
 
     assert!(partition.expired());
-    let err = partition
+    let points = partition
         .select_data_points("expired_metric", &[], 0, 100)
-        .unwrap_err();
-    assert!(matches!(err, TsinkError::NoDataPoints { .. }));
+        .unwrap();
+    assert!(points.is_empty());
 }
 
 #[test]
@@ -140,4 +140,68 @@ fn disk_partition_clean_removes_files() {
     assert!(temp_dir.path().join(tsink::disk::DATA_FILE_NAME).exists());
     partition.clean().unwrap();
     assert!(!temp_dir.path().exists());
+}
+
+#[test]
+fn disk_partition_select_all_supports_legacy_hex_plain_metric_keys() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let data = {
+        let rows = vec![Row::new("deadbeef", DataPoint::new(1, 1.0))];
+        let temp_mem = TempDir::new().unwrap();
+        let wal: Arc<dyn tsink::wal::Wal> = Arc::new(tsink::wal::NopWal);
+        let partition: tsink::partition::SharedPartition =
+            Arc::new(tsink::memory::MemoryPartition::new(
+                wal,
+                Duration::from_secs(60),
+                tsink::TimestampPrecision::Seconds,
+                Duration::from_secs(3600),
+            ));
+        partition.insert_rows(&rows).unwrap();
+        tsink::memory::flush_memory_partition_to_disk(
+            partition.clone(),
+            temp_mem.path(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        std::fs::read(temp_mem.path().join(tsink::disk::DATA_FILE_NAME)).unwrap()
+    };
+
+    let mut metrics = HashMap::new();
+    metrics.insert(
+        "deadbeef".to_string(),
+        DiskMetric {
+            name: "deadbeef".to_string(),
+            offset: 0,
+            encoded_size: data.len() as u64,
+            min_timestamp: 1,
+            max_timestamp: 1,
+            num_data_points: 1,
+        },
+    );
+
+    let partition = DiskPartition::create(
+        temp_dir.path(),
+        PartitionMeta {
+            min_timestamp: 1,
+            max_timestamp: 1,
+            num_data_points: 1,
+            metrics,
+            timestamp_precision: TimestampPrecision::Seconds,
+            created_at: SystemTime::now(),
+        },
+        data,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let exact = partition
+        .select_data_points("deadbeef", &[], 0, 10)
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+
+    let all = partition.select_all_labels("deadbeef", 0, 10).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0.len(), 0);
+    assert_eq!(all[0].1.len(), 1);
 }

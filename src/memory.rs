@@ -7,14 +7,14 @@ use crate::partition::{Partition, SharedPartition};
 use crate::time::{duration_to_units, now_in_precision};
 use crate::wal::Wal;
 use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// A memory partition stores data points in heap memory.
@@ -42,6 +42,20 @@ pub struct MemoryPartition {
     created_at: SystemTime,
     /// Flag to ensure min_t is set only once
     min_t_set: AtomicUsize,
+    /// Prevents new writes from entering while this partition is being flushed.
+    flush_sealed: AtomicBool,
+    /// Number of in-flight write operations currently mutating this partition.
+    inflight_inserts: AtomicUsize,
+}
+
+struct InflightInsertGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for InflightInsertGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl MemoryPartition {
@@ -68,15 +82,29 @@ impl MemoryPartition {
             retention_units,
             created_at,
             min_t_set: AtomicUsize::new(0),
+            flush_sealed: AtomicBool::new(false),
+            inflight_inserts: AtomicUsize::new(0),
         }
     }
 
     /// Gets or creates a metric.
     fn get_or_create_metric(&self, name: Vec<u8>) -> Arc<MemoryMetric> {
-        self.metrics
-            .entry(name.clone())
-            .or_insert_with(|| Arc::new(MemoryMetric::new(name)))
-            .clone()
+        match self.metrics.entry(name) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let metric = Arc::new(MemoryMetric::new(entry.key().clone()));
+                entry.insert(metric.clone());
+                metric
+            }
+        }
+    }
+
+    fn get_or_create_plain_metric(&self, metric: &str) -> Arc<MemoryMetric> {
+        if let Some(existing) = self.metrics.get(metric.as_bytes()) {
+            existing.clone()
+        } else {
+            self.get_or_create_metric(metric.as_bytes().to_vec())
+        }
     }
 
     fn update_min_timestamp(&self, timestamp: i64) {
@@ -170,19 +198,33 @@ impl MemoryPartition {
         // Open the created partition
         DiskPartition::open(dir_path, retention)
     }
-}
 
-impl crate::partition::Partition for MemoryPartition {
-    fn insert_rows(&self, rows: &[Row]) -> Result<Vec<Row>> {
+    fn insert_rows_impl(&self, rows: &[Row], append_wal: bool) -> Result<Vec<Row>> {
         if rows.is_empty() {
             return Err(TsinkError::Other("No rows given".to_string()));
         }
 
-        // Normalize timestamps before touching WAL so recovery matches live writes
+        if self.flush_sealed.load(Ordering::Acquire) {
+            return Ok(rows.to_vec());
+        }
+        self.inflight_inserts.fetch_add(1, Ordering::AcqRel);
+        if self.flush_sealed.load(Ordering::Acquire) {
+            self.inflight_inserts.fetch_sub(1, Ordering::AcqRel);
+            return Ok(rows.to_vec());
+        }
+        let _inflight_guard = InflightInsertGuard {
+            counter: &self.inflight_inserts,
+        };
+
         let mut normalized_rows = Vec::with_capacity(rows.len());
+        let mut batch_max_timestamp = i64::MIN;
+        let mut replace_zero_with: Option<i64> = None;
+
         for row in rows {
-            let timestamp = if row.data_point().timestamp == 0 {
-                let now = now_in_precision(self.timestamp_precision);
+            let original = row.data_point();
+            let timestamp = if original.timestamp == 0 {
+                let now = *replace_zero_with
+                    .get_or_insert_with(|| now_in_precision(self.timestamp_precision));
                 tracing::warn!(
                     "Replacing zero timestamp with current time {} for metric {}",
                     now,
@@ -190,40 +232,42 @@ impl crate::partition::Partition for MemoryPartition {
                 );
                 now
             } else {
-                row.data_point().timestamp
+                original.timestamp
             };
 
-            normalized_rows.push(Row::with_labels(
-                row.metric().to_string(),
-                row.labels().to_vec(),
-                DataPoint::new(timestamp, row.data_point().value),
-            ));
+            batch_max_timestamp = batch_max_timestamp.max(timestamp);
+            if timestamp == original.timestamp {
+                normalized_rows.push(row.clone());
+            } else {
+                normalized_rows.push(Row::with_labels(
+                    row.metric().to_string(),
+                    row.labels().to_vec(),
+                    DataPoint::new(timestamp, original.value),
+                ));
+            }
         }
 
-        let mut accepted_rows = Vec::new();
+        let mut accepted_rows = Vec::with_capacity(normalized_rows.len());
         let mut outdated_rows = Vec::new();
         let mut max_timestamp = i64::MIN;
 
-        let mut provisional_min = self.min_t.load(Ordering::Acquire);
+        let partition_min = self.min_t.load(Ordering::Acquire);
+        let allowed_min = if partition_min == 0 {
+            // For a fresh partition, anchor this batch to its newest timestamp so that very old
+            // rows are cascaded to older partitions instead of stretching the new head window.
+            batch_max_timestamp.saturating_sub(self.partition_duration)
+        } else {
+            partition_min.saturating_sub(self.partition_duration)
+        };
 
-        for row in &normalized_rows {
+        for row in normalized_rows {
             let timestamp = row.data_point().timestamp;
-            if provisional_min != 0 && timestamp < provisional_min {
-                let diff = provisional_min.saturating_sub(timestamp);
-                if diff > self.partition_duration {
-                    outdated_rows.push(row.clone()); // return normalized row
-                    continue;
-                }
+            if timestamp < allowed_min {
+                outdated_rows.push(row);
+                continue;
             }
-
-            if provisional_min == 0 {
-                provisional_min = timestamp;
-            } else {
-                provisional_min = provisional_min.min(timestamp);
-            }
-
             max_timestamp = max_timestamp.max(timestamp);
-            accepted_rows.push(row.clone());
+            accepted_rows.push(row);
         }
 
         if accepted_rows.is_empty() {
@@ -238,8 +282,11 @@ impl crate::partition::Partition for MemoryPartition {
             return Ok(outdated_rows);
         }
 
-        // Write only the rows this partition will actually store to WAL
-        self.wal.append_rows(&accepted_rows)?;
+        // Write only the rows this partition will actually store to WAL.
+        // During recovery, WAL appends must be skipped to avoid replay duplication.
+        if append_wal {
+            self.wal.append_rows(&accepted_rows)?;
+        }
 
         let mut rows_added = 0usize;
 
@@ -249,8 +296,12 @@ impl crate::partition::Partition for MemoryPartition {
             self.update_min_timestamp(timestamp);
 
             // Get or create metric
-            let metric_name = marshal_metric_name(row.metric(), row.labels());
-            let metric = self.get_or_create_metric(metric_name);
+            let metric = if row.labels().is_empty() {
+                self.get_or_create_plain_metric(row.metric())
+            } else {
+                let metric_name = marshal_metric_name(row.metric(), row.labels());
+                self.get_or_create_metric(metric_name)
+            };
 
             // Insert the point
             metric.insert_point(DataPoint::new(timestamp, row.data_point().value));
@@ -274,12 +325,17 @@ impl crate::partition::Partition for MemoryPartition {
             let mut retries = 0;
             loop {
                 let current_max = self.max_t.load(Ordering::Acquire);
-                if max_timestamp <= current_max {
+                if current_max != 0 && max_timestamp <= current_max {
                     break;
                 }
+                let desired = if current_max == 0 {
+                    max_timestamp
+                } else {
+                    max_timestamp.max(current_max)
+                };
                 match self.max_t.compare_exchange_weak(
                     current_max,
-                    max_timestamp,
+                    desired,
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
@@ -303,6 +359,16 @@ impl crate::partition::Partition for MemoryPartition {
 
         Ok(outdated_rows)
     }
+}
+
+impl crate::partition::Partition for MemoryPartition {
+    fn insert_rows(&self, rows: &[Row]) -> Result<Vec<Row>> {
+        self.insert_rows_impl(rows, true)
+    }
+
+    fn insert_rows_recovery(&self, rows: &[Row]) -> Result<Vec<Row>> {
+        self.insert_rows_impl(rows, false)
+    }
 
     fn select_data_points(
         &self,
@@ -311,6 +377,19 @@ impl crate::partition::Partition for MemoryPartition {
         start: i64,
         end: i64,
     ) -> Result<Vec<DataPoint>> {
+        let min = self.min_t.load(Ordering::Acquire);
+        let max = self.max_t.load(Ordering::Acquire);
+        if min != 0 && (end <= min || start > max) {
+            return Ok(Vec::new());
+        }
+
+        if labels.is_empty() {
+            return Ok(self
+                .metrics
+                .get(metric.as_bytes())
+                .map_or_else(Vec::new, |m| m.select_points(start, end)));
+        }
+
         let metric_name = marshal_metric_name(metric, labels);
 
         match self.metrics.get(&metric_name) {
@@ -364,7 +443,7 @@ impl crate::partition::Partition for MemoryPartition {
         if min == 0 {
             return true; // Empty partition is active
         }
-        max - min + 1 < self.partition_duration
+        max.saturating_sub(min).saturating_add(1) < self.partition_duration
     }
 
     fn expired(&self) -> bool {
@@ -380,13 +459,11 @@ impl crate::partition::Partition for MemoryPartition {
         let cutoff =
             now_in_precision(self.timestamp_precision).saturating_sub(self.retention_units);
         let timestamp_expired = max_ts < cutoff;
-        let age_expired = self
-            .created_at
-            .elapsed()
-            .map(|elapsed| elapsed > self.retention)
-            .unwrap_or(false);
+        let age = self.created_at.elapsed().unwrap_or(Duration::ZERO);
+        let age_expired = age > self.retention;
+        let stale_by_timestamp = timestamp_expired && age >= Duration::from_secs(1);
 
-        timestamp_expired && age_expired
+        stale_by_timestamp || age_expired
     }
 
     fn clean(&self) -> Result<()> {
@@ -440,6 +517,26 @@ impl crate::partition::Partition for MemoryPartition {
         };
 
         Ok(Some((data, meta)))
+    }
+
+    fn begin_flush(&self) -> bool {
+        if self
+            .flush_sealed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        while self.inflight_inserts.load(Ordering::Acquire) > 0 {
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    fn end_flush(&self) {
+        self.flush_sealed.store(false, Ordering::Release);
     }
 }
 
@@ -516,46 +613,76 @@ impl MemoryMetric {
         }
     }
 
+    fn merge_out_of_order_points(&self) {
+        let mut ooo_points = self.out_of_order_points.lock();
+        if ooo_points.is_empty() {
+            return;
+        }
+
+        ooo_points.sort_by_key(|p| p.timestamp);
+        let incoming = std::mem::take(&mut *ooo_points);
+        drop(ooo_points);
+
+        let mut points = self.points.write();
+        if points.is_empty() {
+            points.extend(incoming);
+            return;
+        }
+
+        if let (Some(last), Some(first_incoming)) = (points.last(), incoming.first())
+            && last.timestamp <= first_incoming.timestamp
+        {
+            points.extend(incoming);
+            return;
+        }
+
+        let mut merged = Vec::with_capacity(points.len() + incoming.len());
+        let mut i = 0usize;
+        let mut j = 0usize;
+
+        while i < points.len() && j < incoming.len() {
+            if points[i].timestamp <= incoming[j].timestamp {
+                merged.push(points[i]);
+                i += 1;
+            } else {
+                merged.push(incoming[j]);
+                j += 1;
+            }
+        }
+
+        if i < points.len() {
+            merged.extend_from_slice(&points[i..]);
+        }
+        if j < incoming.len() {
+            merged.extend_from_slice(&incoming[j..]);
+        }
+
+        *points = merged;
+    }
+
     fn select_points(&self, start: i64, end: i64) -> Vec<DataPoint> {
-        let mut result = Vec::new();
+        self.merge_out_of_order_points();
 
-        // Read in-order points first and release lock quickly
-        {
-            let points = self.points.read();
-            for point in points.iter() {
-                if point.timestamp >= start && point.timestamp < end {
-                    result.push(*point);
-                }
-            }
+        let points = self.points.read();
+        if points.is_empty() {
+            return Vec::new();
         }
 
-        // Then read out-of-order points
-        {
-            let ooo_points = self.out_of_order_points.lock();
-            for point in ooo_points.iter() {
-                if point.timestamp >= start && point.timestamp < end {
-                    result.push(*point);
-                }
-            }
+        // Points are timestamp-sorted; use binary search to avoid full scans.
+        let start_idx = points.partition_point(|p| p.timestamp < start);
+        let end_idx = points.partition_point(|p| p.timestamp < end);
+        if start_idx >= end_idx {
+            Vec::new()
+        } else {
+            points[start_idx..end_idx].to_vec()
         }
-
-        // Sort by timestamp
-        result.sort_by_key(|p| p.timestamp);
-        result
     }
 
     fn encode_all_points<W: Write>(&self, encoder: &mut GorillaEncoder<W>) -> Result<()> {
+        self.merge_out_of_order_points();
+
         let points = self.points.read();
-        let ooo_points = self.out_of_order_points.lock();
-
-        // Create a sorted iterator without cloning
-        let mut all_points: Vec<&DataPoint> = Vec::with_capacity(points.len() + ooo_points.len());
-        all_points.extend(points.iter());
-        all_points.extend(ooo_points.iter());
-        all_points.sort_by_key(|p| p.timestamp);
-
-        // Encode all points in sorted order
-        for point in all_points {
+        for point in points.iter() {
             encoder.encode_point(point)?;
         }
 

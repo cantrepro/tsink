@@ -182,7 +182,7 @@ fn bench_with_labels(c: &mut Criterion) {
             let row = Row::with_labels(
                 "labeled_metric",
                 vec![
-                    Label::new("host", &format!("server{}", i % 10)),
+                    Label::new("host", format!("server{}", i % 10)),
                     Label::new("region", if i % 2 == 0 { "us-east" } else { "us-west" }),
                 ],
                 DataPoint::new(1600000000 + i as i64, i as f64),
@@ -263,7 +263,7 @@ fn bench_partition_types(c: &mut Criterion) {
             .collect();
 
         b.iter(|| {
-            storage.insert_rows(&black_box(rows.clone())).unwrap();
+            storage.insert_rows(black_box(rows.as_slice())).unwrap();
         });
     });
 
@@ -285,7 +285,7 @@ fn bench_partition_types(c: &mut Criterion) {
             .collect();
 
         b.iter(|| {
-            storage.insert_rows(&black_box(rows.clone())).unwrap();
+            storage.insert_rows(black_box(rows.as_slice())).unwrap();
         });
     });
 

@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::Write;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tsink::wal::{DiskWal, Wal};
 use tsink::{DataPoint, Row, StorageBuilder};
 
 #[test]
@@ -37,8 +39,8 @@ fn test_wal_recovery_with_corruption() {
                 let mut data = fs::read(&path).unwrap();
                 if data.len() > 50 {
                     // Inject garbage in the middle
-                    for i in 30..50 {
-                        data[i] = 0xFF;
+                    for byte in data.iter_mut().take(50).skip(30) {
+                        *byte = 0xFF;
                     }
                     fs::write(&path, data).unwrap();
                     break;
@@ -57,7 +59,7 @@ fn test_wal_recovery_with_corruption() {
     // Should have recovered some data
     let points = storage.select("wal_metric", &[], 1, i64::MAX).unwrap();
     assert!(
-        points.len() > 0,
+        !points.is_empty(),
         "Should recover some data despite corruption"
     );
 }
@@ -130,7 +132,7 @@ fn test_wal_with_invalid_operations() {
 
     let points = storage.select("test", &[], 1, i64::MAX).unwrap();
     // Should have recovered valid entries
-    assert!(points.len() >= 1, "Should recover valid entries");
+    assert!(!points.is_empty(), "Should recover valid entries");
 }
 
 #[test]
@@ -168,16 +170,46 @@ fn test_wal_with_multiple_corrupted_segments() {
 }
 
 #[test]
+fn test_wal_recovery_tolerates_more_than_one_failed_segment() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+
+    // Two segments that should fail parsing.
+    fs::write(wal_dir.join("000001.wal"), vec![0xFF; 32]).unwrap();
+    fs::write(wal_dir.join("000002.wal"), vec![0xFF; 32]).unwrap();
+
+    // One valid segment written using the real WAL encoder.
+    let wal = DiskWal::new(&wal_dir, 0).unwrap();
+    let wal_trait: Arc<dyn Wal> = wal;
+    wal_trait
+        .append_rows(&[Row::new("recoverable", DataPoint::new(7, 7.0))])
+        .unwrap();
+    wal_trait.flush().unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    let points = storage.select("recoverable", &[], 0, 10).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, 7);
+    assert!((points[0].value - 7.0).abs() < 1e-12);
+}
+
+#[test]
 fn test_wal_with_empty_segments() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
     fs::create_dir_all(&wal_dir).unwrap();
 
     // Create empty WAL segment
-    fs::write(wal_dir.join("000001.wal"), &[]).unwrap();
+    fs::write(wal_dir.join("000001.wal"), []).unwrap();
 
     // Create very small WAL segment (less than 8 bytes)
-    fs::write(wal_dir.join("000002.wal"), &[1, 2, 3]).unwrap();
+    fs::write(wal_dir.join("000002.wal"), [1, 2, 3]).unwrap();
 
     // Create valid segment
     let mut file = fs::File::create(wal_dir.join("000003.wal")).unwrap();

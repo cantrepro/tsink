@@ -67,6 +67,46 @@ fn memory_partition_returns_outdated_rows() {
 }
 
 #[test]
+fn memory_partition_filters_rows_far_behind_newest_in_fresh_batch() {
+    let partition = new_memory_partition(Duration::from_secs(60), TimestampPrecision::Seconds);
+
+    let rows = vec![
+        Row::new("metric", DataPoint::new(1000, 1.0)),
+        Row::new("metric", DataPoint::new(100, 2.0)),
+    ];
+
+    let outdated = partition.insert_rows(&rows).unwrap();
+    assert_eq!(outdated.len(), 1);
+    assert_eq!(outdated[0].data_point().timestamp, 100);
+
+    let stored = partition
+        .select_data_points("metric", &[], 0, 2000)
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].timestamp, 1000);
+    assert!((stored[0].value - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn memory_partition_tracks_negative_max_timestamp() {
+    let partition = new_memory_partition(Duration::from_secs(60), TimestampPrecision::Seconds);
+
+    let rows = vec![
+        Row::new("metric", DataPoint::new(-50, 1.0)),
+        Row::new("metric", DataPoint::new(-10, 2.0)),
+    ];
+
+    let outdated = partition.insert_rows(&rows).unwrap();
+    assert!(outdated.is_empty());
+    assert_eq!(partition.max_timestamp(), -10);
+
+    let stored = partition
+        .select_data_points("metric", &[], -200, 0)
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+}
+
+#[test]
 fn flush_memory_partition_round_trip_to_disk() {
     let partition = new_memory_partition(Duration::from_secs(600), TimestampPrecision::Seconds);
 

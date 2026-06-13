@@ -4,7 +4,6 @@
 
 use std::thread;
 use std::time::Duration;
-use tokio;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 
 /// Example: Basic storage with data path persistence
@@ -98,7 +97,7 @@ fn example_concurrent_operations() -> tsink::Result<()> {
                 let timestamp = 1600000000 + i;
                 let row = Row::with_labels(
                     "concurrent_metric",
-                    vec![Label::new("worker", &worker_id.to_string())],
+                    vec![Label::new("worker", worker_id.to_string())],
                     DataPoint::new(timestamp, (worker_id * 100 + i) as f64),
                 );
 

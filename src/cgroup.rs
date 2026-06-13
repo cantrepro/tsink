@@ -5,27 +5,21 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-static INIT: Once = Once::new();
-static mut AVAILABLE_CPUS: usize = 0;
+static AVAILABLE_CPUS: OnceLock<usize> = OnceLock::new();
 
 /// Returns the number of available CPU cores for the application.
 /// This takes into account cgroup CPU quotas if running in a container.
 pub fn available_cpus() -> usize {
-    unsafe {
-        INIT.call_once(|| {
-            AVAILABLE_CPUS = detect_cpu_quota();
-        });
-        AVAILABLE_CPUS
-    }
+    *AVAILABLE_CPUS.get_or_init(detect_cpu_quota)
 }
 
 /// Detects CPU quota from cgroup settings
 fn detect_cpu_quota() -> usize {
-    // Check if we should use environment variable
-    if let Ok(val) = std::env::var("GOMAXPROCS")
-        && let Ok(n) = val.parse::<usize>()
+    // Allow explicit override for Rust users, with GOMAXPROCS compatibility fallback.
+    if let Some(n) =
+        parse_cpu_override_env("TSINK_MAX_CPUS").or_else(|| parse_cpu_override_env("GOMAXPROCS"))
     {
         return n;
     }
@@ -33,7 +27,8 @@ fn detect_cpu_quota() -> usize {
     // Try to get CPU quota from cgroup
     if let Some(quota) = get_cpu_quota() {
         let num_cpus = num_cpus::get();
-        let calculated = (quota + 0.5) as usize;
+        // Respect fractional quotas below 1 CPU by reserving at least one worker.
+        let calculated = quota.ceil() as usize;
 
         if calculated > 0 && calculated < num_cpus {
             return calculated;
@@ -42,6 +37,12 @@ fn detect_cpu_quota() -> usize {
 
     // Fall back to number of logical CPUs
     num_cpus::get()
+}
+
+fn parse_cpu_override_env(var_name: &str) -> Option<usize> {
+    let value = std::env::var(var_name).ok()?;
+    let parsed = value.parse::<usize>().ok()?;
+    (parsed > 0).then_some(parsed)
 }
 
 /// Gets CPU quota from cgroup v1 or v2
@@ -71,6 +72,9 @@ fn get_cpu_quota_v2() -> Option<f64> {
 
     let quota = parts[0].parse::<f64>().ok()?;
     let period = parts[1].parse::<f64>().ok()?;
+    if period <= 0.0 {
+        return None;
+    }
 
     Some(quota / period)
 }
@@ -84,6 +88,9 @@ fn get_cpu_quota_v1() -> Option<f64> {
     }
 
     let period = read_cgroup_value("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?;
+    if period <= 0 {
+        return None;
+    }
     Some(quota as f64 / period as f64)
 }
 
@@ -109,6 +116,7 @@ fn count_cpu_ranges(data: &str) -> usize {
             if bounds.len() == 2
                 && let (Ok(start), Ok(end)) =
                     (bounds[0].parse::<usize>(), bounds[1].parse::<usize>())
+                && end >= start
             {
                 count += end - start + 1;
             }
@@ -190,6 +198,7 @@ mod tests {
         assert_eq!(count_cpu_ranges("0-3,5,7-9"), 8);
         assert_eq!(count_cpu_ranges("0"), 1);
         assert_eq!(count_cpu_ranges(""), 0);
+        assert_eq!(count_cpu_ranges("3-1"), 0);
     }
 
     #[test]

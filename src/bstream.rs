@@ -1,6 +1,7 @@
 //! Bit stream implementation for Gorilla compression.
 
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 use std::io::{self, Read};
 
 /// A stream of bits for writing.
@@ -65,6 +66,11 @@ impl BitStreamWriter {
 
     /// Writes multiple bits.
     pub fn write_bits(&mut self, mut value: u64, mut nbits: usize) {
+        if nbits == 0 {
+            return;
+        }
+        assert!(nbits <= 64, "nbits must be <= 64");
+
         value <<= 64 - nbits;
 
         while nbits >= 8 {
@@ -99,18 +105,27 @@ impl BitStreamWriter {
 }
 
 /// A stream of bits for reading.
-pub struct BitStreamReader {
-    stream: Vec<u8>,
+pub struct BitStreamReader<'a> {
+    stream: Cow<'a, [u8]>,
     stream_offset: usize,
     buffer: u64,
     valid: u8, // Number of bits valid to read from left in buffer
 }
 
-impl BitStreamReader {
+impl<'a> BitStreamReader<'a> {
     /// Creates a new BitStreamReader from bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
+        Self::from_cow(Cow::Owned(bytes))
+    }
+
+    /// Creates a new BitStreamReader borrowing an existing byte slice.
+    pub fn from_slice(bytes: &'a [u8]) -> Self {
+        Self::from_cow(Cow::Borrowed(bytes))
+    }
+
+    fn from_cow(stream: Cow<'a, [u8]>) -> Self {
         Self {
-            stream: bytes,
+            stream,
             stream_offset: 0,
             buffer: 0,
             valid: 0,
@@ -138,6 +153,15 @@ impl BitStreamReader {
 
     /// Reads multiple bits.
     pub fn read_bits(&mut self, nbits: u8) -> io::Result<u64> {
+        if nbits > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nbits must be <= 64",
+            ));
+        }
+        if nbits == 0 {
+            return Ok(0);
+        }
         if self.valid == 0 && !self.load_next_buffer(nbits) {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
@@ -165,6 +189,12 @@ impl BitStreamReader {
 
     /// Fast version of read_bits that assumes buffer has enough data.
     pub fn read_bits_fast(&mut self, nbits: u8) -> io::Result<u64> {
+        if nbits > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nbits must be <= 64",
+            ));
+        }
         if nbits > self.valid {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
@@ -219,7 +249,7 @@ impl BitStreamReader {
     }
 }
 
-impl Read for BitStreamReader {
+impl Read for BitStreamReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         for (i, byte) in buf.iter_mut().enumerate() {
             match self.read_bits(8) {
@@ -250,9 +280,9 @@ mod tests {
         let bytes = writer.into_bytes();
         let mut reader = BitStreamReader::new(bytes);
 
-        assert_eq!(reader.read_bit().unwrap(), true);
-        assert_eq!(reader.read_bit().unwrap(), false);
-        assert_eq!(reader.read_bit().unwrap(), true);
+        assert!(reader.read_bit().unwrap());
+        assert!(!reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(4).unwrap(), 0b1010);
         assert_eq!(reader.read_bits(8).unwrap(), 0xFF);
     }
@@ -273,5 +303,12 @@ mod tests {
         assert_eq!(reader.read_bits(3).unwrap(), 0b101);
         assert_eq!(reader.read_bits(8).unwrap(), 0b11111111);
         assert_eq!(reader.read_bits(12).unwrap(), 0b101010101010);
+    }
+
+    #[test]
+    fn test_read_bits_zero_and_invalid_width() {
+        let mut reader = BitStreamReader::new(vec![0xAA]);
+        assert_eq!(reader.read_bits(0).unwrap(), 0);
+        assert!(reader.read_bits(65).is_err());
     }
 }

@@ -5,11 +5,12 @@ use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::mmap::PlatformMmap;
 use crate::time::{duration_to_units, now_in_precision};
 use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::fs::{self, File};
-use std::io::{Cursor, Write as IoWrite};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -44,7 +45,7 @@ pub struct DiskMetric {
 pub struct DiskPartition {
     dir_path: PathBuf,
     meta: PartitionMeta,
-    mapped_file: PlatformMmap,
+    mapped_file: RwLock<Option<PlatformMmap>>,
     retention: Duration,
     timestamp_precision: TimestampPrecision,
     retention_units: i64,
@@ -63,17 +64,24 @@ impl DiskPartition {
             return Ok(Vec::new());
         }
 
+        let mapped_guard = self.mapped_file.read();
+        let mapped_file = mapped_guard
+            .as_ref()
+            .ok_or_else(|| TsinkError::InvalidPartition {
+                id: self.dir_path.display().to_string(),
+            })?;
+
         // Validate offset is within bounds
         let offset = disk_metric.offset as usize;
-        if offset >= self.mapped_file.len() {
+        if offset >= mapped_file.len() {
             return Err(TsinkError::InvalidOffset {
                 offset: disk_metric.offset,
-                max: self.mapped_file.len() as u64,
+                max: mapped_file.len() as u64,
             });
         }
 
         // Create a cursor at the metric's offset with bounds checking
-        let data_slice = self.mapped_file.as_slice();
+        let data_slice = mapped_file.as_slice();
         let mapped_len = data_slice.len();
         let encoded_size = if disk_metric.encoded_size > 0 {
             disk_metric.encoded_size as usize
@@ -90,11 +98,11 @@ impl DiskPartition {
         }
 
         let metric_data = &data_slice[offset..end_offset];
-        let cursor = Cursor::new(metric_data.to_vec());
 
         // Decode points
-        let mut decoder = GorillaDecoder::new(cursor.into_inner());
-        let mut points = Vec::with_capacity(disk_metric.num_data_points);
+        let mut decoder = GorillaDecoder::from_slice(metric_data);
+        // Metadata can be corrupted; avoid preallocating attacker-controlled capacity.
+        let mut points = Vec::new();
 
         // Must decode all points sequentially due to delta encoding
         for _ in 0..disk_metric.num_data_points {
@@ -148,7 +156,7 @@ impl DiskPartition {
         Ok(Self {
             dir_path: dir_path.to_path_buf(),
             meta,
-            mapped_file,
+            mapped_file: RwLock::new(Some(mapped_file)),
             retention,
             timestamp_precision,
             retention_units,
@@ -164,13 +172,31 @@ impl DiskPartition {
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref();
 
-        // Create directory
-        fs::create_dir_all(dir_path)?;
+        if dir_path.exists() {
+            // Prevent accidental overwrite of an existing persisted partition.
+            if fs::read_dir(dir_path)?.next().is_some() {
+                return Err(TsinkError::IoWithPath {
+                    path: dir_path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "partition directory already exists and is not empty: {}",
+                            dir_path.display()
+                        ),
+                    ),
+                });
+            }
+        } else {
+            fs::create_dir_all(dir_path)?;
+        }
 
         // Write data file
         let data_path = dir_path.join(DATA_FILE_NAME);
         {
-            let mut file = File::create(&data_path)?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&data_path)?;
             file.write_all(&data)?;
             file.sync_all()?;
         }
@@ -199,11 +225,7 @@ impl crate::partition::Partition for DiskPartition {
         end: i64,
     ) -> Result<Vec<DataPoint>> {
         if self.expired() {
-            return Err(TsinkError::NoDataPoints {
-                metric: "unknown".to_string(),
-                start: 0,
-                end: 0,
-            });
+            return Ok(Vec::new());
         }
 
         let metric_name = marshal_metric_name(metric, labels);
@@ -230,11 +252,7 @@ impl crate::partition::Partition for DiskPartition {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
         if self.expired() {
-            return Err(TsinkError::NoDataPoints {
-                metric: metric.to_string(),
-                start,
-                end,
-            });
+            return Ok(Vec::new());
         }
 
         let mut results = Vec::new();
@@ -243,18 +261,22 @@ impl crate::partition::Partition for DiskPartition {
         for (encoded_key, disk_metric) in &self.meta.metrics {
             // Try to unmarshal the name to extract base metric and labels
             let marshaled_bytes = decode_metric_key(encoded_key);
+            let mut matched = false;
 
             // First try to unmarshal it as a marshaled name
-            if let Ok((base_metric, labels)) = unmarshal_metric_name(&marshaled_bytes) {
-                if base_metric == metric {
-                    // Found a matching metric, decode its data points
-                    let points = self.decode_metric_points(disk_metric, start, end)?;
-                    if !points.is_empty() {
-                        results.push((labels, points));
-                    }
+            if let Ok((base_metric, labels)) = unmarshal_metric_name(&marshaled_bytes)
+                && base_metric == metric
+            {
+                // Found a matching metric, decode its data points
+                let points = self.decode_metric_points(disk_metric, start, end)?;
+                if !points.is_empty() {
+                    results.push((labels, points));
+                    matched = true;
                 }
-            } else if marshaled_bytes == metric.as_bytes() {
-                // It might be a plain metric name without labels
+            }
+
+            if !matched && (encoded_key == metric || marshaled_bytes == metric.as_bytes()) {
+                // It might be a plain metric key from legacy metadata.
                 let points = self.decode_metric_points(disk_metric, start, end)?;
                 if !points.is_empty() {
                     results.push((Vec::new(), points));
@@ -289,18 +311,22 @@ impl crate::partition::Partition for DiskPartition {
         let cutoff =
             now_in_precision(self.timestamp_precision).saturating_sub(self.retention_units);
         let timestamp_expired = self.meta.max_timestamp < cutoff;
-        let age_expired = self
-            .meta
-            .created_at
-            .elapsed()
-            .map(|elapsed| elapsed > self.retention)
-            .unwrap_or(false);
+        let age = self.meta.created_at.elapsed().unwrap_or(Duration::ZERO);
+        let age_expired = age > self.retention;
+        let stale_by_timestamp = timestamp_expired && age >= Duration::from_secs(1);
 
-        timestamp_expired && age_expired
+        stale_by_timestamp || age_expired
     }
 
     fn clean(&self) -> Result<()> {
-        fs::remove_dir_all(&self.dir_path)?;
+        // Drop the mmap before deleting files to keep behavior consistent across platforms.
+        let mut mapped = self.mapped_file.write();
+        let _ = mapped.take();
+        drop(mapped);
+
+        if self.dir_path.exists() {
+            fs::remove_dir_all(&self.dir_path)?;
+        }
         Ok(())
     }
 
@@ -350,9 +376,25 @@ const fn default_timestamp_precision() -> TimestampPrecision {
 
 pub(crate) fn write_meta_atomic(path: &Path, meta: &PartitionMeta) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    let file = File::create(&tmp)?;
-    serde_json::to_writer_pretty(&file, meta)?;
-    file.sync_all()?;
+    {
+        let file = File::create(&tmp)?;
+        serde_json::to_writer_pretty(&file, meta)?;
+        file.sync_all()?;
+    }
     fs::rename(tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }

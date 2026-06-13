@@ -12,6 +12,12 @@ pub trait Partition: Send + Sync {
     /// Returns outdated rows that are older than the partition's min timestamp.
     fn insert_rows(&self, rows: &[Row]) -> Result<Vec<Row>>;
 
+    /// Inserts rows during WAL recovery.
+    /// Default behavior matches normal inserts; partitions can override to skip WAL appends.
+    fn insert_rows_recovery(&self, rows: &[Row]) -> Result<Vec<Row>> {
+        self.insert_rows(rows)
+    }
+
     /// Selects data points for a specific metric within the given time range.
     fn select_data_points(
         &self,
@@ -51,6 +57,15 @@ pub trait Partition: Send + Sync {
     /// Flushes the partition's data to disk, returning the encoded data and metadata.
     /// Returns None if the partition doesn't support flushing (e.g., already on disk).
     fn flush_to_disk(&self) -> Result<Option<(Vec<u8>, crate::disk::PartitionMeta)>>;
+
+    /// Marks a partition as being flushed, preventing new writes from being accepted.
+    /// Returns `true` when the partition supports this state transition.
+    fn begin_flush(&self) -> bool {
+        false
+    }
+
+    /// Clears a previously established flush marker.
+    fn end_flush(&self) {}
 }
 
 /// Type alias for a shared partition reference.

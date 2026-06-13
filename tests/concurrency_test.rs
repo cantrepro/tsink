@@ -163,7 +163,7 @@ fn test_concurrent_labeled_metrics() {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
             let labels = vec![
-                Label::new("thread", &thread_id.to_string()),
+                Label::new("thread", thread_id.to_string()),
                 Label::new("type", if thread_id % 2 == 0 { "even" } else { "odd" }),
             ];
 
@@ -186,7 +186,7 @@ fn test_concurrent_labeled_metrics() {
     // Query with different label combinations
     for thread_id in 0..8 {
         let labels = vec![
-            Label::new("thread", &thread_id.to_string()),
+            Label::new("thread", thread_id.to_string()),
             Label::new("type", if thread_id % 2 == 0 { "even" } else { "odd" }),
         ];
         let points = storage

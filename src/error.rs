@@ -25,6 +25,9 @@ pub enum TsinkError {
     #[error("Invalid metric name: {0}")]
     InvalidMetricName(String),
 
+    #[error("Invalid label: {0}")]
+    InvalidLabel(String),
+
     #[error("Partition not found for timestamp {timestamp}")]
     PartitionNotFound { timestamp: i64 },
 
@@ -132,9 +135,9 @@ impl From<crossbeam_channel::RecvError> for TsinkError {
 impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
     fn from(e: crossbeam_channel::RecvTimeoutError) -> Self {
         match e {
-            crossbeam_channel::RecvTimeoutError::Timeout => {
-                TsinkError::ChannelTimeout { timeout_ms: 0 }
-            }
+            crossbeam_channel::RecvTimeoutError::Timeout => TsinkError::ChannelReceive {
+                channel: "recv_timeout: duration unavailable".to_string(),
+            },
             crossbeam_channel::RecvTimeoutError::Disconnected => TsinkError::ChannelReceive {
                 channel: "timeout: channel disconnected".to_string(),
             },

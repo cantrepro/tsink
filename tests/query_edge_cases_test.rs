@@ -1,5 +1,5 @@
 use tempfile::TempDir;
-use tsink::{DataPoint, Label, Row, StorageBuilder};
+use tsink::{DataPoint, Label, Row, StorageBuilder, TsinkError};
 
 #[test]
 fn test_query_empty_database() {
@@ -28,7 +28,9 @@ fn test_query_with_extreme_timestamps() {
         Row::new("extreme", DataPoint::new(1, 2.0)),
         Row::new("extreme", DataPoint::new(i64::MAX - 1, 3.0)),
     ];
-    storage.insert_rows(&rows).unwrap();
+    for row in rows {
+        storage.insert_rows(&[row]).unwrap();
+    }
 
     // Query with full range
     let points = storage.select("extreme", &[], i64::MIN, i64::MAX).unwrap();
@@ -170,14 +172,12 @@ fn test_query_with_complex_labels() {
         .unwrap();
 
     // Test with special characters in labels
-    let labels_sets = vec![
+    let labels_sets = [
         vec![Label::new("key", "value with spaces")],
         vec![Label::new("key", "value/with/slashes")],
         vec![Label::new("key", "value=with=equals")],
         vec![Label::new("key", "value,with,commas")],
         vec![Label::new("key", "value\"with\"quotes")],
-        vec![Label::new("key", "")],   // Empty value
-        vec![Label::new("", "value")], // Empty key (invalid)
         vec![
             Label::new("key1", "value1"),
             Label::new("key2", "value2"),
@@ -196,12 +196,41 @@ fn test_query_with_complex_labels() {
 
     // Query each label set
     for (i, labels) in labels_sets.iter().enumerate() {
-        if labels.iter().any(|l| !l.is_valid()) {
-            continue; // Skip invalid labels
-        }
         let points = storage.select("labeled", labels, 1, 100).unwrap();
-        assert!(points.len() >= 1, "Failed to find data for label set {}", i);
+        assert!(
+            !points.is_empty(),
+            "Failed to find data for label set {}",
+            i
+        );
     }
+}
+
+#[test]
+fn test_query_rejects_invalid_labels() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    let err = storage
+        .insert_rows(&[Row::with_labels(
+            "invalid_label_insert",
+            vec![Label::new("", "value")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidLabel(_)));
+
+    let err = storage
+        .select(
+            "invalid_label_select",
+            &[Label::new("key", "")],
+            1,
+            i64::MAX,
+        )
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidLabel(_)));
 }
 
 #[test]
