@@ -441,6 +441,57 @@ pub fn load_segments_for_level(base: impl AsRef<Path>, level: u8) -> Result<Vec<
     Ok(out)
 }
 
+pub fn collect_expired_segment_dirs(
+    base: impl AsRef<Path>,
+    retention_cutoff: i64,
+) -> Result<Vec<PathBuf>> {
+    let dirs = collect_segment_dirs(base.as_ref(), 0..=2u8)?;
+    let mut expired = Vec::<(u8, u64, PathBuf)>::new();
+
+    for dir in dirs {
+        let manifest_path = dir.join("manifest.bin");
+        let manifest_bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %manifest_path.display(),
+                    error = %err,
+                    "Segment manifest disappeared during retention scan; skipping"
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let parsed_manifest = match parse_manifest(&manifest_bytes) {
+            Ok(manifest) => manifest,
+            Err(TsinkError::DataCorruption(msg)) => {
+                warn!(
+                    path = %manifest_path.display(),
+                    error = %msg,
+                    "Ignoring invalid segment manifest during retention scan"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        let Some(max_ts) = parsed_manifest.max_ts else {
+            continue;
+        };
+
+        if max_ts < retention_cutoff {
+            expired.push((parsed_manifest.level, parsed_manifest.segment_id, dir));
+        }
+    }
+
+    expired.sort_by_key(|(level, segment_id, _)| (*level, *segment_id));
+    Ok(expired
+        .into_iter()
+        .map(|(_, _, segment_root)| segment_root)
+        .collect())
+}
+
 fn collect_segment_dirs(base: &Path, levels: impl IntoIterator<Item = u8>) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for level in levels {
@@ -1968,7 +2019,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{load_segments, load_segments_for_level, SegmentWriter, WalHighWatermark};
+    use super::{
+        collect_expired_segment_dirs, load_segments, load_segments_for_level, SegmentWriter,
+        WalHighWatermark,
+    };
     use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
     use crate::engine::encoder::Encoder;
     use crate::engine::series_registry::SeriesRegistry;
@@ -2039,6 +2093,40 @@ mod tests {
         assert_eq!(loaded[0].manifest.wal_highwater, highwater);
     }
 
+    #[test]
+    fn collect_expired_segment_dirs_finds_all_levels() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+        let series = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap();
+        let series_id = series.series_id;
+
+        let mut old_chunks = HashMap::new();
+        old_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(10, 1.0)])]);
+
+        let mut newer_chunks = HashMap::new();
+        newer_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(60, 2.0)])]);
+
+        let l0_writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        l0_writer.write_segment(&registry, &old_chunks).unwrap();
+
+        let l1_writer = SegmentWriter::new(tmp.path(), 1, 2).unwrap();
+        l1_writer.write_segment(&registry, &old_chunks).unwrap();
+
+        let l2_writer = SegmentWriter::new(tmp.path(), 2, 3).unwrap();
+        l2_writer.write_segment(&registry, &newer_chunks).unwrap();
+
+        let expired = collect_expired_segment_dirs(tmp.path(), 50).unwrap();
+        assert_eq!(
+            expired,
+            vec![
+                l0_writer.layout().root.clone(),
+                l1_writer.layout().root.clone(),
+            ]
+        );
+    }
+
     fn sample_segment_input() -> (SeriesRegistry, HashMap<u64, Vec<Chunk>>) {
         let mut registry = SeriesRegistry::new();
         let series = registry
@@ -2073,5 +2161,30 @@ mod tests {
         let mut chunks_by_series = HashMap::new();
         chunks_by_series.insert(series.series_id, vec![chunk]);
         (registry, chunks_by_series)
+    }
+
+    fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
+        let points = points
+            .iter()
+            .map(|(ts, value)| ChunkPoint {
+                ts: *ts,
+                value: Value::F64(*value),
+            })
+            .collect::<Vec<_>>();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+
+        Chunk {
+            header: ChunkHeader {
+                series_id,
+                lane: ValueLane::Numeric,
+                point_count: points.len() as u16,
+                min_ts: points.first().unwrap().ts,
+                max_ts: points.last().unwrap().ts,
+                ts_codec: encoded.ts_codec,
+                value_codec: encoded.value_codec,
+            },
+            points,
+            encoded_payload: encoded.payload,
+        }
     }
 }

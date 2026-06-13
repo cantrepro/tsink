@@ -16,7 +16,9 @@ use crate::engine::query::{
     decode_chunk_points_in_range_into, decode_encoded_chunk_payload_in_range_into,
     EncodedChunkDescriptor,
 };
-use crate::engine::segment::{load_segment_indexes, SegmentWriter, WalHighWatermark};
+use crate::engine::segment::{
+    collect_expired_segment_dirs, load_segment_indexes, SegmentWriter, WalHighWatermark,
+};
 use crate::engine::series_registry::{
     validate_labels, validate_metric, SeriesId, SeriesRegistry, SeriesResolution,
 };
@@ -492,6 +494,7 @@ impl ChunkStorage {
         if persisted {
             self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
         }
+        self.sweep_expired_persisted_segments()?;
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
@@ -682,6 +685,57 @@ impl ChunkStorage {
         self.reload_persisted_indexes_from_disk()?;
         self.evict_persisted_sealed_chunks();
         Ok(())
+    }
+
+    fn sweep_expired_persisted_segments(&self) -> Result<usize> {
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            return Ok(0);
+        }
+
+        let Some(cutoff) = self.active_retention_cutoff() else {
+            return Ok(0);
+        };
+
+        let _compaction_guard = self.compaction_lock.lock();
+        let _visibility_guard = self.flush_visibility_lock.write();
+
+        let mut expired_dirs = Vec::new();
+        if let Some(path) = &self.numeric_lane_path {
+            expired_dirs.extend(collect_expired_segment_dirs(path, cutoff)?);
+        }
+        if let Some(path) = &self.blob_lane_path {
+            expired_dirs.extend(collect_expired_segment_dirs(path, cutoff)?);
+        }
+
+        if expired_dirs.is_empty() {
+            return Ok(0);
+        }
+
+        {
+            // Drop mmaps before deleting segment files so removal works across platforms.
+            let mut persisted_index = self.persisted_index.write();
+            persisted_index.chunk_refs.clear();
+            persisted_index.segment_maps.clear();
+        }
+
+        let mut removed = 0usize;
+        for dir in expired_dirs {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    let _ = self.reload_persisted_indexes_from_disk();
+                    return Err(err.into());
+                }
+            }
+        }
+
+        if removed > 0 {
+            self.reload_persisted_indexes_from_disk()?;
+            self.evict_persisted_sealed_chunks();
+        }
+
+        Ok(removed)
     }
 
     fn sealed_chunk_is_present_in_persisted_index(
@@ -1809,6 +1863,7 @@ impl Storage for ChunkStorage {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
             self.persist_segment(true)?;
+            self.sweep_expired_persisted_segments()?;
             if self.memory_budget_value() != usize::MAX {
                 self.refresh_memory_usage();
             }
@@ -1909,6 +1964,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     ));
     storage.apply_loaded_segment_indexes(loaded_segments)?;
     storage.replay_from_wal(replay_highwater)?;
+    storage.sweep_expired_persisted_segments()?;
     if storage.memory_budget_value() != usize::MAX {
         storage.refresh_memory_usage();
         storage.enforce_memory_budget_if_needed()?;
@@ -3704,6 +3760,117 @@ mod tests {
                 DataPoint::new(102, 2.0)
             ]
         );
+    }
+
+    #[test]
+    fn retention_sweeper_deletes_expired_persisted_segments_across_levels() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert("retention_swept_metric", &labels)
+            .unwrap()
+            .series_id;
+
+        let mut expired_chunks = HashMap::new();
+        expired_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(1, 1.0), (2, 2.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 0, 1)
+            .unwrap()
+            .write_segment(&registry, &expired_chunks)
+            .unwrap();
+        SegmentWriter::new(&lane_path, 1, 2)
+            .unwrap()
+            .write_segment(&registry, &expired_chunks)
+            .unwrap();
+
+        let mut retained_chunks = HashMap::new();
+        retained_chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(100, 100.0), (101, 101.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 2, 3)
+            .unwrap()
+            .write_segment(&registry, &retained_chunks)
+            .unwrap();
+
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(false)
+            .with_retention(Duration::from_secs(10))
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+        assert!(load_segments_for_level(&lane_path, 1).unwrap().is_empty());
+        let l2 = load_segments_for_level(&lane_path, 2).unwrap();
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].manifest.segment_id, 3);
+
+        let points = storage
+            .select("retention_swept_metric", &labels, 0, 200)
+            .unwrap();
+        assert_eq!(
+            points,
+            vec![DataPoint::new(100, 100.0), DataPoint::new(101, 101.0)]
+        );
+
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn retention_sweeper_is_disabled_when_retention_enforcement_is_off() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let labels = vec![Label::new("host", "a")];
+        let mut registry = SeriesRegistry::new();
+        let series_id = registry
+            .resolve_or_insert("retention_unswept_metric", &labels)
+            .unwrap()
+            .series_id;
+
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            vec![make_persisted_numeric_chunk(
+                series_id,
+                &[(1, 1.0), (2, 2.0)],
+            )],
+        );
+        SegmentWriter::new(&lane_path, 0, 1)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(false)
+            .with_retention(Duration::from_secs(1))
+            .with_retention_enforced(false)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        let l0 = load_segments_for_level(&lane_path, 0).unwrap();
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l0[0].manifest.segment_id, 1);
+
+        let points = storage
+            .select("retention_unswept_metric", &labels, 0, 10)
+            .unwrap();
+        assert_eq!(points, vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]);
+
+        storage.close().unwrap();
     }
 
     #[test]
