@@ -20,6 +20,19 @@ const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
 type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionRunStats {
+    pub compacted: bool,
+    pub source_level: Option<u8>,
+    pub target_level: Option<u8>,
+    pub source_segments: usize,
+    pub output_segments: usize,
+    pub source_chunks: usize,
+    pub output_chunks: usize,
+    pub source_points: usize,
+    pub output_points: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionLevel {
     L0,
@@ -62,11 +75,23 @@ impl Compactor {
     }
 
     pub fn compact_once(&self) -> Result<bool> {
-        if self.try_compact_level(CompactionLevel::L0, CompactionLevel::L1, self.l0_trigger)? {
-            return Ok(true);
+        Ok(self.compact_once_with_stats()?.compacted)
+    }
+
+    pub fn compact_once_with_stats(&self) -> Result<CompactionRunStats> {
+        if let Some(stats) =
+            self.try_compact_level(CompactionLevel::L0, CompactionLevel::L1, self.l0_trigger)?
+        {
+            return Ok(stats);
         }
 
-        self.try_compact_level(CompactionLevel::L1, CompactionLevel::L2, self.l1_trigger)
+        if let Some(stats) =
+            self.try_compact_level(CompactionLevel::L1, CompactionLevel::L2, self.l1_trigger)?
+        {
+            return Ok(stats);
+        }
+
+        Ok(CompactionRunStats::default())
     }
 
     fn try_compact_level(
@@ -74,36 +99,64 @@ impl Compactor {
         source: CompactionLevel,
         target: CompactionLevel,
         count_trigger: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<CompactionRunStats>> {
         let source_level = level_to_u8(source);
         let target_level = level_to_u8(target);
 
         let mut segments = load_segments_for_level(&self.data_path, source_level)?;
         if segments.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
 
         segments.sort_by_key(|segment| segment.manifest.segment_id);
 
         let should_compact = segments.len() >= count_trigger || has_time_overlap(&segments);
         if !should_compact {
-            return Ok(false);
+            return Ok(None);
         }
 
         let window =
             select_compaction_window(&segments, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
         if window.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
 
-        self.compact_segments(target_level, &window)?;
-        Ok(true)
+        let mut stats = self.compact_segments(target_level, &window)?;
+        stats.compacted = true;
+        stats.source_level = Some(source_level);
+        stats.target_level = Some(target_level);
+        Ok(Some(stats))
     }
 
-    fn compact_segments(&self, target_level: u8, segments: &[&LoadedSegment]) -> Result<()> {
+    fn compact_segments(
+        &self,
+        target_level: u8,
+        segments: &[&LoadedSegment],
+    ) -> Result<CompactionRunStats> {
+        let source_segments = segments.len();
         let (series, chunks_by_series) = collect_series_and_chunk_refs(segments)?;
+        let source_chunks = chunks_by_series
+            .values()
+            .map(std::vec::Vec::len)
+            .sum::<usize>();
+        let source_points = chunks_by_series
+            .values()
+            .flat_map(|chunks| chunks.iter())
+            .map(|chunk| chunk.header.point_count as usize)
+            .sum::<usize>();
+
         if chunks_by_series.is_empty() {
-            return Ok(());
+            return Ok(CompactionRunStats {
+                compacted: false,
+                source_level: None,
+                target_level: Some(target_level),
+                source_segments,
+                output_segments: 0,
+                source_chunks,
+                output_chunks: 0,
+                source_points,
+                output_points: 0,
+            });
         }
 
         let mut registry = SeriesRegistry::new();
@@ -122,6 +175,8 @@ impl Compactor {
         let mut pending_chunks = HashMap::<SeriesId, Vec<Chunk>>::new();
         let mut pending_points = 0usize;
         let mut emitted_segments = 0usize;
+        let mut emitted_chunks = 0usize;
+        let mut emitted_points = 0usize;
 
         for series_def in &series {
             let series_id = series_def.series_id;
@@ -130,6 +185,8 @@ impl Compactor {
             };
 
             stream_merge_series_chunks(series_id, chunks, self.point_cap, |chunk| {
+                emitted_chunks = emitted_chunks.saturating_add(1);
+                emitted_points = emitted_points.saturating_add(chunk.header.point_count as usize);
                 pending_points = pending_points.saturating_add(chunk.header.point_count as usize);
                 pending_chunks.entry(series_id).or_default().push(chunk);
                 if pending_points >= output_segment_point_budget {
@@ -148,14 +205,34 @@ impl Compactor {
         }
 
         if emitted_segments == 0 {
-            return Ok(());
+            return Ok(CompactionRunStats {
+                compacted: false,
+                source_level: None,
+                target_level: Some(target_level),
+                source_segments,
+                output_segments: emitted_segments,
+                source_chunks,
+                output_chunks: emitted_chunks,
+                source_points,
+                output_points: emitted_points,
+            });
         }
 
         for segment in segments {
             fs::remove_dir_all(&segment.root)?;
         }
 
-        Ok(())
+        Ok(CompactionRunStats {
+            compacted: true,
+            source_level: None,
+            target_level: Some(target_level),
+            source_segments,
+            output_segments: emitted_segments,
+            source_chunks,
+            output_chunks: emitted_chunks,
+            source_points,
+            output_points: emitted_points,
+        })
     }
 
     fn flush_compacted_segment(

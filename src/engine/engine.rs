@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::concurrency::{Semaphore, SemaphoreGuard};
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
-use crate::engine::compactor::Compactor;
+use crate::engine::compactor::{CompactionRunStats, Compactor};
 use crate::engine::encoder::Encoder;
 use crate::engine::query::{
     decode_chunk_points_in_range_into, decode_encoded_chunk_payload_in_range_into,
@@ -29,8 +29,9 @@ use crate::storage::{
     CompiledSeriesMatcher, SeriesMatcherOp, SeriesSelection, TimestampPrecision,
 };
 use crate::{
-    Aggregation, DataPoint, Label, MetricSeries, QueryOptions, Result, Row, Storage,
-    StorageBuilder, TsinkError, Value,
+    Aggregation, CompactionObservabilitySnapshot, DataPoint, FlushObservabilitySnapshot, Label,
+    MetricSeries, QueryObservabilitySnapshot, QueryOptions, Result, Row, Storage, StorageBuilder,
+    StorageObservabilitySnapshot, TsinkError, Value, WalObservabilitySnapshot,
 };
 
 const STORAGE_OPEN: u8 = 0;
@@ -45,6 +46,150 @@ const DEFAULT_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLOSE_COMPACTION_MAX_PASSES: usize = 128;
 const IN_MEMORY_SHARD_COUNT: usize = 64;
 const REGISTRY_TXN_SHARD_COUNT: usize = IN_MEMORY_SHARD_COUNT;
+
+fn saturating_u64_from_usize(value: usize) -> u64 {
+    value.min(u64::MAX as usize) as u64
+}
+
+fn elapsed_nanos_u64(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+#[derive(Default)]
+struct StorageObservabilityCounters {
+    wal: WalObservabilityCounters,
+    flush: FlushObservabilityCounters,
+    compaction: CompactionObservabilityCounters,
+    query: QueryObservabilityCounters,
+}
+
+impl StorageObservabilityCounters {
+    fn record_compaction_result(&self, stats: CompactionRunStats, duration_nanos: u64) {
+        self.compaction.runs_total.fetch_add(1, Ordering::Relaxed);
+        self.compaction
+            .duration_nanos_total
+            .fetch_add(duration_nanos, Ordering::Relaxed);
+        self.compaction.source_segments_total.fetch_add(
+            saturating_u64_from_usize(stats.source_segments),
+            Ordering::Relaxed,
+        );
+        self.compaction.output_segments_total.fetch_add(
+            saturating_u64_from_usize(stats.output_segments),
+            Ordering::Relaxed,
+        );
+        self.compaction.source_chunks_total.fetch_add(
+            saturating_u64_from_usize(stats.source_chunks),
+            Ordering::Relaxed,
+        );
+        self.compaction.output_chunks_total.fetch_add(
+            saturating_u64_from_usize(stats.output_chunks),
+            Ordering::Relaxed,
+        );
+        self.compaction.source_points_total.fetch_add(
+            saturating_u64_from_usize(stats.source_points),
+            Ordering::Relaxed,
+        );
+        self.compaction.output_points_total.fetch_add(
+            saturating_u64_from_usize(stats.output_points),
+            Ordering::Relaxed,
+        );
+        if stats.compacted {
+            self.compaction
+                .success_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.compaction.noop_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_compaction_error(&self, duration_nanos: u64) {
+        self.compaction.runs_total.fetch_add(1, Ordering::Relaxed);
+        self.compaction.errors_total.fetch_add(1, Ordering::Relaxed);
+        self.compaction
+            .duration_nanos_total
+            .fetch_add(duration_nanos, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct WalObservabilityCounters {
+    replay_runs_total: AtomicU64,
+    replay_frames_total: AtomicU64,
+    replay_series_definitions_total: AtomicU64,
+    replay_sample_batches_total: AtomicU64,
+    replay_points_total: AtomicU64,
+    replay_errors_total: AtomicU64,
+    replay_duration_nanos_total: AtomicU64,
+    append_series_definitions_total: AtomicU64,
+    append_sample_batches_total: AtomicU64,
+    append_points_total: AtomicU64,
+    append_bytes_total: AtomicU64,
+    append_errors_total: AtomicU64,
+    resets_total: AtomicU64,
+    reset_errors_total: AtomicU64,
+}
+
+#[derive(Default)]
+struct FlushObservabilityCounters {
+    pipeline_runs_total: AtomicU64,
+    pipeline_success_total: AtomicU64,
+    pipeline_timeout_total: AtomicU64,
+    pipeline_errors_total: AtomicU64,
+    pipeline_duration_nanos_total: AtomicU64,
+    active_flush_runs_total: AtomicU64,
+    active_flush_errors_total: AtomicU64,
+    active_flushed_series_total: AtomicU64,
+    active_flushed_chunks_total: AtomicU64,
+    active_flushed_points_total: AtomicU64,
+    persist_runs_total: AtomicU64,
+    persist_success_total: AtomicU64,
+    persist_noop_total: AtomicU64,
+    persist_errors_total: AtomicU64,
+    persisted_series_total: AtomicU64,
+    persisted_chunks_total: AtomicU64,
+    persisted_points_total: AtomicU64,
+    persisted_segments_total: AtomicU64,
+    persist_duration_nanos_total: AtomicU64,
+    evicted_sealed_chunks_total: AtomicU64,
+}
+
+#[derive(Default)]
+struct CompactionObservabilityCounters {
+    runs_total: AtomicU64,
+    success_total: AtomicU64,
+    noop_total: AtomicU64,
+    errors_total: AtomicU64,
+    source_segments_total: AtomicU64,
+    output_segments_total: AtomicU64,
+    source_chunks_total: AtomicU64,
+    output_chunks_total: AtomicU64,
+    source_points_total: AtomicU64,
+    output_points_total: AtomicU64,
+    duration_nanos_total: AtomicU64,
+}
+
+#[derive(Default)]
+struct QueryObservabilityCounters {
+    select_calls_total: AtomicU64,
+    select_errors_total: AtomicU64,
+    select_duration_nanos_total: AtomicU64,
+    select_points_returned_total: AtomicU64,
+    select_with_options_calls_total: AtomicU64,
+    select_with_options_errors_total: AtomicU64,
+    select_with_options_duration_nanos_total: AtomicU64,
+    select_with_options_points_returned_total: AtomicU64,
+    select_all_calls_total: AtomicU64,
+    select_all_errors_total: AtomicU64,
+    select_all_duration_nanos_total: AtomicU64,
+    select_all_series_returned_total: AtomicU64,
+    select_all_points_returned_total: AtomicU64,
+    select_series_calls_total: AtomicU64,
+    select_series_errors_total: AtomicU64,
+    select_series_duration_nanos_total: AtomicU64,
+    select_series_returned_total: AtomicU64,
+    merge_path_queries_total: AtomicU64,
+    append_sort_path_queries_total: AtomicU64,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ChunkStorageOptions {
@@ -290,6 +435,7 @@ pub struct ChunkStorage {
     flush_visibility_lock: RwLock<()>,
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    observability: Arc<StorageObservabilityCounters>,
 }
 
 impl ChunkStorage {
@@ -348,6 +494,7 @@ impl ChunkStorage {
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
         let compaction_lock = Arc::new(Mutex::new(()));
+        let observability = Arc::new(StorageObservabilityCounters::default());
         let compaction_thread = if options.background_threads_enabled {
             Self::spawn_background_compaction_thread(
                 Arc::downgrade(&lifecycle),
@@ -355,6 +502,7 @@ impl ChunkStorage {
                 numeric_compactor.clone(),
                 blob_compactor.clone(),
                 options.compaction_interval,
+                Arc::clone(&observability),
             )
         } else {
             Ok(None)
@@ -394,6 +542,7 @@ impl ChunkStorage {
             flush_visibility_lock: RwLock::new(()),
             compaction_thread: Mutex::new(compaction_thread?),
             flush_thread: Mutex::new(None),
+            observability,
         })
     }
 
@@ -475,6 +624,7 @@ impl ChunkStorage {
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
         compaction_interval: Duration,
+        observability: Arc<StorageObservabilityCounters>,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         if numeric_compactor.is_none() && blob_compactor.is_none() {
             return Ok(None);
@@ -496,8 +646,11 @@ impl ChunkStorage {
                 }
 
                 let _compaction_guard = compaction_lock.lock();
-                let _ =
-                    Self::compact_compactors(numeric_compactor.as_ref(), blob_compactor.as_ref());
+                let _ = Self::compact_compactors(
+                    numeric_compactor.as_ref(),
+                    blob_compactor.as_ref(),
+                    Some(observability.as_ref()),
+                );
             })?;
 
         Ok(Some(handle))
@@ -589,7 +742,21 @@ impl ChunkStorage {
     }
 
     fn flush_pipeline_once(&self) -> Result<()> {
+        self.observability
+            .flush
+            .pipeline_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
         if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            self.observability
+                .flush
+                .pipeline_success_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.observability
+                .flush
+                .pipeline_duration_nanos_total
+                .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
             return Ok(());
         }
 
@@ -597,19 +764,94 @@ impl ChunkStorage {
         // under sustained write load instead of bailing immediately when one permit is busy.
         let write_permits = match self.write_limiter.acquire_all(self.write_timeout) {
             Ok(permits) => permits,
-            Err(TsinkError::WriteTimeout { .. }) => return Ok(()),
-            Err(err) => return Err(err),
+            Err(TsinkError::WriteTimeout { .. }) => {
+                self.observability
+                    .flush
+                    .pipeline_timeout_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                return Ok(());
+            }
+            Err(err) => {
+                self.observability
+                    .flush
+                    .pipeline_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                return Err(err);
+            }
         };
-        self.flush_all_active()?;
-        let persisted = self.persist_segment(true)?;
+        let flush_result = self.flush_all_active();
+        if let Err(err) = flush_result {
+            drop(write_permits);
+            self.observability
+                .flush
+                .pipeline_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.observability
+                .flush
+                .pipeline_duration_nanos_total
+                .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+            return Err(err);
+        }
+
+        let persisted = match self.persist_segment(true) {
+            Ok(persisted) => persisted,
+            Err(err) => {
+                drop(write_permits);
+                self.observability
+                    .flush
+                    .pipeline_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                return Err(err);
+            }
+        };
         drop(write_permits);
         if persisted {
-            self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks()?;
+            if let Err(err) = self.refresh_persisted_indexes_and_evict_flushed_sealed_chunks() {
+                self.observability
+                    .flush
+                    .pipeline_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                return Err(err);
+            }
         }
-        self.sweep_expired_persisted_segments()?;
+        if let Err(err) = self.sweep_expired_persisted_segments() {
+            self.observability
+                .flush
+                .pipeline_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.observability
+                .flush
+                .pipeline_duration_nanos_total
+                .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+            return Err(err);
+        }
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
+        self.observability
+            .flush
+            .pipeline_success_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.observability
+            .flush
+            .pipeline_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1028,7 +1270,11 @@ impl ChunkStorage {
     fn refresh_persisted_indexes_and_evict_flushed_sealed_chunks(&self) -> Result<()> {
         let _visibility_guard = self.flush_visibility_lock.write();
         self.reload_persisted_indexes_from_disk()?;
-        self.evict_persisted_sealed_chunks();
+        let evicted = self.evict_persisted_sealed_chunks();
+        self.observability
+            .flush
+            .evicted_sealed_chunks_total
+            .fetch_add(saturating_u64_from_usize(evicted), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1149,6 +1395,13 @@ impl ChunkStorage {
             sealed.remove(&series_id);
         }
 
+        if removed {
+            self.observability
+                .flush
+                .evicted_sealed_chunks_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         removed
     }
 
@@ -1259,20 +1512,60 @@ impl ChunkStorage {
     }
 
     fn flush_all_active(&self) -> Result<()> {
-        for shard in &self.active_builders {
-            let mut active = shard.write();
-            for (series_id, state) in active.iter_mut() {
-                let Some(chunk) = state.flush_partial()? else {
-                    continue;
-                };
-                let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
-                let key = SealedChunkKey::from_chunk(&chunk, sequence);
-                let mut sealed = self.sealed_shard(*series_id).write();
-                sealed.entry(*series_id).or_default().insert(key, chunk);
+        self.observability
+            .flush
+            .active_flush_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut flushed_series = 0usize;
+        let mut flushed_chunks = 0usize;
+        let mut flushed_points = 0usize;
+
+        let result = (|| -> Result<()> {
+            for shard in &self.active_builders {
+                let mut active = shard.write();
+                for (series_id, state) in active.iter_mut() {
+                    let Some(chunk) = state.flush_partial()? else {
+                        continue;
+                    };
+                    flushed_series = flushed_series.saturating_add(1);
+                    flushed_chunks = flushed_chunks.saturating_add(1);
+                    flushed_points =
+                        flushed_points.saturating_add(chunk.header.point_count as usize);
+                    let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
+                    let key = SealedChunkKey::from_chunk(&chunk, sequence);
+                    let mut sealed = self.sealed_shard(*series_id).write();
+                    sealed.entry(*series_id).or_default().insert(key, chunk);
+                }
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.observability
+                    .flush
+                    .active_flushed_series_total
+                    .fetch_add(saturating_u64_from_usize(flushed_series), Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .active_flushed_chunks_total
+                    .fetch_add(saturating_u64_from_usize(flushed_chunks), Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .active_flushed_points_total
+                    .fetch_add(saturating_u64_from_usize(flushed_points), Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => {
+                self.observability
+                    .flush
+                    .active_flush_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
             }
         }
-
-        Ok(())
     }
 
     fn collect_points_for_series_into(
@@ -1283,8 +1576,16 @@ impl ChunkStorage {
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
         if self.try_collect_points_for_series_with_merge(series_id, start, end, out)? {
+            self.observability
+                .query
+                .merge_path_queries_total
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        self.observability
+            .query
+            .append_sort_path_queries_total
+            .fetch_add(1, Ordering::Relaxed);
         self.collect_points_for_series_append_sort_path(series_id, start, end, out)
     }
 
@@ -2212,33 +2513,85 @@ impl ChunkStorage {
             return Ok(());
         };
 
-        let mut stream = wal.replay_stream_after(replay_highwater)?;
-        while let Some(frame) = stream.next_frame()? {
-            match frame {
-                ReplayFrame::SeriesDefinition(definition) => {
-                    self.registry.write().register_series_with_id(
-                        definition.series_id,
-                        &definition.metric,
-                        &definition.labels,
-                    )?;
-                }
-                ReplayFrame::Samples(batches) => {
-                    for batch in batches {
-                        let points = batch.decode_points()?;
-                        for point in points {
-                            self.append_point_to_series(
-                                batch.series_id,
-                                batch.lane,
-                                point.ts,
-                                point.value,
-                            )?;
+        self.observability
+            .wal
+            .replay_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let mut replay_frames = 0u64;
+        let mut replay_series_defs = 0u64;
+        let mut replay_sample_batches = 0u64;
+        let mut replay_points = 0u64;
+
+        let replay_result = (|| -> Result<()> {
+            let mut stream = wal.replay_stream_after(replay_highwater)?;
+            while let Some(frame) = stream.next_frame()? {
+                replay_frames = replay_frames.saturating_add(1);
+                match frame {
+                    ReplayFrame::SeriesDefinition(definition) => {
+                        replay_series_defs = replay_series_defs.saturating_add(1);
+                        self.registry.write().register_series_with_id(
+                            definition.series_id,
+                            &definition.metric,
+                            &definition.labels,
+                        )?;
+                    }
+                    ReplayFrame::Samples(batches) => {
+                        replay_sample_batches =
+                            replay_sample_batches.saturating_add(batches.len() as u64);
+                        for batch in batches {
+                            let points = batch.decode_points()?;
+                            replay_points = replay_points
+                                .saturating_add(saturating_u64_from_usize(points.len()));
+                            for point in points {
+                                self.append_point_to_series(
+                                    batch.series_id,
+                                    batch.lane,
+                                    point.ts,
+                                    point.value,
+                                )?;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })();
+
+        self.observability
+            .wal
+            .replay_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match replay_result {
+            Ok(()) => {
+                self.observability
+                    .wal
+                    .replay_frames_total
+                    .fetch_add(replay_frames, Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .replay_series_definitions_total
+                    .fetch_add(replay_series_defs, Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .replay_sample_batches_total
+                    .fetch_add(replay_sample_batches, Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .replay_points_total
+                    .fetch_add(replay_points, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => {
+                self.observability
+                    .wal
+                    .replay_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 
     fn apply_loaded_segment_indexes(
@@ -2334,154 +2687,266 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn persist_segment(&self, include_wal_highwater: bool) -> Result<bool> {
-        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
-            return Ok(false);
-        }
-
-        let wal_highwater = if include_wal_highwater {
-            self.wal
-                .as_ref()
-                .map(|wal| wal.current_highwater())
-                .unwrap_or_default()
-        } else {
-            WalHighWatermark::default()
-        };
-
-        let (delta_chunks, delta_watermarks) = {
-            let persisted = self.persisted_chunk_watermarks.read();
-
-            let mut delta = HashMap::new();
-            let mut watermarks = HashMap::new();
-            for shard in &self.sealed_chunks {
-                let sealed = shard.read();
-                for (series_id, chunks) in sealed.iter() {
-                    let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                    let mut updates = Vec::new();
-                    let mut max_sequence = persisted_sequence;
-                    for (key, chunk) in chunks {
-                        if key.sequence <= persisted_sequence {
-                            continue;
-                        }
-                        max_sequence = max_sequence.max(key.sequence);
-                        updates.push(chunk.clone());
-                    }
-                    if !updates.is_empty() {
-                        delta.insert(*series_id, updates);
-                        watermarks.insert(*series_id, max_sequence);
-                    }
-                }
-            }
-            (delta, watermarks)
-        };
-
-        if delta_chunks.is_empty() {
-            if let Some(wal) = &self.wal {
-                wal.reset()?;
-            }
-            return Ok(false);
-        }
-
-        let mut numeric_chunks = HashMap::new();
-        let mut blob_chunks = HashMap::new();
-        let mut numeric_watermarks = HashMap::new();
-        let mut blob_watermarks = HashMap::new();
-        for (series_id, chunks) in &delta_chunks {
-            let Some(first) = chunks.first() else {
-                continue;
-            };
-            let Some(watermark) = delta_watermarks.get(series_id).copied() else {
-                continue;
-            };
-
-            match first.header.lane {
-                ValueLane::Numeric => {
-                    numeric_chunks.insert(*series_id, chunks.clone());
-                    numeric_watermarks.insert(*series_id, watermark);
-                }
-                ValueLane::Blob => {
-                    blob_chunks.insert(*series_id, chunks.clone());
-                    blob_watermarks.insert(*series_id, watermark);
-                }
-            }
-        }
-
-        if !numeric_chunks.is_empty() && self.numeric_lane_path.is_none() {
-            return Err(TsinkError::InvalidConfiguration(
-                "cannot persist numeric chunks without numeric lane path".to_string(),
-            ));
-        }
-        if !blob_chunks.is_empty() && self.blob_lane_path.is_none() {
-            return Err(TsinkError::InvalidConfiguration(
-                "cannot persist blob chunks without blob lane path".to_string(),
-            ));
-        }
-
-        {
-            let registry = self.registry.read();
-            let mut published_segment_roots = Vec::new();
-
-            let persist_result = (|| -> Result<()> {
-                if let (Some(path), false) = (&self.numeric_lane_path, numeric_chunks.is_empty()) {
-                    let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
-                    let writer = SegmentWriter::new(path, 0, segment_id)?;
-                    writer.write_segment_with_wal_highwater(
-                        &registry,
-                        &numeric_chunks,
-                        wal_highwater,
-                    )?;
-                    published_segment_roots.push(writer.layout().root.clone());
-                }
-
-                if let (Some(path), false) = (&self.blob_lane_path, blob_chunks.is_empty()) {
-                    let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
-                    let writer = SegmentWriter::new(path, 0, segment_id)?;
-                    writer.write_segment_with_wal_highwater(
-                        &registry,
-                        &blob_chunks,
-                        wal_highwater,
-                    )?;
-                    published_segment_roots.push(writer.layout().root.clone());
-                }
-
+    fn reset_wal_with_stats(&self, wal: &FramedWal) -> Result<()> {
+        match wal.reset() {
+            Ok(()) => {
+                self.observability
+                    .wal
+                    .resets_total
+                    .fetch_add(1, Ordering::Relaxed);
                 Ok(())
-            })();
-
-            if let Err(persist_err) = persist_result {
-                if let Err(rollback_err) =
-                    self.rollback_published_segments(&published_segment_roots)
-                {
-                    return Err(TsinkError::Other(format!(
-                        "persist failed and rollback failed: persist={persist_err}, rollback={rollback_err}"
-                    )));
-                }
-                return Err(persist_err);
+            }
+            Err(err) => {
+                self.observability
+                    .wal
+                    .reset_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
             }
         }
+    }
 
-        let mut flushed_watermarks = numeric_watermarks;
-        flushed_watermarks.extend(blob_watermarks);
-        self.mark_persisted_chunk_watermarks(&flushed_watermarks);
+    fn persist_segment(&self, include_wal_highwater: bool) -> Result<bool> {
+        self.observability
+            .flush
+            .persist_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
 
-        if let Some(wal) = &self.wal {
-            wal.reset()?;
+        let persist_result = (|| -> Result<(bool, usize, usize, usize, usize)> {
+            if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+                return Ok((false, 0, 0, 0, 0));
+            }
+
+            let wal_highwater = if include_wal_highwater {
+                self.wal
+                    .as_ref()
+                    .map(|wal| wal.current_highwater())
+                    .unwrap_or_default()
+            } else {
+                WalHighWatermark::default()
+            };
+
+            let (delta_chunks, delta_watermarks) = {
+                let persisted = self.persisted_chunk_watermarks.read();
+
+                let mut delta = HashMap::new();
+                let mut watermarks = HashMap::new();
+                for shard in &self.sealed_chunks {
+                    let sealed = shard.read();
+                    for (series_id, chunks) in sealed.iter() {
+                        let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                        let mut updates = Vec::new();
+                        let mut max_sequence = persisted_sequence;
+                        for (key, chunk) in chunks {
+                            if key.sequence <= persisted_sequence {
+                                continue;
+                            }
+                            max_sequence = max_sequence.max(key.sequence);
+                            updates.push(chunk.clone());
+                        }
+                        if !updates.is_empty() {
+                            delta.insert(*series_id, updates);
+                            watermarks.insert(*series_id, max_sequence);
+                        }
+                    }
+                }
+                (delta, watermarks)
+            };
+
+            if delta_chunks.is_empty() {
+                if let Some(wal) = &self.wal {
+                    self.reset_wal_with_stats(wal)?;
+                }
+                return Ok((false, 0, 0, 0, 0));
+            }
+
+            let persisted_series = delta_chunks.len();
+            let persisted_chunks = delta_chunks.values().map(std::vec::Vec::len).sum::<usize>();
+            let persisted_points = delta_chunks
+                .values()
+                .flat_map(|chunks| chunks.iter())
+                .map(|chunk| chunk.header.point_count as usize)
+                .sum::<usize>();
+
+            let mut numeric_chunks = HashMap::new();
+            let mut blob_chunks = HashMap::new();
+            let mut numeric_watermarks = HashMap::new();
+            let mut blob_watermarks = HashMap::new();
+            for (series_id, chunks) in &delta_chunks {
+                let Some(first) = chunks.first() else {
+                    continue;
+                };
+                let Some(watermark) = delta_watermarks.get(series_id).copied() else {
+                    continue;
+                };
+
+                match first.header.lane {
+                    ValueLane::Numeric => {
+                        numeric_chunks.insert(*series_id, chunks.clone());
+                        numeric_watermarks.insert(*series_id, watermark);
+                    }
+                    ValueLane::Blob => {
+                        blob_chunks.insert(*series_id, chunks.clone());
+                        blob_watermarks.insert(*series_id, watermark);
+                    }
+                }
+            }
+
+            if !numeric_chunks.is_empty() && self.numeric_lane_path.is_none() {
+                return Err(TsinkError::InvalidConfiguration(
+                    "cannot persist numeric chunks without numeric lane path".to_string(),
+                ));
+            }
+            if !blob_chunks.is_empty() && self.blob_lane_path.is_none() {
+                return Err(TsinkError::InvalidConfiguration(
+                    "cannot persist blob chunks without blob lane path".to_string(),
+                ));
+            }
+
+            let persisted_segments = {
+                let registry = self.registry.read();
+                let mut published_segment_roots = Vec::new();
+
+                let persist_result = (|| -> Result<()> {
+                    if let (Some(path), false) =
+                        (&self.numeric_lane_path, numeric_chunks.is_empty())
+                    {
+                        let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
+                        let writer = SegmentWriter::new(path, 0, segment_id)?;
+                        writer.write_segment_with_wal_highwater(
+                            &registry,
+                            &numeric_chunks,
+                            wal_highwater,
+                        )?;
+                        published_segment_roots.push(writer.layout().root.clone());
+                    }
+
+                    if let (Some(path), false) = (&self.blob_lane_path, blob_chunks.is_empty()) {
+                        let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
+                        let writer = SegmentWriter::new(path, 0, segment_id)?;
+                        writer.write_segment_with_wal_highwater(
+                            &registry,
+                            &blob_chunks,
+                            wal_highwater,
+                        )?;
+                        published_segment_roots.push(writer.layout().root.clone());
+                    }
+
+                    Ok(())
+                })();
+
+                if let Err(persist_err) = persist_result {
+                    if let Err(rollback_err) =
+                        self.rollback_published_segments(&published_segment_roots)
+                    {
+                        return Err(TsinkError::Other(format!(
+                            "persist failed and rollback failed: persist={persist_err}, rollback={rollback_err}"
+                        )));
+                    }
+                    return Err(persist_err);
+                }
+
+                published_segment_roots.len()
+            };
+
+            let mut flushed_watermarks = numeric_watermarks;
+            flushed_watermarks.extend(blob_watermarks);
+            self.mark_persisted_chunk_watermarks(&flushed_watermarks);
+
+            if let Some(wal) = &self.wal {
+                self.reset_wal_with_stats(wal)?;
+            }
+
+            Ok((
+                true,
+                persisted_series,
+                persisted_chunks,
+                persisted_points,
+                persisted_segments,
+            ))
+        })();
+
+        self.observability
+            .flush
+            .persist_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match persist_result {
+            Ok((persisted, series, chunks, points, segments)) => {
+                if persisted {
+                    self.observability
+                        .flush
+                        .persist_success_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.observability
+                        .flush
+                        .persisted_series_total
+                        .fetch_add(saturating_u64_from_usize(series), Ordering::Relaxed);
+                    self.observability
+                        .flush
+                        .persisted_chunks_total
+                        .fetch_add(saturating_u64_from_usize(chunks), Ordering::Relaxed);
+                    self.observability
+                        .flush
+                        .persisted_points_total
+                        .fetch_add(saturating_u64_from_usize(points), Ordering::Relaxed);
+                    self.observability
+                        .flush
+                        .persisted_segments_total
+                        .fetch_add(saturating_u64_from_usize(segments), Ordering::Relaxed);
+                } else {
+                    self.observability
+                        .flush
+                        .persist_noop_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(persisted)
+            }
+            Err(err) => {
+                self.observability
+                    .flush
+                    .persist_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
         }
-
-        Ok(true)
     }
 
     fn compact_compactors(
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
+        observability: Option<&StorageObservabilityCounters>,
     ) -> Result<bool> {
         let mut compacted = false;
         if let Some(compactor) = numeric_compactor {
-            compacted |= compactor.compact_once()?;
+            compacted |= Self::run_compactor_once(compactor, observability)?;
         }
         if let Some(compactor) = blob_compactor {
-            compacted |= compactor.compact_once()?;
+            compacted |= Self::run_compactor_once(compactor, observability)?;
         }
         Ok(compacted)
+    }
+
+    fn run_compactor_once(
+        compactor: &Compactor,
+        observability: Option<&StorageObservabilityCounters>,
+    ) -> Result<bool> {
+        let started = Instant::now();
+        match compactor.compact_once_with_stats() {
+            Ok(stats) => {
+                if let Some(obs) = observability {
+                    obs.record_compaction_result(stats, elapsed_nanos_u64(started));
+                }
+                Ok(stats.compacted)
+            }
+            Err(err) => {
+                if let Some(obs) = observability {
+                    obs.record_compaction_error(elapsed_nanos_u64(started));
+                }
+                Err(err)
+            }
+        }
     }
 
     fn compact_until_settled(&self, max_passes: usize) -> Result<usize> {
@@ -2491,6 +2956,7 @@ impl ChunkStorage {
             if !Self::compact_compactors(
                 self.numeric_compactor.as_ref(),
                 self.blob_compactor.as_ref(),
+                Some(self.observability.as_ref()),
             )? {
                 break;
             }
@@ -2586,10 +3052,46 @@ impl Storage for ChunkStorage {
 
             if let (Some(wal), Some(batches)) = (&self.wal, wal_batches.as_deref()) {
                 for definition in &new_series_defs {
-                    wal.append_series_definition(definition)?;
+                    if let Err(err) = wal.append_series_definition(definition) {
+                        self.observability
+                            .wal
+                            .append_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(err);
+                    }
                 }
 
-                wal.append_samples(batches)?;
+                if let Err(err) = wal.append_samples(batches) {
+                    self.observability
+                        .wal
+                        .append_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+
+                let batch_points = batches
+                    .iter()
+                    .map(|batch| batch.point_count as usize)
+                    .sum::<usize>();
+                self.observability
+                    .wal
+                    .append_series_definitions_total
+                    .fetch_add(
+                        saturating_u64_from_usize(new_series_defs.len()),
+                        Ordering::Relaxed,
+                    );
+                self.observability
+                    .wal
+                    .append_sample_batches_total
+                    .fetch_add(saturating_u64_from_usize(batches.len()), Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .append_points_total
+                    .fetch_add(saturating_u64_from_usize(batch_points), Ordering::Relaxed);
+                self.observability
+                    .wal
+                    .append_bytes_total
+                    .fetch_add(estimated_wal_growth, Ordering::Relaxed);
             }
             self.ingest_pending_points(std::mem::take(&mut pending_points))?;
             ingest_committed = true;
@@ -2627,12 +3129,42 @@ impl Storage for ChunkStorage {
         start: i64,
         end: i64,
     ) -> Result<Vec<DataPoint>> {
-        self.ensure_open()?;
-        Self::validate_select_request(metric, labels, start, end)?;
+        self.observability
+            .query
+            .select_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
 
-        let mut out = Vec::new();
-        self.select_into_impl(metric, labels, start, end, &mut out)?;
-        Ok(out)
+        let result = (|| -> Result<Vec<DataPoint>> {
+            self.ensure_open()?;
+            Self::validate_select_request(metric, labels, start, end)?;
+
+            let mut out = Vec::new();
+            self.select_into_impl(metric, labels, start, end, &mut out)?;
+            Ok(out)
+        })();
+
+        self.observability
+            .query
+            .select_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match result {
+            Ok(points) => {
+                self.observability
+                    .query
+                    .select_points_returned_total
+                    .fetch_add(saturating_u64_from_usize(points.len()), Ordering::Relaxed);
+                Ok(points)
+            }
+            Err(err) => {
+                self.observability
+                    .query
+                    .select_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 
     fn select_into(
@@ -2649,75 +3181,105 @@ impl Storage for ChunkStorage {
     }
 
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>> {
-        self.ensure_open()?;
-        validate_metric(metric)?;
-        validate_labels(&opts.labels)?;
+        self.observability
+            .query
+            .select_with_options_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
 
-        if opts.start >= opts.end {
-            return Err(TsinkError::InvalidTimeRange {
-                start: opts.start,
-                end: opts.end,
-            });
-        }
+        let result = (|| -> Result<Vec<DataPoint>> {
+            self.ensure_open()?;
+            validate_metric(metric)?;
+            validate_labels(&opts.labels)?;
 
-        if let Some(downsample) = opts.downsample {
-            if downsample.interval <= 0 {
-                return Err(TsinkError::InvalidConfiguration(
-                    "downsample interval must be positive".to_string(),
-                ));
+            if opts.start >= opts.end {
+                return Err(TsinkError::InvalidTimeRange {
+                    start: opts.start,
+                    end: opts.end,
+                });
             }
-        }
 
-        let mut points = Vec::new();
-        self.select_into_impl(metric, &opts.labels, opts.start, opts.end, &mut points)?;
-
-        let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
-            (true, Aggregation::None) => Aggregation::Last,
-            _ => opts.aggregation,
-        };
-
-        let mut processed = if let Some(custom) = opts.custom_aggregation {
             if let Some(downsample) = opts.downsample {
-                downsample_points_with_custom(
+                if downsample.interval <= 0 {
+                    return Err(TsinkError::InvalidConfiguration(
+                        "downsample interval must be positive".to_string(),
+                    ));
+                }
+            }
+
+            let mut points = Vec::new();
+            self.select_into_impl(metric, &opts.labels, opts.start, opts.end, &mut points)?;
+
+            let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
+                (true, Aggregation::None) => Aggregation::Last,
+                _ => opts.aggregation,
+            };
+
+            let mut processed = if let Some(custom) = opts.custom_aggregation {
+                if let Some(downsample) = opts.downsample {
+                    downsample_points_with_custom(
+                        &points,
+                        downsample.interval,
+                        custom.as_ref(),
+                        opts.start,
+                        opts.end,
+                    )?
+                } else {
+                    custom
+                        .aggregate_series(&points)?
+                        .into_iter()
+                        .collect::<Vec<DataPoint>>()
+                }
+            } else if let Some(downsample) = opts.downsample {
+                downsample_points(
                     &points,
                     downsample.interval,
-                    custom.as_ref(),
+                    aggregation,
                     opts.start,
                     opts.end,
                 )?
-            } else {
-                custom
-                    .aggregate_series(&points)?
+            } else if aggregation != Aggregation::None {
+                aggregate_series(&points, aggregation)?
                     .into_iter()
                     .collect::<Vec<DataPoint>>()
+            } else {
+                points
+            };
+
+            if opts.offset > 0 && opts.offset < processed.len() {
+                processed.drain(0..opts.offset);
+            } else if opts.offset >= processed.len() {
+                processed.clear();
             }
-        } else if let Some(downsample) = opts.downsample {
-            downsample_points(
-                &points,
-                downsample.interval,
-                aggregation,
-                opts.start,
-                opts.end,
-            )?
-        } else if aggregation != Aggregation::None {
-            aggregate_series(&points, aggregation)?
-                .into_iter()
-                .collect::<Vec<DataPoint>>()
-        } else {
-            points
-        };
 
-        if opts.offset > 0 && opts.offset < processed.len() {
-            processed.drain(0..opts.offset);
-        } else if opts.offset >= processed.len() {
-            processed.clear();
+            if let Some(limit) = opts.limit {
+                processed.truncate(limit);
+            }
+
+            Ok(processed)
+        })();
+
+        self.observability
+            .query
+            .select_with_options_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match result {
+            Ok(points) => {
+                self.observability
+                    .query
+                    .select_with_options_points_returned_total
+                    .fetch_add(saturating_u64_from_usize(points.len()), Ordering::Relaxed);
+                Ok(points)
+            }
+            Err(err) => {
+                self.observability
+                    .query
+                    .select_with_options_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
         }
-
-        if let Some(limit) = opts.limit {
-            processed.truncate(limit);
-        }
-
-        Ok(processed)
     }
 
     fn select_all(
@@ -2726,49 +3288,87 @@ impl Storage for ChunkStorage {
         start: i64,
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
-        self.ensure_open()?;
-        validate_metric(metric)?;
+        self.observability
+            .query
+            .select_all_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
 
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
+        let result = (|| -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.ensure_open()?;
+            validate_metric(metric)?;
 
-        let series_ids = self.registry.read().series_ids_for_metric(metric);
-        if series_ids.is_empty() {
-            return Ok(Vec::new());
-        }
+            if start >= end {
+                return Err(TsinkError::InvalidTimeRange { start, end });
+            }
 
-        let series_with_labels = {
-            let registry = self.registry.read();
-            series_ids
-                .into_iter()
-                .map(|series_id| {
-                    let labels = registry
-                        .decode_series_key(series_id)
-                        .map(|key| key.labels)
-                        .unwrap_or_default();
-                    (series_id, labels)
+            let series_ids = self.registry.read().series_ids_for_metric(metric);
+            if series_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let series_with_labels = {
+                let registry = self.registry.read();
+                series_ids
+                    .into_iter()
+                    .map(|series_id| {
+                        let labels = registry
+                            .decode_series_key(series_id)
+                            .map(|key| key.labels)
+                            .unwrap_or_default();
+                        (series_id, labels)
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let mut out = series_with_labels
+                .into_par_iter()
+                .map(|(series_id, labels)| {
+                    let points = self.collect_points_for_series(series_id, start, end)?;
+                    if points.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some((labels, points)))
+                    }
                 })
-                .collect::<Vec<_>>()
-        };
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
-        let mut out = series_with_labels
-            .into_par_iter()
-            .map(|(series_id, labels)| {
-                let points = self.collect_points_for_series(series_id, start, end)?;
-                if points.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some((labels, points)))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        })();
 
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        self.observability
+            .query
+            .select_all_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match result {
+            Ok(series) => {
+                let points_returned = series.iter().map(|(_, points)| points.len()).sum::<usize>();
+                self.observability
+                    .query
+                    .select_all_series_returned_total
+                    .fetch_add(saturating_u64_from_usize(series.len()), Ordering::Relaxed);
+                self.observability
+                    .query
+                    .select_all_points_returned_total
+                    .fetch_add(
+                        saturating_u64_from_usize(points_returned),
+                        Ordering::Relaxed,
+                    );
+                Ok(series)
+            }
+            Err(err) => {
+                self.observability
+                    .query
+                    .select_all_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
@@ -2789,8 +3389,38 @@ impl Storage for ChunkStorage {
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
-        self.ensure_open()?;
-        self.select_series_impl(selection)
+        self.observability
+            .query
+            .select_series_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+
+        let result = (|| -> Result<Vec<MetricSeries>> {
+            self.ensure_open()?;
+            self.select_series_impl(selection)
+        })();
+
+        self.observability
+            .query
+            .select_series_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match result {
+            Ok(series) => {
+                self.observability
+                    .query
+                    .select_series_returned_total
+                    .fetch_add(saturating_u64_from_usize(series.len()), Ordering::Relaxed);
+                Ok(series)
+            }
+            Err(err) => {
+                self.observability
+                    .query
+                    .select_series_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 
     fn memory_used(&self) -> usize {
@@ -2802,6 +3432,353 @@ impl Storage for ChunkStorage {
 
     fn memory_budget(&self) -> usize {
         self.memory_budget_value()
+    }
+
+    fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
+        let (wal_enabled, wal_size_bytes, wal_segment_count, wal_active_segment, wal_highwater) =
+            match &self.wal {
+                Some(wal) => (
+                    true,
+                    wal.total_size_bytes().unwrap_or(0),
+                    wal.segment_count().unwrap_or(0),
+                    wal.active_segment(),
+                    wal.current_highwater(),
+                ),
+                None => (false, 0, 0, 0, WalHighWatermark::default()),
+            };
+
+        StorageObservabilitySnapshot {
+            wal: WalObservabilitySnapshot {
+                enabled: wal_enabled,
+                size_bytes: wal_size_bytes,
+                segment_count: wal_segment_count,
+                active_segment: wal_active_segment,
+                highwater_segment: wal_highwater.segment,
+                highwater_frame: wal_highwater.frame,
+                replay_runs_total: self
+                    .observability
+                    .wal
+                    .replay_runs_total
+                    .load(Ordering::Relaxed),
+                replay_frames_total: self
+                    .observability
+                    .wal
+                    .replay_frames_total
+                    .load(Ordering::Relaxed),
+                replay_series_definitions_total: self
+                    .observability
+                    .wal
+                    .replay_series_definitions_total
+                    .load(Ordering::Relaxed),
+                replay_sample_batches_total: self
+                    .observability
+                    .wal
+                    .replay_sample_batches_total
+                    .load(Ordering::Relaxed),
+                replay_points_total: self
+                    .observability
+                    .wal
+                    .replay_points_total
+                    .load(Ordering::Relaxed),
+                replay_errors_total: self
+                    .observability
+                    .wal
+                    .replay_errors_total
+                    .load(Ordering::Relaxed),
+                replay_duration_nanos_total: self
+                    .observability
+                    .wal
+                    .replay_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                append_series_definitions_total: self
+                    .observability
+                    .wal
+                    .append_series_definitions_total
+                    .load(Ordering::Relaxed),
+                append_sample_batches_total: self
+                    .observability
+                    .wal
+                    .append_sample_batches_total
+                    .load(Ordering::Relaxed),
+                append_points_total: self
+                    .observability
+                    .wal
+                    .append_points_total
+                    .load(Ordering::Relaxed),
+                append_bytes_total: self
+                    .observability
+                    .wal
+                    .append_bytes_total
+                    .load(Ordering::Relaxed),
+                append_errors_total: self
+                    .observability
+                    .wal
+                    .append_errors_total
+                    .load(Ordering::Relaxed),
+                resets_total: self.observability.wal.resets_total.load(Ordering::Relaxed),
+                reset_errors_total: self
+                    .observability
+                    .wal
+                    .reset_errors_total
+                    .load(Ordering::Relaxed),
+            },
+            flush: FlushObservabilitySnapshot {
+                pipeline_runs_total: self
+                    .observability
+                    .flush
+                    .pipeline_runs_total
+                    .load(Ordering::Relaxed),
+                pipeline_success_total: self
+                    .observability
+                    .flush
+                    .pipeline_success_total
+                    .load(Ordering::Relaxed),
+                pipeline_timeout_total: self
+                    .observability
+                    .flush
+                    .pipeline_timeout_total
+                    .load(Ordering::Relaxed),
+                pipeline_errors_total: self
+                    .observability
+                    .flush
+                    .pipeline_errors_total
+                    .load(Ordering::Relaxed),
+                pipeline_duration_nanos_total: self
+                    .observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                active_flush_runs_total: self
+                    .observability
+                    .flush
+                    .active_flush_runs_total
+                    .load(Ordering::Relaxed),
+                active_flush_errors_total: self
+                    .observability
+                    .flush
+                    .active_flush_errors_total
+                    .load(Ordering::Relaxed),
+                active_flushed_series_total: self
+                    .observability
+                    .flush
+                    .active_flushed_series_total
+                    .load(Ordering::Relaxed),
+                active_flushed_chunks_total: self
+                    .observability
+                    .flush
+                    .active_flushed_chunks_total
+                    .load(Ordering::Relaxed),
+                active_flushed_points_total: self
+                    .observability
+                    .flush
+                    .active_flushed_points_total
+                    .load(Ordering::Relaxed),
+                persist_runs_total: self
+                    .observability
+                    .flush
+                    .persist_runs_total
+                    .load(Ordering::Relaxed),
+                persist_success_total: self
+                    .observability
+                    .flush
+                    .persist_success_total
+                    .load(Ordering::Relaxed),
+                persist_noop_total: self
+                    .observability
+                    .flush
+                    .persist_noop_total
+                    .load(Ordering::Relaxed),
+                persist_errors_total: self
+                    .observability
+                    .flush
+                    .persist_errors_total
+                    .load(Ordering::Relaxed),
+                persisted_series_total: self
+                    .observability
+                    .flush
+                    .persisted_series_total
+                    .load(Ordering::Relaxed),
+                persisted_chunks_total: self
+                    .observability
+                    .flush
+                    .persisted_chunks_total
+                    .load(Ordering::Relaxed),
+                persisted_points_total: self
+                    .observability
+                    .flush
+                    .persisted_points_total
+                    .load(Ordering::Relaxed),
+                persisted_segments_total: self
+                    .observability
+                    .flush
+                    .persisted_segments_total
+                    .load(Ordering::Relaxed),
+                persist_duration_nanos_total: self
+                    .observability
+                    .flush
+                    .persist_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                evicted_sealed_chunks_total: self
+                    .observability
+                    .flush
+                    .evicted_sealed_chunks_total
+                    .load(Ordering::Relaxed),
+            },
+            compaction: CompactionObservabilitySnapshot {
+                runs_total: self
+                    .observability
+                    .compaction
+                    .runs_total
+                    .load(Ordering::Relaxed),
+                success_total: self
+                    .observability
+                    .compaction
+                    .success_total
+                    .load(Ordering::Relaxed),
+                noop_total: self
+                    .observability
+                    .compaction
+                    .noop_total
+                    .load(Ordering::Relaxed),
+                errors_total: self
+                    .observability
+                    .compaction
+                    .errors_total
+                    .load(Ordering::Relaxed),
+                source_segments_total: self
+                    .observability
+                    .compaction
+                    .source_segments_total
+                    .load(Ordering::Relaxed),
+                output_segments_total: self
+                    .observability
+                    .compaction
+                    .output_segments_total
+                    .load(Ordering::Relaxed),
+                source_chunks_total: self
+                    .observability
+                    .compaction
+                    .source_chunks_total
+                    .load(Ordering::Relaxed),
+                output_chunks_total: self
+                    .observability
+                    .compaction
+                    .output_chunks_total
+                    .load(Ordering::Relaxed),
+                source_points_total: self
+                    .observability
+                    .compaction
+                    .source_points_total
+                    .load(Ordering::Relaxed),
+                output_points_total: self
+                    .observability
+                    .compaction
+                    .output_points_total
+                    .load(Ordering::Relaxed),
+                duration_nanos_total: self
+                    .observability
+                    .compaction
+                    .duration_nanos_total
+                    .load(Ordering::Relaxed),
+            },
+            query: QueryObservabilitySnapshot {
+                select_calls_total: self
+                    .observability
+                    .query
+                    .select_calls_total
+                    .load(Ordering::Relaxed),
+                select_errors_total: self
+                    .observability
+                    .query
+                    .select_errors_total
+                    .load(Ordering::Relaxed),
+                select_duration_nanos_total: self
+                    .observability
+                    .query
+                    .select_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                select_points_returned_total: self
+                    .observability
+                    .query
+                    .select_points_returned_total
+                    .load(Ordering::Relaxed),
+                select_with_options_calls_total: self
+                    .observability
+                    .query
+                    .select_with_options_calls_total
+                    .load(Ordering::Relaxed),
+                select_with_options_errors_total: self
+                    .observability
+                    .query
+                    .select_with_options_errors_total
+                    .load(Ordering::Relaxed),
+                select_with_options_duration_nanos_total: self
+                    .observability
+                    .query
+                    .select_with_options_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                select_with_options_points_returned_total: self
+                    .observability
+                    .query
+                    .select_with_options_points_returned_total
+                    .load(Ordering::Relaxed),
+                select_all_calls_total: self
+                    .observability
+                    .query
+                    .select_all_calls_total
+                    .load(Ordering::Relaxed),
+                select_all_errors_total: self
+                    .observability
+                    .query
+                    .select_all_errors_total
+                    .load(Ordering::Relaxed),
+                select_all_duration_nanos_total: self
+                    .observability
+                    .query
+                    .select_all_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                select_all_series_returned_total: self
+                    .observability
+                    .query
+                    .select_all_series_returned_total
+                    .load(Ordering::Relaxed),
+                select_all_points_returned_total: self
+                    .observability
+                    .query
+                    .select_all_points_returned_total
+                    .load(Ordering::Relaxed),
+                select_series_calls_total: self
+                    .observability
+                    .query
+                    .select_series_calls_total
+                    .load(Ordering::Relaxed),
+                select_series_errors_total: self
+                    .observability
+                    .query
+                    .select_series_errors_total
+                    .load(Ordering::Relaxed),
+                select_series_duration_nanos_total: self
+                    .observability
+                    .query
+                    .select_series_duration_nanos_total
+                    .load(Ordering::Relaxed),
+                select_series_returned_total: self
+                    .observability
+                    .query
+                    .select_series_returned_total
+                    .load(Ordering::Relaxed),
+                merge_path_queries_total: self
+                    .observability
+                    .query
+                    .merge_path_queries_total
+                    .load(Ordering::Relaxed),
+                append_sort_path_queries_total: self
+                    .observability
+                    .query
+                    .append_sort_path_queries_total
+                    .load(Ordering::Relaxed),
+            },
+        }
     }
 
     fn close(&self) -> Result<()> {

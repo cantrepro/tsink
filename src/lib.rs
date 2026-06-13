@@ -21,8 +21,10 @@ pub use async_storage::{AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder};
 pub use error::{Result, TsinkError};
 pub use label::Label;
 pub use storage::{
-    Aggregation, DownsampleOptions, MetricSeries, QueryOptions, SeriesMatcher, SeriesMatcherOp,
-    SeriesSelection, Storage, StorageBuilder, TimestampPrecision,
+    Aggregation, CompactionObservabilitySnapshot, DownsampleOptions, FlushObservabilitySnapshot,
+    MetricSeries, QueryObservabilitySnapshot, QueryOptions, SeriesMatcher, SeriesMatcherOp,
+    SeriesSelection, Storage, StorageBuilder, StorageObservabilitySnapshot, TimestampPrecision,
+    WalObservabilitySnapshot,
 };
 pub use value::{Aggregator, BytesAggregation, Codec, CodecAggregator, Value};
 pub use wal::WalSyncMode;

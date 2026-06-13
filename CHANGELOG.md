@@ -1,3 +1,14 @@
+0.8.2
+tsink
+- Add storage observability snapshot API (`Storage::observability_snapshot`) with structured WAL/flush/compaction/query internals
+- Instrument WAL internals (replay runs/frames/points/errors/duration, append series/batches/points/bytes/errors, reset stats, active segment/highwater visibility)
+- Instrument flush/persist internals (pipeline runs/success/timeouts/errors/duration, active flush series/chunks/points, persist success/noop/errors, persisted series/chunks/points/segments, eviction stats)
+- Instrument compaction internals with per-run source/output segment/chunk/point accounting and expose `CompactionRunStats`
+- Instrument query internals (`select`, `select_with_options`, `select_all`, `select_series`) with call/error/duration/result counts plus merge-path vs append/sort-path selection counters
+tsink-server
+- Deepen `/metrics` exposition with WAL/flush/compaction/query internal counters and gauges
+- Deepen `/api/v1/status/tsdb` response with nested internal observability sections (`wal`, `flush`, `compaction`, `query`)
+
 0.8.1
 general
 - Add CI publish jobs

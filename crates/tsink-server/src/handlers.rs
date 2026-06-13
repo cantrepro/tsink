@@ -236,6 +236,8 @@ fn handle_metrics(storage: &Arc<dyn Storage>, server_start: Instant) -> HttpResp
     let memory_budget = storage.memory_budget();
     let series_count = storage.list_metrics().map(|m| m.len()).unwrap_or(0);
     let uptime = server_start.elapsed().as_secs();
+    let obs = storage.observability_snapshot();
+    let wal_enabled = u8::from(obs.wal.enabled);
 
     let body = format!(
         "# HELP tsink_memory_used_bytes Estimated in-memory bytes\n\
@@ -249,7 +251,289 @@ fn handle_metrics(storage: &Arc<dyn Storage>, server_start: Instant) -> HttpResp
          tsink_series_total {series_count}\n\
          # HELP tsink_uptime_seconds Server uptime in seconds\n\
          # TYPE tsink_uptime_seconds gauge\n\
-         tsink_uptime_seconds {uptime}\n"
+         tsink_uptime_seconds {uptime}\n\
+         # HELP tsink_wal_enabled WAL enabled state (1 enabled, 0 disabled)\n\
+         # TYPE tsink_wal_enabled gauge\n\
+         tsink_wal_enabled {wal_enabled}\n\
+         # HELP tsink_wal_size_bytes WAL size on disk in bytes\n\
+         # TYPE tsink_wal_size_bytes gauge\n\
+         tsink_wal_size_bytes {wal_size_bytes}\n\
+         # HELP tsink_wal_segments WAL segment files present\n\
+         # TYPE tsink_wal_segments gauge\n\
+         tsink_wal_segments {wal_segments}\n\
+         # HELP tsink_wal_active_segment Current WAL segment id\n\
+         # TYPE tsink_wal_active_segment gauge\n\
+         tsink_wal_active_segment {wal_active_segment}\n\
+         # HELP tsink_wal_highwater_segment Last WAL replay highwater segment\n\
+         # TYPE tsink_wal_highwater_segment gauge\n\
+         tsink_wal_highwater_segment {wal_highwater_segment}\n\
+         # HELP tsink_wal_highwater_frame Last WAL replay highwater frame\n\
+         # TYPE tsink_wal_highwater_frame gauge\n\
+         tsink_wal_highwater_frame {wal_highwater_frame}\n\
+         # HELP tsink_wal_replay_runs_total WAL replay runs\n\
+         # TYPE tsink_wal_replay_runs_total counter\n\
+         tsink_wal_replay_runs_total {wal_replay_runs_total}\n\
+         # HELP tsink_wal_replay_frames_total WAL replayed frames\n\
+         # TYPE tsink_wal_replay_frames_total counter\n\
+         tsink_wal_replay_frames_total {wal_replay_frames_total}\n\
+         # HELP tsink_wal_replay_series_definitions_total WAL replayed series definitions\n\
+         # TYPE tsink_wal_replay_series_definitions_total counter\n\
+         tsink_wal_replay_series_definitions_total {wal_replay_series_definitions_total}\n\
+         # HELP tsink_wal_replay_sample_batches_total WAL replayed sample batches\n\
+         # TYPE tsink_wal_replay_sample_batches_total counter\n\
+         tsink_wal_replay_sample_batches_total {wal_replay_sample_batches_total}\n\
+         # HELP tsink_wal_replay_points_total WAL replayed points\n\
+         # TYPE tsink_wal_replay_points_total counter\n\
+         tsink_wal_replay_points_total {wal_replay_points_total}\n\
+         # HELP tsink_wal_replay_errors_total WAL replay errors\n\
+         # TYPE tsink_wal_replay_errors_total counter\n\
+         tsink_wal_replay_errors_total {wal_replay_errors_total}\n\
+         # HELP tsink_wal_replay_duration_nanoseconds_total WAL replay runtime\n\
+         # TYPE tsink_wal_replay_duration_nanoseconds_total counter\n\
+         tsink_wal_replay_duration_nanoseconds_total {wal_replay_duration_nanos_total}\n\
+         # HELP tsink_wal_append_series_definitions_total WAL appended series definitions\n\
+         # TYPE tsink_wal_append_series_definitions_total counter\n\
+         tsink_wal_append_series_definitions_total {wal_append_series_definitions_total}\n\
+         # HELP tsink_wal_append_sample_batches_total WAL appended sample batches\n\
+         # TYPE tsink_wal_append_sample_batches_total counter\n\
+         tsink_wal_append_sample_batches_total {wal_append_sample_batches_total}\n\
+         # HELP tsink_wal_append_points_total WAL appended points\n\
+         # TYPE tsink_wal_append_points_total counter\n\
+         tsink_wal_append_points_total {wal_append_points_total}\n\
+         # HELP tsink_wal_append_bytes_total WAL appended bytes\n\
+         # TYPE tsink_wal_append_bytes_total counter\n\
+         tsink_wal_append_bytes_total {wal_append_bytes_total}\n\
+         # HELP tsink_wal_append_errors_total WAL append errors\n\
+         # TYPE tsink_wal_append_errors_total counter\n\
+         tsink_wal_append_errors_total {wal_append_errors_total}\n\
+         # HELP tsink_wal_resets_total WAL resets\n\
+         # TYPE tsink_wal_resets_total counter\n\
+         tsink_wal_resets_total {wal_resets_total}\n\
+         # HELP tsink_wal_reset_errors_total WAL reset errors\n\
+         # TYPE tsink_wal_reset_errors_total counter\n\
+         tsink_wal_reset_errors_total {wal_reset_errors_total}\n\
+         # HELP tsink_flush_pipeline_runs_total Flush pipeline runs\n\
+         # TYPE tsink_flush_pipeline_runs_total counter\n\
+         tsink_flush_pipeline_runs_total {flush_pipeline_runs_total}\n\
+         # HELP tsink_flush_pipeline_success_total Successful flush pipeline runs\n\
+         # TYPE tsink_flush_pipeline_success_total counter\n\
+         tsink_flush_pipeline_success_total {flush_pipeline_success_total}\n\
+         # HELP tsink_flush_pipeline_timeout_total Flush pipeline write-timeout skips\n\
+         # TYPE tsink_flush_pipeline_timeout_total counter\n\
+         tsink_flush_pipeline_timeout_total {flush_pipeline_timeout_total}\n\
+         # HELP tsink_flush_pipeline_errors_total Flush pipeline errors\n\
+         # TYPE tsink_flush_pipeline_errors_total counter\n\
+         tsink_flush_pipeline_errors_total {flush_pipeline_errors_total}\n\
+         # HELP tsink_flush_pipeline_duration_nanoseconds_total Flush pipeline runtime\n\
+         # TYPE tsink_flush_pipeline_duration_nanoseconds_total counter\n\
+         tsink_flush_pipeline_duration_nanoseconds_total {flush_pipeline_duration_nanos_total}\n\
+         # HELP tsink_flush_active_runs_total Active chunk flush runs\n\
+         # TYPE tsink_flush_active_runs_total counter\n\
+         tsink_flush_active_runs_total {active_flush_runs_total}\n\
+         # HELP tsink_flush_active_errors_total Active chunk flush errors\n\
+         # TYPE tsink_flush_active_errors_total counter\n\
+         tsink_flush_active_errors_total {active_flush_errors_total}\n\
+         # HELP tsink_flush_active_series_total Active series flushed into sealed chunks\n\
+         # TYPE tsink_flush_active_series_total counter\n\
+         tsink_flush_active_series_total {active_flushed_series_total}\n\
+         # HELP tsink_flush_active_chunks_total Active chunks flushed\n\
+         # TYPE tsink_flush_active_chunks_total counter\n\
+         tsink_flush_active_chunks_total {active_flushed_chunks_total}\n\
+         # HELP tsink_flush_active_points_total Active points flushed\n\
+         # TYPE tsink_flush_active_points_total counter\n\
+         tsink_flush_active_points_total {active_flushed_points_total}\n\
+         # HELP tsink_flush_persist_runs_total Persist attempts\n\
+         # TYPE tsink_flush_persist_runs_total counter\n\
+         tsink_flush_persist_runs_total {persist_runs_total}\n\
+         # HELP tsink_flush_persist_success_total Successful persist runs\n\
+         # TYPE tsink_flush_persist_success_total counter\n\
+         tsink_flush_persist_success_total {persist_success_total}\n\
+         # HELP tsink_flush_persist_noop_total Persist runs with no new chunks\n\
+         # TYPE tsink_flush_persist_noop_total counter\n\
+         tsink_flush_persist_noop_total {persist_noop_total}\n\
+         # HELP tsink_flush_persist_errors_total Persist errors\n\
+         # TYPE tsink_flush_persist_errors_total counter\n\
+         tsink_flush_persist_errors_total {persist_errors_total}\n\
+         # HELP tsink_flush_persisted_series_total Series persisted\n\
+         # TYPE tsink_flush_persisted_series_total counter\n\
+         tsink_flush_persisted_series_total {persisted_series_total}\n\
+         # HELP tsink_flush_persisted_chunks_total Chunks persisted\n\
+         # TYPE tsink_flush_persisted_chunks_total counter\n\
+         tsink_flush_persisted_chunks_total {persisted_chunks_total}\n\
+         # HELP tsink_flush_persisted_points_total Points persisted\n\
+         # TYPE tsink_flush_persisted_points_total counter\n\
+         tsink_flush_persisted_points_total {persisted_points_total}\n\
+         # HELP tsink_flush_persisted_segments_total Segments emitted by persist\n\
+         # TYPE tsink_flush_persisted_segments_total counter\n\
+         tsink_flush_persisted_segments_total {persisted_segments_total}\n\
+         # HELP tsink_flush_persist_duration_nanoseconds_total Persist runtime\n\
+         # TYPE tsink_flush_persist_duration_nanoseconds_total counter\n\
+         tsink_flush_persist_duration_nanoseconds_total {persist_duration_nanos_total}\n\
+         # HELP tsink_flush_evicted_sealed_chunks_total Sealed chunks evicted after persistence\n\
+         # TYPE tsink_flush_evicted_sealed_chunks_total counter\n\
+         tsink_flush_evicted_sealed_chunks_total {evicted_sealed_chunks_total}\n\
+         # HELP tsink_compaction_runs_total Compaction invocations\n\
+         # TYPE tsink_compaction_runs_total counter\n\
+         tsink_compaction_runs_total {compaction_runs_total}\n\
+         # HELP tsink_compaction_success_total Compaction runs that rewrote segments\n\
+         # TYPE tsink_compaction_success_total counter\n\
+         tsink_compaction_success_total {compaction_success_total}\n\
+         # HELP tsink_compaction_noop_total Compaction runs with no rewrite\n\
+         # TYPE tsink_compaction_noop_total counter\n\
+         tsink_compaction_noop_total {compaction_noop_total}\n\
+         # HELP tsink_compaction_errors_total Compaction errors\n\
+         # TYPE tsink_compaction_errors_total counter\n\
+         tsink_compaction_errors_total {compaction_errors_total}\n\
+         # HELP tsink_compaction_source_segments_total Source segments considered by compaction\n\
+         # TYPE tsink_compaction_source_segments_total counter\n\
+         tsink_compaction_source_segments_total {compaction_source_segments_total}\n\
+         # HELP tsink_compaction_output_segments_total Output segments emitted by compaction\n\
+         # TYPE tsink_compaction_output_segments_total counter\n\
+         tsink_compaction_output_segments_total {compaction_output_segments_total}\n\
+         # HELP tsink_compaction_source_chunks_total Source chunks considered by compaction\n\
+         # TYPE tsink_compaction_source_chunks_total counter\n\
+         tsink_compaction_source_chunks_total {compaction_source_chunks_total}\n\
+         # HELP tsink_compaction_output_chunks_total Output chunks emitted by compaction\n\
+         # TYPE tsink_compaction_output_chunks_total counter\n\
+         tsink_compaction_output_chunks_total {compaction_output_chunks_total}\n\
+         # HELP tsink_compaction_source_points_total Source points considered by compaction\n\
+         # TYPE tsink_compaction_source_points_total counter\n\
+         tsink_compaction_source_points_total {compaction_source_points_total}\n\
+         # HELP tsink_compaction_output_points_total Output points emitted by compaction\n\
+         # TYPE tsink_compaction_output_points_total counter\n\
+         tsink_compaction_output_points_total {compaction_output_points_total}\n\
+         # HELP tsink_compaction_duration_nanoseconds_total Compaction runtime\n\
+         # TYPE tsink_compaction_duration_nanoseconds_total counter\n\
+         tsink_compaction_duration_nanoseconds_total {compaction_duration_nanos_total}\n\
+         # HELP tsink_query_select_calls_total Storage select calls\n\
+         # TYPE tsink_query_select_calls_total counter\n\
+         tsink_query_select_calls_total {query_select_calls_total}\n\
+         # HELP tsink_query_select_errors_total Storage select errors\n\
+         # TYPE tsink_query_select_errors_total counter\n\
+         tsink_query_select_errors_total {query_select_errors_total}\n\
+         # HELP tsink_query_select_duration_nanoseconds_total Storage select runtime\n\
+         # TYPE tsink_query_select_duration_nanoseconds_total counter\n\
+         tsink_query_select_duration_nanoseconds_total {query_select_duration_nanos_total}\n\
+         # HELP tsink_query_select_points_returned_total Points returned by select\n\
+         # TYPE tsink_query_select_points_returned_total counter\n\
+         tsink_query_select_points_returned_total {query_select_points_returned_total}\n\
+         # HELP tsink_query_select_with_options_calls_total Storage select_with_options calls\n\
+         # TYPE tsink_query_select_with_options_calls_total counter\n\
+         tsink_query_select_with_options_calls_total {query_select_with_options_calls_total}\n\
+         # HELP tsink_query_select_with_options_errors_total Storage select_with_options errors\n\
+         # TYPE tsink_query_select_with_options_errors_total counter\n\
+         tsink_query_select_with_options_errors_total {query_select_with_options_errors_total}\n\
+         # HELP tsink_query_select_with_options_duration_nanoseconds_total Storage select_with_options runtime\n\
+         # TYPE tsink_query_select_with_options_duration_nanoseconds_total counter\n\
+         tsink_query_select_with_options_duration_nanoseconds_total {query_select_with_options_duration_nanos_total}\n\
+         # HELP tsink_query_select_with_options_points_returned_total Points returned by select_with_options\n\
+         # TYPE tsink_query_select_with_options_points_returned_total counter\n\
+         tsink_query_select_with_options_points_returned_total {query_select_with_options_points_returned_total}\n\
+         # HELP tsink_query_select_all_calls_total Storage select_all calls\n\
+         # TYPE tsink_query_select_all_calls_total counter\n\
+         tsink_query_select_all_calls_total {query_select_all_calls_total}\n\
+         # HELP tsink_query_select_all_errors_total Storage select_all errors\n\
+         # TYPE tsink_query_select_all_errors_total counter\n\
+         tsink_query_select_all_errors_total {query_select_all_errors_total}\n\
+         # HELP tsink_query_select_all_duration_nanoseconds_total Storage select_all runtime\n\
+         # TYPE tsink_query_select_all_duration_nanoseconds_total counter\n\
+         tsink_query_select_all_duration_nanoseconds_total {query_select_all_duration_nanos_total}\n\
+         # HELP tsink_query_select_all_series_returned_total Series returned by select_all\n\
+         # TYPE tsink_query_select_all_series_returned_total counter\n\
+         tsink_query_select_all_series_returned_total {query_select_all_series_returned_total}\n\
+         # HELP tsink_query_select_all_points_returned_total Points returned by select_all\n\
+         # TYPE tsink_query_select_all_points_returned_total counter\n\
+         tsink_query_select_all_points_returned_total {query_select_all_points_returned_total}\n\
+         # HELP tsink_query_select_series_calls_total Storage select_series calls\n\
+         # TYPE tsink_query_select_series_calls_total counter\n\
+         tsink_query_select_series_calls_total {query_select_series_calls_total}\n\
+         # HELP tsink_query_select_series_errors_total Storage select_series errors\n\
+         # TYPE tsink_query_select_series_errors_total counter\n\
+         tsink_query_select_series_errors_total {query_select_series_errors_total}\n\
+         # HELP tsink_query_select_series_duration_nanoseconds_total Storage select_series runtime\n\
+         # TYPE tsink_query_select_series_duration_nanoseconds_total counter\n\
+         tsink_query_select_series_duration_nanoseconds_total {query_select_series_duration_nanos_total}\n\
+         # HELP tsink_query_select_series_returned_total Series returned by select_series\n\
+         # TYPE tsink_query_select_series_returned_total counter\n\
+         tsink_query_select_series_returned_total {query_select_series_returned_total}\n\
+         # HELP tsink_query_merge_path_queries_total Query series collections using merge path\n\
+         # TYPE tsink_query_merge_path_queries_total counter\n\
+         tsink_query_merge_path_queries_total {query_merge_path_queries_total}\n\
+         # HELP tsink_query_append_sort_path_queries_total Query series collections using append/sort path\n\
+         # TYPE tsink_query_append_sort_path_queries_total counter\n\
+         tsink_query_append_sort_path_queries_total {query_append_sort_path_queries_total}\n"
+        ,
+        wal_size_bytes = obs.wal.size_bytes,
+        wal_segments = obs.wal.segment_count,
+        wal_active_segment = obs.wal.active_segment,
+        wal_highwater_segment = obs.wal.highwater_segment,
+        wal_highwater_frame = obs.wal.highwater_frame,
+        wal_replay_runs_total = obs.wal.replay_runs_total,
+        wal_replay_frames_total = obs.wal.replay_frames_total,
+        wal_replay_series_definitions_total = obs.wal.replay_series_definitions_total,
+        wal_replay_sample_batches_total = obs.wal.replay_sample_batches_total,
+        wal_replay_points_total = obs.wal.replay_points_total,
+        wal_replay_errors_total = obs.wal.replay_errors_total,
+        wal_replay_duration_nanos_total = obs.wal.replay_duration_nanos_total,
+        wal_append_series_definitions_total = obs.wal.append_series_definitions_total,
+        wal_append_sample_batches_total = obs.wal.append_sample_batches_total,
+        wal_append_points_total = obs.wal.append_points_total,
+        wal_append_bytes_total = obs.wal.append_bytes_total,
+        wal_append_errors_total = obs.wal.append_errors_total,
+        wal_resets_total = obs.wal.resets_total,
+        wal_reset_errors_total = obs.wal.reset_errors_total,
+        flush_pipeline_runs_total = obs.flush.pipeline_runs_total,
+        flush_pipeline_success_total = obs.flush.pipeline_success_total,
+        flush_pipeline_timeout_total = obs.flush.pipeline_timeout_total,
+        flush_pipeline_errors_total = obs.flush.pipeline_errors_total,
+        flush_pipeline_duration_nanos_total = obs.flush.pipeline_duration_nanos_total,
+        active_flush_runs_total = obs.flush.active_flush_runs_total,
+        active_flush_errors_total = obs.flush.active_flush_errors_total,
+        active_flushed_series_total = obs.flush.active_flushed_series_total,
+        active_flushed_chunks_total = obs.flush.active_flushed_chunks_total,
+        active_flushed_points_total = obs.flush.active_flushed_points_total,
+        persist_runs_total = obs.flush.persist_runs_total,
+        persist_success_total = obs.flush.persist_success_total,
+        persist_noop_total = obs.flush.persist_noop_total,
+        persist_errors_total = obs.flush.persist_errors_total,
+        persisted_series_total = obs.flush.persisted_series_total,
+        persisted_chunks_total = obs.flush.persisted_chunks_total,
+        persisted_points_total = obs.flush.persisted_points_total,
+        persisted_segments_total = obs.flush.persisted_segments_total,
+        persist_duration_nanos_total = obs.flush.persist_duration_nanos_total,
+        evicted_sealed_chunks_total = obs.flush.evicted_sealed_chunks_total,
+        compaction_runs_total = obs.compaction.runs_total,
+        compaction_success_total = obs.compaction.success_total,
+        compaction_noop_total = obs.compaction.noop_total,
+        compaction_errors_total = obs.compaction.errors_total,
+        compaction_source_segments_total = obs.compaction.source_segments_total,
+        compaction_output_segments_total = obs.compaction.output_segments_total,
+        compaction_source_chunks_total = obs.compaction.source_chunks_total,
+        compaction_output_chunks_total = obs.compaction.output_chunks_total,
+        compaction_source_points_total = obs.compaction.source_points_total,
+        compaction_output_points_total = obs.compaction.output_points_total,
+        compaction_duration_nanos_total = obs.compaction.duration_nanos_total,
+        query_select_calls_total = obs.query.select_calls_total,
+        query_select_errors_total = obs.query.select_errors_total,
+        query_select_duration_nanos_total = obs.query.select_duration_nanos_total,
+        query_select_points_returned_total = obs.query.select_points_returned_total,
+        query_select_with_options_calls_total = obs.query.select_with_options_calls_total,
+        query_select_with_options_errors_total = obs.query.select_with_options_errors_total,
+        query_select_with_options_duration_nanos_total =
+            obs.query.select_with_options_duration_nanos_total,
+        query_select_with_options_points_returned_total =
+            obs.query.select_with_options_points_returned_total,
+        query_select_all_calls_total = obs.query.select_all_calls_total,
+        query_select_all_errors_total = obs.query.select_all_errors_total,
+        query_select_all_duration_nanos_total = obs.query.select_all_duration_nanos_total,
+        query_select_all_series_returned_total = obs.query.select_all_series_returned_total,
+        query_select_all_points_returned_total = obs.query.select_all_points_returned_total,
+        query_select_series_calls_total = obs.query.select_series_calls_total,
+        query_select_series_errors_total = obs.query.select_series_errors_total,
+        query_select_series_duration_nanos_total = obs.query.select_series_duration_nanos_total,
+        query_select_series_returned_total = obs.query.select_series_returned_total,
+        query_merge_path_queries_total = obs.query.merge_path_queries_total,
+        query_append_sort_path_queries_total = obs.query.append_sort_path_queries_total,
     );
 
     HttpResponse::new(200, body.into_bytes())
@@ -260,13 +544,15 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
     let storage = Arc::clone(storage);
-    let result = tokio::task::spawn_blocking(move || storage.list_metrics().map(|m| m.len())).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let series_count = storage.list_metrics().map(|m| m.len()).unwrap_or(0);
+        let observability = storage.observability_snapshot();
+        (series_count, observability)
+    })
+    .await;
 
-    let series_count = match result {
-        Ok(Ok(count)) => count,
-        Ok(Err(_)) => 0,
-        Err(_) => 0,
-    };
+    let (series_count, observability): (usize, tsink::StorageObservabilitySnapshot) =
+        result.unwrap_or_default();
 
     json_response(
         200,
@@ -276,6 +562,84 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
                 "seriesCount": series_count,
                 "memoryUsedBytes": memory_used,
                 "memoryBudgetBytes": memory_budget,
+                "wal": {
+                    "enabled": observability.wal.enabled,
+                    "sizeBytes": observability.wal.size_bytes,
+                    "segmentCount": observability.wal.segment_count,
+                    "activeSegment": observability.wal.active_segment,
+                    "highwaterSegment": observability.wal.highwater_segment,
+                    "highwaterFrame": observability.wal.highwater_frame,
+                    "replayRunsTotal": observability.wal.replay_runs_total,
+                    "replayFramesTotal": observability.wal.replay_frames_total,
+                    "replaySeriesDefinitionsTotal": observability.wal.replay_series_definitions_total,
+                    "replaySampleBatchesTotal": observability.wal.replay_sample_batches_total,
+                    "replayPointsTotal": observability.wal.replay_points_total,
+                    "replayErrorsTotal": observability.wal.replay_errors_total,
+                    "replayDurationNanosTotal": observability.wal.replay_duration_nanos_total,
+                    "appendSeriesDefinitionsTotal": observability.wal.append_series_definitions_total,
+                    "appendSampleBatchesTotal": observability.wal.append_sample_batches_total,
+                    "appendPointsTotal": observability.wal.append_points_total,
+                    "appendBytesTotal": observability.wal.append_bytes_total,
+                    "appendErrorsTotal": observability.wal.append_errors_total,
+                    "resetsTotal": observability.wal.resets_total,
+                    "resetErrorsTotal": observability.wal.reset_errors_total
+                },
+                "flush": {
+                    "pipelineRunsTotal": observability.flush.pipeline_runs_total,
+                    "pipelineSuccessTotal": observability.flush.pipeline_success_total,
+                    "pipelineTimeoutTotal": observability.flush.pipeline_timeout_total,
+                    "pipelineErrorsTotal": observability.flush.pipeline_errors_total,
+                    "pipelineDurationNanosTotal": observability.flush.pipeline_duration_nanos_total,
+                    "activeFlushRunsTotal": observability.flush.active_flush_runs_total,
+                    "activeFlushErrorsTotal": observability.flush.active_flush_errors_total,
+                    "activeFlushedSeriesTotal": observability.flush.active_flushed_series_total,
+                    "activeFlushedChunksTotal": observability.flush.active_flushed_chunks_total,
+                    "activeFlushedPointsTotal": observability.flush.active_flushed_points_total,
+                    "persistRunsTotal": observability.flush.persist_runs_total,
+                    "persistSuccessTotal": observability.flush.persist_success_total,
+                    "persistNoopTotal": observability.flush.persist_noop_total,
+                    "persistErrorsTotal": observability.flush.persist_errors_total,
+                    "persistedSeriesTotal": observability.flush.persisted_series_total,
+                    "persistedChunksTotal": observability.flush.persisted_chunks_total,
+                    "persistedPointsTotal": observability.flush.persisted_points_total,
+                    "persistedSegmentsTotal": observability.flush.persisted_segments_total,
+                    "persistDurationNanosTotal": observability.flush.persist_duration_nanos_total,
+                    "evictedSealedChunksTotal": observability.flush.evicted_sealed_chunks_total
+                },
+                "compaction": {
+                    "runsTotal": observability.compaction.runs_total,
+                    "successTotal": observability.compaction.success_total,
+                    "noopTotal": observability.compaction.noop_total,
+                    "errorsTotal": observability.compaction.errors_total,
+                    "sourceSegmentsTotal": observability.compaction.source_segments_total,
+                    "outputSegmentsTotal": observability.compaction.output_segments_total,
+                    "sourceChunksTotal": observability.compaction.source_chunks_total,
+                    "outputChunksTotal": observability.compaction.output_chunks_total,
+                    "sourcePointsTotal": observability.compaction.source_points_total,
+                    "outputPointsTotal": observability.compaction.output_points_total,
+                    "durationNanosTotal": observability.compaction.duration_nanos_total
+                },
+                "query": {
+                    "selectCallsTotal": observability.query.select_calls_total,
+                    "selectErrorsTotal": observability.query.select_errors_total,
+                    "selectDurationNanosTotal": observability.query.select_duration_nanos_total,
+                    "selectPointsReturnedTotal": observability.query.select_points_returned_total,
+                    "selectWithOptionsCallsTotal": observability.query.select_with_options_calls_total,
+                    "selectWithOptionsErrorsTotal": observability.query.select_with_options_errors_total,
+                    "selectWithOptionsDurationNanosTotal": observability.query.select_with_options_duration_nanos_total,
+                    "selectWithOptionsPointsReturnedTotal": observability.query.select_with_options_points_returned_total,
+                    "selectAllCallsTotal": observability.query.select_all_calls_total,
+                    "selectAllErrorsTotal": observability.query.select_all_errors_total,
+                    "selectAllDurationNanosTotal": observability.query.select_all_duration_nanos_total,
+                    "selectAllSeriesReturnedTotal": observability.query.select_all_series_returned_total,
+                    "selectAllPointsReturnedTotal": observability.query.select_all_points_returned_total,
+                    "selectSeriesCallsTotal": observability.query.select_series_calls_total,
+                    "selectSeriesErrorsTotal": observability.query.select_series_errors_total,
+                    "selectSeriesDurationNanosTotal": observability.query.select_series_duration_nanos_total,
+                    "selectSeriesReturnedTotal": observability.query.select_series_returned_total,
+                    "mergePathQueriesTotal": observability.query.merge_path_queries_total,
+                    "appendSortPathQueriesTotal": observability.query.append_sort_path_queries_total
+                }
             }
         }),
     )
@@ -1172,6 +1536,10 @@ mod tests {
         assert!(body.contains("tsink_memory_used_bytes"));
         assert!(body.contains("tsink_series_total"));
         assert!(body.contains("tsink_uptime_seconds"));
+        assert!(body.contains("tsink_wal_enabled"));
+        assert!(body.contains("tsink_flush_pipeline_runs_total"));
+        assert!(body.contains("tsink_compaction_runs_total"));
+        assert!(body.contains("tsink_query_select_calls_total"));
     }
 
     #[tokio::test]
@@ -1224,6 +1592,10 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert!(body["data"]["seriesCount"].is_number());
         assert!(body["data"]["memoryUsedBytes"].is_number());
+        assert!(body["data"]["wal"]["enabled"].is_boolean());
+        assert!(body["data"]["flush"]["pipelineRunsTotal"].is_number());
+        assert!(body["data"]["compaction"]["runsTotal"].is_number());
+        assert!(body["data"]["query"]["selectCallsTotal"].is_number());
     }
 
     #[tokio::test]

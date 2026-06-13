@@ -134,6 +134,105 @@ impl SeriesSelection {
     }
 }
 
+/// Runtime observability snapshot for the storage engine internals.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StorageObservabilitySnapshot {
+    pub wal: WalObservabilitySnapshot,
+    pub flush: FlushObservabilitySnapshot,
+    pub compaction: CompactionObservabilitySnapshot,
+    pub query: QueryObservabilitySnapshot,
+}
+
+/// WAL internals snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WalObservabilitySnapshot {
+    pub enabled: bool,
+    pub size_bytes: u64,
+    pub segment_count: u64,
+    pub active_segment: u64,
+    pub highwater_segment: u64,
+    pub highwater_frame: u64,
+    pub replay_runs_total: u64,
+    pub replay_frames_total: u64,
+    pub replay_series_definitions_total: u64,
+    pub replay_sample_batches_total: u64,
+    pub replay_points_total: u64,
+    pub replay_errors_total: u64,
+    pub replay_duration_nanos_total: u64,
+    pub append_series_definitions_total: u64,
+    pub append_sample_batches_total: u64,
+    pub append_points_total: u64,
+    pub append_bytes_total: u64,
+    pub append_errors_total: u64,
+    pub resets_total: u64,
+    pub reset_errors_total: u64,
+}
+
+/// Flush/persist internals snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FlushObservabilitySnapshot {
+    pub pipeline_runs_total: u64,
+    pub pipeline_success_total: u64,
+    pub pipeline_timeout_total: u64,
+    pub pipeline_errors_total: u64,
+    pub pipeline_duration_nanos_total: u64,
+    pub active_flush_runs_total: u64,
+    pub active_flush_errors_total: u64,
+    pub active_flushed_series_total: u64,
+    pub active_flushed_chunks_total: u64,
+    pub active_flushed_points_total: u64,
+    pub persist_runs_total: u64,
+    pub persist_success_total: u64,
+    pub persist_noop_total: u64,
+    pub persist_errors_total: u64,
+    pub persisted_series_total: u64,
+    pub persisted_chunks_total: u64,
+    pub persisted_points_total: u64,
+    pub persisted_segments_total: u64,
+    pub persist_duration_nanos_total: u64,
+    pub evicted_sealed_chunks_total: u64,
+}
+
+/// Compaction internals snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CompactionObservabilitySnapshot {
+    pub runs_total: u64,
+    pub success_total: u64,
+    pub noop_total: u64,
+    pub errors_total: u64,
+    pub source_segments_total: u64,
+    pub output_segments_total: u64,
+    pub source_chunks_total: u64,
+    pub output_chunks_total: u64,
+    pub source_points_total: u64,
+    pub output_points_total: u64,
+    pub duration_nanos_total: u64,
+}
+
+/// Query internals snapshot.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct QueryObservabilitySnapshot {
+    pub select_calls_total: u64,
+    pub select_errors_total: u64,
+    pub select_duration_nanos_total: u64,
+    pub select_points_returned_total: u64,
+    pub select_with_options_calls_total: u64,
+    pub select_with_options_errors_total: u64,
+    pub select_with_options_duration_nanos_total: u64,
+    pub select_with_options_points_returned_total: u64,
+    pub select_all_calls_total: u64,
+    pub select_all_errors_total: u64,
+    pub select_all_duration_nanos_total: u64,
+    pub select_all_series_returned_total: u64,
+    pub select_all_points_returned_total: u64,
+    pub select_series_calls_total: u64,
+    pub select_series_errors_total: u64,
+    pub select_series_duration_nanos_total: u64,
+    pub select_series_returned_total: u64,
+    pub merge_path_queries_total: u64,
+    pub append_sort_path_queries_total: u64,
+}
+
 /// Storage provides thread-safe capabilities for insertion and retrieval from time-series storage.
 pub trait Storage: Send + Sync {
     /// Inserts rows into the storage.
@@ -243,6 +342,11 @@ pub trait Storage: Send + Sync {
     /// `usize::MAX` means "no explicit budget configured".
     fn memory_budget(&self) -> usize {
         usize::MAX
+    }
+
+    /// Returns low-level runtime observability counters/gauges.
+    fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
+        StorageObservabilitySnapshot::default()
     }
 
     /// Closes the storage gracefully.

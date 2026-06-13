@@ -441,6 +441,14 @@ impl FramedWal {
         *self.last_highwater.lock()
     }
 
+    pub fn active_segment(&self) -> u64 {
+        self.active_segment.load(Ordering::Acquire)
+    }
+
+    pub fn segment_count(&self) -> Result<u64> {
+        Ok(collect_wal_segment_files(&self.dir)?.len() as u64)
+    }
+
     pub fn reset(&self) -> Result<()> {
         let mut writer = self.writer.lock();
         writer.flush()?;
