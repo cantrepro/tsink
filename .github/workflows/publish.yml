@@ -25,7 +25,7 @@ jobs:
       - name: Check if already published
         id: check
         run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
             "https://crates.io/api/v1/crates/tsink/${{ steps.version.outputs.version }}")
           if [ "$STATUS" = "200" ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
@@ -57,7 +57,7 @@ jobs:
       - name: Check if already published
         id: check
         run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
             "https://crates.io/api/v1/crates/tsink-server/${{ steps.version.outputs.version }}")
           if [ "$STATUS" = "200" ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
@@ -91,7 +91,7 @@ jobs:
       - name: Check if already published on PyPI
         id: check
         run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
             "https://pypi.org/pypi/tsink_uniffi/${{ steps.version.outputs.version }}/json")
           if [ "$STATUS" = "200" ]; then
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
@@ -126,12 +126,25 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: docker/setup-qemu-action@v3
 
+      - name: Install uniffi-bindgen
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build uniffi-bindgen
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          cargo build -p tsink-uniffi --bin uniffi-bindgen
+          echo "${{ github.workspace }}/target/debug" >> "$GITHUB_PATH"
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist ${{ matrix.args }}
           working-directory: crates/tsink-uniffi
+          before-script-linux: |
+            cargo build -p tsink-uniffi --bin uniffi-bindgen
+            cp target/debug/uniffi-bindgen /usr/local/bin/
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
