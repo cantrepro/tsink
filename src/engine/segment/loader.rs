@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -432,9 +433,39 @@ pub fn collect_expired_segment_dirs(
 }
 
 fn collect_segment_dirs(base: &Path, levels: impl IntoIterator<Item = u8>) -> Result<Vec<PathBuf>> {
+    let metadata = match fs::metadata(base) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("segment base is not a directory: {}", base.display()),
+        )
+        .into());
+    }
+
+    let segments_root = base.join("segments");
+    let metadata = match fs::metadata(&segments_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!(
+                "segment root is not a directory: {}",
+                segments_root.display()
+            ),
+        )
+        .into());
+    }
+
     let mut dirs = Vec::new();
     for level in levels {
-        let level_root = base.join("segments").join(format!("L{level}"));
+        let level_root = segments_root.join(format!("L{level}"));
         let read_dir = match fs::read_dir(&level_root) {
             Ok(read_dir) => read_dir,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
