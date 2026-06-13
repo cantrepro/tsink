@@ -4,6 +4,14 @@ use super::chunk::Chunk;
 use super::encoder::Encoder;
 use super::series_registry::SeriesId;
 
+#[derive(Debug, Clone, Copy)]
+pub struct EncodedChunkDescriptor {
+    pub lane: super::chunk::ValueLane,
+    pub ts_codec: super::chunk::TimestampCodecId,
+    pub value_codec: super::chunk::ValueCodecId,
+    pub point_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub metric: String,
@@ -73,15 +81,18 @@ pub fn decode_chunk_points_in_range_into(
     out: &mut Vec<DataPoint>,
 ) -> Result<()> {
     if chunk.points.is_empty() && !chunk.encoded_payload.is_empty() {
-        let decoded = Encoder::decode_chunk_points_from_payload(
-            chunk.header.lane,
-            chunk.header.ts_codec,
-            chunk.header.value_codec,
-            chunk.header.point_count as usize,
+        return decode_encoded_chunk_payload_in_range_into(
+            EncodedChunkDescriptor {
+                lane: chunk.header.lane,
+                ts_codec: chunk.header.ts_codec,
+                value_codec: chunk.header.value_codec,
+                point_count: chunk.header.point_count as usize,
+            },
             &chunk.encoded_payload,
-        )?;
-        append_sorted_owned_chunk_points_in_range(decoded, start, end, out);
-        return Ok(());
+            start,
+            end,
+            out,
+        );
     }
 
     // Canonical in-memory chunks are finalized from sorted points and always carry encoded payload.
@@ -102,6 +113,24 @@ pub fn decode_chunk_points_in_range_into(
         }
     }
 
+    Ok(())
+}
+
+pub fn decode_encoded_chunk_payload_in_range_into(
+    descriptor: EncodedChunkDescriptor,
+    payload: &[u8],
+    start: i64,
+    end: i64,
+    out: &mut Vec<DataPoint>,
+) -> Result<()> {
+    let decoded = Encoder::decode_chunk_points_from_payload(
+        descriptor.lane,
+        descriptor.ts_codec,
+        descriptor.value_codec,
+        descriptor.point_count,
+        payload,
+    )?;
+    append_sorted_owned_chunk_points_in_range(decoded, start, end, out);
     Ok(())
 }
 

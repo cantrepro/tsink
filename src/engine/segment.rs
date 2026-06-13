@@ -9,6 +9,7 @@ use tracing::warn;
 use crate::engine::chunk::{Chunk, ChunkHeader, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::index::{ChunkIndex, ChunkIndexEntry};
 use crate::engine::series_registry::{LabelPairId, SeriesId, SeriesRegistry};
+use crate::mmap::{create_mmap, PlatformMmap};
 use crate::{Label, Result, TsinkError};
 
 const MANIFEST_MAGIC: [u8; 4] = *b"TSM2";
@@ -98,6 +99,20 @@ pub struct LoadedSegment {
     pub manifest: SegmentManifest,
     pub series: Vec<PersistedSeries>,
     pub chunks_by_series: HashMap<SeriesId, Vec<Chunk>>,
+}
+
+pub struct IndexedSegment {
+    pub root: PathBuf,
+    pub manifest: SegmentManifest,
+    pub chunk_index: ChunkIndex,
+    pub chunks_mmap: PlatformMmap,
+}
+
+#[derive(Default)]
+pub struct LoadedSegmentIndexes {
+    pub next_segment_id: u64,
+    pub series: Vec<PersistedSeries>,
+    pub indexed_segments: Vec<IndexedSegment>,
 }
 
 #[derive(Debug)]
@@ -296,6 +311,62 @@ pub fn load_segments(base: impl AsRef<Path>) -> Result<LoadedSegments> {
     })
 }
 
+pub fn load_segment_indexes(base: impl AsRef<Path>) -> Result<LoadedSegmentIndexes> {
+    let dirs = collect_segment_dirs(base.as_ref(), 0..=2u8)?;
+
+    let mut parsed = Vec::new();
+    let mut max_segment_id = 0u64;
+
+    for dir in dirs {
+        match load_segment_dir_indexed(&dir) {
+            Ok(segment) => {
+                max_segment_id = max_segment_id.max(segment.manifest.segment_id);
+                parsed.push(segment);
+            }
+            Err(TsinkError::DataCorruption(msg)) => {
+                warn!(path = %dir.display(), error = %msg, "Ignoring invalid segment directory");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    parsed.sort_by_key(|segment| (segment.manifest.level, segment.manifest.segment_id));
+
+    let mut series_by_id: BTreeMap<SeriesId, PersistedSeries> = BTreeMap::new();
+    let mut indexed_segments = Vec::with_capacity(parsed.len());
+
+    for segment in parsed {
+        for series in &segment.series {
+            match series_by_id.get(&series.series_id) {
+                Some(existing)
+                    if existing.metric == series.metric && existing.labels == series.labels => {}
+                Some(_) => {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "series id {} conflicts across segments",
+                        series.series_id
+                    )));
+                }
+                None => {
+                    series_by_id.insert(series.series_id, series.clone());
+                }
+            }
+        }
+
+        indexed_segments.push(IndexedSegment {
+            root: segment.root,
+            manifest: segment.manifest,
+            chunk_index: segment.chunk_index,
+            chunks_mmap: segment.chunks_mmap,
+        });
+    }
+
+    Ok(LoadedSegmentIndexes {
+        next_segment_id: max_segment_id.saturating_add(1).max(1),
+        series: series_by_id.into_values().collect(),
+        indexed_segments,
+    })
+}
+
 pub fn load_segments_for_level(base: impl AsRef<Path>, level: u8) -> Result<Vec<LoadedSegment>> {
     let dirs = collect_segment_dirs(base.as_ref(), std::iter::once(level))?;
     let mut out = Vec::new();
@@ -359,6 +430,14 @@ struct ParsedSegment {
     manifest: SegmentManifest,
     series: Vec<PersistedSeries>,
     chunks_by_series: HashMap<SeriesId, Vec<Chunk>>,
+}
+
+struct ParsedIndexedSegment {
+    root: PathBuf,
+    manifest: SegmentManifest,
+    series: Vec<PersistedSeries>,
+    chunk_index: ChunkIndex,
+    chunks_mmap: PlatformMmap,
 }
 
 fn load_segment_dir(path: &Path) -> Result<ParsedSegment> {
@@ -467,6 +546,79 @@ fn load_segment_dir(path: &Path) -> Result<ParsedSegment> {
         manifest,
         series,
         chunks_by_series,
+    })
+}
+
+fn load_segment_dir_indexed(path: &Path) -> Result<ParsedIndexedSegment> {
+    let layout = SegmentLayout {
+        root: path.to_path_buf(),
+        chunks_path: path.join("chunks.bin"),
+        chunk_index_path: path.join("chunk_index.bin"),
+        series_path: path.join("series.bin"),
+        postings_path: path.join("postings.bin"),
+        manifest_path: path.join("manifest.bin"),
+    };
+
+    if !layout.manifest_path.exists() {
+        return Err(TsinkError::DataCorruption(
+            "missing manifest.bin".to_string(),
+        ));
+    }
+
+    let manifest_bytes = fs::read(&layout.manifest_path)?;
+    let parsed_manifest = parse_manifest(&manifest_bytes)?;
+    let chunk_index_bytes = fs::read(&layout.chunk_index_path)?;
+    let series_bytes = fs::read(&layout.series_path)?;
+    let postings_bytes = fs::read(&layout.postings_path)?;
+
+    let chunks_file = File::open(&layout.chunks_path)?;
+    let chunks_mmap = create_mmap(chunks_file).map_err(|err| TsinkError::MemoryMap {
+        path: layout.chunks_path.clone(),
+        details: err.to_string(),
+    })?;
+
+    verify_file_manifest_entry(
+        &parsed_manifest.files[0],
+        FILE_KIND_CHUNKS,
+        chunks_mmap.as_slice(),
+    )?;
+    verify_file_manifest_entry(
+        &parsed_manifest.files[1],
+        FILE_KIND_CHUNK_INDEX,
+        &chunk_index_bytes,
+    )?;
+    verify_file_manifest_entry(&parsed_manifest.files[2], FILE_KIND_SERIES, &series_bytes)?;
+    verify_file_manifest_entry(
+        &parsed_manifest.files[3],
+        FILE_KIND_POSTINGS,
+        &postings_bytes,
+    )?;
+
+    let parsed_series = parse_series_file(&series_bytes)?;
+    let series = decode_persisted_series(&parsed_series)?;
+
+    // Parse for corruption detection even though startup path rebuilds postings from series labels.
+    parse_postings_file(&postings_bytes)?;
+
+    let chunk_index = parse_chunk_index_file(&chunk_index_bytes)?;
+    validate_chunk_index_against_chunks_file(chunks_mmap.as_slice(), &chunk_index)?;
+
+    let manifest = SegmentManifest {
+        segment_id: parsed_manifest.segment_id,
+        level: parsed_manifest.level,
+        chunk_count: parsed_manifest.chunk_count,
+        point_count: parsed_manifest.point_count,
+        series_count: parsed_manifest.series_count,
+        min_ts: parsed_manifest.min_ts,
+        max_ts: parsed_manifest.max_ts,
+    };
+
+    Ok(ParsedIndexedSegment {
+        root: path.to_path_buf(),
+        manifest,
+        series,
+        chunk_index,
+        chunks_mmap,
     })
 }
 
@@ -1399,6 +1551,148 @@ fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecordMeta>> {
     }
 
     Ok(records)
+}
+
+fn validate_chunk_index_against_chunks_file(bytes: &[u8], index: &ChunkIndex) -> Result<()> {
+    if bytes.len() < CHUNKS_HEADER_LEN {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin is too short".to_string(),
+        ));
+    }
+
+    let mut pos = 0usize;
+    let magic = read_array::<4>(bytes, &mut pos)?;
+    if magic != CHUNKS_MAGIC {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin magic mismatch".to_string(),
+        ));
+    }
+
+    let version = read_u16(bytes, &mut pos)?;
+    if version != FORMAT_VERSION {
+        return Err(TsinkError::DataCorruption(format!(
+            "unsupported chunks.bin version {version}"
+        )));
+    }
+
+    let _flags = read_u16(bytes, &mut pos)?;
+    let chunk_count = read_u64(bytes, &mut pos)? as usize;
+
+    if chunk_count != index.entries.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk count mismatch: chunks.bin has {}, chunk_index.bin has {}",
+            chunk_count,
+            index.entries.len()
+        )));
+    }
+
+    let mut expected_by_offset = BTreeMap::<u64, &ChunkIndexEntry>::new();
+    for entry in &index.entries {
+        if expected_by_offset
+            .insert(entry.chunk_offset, entry)
+            .is_some()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "duplicate chunk offset {} in chunk index",
+                entry.chunk_offset
+            )));
+        }
+    }
+
+    for _ in 0..chunk_count {
+        let record_offset = pos as u64;
+        let Some(entry) = expected_by_offset.remove(&record_offset) else {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunks.bin contains unindexed chunk record at offset {}",
+                record_offset
+            )));
+        };
+
+        let record_len = read_u32(bytes, &mut pos)? as usize;
+        let record_end = pos.saturating_add(record_len);
+        if record_end > bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "chunk record exceeds chunks.bin length".to_string(),
+            ));
+        }
+
+        let total_len = u32::try_from(record_len.saturating_add(4)).map_err(|_| {
+            TsinkError::DataCorruption("chunk record total length exceeds u32".to_string())
+        })?;
+        if total_len != entry.chunk_len {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunk length mismatch at offset {}: index {}, chunk {}",
+                entry.chunk_offset, entry.chunk_len, total_len
+            )));
+        }
+
+        let header_crc32 = read_u32(bytes, &mut pos)?;
+        let header_start = pos;
+
+        let series_id = read_u64(bytes, &mut pos)?;
+        let lane = decode_lane(read_u8(bytes, &mut pos)?)?;
+        let ts_codec = decode_ts_codec(read_u8(bytes, &mut pos)?)?;
+        let value_codec = decode_value_codec(read_u8(bytes, &mut pos)?)?;
+        let _chunk_flags = read_u8(bytes, &mut pos)?;
+        let point_count = read_u16(bytes, &mut pos)?;
+        let min_ts = read_i64(bytes, &mut pos)?;
+        let max_ts = read_i64(bytes, &mut pos)?;
+        let payload_len = read_u32(bytes, &mut pos)? as usize;
+
+        let header_end = pos;
+        if checksum32(&bytes[header_start..header_end]) != header_crc32 {
+            return Err(TsinkError::DataCorruption(
+                "chunk header crc mismatch".to_string(),
+            ));
+        }
+
+        if series_id != entry.series_id
+            || min_ts != entry.min_ts
+            || max_ts != entry.max_ts
+            || point_count != entry.point_count
+            || lane != entry.lane
+            || ts_codec != entry.ts_codec
+            || value_codec != entry.value_codec
+        {
+            return Err(TsinkError::DataCorruption(
+                "chunk index entry does not match chunk header".to_string(),
+            ));
+        }
+
+        let payload = read_bytes(bytes, &mut pos, payload_len)?;
+        let payload_crc32 = read_u32(bytes, &mut pos)?;
+        if checksum32(payload) != payload_crc32 {
+            return Err(TsinkError::DataCorruption(
+                "chunk payload crc mismatch".to_string(),
+            ));
+        }
+
+        if pos != record_end {
+            return Err(TsinkError::DataCorruption(
+                "chunk record length mismatch".to_string(),
+            ));
+        }
+    }
+
+    if !expected_by_offset.is_empty() {
+        let first_missing = expected_by_offset
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or_default();
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk index references missing chunk offset {}",
+            first_missing
+        )));
+    }
+
+    if pos != bytes.len() {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin has trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn decode_lane(raw: u8) -> Result<ValueLane> {

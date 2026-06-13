@@ -10,12 +10,16 @@ use crate::concurrency::Semaphore;
 use crate::engine::chunk::{Chunk, ChunkBuilder, ChunkPoint, ValueLane};
 use crate::engine::compactor::Compactor;
 use crate::engine::encoder::Encoder;
-use crate::engine::query::decode_chunk_points_in_range_into;
-use crate::engine::segment::{load_segments, SegmentWriter};
+use crate::engine::query::{
+    decode_chunk_points_in_range_into, decode_encoded_chunk_payload_in_range_into,
+    EncodedChunkDescriptor,
+};
+use crate::engine::segment::{load_segment_indexes, SegmentWriter};
 use crate::engine::series_registry::{
     validate_labels, validate_metric, SeriesId, SeriesRegistry, SeriesResolution,
 };
 use crate::engine::wal::{FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame};
+use crate::mmap::PlatformMmap;
 use crate::storage::{
     aggregate_series, downsample_points, downsample_points_with_custom, TimestampPrecision,
 };
@@ -186,6 +190,20 @@ impl SealedChunkKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedChunkRef {
+    min_ts: i64,
+    max_ts: i64,
+    point_count: u16,
+    sequence: u64,
+    chunk_offset: u64,
+    chunk_len: u32,
+    lane: ValueLane,
+    ts_codec: super::chunk::TimestampCodecId,
+    value_codec: super::chunk::ValueCodecId,
+    segment_slot: usize,
+}
+
 const NUMERIC_LANE_ROOT: &str = "lane_numeric";
 const BLOB_LANE_ROOT: &str = "lane_blob";
 const WAL_DIR_NAME: &str = "wal";
@@ -195,8 +213,9 @@ pub struct ChunkStorage {
     registry_write_txn: Mutex<()>,
     active_builders: RwLock<HashMap<SeriesId, ActiveSeriesState>>,
     sealed_chunks: RwLock<HashMap<SeriesId, BTreeMap<SealedChunkKey, Chunk>>>,
+    persisted_chunk_refs: RwLock<HashMap<SeriesId, Vec<PersistedChunkRef>>>,
+    persisted_segment_maps: RwLock<Vec<Arc<PlatformMmap>>>,
     persisted_chunk_watermarks: RwLock<HashMap<SeriesId, u64>>,
-    loaded_chunk_sequence_watermark: AtomicU64,
     next_chunk_sequence: AtomicU64,
     chunk_point_cap: usize,
     numeric_lane_path: Option<PathBuf>,
@@ -257,8 +276,9 @@ impl ChunkStorage {
             registry_write_txn: Mutex::new(()),
             active_builders: RwLock::new(HashMap::new()),
             sealed_chunks: RwLock::new(HashMap::new()),
+            persisted_chunk_refs: RwLock::new(HashMap::new()),
+            persisted_segment_maps: RwLock::new(Vec::new()),
             persisted_chunk_watermarks: RwLock::new(HashMap::new()),
-            loaded_chunk_sequence_watermark: AtomicU64::new(0),
             next_chunk_sequence: AtomicU64::new(1),
             chunk_point_cap: chunk_point_cap.clamp(1, u16::MAX as usize),
             numeric_compactor: numeric_lane_path.as_ref().map(|path| {
@@ -399,54 +419,75 @@ impl ChunkStorage {
         out.clear();
         let mut has_overlap = false;
         let mut has_previous_chunk = false;
-        let mut has_previous_loaded_chunk = false;
-        let mut has_previous_runtime_chunk = false;
+        let mut has_previous_persisted_chunk = false;
         let mut previous_max_ts = i64::MIN;
-        let mut previous_loaded_max_ts = i64::MIN;
-        let mut previous_runtime_max_ts = i64::MIN;
+        let mut previous_persisted_max_ts = i64::MIN;
         let mut requires_output_validation = false;
         let mut requires_timestamp_dedupe = false;
         let mut requires_exact_dedupe = false;
-        let loaded_chunk_sequence_watermark =
-            self.loaded_chunk_sequence_watermark.load(Ordering::Relaxed);
+
+        {
+            let persisted_chunk_refs = self.persisted_chunk_refs.read();
+            let persisted_segment_maps = self.persisted_segment_maps.read();
+
+            if let Some(chunks) = persisted_chunk_refs.get(&series_id) {
+                let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
+                for chunk_ref in &chunks[..end_idx] {
+                    if chunk_ref.max_ts < start {
+                        continue;
+                    }
+
+                    if has_previous_chunk && chunk_ref.min_ts <= previous_max_ts {
+                        has_overlap = true;
+                        if has_previous_persisted_chunk
+                            && chunk_ref.min_ts <= previous_persisted_max_ts
+                        {
+                            requires_timestamp_dedupe = true;
+                        }
+                    }
+
+                    has_previous_chunk = true;
+                    has_previous_persisted_chunk = true;
+                    previous_max_ts = previous_max_ts.max(chunk_ref.max_ts);
+                    previous_persisted_max_ts = previous_persisted_max_ts.max(chunk_ref.max_ts);
+
+                    let payload = persisted_chunk_payload(&persisted_segment_maps, chunk_ref)?;
+                    decode_encoded_chunk_payload_in_range_into(
+                        EncodedChunkDescriptor {
+                            lane: chunk_ref.lane,
+                            ts_codec: chunk_ref.ts_codec,
+                            value_codec: chunk_ref.value_codec,
+                            point_count: chunk_ref.point_count as usize,
+                        },
+                        payload,
+                        start,
+                        end,
+                        out,
+                    )?;
+                }
+            }
+        }
 
         {
             let sealed = self.sealed_chunks.read();
             if let Some(chunks) = sealed.get(&series_id) {
                 let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
-                for (key, chunk) in chunks.range(..end_bound) {
+                for (_, chunk) in chunks.range(..end_bound) {
                     if chunk.header.max_ts < start {
                         continue;
                     }
-                    let chunk_is_loaded = key.sequence <= loaded_chunk_sequence_watermark;
+
                     if has_previous_chunk && chunk.header.min_ts <= previous_max_ts {
                         has_overlap = true;
-                        if chunk_is_loaded {
-                            if has_previous_loaded_chunk
-                                && chunk.header.min_ts <= previous_loaded_max_ts
-                            {
-                                requires_timestamp_dedupe = true;
-                            }
-                            if has_previous_runtime_chunk
-                                && chunk.header.min_ts <= previous_runtime_max_ts
-                            {
-                                requires_exact_dedupe = true;
-                            }
-                        } else if has_previous_loaded_chunk
-                            && chunk.header.min_ts <= previous_loaded_max_ts
+                        if has_previous_persisted_chunk
+                            && chunk.header.min_ts <= previous_persisted_max_ts
                         {
                             requires_exact_dedupe = true;
                         }
                     }
+
                     has_previous_chunk = true;
                     previous_max_ts = previous_max_ts.max(chunk.header.max_ts);
-                    if chunk_is_loaded {
-                        has_previous_loaded_chunk = true;
-                        previous_loaded_max_ts = previous_loaded_max_ts.max(chunk.header.max_ts);
-                    } else {
-                        has_previous_runtime_chunk = true;
-                        previous_runtime_max_ts = previous_runtime_max_ts.max(chunk.header.max_ts);
-                    }
 
                     // Chunks without encoded payload may be ad-hoc/manual and not guaranteed sorted.
                     if chunk.points.len() > 1 && chunk.encoded_payload.is_empty() {
@@ -472,7 +513,7 @@ impl ChunkStorage {
                     if has_previous_chunk && point.ts <= previous_max_ts {
                         has_overlap = true;
                     }
-                    if has_previous_loaded_chunk && point.ts <= previous_loaded_max_ts {
+                    if has_previous_persisted_chunk && point.ts <= previous_persisted_max_ts {
                         requires_exact_dedupe = true;
                     }
                     if has_previous_active && point.ts < previous_active_ts {
@@ -812,10 +853,13 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn apply_loaded_segments(&self, loaded: crate::engine::segment::LoadedSegments) -> Result<()> {
+    fn apply_loaded_segment_indexes(
+        &self,
+        loaded: crate::engine::segment::LoadedSegmentIndexes,
+    ) -> Result<()> {
         {
             let mut registry = self.registry.write();
-            for series in loaded.series {
+            for series in &loaded.series {
                 registry.register_series_with_id(
                     series.series_id,
                     &series.metric,
@@ -824,44 +868,65 @@ impl ChunkStorage {
             }
         }
 
+        let mut persisted_refs = HashMap::<SeriesId, Vec<PersistedChunkRef>>::new();
+        let mut persisted_maps = Vec::<Arc<PlatformMmap>>::new();
+        let mut sequence = 1u64;
+        let mut loaded_max_timestamp = i64::MIN;
+
         {
-            let mut sealed = self.sealed_chunks.write();
-            let mut loaded_max_timestamp = i64::MIN;
-            for (series_id, chunks) in loaded.chunks_by_series {
-                let entry = sealed.entry(series_id).or_default();
-                for chunk in chunks {
-                    loaded_max_timestamp = loaded_max_timestamp.max(chunk.header.max_ts);
-                    let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
-                    let key = SealedChunkKey::from_chunk(&chunk, sequence);
-                    entry.insert(key, chunk);
+            for indexed_segment in loaded.indexed_segments {
+                let segment_slot = persisted_maps.len();
+                persisted_maps.push(Arc::new(indexed_segment.chunks_mmap));
+
+                for entry in indexed_segment.chunk_index.entries {
+                    loaded_max_timestamp = loaded_max_timestamp.max(entry.max_ts);
+                    persisted_refs
+                        .entry(entry.series_id)
+                        .or_default()
+                        .push(PersistedChunkRef {
+                            min_ts: entry.min_ts,
+                            max_ts: entry.max_ts,
+                            point_count: entry.point_count,
+                            sequence,
+                            chunk_offset: entry.chunk_offset,
+                            chunk_len: entry.chunk_len,
+                            lane: entry.lane,
+                            ts_codec: entry.ts_codec,
+                            value_codec: entry.value_codec,
+                            segment_slot,
+                        });
+                    sequence = sequence.saturating_add(1);
                 }
             }
+        }
 
-            if loaded_max_timestamp != i64::MIN {
-                self.update_max_observed_timestamp(loaded_max_timestamp);
-            }
+        for chunks in persisted_refs.values_mut() {
+            chunks.sort_by_key(|chunk| {
+                (
+                    chunk.min_ts,
+                    chunk.max_ts,
+                    chunk.point_count,
+                    chunk.sequence,
+                    chunk.chunk_offset,
+                )
+            });
         }
 
         {
-            let sealed = self.sealed_chunks.read();
-            let mut persisted = self.persisted_chunk_watermarks.write();
-            persisted.clear();
-            for (series_id, chunks) in sealed.iter() {
-                let watermark = chunks
-                    .keys()
-                    .next_back()
-                    .map(|key| key.sequence)
-                    .unwrap_or(0);
-                persisted.insert(*series_id, watermark);
-            }
+            let mut maps = self.persisted_segment_maps.write();
+            *maps = persisted_maps;
+        }
+        {
+            let mut refs = self.persisted_chunk_refs.write();
+            *refs = persisted_refs;
+        }
+        {
+            self.persisted_chunk_watermarks.write().clear();
         }
 
-        let loaded_chunk_watermark = self
-            .next_chunk_sequence
-            .load(Ordering::SeqCst)
-            .saturating_sub(1);
-        self.loaded_chunk_sequence_watermark
-            .store(loaded_chunk_watermark, Ordering::SeqCst);
+        if loaded_max_timestamp != i64::MIN {
+            self.update_max_observed_timestamp(loaded_max_timestamp);
+        }
 
         self.next_segment_id
             .store(loaded.next_segment_id.max(1), Ordering::SeqCst);
@@ -1269,16 +1334,16 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     };
 
     let loaded_numeric = if let Some(path) = &numeric_lane_path {
-        load_segments(path)?
+        load_segment_indexes(path)?
     } else {
-        crate::engine::segment::LoadedSegments::default()
+        crate::engine::segment::LoadedSegmentIndexes::default()
     };
     let loaded_blob = if let Some(path) = &blob_lane_path {
-        load_segments(path)?
+        load_segment_indexes(path)?
     } else {
-        crate::engine::segment::LoadedSegments::default()
+        crate::engine::segment::LoadedSegmentIndexes::default()
     };
-    let loaded_segments = merge_loaded_segments(loaded_numeric, loaded_blob)?;
+    let loaded_segments = merge_loaded_segment_indexes(loaded_numeric, loaded_blob)?;
 
     let wal = if let Some(data_path) = builder.data_path() {
         let wal_path = data_path.join(WAL_DIR_NAME);
@@ -1304,7 +1369,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         loaded_segments.next_segment_id,
         storage_options,
     ));
-    storage.apply_loaded_segments(loaded_segments)?;
+    storage.apply_loaded_segment_indexes(loaded_segments)?;
     storage.replay_from_wal()?;
 
     Ok(storage as Arc<dyn Storage>)
@@ -1324,10 +1389,10 @@ fn clear_wal_dir_if_present(wal_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn merge_loaded_segments(
-    mut numeric: crate::engine::segment::LoadedSegments,
-    mut blob: crate::engine::segment::LoadedSegments,
-) -> Result<crate::engine::segment::LoadedSegments> {
+fn merge_loaded_segment_indexes(
+    mut numeric: crate::engine::segment::LoadedSegmentIndexes,
+    mut blob: crate::engine::segment::LoadedSegmentIndexes,
+) -> Result<crate::engine::segment::LoadedSegmentIndexes> {
     let mut series_by_id = BTreeMap::new();
     for series in numeric.series.drain(..) {
         series_by_id.insert(series.series_id, series);
@@ -1349,29 +1414,81 @@ fn merge_loaded_segments(
         }
     }
 
-    let mut chunks_by_series = numeric.chunks_by_series;
-    for (series_id, mut chunks) in blob.chunks_by_series.drain() {
-        chunks_by_series
-            .entry(series_id)
-            .or_default()
-            .append(&mut chunks);
-    }
+    let mut indexed_segments = numeric.indexed_segments;
+    indexed_segments.append(&mut blob.indexed_segments);
+    indexed_segments.sort_by_key(|segment| (segment.manifest.level, segment.manifest.segment_id));
 
-    for chunks in chunks_by_series.values_mut() {
-        chunks.sort_by(|a, b| {
-            (a.header.min_ts, a.header.max_ts, a.header.point_count).cmp(&(
-                b.header.min_ts,
-                b.header.max_ts,
-                b.header.point_count,
-            ))
-        });
-    }
-
-    Ok(crate::engine::segment::LoadedSegments {
+    Ok(crate::engine::segment::LoadedSegmentIndexes {
         next_segment_id: numeric.next_segment_id.max(blob.next_segment_id).max(1),
         series: series_by_id.into_values().collect(),
-        chunks_by_series,
+        indexed_segments,
     })
+}
+
+fn persisted_chunk_payload<'a>(
+    persisted_segment_maps: &'a [Arc<PlatformMmap>],
+    chunk_ref: &PersistedChunkRef,
+) -> Result<&'a [u8]> {
+    let Some(mapped_segment) = persisted_segment_maps.get(chunk_ref.segment_slot) else {
+        return Err(TsinkError::DataCorruption(format!(
+            "missing mapped segment slot {}",
+            chunk_ref.segment_slot
+        )));
+    };
+    let bytes = mapped_segment.as_slice();
+
+    let offset = usize::try_from(chunk_ref.chunk_offset).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "chunk offset {} exceeds usize",
+            chunk_ref.chunk_offset
+        ))
+    })?;
+    let record_len = usize::try_from(chunk_ref.chunk_len).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "chunk length {} exceeds usize",
+            chunk_ref.chunk_len
+        ))
+    })?;
+    let record_end = offset.saturating_add(record_len);
+    if record_end > bytes.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk at offset {} length {} exceeds mapped file size {}",
+            chunk_ref.chunk_offset,
+            chunk_ref.chunk_len,
+            bytes.len()
+        )));
+    }
+
+    let record = &bytes[offset..record_end];
+    if record.len() < 42 {
+        return Err(TsinkError::DataCorruption(
+            "chunk record too short for header".to_string(),
+        ));
+    }
+
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&record[0..4]);
+    let body_len = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(usize::MAX);
+    if body_len.saturating_add(4) != record.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk record length mismatch at offset {}",
+            chunk_ref.chunk_offset
+        )));
+    }
+
+    raw.copy_from_slice(&record[38..42]);
+    let payload_len = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(usize::MAX);
+    let payload_start = 42usize;
+    let payload_end = payload_start.saturating_add(payload_len);
+
+    if payload_end.saturating_add(4) != record.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk payload length mismatch at offset {}",
+            chunk_ref.chunk_offset
+        )));
+    }
+
+    Ok(&record[payload_start..payload_end])
 }
 
 fn duration_to_timestamp_units(duration: Duration, precision: TimestampPrecision) -> i64 {
