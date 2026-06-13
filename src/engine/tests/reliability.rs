@@ -11,20 +11,47 @@ fn replace_numeric_lane_with_file(root: &Path) {
 }
 
 fn replace_path_with_file(root: &Path) {
-    if let Err(err) = std::fs::remove_dir_all(root) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            panic!("failed to remove directory root {}: {err}", root.display());
+    let mut last_err = None;
+    for _ in 0..20 {
+        if let Err(err) = std::fs::remove_dir_all(root) {
+            match err.kind() {
+                std::io::ErrorKind::NotFound => {}
+                std::io::ErrorKind::PermissionDenied => {
+                    last_err = Some(format!(
+                        "failed to remove directory root {}: {err}",
+                        root.display()
+                    ));
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                _ => panic!("failed to remove directory root {}: {err}", root.display()),
+            }
+        }
+        if let Err(err) = std::fs::remove_file(root) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                panic!("failed to remove file root {}: {err}", root.display());
+            }
+        }
+
+        if let Some(parent) = root.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        match std::fs::write(root, b"not-a-directory") {
+            Ok(()) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => {
+                last_err = Some(format!(
+                    "failed to replace directory root {}: {err}",
+                    root.display()
+                ));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("failed to write file root {}: {err}", root.display()),
         }
     }
-    if let Err(err) = std::fs::remove_file(root) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            panic!("failed to remove file root {}: {err}", root.display());
-        }
-    }
-    if let Some(parent) = root.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(root, b"not-a-directory").unwrap();
+    panic!(
+        "{}",
+        last_err.unwrap_or_else(|| format!("failed to replace directory root {}", root.display()))
+    );
 }
 
 fn wait_for_condition<F>(timeout: Duration, poll_interval: Duration, condition: F) -> bool
@@ -861,13 +888,15 @@ fn tier_move_staging_sync_failure_keeps_source_visible_and_avoids_destination_pu
         .join("segments")
         .join("L2")
         .join("seg-0000000000000001");
+    let destination_parent = destination_root.parent().unwrap().to_path_buf();
     let staging_prefix = staged_dir_prefix("tier-segment");
     let _guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
         move |candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&staging_prefix))
+            candidate.parent() == Some(destination_parent.as_path())
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&staging_prefix))
         },
         "injected tier destination staging sync failure",
     );

@@ -623,10 +623,7 @@ impl FramedWal {
         writer.get_mut().sync_data()?;
 
         let active_path = self.path.lock().clone();
-        let replacement = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&active_path)?;
+        let (replacement, _, _) = open_segment_for_append(&active_path)?;
         let capacity = writer.capacity();
         let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));
         let _ = old_writer.into_parts();

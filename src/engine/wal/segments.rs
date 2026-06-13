@@ -118,10 +118,8 @@ impl FramedWal {
             active_last_seq = 0;
             file
         } else {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&active.path)?
+            let (file, _, _) = open_segment_for_append(&active.path)?;
+            file
         };
         let accounting = WalRuntimeAccounting::from_segments(&segments)?;
         let writer = BufWriter::with_capacity(buffer_size.max(1), writer_file);

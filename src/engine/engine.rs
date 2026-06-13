@@ -613,6 +613,7 @@ impl Drop for ChunkStorage {
             .store(STORAGE_CLOSED, Ordering::SeqCst);
         self.notify_background_threads();
         let _ = self.join_background_threads();
+        self.release_data_path_process_lock();
     }
 }
 

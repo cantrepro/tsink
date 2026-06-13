@@ -1,8 +1,11 @@
 //! Platform-aware memory-mapped file helpers.
 
+#[cfg(not(windows))]
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::io;
+#[cfg(windows)]
+use std::io::Read;
 
 #[cfg(target_arch = "x86")]
 pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
@@ -25,7 +28,12 @@ pub const MAX_MAP_SIZE: usize = usize::MAX;
 pub const MAX_MAP_SIZE: usize = 0x7FFFFFFF;
 
 pub struct PlatformMmap {
+    #[cfg(not(windows))]
     mmap: Mmap,
+    // Windows does not allow segment directories to be retired while their
+    // chunk files are memory mapped, so keep immutable segment bytes owned.
+    #[cfg(windows)]
+    bytes: Box<[u8]>,
 }
 
 impl PlatformMmap {
@@ -39,35 +47,67 @@ impl PlatformMmap {
 
     #[inline]
     fn create_map(file: File, length: usize) -> io::Result<Self> {
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(windows)]
         {
-            if length > MAX_MAP_SIZE {
+            let mut file = file;
+            let mut bytes = Vec::with_capacity(length);
+            file.read_to_end(&mut bytes)?;
+            if bytes.len() != length {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                    io::ErrorKind::UnexpectedEof,
                     format!(
-                        "Map size {} exceeds maximum {} for this architecture",
-                        length, MAX_MAP_SIZE
+                        "file length changed while loading segment bytes: expected {length}, read {}",
+                        bytes.len()
                     ),
                 ));
             }
+
+            return Ok(PlatformMmap {
+                bytes: bytes.into_boxed_slice(),
+            });
         }
 
-        let mmap = unsafe { MmapOptions::new().len(length).map(&file)? };
-        drop(file);
+        #[cfg(not(windows))]
+        {
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                if length > MAX_MAP_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Map size {} exceeds maximum {} for this architecture",
+                            length, MAX_MAP_SIZE
+                        ),
+                    ));
+                }
+            }
 
-        Ok(PlatformMmap { mmap })
+            let mmap = unsafe { MmapOptions::new().len(length).map(&file)? };
+            drop(file);
+
+            Ok(PlatformMmap { mmap })
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.mmap[..]
+        #[cfg(not(windows))]
+        return &self.mmap[..];
+        #[cfg(windows)]
+        return &self.bytes[..];
     }
 
     pub fn len(&self) -> usize {
-        self.mmap.len()
+        #[cfg(not(windows))]
+        return self.mmap.len();
+        #[cfg(windows)]
+        return self.bytes.len();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
+        #[cfg(not(windows))]
+        return self.mmap.is_empty();
+        #[cfg(windows)]
+        return self.bytes.is_empty();
     }
 }
 
