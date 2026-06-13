@@ -320,23 +320,30 @@ impl FramedWal {
             segments.push(WalSegmentFile { id: 0, path });
         }
 
-        let mut active = segments.last().cloned().ok_or_else(|| TsinkError::Wal {
+        let active = segments.last().cloned().ok_or_else(|| TsinkError::Wal {
             operation: "open".to_string(),
             details: "missing WAL segment after initialization".to_string(),
         })?;
-        let mut active_last_seq = 0u64;
-        let mut last_highwater = WalHighWatermark::default();
-        for segment in &segments {
-            let last_seq = scan_last_seq(&segment.path)?;
-            if segment.id == active.id {
-                active_last_seq = last_seq;
-                active = segment.clone();
+        let active_last_seq = scan_last_seq(&active.path)?;
+        let mut last_highwater = if active_last_seq > 0 {
+            WalHighWatermark {
+                segment: active.id,
+                frame: active_last_seq,
             }
-            if last_seq > 0 {
-                last_highwater = last_highwater.max(WalHighWatermark {
-                    segment: segment.id,
-                    frame: last_seq,
-                });
+        } else {
+            WalHighWatermark::default()
+        };
+
+        if last_highwater == WalHighWatermark::default() {
+            for segment in segments.iter().rev().skip(1) {
+                let last_seq = scan_last_seq(&segment.path)?;
+                if last_seq > 0 {
+                    last_highwater = WalHighWatermark {
+                        segment: segment.id,
+                        frame: last_seq,
+                    };
+                    break;
+                }
             }
         }
 
@@ -348,7 +355,7 @@ impl FramedWal {
 
         Ok(Self {
             dir,
-            path: Mutex::new(active.path),
+            path: Mutex::new(active.path.clone()),
             writer: Mutex::new(writer),
             active_segment: AtomicU64::new(active.id),
             next_seq: AtomicU64::new(active_last_seq.saturating_add(1)),
@@ -546,13 +553,12 @@ impl FramedWal {
         let frame_seq = self.next_seq.load(Ordering::SeqCst);
         let active_segment = self.active_segment.load(Ordering::SeqCst);
 
-        let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
-        header.extend_from_slice(&FRAME_MAGIC);
-        header.push(frame_type);
-        header.extend_from_slice(&[0u8; 3]);
-        header.extend_from_slice(&frame_seq.to_le_bytes());
-        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        header.extend_from_slice(&payload_crc32.to_le_bytes());
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        header[0..4].copy_from_slice(&FRAME_MAGIC);
+        header[4] = frame_type;
+        header[8..16].copy_from_slice(&frame_seq.to_le_bytes());
+        header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[20..24].copy_from_slice(&payload_crc32.to_le_bytes());
 
         let write_result = writer
             .write_all(&header)
@@ -775,6 +781,7 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
     let file = OpenOptions::new().read(true).open(path)?;
     let mut reader = BufReader::new(file);
     let mut last_seq = 0u64;
+    let mut payload = Vec::new();
 
     loop {
         let mut header = [0u8; FRAME_HEADER_LEN];
@@ -797,12 +804,12 @@ fn scan_last_seq(path: &Path) -> Result<u64> {
             break;
         }
 
-        let mut payload = vec![0u8; payload_len];
-        if reader.read_exact(&mut payload).is_err() {
+        payload.resize(payload_len, 0);
+        if reader.read_exact(payload.as_mut_slice()).is_err() {
             break;
         }
 
-        if checksum32(&payload) != expected_crc32 {
+        if checksum32(payload.as_slice()) != expected_crc32 {
             break;
         }
 

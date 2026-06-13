@@ -58,8 +58,6 @@ pub async fn handle_request(
     }
 }
 
-// --- PromQL Endpoints ---
-
 async fn handle_instant_query(
     storage: &Arc<dyn Storage>,
     _engine: &Engine,
@@ -116,6 +114,9 @@ async fn handle_range_query(
         Ok(ts) => ts,
         Err(err) => return promql_error_response("bad_data", &err),
     };
+    if end < start {
+        return promql_error_response("bad_data", "end timestamp must not be before start time");
+    }
     let step = match parse_step(&step_str, precision) {
         Ok(s) => s,
         Err(err) => return promql_error_response("bad_data", &err),
@@ -230,8 +231,6 @@ async fn handle_label_values(storage: &Arc<dyn Storage>, label_name: &str) -> Ht
     }
 }
 
-// --- Observability Endpoints ---
-
 fn handle_metrics(storage: &Arc<dyn Storage>, server_start: Instant) -> HttpResponse {
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
@@ -257,8 +256,6 @@ fn handle_metrics(storage: &Arc<dyn Storage>, server_start: Instant) -> HttpResp
         .with_header("Content-Type", "text/plain; version=0.0.4")
 }
 
-// --- TSDB Status ---
-
 async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
@@ -283,8 +280,6 @@ async fn handle_tsdb_status(storage: &Arc<dyn Storage>) -> HttpResponse {
         }),
     )
 }
-
-// --- Remote Write/Read (existing) ---
 
 async fn handle_remote_write(storage: &Arc<dyn Storage>, request: &HttpRequest) -> HttpResponse {
     let decoded = match decode_body(request) {
@@ -368,8 +363,6 @@ async fn handle_remote_read(storage: &Arc<dyn Storage>, request: &HttpRequest) -
         .with_header("Content-Encoding", "snappy")
         .with_header("X-Prometheus-Remote-Read-Version", "0.1.0")
 }
-
-// --- Prometheus Text Import ---
 
 async fn handle_prometheus_import(
     storage: &Arc<dyn Storage>,
@@ -479,8 +472,6 @@ fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> {
 
     Ok(labels)
 }
-
-// --- Helpers ---
 
 fn decode_body(request: &HttpRequest) -> Result<Vec<u8>, String> {
     match request.header("content-encoding") {
@@ -624,11 +615,9 @@ fn current_timestamp(precision: TimestampPrecision) -> i64 {
 }
 
 fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
-    // Try as integer first
     if let Ok(ts) = s.parse::<i64>() {
         return Ok(ts);
     }
-    // Try as float (seconds) and convert to precision
     if let Ok(secs) = s.parse::<f64>() {
         let ts = match precision {
             TimestampPrecision::Seconds => secs as i64,
@@ -642,7 +631,6 @@ fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String
 }
 
 fn parse_step(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
-    // Try as float seconds first
     if let Ok(secs) = s.parse::<f64>() {
         if secs <= 0.0 {
             return Err("step must be positive".to_string());
@@ -655,8 +643,6 @@ fn parse_step(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
         };
         return Ok(step.max(1));
     }
-
-    // Try as duration string (e.g. "15s", "1m", "1h")
     let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
         (stripped, "ms")
     } else if s.len() > 1 {

@@ -1,0 +1,181 @@
+name: Publish
+
+on:
+  push:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-tsink:
+    name: Publish tsink to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="tsink") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already published
+        id: check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/tsink/${{ steps.version.outputs.version }}")
+          if [ "$STATUS" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish tsink
+        if: steps.check.outputs.published == 'false'
+        run: cargo publish -p tsink
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-tsink-server:
+    name: Publish tsink-server to crates.io
+    needs: publish-tsink
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="tsink-server") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already published
+        id: check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/tsink-server/${{ steps.version.outputs.version }}")
+          if [ "$STATUS" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish tsink-server
+        if: steps.check.outputs.published == 'false'
+        run: cargo publish -p tsink-server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  check-python-version:
+    name: Check Python package version
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="tsink-uniffi") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already published on PyPI
+        id: check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/tsink_uniffi/${{ steps.version.outputs.version }}/json")
+          if [ "$STATUS" = "200" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-python-wheels:
+    name: Build wheel (${{ matrix.target }})
+    needs: check-python-version
+    if: needs.check-python-version.outputs.should_publish == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            args: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            args: ""
+          - os: macos-latest
+            target: universal2-apple-darwin
+            args: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist ${{ matrix.args }}
+          working-directory: crates/tsink-uniffi
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: crates/tsink-uniffi/dist/*.whl
+
+  build-python-sdist:
+    name: Build sdist
+    needs: check-python-version
+    if: needs.check-python-version.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: crates/tsink-uniffi
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/tsink-uniffi/dist/*.tar.gz
+
+  publish-python:
+    name: Publish to PyPI
+    needs: [check-python-version, build-python-wheels, build-python-sdist]
+    if: needs.check-python-version.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist/

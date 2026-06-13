@@ -66,8 +66,6 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     let server_start = Instant::now();
     let auth_token = config.auth_token.clone();
     let precision = config.timestamp_precision;
-
-    // Spawn signal handler
     tokio::spawn(async move {
         if let Err(err) = wait_for_shutdown_signal().await {
             eprintln!("signal handler error: {err}");
@@ -137,8 +135,6 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
             active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
-
-    // Wait for in-flight connections to drain
     let drain_start = Instant::now();
     while active_connections.load(std::sync::atomic::Ordering::Relaxed) > 0 {
         if drain_start.elapsed() > SHUTDOWN_GRACE_PERIOD {
@@ -147,8 +143,6 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    // Close storage
     let storage_clone = Arc::clone(&storage);
     let _ = tokio::task::spawn_blocking(move || storage_clone.close()).await;
 
@@ -233,7 +227,6 @@ async fn handle_connection(
     auth_token: Option<&str>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
-    // Set TCP keepalive
     let sock_ref = socket2::SockRef::from(&stream);
     let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
     let _ = sock_ref.set_tcp_keepalive(&keepalive);
@@ -287,7 +280,6 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        // Read request with keep-alive timeout
         let request = tokio::select! {
             result = tokio::time::timeout(KEEP_ALIVE_TIMEOUT, read_http_request(reader)) => {
                 match result {
@@ -301,7 +293,6 @@ where
                         return Ok(());
                     }
                     Err(_) => {
-                        // Keep-alive timeout; close connection silently
                         return Ok(());
                     }
                 }
@@ -310,8 +301,6 @@ where
                 return Ok(());
             }
         };
-
-        // Check auth
         if let Some(token) = auth_token {
             let path = request.path_without_query();
             let skip_auth = path == "/healthz" || path == "/ready";
@@ -328,8 +317,6 @@ where
                 }
             }
         }
-
-        // Check for Connection: close
         let close = request
             .header("connection")
             .is_some_and(|v| v.eq_ignore_ascii_case("close"));
@@ -401,8 +388,6 @@ mod tests {
         let auth_token_owned = auth_token.map(String::from);
 
         let (client, server) = tokio::io::duplex(64 * 1024);
-
-        // Spawn server handler
         let server_handle = tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(server);
             let mut shutdown_rx = shutdown_rx;
@@ -420,12 +405,8 @@ mod tests {
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
-
-        // Write request from client side
         client_write.write_all(raw_request).await.unwrap();
         drop(client_write);
-
-        // Read response
         let mut response = Vec::new();
         client_read.read_to_end(&mut response).await.unwrap();
 
@@ -443,7 +424,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_token_required_when_configured() {
-        // Request without auth header should get 401
         let response = send_request(
             b"GET /api/v1/labels HTTP/1.1\r\nConnection: close\r\n\r\n",
             Some("secret-token"),
@@ -452,16 +432,12 @@ mod tests {
         assert_eq!(extract_status_code(&response), 401);
         let text = String::from_utf8_lossy(&response);
         assert!(text.contains("WWW-Authenticate: Bearer"));
-
-        // Request with correct auth should succeed
         let response = send_request(
             b"GET /api/v1/labels HTTP/1.1\r\nAuthorization: Bearer secret-token\r\nConnection: close\r\n\r\n",
             Some("secret-token"),
         )
         .await;
         assert_eq!(extract_status_code(&response), 200);
-
-        // Request with wrong token should get 401
         let response = send_request(
             b"GET /api/v1/labels HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\nConnection: close\r\n\r\n",
             Some("secret-token"),
@@ -472,7 +448,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_skipped_for_health_probes() {
-        // /healthz should work without auth
         let response = send_request(
             b"GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n",
             Some("secret-token"),
@@ -480,7 +455,6 @@ mod tests {
         .await;
         assert_eq!(extract_status_code(&response), 200);
 
-        // /ready should work without auth
         let response = send_request(
             b"GET /ready HTTP/1.1\r\nConnection: close\r\n\r\n",
             Some("secret-token"),

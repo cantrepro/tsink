@@ -290,6 +290,7 @@ pub fn status_reason(code: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",

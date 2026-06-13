@@ -63,21 +63,21 @@ It stores time-series data in compressed chunks, persists immutable segment file
 
 ```toml
 [dependencies]
-tsink = "0.8.0"
+tsink = "0.8"
 ```
 
 Enable PromQL support:
 
 ```toml
 [dependencies]
-tsink = { version = "0.8.0", features = ["promql"] }
+tsink = { version = "0.8", features = ["promql"] }
 ```
 
 Enable async storage facade (dedicated worker threads, runtime-agnostic futures):
 
 ```toml
 [dependencies]
-tsink = { version = "0.8.0", features = ["async-storage"] }
+tsink = { version = "0.8", features = ["async-storage"] }
 ```
 
 ## Quick Start

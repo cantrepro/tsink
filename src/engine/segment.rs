@@ -217,6 +217,28 @@ impl SegmentWriter {
         let (series_bytes, postings, series_count) = build_series_file(registry, chunks_by_series)?;
         let postings_bytes = build_postings_file(&postings)?;
         let chunk_index_bytes = build_chunk_index_file(&mut chunk_index)?;
+        let manifest_files = [
+            ManifestFileEntry {
+                kind: FILE_KIND_CHUNKS,
+                file_len: chunks_bytes.len() as u64,
+                hash64: hash64(&chunks_bytes),
+            },
+            ManifestFileEntry {
+                kind: FILE_KIND_CHUNK_INDEX,
+                file_len: chunk_index_bytes.len() as u64,
+                hash64: hash64(&chunk_index_bytes),
+            },
+            ManifestFileEntry {
+                kind: FILE_KIND_SERIES,
+                file_len: series_bytes.len() as u64,
+                hash64: hash64(&series_bytes),
+            },
+            ManifestFileEntry {
+                kind: FILE_KIND_POSTINGS,
+                file_len: postings_bytes.len() as u64,
+                hash64: hash64(&postings_bytes),
+            },
+        ];
 
         let data_files = [
             (&self.staging_layout.chunks_path, chunks_bytes),
@@ -244,7 +266,7 @@ impl SegmentWriter {
             wal_highwater,
         };
 
-        let manifest_bytes = build_manifest_file(&self.staging_layout, &manifest)?;
+        let manifest_bytes = build_manifest_file(&manifest, manifest_files)?;
         write_tmp_and_sync(&self.staging_layout.manifest_path, &manifest_bytes)?;
         rename_tmp(&self.staging_layout.manifest_path)?;
 
@@ -762,16 +784,22 @@ fn build_chunks_and_index(
             continue;
         };
 
-        let mut ordered = chunks.clone();
-        ordered.sort_by(|a, b| {
-            (a.header.min_ts, a.header.max_ts, a.header.point_count).cmp(&(
-                b.header.min_ts,
-                b.header.max_ts,
-                b.header.point_count,
-            ))
+        let mut ordered_indices = (0..chunks.len()).collect::<Vec<_>>();
+        ordered_indices.sort_by(|&a, &b| {
+            (
+                chunks[a].header.min_ts,
+                chunks[a].header.max_ts,
+                chunks[a].header.point_count,
+            )
+                .cmp(&(
+                    chunks[b].header.min_ts,
+                    chunks[b].header.max_ts,
+                    chunks[b].header.point_count,
+                ))
         });
 
-        for chunk in ordered {
+        for chunk_idx in ordered_indices {
+            let chunk = &chunks[chunk_idx];
             if chunk.encoded_payload.is_empty() {
                 return Err(TsinkError::DataCorruption(
                     "chunk payload is empty during segment write".to_string(),
@@ -785,7 +813,7 @@ fn build_chunks_and_index(
 
             let offset = bytes.len() as u64;
             let record_start = bytes.len();
-            append_chunk_record(&mut bytes, &chunk)?;
+            append_chunk_record(&mut bytes, chunk)?;
             let record_len =
                 u32::try_from(bytes.len().saturating_sub(record_start)).map_err(|_| {
                     TsinkError::InvalidConfiguration(
@@ -1091,35 +1119,10 @@ where
     out
 }
 
-fn build_manifest_file(layout: &SegmentLayout, manifest: &SegmentManifest) -> Result<Vec<u8>> {
-    let chunks_bytes = fs::read(&layout.chunks_path)?;
-    let chunk_index_bytes = fs::read(&layout.chunk_index_path)?;
-    let series_bytes = fs::read(&layout.series_path)?;
-    let postings_bytes = fs::read(&layout.postings_path)?;
-
-    let file_entries = [
-        ManifestFileEntry {
-            kind: FILE_KIND_CHUNKS,
-            file_len: chunks_bytes.len() as u64,
-            hash64: hash64(&chunks_bytes),
-        },
-        ManifestFileEntry {
-            kind: FILE_KIND_CHUNK_INDEX,
-            file_len: chunk_index_bytes.len() as u64,
-            hash64: hash64(&chunk_index_bytes),
-        },
-        ManifestFileEntry {
-            kind: FILE_KIND_SERIES,
-            file_len: series_bytes.len() as u64,
-            hash64: hash64(&series_bytes),
-        },
-        ManifestFileEntry {
-            kind: FILE_KIND_POSTINGS,
-            file_len: postings_bytes.len() as u64,
-            hash64: hash64(&postings_bytes),
-        },
-    ];
-
+fn build_manifest_file(
+    manifest: &SegmentManifest,
+    file_entries: [ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT as usize],
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&MANIFEST_MAGIC);
     bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());

@@ -27,6 +27,11 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    if matches!(first.as_deref(), Some("-V" | "--version")) {
+        println!("tsink-server {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mode = first.unwrap_or_else(|| "server".to_string());
     if mode != "server" {
         return Err(format!("unknown mode '{mode}'. Run with --help for usage."));
@@ -173,8 +178,6 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     if value.is_empty() {
         return Err("empty duration value".to_string());
     }
-
-    // Try pure numeric (seconds)
     if let Ok(secs) = value.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
     }
@@ -214,8 +217,6 @@ fn parse_byte_size(value: &str) -> Result<usize, String> {
     if value.is_empty() {
         return Err("empty byte size value".to_string());
     }
-
-    // Try pure numeric
     if let Ok(bytes) = value.parse::<usize>() {
         return Ok(bytes);
     }
@@ -250,6 +251,9 @@ fn print_usage() {
     println!(
         "Usage:
   tsink-server server [OPTIONS]
+
+General:
+  -V, --version                     Print version and exit
 
 Server options:
   --listen <ADDR>                   Bind address (default: 127.0.0.1:9201)

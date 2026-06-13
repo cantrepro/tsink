@@ -1,12 +1,14 @@
 [package]
 name = "tsink-server"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
-publish = false
 description = "Server mode for tsink with Prometheus remote read/write wire compatibility"
+repository = "https://github.com/h2337/tsink"
+homepage = "https://github.com/h2337/tsink"
+license = "MIT"
 
 [dependencies]
-tsink = { path = "../..", features = ["promql"] }
+tsink = { version = "0.8.1", path = "../..", features = ["promql"] }
 prost = "0.13"
 regex = "1.11"
 snap = "1.1"

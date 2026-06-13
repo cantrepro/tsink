@@ -1,6 +1,6 @@
 [package]
 name = "tsink"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 authors = ["h2337"]
 description = "A lightweight embedded time-series database with a straightforward API"
@@ -12,7 +12,7 @@ categories = ["database", "embedded", "data-structures"]
 readme = "README.md"
 
 [workspace]
-members = [".", "crates/tsink-server"]
+members = [".", "crates/tsink-server", "crates/tsink-uniffi"]
 resolver = "2"
 
 [dependencies]

@@ -20,6 +20,31 @@ enum ValueFamily {
     Blob,
 }
 
+trait EncodablePoint {
+    fn ts(&self) -> i64;
+    fn value(&self) -> &Value;
+}
+
+impl EncodablePoint for DataPoint {
+    fn ts(&self) -> i64 {
+        self.timestamp
+    }
+
+    fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+impl EncodablePoint for ChunkPoint {
+    fn ts(&self) -> i64 {
+        self.ts
+    }
+
+    fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
 pub struct Encoder;
 
 impl Encoder {
@@ -35,17 +60,8 @@ impl Encoder {
     }
 
     pub fn choose_codecs(points: &[DataPoint]) -> Result<(TimestampCodecId, ValueCodecId)> {
-        let chunk_points = points
-            .iter()
-            .map(|point| ChunkPoint {
-                ts: point.timestamp,
-                value: point.value.clone(),
-            })
-            .collect::<Vec<_>>();
-
         let lane = Self::choose_lane(points);
-        let encoded = Self::encode_chunk_points(&chunk_points, lane)?;
-        Ok((encoded.ts_codec, encoded.value_codec))
+        Self::choose_codecs_for_points(points, lane)
     }
 
     pub fn encode(points: &[DataPoint]) -> Result<EncodedChunk> {
@@ -56,15 +72,7 @@ impl Encoder {
         }
 
         let lane = Self::choose_lane(points);
-        let chunk_points = points
-            .iter()
-            .map(|point| ChunkPoint {
-                ts: point.timestamp,
-                value: point.value.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        Self::encode_chunk_points(&chunk_points, lane)
+        Self::encode_points(points, lane)
     }
 
     pub fn decode(encoded: &EncodedChunk) -> Result<Vec<DataPoint>> {
@@ -77,6 +85,30 @@ impl Encoder {
     }
 
     pub fn encode_chunk_points(points: &[ChunkPoint], lane: ValueLane) -> Result<EncodedChunk> {
+        Self::encode_points(points, lane)
+    }
+
+    pub fn validate_chunk_points(points: &[ChunkPoint], lane: ValueLane) -> Result<()> {
+        infer_value_family(points, lane)?;
+        Ok(())
+    }
+
+    fn choose_codecs_for_points<P: EncodablePoint>(
+        points: &[P],
+        lane: ValueLane,
+    ) -> Result<(TimestampCodecId, ValueCodecId)> {
+        if points.is_empty() {
+            return Err(TsinkError::InvalidConfiguration(
+                "cannot encode empty chunk".to_string(),
+            ));
+        }
+
+        let (ts_codec, _) = choose_best_timestamp_codec(points)?;
+        let (value_codec, _) = choose_best_value_codec(points, lane)?;
+        Ok((ts_codec, value_codec))
+    }
+
+    fn encode_points<P: EncodablePoint>(points: &[P], lane: ValueLane) -> Result<EncodedChunk> {
         if points.is_empty() {
             return Err(TsinkError::InvalidConfiguration(
                 "cannot encode empty chunk".to_string(),
@@ -99,11 +131,6 @@ impl Encoder {
             point_count: points.len(),
             payload,
         })
-    }
-
-    pub fn validate_chunk_points(points: &[ChunkPoint], lane: ValueLane) -> Result<()> {
-        infer_value_family(points, lane)?;
-        Ok(())
     }
 
     pub fn decode_chunk_points(encoded: &EncodedChunk) -> Result<Vec<ChunkPoint>> {
@@ -212,7 +239,9 @@ impl Encoder {
     }
 }
 
-fn choose_best_timestamp_codec(points: &[ChunkPoint]) -> Result<(TimestampCodecId, Vec<u8>)> {
+fn choose_best_timestamp_codec<P: EncodablePoint>(
+    points: &[P],
+) -> Result<(TimestampCodecId, Vec<u8>)> {
     let mut candidates = Vec::with_capacity(3);
 
     if let Some(payload) = encode_timestamps_fixed_step_rle(points)? {
@@ -232,8 +261,8 @@ fn choose_best_timestamp_codec(points: &[ChunkPoint]) -> Result<(TimestampCodecI
     choose_smallest(candidates)
 }
 
-fn choose_best_value_codec(
-    points: &[ChunkPoint],
+fn choose_best_value_codec<P: EncodablePoint>(
+    points: &[P],
     lane: ValueLane,
 ) -> Result<(ValueCodecId, Vec<u8>)> {
     let family = infer_value_family(points, lane)?;
@@ -287,14 +316,14 @@ fn choose_smallest<T>(mut candidates: Vec<(T, Vec<u8>)>) -> Result<(T, Vec<u8>)>
     Ok(candidates.swap_remove(0))
 }
 
-fn infer_value_family(points: &[ChunkPoint], lane: ValueLane) -> Result<ValueFamily> {
+fn infer_value_family<P: EncodablePoint>(points: &[P], lane: ValueLane) -> Result<ValueFamily> {
     let Some(first) = points.first() else {
         return Err(TsinkError::Codec(
             "cannot infer value family from empty chunk".to_string(),
         ));
     };
 
-    let first_family = match (&first.value, lane) {
+    let first_family = match (first.value(), lane) {
         (Value::F64(_), ValueLane::Numeric) => ValueFamily::F64,
         (Value::I64(_), ValueLane::Numeric) => ValueFamily::I64,
         (Value::U64(_), ValueLane::Numeric) => ValueFamily::U64,
@@ -316,7 +345,7 @@ fn infer_value_family(points: &[ChunkPoint], lane: ValueLane) -> Result<ValueFam
 
     for point in points.iter().skip(1) {
         let ok = matches!(
-            (&point.value, first_family),
+            (point.value(), first_family),
             (Value::F64(_), ValueFamily::F64)
                 | (Value::I64(_), ValueFamily::I64)
                 | (Value::U64(_), ValueFamily::U64)
@@ -335,7 +364,7 @@ fn infer_value_family(points: &[ChunkPoint], lane: ValueLane) -> Result<ValueFam
                     ValueFamily::Blob => "bytes/string",
                 }
                 .to_string(),
-                actual: point.value.kind().to_string(),
+                actual: point.value().kind().to_string(),
             });
         }
     }
@@ -343,13 +372,13 @@ fn infer_value_family(points: &[ChunkPoint], lane: ValueLane) -> Result<ValueFam
     Ok(first_family)
 }
 
-fn encode_timestamps_fixed_step_rle(points: &[ChunkPoint]) -> Result<Option<Vec<u8>>> {
+fn encode_timestamps_fixed_step_rle<P: EncodablePoint>(points: &[P]) -> Result<Option<Vec<u8>>> {
     let Some(first) = points.first() else {
         return Ok(None);
     };
-    let first_ts = first.ts;
+    let first_ts = first.ts();
     let step = if points.len() > 1 {
-        points[1].ts.checked_sub(points[0].ts).ok_or_else(|| {
+        points[1].ts().checked_sub(points[0].ts()).ok_or_else(|| {
             TsinkError::Codec(
                 "timestamp delta overflow while encoding fixed-step timestamps".to_string(),
             )
@@ -360,7 +389,7 @@ fn encode_timestamps_fixed_step_rle(points: &[ChunkPoint]) -> Result<Option<Vec<
 
     let mut is_fixed_step = true;
     for window in points.windows(2) {
-        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+        let delta = window[1].ts().checked_sub(window[0].ts()).ok_or_else(|| {
             TsinkError::Codec(
                 "timestamp delta overflow while encoding fixed-step timestamps".to_string(),
             )
@@ -381,15 +410,15 @@ fn encode_timestamps_fixed_step_rle(points: &[ChunkPoint]) -> Result<Option<Vec<
     }
 }
 
-fn encode_timestamps_delta_of_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_timestamps_delta_of_delta<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&points[0].ts.to_le_bytes());
+    out.extend_from_slice(&points[0].ts().to_le_bytes());
 
     if points.len() == 1 {
         return Ok(out);
     }
 
-    let mut prev_delta = points[1].ts.checked_sub(points[0].ts).ok_or_else(|| {
+    let mut prev_delta = points[1].ts().checked_sub(points[0].ts()).ok_or_else(|| {
         TsinkError::Codec(
             "timestamp delta overflow while encoding delta-of-delta timestamps".to_string(),
         )
@@ -397,7 +426,7 @@ fn encode_timestamps_delta_of_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     out.extend_from_slice(&prev_delta.to_le_bytes());
 
     for window in points.windows(2).skip(1) {
-        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+        let delta = window[1].ts().checked_sub(window[0].ts()).ok_or_else(|| {
             TsinkError::Codec(
                 "timestamp delta overflow while encoding delta-of-delta timestamps".to_string(),
             )
@@ -414,12 +443,12 @@ fn encode_timestamps_delta_of_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_timestamps_delta_varint(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_timestamps_delta_varint<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&points[0].ts.to_le_bytes());
+    out.extend_from_slice(&points[0].ts().to_le_bytes());
 
     for window in points.windows(2) {
-        let delta = window[1].ts.checked_sub(window[0].ts).ok_or_else(|| {
+        let delta = window[1].ts().checked_sub(window[0].ts()).ok_or_else(|| {
             TsinkError::Codec(
                 "timestamp delta overflow while encoding delta-varint timestamps".to_string(),
             )
@@ -568,28 +597,27 @@ fn decode_timestamps_delta_varint(payload: &[u8], point_count: usize) -> Result<
     Ok(out)
 }
 
-fn encode_values_constant_rle(points: &[ChunkPoint]) -> Option<Vec<u8>> {
-    let first = points.first()?.value.clone();
-    if points.iter().all(|point| point.value == first) {
-        encode_single_value(&first).ok()
+fn encode_values_constant_rle<P: EncodablePoint>(points: &[P]) -> Option<Vec<u8>> {
+    let first = points.first()?.value();
+    if points.iter().all(|point| point.value() == first) {
+        encode_single_value(first).ok()
     } else {
         None
     }
 }
 
-fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_values_f64_xor<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(points.len().saturating_mul(8));
     let mut prev = match points.first() {
-        Some(ChunkPoint {
-            value: Value::F64(v),
-            ..
-        }) => v.to_bits(),
-        Some(point) => {
-            return Err(TsinkError::ValueTypeMismatch {
-                expected: "f64".to_string(),
-                actual: point.value.kind().to_string(),
-            });
-        }
+        Some(point) => match point.value() {
+            Value::F64(v) => v.to_bits(),
+            value => {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: "f64".to_string(),
+                    actual: value.kind().to_string(),
+                });
+            }
+        },
         None => return Ok(out),
     };
 
@@ -605,10 +633,10 @@ fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     let mut has_prev_window = false;
 
     for point in points.iter().skip(1) {
-        let Value::F64(v) = &point.value else {
+        let Value::F64(v) = point.value() else {
             return Err(TsinkError::ValueTypeMismatch {
                 expected: "f64".to_string(),
-                actual: point.value.kind().to_string(),
+                actual: point.value().kind().to_string(),
             });
         };
 
@@ -650,19 +678,18 @@ fn encode_values_f64_xor(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_values_i64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_values_i64_delta<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let first = match points.first() {
-        Some(ChunkPoint {
-            value: Value::I64(v),
-            ..
-        }) => *v,
-        Some(point) => {
-            return Err(TsinkError::ValueTypeMismatch {
-                expected: "i64".to_string(),
-                actual: point.value.kind().to_string(),
-            });
-        }
+        Some(point) => match point.value() {
+            Value::I64(v) => *v,
+            value => {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: "i64".to_string(),
+                    actual: value.kind().to_string(),
+                });
+            }
+        },
         None => return Ok(out),
     };
 
@@ -670,10 +697,10 @@ fn encode_values_i64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     let mut prev = first;
 
     for point in points.iter().skip(1) {
-        let Value::I64(v) = point.value else {
+        let Value::I64(v) = point.value() else {
             return Err(TsinkError::ValueTypeMismatch {
                 expected: "i64".to_string(),
-                actual: point.value.kind().to_string(),
+                actual: point.value().kind().to_string(),
             });
         };
 
@@ -681,25 +708,24 @@ fn encode_values_i64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
             TsinkError::Codec("i64 delta overflow while encoding values".to_string())
         })?;
         encode_svarint(delta, &mut out);
-        prev = v;
+        prev = *v;
     }
 
     Ok(out)
 }
 
-fn encode_values_u64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_values_u64_delta<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let first = match points.first() {
-        Some(ChunkPoint {
-            value: Value::U64(v),
-            ..
-        }) => *v,
-        Some(point) => {
-            return Err(TsinkError::ValueTypeMismatch {
-                expected: "u64".to_string(),
-                actual: point.value.kind().to_string(),
-            });
-        }
+        Some(point) => match point.value() {
+            Value::U64(v) => *v,
+            value => {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: "u64".to_string(),
+                    actual: value.kind().to_string(),
+                });
+            }
+        },
         None => return Ok(out),
     };
 
@@ -707,34 +733,34 @@ fn encode_values_u64_delta(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     let mut prev = first;
 
     for point in points.iter().skip(1) {
-        let Value::U64(v) = point.value else {
+        let Value::U64(v) = point.value() else {
             return Err(TsinkError::ValueTypeMismatch {
                 expected: "u64".to_string(),
-                actual: point.value.kind().to_string(),
+                actual: point.value().kind().to_string(),
             });
         };
 
         // Encode deltas in wrapping u64 space so every valid transition is representable.
         let delta = v.wrapping_sub(prev) as i64;
         encode_svarint(delta, &mut out);
-        prev = v;
+        prev = *v;
     }
 
     Ok(out)
 }
 
-fn encode_values_bool_bitpack(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_values_bool_bitpack<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = vec![0u8; points.len().div_ceil(8)];
 
     for (idx, point) in points.iter().enumerate() {
-        let Value::Bool(v) = point.value else {
+        let Value::Bool(v) = point.value() else {
             return Err(TsinkError::ValueTypeMismatch {
                 expected: "bool".to_string(),
-                actual: point.value.kind().to_string(),
+                actual: point.value().kind().to_string(),
             });
         };
 
-        if v {
+        if *v {
             let byte_idx = idx / 8;
             let bit_idx = idx % 8;
             out[byte_idx] |= 1 << bit_idx;
@@ -744,11 +770,11 @@ fn encode_values_bool_bitpack(points: &[ChunkPoint]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_values_blob_delta_block(points: &[ChunkPoint]) -> Result<Vec<u8>> {
+fn encode_values_blob_delta_block<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
 
     for point in points {
-        match &point.value {
+        match point.value() {
             Value::Bytes(bytes) => {
                 out.push(5);
                 encode_uvarint(bytes.len() as u64, &mut out);
