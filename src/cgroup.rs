@@ -25,9 +25,10 @@ pub fn available_cpus() -> usize {
 fn detect_cpu_quota() -> usize {
     // Check if we should use environment variable
     if let Ok(val) = std::env::var("GOMAXPROCS")
-        && let Ok(n) = val.parse::<usize>() {
-            return n;
-        }
+        && let Ok(n) = val.parse::<usize>()
+    {
+        return n;
+    }
 
     // Try to get CPU quota from cgroup
     if let Some(quota) = get_cpu_quota() {
@@ -108,9 +109,9 @@ fn count_cpu_ranges(data: &str) -> usize {
             if bounds.len() == 2
                 && let (Ok(start), Ok(end)) =
                     (bounds[0].parse::<usize>(), bounds[1].parse::<usize>())
-                {
-                    count += end - start + 1;
-                }
+            {
+                count += end - start + 1;
+            }
         } else if part.parse::<usize>().is_ok() {
             count += 1;
         }

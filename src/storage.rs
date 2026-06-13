@@ -260,19 +260,20 @@ impl StorageImpl {
             let path = entry.path();
 
             if path.is_dir()
-                && let Some(name) = path.file_name() {
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with("p-") {
-                        match DiskPartition::open(&path, self.retention) {
-                            Ok(partition) => {
-                                partitions.push(Arc::new(partition) as SharedPartition);
-                            }
-                            Err(TsinkError::NoDataPoints { .. }) => continue,
-                            Err(TsinkError::InvalidPartition { .. }) => continue,
-                            Err(e) => return Err(e),
+                && let Some(name) = path.file_name()
+            {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("p-") {
+                    match DiskPartition::open(&path, self.retention) {
+                        Ok(partition) => {
+                            partitions.push(Arc::new(partition) as SharedPartition);
                         }
+                        Err(TsinkError::NoDataPoints { .. }) => continue,
+                        Err(TsinkError::InvalidPartition { .. }) => continue,
+                        Err(e) => return Err(e),
                     }
                 }
+            }
         }
 
         // Sort by min timestamp and insert into list
@@ -307,9 +308,10 @@ impl StorageImpl {
 
     fn ensure_active_head(&self) -> Result<()> {
         if let Some(head) = self.partition_list.get_head()
-            && head.active() {
-                return Ok(());
-            }
+            && head.active()
+        {
+            return Ok(());
+        }
 
         // Need to create a new partition
         self.new_partition(None)?;

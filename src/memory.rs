@@ -147,10 +147,9 @@ impl crate::partition::Partition for MemoryPartition {
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
 
-        if is_first_insert
-            && let Some(min) = rows.iter().map(|r| r.data_point.timestamp).min() {
-                self.min_t.store(min, Ordering::SeqCst);
-            }
+        if is_first_insert && let Some(min) = rows.iter().map(|r| r.data_point.timestamp).min() {
+            self.min_t.store(min, Ordering::SeqCst);
+        }
 
         let mut outdated_rows = Vec::new();
         let mut max_timestamp = rows[0].data_point.timestamp;

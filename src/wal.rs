@@ -100,9 +100,10 @@ impl DiskWal {
             for entry in entries {
                 if let Ok(entry) = entry
                     && let Some(name) = entry.file_name().to_str()
-                        && let Ok(index) = name.parse::<u32>() {
-                            max_index = max_index.max(index);
-                        }
+                    && let Ok(index) = name.parse::<u32>()
+                {
+                    max_index = max_index.max(index);
+                }
             }
         }
 
@@ -145,12 +146,13 @@ impl DiskWal {
             let path = entry.path();
 
             if path.is_file()
-                && let Some(name) = path.file_name() {
-                    // Check if it's a valid segment file (numeric name)
-                    if name.to_string_lossy().parse::<u32>().is_ok() {
-                        segments.push(path);
-                    }
+                && let Some(name) = path.file_name()
+            {
+                // Check if it's a valid segment file (numeric name)
+                if name.to_string_lossy().parse::<u32>().is_ok() {
+                    segments.push(path);
                 }
+            }
         }
 
         // Sort by numeric value
@@ -282,12 +284,13 @@ impl WalReader {
                 let path = entry.path();
 
                 if path.is_file()
-                    && let Some(name) = path.file_name() {
-                        // Check if it's a valid segment file (numeric name)
-                        if name.to_string_lossy().parse::<u32>().is_ok() {
-                            segments.push(path);
-                        }
+                    && let Some(name) = path.file_name()
+                {
+                    // Check if it's a valid segment file (numeric name)
+                    if name.to_string_lossy().parse::<u32>().is_ok() {
+                        segments.push(path);
                     }
+                }
             }
         }
 

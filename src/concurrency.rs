@@ -68,9 +68,9 @@ impl Semaphore {
                 .permits
                 .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-            {
-                return Some(SemaphoreGuard { semaphore: self });
-            }
+        {
+            return Some(SemaphoreGuard { semaphore: self });
+        }
         None
     }
 
