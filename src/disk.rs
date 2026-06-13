@@ -1,6 +1,6 @@
 //! Disk partition implementation.
 
-use crate::encoding::GorillaDecoder;
+use crate::encoding::{Gorilla64Decoder, MetricEncoding, PointDecoder};
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::mmap::PlatformMmap;
 use crate::time::{duration_to_units, now_in_precision};
@@ -34,6 +34,7 @@ pub struct DiskMetric {
     pub name: String,
     pub offset: u64,
     pub encoded_size: u64,
+    pub encoding: MetricEncoding,
     pub min_timestamp: i64,
     pub max_timestamp: i64,
     pub num_data_points: usize,
@@ -100,7 +101,6 @@ impl DiskPartition {
 
         let metric_data = &data_slice[offset..end_offset];
 
-        let mut decoder = GorillaDecoder::from_slice(metric_data);
         // Metadata can be corrupted; avoid preallocating attacker-controlled capacity.
         let mut points = Vec::new();
 
@@ -112,27 +112,56 @@ impl DiskPartition {
             )));
         }
 
-        // Must decode all points sequentially due to delta encoding
-        for (decoded_points, _) in (0..disk_metric.num_data_points).enumerate() {
-            let point = match decoder.decode_point() {
-                Ok(point) => point,
-                Err(TsinkError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Err(TsinkError::DataCorruption(format!(
-                        "truncated metric stream: expected {} points, decoded {}",
-                        disk_metric.num_data_points, decoded_points
-                    )));
+        match disk_metric.encoding {
+            MetricEncoding::Typed => {
+                let mut decoder = PointDecoder::from_slice(metric_data);
+                for (decoded_points, _) in (0..disk_metric.num_data_points).enumerate() {
+                    let point = match decoder.decode_point() {
+                        Ok(point) => point,
+                        Err(TsinkError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Err(TsinkError::DataCorruption(format!(
+                                "truncated metric stream: expected {} points, decoded {}",
+                                disk_metric.num_data_points, decoded_points
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    if point.timestamp < start {
+                        continue;
+                    }
+                    if point.timestamp >= end {
+                        break;
+                    }
+
+                    points.push(point);
                 }
-                Err(e) => return Err(e),
-            };
-
-            if point.timestamp < start {
-                continue;
             }
-            if point.timestamp >= end {
-                break;
-            }
+            gorilla_encoding => {
+                let mut decoder = Gorilla64Decoder::from_slice(metric_data);
+                for (decoded_points, _) in (0..disk_metric.num_data_points).enumerate() {
+                    let (timestamp, value_bits) = match decoder.decode_point() {
+                        Ok(decoded) => decoded,
+                        Err(TsinkError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Err(TsinkError::DataCorruption(format!(
+                                "truncated metric stream: expected {} points, decoded {}",
+                                disk_metric.num_data_points, decoded_points
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    };
 
-            points.push(point);
+                    if timestamp < start {
+                        continue;
+                    }
+                    if timestamp >= end {
+                        break;
+                    }
+
+                    let value = gorilla_encoding.bits_to_value(value_bits)?;
+                    points.push(DataPoint::new(timestamp, value));
+                }
+            }
         }
 
         Ok(points)
@@ -408,7 +437,7 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::GorillaEncoder;
+    use crate::encoding::PointEncoder;
     use crate::partition::Partition;
     use tempfile::TempDir;
 
@@ -417,7 +446,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let mut encoded = Vec::new();
-        let mut encoder = GorillaEncoder::new(&mut encoded);
+        let mut encoder = PointEncoder::new(&mut encoded);
         encoder.encode_point(&DataPoint::new(42, 1.23)).unwrap();
         encoder.flush().unwrap();
 
@@ -431,6 +460,7 @@ mod tests {
                 name: "cpu_usage".to_string(),
                 offset: 0,
                 encoded_size: encoded.len() as u64,
+                encoding: MetricEncoding::Typed,
                 min_timestamp: 42,
                 max_timestamp: 42,
                 num_data_points: usize::MAX,

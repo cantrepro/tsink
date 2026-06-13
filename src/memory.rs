@@ -1,7 +1,7 @@
 //! Memory partition implementation.
 
 use crate::disk::{DiskMetric, DiskPartition, PartitionMeta, encode_metric_key};
-use crate::encoding::GorillaEncoder;
+use crate::encoding::{Gorilla64Encoder, MetricEncoding, PointEncoder};
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::partition::{Partition, SharedPartition};
 use crate::time::{duration_to_units, now_in_precision};
@@ -150,9 +150,7 @@ impl MemoryPartition {
 
             let offset = data_file.stream_position()?;
 
-            let mut encoder = GorillaEncoder::new(&mut data_file);
-            metric.encode_all_points(&mut encoder)?;
-            encoder.flush()?;
+            let encoding = metric.encode_all_points(&mut data_file)?;
 
             let end = data_file.stream_position()?;
             let encoded_size = end.saturating_sub(offset);
@@ -166,6 +164,7 @@ impl MemoryPartition {
                     name: metric_name,
                     offset,
                     encoded_size,
+                    encoding,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
                     num_data_points: metric.size(),
@@ -462,9 +461,7 @@ impl crate::partition::Partition for MemoryPartition {
             let (name, metric) = entry.pair();
             let offset = data.len() as u64;
 
-            let mut encoder = GorillaEncoder::new(&mut data);
-            metric.encode_all_points(&mut encoder)?;
-            encoder.flush()?;
+            let encoding = metric.encode_all_points(&mut data)?;
 
             let encoded_size = (data.len() as u64).saturating_sub(offset);
 
@@ -476,6 +473,7 @@ impl crate::partition::Partition for MemoryPartition {
                     name: metric_name,
                     offset,
                     encoded_size,
+                    encoding,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
                     num_data_points: metric.size(),
@@ -542,6 +540,7 @@ impl MemoryMetric {
     }
 
     fn insert_point(&self, point: DataPoint) {
+        let timestamp = point.timestamp;
         let is_first = self.size.load(Ordering::Acquire) == 0;
 
         if is_first {
@@ -550,8 +549,8 @@ impl MemoryMetric {
 
             if self.size.load(Ordering::Acquire) == 0 {
                 points.push(point);
-                self.min_timestamp.store(point.timestamp, Ordering::Release);
-                self.max_timestamp.store(point.timestamp, Ordering::Release);
+                self.min_timestamp.store(timestamp, Ordering::Release);
+                self.max_timestamp.store(timestamp, Ordering::Release);
                 self.size.store(1, Ordering::Release);
                 return;
             }
@@ -560,10 +559,10 @@ impl MemoryMetric {
 
         // Use upgradeable read lock to avoid lock thrashing
         let points = self.points.upgradable_read();
-        if !points.is_empty() && points[points.len() - 1].timestamp < point.timestamp {
+        if !points.is_empty() && points[points.len() - 1].timestamp < timestamp {
             let mut points = parking_lot::RwLockUpgradableReadGuard::upgrade(points);
             points.push(point);
-            self.max_timestamp.store(point.timestamp, Ordering::SeqCst);
+            self.max_timestamp.store(timestamp, Ordering::SeqCst);
             self.size.fetch_add(1, Ordering::SeqCst);
         } else {
             drop(points);
@@ -573,11 +572,11 @@ impl MemoryMetric {
 
             let current_min = self.min_timestamp.load(Ordering::SeqCst);
             let current_max = self.max_timestamp.load(Ordering::SeqCst);
-            if point.timestamp < current_min {
-                self.min_timestamp.store(point.timestamp, Ordering::SeqCst);
+            if timestamp < current_min {
+                self.min_timestamp.store(timestamp, Ordering::SeqCst);
             }
-            if point.timestamp > current_max {
-                self.max_timestamp.store(point.timestamp, Ordering::SeqCst);
+            if timestamp > current_max {
+                self.max_timestamp.store(timestamp, Ordering::SeqCst);
             }
         }
     }
@@ -611,10 +610,10 @@ impl MemoryMetric {
 
         while i < points.len() && j < incoming.len() {
             if points[i].timestamp <= incoming[j].timestamp {
-                merged.push(points[i]);
+                merged.push(points[i].clone());
                 i += 1;
             } else {
-                merged.push(incoming[j]);
+                merged.push(incoming[j].clone());
                 j += 1;
             }
         }
@@ -647,15 +646,29 @@ impl MemoryMetric {
         }
     }
 
-    fn encode_all_points<W: Write>(&self, encoder: &mut GorillaEncoder<W>) -> Result<()> {
+    fn encode_all_points<W: Write>(&self, writer: &mut W) -> Result<MetricEncoding> {
         self.merge_out_of_order_points();
 
         let points = self.points.read();
+
+        let encoding = MetricEncoding::infer_from_points(&points);
+        if encoding.is_gorilla() {
+            let mut encoder = Gorilla64Encoder::new(writer);
+            for point in points.iter() {
+                let value_bits = encoding.value_to_bits(&point.value)?;
+                encoder.encode_point(point.timestamp, value_bits)?;
+            }
+            encoder.flush()?;
+            return Ok(encoding);
+        }
+
+        let mut encoder = PointEncoder::new(writer);
         for point in points.iter() {
             encoder.encode_point(point)?;
         }
+        encoder.flush()?;
 
-        Ok(())
+        Ok(MetricEncoding::Typed)
     }
 
     fn min_timestamp(&self) -> i64 {

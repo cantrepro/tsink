@@ -15,6 +15,7 @@ pub mod mmap;
 pub mod partition;
 pub mod storage;
 pub(crate) mod time;
+pub mod value;
 pub mod wal;
 
 pub use error::{Result, TsinkError};
@@ -23,24 +24,38 @@ pub use storage::{
     Aggregation, DownsampleOptions, MetricSeries, QueryOptions, Storage, StorageBuilder,
     TimestampPrecision,
 };
+pub use value::{Aggregator, BytesAggregation, Codec, CodecAggregator, Value};
 pub use wal::WalSyncMode;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Represents a data point, the smallest unit of time series data.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataPoint {
     /// The actual value.
-    pub value: f64,
+    pub value: Value,
     /// Unix timestamp.
     pub timestamp: i64,
 }
 
 impl DataPoint {
     /// Creates a new DataPoint.
-    pub fn new(timestamp: i64, value: f64) -> Self {
-        Self { timestamp, value }
+    pub fn new(timestamp: i64, value: impl Into<Value>) -> Self {
+        Self {
+            timestamp,
+            value: value.into(),
+        }
+    }
+
+    /// Returns the value as f64 when numeric.
+    pub fn value_as_f64(&self) -> Option<f64> {
+        self.value.as_f64()
+    }
+
+    /// Returns the value as a borrowed byte slice for raw payloads.
+    pub fn value_as_bytes(&self) -> Option<&[u8]> {
+        self.value.as_bytes()
     }
 }
 
@@ -90,7 +105,7 @@ impl Row {
 
     /// Gets the data point.
     pub fn data_point(&self) -> DataPoint {
-        self.data_point
+        self.data_point.clone()
     }
 
     /// Sets the metric name.

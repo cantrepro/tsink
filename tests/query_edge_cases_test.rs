@@ -100,9 +100,15 @@ fn test_query_with_nan_and_infinity() {
     let points = storage.select("special", &[], 1, 1000).unwrap();
     assert_eq!(points.len(), 5);
 
-    assert!(points[0].value.is_nan());
-    assert!(points[1].value.is_infinite() && points[1].value > 0.0);
-    assert!(points[2].value.is_infinite() && points[2].value < 0.0);
+    assert!(points[0].value_as_f64().unwrap_or(f64::NAN).is_nan());
+    assert!(
+        points[1].value_as_f64().unwrap_or(f64::NAN).is_infinite()
+            && points[1].value_as_f64().unwrap_or(f64::NAN) > 0.0
+    );
+    assert!(
+        points[2].value_as_f64().unwrap_or(f64::NAN).is_infinite()
+            && points[2].value_as_f64().unwrap_or(f64::NAN) < 0.0
+    );
 }
 
 #[test]

@@ -6,7 +6,10 @@ use crate::list::PartitionList;
 use crate::memory::MemoryPartition;
 use crate::partition::SharedPartition;
 use crate::wal::{DiskWal, NopWal, Wal, WalReader, WalSyncMode};
-use crate::{DataPoint, Label, Result, Row, TsinkError};
+use crate::{
+    Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
+    Result, Row, TsinkError, Value,
+};
 use crossbeam_channel::{Sender, bounded};
 use std::collections::BTreeSet;
 use std::fs;
@@ -320,13 +323,14 @@ pub struct DownsampleOptions {
 }
 
 /// Options to customize queries (aggregation, downsampling, pagination).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct QueryOptions {
     pub labels: Vec<Label>,
     pub start: i64,
     pub end: i64,
     pub aggregation: Aggregation,
     pub downsample: Option<DownsampleOptions>,
+    pub custom_aggregation: Option<Arc<dyn BytesAggregation>>,
     pub limit: Option<usize>,
     pub offset: usize,
 }
@@ -340,6 +344,7 @@ impl QueryOptions {
             end,
             aggregation: Aggregation::None,
             downsample: None,
+            custom_aggregation: None,
             limit: None,
             offset: 0,
         }
@@ -368,6 +373,16 @@ impl QueryOptions {
     /// Apply aggregation without downsampling (reduces the whole series to one point).
     pub fn with_aggregation(mut self, aggregation: Aggregation) -> Self {
         self.aggregation = aggregation;
+        self
+    }
+
+    /// Apply a custom bytes aggregation by providing a codec and typed aggregator.
+    pub fn with_custom_bytes_aggregation<C, A>(mut self, codec: C, aggregator: A) -> Self
+    where
+        C: Codec + 'static,
+        A: TypedAggregator<C::Item> + 'static,
+    {
+        self.custom_aggregation = Some(Arc::new(CodecAggregator::new(codec, aggregator)));
         self
     }
 }
@@ -1096,16 +1111,31 @@ impl Storage for StorageImpl {
             _ => opts.aggregation,
         };
 
-        let mut processed = if let Some(downsample) = opts.downsample {
+        let mut processed = if let Some(custom) = opts.custom_aggregation {
+            if let Some(downsample) = opts.downsample {
+                downsample_points_with_custom(
+                    &points,
+                    downsample.interval,
+                    custom.as_ref(),
+                    opts.start,
+                    opts.end,
+                )?
+            } else {
+                custom
+                    .aggregate_series(&points)?
+                    .into_iter()
+                    .collect::<Vec<DataPoint>>()
+            }
+        } else if let Some(downsample) = opts.downsample {
             downsample_points(
                 &points,
                 downsample.interval,
                 aggregation,
                 opts.start,
                 opts.end,
-            )
+            )?
         } else if aggregation != Aggregation::None {
-            aggregate_series(&points, aggregation)
+            aggregate_series(&points, aggregation)?
                 .into_iter()
                 .collect::<Vec<DataPoint>>()
         } else {
@@ -1251,187 +1281,433 @@ impl Drop for StorageImpl {
     }
 }
 
-fn min_non_nan_point(points: &[DataPoint]) -> Option<DataPoint> {
-    let mut best: Option<DataPoint> = None;
-    for point in points.iter().copied() {
-        if point.value.is_nan() {
-            continue;
-        }
-        match best {
-            Some(current) if point.value.total_cmp(&current.value).is_lt() => best = Some(point),
-            None => best = Some(point),
-            _ => {}
-        }
-    }
-    best
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericDomain {
+    F64,
+    I64,
+    U64,
+    Mixed,
 }
 
-fn max_non_nan_point(points: &[DataPoint]) -> Option<DataPoint> {
-    let mut best: Option<DataPoint> = None;
-    for point in points.iter().copied() {
-        if point.value.is_nan() {
-            continue;
-        }
-        match best {
-            Some(current) if point.value.total_cmp(&current.value).is_gt() => best = Some(point),
-            None => best = Some(point),
-            _ => {}
-        }
+fn aggregation_name(aggregation: Aggregation) -> &'static str {
+    match aggregation {
+        Aggregation::None => "none",
+        Aggregation::Sum => "sum",
+        Aggregation::Min => "min",
+        Aggregation::Max => "max",
+        Aggregation::Avg => "avg",
+        Aggregation::First => "first",
+        Aggregation::Last => "last",
+        Aggregation::Count => "count",
+        Aggregation::Median => "median",
+        Aggregation::Range => "range",
+        Aggregation::Variance => "variance",
+        Aggregation::StdDev => "stddev",
     }
-    best
 }
 
-fn sum_and_count_non_nan(points: &[DataPoint]) -> Option<(f64, usize)> {
-    let mut sum = 0.0;
-    let mut count = 0usize;
+fn is_nan_f64(value: &Value) -> bool {
+    matches!(value, Value::F64(v) if v.is_nan())
+}
+
+fn numeric_domain(points: &[DataPoint], aggregation: Aggregation) -> Result<Option<NumericDomain>> {
+    let mut has_f64 = false;
+    let mut has_i64 = false;
+    let mut has_u64 = false;
+
     for point in points {
-        if point.value.is_nan() {
-            continue;
+        match &point.value {
+            Value::F64(v) => {
+                if !v.is_nan() {
+                    has_f64 = true;
+                }
+            }
+            Value::I64(_) => has_i64 = true,
+            Value::U64(_) => has_u64 = true,
+            _ => {
+                return Err(TsinkError::UnsupportedAggregation {
+                    aggregation: aggregation_name(aggregation).to_string(),
+                    value_type: point.value.kind().to_string(),
+                });
+            }
         }
-        sum += point.value;
-        count += 1;
     }
-    if count == 0 { None } else { Some((sum, count)) }
+
+    let count = has_f64 as u8 + has_i64 as u8 + has_u64 as u8;
+    if count == 0 {
+        Ok(None)
+    } else if count > 1 {
+        Ok(Some(NumericDomain::Mixed))
+    } else if has_f64 {
+        Ok(Some(NumericDomain::F64))
+    } else if has_i64 {
+        Ok(Some(NumericDomain::I64))
+    } else {
+        Ok(Some(NumericDomain::U64))
+    }
 }
 
-fn median_non_nan(points: &[DataPoint]) -> Option<f64> {
-    let mut values: Vec<f64> = points
-        .iter()
-        .filter_map(|point| {
-            if point.value.is_nan() {
-                None
-            } else {
-                Some(point.value)
+fn numeric_values_f64(points: &[DataPoint], aggregation: Aggregation) -> Result<Vec<f64>> {
+    let mut values = Vec::with_capacity(points.len());
+    for point in points {
+        match &point.value {
+            Value::F64(v) if v.is_nan() => {}
+            Value::F64(v) => values.push(*v),
+            Value::I64(v) => values.push(*v as f64),
+            Value::U64(v) => values.push(*v as f64),
+            _ => {
+                return Err(TsinkError::UnsupportedAggregation {
+                    aggregation: aggregation_name(aggregation).to_string(),
+                    value_type: point.value.kind().to_string(),
+                });
             }
-        })
-        .collect();
+        }
+    }
+    Ok(values)
+}
 
+fn value_cmp(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (Value::F64(a), Value::F64(b)) => Ok(a.total_cmp(b)),
+        (Value::F64(a), Value::I64(b)) => Ok(a.total_cmp(&(*b as f64))),
+        (Value::F64(a), Value::U64(b)) => Ok(a.total_cmp(&(*b as f64))),
+        (Value::I64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
+        (Value::I64(a), Value::I64(b)) => Ok(a.cmp(b)),
+        (Value::I64(a), Value::U64(b)) => Ok((*a as f64).total_cmp(&(*b as f64))),
+        (Value::U64(a), Value::F64(b)) => Ok((*a as f64).total_cmp(b)),
+        (Value::U64(a), Value::I64(b)) => Ok((*a as f64).total_cmp(&(*b as f64))),
+        (Value::U64(a), Value::U64(b)) => Ok(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+        (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
+        (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+        _ => Err(TsinkError::ValueTypeMismatch {
+            expected: lhs.kind().to_string(),
+            actual: rhs.kind().to_string(),
+        }),
+    }
+}
+
+fn min_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
+    let mut best: Option<DataPoint> = None;
+    for point in points {
+        if is_nan_f64(&point.value) {
+            continue;
+        }
+
+        match &best {
+            Some(current) if value_cmp(&point.value, &current.value)?.is_lt() => {
+                best = Some(point.clone())
+            }
+            None => best = Some(point.clone()),
+            _ => {}
+        }
+    }
+    Ok(best)
+}
+
+fn max_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
+    let mut best: Option<DataPoint> = None;
+    for point in points {
+        if is_nan_f64(&point.value) {
+            continue;
+        }
+
+        match &best {
+            Some(current) if value_cmp(&point.value, &current.value)?.is_gt() => {
+                best = Some(point.clone())
+            }
+            None => best = Some(point.clone()),
+            _ => {}
+        }
+    }
+    Ok(best)
+}
+
+fn sum_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let Some(domain) = numeric_domain(points, Aggregation::Sum)? else {
+        return Ok(None);
+    };
+
+    let value = match domain {
+        NumericDomain::F64 => {
+            let sum: f64 = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::F64(v) if !v.is_nan() => Some(*v),
+                    _ => None,
+                })
+                .sum();
+            Value::F64(sum)
+        }
+        NumericDomain::I64 => {
+            let sum = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::I64(v) => Some(*v as i128),
+                    _ => None,
+                })
+                .sum::<i128>()
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            Value::I64(sum)
+        }
+        NumericDomain::U64 => {
+            let sum = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::U64(v) => Some(*v as u128),
+                    _ => None,
+                })
+                .sum::<u128>()
+                .min(u64::MAX as u128) as u64;
+            Value::U64(sum)
+        }
+        NumericDomain::Mixed => {
+            let sum: f64 = numeric_values_f64(points, Aggregation::Sum)?
+                .into_iter()
+                .sum();
+            Value::F64(sum)
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn average_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let values = numeric_values_f64(points, Aggregation::Avg)?;
     if values.is_empty() {
-        return None;
+        return Ok(None);
+    }
+    let sum: f64 = values.iter().sum();
+    Ok(Some(Value::F64(sum / values.len() as f64)))
+}
+
+fn median_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let mut values = numeric_values_f64(points, Aggregation::Median)?;
+    if values.is_empty() {
+        return Ok(None);
     }
 
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
-
-    if values.len() % 2 == 1 {
-        Some(values[mid])
+    let median = if values.len() % 2 == 1 {
+        values[mid]
     } else {
-        Some((values[mid - 1] + values[mid]) / 2.0)
+        (values[mid - 1] + values[mid]) / 2.0
+    };
+
+    Ok(Some(Value::F64(median)))
+}
+
+fn range_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let Some(domain) = numeric_domain(points, Aggregation::Range)? else {
+        return Ok(None);
+    };
+
+    let value = match domain {
+        NumericDomain::F64 => {
+            let values: Vec<f64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::F64(v) if !v.is_nan() => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values
+                .iter()
+                .copied()
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            let max = values
+                .iter()
+                .copied()
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            Value::F64(max - min)
+        }
+        NumericDomain::I64 => {
+            let values: Vec<i64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::I64(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values.iter().min().copied().unwrap() as i128;
+            let max = values.iter().max().copied().unwrap() as i128;
+            Value::I64((max - min).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
+        NumericDomain::U64 => {
+            let values: Vec<u64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::U64(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values.iter().min().copied().unwrap();
+            let max = values.iter().max().copied().unwrap();
+            Value::U64(max.saturating_sub(min))
+        }
+        NumericDomain::Mixed => {
+            let values = numeric_values_f64(points, Aggregation::Range)?;
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values
+                .iter()
+                .copied()
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            let max = values
+                .iter()
+                .copied()
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            Value::F64(max - min)
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn population_variance_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let values = numeric_values_f64(points, Aggregation::Variance)?;
+    if values.is_empty() {
+        return Ok(None);
     }
-}
 
-fn range_non_nan(points: &[DataPoint]) -> Option<f64> {
-    let min = min_non_nan_point(points)?.value;
-    let max = max_non_nan_point(points)?.value;
-    Some(max - min)
-}
-
-fn population_variance_non_nan(points: &[DataPoint]) -> Option<f64> {
     let mut count = 0.0f64;
     let mut mean = 0.0f64;
     let mut m2 = 0.0f64;
 
-    for point in points {
-        if point.value.is_nan() {
-            continue;
-        }
-
+    for value in values {
         count += 1.0;
-        let delta = point.value - mean;
+        let delta = value - mean;
         mean += delta / count;
-        let delta2 = point.value - mean;
+        let delta2 = value - mean;
         m2 += delta * delta2;
     }
 
-    if count == 0.0 { None } else { Some(m2 / count) }
+    Ok(Some(Value::F64(m2 / count)))
 }
 
-fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<DataPoint> {
+fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Result<Option<DataPoint>> {
     if points.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    match aggregation {
+    let last = points
+        .last()
+        .ok_or_else(|| TsinkError::Other("aggregation on empty series".to_string()))?;
+
+    let aggregated = match aggregation {
         Aggregation::None => None,
-        Aggregation::First => points.first().copied(),
-        Aggregation::Last => points.last().copied(),
+        Aggregation::First => return Ok(points.first().cloned()),
+        Aggregation::Last => return Ok(points.last().cloned()),
         Aggregation::Count => Some(DataPoint::new(
-            points.last().unwrap().timestamp,
-            points.iter().filter(|point| !point.value.is_nan()).count() as f64,
+            last.timestamp,
+            Value::U64(
+                points
+                    .iter()
+                    .filter(|point| !is_nan_f64(&point.value))
+                    .count() as u64,
+            ),
         )),
-        Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
-            .map(|(sum, count)| {
-                let value = if aggregation == Aggregation::Avg {
-                    sum / count as f64
-                } else {
-                    sum
-                };
-                DataPoint::new(points.last().unwrap().timestamp, value)
+        Aggregation::Sum => sum_numeric(points)?
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+        Aggregation::Avg => average_numeric(points)?
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+        Aggregation::Min => min_point(points)?.or_else(|| Some(last.clone())),
+        Aggregation::Max => max_point(points)?.or_else(|| Some(last.clone())),
+        Aggregation::Median => median_numeric(points)?
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+        Aggregation::Range => range_numeric(points)?
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+        Aggregation::Variance => population_variance_numeric(points)?
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+        Aggregation::StdDev => population_variance_numeric(points)?
+            .and_then(|value| match value {
+                Value::F64(v) => Some(Value::F64(v.sqrt())),
+                _ => None,
             })
-            .or_else(|| points.last().copied()),
-        Aggregation::Min => min_non_nan_point(points).or_else(|| points.last().copied()),
-        Aggregation::Max => max_non_nan_point(points).or_else(|| points.last().copied()),
-        Aggregation::Median => median_non_nan(points)
-            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
-            .or_else(|| points.last().copied()),
-        Aggregation::Range => range_non_nan(points)
-            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
-            .or_else(|| points.last().copied()),
-        Aggregation::Variance => population_variance_non_nan(points)
-            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value))
-            .or_else(|| points.last().copied()),
-        Aggregation::StdDev => population_variance_non_nan(points)
-            .map(|value| DataPoint::new(points.last().unwrap().timestamp, value.sqrt()))
-            .or_else(|| points.last().copied()),
-    }
+            .map(|value| DataPoint::new(last.timestamp, value))
+            .or_else(|| Some(last.clone())),
+    };
+
+    Ok(aggregated)
 }
 
 fn aggregate_bucket(
     points: &[DataPoint],
     aggregation: Aggregation,
     bucket_start: i64,
-) -> Option<DataPoint> {
+) -> Result<Option<DataPoint>> {
     if points.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    match aggregation {
+    let last = points
+        .last()
+        .ok_or_else(|| TsinkError::Other("aggregation on empty bucket".to_string()))?;
+
+    let aggregated = match aggregation {
         Aggregation::None => None,
-        Aggregation::First => points.first().copied(),
-        Aggregation::Last => points.last().copied(),
+        Aggregation::First => return Ok(points.first().cloned()),
+        Aggregation::Last => return Ok(points.last().cloned()),
         Aggregation::Count => Some(DataPoint::new(
             bucket_start,
-            points.iter().filter(|point| !point.value.is_nan()).count() as f64,
+            Value::U64(
+                points
+                    .iter()
+                    .filter(|point| !is_nan_f64(&point.value))
+                    .count() as u64,
+            ),
         )),
-        Aggregation::Sum | Aggregation::Avg => sum_and_count_non_nan(points)
-            .map(|(sum, count)| {
-                let value = if aggregation == Aggregation::Avg {
-                    sum / count as f64
-                } else {
-                    sum
-                };
-                DataPoint::new(bucket_start, value)
+        Aggregation::Sum => sum_numeric(points)?
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Avg => average_numeric(points)?
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Min => min_point(points)?
+            .map(|point| DataPoint::new(bucket_start, point.value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Max => max_point(points)?
+            .map(|point| DataPoint::new(bucket_start, point.value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Median => median_numeric(points)?
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Range => range_numeric(points)?
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::Variance => population_variance_numeric(points)?
+            .map(|value| DataPoint::new(bucket_start, value))
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+        Aggregation::StdDev => population_variance_numeric(points)?
+            .and_then(|value| match value {
+                Value::F64(v) => Some(Value::F64(v.sqrt())),
+                _ => None,
             })
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Min => min_non_nan_point(points)
-            .map(|p| DataPoint::new(bucket_start, p.value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Max => max_non_nan_point(points)
-            .map(|p| DataPoint::new(bucket_start, p.value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Median => median_non_nan(points)
             .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Range => range_non_nan(points)
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Variance => population_variance_non_nan(points)
-            .map(|value| DataPoint::new(bucket_start, value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::StdDev => population_variance_non_nan(points)
-            .map(|value| DataPoint::new(bucket_start, value.sqrt()))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-    }
+            .or_else(|| Some(DataPoint::new(bucket_start, last.value.clone()))),
+    };
+
+    Ok(aggregated)
 }
 
 fn downsample_points(
@@ -1440,9 +1716,9 @@ fn downsample_points(
     aggregation: Aggregation,
     start: i64,
     end: i64,
-) -> Vec<DataPoint> {
+) -> Result<Vec<DataPoint>> {
     if points.is_empty() || interval <= 0 || start >= end {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
@@ -1454,7 +1730,6 @@ fn downsample_points(
     let mut result = Vec::new();
     let mut idx = 0;
 
-    // Skip points that are outside the query window lower bound.
     while idx < points.len() && points[idx].timestamp < start {
         idx += 1;
     }
@@ -1476,12 +1751,61 @@ fn downsample_points(
             idx += 1;
         }
 
-        if let Some(dp) = aggregate_bucket(&points[bucket_begin..idx], aggregation, bucket_start) {
+        if let Some(dp) = aggregate_bucket(&points[bucket_begin..idx], aggregation, bucket_start)? {
             result.push(dp);
         }
     }
 
-    result
+    Ok(result)
+}
+
+fn downsample_points_with_custom(
+    points: &[DataPoint],
+    interval: i64,
+    aggregation: &dyn BytesAggregation,
+    start: i64,
+    end: i64,
+) -> Result<Vec<DataPoint>> {
+    if points.is_empty() || interval <= 0 || start >= end {
+        return Ok(Vec::new());
+    }
+
+    fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
+        let rel = ts as i128 - start as i128;
+        let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
+        bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
+    let mut result = Vec::new();
+    let mut idx = 0;
+
+    while idx < points.len() && points[idx].timestamp < start {
+        idx += 1;
+    }
+
+    while idx < points.len() {
+        if points[idx].timestamp >= end {
+            break;
+        }
+
+        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
+        let bucket_end = bucket_start.saturating_add(interval);
+        let bucket_begin = idx;
+
+        while idx < points.len() {
+            let ts = points[idx].timestamp;
+            if ts >= end || ts >= bucket_end {
+                break;
+            }
+            idx += 1;
+        }
+
+        if let Some(dp) = aggregation.aggregate_bucket(&points[bucket_begin..idx], bucket_start)? {
+            result.push(dp);
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1856,7 +2180,7 @@ mod tests {
             DataPoint::new(2_000_005, 3.0),
         ];
 
-        let result = downsample_points(&points, 1, Aggregation::Last, 0, 3_000_000);
+        let result = downsample_points(&points, 1, Aggregation::Last, 0, 3_000_000).unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], DataPoint::new(5, 1.0));

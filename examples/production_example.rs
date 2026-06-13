@@ -123,8 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(points) => {
                     let duration = start.elapsed();
                     if !points.is_empty() {
-                        let avg_value: f64 =
-                            points.iter().map(|p| p.value).sum::<f64>() / points.len() as f64;
+                        let avg_value: f64 = points
+                            .iter()
+                            .map(|p| p.value_as_f64().unwrap_or(f64::NAN))
+                            .sum::<f64>()
+                            / points.len() as f64;
                         info!(
                             "Query {} returned {} CPU data points, avg value: {:.2}, duration: {:?}",
                             iteration,
@@ -150,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let latest = points.last().unwrap();
                         info!(
                             "Latest memory usage for server-1: {:.2} MB",
-                            latest.value / 1024.0
+                            latest.value_as_f64().unwrap_or(f64::NAN) / 1024.0
                         );
                     }
                 }

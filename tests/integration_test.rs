@@ -27,9 +27,9 @@ fn test_basic_insert_and_select() {
 
     let points = storage.select("metric1", &[], 1000, 1003).unwrap();
     assert_eq!(points.len(), 3);
-    assert_eq!(points[0].value, 1.0);
-    assert_eq!(points[1].value, 2.0);
-    assert_eq!(points[2].value, 3.0);
+    assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 1.0);
+    assert_eq!(points[1].value_as_f64().unwrap_or(f64::NAN), 2.0);
+    assert_eq!(points[2].value_as_f64().unwrap_or(f64::NAN), 3.0);
 }
 
 #[test]
@@ -48,11 +48,11 @@ fn test_labeled_metrics() {
 
     let points1 = storage.select("cpu", &labels1, 999, 1001).unwrap();
     assert_eq!(points1.len(), 1);
-    assert_eq!(points1[0].value, 10.0);
+    assert_eq!(points1[0].value_as_f64().unwrap_or(f64::NAN), 10.0);
 
     let points2 = storage.select("cpu", &labels2, 999, 1001).unwrap();
     assert_eq!(points2.len(), 1);
-    assert_eq!(points2[0].value, 20.0);
+    assert_eq!(points2[0].value_as_f64().unwrap_or(f64::NAN), 20.0);
 }
 
 #[test]
@@ -128,8 +128,8 @@ fn test_persistence() {
 
         let points = storage.select("persistent_metric", &[], 999, 1002).unwrap();
         assert_eq!(points.len(), 2);
-        assert_eq!(points[0].value, 100.0);
-        assert_eq!(points[1].value, 101.0);
+        assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 100.0);
+        assert_eq!(points[1].value_as_f64().unwrap_or(f64::NAN), 101.0);
     }
 }
 
@@ -201,7 +201,7 @@ fn test_concurrent_writes() {
         .select("test_metric", &[], test_timestamp - 1, test_timestamp + 1)
         .unwrap();
     assert_eq!(test_points.len(), 1);
-    assert_eq!(test_points[0].value, 42.0);
+    assert_eq!(test_points[0].value_as_f64().unwrap_or(f64::NAN), 42.0);
 
     // Now test concurrent writes with a shared metric name
     let mut handles = vec![];
@@ -236,7 +236,10 @@ fn test_concurrent_writes() {
 
     assert_eq!(points.len(), 10, "Expected 10 points for concurrent_metric");
 
-    let mut values: Vec<f64> = points.iter().map(|p| p.value).collect();
+    let mut values: Vec<f64> = points
+        .iter()
+        .map(|p| p.value_as_f64().unwrap_or(f64::NAN))
+        .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let expected: Vec<f64> = (0..10).map(|i| i as f64).collect();
     assert_eq!(values, expected);
@@ -351,7 +354,7 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
     assert!(
         live_points
             .iter()
-            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+            .any(|p| p.timestamp == 3 && (p.value_as_f64().unwrap_or(f64::NAN) - 3.0).abs() < 1e-12),
         "newly inserted point should be present before close"
     );
     storage.close().unwrap();
@@ -368,7 +371,7 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
     assert!(
         points
             .iter()
-            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+            .any(|p| p.timestamp == 3 && (p.value_as_f64().unwrap_or(f64::NAN) - 3.0).abs() < 1e-12),
         "newly inserted point should survive close/reopen even with existing disk partitions"
     );
 }
@@ -609,7 +612,7 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
     let fresh = reopened.select("fresh_metric", &[], 0, 10).unwrap();
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].timestamp, 6);
-    assert!((fresh[0].value - 6.0).abs() < 1e-12);
+    assert!((fresh[0].value_as_f64().unwrap_or(f64::NAN) - 6.0).abs() < 1e-12);
 }
 
 #[test]
@@ -658,7 +661,7 @@ fn test_wal_buffer_size_zero_still_recovers() {
     let points = storage.select("zero_buf_wal", &[], 0, 10).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 1);
-    assert!((points[0].value - 1.0).abs() < 1e-12);
+    assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
 }
 
 #[test]
@@ -693,7 +696,7 @@ fn test_wal_sync_mode_can_be_switched() {
         let points = storage.select("sync_mode_metric", &[], 0, 10).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].timestamp, 1);
-        assert!((points[0].value - 1.0).abs() < 1e-12);
+        assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
     }
 }
 
@@ -801,6 +804,14 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
 
     let points = storage.select("collision_metric", &[], 0, 20).unwrap();
     assert_eq!(points.len(), 2);
-    assert!(points.iter().any(|p| (p.value - 1.0).abs() < 1e-12));
-    assert!(points.iter().any(|p| (p.value - 2.0).abs() < 1e-12));
+    assert!(
+        points
+            .iter()
+            .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12)
+    );
+    assert!(
+        points
+            .iter()
+            .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 2.0).abs() < 1e-12)
+    );
 }

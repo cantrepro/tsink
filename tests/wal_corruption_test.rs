@@ -26,7 +26,8 @@ fn wal_insert_record(metric: &str, timestamp: i64, value: f64) -> Vec<u8> {
     out.extend(encode_uvarint(metric_name.len() as u64));
     out.extend(metric_name);
     out.extend(encode_varint(timestamp));
-    out.extend(encode_uvarint(value.to_bits()));
+    out.push(0u8); // VALUE_TAG_F64
+    out.extend_from_slice(&value.to_bits().to_le_bytes());
     out
 }
 
@@ -217,7 +218,7 @@ fn test_wal_recovery_tolerates_more_than_one_failed_segment() {
     let points = storage.select("recoverable", &[], 0, 10).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 7);
-    assert!((points[0].value - 7.0).abs() < 1e-12);
+    assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 7.0).abs() < 1e-12);
 }
 
 #[test]

@@ -56,14 +56,14 @@ fn disk_wal_persists_rotates_and_recovers() {
     assert!(recovered.iter().any(|row| row.metric() == "wal_metric"
         && row.labels().is_empty()
         && row.data_point().timestamp == 1
-        && (row.data_point().value - 1.0).abs() < 1e-12));
+        && (row.data_point().value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12));
 
     let expected_label = vec![Label::new("host", "a")];
     assert!(recovered.iter().any(|row| {
         row.metric() == "wal_metric"
             && row.labels() == expected_label.as_slice()
             && row.data_point().timestamp == 2
-            && (row.data_point().value - 2.5).abs() < 1e-12
+            && (row.data_point().value_as_f64().unwrap_or(f64::NAN) - 2.5).abs() < 1e-12
     }));
 
     wal_trait.punctuate().unwrap();
@@ -107,7 +107,7 @@ fn disk_wal_flush_with_buffer_persists() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].metric(), "buffered_metric");
     assert_eq!(recovered[0].data_point().timestamp, 1);
-    assert!((recovered[0].data_point().value - 1.5).abs() < 1e-12);
+    assert!((recovered[0].data_point().value_as_f64().unwrap_or(f64::NAN) - 1.5).abs() < 1e-12);
 }
 
 #[test]
@@ -115,7 +115,8 @@ fn wal_reader_accepts_valid_short_segments() {
     let temp_dir = TempDir::new().unwrap();
     let segment = temp_dir.path().join("000001.wal");
 
-    fs::write(segment, vec![1, 3, 1, 0, b'a', 0, 0]).unwrap();
+    // op=insert, metric_len=3, metric_name=[1,0,'a'], ts=0, value=bool(false)
+    fs::write(segment, vec![1, 3, 1, 0, b'a', 0, 3, 0]).unwrap();
 
     let recovered = WalReader::new(temp_dir.path()).unwrap().read_all().unwrap();
     assert_eq!(recovered.len(), 1);

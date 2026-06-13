@@ -16,7 +16,7 @@ fn test_simple_insert() {
     println!("Found {} points", points.len());
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 1000);
-    assert_eq!(points[0].value, 1.0);
+    assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 1.0);
 }
 
 #[test]

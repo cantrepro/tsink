@@ -104,6 +104,18 @@ pub enum TsinkError {
     #[error("Data point with timestamp {timestamp} is outside the retention window")]
     OutOfRetention { timestamp: i64 },
 
+    #[error("Unsupported aggregation '{aggregation}' for value type '{value_type}'")]
+    UnsupportedAggregation {
+        aggregation: String,
+        value_type: String,
+    },
+
+    #[error("Value type mismatch: expected {expected}, found {actual}")]
+    ValueTypeMismatch { expected: String, actual: String },
+
+    #[error("Codec error: {0}")]
+    Codec(String),
+
     #[error("Other error: {0}")]
     Other(String),
 }

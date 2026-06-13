@@ -1,7 +1,7 @@
 //! Write-ahead log implementation.
 
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
-use crate::{DataPoint, Result, Row, TsinkError};
+use crate::{DataPoint, Result, Row, TsinkError, Value};
 use parking_lot::Mutex;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -71,6 +71,13 @@ impl Wal for NopWal {
 
 const WAL_SEGMENT_EXTENSION: &str = ".wal";
 const MAX_WAL_METRIC_NAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WAL_VALUE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const VALUE_TAG_F64: u8 = 0;
+const VALUE_TAG_I64: u8 = 1;
+const VALUE_TAG_U64: u8 = 2;
+const VALUE_TAG_BOOL: u8 = 3;
+const VALUE_TAG_BYTES: u8 = 4;
+const VALUE_TAG_STRING: u8 = 5;
 
 /// Sync policy for WAL durability/performance tradeoffs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,10 +282,7 @@ impl Wal for DiskWal {
                 let ts_size = encode_varint(row.data_point().timestamp, &mut ts_buf);
                 segment.writer.write_all(&ts_buf[..ts_size])?;
 
-                let value_bits = row.data_point().value.to_bits();
-                let mut val_buf = [0u8; 10];
-                let val_size = encode_uvarint(value_bits, &mut val_buf);
-                segment.writer.write_all(&val_buf[..val_size])?;
+                encode_value(&mut segment.writer, &row.data_point().value)?;
             }
 
             self.maybe_sync_after_append(&mut segment.writer)?;
@@ -519,7 +523,7 @@ impl WalReader {
         if decode_varint(reader).is_err() {
             return Ok(false);
         }
-        if decode_uvarint(reader).is_err() {
+        if decode_value(reader).is_err() {
             return Ok(false);
         }
 
@@ -670,8 +674,8 @@ impl WalReader {
                         }
                     };
 
-                    let value_bits = match decode_uvarint(&mut reader) {
-                        Ok(bits) => bits,
+                    let value = match decode_value(&mut reader) {
+                        Ok(value) => value,
                         Err(e) => {
                             if Self::handle_corrupted_entry(
                                 &mut reader,
@@ -679,14 +683,13 @@ impl WalReader {
                                 file_len,
                                 entry_start,
                                 &mut corrupted_entries,
-                                format!("failed to decode value bits: {e}"),
+                                format!("failed to decode value payload: {e}"),
                             )? {
                                 continue;
                             }
                             break;
                         }
                     };
-                    let value = f64::from_bits(value_bits);
 
                     self.rows_to_insert.push(Row {
                         metric,
@@ -707,6 +710,103 @@ impl WalOperation {
             1 => Some(WalOperation::Insert),
             _ => None,
         }
+    }
+}
+
+fn encode_value<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
+    match value {
+        Value::F64(v) => {
+            writer.write_all(&[VALUE_TAG_F64])?;
+            writer.write_all(&v.to_bits().to_le_bytes())?;
+        }
+        Value::I64(v) => {
+            writer.write_all(&[VALUE_TAG_I64])?;
+            let mut buf = [0u8; 10];
+            let len = encode_varint(*v, &mut buf);
+            writer.write_all(&buf[..len])?;
+        }
+        Value::U64(v) => {
+            writer.write_all(&[VALUE_TAG_U64])?;
+            let mut buf = [0u8; 10];
+            let len = encode_uvarint(*v, &mut buf);
+            writer.write_all(&buf[..len])?;
+        }
+        Value::Bool(v) => {
+            writer.write_all(&[VALUE_TAG_BOOL])?;
+            writer.write_all(&[*v as u8])?;
+        }
+        Value::Bytes(v) => {
+            writer.write_all(&[VALUE_TAG_BYTES])?;
+            let mut len_buf = [0u8; 10];
+            let len_size = encode_uvarint(v.len() as u64, &mut len_buf);
+            writer.write_all(&len_buf[..len_size])?;
+            writer.write_all(v)?;
+        }
+        Value::String(v) => {
+            writer.write_all(&[VALUE_TAG_STRING])?;
+            let mut len_buf = [0u8; 10];
+            let len_size = encode_uvarint(v.len() as u64, &mut len_buf);
+            writer.write_all(&len_buf[..len_size])?;
+            writer.write_all(v.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_value<R: Read>(reader: &mut R) -> Result<Value> {
+    fn decode_payload_len<R: Read>(reader: &mut R, kind: &str) -> Result<usize> {
+        let len_u64 = decode_uvarint(reader)?;
+        if len_u64 > MAX_WAL_VALUE_PAYLOAD_BYTES as u64 {
+            return Err(TsinkError::DataCorruption(format!(
+                "{kind} payload length {len_u64} exceeds maximum {MAX_WAL_VALUE_PAYLOAD_BYTES}"
+            )));
+        }
+
+        usize::try_from(len_u64).map_err(|_| {
+            TsinkError::DataCorruption(format!("{kind} payload length exceeds usize"))
+        })
+    }
+
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+
+    match tag[0] {
+        VALUE_TAG_F64 => {
+            let mut bytes = [0u8; 8];
+            reader.read_exact(&mut bytes)?;
+            Ok(Value::F64(f64::from_bits(u64::from_le_bytes(bytes))))
+        }
+        VALUE_TAG_I64 => Ok(Value::I64(decode_varint(reader)?)),
+        VALUE_TAG_U64 => Ok(Value::U64(decode_uvarint(reader)?)),
+        VALUE_TAG_BOOL => {
+            let mut raw = [0u8; 1];
+            reader.read_exact(&mut raw)?;
+            match raw[0] {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                other => Err(TsinkError::DataCorruption(format!(
+                    "invalid bool payload {other}"
+                ))),
+            }
+        }
+        VALUE_TAG_BYTES => {
+            let len = decode_payload_len(reader, "bytes")?;
+            let mut bytes = vec![0u8; len];
+            reader.read_exact(&mut bytes)?;
+            Ok(Value::Bytes(bytes))
+        }
+        VALUE_TAG_STRING => {
+            let len = decode_payload_len(reader, "string")?;
+            let mut bytes = vec![0u8; len];
+            reader.read_exact(&mut bytes)?;
+            let value = String::from_utf8(bytes).map_err(|e| {
+                TsinkError::DataCorruption(format!("invalid UTF-8 string payload: {e}"))
+            })?;
+            Ok(Value::String(value))
+        }
+        other => Err(TsinkError::DataCorruption(format!(
+            "unknown value tag {other}"
+        ))),
     }
 }
 
@@ -835,13 +935,100 @@ mod tests {
         let mut bytes = fs::read(&segment).unwrap();
         assert!(bytes.len() > 2);
 
-        // Corrupt first record length so recovery must scan for the next valid record.
-        bytes[1] = 0xFE;
+        // Corrupt all bytes before the second record so recovery must resync to it.
+        let recover_metric = marshal_metric_name("recover_me", &[]);
+        let metric_pos = bytes
+            .windows(recover_metric.len())
+            .position(|window| window == recover_metric.as_slice())
+            .expect("recover_me metric payload should exist");
+        let second_op = metric_pos
+            .checked_sub(2)
+            .expect("second record should contain opcode + metric length before metric bytes");
+        bytes[..second_op].fill(0xFF);
         fs::write(&segment, bytes).unwrap();
 
         let recovered = WalReader::new(&wal_dir).unwrap().read_all().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].metric(), "recover_me");
         assert_eq!(recovered[0].data_point(), DataPoint::new(2, 2.0));
+    }
+
+    #[test]
+    fn encode_decode_value_roundtrips_all_supported_types() {
+        let cases = vec![
+            Value::F64(1.25),
+            Value::I64(-42),
+            Value::U64(777),
+            Value::Bool(true),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::String("hello".to_string()),
+        ];
+
+        for value in cases {
+            let mut buf = Vec::new();
+            encode_value(&mut buf, &value).unwrap();
+            let decoded = decode_value(&mut Cursor::new(buf)).unwrap();
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn decode_value_rejects_invalid_bool_payload() {
+        let mut buf = Vec::new();
+        buf.push(VALUE_TAG_BOOL);
+        buf.push(9);
+        let err = decode_value(&mut Cursor::new(buf)).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(_)));
+    }
+
+    #[test]
+    fn decode_value_rejects_oversized_bytes_payload_length() {
+        let mut buf = Vec::new();
+        buf.push(VALUE_TAG_BYTES);
+
+        let mut len_buf = [0u8; 10];
+        let n = encode_uvarint(MAX_WAL_VALUE_PAYLOAD_BYTES as u64 + 1, &mut len_buf);
+        buf.extend_from_slice(&len_buf[..n]);
+
+        let err = decode_value(&mut Cursor::new(buf)).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(_)));
+    }
+
+    #[test]
+    fn decode_value_rejects_oversized_string_payload_length() {
+        let mut buf = Vec::new();
+        buf.push(VALUE_TAG_STRING);
+
+        let mut len_buf = [0u8; 10];
+        let n = encode_uvarint(MAX_WAL_VALUE_PAYLOAD_BYTES as u64 + 1, &mut len_buf);
+        buf.extend_from_slice(&len_buf[..n]);
+
+        let err = decode_value(&mut Cursor::new(buf)).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(_)));
+    }
+
+    #[test]
+    fn wal_reader_roundtrips_rows_with_all_value_types() {
+        let tmp = TempDir::new().unwrap();
+        let wal = DiskWal::new(tmp.path(), 0).unwrap();
+
+        let rows = vec![
+            Row::new("typed_wal", DataPoint::new(1, 1.0f64)),
+            Row::new("typed_wal", DataPoint::new(2, -1i64)),
+            Row::new("typed_wal", DataPoint::new(3, 5u64)),
+            Row::new("typed_wal", DataPoint::new(4, true)),
+            Row::new("typed_wal", DataPoint::new(5, Value::Bytes(vec![7, 8]))),
+            Row::new("typed_wal", DataPoint::new(6, "ok")),
+        ];
+
+        wal.append_rows(&rows).unwrap();
+        wal.flush().unwrap();
+
+        let recovered = WalReader::new(tmp.path()).unwrap().read_all().unwrap();
+        assert_eq!(recovered.len(), rows.len());
+        for (lhs, rhs) in recovered.iter().zip(rows.iter()) {
+            assert_eq!(lhs.metric(), rhs.metric());
+            assert_eq!(lhs.data_point(), rhs.data_point());
+        }
     }
 }

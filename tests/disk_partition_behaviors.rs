@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 use tsink::disk::{DiskMetric, DiskPartition, PartitionMeta};
+use tsink::encoding::MetricEncoding;
 use tsink::partition::Partition;
 use tsink::{DataPoint, Row, TimestampPrecision, TsinkError};
 
@@ -39,6 +40,7 @@ fn disk_partition_reports_invalid_offsets() {
             name: encoded_key,
             offset: 1024,
             encoded_size: 16,
+            encoding: MetricEncoding::Typed,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 1,
@@ -74,6 +76,7 @@ fn disk_partition_expires_and_prevents_reads() {
             name: "expired_metric".to_string(),
             offset: 0,
             encoded_size: 16,
+            encoding: MetricEncoding::Typed,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 0,
@@ -111,6 +114,7 @@ fn disk_partition_clean_removes_files() {
             name: "clean_metric".to_string(),
             offset: 0,
             encoded_size: 16,
+            encoding: MetricEncoding::Typed,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 1,
@@ -185,6 +189,7 @@ fn disk_partition_select_all_uses_encoded_metric_keys() {
             name: encoded_key,
             offset: 0,
             encoded_size: data.len() as u64,
+            encoding: MetricEncoding::GorillaF64,
             min_timestamp: 1,
             max_timestamp: 1,
             num_data_points: 1,
@@ -250,6 +255,7 @@ fn disk_partition_list_metric_series_uses_encoded_metric_keys() {
             name: encoded_key,
             offset: 0,
             encoded_size: data.len() as u64,
+            encoding: MetricEncoding::GorillaF64,
             min_timestamp: 1,
             max_timestamp: 1,
             num_data_points: 1,

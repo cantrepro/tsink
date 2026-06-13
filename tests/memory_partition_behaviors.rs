@@ -91,7 +91,10 @@ fn memory_partition_handles_zero_timestamp_and_out_of_order() {
     assert!(points.iter().all(|p| p.timestamp != 0));
     assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
 
-    let values: Vec<f64> = points.iter().map(|p| p.value).collect();
+    let values: Vec<f64> = points
+        .iter()
+        .map(|p| p.value_as_f64().unwrap_or(f64::NAN))
+        .collect();
     assert!(values.contains(&1.0));
     assert!(values.contains(&2.0));
     assert!(values.contains(&3.0));
@@ -135,7 +138,7 @@ fn memory_partition_filters_rows_far_behind_newest_in_fresh_batch() {
         .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].timestamp, 1000);
-    assert!((stored[0].value - 1.0).abs() < 1e-12);
+    assert!((stored[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
 }
 
 #[test]
@@ -191,8 +194,8 @@ fn flush_memory_partition_round_trip_to_disk() {
     assert_eq!(disk_points.len(), 2);
     assert_eq!(disk_points[0].timestamp, 10);
     assert_eq!(disk_points[1].timestamp, 12);
-    assert_eq!(disk_points[0].value, 5.0);
-    assert_eq!(disk_points[1].value, 7.5);
+    assert_eq!(disk_points[0].value_as_f64().unwrap_or(f64::NAN), 5.0);
+    assert_eq!(disk_points[1].value_as_f64().unwrap_or(f64::NAN), 7.5);
 
     let grouped = disk_partition
         .select_all_labels("disk_metric", 0, 100)
@@ -254,7 +257,7 @@ fn public_flush_helper_seals_partition_while_flushing() {
         .unwrap();
     assert_eq!(disk_points.len(), 1);
     assert_eq!(disk_points[0].timestamp, 1);
-    assert_eq!(disk_points[0].value, 1.0);
+    assert_eq!(disk_points[0].value_as_f64().unwrap_or(f64::NAN), 1.0);
 
     let accepted = partition.insert_rows(&[pending_row]).unwrap();
     assert!(accepted.is_empty());
