@@ -110,6 +110,31 @@ storage.close().await?;
 # }
 ```
 
+## Server Mode (Prometheus Wire Compatible)
+
+This workspace includes a binary crate at `crates/tsink-server` that runs tsink as a network service and accepts Prometheus remote storage wire format (protobuf + snappy).
+
+Run the server:
+
+```bash
+cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-data
+```
+
+Supported endpoints:
+- `GET /healthz`
+- `POST /api/v1/write` (Prometheus remote write)
+- `POST /api/v1/read` (Prometheus remote read)
+
+Example Prometheus config:
+
+```yaml
+remote_write:
+  - url: http://127.0.0.1:9201/api/v1/write
+
+remote_read:
+  - url: http://127.0.0.1:9201/api/v1/read
+```
+
 ## Query APIs
 
 | Method | Description |

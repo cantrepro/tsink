@@ -1,0 +1,15 @@
+[package]
+name = "tsink-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Server mode for tsink with Prometheus remote read/write wire compatibility"
+
+[dependencies]
+tsink = { path = "../.." }
+prost = "0.13"
+regex = "1.11"
+snap = "1.1"
+
+[dev-dependencies]
+tempfile = "3.14"

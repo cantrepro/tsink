@@ -11,6 +11,10 @@ keywords = ["time-series", "database", "embedded", "tsdb", "metrics"]
 categories = ["database", "embedded", "data-structures"]
 readme = "README.md"
 
+[workspace]
+members = [".", "crates/tsink-server"]
+resolver = "2"
+
 [dependencies]
 # Core dependencies
 thiserror = "2.0"
