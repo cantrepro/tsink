@@ -32,7 +32,7 @@ Add tsink to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsink = "0.3.1"
+tsink = "0.4.0"
 ```
 
 ## Quick Start
@@ -129,6 +129,35 @@ let all_results = storage.select_all("http_requests", 1600000000, 1600000100)?;
 for (labels, points) in all_results {
     println!("Labels: {:?}, Points: {}", labels, points.len());
 }
+```
+
+### Query Options: Downsampling, Aggregation, Pagination
+
+Use `select_with_options` to shape query results without post-processing:
+
+```rust
+use tsink::{
+    Aggregation, DataPoint, Label, QueryOptions, Row,
+    StorageBuilder, Storage,
+};
+
+let storage = StorageBuilder::new().with_data_path("./tsink-data").build()?;
+
+// Insert some points
+storage.insert_rows(&[
+    Row::new("cpu", DataPoint::new(1_000, 1.0)),
+    Row::new("cpu", DataPoint::new(2_000, 2.0)),
+    Row::new("cpu", DataPoint::new(3_000, 3.0)),
+    Row::new("cpu", DataPoint::new(4_500, 1.5)),
+])?;
+
+// Downsample into 2s buckets using average, with pagination
+let opts = QueryOptions::new(1_000, 5_000)
+    .with_downsample(2_000, Aggregation::Avg)
+    .with_pagination(0, Some(2));
+
+let buckets = storage.select_with_options("cpu", opts)?;
+// buckets: [ (t=1000, avg=1.5), (t=3000, avg=2.25) ]
 ```
 
 ## Architecture

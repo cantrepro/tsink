@@ -38,31 +38,28 @@ pub struct PlatformMmap {
 impl PlatformMmap {
     /// Creates a new memory-mapped file with architecture-specific limits
     pub fn new(file: File, length: usize) -> io::Result<Self> {
-        if length > MAX_MAP_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Map size {} exceeds maximum {} for this architecture",
-                    length, MAX_MAP_SIZE
-                ),
-            ));
-        }
-
-        let mmap = unsafe { MmapOptions::new().len(length).map(&file)? };
-
-        Ok(PlatformMmap { mmap, file })
+        Self::create_map(file, length, false)
     }
 
     /// Creates a read-only memory-mapped file
     pub fn new_readonly(file: File, length: usize) -> io::Result<Self> {
-        if length > MAX_MAP_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Map size {} exceeds maximum {} for this architecture",
-                    length, MAX_MAP_SIZE
-                ),
-            ));
+        Self::create_map(file, length, true)
+    }
+
+    #[inline]
+    fn create_map(file: File, length: usize, _readonly: bool) -> io::Result<Self> {
+        // Only enforce the configured ceiling on platforms where MAX_MAP_SIZE is not unbounded.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            if length > MAX_MAP_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Map size {} exceeds maximum {} for this architecture",
+                        length, MAX_MAP_SIZE
+                    ),
+                ));
+            }
         }
 
         let mmap = unsafe { MmapOptions::new().len(length).map(&file)? };

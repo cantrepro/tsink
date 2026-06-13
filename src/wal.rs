@@ -163,7 +163,7 @@ impl DiskWal {
             let path = entry.path();
 
             if path.is_file()
-                && let Some(index) = path.file_name().and_then(|name| parse_segment_index(name))
+                && let Some(index) = path.file_name().and_then(parse_segment_index)
             {
                 segments.push((index, path));
             }
@@ -293,7 +293,7 @@ impl WalReader {
                 let path = entry.path();
 
                 if path.is_file()
-                    && let Some(index) = path.file_name().and_then(|name| parse_segment_index(name))
+                    && let Some(index) = path.file_name().and_then(parse_segment_index)
                 {
                     segments.push((index, path));
                 }

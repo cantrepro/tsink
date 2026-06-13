@@ -1,6 +1,6 @@
 //! Memory partition implementation.
 
-use crate::disk::{DiskMetric, DiskPartition, PartitionMeta};
+use crate::disk::{DiskMetric, DiskPartition, PartitionMeta, encode_metric_key};
 use crate::encoding::GorillaEncoder;
 use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::partition::{Partition, SharedPartition};
@@ -124,13 +124,18 @@ impl MemoryPartition {
             metric.encode_all_points(&mut encoder)?;
             encoder.flush()?;
 
-            // Add to metadata
-            let name_string = String::from_utf8_lossy(name).into_owned();
+            // Track encoded byte size for accurate slicing
+            let end = data_file.stream_position()?;
+            let encoded_size = end.saturating_sub(offset);
+
+            // Add to metadata with lossless key encoding
+            let encoded_key = encode_metric_key(name);
             metrics_map.insert(
-                name_string.clone(),
+                encoded_key.clone(),
                 DiskMetric {
-                    name: name_string,
+                    name: encoded_key,
                     offset,
+                    encoded_size,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
                     num_data_points: metric.size(),
@@ -163,15 +168,9 @@ impl crate::partition::Partition for MemoryPartition {
             return Err(TsinkError::Other("No rows given".to_string()));
         }
 
-        // Write to WAL first
-        self.wal.append_rows(rows)?;
-
-        let mut outdated_rows = Vec::new();
-        let mut max_timestamp = i64::MIN;
-        let mut rows_added = 0usize;
-
+        // Normalize timestamps before touching WAL so recovery matches live writes
+        let mut normalized_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            // Validate and handle zero timestamp
             let timestamp = if row.data_point().timestamp == 0 {
                 let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                 tracing::warn!(
@@ -184,11 +183,27 @@ impl crate::partition::Partition for MemoryPartition {
                 row.data_point().timestamp
             };
 
+            normalized_rows.push(Row::with_labels(
+                row.metric().to_string(),
+                row.labels().to_vec(),
+                DataPoint::new(timestamp, row.data_point().value),
+            ));
+        }
+
+        // Write to WAL first using normalized rows
+        self.wal.append_rows(&normalized_rows)?;
+
+        let mut outdated_rows = Vec::new();
+        let mut max_timestamp = i64::MIN;
+        let mut rows_added = 0usize;
+
+        for row in &normalized_rows {
+            let timestamp = row.data_point().timestamp;
             let current_min = self.min_t.load(Ordering::Acquire);
             if current_min != 0 && timestamp < current_min {
                 let diff = current_min.saturating_sub(timestamp);
                 if diff > self.partition_duration {
-                    outdated_rows.push(row.clone());
+                    outdated_rows.push(row.clone()); // return normalized row
                     continue;
                 }
             }
@@ -345,13 +360,16 @@ impl crate::partition::Partition for MemoryPartition {
             metric.encode_all_points(&mut encoder)?;
             encoder.flush()?;
 
+            let encoded_size = (data.len() as u64).saturating_sub(offset);
+
             // Add to metadata
-            let name_string = String::from_utf8_lossy(name).into_owned();
+            let encoded_key = encode_metric_key(name);
             metrics_map.insert(
-                name_string.clone(),
+                encoded_key.clone(),
                 DiskMetric {
-                    name: name_string,
+                    name: encoded_key,
                     offset,
+                    encoded_size,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
                     num_data_points: metric.size(),

@@ -153,8 +153,8 @@ impl<W: Write> GorillaEncoder<W> {
     fn write_varint(&mut self, value: i64) -> Result<()> {
         let mut buf = [0u8; 10];
         let len = encode_varint(value, &mut buf);
-        for i in 0..len {
-            self.buf.write_byte(buf[i]);
+        for byte in buf.iter().take(len).copied() {
+            self.buf.write_byte(byte);
         }
         Ok(())
     }
@@ -163,8 +163,8 @@ impl<W: Write> GorillaEncoder<W> {
     fn write_uvarint(&mut self, value: u64) -> Result<()> {
         let mut buf = [0u8; 10];
         let len = encode_uvarint(value, &mut buf);
-        for i in 0..len {
-            self.buf.write_byte(buf[i]);
+        for byte in buf.iter().take(len).copied() {
+            self.buf.write_byte(byte);
         }
         Ok(())
     }

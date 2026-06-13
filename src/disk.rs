@@ -6,6 +6,7 @@ use crate::mmap::PlatformMmap;
 use crate::{DataPoint, Label, Result, Row, TsinkError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::fs::{self, File};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,8 @@ pub struct PartitionMeta {
 pub struct DiskMetric {
     pub name: String,
     pub offset: u64,
+    #[serde(default = "default_encoded_size")]
+    pub encoded_size: u64,
     pub min_timestamp: i64,
     pub max_timestamp: i64,
     pub num_data_points: usize,
@@ -51,7 +54,7 @@ impl DiskPartition {
         end: i64,
     ) -> Result<Vec<DataPoint>> {
         // Early exit if query range is completely outside metric range
-        if end <= disk_metric.min_timestamp || start >= disk_metric.max_timestamp {
+        if end <= disk_metric.min_timestamp || start > disk_metric.max_timestamp {
             return Ok(Vec::new());
         }
 
@@ -66,10 +69,21 @@ impl DiskPartition {
 
         // Create a cursor at the metric's offset with bounds checking
         let data_slice = self.mapped_file.as_slice();
-        let end_offset = std::cmp::min(
-            data_slice.len(),
-            offset + (disk_metric.num_data_points * 16),
-        );
+        let mapped_len = data_slice.len();
+        let encoded_size = if disk_metric.encoded_size > 0 {
+            disk_metric.encoded_size as usize
+        } else {
+            // Fallback for older metadata without encoded size: read until file end
+            mapped_len.saturating_sub(offset)
+        };
+
+        let end_offset = std::cmp::min(mapped_len, offset.saturating_add(encoded_size));
+        if end_offset <= offset {
+            return Err(TsinkError::DataCorruption(format!(
+                "Invalid metric bounds: offset {offset}, encoded_size {encoded_size}"
+            )));
+        }
+
         let metric_data = &data_slice[offset..end_offset];
         let cursor = Cursor::new(metric_data.to_vec());
 
@@ -181,11 +195,17 @@ impl crate::partition::Partition for DiskPartition {
         }
 
         let metric_name = marshal_metric_name(metric, labels);
-        let metric_name_str = String::from_utf8_lossy(&metric_name);
+        let encoded_key = encode_metric_key(&metric_name);
 
-        let disk_metric = match self.meta.metrics.get(metric_name_str.as_ref()) {
-            Some(m) => m,
-            None => return Ok(Vec::new()),
+        let disk_metric = self.meta.metrics.get(&encoded_key).or_else(|| {
+            // Backward compatibility: fall back to plain UTF-8 metric name if present
+            std::str::from_utf8(&metric_name)
+                .ok()
+                .and_then(|plain| self.meta.metrics.get(plain))
+        });
+
+        let Some(disk_metric) = disk_metric else {
+            return Ok(Vec::new());
         };
 
         self.decode_metric_points(disk_metric, start, end)
@@ -208,12 +228,12 @@ impl crate::partition::Partition for DiskPartition {
         let mut results = Vec::new();
 
         // Iterate through all metrics in metadata
-        for (marshaled_name, disk_metric) in &self.meta.metrics {
+        for (encoded_key, disk_metric) in &self.meta.metrics {
             // Try to unmarshal the name to extract base metric and labels
-            let marshaled_bytes = marshaled_name.as_bytes();
+            let marshaled_bytes = decode_metric_key(encoded_key);
 
             // First try to unmarshal it as a marshaled name
-            if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_bytes) {
+            if let Ok((base_metric, labels)) = unmarshal_metric_name(&marshaled_bytes) {
                 if base_metric == metric {
                     // Found a matching metric, decode its data points
                     let points = self.decode_metric_points(disk_metric, start, end)?;
@@ -221,7 +241,7 @@ impl crate::partition::Partition for DiskPartition {
                         results.push((labels, points));
                     }
                 }
-            } else if marshaled_name == metric {
+            } else if marshaled_bytes == metric.as_bytes() {
                 // It might be a plain metric name without labels
                 let points = self.decode_metric_points(disk_metric, start, end)?;
                 if !points.is_empty() {
@@ -266,4 +286,38 @@ impl crate::partition::Partition for DiskPartition {
         // DiskPartition is already on disk, so return None
         Ok(None)
     }
+}
+
+/// Lossless key encoding for marshaled metric bytes.
+pub(crate) fn encode_metric_key(metric: &[u8]) -> String {
+    let mut out = String::with_capacity(metric.len() * 2);
+    for byte in metric {
+        // Lower-case hex for deterministic keys
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
+}
+
+/// Decodes a previously encoded metric key, falling back to raw UTF-8 bytes for old metadata.
+pub(crate) fn decode_metric_key(key: &str) -> Vec<u8> {
+    if key.len() & 1 == 0 && key.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        let mut out = Vec::with_capacity(key.len() / 2);
+        let mut i = 0;
+        while i < key.len() {
+            let byte_str = &key[i..i + 2];
+            if let Ok(val) = u8::from_str_radix(byte_str, 16) {
+                out.push(val);
+            } else {
+                return key.as_bytes().to_vec();
+            }
+            i += 2;
+        }
+        return out;
+    }
+
+    key.as_bytes().to_vec()
+}
+
+const fn default_encoded_size() -> u64 {
+    0
 }

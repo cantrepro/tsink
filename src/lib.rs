@@ -18,7 +18,9 @@ pub mod wal;
 
 pub use error::{Result, TsinkError};
 pub use label::Label;
-pub use storage::{Storage, StorageBuilder, TimestampPrecision};
+pub use storage::{
+    Aggregation, DownsampleOptions, QueryOptions, Storage, StorageBuilder, TimestampPrecision,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

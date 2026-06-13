@@ -41,6 +41,9 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects with additional options like downsampling, aggregation, and pagination.
+    fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
+
     /// Selects data points for a metric regardless of labels.
     /// Returns a map of label sets to their corresponding data points.
     fn select_all(
@@ -208,6 +211,76 @@ impl StorageBuilder {
     }
 }
 
+/// Aggregation applied to query results or buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aggregation {
+    None,
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Last,
+}
+
+/// Downsampling configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownsampleOptions {
+    pub interval: i64,
+}
+
+/// Options to customize queries (aggregation, downsampling, pagination).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryOptions {
+    pub labels: Vec<Label>,
+    pub start: i64,
+    pub end: i64,
+    pub aggregation: Aggregation,
+    pub downsample: Option<DownsampleOptions>,
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+impl QueryOptions {
+    /// Create query options for a time range.
+    pub fn new(start: i64, end: i64) -> Self {
+        Self {
+            labels: Vec::new(),
+            start,
+            end,
+            aggregation: Aggregation::None,
+            downsample: None,
+            limit: None,
+            offset: 0,
+        }
+    }
+
+    /// Attach labels to filter the series.
+    pub fn with_labels(mut self, labels: Vec<Label>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Apply pagination.
+    pub fn with_pagination(mut self, offset: usize, limit: Option<usize>) -> Self {
+        self.offset = offset;
+        self.limit = limit;
+        self
+    }
+
+    /// Apply downsampling using the given interval and aggregation.
+    pub fn with_downsample(mut self, interval: i64, aggregation: Aggregation) -> Self {
+        self.downsample = Some(DownsampleOptions { interval });
+        self.aggregation = aggregation;
+        self
+    }
+
+    /// Apply aggregation without downsampling (reduces the whole series to one point).
+    pub fn with_aggregation(mut self, aggregation: Aggregation) -> Self {
+        self.aggregation = aggregation;
+        self
+    }
+}
+
 /// Main storage implementation.
 struct StorageImpl {
     partition_list: Arc<PartitionList>,
@@ -247,16 +320,14 @@ impl StorageImpl {
         self.ensure_active_head()?;
 
         let mut rows_to_insert = rows.to_vec();
-        let mut i = 0;
 
-        for partition in self.partition_list.iter() {
-            if i >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
+        for (idx, partition) in self.partition_list.iter().enumerate() {
+            if idx >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
                 break;
             }
 
             let outdated = partition.insert_rows(&rows_to_insert)?;
             rows_to_insert = outdated;
-            i += 1;
         }
 
         Ok(())
@@ -478,16 +549,14 @@ impl Storage for StorageImpl {
             self.ensure_active_head()?;
 
             let mut rows_to_insert = rows.to_vec();
-            let mut i = 0;
 
-            for partition in self.partition_list.iter() {
-                if i >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
+            for (idx, partition) in self.partition_list.iter().enumerate() {
+                if idx >= WRITABLE_PARTITIONS_NUM || rows_to_insert.is_empty() {
                     break;
                 }
 
                 let outdated = partition.insert_rows(&rows_to_insert)?;
                 rows_to_insert = outdated;
-                i += 1;
             }
 
             Ok(())
@@ -548,6 +617,65 @@ impl Storage for StorageImpl {
         }
 
         Ok(all_points)
+    }
+
+    fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>> {
+        if metric.is_empty() {
+            return Err(TsinkError::MetricRequired);
+        }
+
+        if opts.start >= opts.end {
+            return Err(TsinkError::InvalidTimeRange {
+                start: opts.start,
+                end: opts.end,
+            });
+        }
+
+        if let Some(d) = opts.downsample
+            && d.interval <= 0
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "downsample interval must be positive".to_string(),
+            ));
+        }
+
+        // Reuse the existing select for raw points.
+        let points = self.select(metric, &opts.labels, opts.start, opts.end)?;
+
+        // Downsample or aggregate if requested.
+        let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
+            (true, Aggregation::None) => Aggregation::Last, // sensible default for downsampling
+            _ => opts.aggregation,
+        };
+
+        let mut processed = if let Some(downsample) = opts.downsample {
+            downsample_points(
+                &points,
+                downsample.interval,
+                aggregation,
+                opts.start,
+                opts.end,
+            )
+        } else if aggregation != Aggregation::None {
+            aggregate_series(&points, aggregation)
+                .into_iter()
+                .collect::<Vec<DataPoint>>()
+        } else {
+            points
+        };
+
+        // Apply pagination.
+        if opts.offset > 0 && opts.offset < processed.len() {
+            processed.drain(0..opts.offset);
+        } else if opts.offset >= processed.len() {
+            processed.clear();
+        }
+
+        if let Some(limit) = opts.limit {
+            processed.truncate(limit);
+        }
+
+        Ok(processed)
     }
 
     fn select_all(
@@ -627,6 +755,128 @@ impl Storage for StorageImpl {
 
         Ok(())
     }
+}
+
+fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<DataPoint> {
+    if points.is_empty() {
+        return None;
+    }
+
+    match aggregation {
+        Aggregation::None => None,
+        Aggregation::Last => points.last().copied(),
+        Aggregation::Sum | Aggregation::Avg => {
+            let mut sum = 0.0;
+            for p in points {
+                sum += p.value;
+            }
+            let value = if aggregation == Aggregation::Avg {
+                sum / points.len() as f64
+            } else {
+                sum
+            };
+
+            Some(DataPoint::new(points.last().unwrap().timestamp, value))
+        }
+        Aggregation::Min => points
+            .iter()
+            .min_by(|a, b| {
+                a.value
+                    .partial_cmp(&b.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied(),
+        Aggregation::Max => points
+            .iter()
+            .max_by(|a, b| {
+                a.value
+                    .partial_cmp(&b.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied(),
+    }
+}
+
+fn aggregate_bucket(
+    points: &[DataPoint],
+    aggregation: Aggregation,
+    bucket_start: i64,
+) -> Option<DataPoint> {
+    if points.is_empty() {
+        return None;
+    }
+
+    match aggregation {
+        Aggregation::None => None,
+        Aggregation::Last => points.last().copied(),
+        Aggregation::Sum | Aggregation::Avg => {
+            let mut sum = 0.0;
+            for p in points {
+                sum += p.value;
+            }
+            let value = if aggregation == Aggregation::Avg {
+                sum / points.len() as f64
+            } else {
+                sum
+            };
+            Some(DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Min => points
+            .iter()
+            .min_by(|a, b| {
+                a.value
+                    .partial_cmp(&b.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| DataPoint::new(bucket_start, p.value)),
+        Aggregation::Max => points
+            .iter()
+            .max_by(|a, b| {
+                a.value
+                    .partial_cmp(&b.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| DataPoint::new(bucket_start, p.value)),
+    }
+}
+
+fn downsample_points(
+    points: &[DataPoint],
+    interval: i64,
+    aggregation: Aggregation,
+    start: i64,
+    end: i64,
+) -> Vec<DataPoint> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut idx = 0;
+    let mut bucket_start = start;
+
+    while bucket_start < end {
+        let bucket_end = bucket_start.saturating_add(interval);
+        let mut bucket_points = Vec::new();
+
+        while idx < points.len() && points[idx].timestamp < bucket_end {
+            bucket_points.push(points[idx]);
+            idx += 1;
+        }
+
+        if let Some(dp) = aggregate_bucket(&bucket_points, aggregation, bucket_start) {
+            result.push(dp);
+        }
+
+        // Fast-forward if points are sparse
+        if idx < points.len() && points[idx].timestamp >= bucket_end {
+            let next_bucket = points[idx].timestamp / interval * interval;
+            bucket_start = std::cmp::max(bucket_end, next_bucket);
+        } else {
+            bucket_start = bucket_end;
+        }
+    }
+
+    result
 }
 
 /// Simple semaphore implementation for limiting concurrent workers.

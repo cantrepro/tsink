@@ -27,6 +27,7 @@ fn disk_partition_reports_invalid_offsets() {
         DiskMetric {
             name: "bad_metric".to_string(),
             offset: 1024,
+            encoded_size: 16,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 1,
@@ -61,6 +62,7 @@ fn disk_partition_expires_and_prevents_reads() {
         DiskMetric {
             name: "expired_metric".to_string(),
             offset: 0,
+            encoded_size: 16,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 0,
@@ -97,6 +99,7 @@ fn disk_partition_clean_removes_files() {
         DiskMetric {
             name: "clean_metric".to_string(),
             offset: 0,
+            encoded_size: 16,
             min_timestamp: 0,
             max_timestamp: 10,
             num_data_points: 1,
