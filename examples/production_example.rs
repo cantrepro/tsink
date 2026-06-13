@@ -4,17 +4,24 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .try_init()
+        .ok();
+
     info!("Starting tsink production example");
 
-    // Create storage with production settings
     let storage = Arc::new(
         StorageBuilder::new()
             .with_data_path("./tsink-data")
-            .with_retention(Duration::from_secs(7 * 24 * 3600)) // 7 days
-            .with_partition_duration(Duration::from_secs(3600)) // 1 hour
+            .with_retention(Duration::from_secs(7 * 24 * 3600))
+            .with_chunk_points(4096)
             .with_timestamp_precision(TimestampPrecision::Nanoseconds)
             .with_write_timeout(Duration::from_secs(30))
             .with_wal_buffer_size(4096)
@@ -22,10 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
     );
 
-    // Simulate production workload
     info!("Starting production workload simulation");
 
-    // Spawn multiple writer threads
     let mut writer_handles = vec![];
     for thread_id in 0..4 {
         let storage_clone = Arc::clone(&storage);
@@ -37,14 +42,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let start = std::time::Instant::now();
                 let mut rows = Vec::new();
 
-                // Generate batch of metrics
                 for i in 0..100 {
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_nanos() as i64;
 
-                    // CPU metrics
                     rows.push(Row::with_labels(
                         "cpu_usage",
                         vec![
@@ -54,7 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         DataPoint::new(timestamp, 50.0 + (i as f64) * 0.1),
                     ));
 
-                    // Memory metrics
                     rows.push(Row::with_labels(
                         "memory_usage",
                         vec![
@@ -64,7 +66,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         DataPoint::new(timestamp, 1024.0 * (1000.0 + i as f64)),
                     ));
 
-                    // Network metrics
                     rows.push(Row::with_labels(
                         "network_bytes",
                         vec![
@@ -76,7 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
 
-                // Insert batch
                 match storage_clone.insert_rows(&rows) {
                     Ok(_) => {
                         let duration = start.elapsed();
@@ -98,7 +98,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Small delay between batches
                 thread::sleep(Duration::from_millis(100));
             }
 
@@ -108,13 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer_handles.push(handle);
     }
 
-    // Spawn reader thread
     let storage_reader = Arc::clone(&storage);
 
     let reader_handle = thread::spawn(move || {
         info!("Reader thread started");
 
-        thread::sleep(Duration::from_secs(2)); // Wait for some data
+        thread::sleep(Duration::from_secs(2));
 
         for iteration in 0..20 {
             let start = std::time::Instant::now();
@@ -122,9 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as i64;
-            let start_time = end_time - 60_000_000_000; // Last 60 seconds
+            let start_time = end_time - 60_000_000_000;
 
-            // Query CPU metrics
             match storage_reader.select(
                 "cpu_usage",
                 &[Label::new("host", "server-0")],
@@ -134,8 +131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(points) => {
                     let duration = start.elapsed();
                     if !points.is_empty() {
-                        let avg_value: f64 =
-                            points.iter().map(|p| p.value).sum::<f64>() / points.len() as f64;
+                        let avg_value: f64 = points
+                            .iter()
+                            .map(|p| p.value_as_f64().unwrap_or(f64::NAN))
+                            .sum::<f64>()
+                            / points.len() as f64;
                         info!(
                             "Query {} returned {} CPU data points, avg value: {:.2}, duration: {:?}",
                             iteration,
@@ -150,7 +150,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Query memory metrics
             match storage_reader.select(
                 "memory_usage",
                 &[Label::new("host", "server-1"), Label::new("type", "used")],
@@ -162,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let latest = points.last().unwrap();
                         info!(
                             "Latest memory usage for server-1: {:.2} MB",
-                            latest.value / 1024.0
+                            latest.value_as_f64().unwrap_or(f64::NAN) / 1024.0
                         );
                     }
                 }
@@ -177,14 +176,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Reader thread completed");
     });
 
-    // Wait for all threads to complete
     for handle in writer_handles {
         handle.join().expect("Writer thread panicked");
     }
 
     reader_handle.join().expect("Reader thread panicked");
 
-    // Graceful shutdown
     info!("Shutting down storage");
     storage.close()?;
 

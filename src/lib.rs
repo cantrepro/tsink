@@ -2,45 +2,60 @@
 //!
 //! tsink is a Rust implementation of a time-series storage engine with a straightforward API.
 
-pub mod bstream;
+#[cfg(feature = "async-storage")]
+pub mod async_storage;
 pub mod cgroup;
 pub mod concurrency;
-pub mod disk;
-pub mod encoding;
+pub mod engine;
 pub mod error;
 pub mod label;
-pub mod list;
-pub mod memory;
 pub mod mmap;
-pub mod partition;
+#[cfg(feature = "promql")]
+pub mod promql;
 pub mod storage;
-pub(crate) mod time;
+pub mod value;
 pub mod wal;
 
+#[cfg(feature = "async-storage")]
+pub use async_storage::{AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder};
 pub use error::{Result, TsinkError};
 pub use label::Label;
 pub use storage::{
-    Aggregation, DownsampleOptions, MetricSeries, QueryOptions, Storage, StorageBuilder,
-    TimestampPrecision,
+    Aggregation, DownsampleOptions, MetricSeries, QueryOptions, SeriesMatcher, SeriesMatcherOp,
+    SeriesSelection, Storage, StorageBuilder, TimestampPrecision,
 };
+pub use value::{Aggregator, BytesAggregation, Codec, CodecAggregator, Value};
 pub use wal::WalSyncMode;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Represents a data point, the smallest unit of time series data.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPoint {
     /// The actual value.
-    pub value: f64,
+    pub value: Value,
     /// Unix timestamp.
     pub timestamp: i64,
 }
 
 impl DataPoint {
     /// Creates a new DataPoint.
-    pub fn new(timestamp: i64, value: f64) -> Self {
-        Self { timestamp, value }
+    pub fn new(timestamp: i64, value: impl Into<Value>) -> Self {
+        Self {
+            timestamp,
+            value: value.into(),
+        }
+    }
+
+    /// Returns the value as f64 when numeric and exactly representable.
+    pub fn value_as_f64(&self) -> Option<f64> {
+        self.value.as_f64()
+    }
+
+    /// Returns the value as a borrowed byte slice for raw payloads.
+    pub fn value_as_bytes(&self) -> Option<&[u8]> {
+        self.value.as_bytes()
     }
 }
 
@@ -89,8 +104,8 @@ impl Row {
     }
 
     /// Gets the data point.
-    pub fn data_point(&self) -> DataPoint {
-        self.data_point
+    pub fn data_point(&self) -> &DataPoint {
+        &self.data_point
     }
 
     /// Sets the metric name.
@@ -112,5 +127,21 @@ impl Row {
 impl fmt::Display for DataPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DataPoint(ts: {}, val: {})", self.timestamp, self.value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataPoint;
+
+    #[test]
+    fn datapoint_equality_treats_nan_values_as_equal() {
+        assert_eq!(DataPoint::new(1, f64::NAN), DataPoint::new(1, f64::NAN));
+    }
+
+    #[test]
+    fn datapoint_equality_keeps_standard_f64_behavior_for_non_nan_values() {
+        assert_eq!(DataPoint::new(1, 0.0_f64), DataPoint::new(1, -0.0_f64));
+        assert_ne!(DataPoint::new(1, 1.0_f64), DataPoint::new(1, 2.0_f64));
     }
 }

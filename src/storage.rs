@@ -1,27 +1,15 @@
-//! Main storage implementation for tsink.
+//! Main storage API and query helpers for tsink.
 
-use crate::concurrency::Semaphore;
-use crate::disk::DiskPartition;
-use crate::list::PartitionList;
-use crate::memory::MemoryPartition;
-use crate::partition::SharedPartition;
-use crate::wal::{DiskWal, NopWal, Wal, WalReader, WalSyncMode};
-use crate::{DataPoint, Label, Result, Row, TsinkError};
-use crossbeam_channel::{Sender, bounded};
-use std::collections::BTreeSet;
-use std::fs;
+use crate::value::{i64_to_f64_exact, u64_to_f64_exact};
+use crate::wal::WalSyncMode;
+use crate::{
+    Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
+    Result, Row, TsinkError, Value,
+};
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread;
 use std::time::Duration;
-use tracing::{error, info, warn};
-
-const WRITABLE_PARTITIONS_NUM: usize = 2;
-const STORAGE_OPEN: u8 = 0;
-const STORAGE_CLOSING: u8 = 1;
-const STORAGE_CLOSED: u8 = 2;
-const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 
 /// Timestamp precision for data points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -41,6 +29,111 @@ pub struct MetricSeries {
     pub labels: Vec<Label>,
 }
 
+/// Label matcher operator for series selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SeriesMatcherOp {
+    Equal,
+    NotEqual,
+    RegexMatch,
+    RegexNoMatch,
+}
+
+/// Label matcher for series selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeriesMatcher {
+    pub name: String,
+    pub op: SeriesMatcherOp,
+    pub value: String,
+}
+
+impl SeriesMatcher {
+    #[must_use]
+    pub fn new(name: impl Into<String>, op: SeriesMatcherOp, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            op,
+            value: value.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn equal(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::Equal, value)
+    }
+
+    #[must_use]
+    pub fn not_equal(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::NotEqual, value)
+    }
+
+    #[must_use]
+    pub fn regex_match(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::RegexMatch, value)
+    }
+
+    #[must_use]
+    pub fn regex_no_match(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::new(name, SeriesMatcherOp::RegexNoMatch, value)
+    }
+}
+
+/// Selection request for matching metric series.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeriesSelection {
+    pub metric: Option<String>,
+    pub matchers: Vec<SeriesMatcher>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+}
+
+impl SeriesSelection {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_metric(mut self, metric: impl Into<String>) -> Self {
+        self.metric = Some(metric.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_matcher(mut self, matcher: SeriesMatcher) -> Self {
+        self.matchers.push(matcher);
+        self
+    }
+
+    #[must_use]
+    pub fn with_matchers(mut self, matchers: Vec<SeriesMatcher>) -> Self {
+        self.matchers = matchers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_time_range(mut self, start: i64, end: i64) -> Self {
+        self.start = Some(start);
+        self.end = Some(end);
+        self
+    }
+
+    pub(crate) fn normalized_time_range(&self) -> Result<Option<(i64, i64)>> {
+        match (self.start, self.end) {
+            (None, None) => Ok(None),
+            (Some(start), Some(end)) => {
+                if start >= end {
+                    return Err(TsinkError::InvalidTimeRange { start, end });
+                }
+                Ok(Some((start, end)))
+            }
+            _ => Err(TsinkError::InvalidConfiguration(
+                "series selection requires both start and end when time range filtering is enabled"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 /// Storage provides thread-safe capabilities for insertion and retrieval from time-series storage.
 pub trait Storage: Send + Sync {
     /// Inserts rows into the storage.
@@ -55,6 +148,19 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects data points into a caller-provided buffer, allowing allocation reuse.
+    fn select_into(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        out: &mut Vec<DataPoint>,
+    ) -> Result<()> {
+        *out = self.select(metric, labels, start, end)?;
+        Ok(())
+    }
+
     /// Selects with additional options like downsampling, aggregation, and pagination.
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
 
@@ -67,26 +173,166 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
 
-    /// Lists all known metric series across partitions and WAL.
+    /// Lists all known metric series currently present in storage.
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         Err(TsinkError::Other(
             "list_metrics is not implemented for this storage backend".to_string(),
         ))
     }
 
+    /// Lists known metric series and may include additional WAL-scanned series.
+    fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
+        self.list_metrics()
+    }
+
+    /// Selects metric series by structured label matchers (non-PromQL API).
+    fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
+        if let Some(metric) = &selection.metric {
+            if metric.is_empty() {
+                return Err(TsinkError::MetricRequired);
+            }
+            if metric.len() > u16::MAX as usize {
+                return Err(TsinkError::InvalidMetricName(format!(
+                    "metric name too long: {} bytes (max {})",
+                    metric.len(),
+                    u16::MAX as usize
+                )));
+            }
+        }
+
+        let time_range = selection.normalized_time_range()?;
+        let compiled_matchers = compile_series_matchers(&selection.matchers)?;
+
+        let mut series = self.list_metrics()?;
+        series.retain(|entry| {
+            if selection
+                .metric
+                .as_ref()
+                .is_some_and(|metric| entry.name != *metric)
+            {
+                return false;
+            }
+
+            compiled_matchers
+                .iter()
+                .all(|matcher| matcher.matches(&entry.name, &entry.labels))
+        });
+
+        if let Some((start, end)) = time_range {
+            let mut filtered = Vec::with_capacity(series.len());
+            for entry in series {
+                let points = self.select(&entry.name, &entry.labels, start, end)?;
+                if !points.is_empty() {
+                    filtered.push(entry);
+                }
+            }
+            series = filtered;
+        }
+
+        series.sort();
+        Ok(series)
+    }
+
+    /// Returns currently estimated in-memory bytes owned by the storage engine.
+    fn memory_used(&self) -> usize {
+        0
+    }
+
+    /// Returns configured in-memory byte budget for the storage engine.
+    ///
+    /// `usize::MAX` means "no explicit budget configured".
+    fn memory_budget(&self) -> usize {
+        usize::MAX
+    }
+
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledSeriesMatcher {
+    pub name: String,
+    pub op: SeriesMatcherOp,
+    pub value: String,
+    pub regex: Option<Regex>,
+}
+
+impl CompiledSeriesMatcher {
+    pub(crate) fn matches(&self, metric: &str, labels: &[Label]) -> bool {
+        let actual = if self.name == "__name__" {
+            Some(metric)
+        } else {
+            labels
+                .iter()
+                .find(|label| label.name == self.name)
+                .map(|label| label.value.as_str())
+        };
+
+        match self.op {
+            SeriesMatcherOp::Equal => actual.is_some_and(|value| value == self.value),
+            SeriesMatcherOp::NotEqual => actual.is_none_or(|value| value != self.value),
+            SeriesMatcherOp::RegexMatch => actual.is_some_and(|value| {
+                self.regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(value))
+            }),
+            SeriesMatcherOp::RegexNoMatch => !actual.is_some_and(|value| {
+                self.regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(value))
+            }),
+        }
+    }
+}
+
+pub(crate) fn compile_series_matchers(
+    matchers: &[SeriesMatcher],
+) -> Result<Vec<CompiledSeriesMatcher>> {
+    let mut compiled = Vec::with_capacity(matchers.len());
+    for matcher in matchers {
+        if matcher.name.is_empty() {
+            return Err(TsinkError::InvalidLabel(
+                "series matcher label name cannot be empty".to_string(),
+            ));
+        }
+
+        let regex = match matcher.op {
+            SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch => {
+                let anchored = format!("^(?:{})$", matcher.value);
+                Some(Regex::new(&anchored).map_err(|err| {
+                    TsinkError::InvalidConfiguration(format!(
+                        "invalid matcher regex '{}': {err}",
+                        matcher.value
+                    ))
+                })?)
+            }
+            SeriesMatcherOp::Equal | SeriesMatcherOp::NotEqual => None,
+        };
+
+        compiled.push(CompiledSeriesMatcher {
+            name: matcher.name.clone(),
+            op: matcher.op,
+            value: matcher.value.clone(),
+            regex,
+        });
+    }
+    Ok(compiled)
 }
 
 /// Builder for creating a Storage instance.
 pub struct StorageBuilder {
     data_path: Option<PathBuf>,
     retention: Duration,
+    retention_enforced: bool,
     timestamp_precision: TimestampPrecision,
+    chunk_points: usize,
     max_writers: usize,
     write_timeout: Duration,
     partition_duration: Duration,
+    memory_limit_bytes: usize,
+    cardinality_limit: usize,
     wal_enabled: bool,
+    wal_size_limit_bytes: usize,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
 }
@@ -95,12 +341,17 @@ impl Default for StorageBuilder {
     fn default() -> Self {
         Self {
             data_path: None,
-            retention: Duration::from_secs(14 * 24 * 3600), // 14 days
+            retention: Duration::from_secs(14 * 24 * 3600),
+            retention_enforced: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
+            chunk_points: crate::engine::DEFAULT_CHUNK_POINTS,
             max_writers: crate::cgroup::default_workers_limit(),
             write_timeout: Duration::from_secs(30),
-            partition_duration: Duration::from_secs(3600), // 1 hour
+            partition_duration: Duration::from_secs(3600),
+            memory_limit_bytes: usize::MAX,
+            cardinality_limit: usize::MAX,
             wal_enabled: true,
+            wal_size_limit_bytes: usize::MAX,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
         }
@@ -109,31 +360,50 @@ impl Default for StorageBuilder {
 
 impl StorageBuilder {
     /// Creates a new StorageBuilder with default settings.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    // Storage configuration methods
-
     /// Sets the data path for persistent storage.
+    #[must_use]
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.data_path = Some(path.as_ref().to_path_buf());
         self
     }
 
     /// Sets the retention period.
+    #[must_use]
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
         self
     }
 
+    /// Enables or disables retention enforcement.
+    ///
+    /// When disabled, points are never rejected or filtered due to retention.
+    #[must_use]
+    pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
+        self.retention_enforced = enforced;
+        self
+    }
+
     /// Sets the timestamp precision.
+    #[must_use]
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.timestamp_precision = precision;
         self
     }
 
+    /// Sets the target points-per-chunk for the storage engine.
+    #[must_use]
+    pub fn with_chunk_points(mut self, points: usize) -> Self {
+        self.chunk_points = points.clamp(1, u16::MAX as usize);
+        self
+    }
+
     /// Sets the maximum number of concurrent writers.
+    #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
         self.max_writers = if max_writers == 0 {
             crate::cgroup::default_workers_limit().max(1)
@@ -144,30 +414,63 @@ impl StorageBuilder {
     }
 
     /// Sets the write timeout.
+    #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
     }
 
     /// Sets the partition duration.
+    #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.partition_duration = duration;
         self
     }
 
+    /// Sets a global in-memory byte budget for active + sealed chunks.
+    ///
+    /// When exceeded, the engine applies backpressure by persisting sealed chunks to L0
+    /// and evicting the oldest sealed chunks from RAM before admitting new writes.
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes;
+        self
+    }
+
+    /// Sets a hard upper bound for total series cardinality.
+    ///
+    /// New metric+label combinations are rejected once the limit is reached.
+    #[must_use]
+    pub fn with_cardinality_limit(mut self, series: usize) -> Self {
+        self.cardinality_limit = series;
+        self
+    }
+
     /// Enables or disables WAL.
+    #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
         self
     }
 
+    /// Sets a hard upper bound for on-disk WAL bytes across all WAL segments.
+    ///
+    /// `usize::MAX` disables the limit.
+    #[must_use]
+    pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
+        self.wal_size_limit_bytes = bytes;
+        self
+    }
+
     /// Sets the WAL buffer size.
+    #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
         self.wal_buffer_size = size;
         self
     }
 
     /// Sets WAL fsync policy.
+    #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.wal_sync_mode = mode;
         self
@@ -175,111 +478,63 @@ impl StorageBuilder {
 
     /// Builds the Storage instance.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
-        let storage = self.build_impl()?;
-        Ok(storage)
+        crate::engine::build_storage(self)
     }
 
-    fn build_impl(self) -> Result<Arc<StorageImpl>> {
-        // Check file descriptor limits on Unix systems
-        #[cfg(unix)]
-        {
-            let mut rlim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            unsafe {
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-                    let required_fds = 100; // Minimum required file descriptors
-                    if rlim.rlim_cur < required_fds {
-                        tracing::warn!(
-                            "Low file descriptor limit: {}. Consider increasing with 'ulimit -n'",
-                            rlim.rlim_cur
-                        );
-                    }
-                }
-            }
-        }
+    pub(crate) fn chunk_points(&self) -> usize {
+        self.chunk_points
+    }
 
-        let max_writers = if self.max_writers == 0 {
-            crate::cgroup::default_workers_limit().max(1)
-        } else {
-            self.max_writers
-        };
+    pub(crate) fn data_path(&self) -> Option<&Path> {
+        self.data_path.as_deref()
+    }
 
-        let partition_units =
-            crate::time::duration_to_units(self.partition_duration, self.timestamp_precision);
-        if partition_units <= 0 {
-            return Err(TsinkError::InvalidConfiguration(
-                "partition_duration is too small for the configured timestamp_precision"
-                    .to_string(),
-            ));
-        }
+    pub(crate) fn retention(&self) -> Duration {
+        self.retention
+    }
 
-        if !self.retention.is_zero()
-            && crate::time::duration_to_units(self.retention, self.timestamp_precision) <= 0
-        {
-            return Err(TsinkError::InvalidConfiguration(
-                "retention is too small for the configured timestamp_precision".to_string(),
-            ));
-        }
+    pub(crate) fn retention_enforced(&self) -> bool {
+        self.retention_enforced
+    }
 
-        if let Some(ref data_path) = self.data_path {
-            // Ensure persistent storage path exists even when WAL is disabled.
-            fs::create_dir_all(data_path)?;
-        }
+    pub(crate) fn timestamp_precision(&self) -> TimestampPrecision {
+        self.timestamp_precision
+    }
 
-        let use_disk_wal = self.data_path.is_some() && self.wal_enabled;
+    pub(crate) fn max_writers(&self) -> usize {
+        self.max_writers
+    }
 
-        // Create WAL based on configuration
-        let wal: Arc<dyn Wal> = if let Some(ref data_path) = self.data_path {
-            if use_disk_wal {
-                DiskWal::new_with_sync_mode(
-                    data_path.join("wal"),
-                    self.wal_buffer_size,
-                    self.wal_sync_mode,
-                )?
-            } else {
-                Arc::new(NopWal)
-            }
-        } else {
-            Arc::new(NopWal)
-        };
+    pub(crate) fn write_timeout(&self) -> Duration {
+        self.write_timeout
+    }
 
-        let storage = Arc::new(StorageImpl {
-            partition_list: Arc::new(PartitionList::new()),
-            data_path: self.data_path.clone(),
-            partition_duration: self.partition_duration,
-            retention: self.retention,
-            timestamp_precision: self.timestamp_precision,
-            write_timeout: self.write_timeout,
-            wal: wal.clone(),
-            workers_semaphore: Arc::new(Semaphore::new(max_writers)),
-            lifecycle: Arc::new(AtomicU8::new(STORAGE_OPEN)),
-            partition_creation_lock: Arc::new(parking_lot::Mutex::new(())),
-            partition_ops_lock: Arc::new(parking_lot::RwLock::new(())),
-            expiry_thread: Arc::new(parking_lot::Mutex::new(None)),
-            expiry_stop_tx: Arc::new(parking_lot::Mutex::new(None)),
-            flush_thread: Arc::new(parking_lot::Mutex::new(None)),
-        });
+    pub(crate) fn partition_duration(&self) -> Duration {
+        self.partition_duration
+    }
 
-        // Load existing partitions from disk if data path is set
-        if let Some(ref data_path) = self.data_path {
-            storage.load_disk_partitions(data_path)?;
+    pub(crate) fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit_bytes
+    }
 
-            // Recover from WAL if it exists
-            let wal_dir = data_path.join("wal");
-            if use_disk_wal && wal_dir.exists() {
-                storage.recover_from_wal(&wal_dir)?;
-            }
-        }
+    pub(crate) fn cardinality_limit(&self) -> usize {
+        self.cardinality_limit
+    }
 
-        // Create initial memory partition
-        storage.new_partition(None)?;
+    pub(crate) fn wal_enabled(&self) -> bool {
+        self.wal_enabled
+    }
 
-        // Start background tasks
-        storage.start_background_tasks();
+    pub(crate) fn wal_size_limit_bytes(&self) -> usize {
+        self.wal_size_limit_bytes
+    }
 
-        Ok(storage)
+    pub(crate) fn wal_buffer_size(&self) -> usize {
+        self.wal_buffer_size
+    }
+
+    pub(crate) fn wal_sync_mode(&self) -> WalSyncMode {
+        self.wal_sync_mode
     }
 }
 
@@ -291,7 +546,13 @@ pub enum Aggregation {
     Min,
     Max,
     Avg,
+    First,
     Last,
+    Count,
+    Median,
+    Range,
+    Variance,
+    StdDev,
 }
 
 /// Downsampling configuration.
@@ -301,19 +562,21 @@ pub struct DownsampleOptions {
 }
 
 /// Options to customize queries (aggregation, downsampling, pagination).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct QueryOptions {
     pub labels: Vec<Label>,
     pub start: i64,
     pub end: i64,
     pub aggregation: Aggregation,
     pub downsample: Option<DownsampleOptions>,
+    pub custom_aggregation: Option<Arc<dyn BytesAggregation>>,
     pub limit: Option<usize>,
     pub offset: usize,
 }
 
 impl QueryOptions {
     /// Create query options for a time range.
+    #[must_use]
     pub fn new(start: i64, end: i64) -> Self {
         Self {
             labels: Vec::new(),
@@ -321,18 +584,21 @@ impl QueryOptions {
             end,
             aggregation: Aggregation::None,
             downsample: None,
+            custom_aggregation: None,
             limit: None,
             offset: 0,
         }
     }
 
     /// Attach labels to filter the series.
+    #[must_use]
     pub fn with_labels(mut self, labels: Vec<Label>) -> Self {
         self.labels = labels;
         self
     }
 
     /// Apply pagination.
+    #[must_use]
     pub fn with_pagination(mut self, offset: usize, limit: Option<usize>) -> Self {
         self.offset = offset;
         self.limit = limit;
@@ -340,6 +606,7 @@ impl QueryOptions {
     }
 
     /// Apply downsampling using the given interval and aggregation.
+    #[must_use]
     pub fn with_downsample(mut self, interval: i64, aggregation: Aggregation) -> Self {
         self.downsample = Some(DownsampleOptions { interval });
         self.aggregation = aggregation;
@@ -347,1173 +614,819 @@ impl QueryOptions {
     }
 
     /// Apply aggregation without downsampling (reduces the whole series to one point).
+    #[must_use]
     pub fn with_aggregation(mut self, aggregation: Aggregation) -> Self {
         self.aggregation = aggregation;
         self
     }
-}
 
-/// Main storage implementation.
-struct StorageImpl {
-    partition_list: Arc<PartitionList>,
-    data_path: Option<PathBuf>,
-    partition_duration: Duration,
-    retention: Duration,
-    timestamp_precision: TimestampPrecision,
-    write_timeout: Duration,
-    wal: Arc<dyn Wal>,
-    workers_semaphore: Arc<Semaphore>,
-    lifecycle: Arc<AtomicU8>,
-    partition_creation_lock: Arc<parking_lot::Mutex<()>>,
-    partition_ops_lock: Arc<parking_lot::RwLock<()>>,
-    expiry_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
-    expiry_stop_tx: Arc<parking_lot::Mutex<Option<Sender<()>>>>,
-    flush_thread: Arc<parking_lot::Mutex<Option<thread::JoinHandle<()>>>>,
-}
-
-impl StorageImpl {
-    fn canonical_series(name: String, mut labels: Vec<Label>) -> MetricSeries {
-        labels.sort();
-        MetricSeries { name, labels }
-    }
-
-    fn ensure_operational(&self) -> Result<()> {
-        match self.lifecycle.load(Ordering::SeqCst) {
-            STORAGE_OPEN => Ok(()),
-            STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-            _ => Err(TsinkError::StorageClosed),
-        }
-    }
-
-    fn validate_metric_name(metric: &str) -> Result<()> {
-        if metric.is_empty() {
-            return Err(TsinkError::MetricRequired);
-        }
-        if metric.len() > MAX_METRIC_NAME_LEN {
-            return Err(TsinkError::InvalidMetricName(format!(
-                "metric name too long: {} bytes (max {})",
-                metric.len(),
-                MAX_METRIC_NAME_LEN
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_labels(labels: &[Label]) -> Result<()> {
-        if labels.iter().all(Label::is_valid) {
-            Ok(())
-        } else {
-            Err(TsinkError::InvalidLabel(
-                "label name and value must be non-empty".to_string(),
-            ))
-        }
-    }
-
-    fn validate_rows(rows: &[Row]) -> Result<()> {
-        for row in rows {
-            Self::validate_metric_name(row.metric())?;
-            Self::validate_labels(row.labels())?;
-        }
-        Ok(())
-    }
-
-    fn recover_from_wal(&self, wal_dir: &Path) -> Result<()> {
-        let reader = WalReader::new(wal_dir)?;
-        let rows = reader.read_all()?;
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut skipped_invalid = 0usize;
-        let mut valid_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            if Self::validate_metric_name(row.metric()).is_ok()
-                && Self::validate_labels(row.labels()).is_ok()
-            {
-                valid_rows.push(row);
-            } else {
-                skipped_invalid += 1;
-            }
-        }
-
-        if skipped_invalid > 0 {
-            warn!(
-                count = skipped_invalid,
-                "Skipping WAL rows with invalid metric names or labels during recovery"
-            );
-        }
-
-        if !valid_rows.is_empty() {
-            info!("Recovering {} rows from WAL", valid_rows.len());
-        }
-
-        let replay_result = if valid_rows.is_empty() {
-            Ok(())
-        } else {
-            // Insert recovered rows.
-            let mut replay_result = Ok(());
-            for chunk in valid_rows.chunks(1000) {
-                if let Err(e) = self.insert_rows_recovery(chunk) {
-                    replay_result = Err(e);
-                    break;
-                }
-            }
-            replay_result
-        };
-
-        // Always refresh the WAL after replay attempt to avoid duplicate replays on restart.
-        let refresh_result = self.wal.refresh();
-        match (replay_result, refresh_result) {
-            (Err(replay_err), Err(refresh_err)) => {
-                warn!(
-                    replay_error = %replay_err,
-                    refresh_error = %refresh_err,
-                    "WAL replay failed and WAL refresh also failed"
-                );
-                Err(replay_err)
-            }
-            (Err(replay_err), Ok(())) => Err(replay_err),
-            (Ok(()), Err(refresh_err)) => Err(refresh_err),
-            (Ok(()), Ok(())) => Ok(()),
-        }
-    }
-
-    fn insert_rows_internal(&self, rows: &[Row]) -> Result<()> {
-        self.insert_rows_internal_with_mode(rows, false)
-    }
-
-    fn insert_rows_recovery(&self, rows: &[Row]) -> Result<()> {
-        self.insert_rows_internal_with_mode(rows, true)
-    }
-
-    fn insert_rows_internal_with_mode(&self, rows: &[Row], recovery_mode: bool) -> Result<()> {
-        Self::validate_rows(rows)?;
-        self.ensure_active_head()?;
-        let _partition_ops_guard = self.partition_ops_lock.read();
-
-        let mut pending_rows = rows.to_vec();
-        let mut extra_partitions = 0usize;
-        // A partition can accept at least one row from a non-empty batch; cap growth by batch size.
-        let max_extra_partitions = rows.len().saturating_add(WRITABLE_PARTITIONS_NUM);
-
-        while !pending_rows.is_empty() {
-            let mut remaining = pending_rows;
-
-            for partition in self.partition_list.iter() {
-                if remaining.is_empty() {
-                    break;
-                }
-
-                if partition.expired() {
-                    continue;
-                }
-
-                let insert_result = if recovery_mode {
-                    partition.insert_rows_recovery(&remaining)
-                } else {
-                    partition.insert_rows(&remaining)
-                };
-
-                match insert_result {
-                    Ok(outdated_rows) => remaining = outdated_rows,
-                    Err(TsinkError::ReadOnlyPartition { .. }) => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-
-            if remaining.is_empty() {
-                return Ok(());
-            }
-
-            if extra_partitions >= max_extra_partitions {
-                let ts = remaining
-                    .iter()
-                    .map(|row| row.data_point().timestamp)
-                    .min()
-                    .unwrap_or(0);
-                return Err(TsinkError::OutOfRetention { timestamp: ts });
-            }
-
-            self.append_partition(None)?;
-            if self.data_path.is_some() {
-                self.schedule_flush_partitions();
-            }
-            extra_partitions += 1;
-            pending_rows = remaining;
-        }
-
-        Ok(())
-    }
-
-    fn load_disk_partitions(&self, data_path: &Path) -> Result<()> {
-        let entries = fs::read_dir(data_path)?;
-        let mut partitions = Vec::new();
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir()
-                && let Some(name) = path.file_name()
-            {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("p-") {
-                    match DiskPartition::open(&path, self.retention) {
-                        Ok(partition) => {
-                            partitions.push(Arc::new(partition) as SharedPartition);
-                        }
-                        Err(TsinkError::NoDataPoints { .. }) => continue,
-                        Err(TsinkError::InvalidPartition { .. }) => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-
-        // Sort by min timestamp and insert into list
-        partitions.sort_by_key(|p| p.min_timestamp());
-        for partition in partitions {
-            self.partition_list.insert(partition);
-        }
-
-        Ok(())
-    }
-
-    fn build_partition(&self, partition: Option<SharedPartition>) -> SharedPartition {
-        if let Some(p) = partition {
-            p
-        } else {
-            let mem_partition = Arc::new(MemoryPartition::new(
-                self.wal.clone(),
-                self.partition_duration,
-                self.timestamp_precision,
-                self.retention,
-            ));
-
-            mem_partition as SharedPartition
-        }
-    }
-
-    fn new_partition(&self, partition: Option<SharedPartition>) -> Result<()> {
-        let partition = self.build_partition(partition);
-        // Rotate WAL first so a punctuate failure does not mutate partition state.
-        self.wal.punctuate()?;
-        self.partition_list.insert(partition);
-        Ok(())
-    }
-
-    fn append_partition(&self, partition: Option<SharedPartition>) -> Result<()> {
-        let partition = self.build_partition(partition);
-        // Keep WAL segmentation consistent with partition lifecycle for recovery.
-        self.wal.punctuate()?;
-        self.partition_list.insert_tail(partition);
-        Ok(())
-    }
-
-    fn active_partition_count(&self) -> usize {
-        self.partition_list
-            .iter()
-            .filter(|p| p.active() && !p.expired())
-            .count()
-    }
-
-    fn ensure_active_head(&self) -> Result<()> {
-        if self.active_partition_count() >= WRITABLE_PARTITIONS_NUM {
-            return Ok(());
-        }
-
-        let _guard = self.partition_creation_lock.lock();
-
-        let mut created = 0usize;
-        while self.active_partition_count() < WRITABLE_PARTITIONS_NUM {
-            self.new_partition(None)?;
-            created += 1;
-        }
-
-        if created > 0 {
-            // Trigger flush in background to free older partitions
-            if self.data_path.is_some() {
-                self.schedule_flush_partitions();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn schedule_flush_partitions(&self) {
-        let mut slot = self.flush_thread.lock();
-
-        if let Some(handle) = slot.as_ref()
-            && !handle.is_finished()
-        {
-            return;
-        }
-
-        if let Some(handle) = slot.take() {
-            let _ = handle.join();
-        }
-
-        let storage = self.clone_refs();
-        *slot = Some(thread::spawn(move || {
-            if let Err(e) = storage.flush_partitions() {
-                error!("Failed to flush partitions: {}", e);
-            }
-        }));
-    }
-
-    fn collect_flush_candidates(&self, skip_head: usize) -> Vec<SharedPartition> {
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut partitions_to_flush = Vec::new();
-        let mut i = 0usize;
-
-        for partition in self.partition_list.iter() {
-            if i < skip_head {
-                i += 1;
-                continue;
-            }
-
-            if partition.size() == 0 {
-                continue;
-            }
-
-            partitions_to_flush.push(partition);
-        }
-
-        partitions_to_flush
-    }
-
-    fn flush_partitions(&self) -> Result<()> {
-        let partitions_to_flush = self.collect_flush_candidates(WRITABLE_PARTITIONS_NUM);
-
-        for partition in partitions_to_flush {
-            if let Some(data_path) = &self.data_path {
-                if !partition.begin_flush() {
-                    continue;
-                }
-
-                let prepared = match self.flush_memory_partition_to_disk(&partition, data_path) {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        partition.end_flush();
-                        error!("Failed to flush partition: {}", e);
-                        continue;
-                    }
-                };
-
-                let Some(flushed_partition) = prepared else {
-                    partition.end_flush();
-                    continue;
-                };
-
-                let swapped = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list
-                        .swap(&partition, flushed_partition.clone())
-                };
-
-                match swapped {
-                    Ok(()) => {
-                        // Remove oldest WAL segment only when a memory partition was persisted.
-                        self.wal.remove_oldest()?;
-                    }
-                    Err(TsinkError::PartitionNotFound { .. }) => {
-                        partition.end_flush();
-                        let _ = flushed_partition.clean();
-                    }
-                    Err(e) => {
-                        partition.end_flush();
-                        let _ = flushed_partition.clean();
-                        return Err(e);
-                    }
-                }
-            } else {
-                // In-memory mode - just remove old partitions.
-                let remove_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.remove(&partition)
-                };
-
-                match remove_result {
-                    Ok(()) | Err(TsinkError::PartitionNotFound { .. }) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_all_partitions(&self) -> Result<()> {
-        let partitions_to_flush = self.collect_flush_candidates(0);
-
-        for partition in partitions_to_flush {
-            if let Some(data_path) = &self.data_path {
-                if !partition.begin_flush() {
-                    continue;
-                }
-
-                let prepared = match self.flush_memory_partition_to_disk(&partition, data_path)? {
-                    Some(prepared) => prepared,
-                    None => {
-                        partition.end_flush();
-                        continue;
-                    }
-                };
-
-                let swap_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.swap(&partition, prepared.clone())
-                };
-
-                if let Err(e) = swap_result {
-                    partition.end_flush();
-                    let _ = prepared.clean();
-                    return Err(e);
-                }
-            } else {
-                let remove_result = {
-                    let _partition_ops_guard = self.partition_ops_lock.write();
-                    self.partition_list.remove(&partition)
-                };
-                if let Err(e) = remove_result {
-                    if matches!(e, TsinkError::PartitionNotFound { .. }) {
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_memory_partition_to_disk(
-        &self,
-        partition: &SharedPartition,
-        data_path: &Path,
-    ) -> Result<Option<SharedPartition>> {
-        if partition.size() == 0 {
-            return Ok(None);
-        }
-
-        let dir_path = self.next_partition_dir(partition, data_path)?;
-
-        match partition.flush_to_disk()? {
-            Some((data, meta)) => {
-                let disk_partition =
-                    crate::disk::DiskPartition::create(&dir_path, meta, data, self.retention)?;
-                Ok(Some(Arc::new(disk_partition) as SharedPartition))
-            }
-            None => {
-                // Already on disk, nothing to do.
-                Ok(None)
-            }
-        }
-    }
-
-    fn next_partition_dir(&self, partition: &SharedPartition, data_path: &Path) -> Result<PathBuf> {
-        let base = format!(
-            "p-{}-{}",
-            partition.min_timestamp(),
-            partition.max_timestamp()
-        );
-        let mut candidate = data_path.join(&base);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-
-        for suffix in 1u64.. {
-            candidate = data_path.join(format!("{base}-{suffix}"));
-            if !candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-
-        Err(TsinkError::Other(
-            "unable to allocate unique partition directory".to_string(),
-        ))
-    }
-
-    fn remove_expired_partitions(&self) -> Result<()> {
-        let _partition_ops_guard = self.partition_ops_lock.write();
-        let mut expired = Vec::new();
-
-        for partition in self.partition_list.iter() {
-            if partition.expired() {
-                expired.push(partition);
-            }
-        }
-
-        for partition in expired {
-            self.partition_list.remove(&partition)?;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn expiry_check_interval(&self) -> Duration {
-        Duration::from_millis(50)
-    }
-
-    #[cfg(not(test))]
-    fn expiry_check_interval(&self) -> Duration {
-        if self.retention.is_zero() {
-            return Duration::from_secs(3600);
-        }
-
-        let interval = self.retention / 10;
-        interval.clamp(Duration::from_secs(1), Duration::from_secs(3600))
-    }
-
-    fn start_background_tasks(&self) {
-        let (stop_tx, stop_rx) = bounded::<()>(1);
-        *self.expiry_stop_tx.lock() = Some(stop_tx);
-
-        let storage = self.clone_refs();
-        let interval = storage.expiry_check_interval();
-        let handle = thread::spawn(move || {
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Ok(_) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if storage.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
-                            break;
-                        }
-
-                        if let Err(e) = storage.remove_expired_partitions() {
-                            error!("Failed to remove expired partitions: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-        *self.expiry_thread.lock() = Some(handle);
-    }
-
-    fn stop_background_tasks(&self) {
-        if let Some(tx) = self.expiry_stop_tx.lock().take() {
-            let _ = tx.try_send(());
-        }
-
-        if let Some(handle) = self.expiry_thread.lock().take() {
-            let _ = handle.join();
-        }
-    }
-
-    fn stop_flush_worker(&self) {
-        if let Some(handle) = self.flush_thread.lock().take() {
-            let _ = handle.join();
-        }
-    }
-
-    fn clone_refs(&self) -> Arc<StorageImpl> {
-        Arc::new(StorageImpl {
-            partition_list: self.partition_list.clone(),
-            data_path: self.data_path.clone(),
-            partition_duration: self.partition_duration,
-            retention: self.retention,
-            timestamp_precision: self.timestamp_precision,
-            write_timeout: self.write_timeout,
-            wal: self.wal.clone(),
-            workers_semaphore: self.workers_semaphore.clone(),
-            lifecycle: self.lifecycle.clone(),
-            partition_creation_lock: self.partition_creation_lock.clone(),
-            partition_ops_lock: self.partition_ops_lock.clone(),
-            expiry_thread: self.expiry_thread.clone(),
-            expiry_stop_tx: self.expiry_stop_tx.clone(),
-            flush_thread: self.flush_thread.clone(),
-        })
+    /// Apply a custom bytes aggregation by providing a codec and typed aggregator.
+    #[must_use]
+    pub fn with_custom_bytes_aggregation<C, A>(mut self, codec: C, aggregator: A) -> Self
+    where
+        C: Codec + 'static,
+        A: TypedAggregator<C::Item> + 'static,
+    {
+        self.custom_aggregation = Some(Arc::new(CodecAggregator::new(codec, aggregator)));
+        self
     }
 }
 
-impl Storage for StorageImpl {
-    fn insert_rows(&self, rows: &[Row]) -> Result<()> {
-        self.ensure_operational()?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericDomain {
+    F64,
+    I64,
+    U64,
+    Mixed,
+}
 
-        // Try to acquire worker slot with timeout
-        let _guard = match self.workers_semaphore.try_acquire_for(self.write_timeout) {
-            Ok(guard) => guard,
-            Err(TsinkError::WriteTimeout { .. }) => {
-                return match self.lifecycle.load(Ordering::SeqCst) {
-                    STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-                    STORAGE_CLOSED => Err(TsinkError::StorageClosed),
-                    _ => Err(TsinkError::WriteTimeout {
-                        timeout_ms: self.write_timeout.as_millis() as u64,
-                        workers: self.workers_semaphore.capacity(),
-                    }),
+fn aggregation_name(aggregation: Aggregation) -> &'static str {
+    match aggregation {
+        Aggregation::None => "none",
+        Aggregation::Sum => "sum",
+        Aggregation::Min => "min",
+        Aggregation::Max => "max",
+        Aggregation::Avg => "avg",
+        Aggregation::First => "first",
+        Aggregation::Last => "last",
+        Aggregation::Count => "count",
+        Aggregation::Median => "median",
+        Aggregation::Range => "range",
+        Aggregation::Variance => "variance",
+        Aggregation::StdDev => "stddev",
+    }
+}
+
+fn is_nan_f64(value: &Value) -> bool {
+    matches!(value, Value::F64(v) if v.is_nan())
+}
+
+fn numeric_domain(points: &[DataPoint], aggregation: Aggregation) -> Result<Option<NumericDomain>> {
+    let mut has_f64 = false;
+    let mut has_i64 = false;
+    let mut has_u64 = false;
+
+    for point in points {
+        match &point.value {
+            Value::F64(v) => {
+                if !v.is_nan() {
+                    has_f64 = true;
+                }
+            }
+            Value::I64(_) => has_i64 = true,
+            Value::U64(_) => has_u64 = true,
+            _ => {
+                return Err(TsinkError::UnsupportedAggregation {
+                    aggregation: aggregation_name(aggregation).to_string(),
+                    value_type: point.value.kind().to_string(),
+                });
+            }
+        }
+    }
+
+    let count = has_f64 as u8 + has_i64 as u8 + has_u64 as u8;
+    if count == 0 {
+        Ok(None)
+    } else if count > 1 {
+        Ok(Some(NumericDomain::Mixed))
+    } else if has_f64 {
+        Ok(Some(NumericDomain::F64))
+    } else if has_i64 {
+        Ok(Some(NumericDomain::I64))
+    } else {
+        Ok(Some(NumericDomain::U64))
+    }
+}
+
+fn numeric_values_f64(points: &[DataPoint], aggregation: Aggregation) -> Result<Vec<f64>> {
+    let mut values = Vec::with_capacity(points.len());
+    for point in points {
+        match &point.value {
+            Value::F64(v) if v.is_nan() => {}
+            Value::F64(v) => values.push(*v),
+            Value::I64(v) => {
+                let Some(value) = i64_to_f64_exact(*v) else {
+                    return Err(TsinkError::UnsupportedAggregation {
+                        aggregation: aggregation_name(aggregation).to_string(),
+                        value_type: format!(
+                            "{} (cannot be represented exactly as f64)",
+                            point.value.kind()
+                        ),
+                    });
                 };
+                values.push(value);
             }
-            Err(err) => return Err(err),
-        };
-
-        self.ensure_operational()?;
-        self.insert_rows_internal(rows)
-    }
-
-    fn select(
-        &self,
-        metric: &str,
-        labels: &[Label],
-        start: i64,
-        end: i64,
-    ) -> Result<Vec<DataPoint>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-        Self::validate_labels(labels)?;
-
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut all_points = Vec::new();
-
-        for partition in self.partition_list.iter() {
-            if partition.size() == 0 || partition.expired() {
-                continue;
+            Value::U64(v) => {
+                let Some(value) = u64_to_f64_exact(*v) else {
+                    return Err(TsinkError::UnsupportedAggregation {
+                        aggregation: aggregation_name(aggregation).to_string(),
+                        value_type: format!(
+                            "{} (cannot be represented exactly as f64)",
+                            point.value.kind()
+                        ),
+                    });
+                };
+                values.push(value);
             }
-
-            match partition.select_data_points(metric, labels, start, end) {
-                Ok(points) => all_points.extend(points),
-                Err(TsinkError::NoDataPoints { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        all_points.sort_by_key(|p| p.timestamp);
-
-        Ok(all_points)
-    }
-
-    fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-        Self::validate_labels(&opts.labels)?;
-
-        if opts.start >= opts.end {
-            return Err(TsinkError::InvalidTimeRange {
-                start: opts.start,
-                end: opts.end,
-            });
-        }
-
-        if let Some(d) = opts.downsample
-            && d.interval <= 0
-        {
-            return Err(TsinkError::InvalidConfiguration(
-                "downsample interval must be positive".to_string(),
-            ));
-        }
-
-        // Reuse the existing select for raw points.
-        let points = self.select(metric, &opts.labels, opts.start, opts.end)?;
-
-        // Downsample or aggregate if requested.
-        let aggregation = match (opts.downsample.is_some(), opts.aggregation) {
-            (true, Aggregation::None) => Aggregation::Last, // sensible default for downsampling
-            _ => opts.aggregation,
-        };
-
-        let mut processed = if let Some(downsample) = opts.downsample {
-            downsample_points(
-                &points,
-                downsample.interval,
-                aggregation,
-                opts.start,
-                opts.end,
-            )
-        } else if aggregation != Aggregation::None {
-            aggregate_series(&points, aggregation)
-                .into_iter()
-                .collect::<Vec<DataPoint>>()
-        } else {
-            points
-        };
-
-        // Apply pagination.
-        if opts.offset > 0 && opts.offset < processed.len() {
-            processed.drain(0..opts.offset);
-        } else if opts.offset >= processed.len() {
-            processed.clear();
-        }
-
-        if let Some(limit) = opts.limit {
-            processed.truncate(limit);
-        }
-
-        Ok(processed)
-    }
-
-    fn select_all(
-        &self,
-        metric: &str,
-        start: i64,
-        end: i64,
-    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
-        self.ensure_operational()?;
-        Self::validate_metric_name(metric)?;
-
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-
-        let _partition_ops_guard = self.partition_ops_lock.read();
-        let mut results_map: std::collections::HashMap<Vec<Label>, Vec<DataPoint>> =
-            std::collections::HashMap::new();
-
-        for partition in self.partition_list.iter() {
-            // Skip only if partition is truly empty (size == 0)
-            if partition.size() == 0 {
-                continue;
-            }
-
-            if partition.expired() {
-                continue;
-            }
-
-            // Perform selection
-            match partition.select_all_labels(metric, start, end) {
-                Ok(partition_results) => {
-                    for (labels, points) in partition_results {
-                        results_map.entry(labels).or_default().extend(points);
-                    }
-                }
-                Err(TsinkError::NoDataPoints { .. }) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Sort points within each label set
-        let mut results: Vec<(Vec<Label>, Vec<DataPoint>)> = results_map
-            .into_iter()
-            .map(|(labels, mut points)| {
-                points.sort_by_key(|p| p.timestamp);
-                (labels, points)
-            })
-            .collect();
-
-        // Sort by label sets for consistent output
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(results)
-    }
-
-    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
-        self.ensure_operational()?;
-
-        let mut unique = BTreeSet::new();
-        let mut skipped_invalid = 0usize;
-
-        {
-            let _partition_ops_guard = self.partition_ops_lock.read();
-
-            for partition in self.partition_list.iter() {
-                if partition.size() == 0 || partition.expired() {
-                    continue;
-                }
-
-                for (name, labels) in partition.list_metric_series()? {
-                    if Self::validate_metric_name(&name).is_err()
-                        || Self::validate_labels(&labels).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(name, labels));
-                }
-            }
-        }
-
-        if let Some(data_path) = &self.data_path {
-            let wal_dir = data_path.join("wal");
-            if wal_dir.exists() {
-                let rows = WalReader::new(&wal_dir)?.read_all()?;
-                for row in rows {
-                    if Self::validate_metric_name(row.metric()).is_err()
-                        || Self::validate_labels(row.labels()).is_err()
-                    {
-                        skipped_invalid += 1;
-                        continue;
-                    }
-
-                    unique.insert(Self::canonical_series(
-                        row.metric().to_string(),
-                        row.labels().to_vec(),
-                    ));
-                }
-            }
-        }
-
-        if skipped_invalid > 0 {
-            warn!(
-                count = skipped_invalid,
-                "Skipping invalid metric series while listing metrics"
-            );
-        }
-
-        Ok(unique.into_iter().collect())
-    }
-
-    fn close(&self) -> Result<()> {
-        let state = self.lifecycle.compare_exchange(
-            STORAGE_OPEN,
-            STORAGE_CLOSING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        if state.is_err() {
-            return match self.lifecycle.load(Ordering::SeqCst) {
-                STORAGE_CLOSING => Err(TsinkError::StorageShuttingDown),
-                _ => Err(TsinkError::StorageClosed),
-            };
-        }
-
-        // Stop background workers first to avoid resource retention while closing.
-        self.stop_background_tasks();
-
-        let close_result = (|| -> Result<()> {
-            // Block until all in-flight writers have completed.
-            let _writer_guards = self.workers_semaphore.acquire_all(self.write_timeout)?;
-
-            // Ensure no flush worker is racing with close-time flush/removal.
-            self.stop_flush_worker();
-
-            // Flush WAL
-            self.wal.flush()?;
-
-            // For in-memory mode, just return
-            if self.data_path.is_none() {
-                return Ok(());
-            }
-
-            // Create final partitions to make all writable ones read-only
-            for _ in 0..WRITABLE_PARTITIONS_NUM {
-                self.new_partition(None)?;
-            }
-
-            // Flush all partitions
-            self.flush_all_partitions()?;
-
-            // Remove expired partitions
-            self.remove_expired_partitions()?;
-
-            // Remove WAL
-            self.wal.remove_all()?;
-
-            Ok(())
-        })();
-
-        match close_result {
-            Ok(()) => {
-                self.lifecycle.store(STORAGE_CLOSED, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(err) => {
-                self.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
-                self.start_background_tasks();
-                Err(err)
+            _ => {
+                return Err(TsinkError::UnsupportedAggregation {
+                    aggregation: aggregation_name(aggregation).to_string(),
+                    value_type: point.value.kind().to_string(),
+                });
             }
         }
     }
+    Ok(values)
 }
 
-fn min_non_nan_point(points: &[DataPoint]) -> Option<DataPoint> {
-    let mut best: Option<DataPoint> = None;
-    for point in points.iter().copied() {
-        if point.value.is_nan() {
-            continue;
-        }
-        match best {
-            Some(current) if point.value.total_cmp(&current.value).is_lt() => best = Some(point),
-            None => best = Some(point),
-            _ => {}
-        }
-    }
-    best
-}
-
-fn max_non_nan_point(points: &[DataPoint]) -> Option<DataPoint> {
-    let mut best: Option<DataPoint> = None;
-    for point in points.iter().copied() {
-        if point.value.is_nan() {
-            continue;
-        }
-        match best {
-            Some(current) if point.value.total_cmp(&current.value).is_gt() => best = Some(point),
-            None => best = Some(point),
-            _ => {}
-        }
-    }
-    best
-}
-
-fn aggregate_series(points: &[DataPoint], aggregation: Aggregation) -> Option<DataPoint> {
-    if points.is_empty() {
+fn integral_f64_to_i128(value: f64) -> Option<i128> {
+    if !value.is_finite() {
         return None;
     }
 
-    match aggregation {
-        Aggregation::None => None,
-        Aggregation::Last => points.last().copied(),
-        Aggregation::Sum | Aggregation::Avg => {
-            let mut sum = 0.0;
-            for p in points {
-                sum += p.value;
-            }
-            let value = if aggregation == Aggregation::Avg {
-                sum / points.len() as f64
-            } else {
-                sum
-            };
+    let bits = value.to_bits();
+    let sign = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
 
-            Some(DataPoint::new(points.last().unwrap().timestamp, value))
+    let magnitude = if exponent_bits == 0 {
+        if fraction == 0 {
+            0u128
+        } else {
+            return None;
         }
-        Aggregation::Min => min_non_nan_point(points).or_else(|| points.last().copied()),
-        Aggregation::Max => max_non_nan_point(points).or_else(|| points.last().copied()),
+    } else {
+        let exponent = exponent_bits - 1023;
+        let significand = ((1u64 << 52) | fraction) as u128;
+
+        if exponent < 0 {
+            return None;
+        }
+
+        if exponent >= 52 {
+            let shift = (exponent - 52) as u32;
+            significand.checked_shl(shift)?
+        } else {
+            let shift = (52 - exponent) as u32;
+            let mask = (1u128 << shift) - 1;
+            if (significand & mask) != 0 {
+                return None;
+            }
+            significand >> shift
+        }
+    };
+
+    if sign {
+        let min_abs = (i128::MAX as u128) + 1;
+        if magnitude == min_abs {
+            Some(i128::MIN)
+        } else if magnitude <= i128::MAX as u128 {
+            Some(-(magnitude as i128))
+        } else {
+            None
+        }
+    } else if magnitude <= i128::MAX as u128 {
+        Some(magnitude as i128)
+    } else {
+        None
     }
+}
+
+fn cmp_f64_with_i128(value: f64, integer: i128) -> std::cmp::Ordering {
+    if value.is_nan() {
+        return value.total_cmp(&(integer as f64));
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+    }
+
+    let rounded = integer as f64;
+    let ord = value.total_cmp(&rounded);
+    if !ord.is_eq() {
+        return ord;
+    }
+
+    integral_f64_to_i128(value)
+        .map(|parsed| parsed.cmp(&integer))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn value_cmp(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (Value::F64(a), Value::F64(b)) => Ok(a.total_cmp(b)),
+        (Value::F64(a), Value::I64(b)) => Ok(cmp_f64_with_i128(*a, *b as i128)),
+        (Value::F64(a), Value::U64(b)) => Ok(cmp_f64_with_i128(*a, *b as i128)),
+        (Value::I64(a), Value::F64(b)) => Ok(cmp_f64_with_i128(*b, *a as i128).reverse()),
+        (Value::I64(a), Value::I64(b)) => Ok(a.cmp(b)),
+        (Value::I64(a), Value::U64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
+        (Value::U64(a), Value::F64(b)) => Ok(cmp_f64_with_i128(*b, *a as i128).reverse()),
+        (Value::U64(a), Value::I64(b)) => Ok((*a as i128).cmp(&(*b as i128))),
+        (Value::U64(a), Value::U64(b)) => Ok(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+        (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
+        (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+        _ => Err(TsinkError::ValueTypeMismatch {
+            expected: lhs.kind().to_string(),
+            actual: rhs.kind().to_string(),
+        }),
+    }
+}
+
+fn min_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
+    let mut best: Option<DataPoint> = None;
+    for point in points {
+        if is_nan_f64(&point.value) {
+            continue;
+        }
+
+        match &best {
+            Some(current) if value_cmp(&point.value, &current.value)?.is_lt() => {
+                best = Some(point.clone())
+            }
+            None => best = Some(point.clone()),
+            _ => {}
+        }
+    }
+    Ok(best)
+}
+
+fn max_point(points: &[DataPoint]) -> Result<Option<DataPoint>> {
+    let mut best: Option<DataPoint> = None;
+    for point in points {
+        if is_nan_f64(&point.value) {
+            continue;
+        }
+
+        match &best {
+            Some(current) if value_cmp(&point.value, &current.value)?.is_gt() => {
+                best = Some(point.clone())
+            }
+            None => best = Some(point.clone()),
+            _ => {}
+        }
+    }
+    Ok(best)
+}
+
+fn sum_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let Some(domain) = numeric_domain(points, Aggregation::Sum)? else {
+        return Ok(None);
+    };
+
+    let value = match domain {
+        NumericDomain::F64 => {
+            let sum: f64 = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::F64(v) if !v.is_nan() => Some(*v),
+                    _ => None,
+                })
+                .sum();
+            Value::F64(sum)
+        }
+        NumericDomain::I64 => {
+            let sum = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::I64(v) => Some(*v as i128),
+                    _ => None,
+                })
+                .sum::<i128>()
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            Value::I64(sum)
+        }
+        NumericDomain::U64 => {
+            let sum = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::U64(v) => Some(*v as u128),
+                    _ => None,
+                })
+                .sum::<u128>()
+                .min(u64::MAX as u128) as u64;
+            Value::U64(sum)
+        }
+        NumericDomain::Mixed => {
+            let sum: f64 = numeric_values_f64(points, Aggregation::Sum)?
+                .into_iter()
+                .sum();
+            Value::F64(sum)
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn average_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let values = numeric_values_f64(points, Aggregation::Avg)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let sum: f64 = values.iter().sum();
+    Ok(Some(Value::F64(sum / values.len() as f64)))
+}
+
+fn median_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let mut values = numeric_values_f64(points, Aggregation::Median)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    let median = if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
+    };
+
+    Ok(Some(Value::F64(median)))
+}
+
+fn range_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let Some(domain) = numeric_domain(points, Aggregation::Range)? else {
+        return Ok(None);
+    };
+
+    let value = match domain {
+        NumericDomain::F64 => {
+            let values: Vec<f64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::F64(v) if !v.is_nan() => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values
+                .iter()
+                .copied()
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            let max = values
+                .iter()
+                .copied()
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            Value::F64(max - min)
+        }
+        NumericDomain::I64 => {
+            let values: Vec<i64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::I64(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values.iter().min().copied().unwrap() as i128;
+            let max = values.iter().max().copied().unwrap() as i128;
+            Value::I64((max - min).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
+        NumericDomain::U64 => {
+            let values: Vec<u64> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::U64(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values.iter().min().copied().unwrap();
+            let max = values.iter().max().copied().unwrap();
+            Value::U64(max.saturating_sub(min))
+        }
+        NumericDomain::Mixed => {
+            // Preserve integer precision when the mixed set is i64/u64 only.
+            let mut int_min: Option<i128> = None;
+            let mut int_max: Option<i128> = None;
+            let mut has_f64 = false;
+
+            for point in points {
+                match &point.value {
+                    Value::I64(v) => {
+                        let value = *v as i128;
+                        int_min = Some(int_min.map_or(value, |min| min.min(value)));
+                        int_max = Some(int_max.map_or(value, |max| max.max(value)));
+                    }
+                    Value::U64(v) => {
+                        let value = *v as i128;
+                        int_min = Some(int_min.map_or(value, |min| min.min(value)));
+                        int_max = Some(int_max.map_or(value, |max| max.max(value)));
+                    }
+                    Value::F64(v) if v.is_nan() => {}
+                    Value::F64(_) => {
+                        has_f64 = true;
+                        break;
+                    }
+                    _ => {
+                        return Err(TsinkError::UnsupportedAggregation {
+                            aggregation: aggregation_name(Aggregation::Range).to_string(),
+                            value_type: point.value.kind().to_string(),
+                        });
+                    }
+                }
+            }
+
+            if !has_f64 {
+                let (Some(min), Some(max)) = (int_min, int_max) else {
+                    return Ok(None);
+                };
+                return Ok(Some(Value::F64((max - min) as f64)));
+            }
+
+            let values = numeric_values_f64(points, Aggregation::Range)?;
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let min = values
+                .iter()
+                .copied()
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            let max = values
+                .iter()
+                .copied()
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            Value::F64(max - min)
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn population_variance_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
+    let values = numeric_values_f64(points, Aggregation::Variance)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut count = 0.0f64;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+
+    for value in values {
+        count += 1.0;
+        let delta = value - mean;
+        mean += delta / count;
+        let delta2 = value - mean;
+        m2 += delta * delta2;
+    }
+
+    Ok(Some(Value::F64(m2 / count)))
+}
+
+pub(crate) fn aggregate_series(
+    points: &[DataPoint],
+    aggregation: Aggregation,
+) -> Result<Option<DataPoint>> {
+    let Some(last) = points.last() else {
+        return Ok(None);
+    };
+
+    let aggregated = match aggregation {
+        Aggregation::None => None,
+        Aggregation::First => return Ok(points.first().cloned()),
+        Aggregation::Last => return Ok(points.last().cloned()),
+        Aggregation::Count => Some(DataPoint::new(
+            last.timestamp,
+            Value::U64(
+                points
+                    .iter()
+                    .filter(|point| !is_nan_f64(&point.value))
+                    .count() as u64,
+            ),
+        )),
+        Aggregation::Sum => sum_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value)),
+        Aggregation::Avg => {
+            average_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Min => min_point(points)?,
+        Aggregation::Max => max_point(points)?,
+        Aggregation::Median => {
+            median_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Range => {
+            range_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::Variance => {
+            population_variance_numeric(points)?.map(|value| DataPoint::new(last.timestamp, value))
+        }
+        Aggregation::StdDev => population_variance_numeric(points)?
+            .and_then(|value| match value {
+                Value::F64(v) => Some(Value::F64(v.sqrt())),
+                _ => None,
+            })
+            .map(|value| DataPoint::new(last.timestamp, value)),
+    };
+
+    Ok(aggregated)
 }
 
 fn aggregate_bucket(
     points: &[DataPoint],
     aggregation: Aggregation,
     bucket_start: i64,
-) -> Option<DataPoint> {
+) -> Result<Option<DataPoint>> {
     if points.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    match aggregation {
+    let aggregated = match aggregation {
         Aggregation::None => None,
-        Aggregation::Last => points.last().copied(),
-        Aggregation::Sum | Aggregation::Avg => {
-            let mut sum = 0.0;
-            for p in points {
-                sum += p.value;
-            }
-            let value = if aggregation == Aggregation::Avg {
-                sum / points.len() as f64
-            } else {
-                sum
-            };
-            Some(DataPoint::new(bucket_start, value))
+        Aggregation::First => points
+            .first()
+            .map(|point| DataPoint::new(bucket_start, point.value.clone())),
+        Aggregation::Last => points
+            .last()
+            .map(|point| DataPoint::new(bucket_start, point.value.clone())),
+        Aggregation::Count => Some(DataPoint::new(
+            bucket_start,
+            Value::U64(
+                points
+                    .iter()
+                    .filter(|point| !is_nan_f64(&point.value))
+                    .count() as u64,
+            ),
+        )),
+        Aggregation::Sum => sum_numeric(points)?.map(|value| DataPoint::new(bucket_start, value)),
+        Aggregation::Avg => {
+            average_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
         }
-        Aggregation::Min => min_non_nan_point(points)
-            .map(|p| DataPoint::new(bucket_start, p.value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-        Aggregation::Max => max_non_nan_point(points)
-            .map(|p| DataPoint::new(bucket_start, p.value))
-            .or_else(|| points.last().map(|p| DataPoint::new(bucket_start, p.value))),
-    }
+        Aggregation::Min => {
+            min_point(points)?.map(|point| DataPoint::new(bucket_start, point.value))
+        }
+        Aggregation::Max => {
+            max_point(points)?.map(|point| DataPoint::new(bucket_start, point.value))
+        }
+        Aggregation::Median => {
+            median_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Range => {
+            range_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::Variance => {
+            population_variance_numeric(points)?.map(|value| DataPoint::new(bucket_start, value))
+        }
+        Aggregation::StdDev => population_variance_numeric(points)?
+            .and_then(|value| match value {
+                Value::F64(v) => Some(Value::F64(v.sqrt())),
+                _ => None,
+            })
+            .map(|value| DataPoint::new(bucket_start, value)),
+    };
+
+    Ok(aggregated)
 }
 
-fn downsample_points(
+fn bucket_start_for(ts: i64, start: i64, interval: i64) -> i64 {
+    let rel = ts as i128 - start as i128;
+    let bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
+    bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+pub(crate) fn downsample_points(
     points: &[DataPoint],
     interval: i64,
     aggregation: Aggregation,
     start: i64,
     end: i64,
-) -> Vec<DataPoint> {
-    if points.is_empty() {
-        return Vec::new();
+) -> Result<Vec<DataPoint>> {
+    if points.is_empty() || interval <= 0 || start >= end {
+        return Ok(Vec::new());
     }
+
     let mut result = Vec::new();
     let mut idx = 0;
-    let mut bucket_start = start;
 
-    while bucket_start < end {
+    while idx < points.len() && points[idx].timestamp < start {
+        idx += 1;
+    }
+
+    while idx < points.len() {
+        if points[idx].timestamp >= end {
+            break;
+        }
+
+        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
         let bucket_end = bucket_start.saturating_add(interval);
-        let mut bucket_points = Vec::new();
+        let bucket_begin = idx;
 
-        while idx < points.len() && points[idx].timestamp < bucket_end {
-            bucket_points.push(points[idx]);
+        while idx < points.len() {
+            let ts = points[idx].timestamp;
+            if ts >= end || ts >= bucket_end {
+                break;
+            }
             idx += 1;
         }
 
-        if let Some(dp) = aggregate_bucket(&bucket_points, aggregation, bucket_start) {
+        if let Some(dp) = aggregate_bucket(&points[bucket_begin..idx], aggregation, bucket_start)? {
             result.push(dp);
-        }
-
-        // Fast-forward if points are sparse
-        if idx < points.len() && points[idx].timestamp >= bucket_end {
-            let rel = points[idx].timestamp as i128 - start as i128;
-            let next_bucket = start as i128 + rel.div_euclid(interval as i128) * interval as i128;
-            let next_bucket = next_bucket.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            bucket_start = std::cmp::max(bucket_end, next_bucket);
-        } else {
-            bucket_start = bucket_end;
         }
     }
 
-    result
+    Ok(result)
+}
+
+pub(crate) fn downsample_points_with_custom(
+    points: &[DataPoint],
+    interval: i64,
+    aggregation: &dyn BytesAggregation,
+    start: i64,
+    end: i64,
+) -> Result<Vec<DataPoint>> {
+    if points.is_empty() || interval <= 0 || start >= end {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    let mut idx = 0;
+
+    while idx < points.len() && points[idx].timestamp < start {
+        idx += 1;
+    }
+
+    while idx < points.len() {
+        if points[idx].timestamp >= end {
+            break;
+        }
+
+        let bucket_start = bucket_start_for(points[idx].timestamp, start, interval);
+        let bucket_end = bucket_start.saturating_add(interval);
+        let bucket_begin = idx;
+
+        while idx < points.len() {
+            let ts = points[idx].timestamp;
+            if ts >= end || ts >= bucket_end {
+                break;
+            }
+            idx += 1;
+        }
+
+        if let Some(dp) = aggregation.aggregate_bucket(&points[bucket_begin..idx], bucket_start)? {
+            result.push(dp);
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use super::{aggregate_bucket, aggregate_series};
+    use crate::{Aggregation, DataPoint, TsinkError, Value};
 
     #[test]
-    fn memory_mode_removes_expired_partitions_in_background() {
-        let storage = StorageBuilder::new()
-            .with_retention(Duration::from_millis(50))
-            .with_timestamp_precision(TimestampPrecision::Milliseconds)
-            .with_partition_duration(Duration::from_millis(10))
-            .build_impl()
+    fn mixed_i64_u64_min_max_use_integer_order_for_large_values() {
+        let larger = i64::MAX;
+        let smaller = (i64::MAX as u64).saturating_sub(1);
+
+        let min_points = vec![
+            DataPoint::new(1, Value::I64(larger)),
+            DataPoint::new(2, Value::U64(smaller)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
+            .unwrap()
             .unwrap();
+        assert_eq!(min.value, Value::U64(smaller));
 
-        let row = Row::new("metric", DataPoint::new(1, 1.0));
-        storage.insert_rows(&[row]).unwrap();
+        let max_points = vec![
+            DataPoint::new(1, Value::U64(smaller)),
+            DataPoint::new(2, Value::I64(larger)),
+        ];
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::I64(larger));
+    }
 
-        let partition_with_data = storage
-            .partition_list
-            .iter()
-            .find(|partition| partition.size() > 0)
-            .expect("expected partition with data");
-        let weak_partition = Arc::downgrade(&partition_with_data);
-        drop(partition_with_data);
+    #[test]
+    fn mixed_i64_u64_range_preserves_unit_difference_at_high_values() {
+        let points = vec![
+            DataPoint::new(1, Value::I64(i64::MAX - 1)),
+            DataPoint::new(2, Value::U64(i64::MAX as u64)),
+        ];
 
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while weak_partition.upgrade().is_some() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        let range = aggregate_series(&points, Aggregation::Range)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range.value, Value::F64(1.0));
+    }
+
+    #[test]
+    fn mixed_i64_f64_min_max_preserve_order_for_large_values() {
+        let larger_f64 = i64::MAX as f64;
+        let smaller_i64 = i64::MAX - 1;
+
+        let min_points = vec![
+            DataPoint::new(1, Value::F64(larger_f64)),
+            DataPoint::new(2, Value::I64(smaller_i64)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
+            .unwrap()
+            .unwrap();
+        assert_eq!(min.value, Value::I64(smaller_i64));
+
+        let max_points = vec![
+            DataPoint::new(1, Value::I64(smaller_i64)),
+            DataPoint::new(2, Value::F64(larger_f64)),
+        ];
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::F64(larger_f64));
+    }
+
+    #[test]
+    fn mixed_u64_f64_min_max_preserve_order_for_large_values() {
+        let larger_f64 = u64::MAX as f64;
+        let smaller_u64 = u64::MAX - 1;
+
+        let min_points = vec![
+            DataPoint::new(1, Value::F64(larger_f64)),
+            DataPoint::new(2, Value::U64(smaller_u64)),
+        ];
+        let min = aggregate_series(&min_points, Aggregation::Min)
+            .unwrap()
+            .unwrap();
+        assert_eq!(min.value, Value::U64(smaller_u64));
+
+        let max_points = vec![
+            DataPoint::new(1, Value::U64(smaller_u64)),
+            DataPoint::new(2, Value::F64(larger_f64)),
+        ];
+        let max = aggregate_series(&max_points, Aggregation::Max)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.value, Value::F64(larger_f64));
+    }
+
+    #[test]
+    fn variance_rejects_non_representable_large_integers() {
+        let points = vec![
+            DataPoint::new(1, Value::I64(i64::MAX - 1)),
+            DataPoint::new(2, Value::I64(i64::MAX)),
+        ];
+
+        let err = aggregate_series(&points, Aggregation::Variance).unwrap_err();
+        assert!(matches!(err, TsinkError::UnsupportedAggregation { .. }));
+        assert!(err
+            .to_string()
+            .contains("cannot be represented exactly as f64"));
+    }
+
+    #[test]
+    fn all_nan_numeric_aggregations_return_none_for_series() {
+        let points = vec![
+            DataPoint::new(1, Value::F64(f64::NAN)),
+            DataPoint::new(2, Value::F64(f64::NAN)),
+        ];
+
+        for aggregation in [
+            Aggregation::Sum,
+            Aggregation::Avg,
+            Aggregation::Min,
+            Aggregation::Max,
+            Aggregation::Median,
+            Aggregation::Range,
+            Aggregation::Variance,
+            Aggregation::StdDev,
+        ] {
+            assert!(aggregate_series(&points, aggregation).unwrap().is_none());
         }
-
-        assert!(
-            weak_partition.upgrade().is_none(),
-            "expired memory partition should be dropped"
-        );
-
-        storage.close().unwrap();
     }
 
     #[test]
-    fn build_rejects_partition_duration_too_small_for_precision() {
-        let result = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_millis(1))
-            .build_impl();
-
-        assert!(matches!(result, Err(TsinkError::InvalidConfiguration(_))));
-    }
-
-    #[test]
-    fn build_rejects_positive_retention_too_small_for_precision() {
-        let result = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_retention(Duration::from_millis(1))
-            .build_impl();
-
-        assert!(matches!(result, Err(TsinkError::InvalidConfiguration(_))));
-    }
-
-    #[test]
-    fn close_failure_keeps_storage_operational_for_retry() {
-        let storage = StorageBuilder::new()
-            .with_write_timeout(Duration::from_millis(1))
-            .build_impl()
-            .unwrap();
-
-        let permit = storage
-            .workers_semaphore
-            .try_acquire_for(Duration::from_secs(1))
-            .unwrap();
-
-        let err = storage.close().unwrap_err();
-        assert!(matches!(err, TsinkError::WriteTimeout { .. }));
-        drop(permit);
-
-        storage
-            .insert_rows(&[Row::new("close_retry", DataPoint::new(1, 1.0))])
-            .unwrap();
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn insert_batch_spanning_more_than_two_windows_is_accepted() {
-        let storage = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        let rows = vec![
-            Row::new("wide_span", DataPoint::new(10_000, 1.0)),
-            Row::new("wide_span", DataPoint::new(9_900, 2.0)),
-            Row::new("wide_span", DataPoint::new(9_700, 3.0)),
+    fn all_nan_numeric_aggregations_return_none_for_bucket() {
+        let points = vec![
+            DataPoint::new(1, Value::F64(f64::NAN)),
+            DataPoint::new(2, Value::F64(f64::NAN)),
         ];
 
-        storage.insert_rows(&rows).unwrap();
-        let points = storage.select("wide_span", &[], 0, i64::MAX).unwrap();
-        assert_eq!(points.len(), 3);
-
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn backfilled_rows_are_appended_to_older_partitions() {
-        let storage = StorageBuilder::new()
-            .with_timestamp_precision(TimestampPrecision::Seconds)
-            .with_partition_duration(Duration::from_secs(60))
-            .build_impl()
-            .unwrap();
-
-        let rows = vec![
-            Row::new("ordering", DataPoint::new(1_000, 1.0)),
-            Row::new("ordering", DataPoint::new(100, 2.0)),
-            Row::new("ordering", DataPoint::new(-900, 3.0)),
-        ];
-
-        storage.insert_rows(&rows).unwrap();
-
-        let mins: Vec<i64> = storage
-            .partition_list
-            .iter()
-            .filter(|partition| partition.size() > 0)
-            .map(|partition| partition.min_timestamp())
-            .collect();
-
-        assert!(
-            mins.len() >= 3,
-            "expected three non-empty partitions, got {mins:?}"
-        );
-        assert!(
-            mins.windows(2).all(|pair| pair[0] >= pair[1]),
-            "partitions must stay ordered newest->oldest, got {mins:?}"
-        );
-
-        storage.close().unwrap();
-    }
-
-    #[test]
-    fn insert_waiting_on_permit_returns_shutdown_error_when_closing_begins() {
-        let storage = StorageBuilder::new()
-            .with_max_writers(1)
-            .with_write_timeout(Duration::from_millis(25))
-            .build_impl()
-            .unwrap();
-
-        let permit = storage
-            .workers_semaphore
-            .try_acquire_for(Duration::from_secs(1))
-            .unwrap();
-
-        let storage_for_insert = storage.clone_refs();
-        let handle = std::thread::spawn(move || {
-            storage_for_insert.insert_rows(&[Row::new("shutdown", DataPoint::new(1, 1.0))])
-        });
-
-        std::thread::sleep(Duration::from_millis(5));
-        storage.lifecycle.store(STORAGE_CLOSING, Ordering::SeqCst);
-
-        let result = handle.join().unwrap();
-        assert!(matches!(result, Err(TsinkError::StorageShuttingDown)));
-
-        storage.lifecycle.store(STORAGE_OPEN, Ordering::SeqCst);
-        drop(permit);
-        storage.close().unwrap();
+        for aggregation in [
+            Aggregation::Sum,
+            Aggregation::Avg,
+            Aggregation::Min,
+            Aggregation::Max,
+            Aggregation::Median,
+            Aggregation::Range,
+            Aggregation::Variance,
+            Aggregation::StdDev,
+        ] {
+            assert!(aggregate_bucket(&points, aggregation, 1_000)
+                .unwrap()
+                .is_none());
+        }
     }
 }

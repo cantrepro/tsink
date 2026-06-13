@@ -1,7 +1,7 @@
 [package]
 name = "tsink"
-version = "0.7.0"
-edition = "2024"
+version = "0.8.0"
+edition = "2021"
 authors = ["h2337"]
 description = "A lightweight embedded time-series database with a straightforward API"
 repository = "https://github.com/h2337/tsink"
@@ -11,30 +11,29 @@ keywords = ["time-series", "database", "embedded", "tsdb", "metrics"]
 categories = ["database", "embedded", "data-structures"]
 readme = "README.md"
 
+[workspace]
+members = [".", "crates/tsink-server"]
+resolver = "2"
+
 [dependencies]
-# Core dependencies
 thiserror = "2.0"
 parking_lot = "0.12"
-dashmap = "6.1"
 crossbeam-channel = "0.5"
-bytes = "1.9"
 num_cpus = "1.16"
+crc32fast = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+rayon = "1.10"
 
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
 
-# Time handling
-chrono = "0.4"
-
-# Memory mapping
 memmap2 = "0.9"
 
-# Logging
 tracing = "0.1"
+regex = "1.11"
+async-channel = { version = "2.3", optional = true }
 
-# Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -45,12 +44,20 @@ proptest = "1.6"
 env_logger = "0.11"
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 anyhow = "1.0"
+chrono = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
+promql = []
+async-storage = ["dep:async-channel"]
 
 [[bench]]
 name = "storage_benchmarks"
+harness = false
+
+[[bench]]
+name = "workload"
 harness = false
 
 [profile.release]

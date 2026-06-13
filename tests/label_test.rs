@@ -9,8 +9,6 @@ fn test_select_all_with_multiple_labels() {
         .build()
         .unwrap();
 
-    // Insert data points with different label combinations
-    // Same metric "cpu_usage" but with different labels
     let rows1 = vec![
         Row::with_labels(
             "cpu_usage",
@@ -53,59 +51,46 @@ fn test_select_all_with_multiple_labels() {
 
     let rows3 = vec![Row::with_labels(
         "cpu_usage",
-        vec![Label::new("host", "server3")], // Only one label
+        vec![Label::new("host", "server3")],
         DataPoint::new(1200, 12.0),
     )];
     storage.insert_rows(&rows3).unwrap();
 
-    // Query all cpu_usage metrics regardless of labels
     let all_results = storage.select_all("cpu_usage", 0, 3000).unwrap();
 
-    // We should have 3 different label combinations
     assert_eq!(
         all_results.len(),
         3,
         "Should have 3 different label combinations"
     );
 
-    // Count total points
     let total_points: usize = all_results.iter().map(|(_, points)| points.len()).sum();
     assert_eq!(total_points, 5, "Should have 5 total data points");
 
-    // Verify we can find each label combination
     let mut found_server1 = false;
     let mut found_server2 = false;
     let mut found_server3 = false;
 
     for (labels, points) in &all_results {
-        // Check for server1 with region
         if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server1")
         {
             found_server1 = true;
             assert_eq!(points.len(), 2);
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.name == "region" && l.value == "us-west")
-            );
-        }
-        // Check for server2 with region
-        else if labels
+            assert!(labels
+                .iter()
+                .any(|l| l.name == "region" && l.value == "us-west"));
+        } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server2")
         {
             found_server2 = true;
             assert_eq!(points.len(), 2);
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.name == "region" && l.value == "us-east")
-            );
-        }
-        // Check for server3 (only host label)
-        else if labels
+            assert!(labels
+                .iter()
+                .any(|l| l.name == "region" && l.value == "us-east"));
+        } else if labels
             .iter()
             .any(|l| l.name == "host" && l.value == "server3")
         {
@@ -128,7 +113,6 @@ fn test_select_all_no_labels() {
         .build()
         .unwrap();
 
-    // Insert data points without labels
     let rows = vec![
         Row::new("temperature", DataPoint::new(1000, 20.0)),
         Row::new("temperature", DataPoint::new(2000, 22.0)),
@@ -136,7 +120,6 @@ fn test_select_all_no_labels() {
     ];
     storage.insert_rows(&rows).unwrap();
 
-    // Query all temperature metrics
     let all_results = storage.select_all("temperature", 0, 4000).unwrap();
 
     assert_eq!(
@@ -158,7 +141,6 @@ fn test_select_all_mixed_labels_and_no_labels() {
         .build()
         .unwrap();
 
-    // Insert some points with labels and some without
     let rows1 = vec![
         Row::new("requests", DataPoint::new(1000, 100.0)),
         Row::new("requests", DataPoint::new(2000, 110.0)),
@@ -167,12 +149,11 @@ fn test_select_all_mixed_labels_and_no_labels() {
 
     let rows2 = vec![Row::with_labels(
         "requests",
-        vec![Label::new("endpoint", "/api/v1")],
+        vec![Label::new("endpoint", "/api/core")],
         DataPoint::new(1500, 150.0),
     )];
     storage.insert_rows(&rows2).unwrap();
 
-    // Query all
     let all_results = storage.select_all("requests", 0, 3000).unwrap();
 
     assert_eq!(
@@ -181,7 +162,6 @@ fn test_select_all_mixed_labels_and_no_labels() {
         "Should have 2 different label combinations"
     );
 
-    // Verify we have both labeled and unlabeled data
     let mut found_unlabeled = false;
     let mut found_labeled = false;
 
@@ -193,12 +173,71 @@ fn test_select_all_mixed_labels_and_no_labels() {
             found_labeled = true;
             assert_eq!(points.len(), 1);
             assert_eq!(labels[0].name, "endpoint");
-            assert_eq!(labels[0].value, "/api/v1");
+            assert_eq!(labels[0].value, "/api/core");
         }
     }
 
     assert!(found_unlabeled, "Should find unlabeled data");
     assert!(found_labeled, "Should find labeled data");
+}
+
+#[test]
+fn test_select_with_empty_labels_returns_only_unlabeled_series() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::new("requests", DataPoint::new(1000, 100.0)),
+            Row::new("requests", DataPoint::new(2000, 110.0)),
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/core")],
+                DataPoint::new(1500, 150.0),
+            ),
+        ])
+        .unwrap();
+
+    let unlabeled = storage.select("requests", &[], 0, 3000).unwrap();
+    assert_eq!(unlabeled.len(), 2);
+    assert_eq!(unlabeled[0].timestamp, 1000);
+    assert_eq!(unlabeled[1].timestamp, 2000);
+
+    let labeled = storage
+        .select("requests", &[Label::new("endpoint", "/api/core")], 0, 3000)
+        .unwrap();
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].timestamp, 1500);
+}
+
+#[test]
+fn test_select_with_empty_labels_returns_empty_when_only_labeled_series_exist() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/core")],
+                DataPoint::new(1000, 100.0),
+            ),
+            Row::with_labels(
+                "requests",
+                vec![Label::new("endpoint", "/api/admin")],
+                DataPoint::new(2000, 200.0),
+            ),
+        ])
+        .unwrap();
+
+    let unlabeled = storage.select("requests", &[], 0, 3000).unwrap();
+    assert!(unlabeled.is_empty());
 }
 
 #[test]
@@ -209,11 +248,9 @@ fn test_select_all_nonexistent_metric() {
         .build()
         .unwrap();
 
-    // Insert some data
     let rows = vec![Row::new("existing_metric", DataPoint::new(1000, 1.0))];
     storage.insert_rows(&rows).unwrap();
 
-    // Query a non-existent metric
     let all_results = storage.select_all("nonexistent", 0, 2000).unwrap();
 
     assert!(
@@ -230,7 +267,6 @@ fn test_select_all_time_range_filtering() {
         .build()
         .unwrap();
 
-    // Insert data points at different times
     let rows = vec![
         Row::with_labels(
             "metric",
@@ -260,18 +296,15 @@ fn test_select_all_time_range_filtering() {
     ];
     storage.insert_rows(&rows).unwrap();
 
-    // Query with a time range that excludes some points
     let all_results = storage.select_all("metric", 1200, 2700).unwrap();
 
     assert_eq!(all_results.len(), 2, "Should have both label sets");
 
     for (labels, points) in &all_results {
         if labels.iter().any(|l| l.value == "A") {
-            // Type A should have point at 2000 only
             assert_eq!(points.len(), 1);
             assert_eq!(points[0].timestamp, 2000);
         } else if labels.iter().any(|l| l.value == "B") {
-            // Type B should have points at 1500 and 2500
             assert_eq!(points.len(), 2);
             assert_eq!(points[0].timestamp, 1500);
             assert_eq!(points[1].timestamp, 2500);

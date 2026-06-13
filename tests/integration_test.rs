@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
     DataPoint, Label, MetricSeries, QueryOptions, Row, StorageBuilder, TimestampPrecision,
     TsinkError, WalSyncMode,
@@ -27,9 +28,9 @@ fn test_basic_insert_and_select() {
 
     let points = storage.select("metric1", &[], 1000, 1003).unwrap();
     assert_eq!(points.len(), 3);
-    assert_eq!(points[0].value, 1.0);
-    assert_eq!(points[1].value, 2.0);
-    assert_eq!(points[2].value, 3.0);
+    assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 1.0);
+    assert_eq!(points[1].value_as_f64().unwrap_or(f64::NAN), 2.0);
+    assert_eq!(points[2].value_as_f64().unwrap_or(f64::NAN), 3.0);
 }
 
 #[test]
@@ -48,11 +49,11 @@ fn test_labeled_metrics() {
 
     let points1 = storage.select("cpu", &labels1, 999, 1001).unwrap();
     assert_eq!(points1.len(), 1);
-    assert_eq!(points1[0].value, 10.0);
+    assert_eq!(points1[0].value_as_f64().unwrap_or(f64::NAN), 10.0);
 
     let points2 = storage.select("cpu", &labels2, 999, 1001).unwrap();
     assert_eq!(points2.len(), 1);
-    assert_eq!(points2[0].value, 20.0);
+    assert_eq!(points2[0].value_as_f64().unwrap_or(f64::NAN), 20.0);
 }
 
 #[test]
@@ -105,7 +106,6 @@ fn test_persistence() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path();
 
-    // Insert data and close
     {
         let storage = StorageBuilder::new()
             .with_data_path(data_path)
@@ -121,7 +121,6 @@ fn test_persistence() {
         storage.close().unwrap();
     }
 
-    // Reopen and verify data
     {
         let storage = StorageBuilder::new()
             .with_data_path(data_path)
@@ -130,8 +129,8 @@ fn test_persistence() {
 
         let points = storage.select("persistent_metric", &[], 999, 1002).unwrap();
         assert_eq!(points.len(), 2);
-        assert_eq!(points[0].value, 100.0);
-        assert_eq!(points[1].value, 101.0);
+        assert_eq!(points[0].value_as_f64().unwrap_or(f64::NAN), 100.0);
+        assert_eq!(points[1].value_as_f64().unwrap_or(f64::NAN), 101.0);
     }
 }
 
@@ -153,15 +152,37 @@ fn test_out_of_order_inserts() {
     let points = storage.select("metric", &[], 999, 1003).unwrap();
     assert_eq!(points.len(), 3);
 
-    // Should be returned in order
     assert_eq!(points[0].timestamp, 1000);
     assert_eq!(points[1].timestamp, 1001);
     assert_eq!(points[2].timestamp, 1002);
 }
 
 #[test]
+fn test_future_data_is_not_expired_by_partition_age() {
+    let storage = StorageBuilder::new()
+        .with_retention(Duration::from_secs(1))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let future_ts = now + 24 * 3600;
+    storage
+        .insert_rows(&[Row::new("future_metric", DataPoint::new(future_ts, 1.0))])
+        .unwrap();
+
+    thread::sleep(Duration::from_secs(2));
+
+    let points = storage.select("future_metric", &[], 0, i64::MAX).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, future_ts);
+}
+
+#[test]
 fn test_concurrent_writes() {
-    // Use in-memory storage for more reliable testing
     let storage = Arc::new(
         StorageBuilder::new()
             .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -169,7 +190,6 @@ fn test_concurrent_writes() {
             .unwrap(),
     );
 
-    // First, test that single-threaded writes work
     let test_timestamp = 1_000_000;
     let test_row = vec![Row::new(
         "test_metric",
@@ -177,14 +197,12 @@ fn test_concurrent_writes() {
     )];
     storage.insert_rows(&test_row).unwrap();
 
-    // Verify the test write worked
     let test_points = storage
         .select("test_metric", &[], test_timestamp - 1, test_timestamp + 1)
         .unwrap();
     assert_eq!(test_points.len(), 1);
-    assert_eq!(test_points[0].value, 42.0);
+    assert_eq!(test_points[0].value_as_f64().unwrap_or(f64::NAN), 42.0);
 
-    // Now test concurrent writes with a shared metric name
     let mut handles = vec![];
     let base_timestamp = 2_000_000;
 
@@ -192,7 +210,7 @@ fn test_concurrent_writes() {
         let storage = storage.clone();
         let handle = thread::spawn(move || {
             let rows = vec![Row::new(
-                "concurrent_metric", // Use same metric name for all
+                "concurrent_metric",
                 DataPoint::new(base_timestamp + i as i64, i as f64),
             )];
             storage.insert_rows(&rows).unwrap();
@@ -204,7 +222,6 @@ fn test_concurrent_writes() {
         handle.join().unwrap();
     }
 
-    // Verify all data points were inserted for the shared metric
     let points = storage
         .select(
             "concurrent_metric",
@@ -218,8 +235,10 @@ fn test_concurrent_writes() {
 
     assert_eq!(points.len(), 10, "Expected 10 points for concurrent_metric");
 
-    // Check that all values are present
-    let mut values: Vec<f64> = points.iter().map(|p| p.value).collect();
+    let mut values: Vec<f64> = points
+        .iter()
+        .map(|p| p.value_as_f64().unwrap_or(f64::NAN))
+        .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let expected: Vec<f64> = (0..10).map(|i| i as f64).collect();
     assert_eq!(values, expected);
@@ -300,7 +319,6 @@ fn test_select_returns_sorted_points() {
 fn test_persistence_with_existing_partitions_still_allows_writes() {
     let temp_dir = TempDir::new().unwrap();
 
-    // Create initial on-disk partitions
     {
         let storage = StorageBuilder::new()
             .with_data_path(temp_dir.path())
@@ -318,7 +336,6 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
         storage.close().unwrap();
     }
 
-    // Reopen; there will be disk partitions already loaded
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -327,23 +344,20 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
         .build()
         .unwrap();
 
-    // Should still accept new writes
     storage
         .insert_rows(&[Row::new("persist", DataPoint::new(3, 3.0))])
         .unwrap();
 
-    // Verify the new point is visible before close
     let mut live_points = storage.select("persist", &[], 0, 10).unwrap();
     live_points.sort_by_key(|p| p.timestamp);
     assert!(
         live_points
             .iter()
-            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+            .any(|p| p.timestamp == 3 && (p.value_as_f64().unwrap_or(f64::NAN) - 3.0).abs() < 1e-12),
         "newly inserted point should be present before close"
     );
     storage.close().unwrap();
 
-    // Reopen and ensure the new point is still present
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -356,7 +370,7 @@ fn test_persistence_with_existing_partitions_still_allows_writes() {
     assert!(
         points
             .iter()
-            .any(|p| p.timestamp == 3 && (p.value - 3.0).abs() < 1e-12),
+            .any(|p| p.timestamp == 3 && (p.value_as_f64().unwrap_or(f64::NAN) - 3.0).abs() < 1e-12),
         "newly inserted point should survive close/reopen even with existing disk partitions"
     );
 }
@@ -425,6 +439,70 @@ fn test_list_metrics_deduplicates_across_disk_memory_and_wal() {
 }
 
 #[test]
+fn test_list_metrics_ignores_runtime_wal_only_series() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_only_metric = "wal_only_metric";
+    let wal_only_labels = vec![Label::new("source", "wal")];
+
+    {
+        let wal = FramedWal::open(temp_dir.path().join("wal"), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 4242,
+            metric: wal_only_metric.to_string(),
+            labels: wal_only_labels.clone(),
+        })
+        .unwrap();
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    let metrics = storage.list_metrics().unwrap();
+    assert!(metrics.is_empty());
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn test_list_metrics_with_wal_includes_runtime_wal_only_series() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_only_metric = "wal_only_metric";
+    let wal_only_labels = vec![Label::new("source", "wal")];
+
+    {
+        let wal = FramedWal::open(temp_dir.path().join("wal"), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 4242,
+            metric: wal_only_metric.to_string(),
+            labels: wal_only_labels.clone(),
+        })
+        .unwrap();
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::from_secs(1))
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    let metrics = storage.list_metrics_with_wal().unwrap();
+    let expected = vec![MetricSeries {
+        name: wal_only_metric.to_string(),
+        labels: wal_only_labels,
+    }];
+    assert_eq!(metrics, expected);
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn test_build_with_new_data_path_and_wal_disabled() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().join("fresh-data-path");
@@ -446,25 +524,19 @@ fn test_build_with_new_data_path_and_wal_disabled() {
 fn test_wal_disabled_does_not_replay_stale_segments() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
-
-    let wal = tsink::wal::DiskWal::new(&wal_dir, 0).unwrap();
-    let wal_trait: Arc<dyn tsink::wal::Wal> = wal;
-    wal_trait
-        .append_rows(&[Row::new("stale_metric", DataPoint::new(5, 5.0))])
-        .unwrap();
-    wal_trait.flush().unwrap();
+    fs::create_dir_all(&wal_dir).unwrap();
+    fs::write(wal_dir.join("wal.log"), [0xFF, 0x00, 0x13, 0x37]).unwrap();
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_wal_enabled(false)
         .build()
         .unwrap();
-    assert!(
-        storage
-            .select("stale_metric", &[], 0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(storage
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(storage.list_metrics().unwrap().is_empty());
     storage.close().unwrap();
 
     let storage = StorageBuilder::new()
@@ -472,12 +544,63 @@ fn test_wal_disabled_does_not_replay_stale_segments() {
         .with_wal_enabled(false)
         .build()
         .unwrap();
-    assert!(
-        storage
-            .select("stale_metric", &[], 0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(storage
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(storage.list_metrics().unwrap().is_empty());
+}
+
+#[test]
+fn test_wal_disabled_cleans_stale_segments_before_reenable() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+
+    fs::create_dir_all(&wal_dir).unwrap();
+    fs::write(wal_dir.join("wal.log"), [0xAA, 0xBB, 0xCC]).unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("fresh_metric", DataPoint::new(6, 6.0))])
+        .unwrap();
+    storage.close().unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(true)
+        .build()
+        .unwrap();
+
+    assert!(reopened
+        .select("stale_metric", &[], 0, 10)
+        .unwrap()
+        .is_empty());
+    let fresh = reopened.select("fresh_metric", &[], 0, 10).unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].timestamp, 6);
+    assert!((fresh[0].value_as_f64().unwrap_or(f64::NAN) - 6.0).abs() < 1e-12);
+}
+
+#[test]
+fn test_insert_rejects_oversized_labels_even_with_struct_literal() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let oversized = Label {
+        name: "k".to_string(),
+        value: "x".repeat(tsink::label::MAX_LABEL_VALUE_LEN + 1),
+    };
+
+    let err = storage
+        .insert_rows(&[Row::with_labels(
+            "oversized_label_metric",
+            vec![oversized],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidLabel(_)));
 }
 
 #[test]
@@ -495,7 +618,6 @@ fn test_wal_buffer_size_zero_still_recovers() {
         storage
             .insert_rows(&[Row::new("zero_buf_wal", DataPoint::new(1, 1.0))])
             .unwrap();
-        // Drop without close to simulate abrupt shutdown and rely on WAL recovery.
     }
 
     let storage = StorageBuilder::new()
@@ -508,7 +630,36 @@ fn test_wal_buffer_size_zero_still_recovers() {
     let points = storage.select("zero_buf_wal", &[], 0, 10).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].timestamp, 1);
-    assert!((points[0].value - 1.0).abs() < 1e-12);
+    assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn test_drop_without_close_persists_when_wal_disabled() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(false)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new("drop_persist_metric", DataPoint::new(1, 1.0))])
+            .unwrap();
+    }
+
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let points = storage.select("drop_persist_metric", &[], 0, 10).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].timestamp, 1);
+    assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
+    storage.close().unwrap();
 }
 
 #[test]
@@ -543,7 +694,7 @@ fn test_wal_sync_mode_can_be_switched() {
         let points = storage.select("sync_mode_metric", &[], 0, 10).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].timestamp, 1);
-        assert!((points[0].value - 1.0).abs() < 1e-12);
+        assert!((points[0].value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12);
     }
 }
 
@@ -559,11 +710,45 @@ fn test_close_handles_partition_name_conflict() {
         .insert_rows(&[Row::new("close_flush", DataPoint::new(1, 1.0))])
         .unwrap();
 
-    // Force a path conflict for partition flush directory creation.
     fs::write(temp_dir.path().join("p-1-1"), b"conflict").unwrap();
 
-    // Close should succeed by selecting an alternate directory name.
     storage.close().unwrap();
+}
+
+#[test]
+fn test_close_failure_can_be_retried_on_same_handle() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new("close_retry", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    let numeric_lane_root = temp_dir.path().join("lane_numeric");
+    if numeric_lane_root.exists() {
+        if numeric_lane_root.is_dir() {
+            fs::remove_dir_all(&numeric_lane_root).unwrap();
+        } else {
+            fs::remove_file(&numeric_lane_root).unwrap();
+        }
+    }
+    fs::write(&numeric_lane_root, b"conflict").unwrap();
+
+    let first_close_err = storage.close().unwrap_err();
+    assert!(matches!(first_close_err, TsinkError::Io(_)));
+
+    fs::remove_file(&numeric_lane_root).unwrap();
+    storage.close().unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .build()
+        .unwrap();
+    let points = reopened.select("close_retry", &[], 0, 10).unwrap();
+    assert_eq!(points, vec![DataPoint::new(1, 1.0)]);
 }
 
 #[test]
@@ -577,7 +762,6 @@ fn test_select_across_multiple_partitions_persistent() {
         .build()
         .unwrap();
 
-    // Insert out-of-order but spanning multiple partitions
     let rows = vec![
         Row::new("multi_part", DataPoint::new(10, 1.0)),
         Row::new("multi_part", DataPoint::new(13, 2.0)),
@@ -625,20 +809,26 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
         storage.close().unwrap();
     }
 
-    let partition_dirs = fs::read_dir(temp_dir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| name.starts_with("p-"))
-                .unwrap_or(false)
-        })
-        .count();
+    let segment_dirs = fs::read_dir(
+        temp_dir
+            .path()
+            .join("lane_numeric")
+            .join("segments")
+            .join("L0"),
+    )
+    .unwrap()
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with("seg-"))
+            .unwrap_or(false)
+    })
+    .count();
     assert!(
-        partition_dirs >= 2,
-        "expected at least two partition directories, got {partition_dirs}"
+        segment_dirs >= 1,
+        "expected at least one segment directory, got {segment_dirs}"
     );
 
     let storage = StorageBuilder::new()
@@ -651,6 +841,10 @@ fn test_close_persists_partitions_with_same_time_bounds_without_overwrite() {
 
     let points = storage.select("collision_metric", &[], 0, 20).unwrap();
     assert_eq!(points.len(), 2);
-    assert!(points.iter().any(|p| (p.value - 1.0).abs() < 1e-12));
-    assert!(points.iter().any(|p| (p.value - 2.0).abs() < 1e-12));
+    assert!(points
+        .iter()
+        .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 1.0).abs() < 1e-12));
+    assert!(points
+        .iter()
+        .any(|p| (p.value_as_f64().unwrap_or(f64::NAN) - 2.0).abs() < 1e-12));
 }

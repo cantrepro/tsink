@@ -138,7 +138,7 @@ pub mod unix {
 
     /// Advises the kernel about memory access patterns
     pub fn madvise_sequential(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_SEQUENTIAL, madvise};
+        use libc::{madvise, MADV_SEQUENTIAL};
 
         let ret = unsafe {
             madvise(
@@ -157,7 +157,7 @@ pub mod unix {
 
     /// Advises the kernel to expect random access patterns
     pub fn madvise_random(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_RANDOM, madvise};
+        use libc::{madvise, MADV_RANDOM};
 
         let ret = unsafe { madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), MADV_RANDOM) };
 
@@ -170,7 +170,7 @@ pub mod unix {
 
     /// Advises the kernel that we will need this memory soon
     pub fn madvise_willneed(mmap: &Mmap) -> io::Result<()> {
-        use libc::{MADV_WILLNEED, madvise};
+        use libc::{madvise, MADV_WILLNEED};
 
         let ret = unsafe {
             madvise(
@@ -191,7 +191,17 @@ pub mod unix {
 /// Helper function to create an appropriate memory map for the current platform
 pub fn create_mmap(file: File) -> io::Result<PlatformMmap> {
     let metadata = file.metadata()?;
-    let length = metadata.len() as usize;
+    let file_len = metadata.len();
+    let length = usize::try_from(file_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file length {} exceeds usize::MAX ({}) on this platform",
+                file_len,
+                usize::MAX
+            ),
+        )
+    })?;
 
     PlatformMmap::new(file, length)
 }
@@ -209,13 +219,11 @@ mod tests {
 
     #[test]
     fn test_max_map_size() {
-        let max_size = get_max_mmap_size();
-
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(max_size, usize::MAX);
+        assert_eq!(get_max_mmap_size(), usize::MAX);
 
         #[cfg(target_arch = "x86")]
-        assert_eq!(max_size, 0x7FFFFFFF);
+        assert_eq!(get_max_mmap_size(), 0x7FFFFFFF);
     }
 
     #[test]
@@ -236,7 +244,6 @@ mod tests {
 
     #[test]
     fn test_size_limit() {
-        // This should fail on 32-bit architectures if we try to map too much
         #[cfg(all(target_arch = "x86", unix))]
         {
             use std::fs::File;

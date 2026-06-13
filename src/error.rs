@@ -40,6 +40,21 @@ pub enum TsinkError {
     #[error("Write timeout exceeded after {timeout_ms}ms with {workers} concurrent writers")]
     WriteTimeout { timeout_ms: u64, workers: usize },
 
+    #[error("Memory budget exceeded: budget {budget} bytes, required at least {required} bytes")]
+    MemoryBudgetExceeded { budget: usize, required: usize },
+
+    #[error(
+        "Series cardinality limit exceeded: limit {limit}, current {current}, requested {requested}"
+    )]
+    CardinalityLimitExceeded {
+        limit: usize,
+        current: usize,
+        requested: usize,
+    },
+
+    #[error("WAL size limit exceeded: limit {limit} bytes, required at least {required} bytes")]
+    WalSizeLimitExceeded { limit: u64, required: u64 },
+
     #[error("Storage is shutting down")]
     StorageShuttingDown,
 
@@ -104,6 +119,18 @@ pub enum TsinkError {
     #[error("Data point with timestamp {timestamp} is outside the retention window")]
     OutOfRetention { timestamp: i64 },
 
+    #[error("Unsupported aggregation '{aggregation}' for value type '{value_type}'")]
+    UnsupportedAggregation {
+        aggregation: String,
+        value_type: String,
+    },
+
+    #[error("Value type mismatch: expected {expected}, found {actual}")]
+    ValueTypeMismatch { expected: String, actual: String },
+
+    #[error("Codec error: {0}")]
+    Codec(String),
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -135,12 +162,66 @@ impl From<crossbeam_channel::RecvError> for TsinkError {
 impl From<crossbeam_channel::RecvTimeoutError> for TsinkError {
     fn from(e: crossbeam_channel::RecvTimeoutError) -> Self {
         match e {
-            crossbeam_channel::RecvTimeoutError::Timeout => TsinkError::ChannelReceive {
-                channel: "recv_timeout: duration unavailable".to_string(),
-            },
+            crossbeam_channel::RecvTimeoutError::Timeout => {
+                TsinkError::ChannelTimeout { timeout_ms: 0 }
+            }
             crossbeam_channel::RecvTimeoutError::Disconnected => TsinkError::ChannelReceive {
                 channel: "timeout: channel disconnected".to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TsinkError;
+    use crossbeam_channel::RecvTimeoutError;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[test]
+    fn recv_timeout_error_timeout_maps_to_channel_timeout() {
+        let err: TsinkError = RecvTimeoutError::Timeout.into();
+        assert!(matches!(err, TsinkError::ChannelTimeout { timeout_ms: 0 }));
+    }
+
+    #[test]
+    fn recv_timeout_error_disconnected_maps_to_channel_receive() {
+        let err: TsinkError = RecvTimeoutError::Disconnected.into();
+        assert!(matches!(err, TsinkError::ChannelReceive { .. }));
+    }
+
+    #[test]
+    fn recv_error_maps_to_channel_receive() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(tx);
+
+        let err: TsinkError = rx.recv().unwrap_err().into();
+        assert!(matches!(err, TsinkError::ChannelReceive { .. }));
+    }
+
+    #[test]
+    fn send_error_maps_to_channel_send() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(rx);
+
+        let err: TsinkError = tx.send(1).unwrap_err().into();
+        assert!(matches!(err, TsinkError::ChannelSend { .. }));
+    }
+
+    #[test]
+    fn poison_error_maps_to_lock_poisoned() {
+        let shared = Arc::new(Mutex::new(1usize));
+        let shared_for_thread = Arc::clone(&shared);
+
+        let _ = thread::spawn(move || {
+            let _guard = shared_for_thread.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        })
+        .join();
+
+        let poison = shared.lock().unwrap_err();
+        let err: TsinkError = poison.into();
+        assert!(matches!(err, TsinkError::LockPoisoned { .. }));
     }
 }

@@ -1,0 +1,11 @@
+0.8.0
+- Complete storage engine rewrite (LSM-tree with L0/L1/L2 compaction)
+- Segmented WAL with CRC32 checksums, fsync, replay recovery
+- Multi-type value system (f64, i64, u64, bool, bytes, string)
+- PromQL query engine (lexer, parser, evaluator — 23 functions, 15 binary ops, 7 aggregations)
+- Async storage wrapper (tokio-based)
+- HTTP server binary with Prometheus remote read/write compatibility
+- Sharded concurrency (64 shards), background flush/compaction threads
+- Memory budget enforcement with graduated pressure relief
+- Segment-level retention sweeper with physical disk reclamation
+- CI pipeline (fmt, clippy, tests, benchmarks, BPP regression checks)

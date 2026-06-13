@@ -1,156 +1,276 @@
 # tsink
 
 <div align="center">
-
-<p align="right">
-  <img src="https://raw.githubusercontent.com/h2337/tsink/refs/heads/master/logo.svg" width="250" height="250">
-</p>
-
-**A high-performance embedded time-series database for Rust**
-
+  <img src="https://raw.githubusercontent.com/h2337/tsink/refs/heads/master/logo.svg" width="220" height="220" alt="tsink logo">
+  <p><strong>Embedded time-series storage for Rust</strong></p>
+  <a href="https://crates.io/crates/tsink"><img src="https://img.shields.io/crates/v/tsink.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/tsink"><img src="https://docs.rs/tsink/badge.svg" alt="docs.rs"></a>
+  <a href="https://github.com/h2337/tsink/blob/master/LICENSE"><img src="https://img.shields.io/crates/l/tsink.svg" alt="MIT license"></a>
 </div>
 
-## Overview
+---
 
-tsink is a lightweight, high-performance time-series database engine written in Rust. It provides efficient storage and retrieval of time-series data with automatic compression, time-based partitioning, and thread-safe operations.
+`tsink` is a lightweight, in-process time-series database engine for Rust applications.
+It stores time-series data in compressed chunks, persists immutable segment files to disk, and can replay a write-ahead log (WAL) after crashes — all without requiring an external server.
 
-### Key Features
+## Features
 
-- **🚀 High Performance**: Gorilla compression achieves ~1.37 bytes per data point
-- **🔒 Thread-Safe**: Concurrent reads and writes with bounded writer concurrency
-- **💾 Flexible Storage**: Choose between in-memory or persistent disk storage
-- **📊 Time Partitioning**: Automatic data organization by configurable time ranges
-- **🏷️ Label Support**: Multi-dimensional metrics with key-value labels
-- **📝 WAL Support**: Write-ahead logging for durability and crash recovery
-- **🗑️ Auto-Retention**: Configurable automatic data expiration
-- **🐳 Container-Aware**: cgroup support for optimal resource usage in containers
-- **⚡ Zero-Copy Reads**: Memory-mapped files for efficient disk operations
+- **Embedded API** — no external server, network protocol, or daemon required.
+- **Thread-safe** — the storage handle is an `Arc<dyn Storage>`, safe to share across threads.
+- **Multi-series model** — series identity is metric name + exact label set.
+- **Typed values** — `f64`, `i64`, `u64`, `bool`, `bytes`, and `string`.
+- **Rich queries** — downsampling, aggregation (12 built-in functions), pagination, and custom bytes aggregation via the `Codec`/`Aggregator` traits.
+- **Disk persistence** — immutable segment files with a crash-safe commit protocol.
+- **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) with idempotent replay on recovery.
+- **Out-of-order writes** — data is returned sorted by timestamp regardless of insertion order.
+- **Concurrent writers** — multiple threads can insert simultaneously with sharded internal locking.
+- **Optional PromQL engine** — instant and range queries with 20+ built-in functions; enable with the `promql` Cargo feature.
+- **LSM-style compaction** — tiered L0 → L1 → L2 segment compaction reduces read amplification.
+- **Gorilla compression** — Gorilla XOR encoding for floats, delta-of-delta for timestamps, and per-type codecs for other value types.
+- **cgroup-aware defaults** — worker thread counts and memory limits respect container CPU/memory quotas.
+- **Resource limits** — configurable memory budget, series cardinality cap, and WAL size limit with admission backpressure.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Async Usage](#async-usage)
+- [Server Mode](#server-mode-prometheus-wire-compatible)
+- [Query APIs](#query-apis)
+- [Series Discovery](#series-discovery)
+- [Value Model](#value-model)
+- [Label Constraints](#label-constraints)
+- [PromQL Engine](#promql-engine)
+- [Persistence and WAL](#persistence-and-wal)
+- [On-Disk Layout](#on-disk-layout)
+- [Compression and Encoding](#compression-and-encoding)
+- [Performance](#performance)
+- [Architecture](#architecture)
+- [StorageBuilder Options](#storagebuilder-options)
+- [Resource Limits and Backpressure](#resource-limits-and-backpressure)
+- [Container Support](#container-support)
+- [Error Handling](#error-handling)
+- [Advanced Usage](#advanced-usage)
+- [Examples](#examples)
+- [Benchmarks and Tests](#benchmarks-and-tests)
+- [Development Scripts](#development-scripts)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [Minimum Supported Rust Version](#minimum-supported-rust-version)
+- [License](#license)
 
 ## Installation
 
-Add tsink to your `Cargo.toml`:
+```toml
+[dependencies]
+tsink = "0.8.0"
+```
+
+Enable PromQL support:
 
 ```toml
 [dependencies]
-tsink = "0.7.0"
+tsink = { version = "0.8.0", features = ["promql"] }
+```
+
+Enable async storage facade (dedicated worker threads, runtime-agnostic futures):
+
+```toml
+[dependencies]
+tsink = { version = "0.8.0", features = ["async-storage"] }
 ```
 
 ## Quick Start
 
-### Basic Usage
-
 ```rust
-use tsink::{DataPoint, Row, StorageBuilder, Storage, TimestampPrecision};
+use std::error::Error;
+use tsink::{DataPoint, Label, Row, StorageBuilder};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create storage with default settings
-    let storage = StorageBuilder::new()
-        .with_timestamp_precision(TimestampPrecision::Seconds)
-        .build()?;
+fn main() -> Result<(), Box<dyn Error>> {
+    let storage = StorageBuilder::new().build()?;
 
-    // Insert data points
-    let rows = vec![
-        Row::new("cpu_usage", DataPoint::new(1600000000, 45.5)),
-        Row::new("cpu_usage", DataPoint::new(1600000060, 47.2)),
-        Row::new("cpu_usage", DataPoint::new(1600000120, 46.8)),
-    ];
-    storage.insert_rows(&rows)?;
+    storage.insert_rows(&[
+        Row::new("cpu_usage", DataPoint::new(1_700_000_000, 42.5)),
+        Row::new("cpu_usage", DataPoint::new(1_700_000_010, 43.1)),
+        Row::with_labels(
+            "http_requests",
+            vec![Label::new("method", "GET"), Label::new("status", "200")],
+            DataPoint::new(1_700_000_000, 120u64),
+        ),
+    ])?;
 
-    // Note: Using timestamp 0 will automatically use the current timestamp
-    // let row = Row::new("cpu_usage", DataPoint::new(0, 50.0));  // timestamp = current time
+    // Time range is [start, end) (end-exclusive).
+    let cpu = storage.select("cpu_usage", &[], 1_700_000_000, 1_700_000_100)?;
+    assert_eq!(cpu.len(), 2);
 
-    // Query data points
-    let points = storage.select("cpu_usage", &[], 1600000000, 1600000121)?;
-    for point in points {
-        println!("Timestamp: {}, Value: {}", point.timestamp, point.value);
-    }
+    // Label order does not matter for series identity.
+    let get_200 = storage.select(
+        "http_requests",
+        &[Label::new("status", "200"), Label::new("method", "GET")],
+        1_700_000_000,
+        1_700_000_100,
+    )?;
+    assert_eq!(get_200.len(), 1);
 
     storage.close()?;
     Ok(())
 }
 ```
 
-### Persistent Storage
+## Async Usage
+
+`async-storage` exposes `AsyncStorage` and `AsyncStorageBuilder`.
+The async API routes requests through bounded queues to dedicated worker threads, while reusing the existing synchronous engine implementation. It is runtime-agnostic — no dependency on tokio, async-std, or any specific executor.
 
 ```rust
-use tsink::{StorageBuilder, Storage, WalSyncMode};
-use std::time::Duration;
+use tsink::{AsyncStorageBuilder, DataPoint, Row};
 
-let storage = StorageBuilder::new()
-    .with_data_path("./tsink-data")              // Enable disk persistence
-    .with_partition_duration(Duration::from_secs(3600))  // 1-hour partitions
-    .with_retention(Duration::from_secs(7 * 24 * 3600))  // 7-day retention
-    .with_wal_buffer_size(8192)                  // 8KB WAL buffer
-    .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1))) // default
+# async fn run() -> tsink::Result<()> {
+let storage = AsyncStorageBuilder::new()
+    .with_queue_capacity(1024)
+    .with_read_workers(4)
     .build()?;
+
+storage
+    .insert_rows(vec![Row::new("cpu", DataPoint::new(1, 42.0))])
+    .await?;
+
+let points = storage.select("cpu", vec![], 0, 10).await?;
+assert_eq!(points.len(), 1);
+
+storage.close().await?;
+# Ok(())
+# }
 ```
 
-### Multi-Dimensional Metrics with Labels
+`AsyncStorage` also provides synchronous accessors for introspection:
 
-```rust
-use tsink::{DataPoint, Label, Row};
+| Method | Description |
+|---|---|
+| `memory_used()` | Current in-memory usage in bytes. |
+| `memory_budget()` | Configured memory budget. |
+| `inner()` | Access the underlying `Arc<dyn Storage>`. |
+| `into_inner(self)` | Unwrap the underlying storage handle. |
 
-// Create metrics with labels for detailed categorization
-let rows = vec![
-    Row::with_labels(
-        "http_requests",
-        vec![
-            Label::new("method", "GET"),
-            Label::new("status", "200"),
-            Label::new("endpoint", "/api/users"),
-        ],
-        DataPoint::new(1600000000, 150.0),
-    ),
-    Row::with_labels(
-        "http_requests",
-        vec![
-            Label::new("method", "POST"),
-            Label::new("status", "201"),
-            Label::new("endpoint", "/api/users"),
-        ],
-        DataPoint::new(1600000000, 25.0),
-    ),
-];
+## Server Mode (Prometheus Wire Compatible)
 
-storage.insert_rows(&rows)?;
+> **Experimental:** tsink-server is still experimental and under development.
 
-// Query specific label combinations
-let points = storage.select(
-    "http_requests",
-    &[
-        Label::new("method", "GET"),
-        Label::new("status", "200"),
-    ],
-    1600000000,
-    1600000100,
-)?;
+This workspace includes a binary crate at `crates/tsink-server` that runs tsink as an async network service (tokio-based) with Prometheus remote storage wire format, PromQL HTTP API, TLS, and Bearer token authentication.
 
-// Query all label combinations for a metric
-let all_results = storage.select_all("http_requests", 1600000000, 1600000100)?;
-for (labels, points) in all_results {
-    println!("Labels: {:?}, Points: {}", labels, points.len());
-}
+Run the server:
 
-// Discover all metric series currently known by storage
-let all_series = storage.list_metrics()?;
-for series in all_series {
-    println!("Metric: {}, Labels: {:?}", series.name, series.labels);
-}
+```bash
+cargo run -p tsink-server -- server --listen 127.0.0.1:9201 --data-path ./tsink-data
 ```
 
-### Query Options: Downsampling, Aggregation, Pagination
+### CLI Options
 
-Use `select_with_options` to shape query results without post-processing:
+| Flag | Default | Description |
+|---|---|---|
+| `--listen <ADDR>` | `127.0.0.1:9201` | Bind address. |
+| `--data-path <PATH>` | None (in-memory) | Persist tsink data under PATH. |
+| `--wal-enabled <BOOL>` | `true` | Enable WAL. |
+| `--no-wal` | — | Disable WAL (shorthand). |
+| `--timestamp-precision <s\|ms\|us\|ns>` | `ms` | Timestamp precision (server defaults to milliseconds). |
+| `--retention <DURATION>` | 14d | Data retention period (e.g. `14d`, `720h`). |
+| `--memory-limit <BYTES>` | Unlimited | Memory budget (e.g. `1G`, `1073741824`). |
+| `--cardinality-limit <N>` | Unlimited | Max unique series. |
+| `--chunk-points <N>` | 2048 | Target points per chunk. |
+| `--max-writers <N>` | Available CPUs | Concurrent writer threads. |
+| `--wal-sync-mode <MODE>` | `periodic` | WAL fsync policy (`per-append` or `periodic`). |
+| `--tls-cert <PATH>` | — | TLS certificate file (PEM). Requires `--tls-key`. |
+| `--tls-key <PATH>` | — | TLS private key file (PEM). Requires `--tls-cert`. |
+| `--auth-token <TOKEN>` | — | Require Bearer token on all endpoints except health probes. |
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/healthz` | Health check (returns `ok`). |
+| GET | `/ready` | Readiness probe (returns `ready`). |
+| GET | `/metrics` | Self-monitoring metrics (Prometheus exposition format). |
+| GET/POST | `/api/v1/query` | PromQL instant query. |
+| GET/POST | `/api/v1/query_range` | PromQL range query. |
+| GET | `/api/v1/series` | Series metadata (accepts `match[]` selectors). |
+| GET | `/api/v1/labels` | All label names. |
+| GET | `/api/v1/label/<name>/values` | Values for a given label. |
+| POST | `/api/v1/write` | Prometheus remote write (protobuf + snappy). |
+| POST | `/api/v1/read` | Prometheus remote read (protobuf + snappy). |
+| POST | `/api/v1/import/prometheus` | Prometheus text exposition format ingestion. |
+| GET | `/api/v1/status/tsdb` | TSDB stats (JSON). |
+| POST | `/api/v1/admin/delete_series` | Delete series (stub, returns 501). |
+
+### TLS
+
+Provide both `--tls-cert` and `--tls-key` to enable TLS:
+
+```bash
+cargo run -p tsink-server -- server \
+  --tls-cert /path/to/cert.pem \
+  --tls-key /path/to/key.pem
+```
+
+### Authentication
+
+When `--auth-token` is set, all requests except `GET /healthz` and `GET /ready` must include the header `Authorization: Bearer <TOKEN>`. Unauthenticated requests receive a `401 Unauthorized` response.
+
+### Graceful Shutdown
+
+The server handles `SIGTERM` and `SIGINT` signals. On receipt it stops accepting new connections, waits up to 10 seconds for in-flight requests to complete, then closes storage cleanly.
+
+### PromQL HTTP API
+
+The query endpoints follow the [Prometheus HTTP API](https://prometheus.io/docs/prometheus/latest/querying/api/) response format:
+
+```bash
+# Instant query
+curl 'http://localhost:9201/api/v1/query?query=up&time=1700000000'
+
+# Range query
+curl 'http://localhost:9201/api/v1/query_range?query=up&start=1700000000&end=1700000060&step=15s'
+```
+
+### Prometheus Integration
+
+```yaml
+remote_write:
+  - url: http://127.0.0.1:9201/api/v1/write
+
+remote_read:
+  - url: http://127.0.0.1:9201/api/v1/read
+```
+
+### Text Format Ingestion
+
+Post Prometheus exposition format text directly:
+
+```bash
+curl -X POST http://localhost:9201/api/v1/import/prometheus \
+  -H 'Content-Type: text/plain' \
+  --data-binary @metrics.txt
+```
+
+## Query APIs
+
+| Method | Description |
+|---|---|
+| `select(metric, labels, start, end)` | Returns points sorted by timestamp for one series. |
+| `select_into(metric, labels, start, end, &mut buf)` | Same as `select`, but writes into a caller-provided buffer for allocation reuse. |
+| `select_all(metric, start, end)` | Returns grouped results for all label sets of a metric. |
+| `select_with_options(metric, QueryOptions)` | Supports downsampling, aggregation, custom bytes aggregation, and pagination. |
+| `list_metrics()` | Lists all known metric + label-set series. |
+| `list_metrics_with_wal()` | Like `list_metrics`, but also includes series only present in the WAL. |
+| `select_series(SeriesSelection)` | Matcher-based series discovery (`=`, `!=`, `=~`, `!~`) with optional time-window filtering. |
+
+All time ranges are half-open: `[start, end)`.
+
+### Downsampling and Aggregation
 
 ```rust
-use tsink::{
-    Aggregation, DataPoint, Label, QueryOptions, Row,
-    StorageBuilder, Storage,
-};
+use tsink::{Aggregation, DataPoint, QueryOptions, Row, StorageBuilder};
 
-let storage = StorageBuilder::new().with_data_path("./tsink-data").build()?;
-
-// Insert some points
+let storage = StorageBuilder::new().build()?;
 storage.insert_rows(&[
     Row::new("cpu", DataPoint::new(1_000, 1.0)),
     Row::new("cpu", DataPoint::new(2_000, 2.0)),
@@ -158,368 +278,625 @@ storage.insert_rows(&[
     Row::new("cpu", DataPoint::new(4_500, 1.5)),
 ])?;
 
-// Downsample into 2s buckets using average, with pagination
 let opts = QueryOptions::new(1_000, 5_000)
     .with_downsample(2_000, Aggregation::Avg)
     .with_pagination(0, Some(2));
 
 let buckets = storage.select_with_options("cpu", opts)?;
-// buckets: [ (t=1000, avg=1.5), (t=3000, avg=2.25) ]
+assert_eq!(buckets.len(), 2);
 ```
 
-## Architecture
+Built-in aggregation functions:
+`None`, `Sum`, `Min`, `Max`, `Avg`, `First`, `Last`, `Count`, `Median`, `Range`, `Variance`, `StdDev`.
 
-tsink uses a linear-order partition model that divides time-series data into time-bounded chunks:
+### Custom Bytes Aggregation
 
-```
-┌─────────────────────────────────────────┐
-│             tsink Storage               │
-├─────────────────────────────────────────┤
-│                                         │
-│  ┌───────────────┐  Active Partition    │
-│  │ Memory Part.  │◄─ (Writable)         │
-│  └───────────────┘                      │
-│                                         │
-│  ┌───────────────┐  Buffer Partition    │
-│  │ Memory Part.  │◄─ (Out-of-order)     │
-│  └───────────────┘                      │
-│                                         │
-│  ┌───────────────┐                      │
-│  │ Disk Part. 1  │◄─ Read-only          │
-│  └───────────────┘   (Memory-mapped)    │
-│                                         │
-│  ┌───────────────┐                      │
-│  │ Disk Part. 2  │◄─ Read-only          │
-│  └───────────────┘                      │
-│         ...                             │
-└─────────────────────────────────────────┘
-```
-
-### Partition Lifecycle
-
-1. **Active Partition**: Accepts new writes, kept in memory
-2. **Buffer Partition**: Handles out-of-order writes within recent time window
-3. **Flushing**: When active partition is full, it's flushed to disk
-4. **Disk Partitions**: Read-only, memory-mapped for efficient queries
-5. **Expiration**: Old partitions are automatically removed based on retention
-
-### Benefits
-
-- **Fast Queries**: Skip irrelevant partitions based on time range
-- **Efficient Memory**: Only recent data stays in RAM
-- **Low Write Amplification**: Sequential writes, no compaction needed
-- **SSD-Friendly**: Minimal random I/O patterns
-
-## Configuration
-
-### StorageBuilder Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `with_data_path` | Directory for persistent storage | None (in-memory) |
-| `with_retention` | How long to keep data | 14 days |
-| `with_timestamp_precision` | Timestamp precision (ns/μs/ms/s) | Nanoseconds |
-| `with_max_writers` | Maximum concurrent write workers | CPU count |
-| `with_write_timeout` | Timeout for write operations | 30 seconds |
-| `with_partition_duration` | Time range per partition | 1 hour |
-| `with_wal_enabled` | Enable write-ahead logging | true |
-| `with_wal_buffer_size` | WAL buffer size in bytes | 4096 |
-| `with_wal_sync_mode` | WAL fsync strategy | `Periodic(1s)` |
-
-### Example Configuration
+For non-numeric data, implement the `Codec` and `Aggregator` traits to define custom aggregation logic over `bytes`-encoded values:
 
 ```rust
-let storage = StorageBuilder::new()
-    .with_data_path("/var/lib/tsink")
-    .with_retention(Duration::from_secs(30 * 24 * 3600))  // 30 days
-    .with_timestamp_precision(TimestampPrecision::Milliseconds)
-    .with_max_writers(16)
-    .with_write_timeout(Duration::from_secs(60))
-    .with_partition_duration(Duration::from_secs(6 * 3600))  // 6 hours
-    .with_wal_buffer_size(16384)  // 16KB
-    .with_wal_sync_mode(tsink::WalSyncMode::Periodic(Duration::from_secs(1)))
-    .build()?;
+use tsink::{Codec, Aggregator, QueryOptions, Aggregation};
+
+struct MyCodec;
+impl Codec for MyCodec {
+    type Item = MyStruct;
+    fn encode(&self, value: &MyStruct) -> tsink::Result<Vec<u8>> { /* ... */ }
+    fn decode(&self, bytes: &[u8]) -> tsink::Result<MyStruct> { /* ... */ }
+}
+
+struct MyAggregator;
+impl Aggregator<MyStruct> for MyAggregator {
+    fn aggregate(&self, values: &[MyStruct]) -> Option<MyStruct> { /* ... */ }
+}
+
+let opts = QueryOptions::new(start, end)
+    .with_custom_bytes_aggregation(MyCodec, MyAggregator);
 ```
 
-### WAL Sync Modes
+## Series Discovery
 
-`tsink` supports two WAL durability/performance modes:
+Use `select_series` with matcher-based filtering to discover series dynamically:
 
-- `WalSyncMode::Periodic(Duration)` (default): WAL writes are flushed on append, and fsync runs at most once per interval.
-- `WalSyncMode::PerAppend`: every append is flushed and fsynced before returning.
+```rust
+use tsink::{SeriesSelection, SeriesMatcher};
 
-Choose based on workload:
+let selection = SeriesSelection::new()
+    .with_metric("http_requests")
+    .with_matcher(SeriesMatcher::equal("method", "GET"))
+    .with_matcher(SeriesMatcher::regex_match("status", "2.."))
+    .with_time_range(start, end);
 
-- `Periodic`: higher throughput, lower write latency, but a crash can lose up to roughly one sync interval of recently acknowledged WAL data.
-- `PerAppend`: strongest durability for acknowledged writes, with higher fsync overhead and lower write throughput.
+let series = storage.select_series(&selection)?;
+```
 
-Switch modes with `StorageBuilder`:
+Supported matcher operators:
+
+| Operator | Constructor | Description |
+|---|---|---|
+| `=` | `SeriesMatcher::equal(name, value)` | Exact label match. |
+| `!=` | `SeriesMatcher::not_equal(name, value)` | Negated exact match. |
+| `=~` | `SeriesMatcher::regex_match(name, pattern)` | Regex label match. |
+| `!~` | `SeriesMatcher::regex_no_match(name, pattern)` | Negated regex match. |
+
+## Value Model
+
+`DataPoint` stores a `timestamp: i64` and a `value: Value`.
+
+| Variant | Rust type |
+|---|---|
+| `Value::F64(f64)` | `f64` |
+| `Value::I64(i64)` | `i64` |
+| `Value::U64(u64)` | `u64` |
+| `Value::Bool(bool)` | `bool` |
+| `Value::Bytes(Vec<u8>)` | raw bytes |
+| `Value::String(String)` | UTF-8 string |
+
+Notes:
+- A series (same metric + labels) must keep a consistent value type family.
+- `bytes` and `string` data uses blob-lane encoding on disk.
+- Convenience conversions are provided: `DataPoint::new(ts, 42.5)` auto-converts via `Into<Value>`.
+- Accessor methods: `value.as_f64()`, `value.as_i64()`, `value.as_u64()`, `value.as_bool()`, `value.as_bytes()`, `value.as_str()`.
+- `value.kind()` returns a `&'static str` tag: `"f64"`, `"i64"`, `"u64"`, `"bool"`, `"bytes"`, or `"string"`.
+- `Value::F64(NAN)` compares equal to itself, unlike standard `f64`, for consistent equality semantics in collections.
+
+Automatic `From` conversions are provided for: `f64`, `i64`, `i32`, `u64`, `u32`, `usize`, `bool`, `Vec<u8>`, `&[u8]`, `String`, and `&str`.
+
+## Label Constraints
+
+Labels are key-value pairs that identify a series alongside the metric name. Labels are automatically sorted for consistent series identity — insertion order does not matter.
+
+| Constraint | Limit |
+|---|---|
+| Label name length | 256 bytes |
+| Label value length | 16,384 bytes (16 KB) |
+| Metric name length | 65,535 bytes |
+
+Empty label names or values are rejected. Oversized values are truncated at the marshaling boundary.
+
+## PromQL Engine
+
+Enable with the `promql` feature. The engine supports instant and range queries over data stored in tsink.
+
+```rust
+use std::sync::Arc;
+use tsink::{StorageBuilder, DataPoint, Row};
+use tsink::promql::Engine;
+
+let storage = StorageBuilder::new().build()?;
+storage.insert_rows(&[
+    Row::new("http_requests_total", DataPoint::new(1_000, 10.0)),
+    Row::new("http_requests_total", DataPoint::new(2_000, 25.0)),
+    Row::new("http_requests_total", DataPoint::new(3_000, 50.0)),
+])?;
+
+let engine = Engine::new(storage.clone());
+
+// Instant query — evaluates at a single point in time.
+let result = engine.instant_query("http_requests_total", 3_000)?;
+
+// Range query — evaluates at each step across a time window.
+let result = engine.range_query("http_requests_total", 1_000, 3_000, 1_000)?;
+```
+
+Use `Engine::with_precision(storage, precision)` if your timestamps are not in nanoseconds.
+
+Supported functions:
+
+| Category | Functions |
+|---|---|
+| Rate/counter | `rate`, `irate`, `increase` |
+| Over-time | `avg_over_time`, `sum_over_time`, `min_over_time`, `max_over_time`, `count_over_time` |
+| Math | `abs`, `ceil`, `floor`, `round`, `clamp`, `clamp_min`, `clamp_max` |
+| Type conversion | `scalar`, `vector` |
+| Time | `time`, `timestamp` |
+| Sorting | `sort`, `sort_desc` |
+| Label manipulation | `label_replace`, `label_join` |
+
+Aggregation operators: `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk` — with `by`/`without` grouping.
+
+Binary operators: `+`, `-`, `*`, `/`, `%`, `^`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `unless` — with `on`/`ignoring` vector matching and `bool` modifier.
+
+## Persistence and WAL
+
+Set `with_data_path(...)` to enable persistence:
 
 ```rust
 use std::time::Duration;
 use tsink::{StorageBuilder, WalSyncMode};
 
-// Default (explicit): periodic sync every second
-let periodic = StorageBuilder::new()
+let storage = StorageBuilder::new()
     .with_data_path("./tsink-data")
+    .with_chunk_points(2048)
+    .with_wal_enabled(true)
     .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1)))
-    .build()?;
-
-// Strongest durability: sync every append
-let per_append = StorageBuilder::new()
-    .with_data_path("./tsink-data")
-    .with_wal_sync_mode(WalSyncMode::PerAppend)
     .build()?;
 ```
 
-## Compression
+Behavior:
+- `close()` flushes active chunks and writes immutable segment files.
+- With WAL enabled, reopening the same path replays durable WAL frames automatically.
+- Recovery is idempotent — a high-water mark prevents double-apply of WAL frames.
 
-tsink uses the Gorilla compression algorithm, which is specifically designed for time-series data:
+### Sync Modes
 
-- **Delta-of-delta encoding** for timestamps
-- **XOR compression** for floating-point values
-- Typical compression ratio: **~1.37 bytes per data point**
+| Mode | Trade-off |
+|---|---|
+| `WalSyncMode::Periodic(Duration)` | Lower fsync overhead; small recent-write loss window on crash. |
+| `WalSyncMode::PerAppend` | Strongest durability for acknowledged writes; higher fsync cost. |
 
-This means a data point that would normally take 16 bytes (8 bytes timestamp + 8 bytes value) is compressed to less than 2 bytes on average.
+## On-Disk Layout
+
+When persistence is enabled, tsink writes separate numeric/blob lane segment families:
+
+```text
+<data_path>/
+  lane_numeric/
+    segments/
+      L0/...
+      L1/...
+      L2/...
+  lane_blob/
+    segments/
+      L0/...
+      L1/...
+      L2/...
+  wal/
+    wal-0000000000000000.log
+    wal-0000000000000001.log
+    ...
+```
+
+Each segment directory contains:
+`manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
+
+The storage format uses CRC32c and XXH64 checksums for corruption detection and a crash-safe commit protocol (write temps, fsync, rename atomically).
+
+### Compaction
+
+tsink uses tiered LSM-style compaction across three levels:
+
+| Level | Trigger | Description |
+|---|---|---|
+| L0 | Every flush | Newly flushed segments land here. |
+| L1 | 4 L0 segments | L0 segments are merged and re-chunked into L1. |
+| L2 | 4 L1 segments | L1 segments are merged into larger L2 segments. |
+
+Compaction runs automatically in the background and is transparent to reads and writes.
+
+## Compression and Encoding
+
+tsink uses two parallel encoding lanes based on value type:
+
+### Numeric Lane
+
+Timestamps and numeric values (`f64`, `i64`, `u64`, `bool`) are encoded with specialized codecs. The encoder tries all applicable candidates and picks the most compact.
+
+**Timestamp codecs:**
+
+| Codec | Strategy |
+|---|---|
+| Fixed-step RLE | Run-length encoding for fixed-interval timestamps. |
+| Delta-of-delta bitpack | Delta-of-delta encoding with bit-packing (primary strategy). |
+| Delta varint | Varint-encoded deltas for irregular intervals. |
+
+**Value codecs:**
+
+| Codec | Type | Strategy |
+|---|---|---|
+| Gorilla XOR | `f64` | Gorilla-style XOR of IEEE 754 floats. |
+| Zigzag delta bitpack | `i64` | Zigzag encoding + delta + bit-packing. |
+| Delta bitpack | `u64` | Delta encoding + bit-packing. |
+| Constant RLE | any numeric | Run-length encoding for constant values. |
+| Bool bitpack | `bool` | Bit-level packing (1 bit per value). |
+
+### Blob Lane
+
+`bytes` and `string` values are encoded with delta block compression in a separate blob lane.
 
 ## Performance
 
-Benchmarks on AMD Ryzen 7940HS (single core):
+### Compression
 
-| Operation | Throughput | Latency |
-|-----------|------------|---------|
-| Insert single point | 10M ops/sec | ~100ns |
-| Batch insert (1000) | 15M points/sec | ~67μs/batch |
-| Select 1K points | 4.5M queries/sec | ~220ns |
-| Select 1M points | 3.4M queries/sec | ~290ns |
+The adaptive codec selection (Gorilla XOR, delta-of-delta, RLE, bitpacking) achieves **~0.68 bytes per data point** for typical `f64` time-series workloads — down from 16 bytes uncompressed (8-byte timestamp + 8-byte value), a **~23x** compression ratio.
 
-Run benchmarks yourself:
+### Throughput
+
+Insert throughput (single-series, in-memory):
+
+| Batch size | Latency | Throughput |
+|---|---|---|
+| 1 | ~1.7 us | ~577K points/sec |
+| 10 | ~5.3 us | ~1.89M points/sec |
+| 1,000 | ~155 us | ~6.4M points/sec |
+
+Select throughput (single-series, in-memory):
+
+| Result size | Latency | Throughput |
+|---|---|---|
+| 1 point | ~114 ns | ~8.8M queries/sec |
+| 10 points | ~296 ns | ~33.6M points/sec |
+| 1,000 points | ~15.4 us | ~64M points/sec |
+| 1,000,000 points | ~20.9 ms | ~48M points/sec |
+
+Numbers above are ballpark figures from a single run (`--quick` mode). Run benchmarks on your hardware:
+
 ```bash
 cargo bench
+scripts/measure_bpp.sh quick   # Measure bytes-per-point
+scripts/measure_perf.sh quick  # Criterion insert/select matrix
 ```
 
-## Module Overview
+## Architecture
 
-### Core Modules
+```text
+┌─────────────────────────────────────────────────────┐
+│                    Public API                       │
+│   StorageBuilder / Storage / AsyncStorage / PromQL  │
+├────────────┬──────────────┬─────────────────────────┤
+│  Writers   │   Readers    │       Compactor         │
+│ (N threads)│  (concurrent)│   (background merges)   │
+├────────────┴──────────────┴─────────────────────────┤
+│               Engine (partitioned by time)          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
+│  │ Active   │  │ Immutable│  │ Segments │           │
+│  │ Chunks   │→ │ Chunks   │→ │ (L0/L1/  │           │
+│  │ (memory) │  │ (memory) │  │  L2 disk)│           │
+│  └──────────┘  └──────────┘  └──────────┘           │
+├─────────────────────────────────────────────────────┤
+│  WAL (write-ahead log)  │  Series Registry + Index  │
+└─────────────────────────┴───────────────────────────┘
+```
 
-| Module | Description |
-|--------|-------------|
-| `storage` | Main storage engine with builder pattern configuration |
-| `partition` | Time-based data partitioning (memory and disk implementations) |
-| `encoding` | Gorilla compression for efficient time-series storage |
-| `wal` | Write-ahead logging for durability and crash recovery |
-| `label` | Multi-dimensional metric labeling and marshaling |
+Key internals:
+- **Time partitions** split data by wall-clock intervals (default: 1 hour).
+- **Chunks** group data points (default: 2048 per chunk) with delta-of-delta timestamp encoding and per-lane value encoding (numeric vs. blob).
+- **Series registry** maps metric name + label set → series ID, with inverted postings for label-based lookups.
+- **Segment files** are immutable, CRC32c + XXH64 checksummed, and consist of: `manifest.bin`, `chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`.
+- **Sharded locking** (64 internal shards) reduces write contention under high concurrency.
+- **Background flush** periodically converts active chunks into immutable chunks (default: every 250ms).
+- **Background compaction** merges segments across levels (default: every 5s).
 
-### Infrastructure Modules
+## StorageBuilder Options
 
-| Module | Description |
-|--------|-------------|
-| `cgroup` | Container-aware CPU and memory limit detection |
-| `mmap` | Platform-optimized memory-mapped file operations |
-| `concurrency` | Worker pools, semaphores, and rate limiters |
-| `bstream` | Bit-level streaming for compression algorithms |
-| `list` | Thread-safe partition list management |
+| Method | Default | Description |
+|---|---|---|
+| `with_data_path(path)` | `None` (in-memory only) | Directory for segment files and WAL. |
+| `with_chunk_points(n)` | `2048` | Target data points per chunk before flushing. |
+| `with_wal_enabled(bool)` | `true` | Enable/disable write-ahead logging. |
+| `with_wal_sync_mode(mode)` | `Periodic(1s)` | WAL fsync policy. |
+| `with_wal_size_limit(bytes)` | Unlimited | Hard cap on total WAL bytes across all WAL segments. |
+| `with_wal_buffer_size(n)` | 4096 | WAL buffer size in bytes. |
+| `with_retention(duration)` | 14 days | Data retention window. |
+| `with_retention_enforced(bool)` | `true` | Enforce retention window (`false` keeps data forever). |
+| `with_timestamp_precision(p)` | `Nanoseconds` | Timestamp unit (`Seconds`, `Milliseconds`, `Microseconds`, `Nanoseconds`). |
+| `with_max_writers(n)` | Available CPUs (cgroup-aware) | Maximum concurrent writer threads. |
+| `with_write_timeout(duration)` | 30s | Timeout for write operations. |
+| `with_partition_duration(duration)` | 1 hour | Time partition granularity. |
+| `with_memory_limit(bytes)` | Unlimited | Hard in-memory budget with admission backpressure before writes. |
+| `with_cardinality_limit(series)` | Unlimited | Hard cap on total metric+label series cardinality. |
 
-### Utility Modules
+## Resource Limits and Backpressure
 
-| Module | Description |
-|--------|-------------|
-| `error` | Comprehensive error types with context |
+tsink provides three configurable resource limits that protect against unbounded growth:
+
+### Memory Limit
+
+```rust
+let storage = StorageBuilder::new()
+    .with_memory_limit(512 * 1024 * 1024) // 512 MB
+    .build()?;
+```
+
+When the memory budget is reached, new writes block until a background flush frees memory. This provides admission backpressure rather than OOM crashes.
+
+### Cardinality Limit
+
+```rust
+let storage = StorageBuilder::new()
+    .with_cardinality_limit(100_000)
+    .build()?;
+```
+
+Caps the total number of unique metric + label-set combinations. Writes that would create new series beyond this limit return `TsinkError::CardinalityLimitExceeded`.
+
+### WAL Size Limit
+
+```rust
+let storage = StorageBuilder::new()
+    .with_wal_size_limit(1024 * 1024 * 1024) // 1 GB
+    .build()?;
+```
+
+Caps the total WAL bytes on disk. Writes that would exceed this limit return `TsinkError::WalSizeLimitExceeded`.
+
+## Container Support
+
+tsink automatically detects cgroup v1/v2 CPU and memory quotas when running inside containers (Docker, Kubernetes, etc.). This affects:
+
+- **Writer thread count** — defaults to available CPUs within the cgroup quota, not the host CPU count.
+- **Rayon thread pool** — sized to respect container limits.
+
+Override with the `TSINK_MAX_CPUS` environment variable:
+
+```bash
+TSINK_MAX_CPUS=4 cargo run --example production_example
+```
+
+## Error Handling
+
+All fallible operations return `tsink::Result<T>`, which wraps `TsinkError`. Key error variants:
+
+| Error | Cause |
+|---|---|
+| `InvalidTimeRange` | `start >= end` in a query. |
+| `WriteTimeout` | Writer could not acquire a slot within the configured timeout. |
+| `MemoryBudgetExceeded` | Write blocked and memory budget was not freed in time. |
+| `CardinalityLimitExceeded` | Too many unique series. |
+| `WalSizeLimitExceeded` | WAL disk usage reached the configured cap. |
+| `ValueTypeMismatch` | Inserting a different value type into an existing series. |
+| `OutOfRetention` | Data point timestamp is outside the retention window. |
+| `DataCorruption` | Checksum mismatch during segment read. |
+| `StorageClosed` | Operation attempted after `close()` was called. |
 
 ## Advanced Usage
 
-### Label Querying
-
-tsink provides querying capabilities for metrics with labels:
-
-```rust
-use tsink::{DataPoint, Label, Row};
-
-// Insert metrics with various label combinations
-let rows = vec![
-    Row::with_labels(
-        "cpu_usage",
-        vec![Label::new("host", "server1"), Label::new("region", "us-west")],
-        DataPoint::new(1600000000, 45.5),
-    ),
-    Row::with_labels(
-        "cpu_usage",
-        vec![Label::new("host", "server2"), Label::new("region", "us-east")],
-        DataPoint::new(1600000000, 52.1),
-    ),
-    Row::with_labels(
-        "cpu_usage",
-        vec![Label::new("host", "server3")],  // Different label set
-        DataPoint::new(1600000000, 48.3),
-    ),
-];
-storage.insert_rows(&rows)?;
-
-// Method 1: Query with exact label match
-let points = storage.select(
-    "cpu_usage",
-    &[Label::new("host", "server1"), Label::new("region", "us-west")],
-    1600000000,
-    1600000100,
-)?;
-
-// Method 2: Query all label combinations (discovers all variations)
-let all_results = storage.select_all("cpu_usage", 1600000000, 1600000100)?;
-
-// Process results grouped by labels
-for (labels, points) in all_results {
-    // Find which hosts have the most data points
-    if let Some(host_label) = labels.iter().find(|l| l.name == "host") {
-        println!("Host {} has {} data points", host_label.value, points.len());
-    }
-
-    // Aggregate metrics across regions
-    if let Some(region_label) = labels.iter().find(|l| l.name == "region") {
-        let avg: f64 = points.iter().map(|p| p.value).sum::<f64>() / points.len() as f64;
-        println!("Region {} average: {:.2}", region_label.value, avg);
-    }
-}
-```
-
 ### Concurrent Operations
 
-tsink is designed for high-concurrency scenarios:
+The storage handle is `Arc`-based and safe to share across threads:
 
 ```rust
-use std::thread;
 use std::sync::Arc;
+use std::thread;
+use tsink::{DataPoint, Row, StorageBuilder};
 
-let storage = Arc::new(StorageBuilder::new().build()?);
+let storage = StorageBuilder::new()
+    .with_max_writers(8)
+    .build()?;
 
-// Spawn multiple writer threads
 let mut handles = vec![];
-for worker_id in 0..10 {
+for worker_id in 0..8 {
     let storage = storage.clone();
-    let handle = thread::spawn(move || {
-        for i in 0..1000 {
+    handles.push(thread::spawn(move || {
+        for i in 0..10_000 {
             let row = Row::new(
-                "concurrent_metric",
-                DataPoint::new(1600000000 + i, i as f64),
+                format!("worker_{worker_id}"),
+                DataPoint::new(1_700_000_000 + i, i as f64),
             );
             storage.insert_rows(&[row]).unwrap();
         }
-    });
-    handles.push(handle);
+    }));
 }
 
-// Wait for all threads
 for handle in handles {
     handle.join().unwrap();
 }
 ```
 
-### Out-of-Order Insertion
+### Out-of-Order Writes
 
-tsink handles out-of-order data points automatically:
+tsink accepts data points in any order and returns them sorted by timestamp on read:
 
 ```rust
-// Insert data points in random order
-let rows = vec![
-    Row::new("metric", DataPoint::new(1600000500, 5.0)),
-    Row::new("metric", DataPoint::new(1600000100, 1.0)),  // Earlier timestamp
-    Row::new("metric", DataPoint::new(1600000300, 3.0)),
-    Row::new("metric", DataPoint::new(1600000200, 2.0)),  // Out of order
-];
+use tsink::{DataPoint, Row};
 
-storage.insert_rows(&rows)?;
+storage.insert_rows(&[
+    Row::new("metric", DataPoint::new(1_700_000_500, 5.0)),
+    Row::new("metric", DataPoint::new(1_700_000_100, 1.0)),
+    Row::new("metric", DataPoint::new(1_700_000_300, 3.0)),
+    Row::new("metric", DataPoint::new(1_700_000_200, 2.0)),
+])?;
 
-// Query returns points in correct chronological order
-let points = storage.select("metric", &[], 1600000000, 1600001000)?;
+let points = storage.select("metric", &[], 1_700_000_000, 1_700_001_000)?;
+// points are returned in chronological order: 1.0, 2.0, 3.0, 5.0
 assert!(points.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
-```
-
-### Container Deployment
-
-tsink automatically detects container resource limits:
-
-```rust
-// tsink reads cgroup limits automatically
-let storage = StorageBuilder::new()
-    .with_max_writers(0)  // 0 = auto-detect from cgroup
-    .build()?;
-
-// In a container with 2 CPU limit, this will use 2 workers
-// even if the host has 16 CPUs
 ```
 
 ### WAL Recovery
 
-After a crash, tsink automatically recovers from WAL:
+After a crash, tsink automatically replays the WAL on the next open:
 
 ```rust
-// First run - data is written to WAL
+use tsink::StorageBuilder;
+
+// First run — data is written and WAL-protected
 let storage = StorageBuilder::new()
     .with_data_path("/data/tsink")
     .build()?;
 storage.insert_rows(&rows)?;
-// Crash happens here...
+// Crash happens here — close() was never called
 
-// Next run - data is recovered from WAL automatically
+// Next run — recovery is automatic
 let storage = StorageBuilder::new()
     .with_data_path("/data/tsink")  // Same path
-    .build()?;  // Recovery happens here
+    .build()?;  // WAL replay happens here
 
 // Previously inserted data is available
 let points = storage.select("metric", &[], 0, i64::MAX)?;
 ```
 
+Recovery is idempotent — a high-water mark ensures WAL frames are never applied twice.
+
+### Multi-Dimensional Label Querying
+
+```rust
+use tsink::{DataPoint, Label, Row};
+
+storage.insert_rows(&[
+    Row::with_labels(
+        "http_requests",
+        vec![Label::new("method", "GET"), Label::new("status", "200")],
+        DataPoint::new(1_700_000_000, 150.0),
+    ),
+    Row::with_labels(
+        "http_requests",
+        vec![Label::new("method", "POST"), Label::new("status", "201")],
+        DataPoint::new(1_700_000_000, 25.0),
+    ),
+])?;
+
+// Query all label combinations for a metric
+let all_results = storage.select_all("http_requests", 1_700_000_000, 1_700_000_100)?;
+for (labels, points) in all_results {
+    println!("Labels: {:?}, Points: {}", labels, points.len());
+}
+
+// Discover all known series
+let all_series = storage.list_metrics()?;
+for series in all_series {
+    println!("Metric: {}, Labels: {:?}", series.name, series.labels);
+}
+```
+
+### Production Configuration
+
+```rust
+use std::time::Duration;
+use tsink::{StorageBuilder, WalSyncMode, TimestampPrecision};
+
+let storage = StorageBuilder::new()
+    .with_data_path("/var/lib/tsink")
+    .with_timestamp_precision(TimestampPrecision::Milliseconds)
+    .with_retention(Duration::from_secs(30 * 24 * 3600))        // 30 days
+    .with_partition_duration(Duration::from_secs(6 * 3600))     // 6-hour partitions
+    .with_chunk_points(4096)
+    .with_max_writers(16)
+    .with_write_timeout(Duration::from_secs(60))
+    .with_memory_limit(1024 * 1024 * 1024)                      // 1 GB
+    .with_cardinality_limit(500_000)
+    .with_wal_sync_mode(WalSyncMode::Periodic(Duration::from_secs(1)))
+    .with_wal_buffer_size(16384)                                // 16 KB
+    .build()?;
+```
+
 ## Examples
 
-Run the comprehensive example showcasing all features:
-
 ```bash
+cargo run --example basic_usage
+cargo run --example persistent_storage
+cargo run --example production_example
 cargo run --example comprehensive
 ```
 
-Other examples:
-- `basic_usage` - Simple insert and query operations
-- `persistent_storage` - Disk-based storage with WAL
-- `production_example` - Production-ready configuration
+| Example | Description |
+|---|---|
+| `basic_usage` | Simple insert and select with labels. |
+| `persistent_storage` | Disk persistence and WAL recovery. |
+| `production_example` | Resource limits, query options, and custom aggregation. |
+| `comprehensive` | Multiple features: concurrent ops, retention, downsampling, and aggregation. |
 
-## Testing
-
-Run the test suite:
+## Benchmarks and Tests
 
 ```bash
-# Run all tests
-cargo test
+cargo test                          # Run all tests
+cargo test --features promql        # Include PromQL tests
+cargo test --features async-storage # Include async tests
 
-# Run with verbose output
-cargo test -- --nocapture
+cargo bench                         # Run all benchmarks
+cargo bench --bench storage_benchmarks -- '^concurrent_rw/' --quick --noplot
+```
 
-# Run specific test module
-cargo test storage::tests
+### Benchmark Suites
+
+| Benchmark | Description |
+|---|---|
+| `storage_benchmarks` | Criterion-based matrix of insert/select operations at various scales. |
+| `workload` | Realistic workload simulation with multiple series, out-of-order writes, and bytes-per-point measurement. |
+
+## Development Scripts
+
+| Script | Description |
+|---|---|
+| `scripts/measure_perf.sh <quick\|full>` | Run Criterion benchmarks with quick or full sample sizes. |
+| `scripts/measure_bpp.sh <quick\|full>` | Measure bytes-per-point compression efficiency. |
+| `scripts/check_bench_regression.sh [threshold]` | Detect Criterion benchmark regressions beyond a threshold (default: 50%). |
+
+The `measure_bpp.sh` script accepts environment variables for workload tuning:
+
+| Variable | Description |
+|---|---|
+| `TSINK_ACTIVE_SERIES` | Number of concurrent series. |
+| `TSINK_WARMUP_POINTS` / `TSINK_MEASURE_POINTS` | Points ingested during warmup and measurement phases. |
+| `TSINK_BATCH_SIZE` | Insert batch size. |
+| `TSINK_OOO_MAX_SECONDS` / `TSINK_OOO_PERMILLE` | Out-of-order write tuning. |
+| `TSINK_RETENTION_SECONDS` / `TSINK_PARTITION_SECONDS` | Retention and partition windows. |
+| `TSINK_FAIL_ON_TARGET` | Fail if compression target is not met. |
+
+## Project Structure
+
+```text
+tsink/
+├── src/
+│   ├── lib.rs                  # Public API re-exports
+│   ├── storage.rs              # Storage trait and StorageBuilder
+│   ├── value.rs                # Value types, Codec, Aggregator traits
+│   ├── label.rs                # Label handling and marshaling
+│   ├── error.rs                # TsinkError and Result type
+│   ├── wal.rs                  # WalSyncMode
+│   ├── async_storage.rs        # Async facade (feature-gated)
+│   ├── cgroup.rs               # Container resource detection
+│   ├── concurrency.rs          # Concurrency primitives
+│   ├── mmap.rs                 # Memory-mapped I/O
+│   ├── engine/
+│   │   ├── engine.rs           # Core storage engine
+│   │   ├── compactor.rs        # LSM compaction
+│   │   ├── segment.rs          # Segment file I/O
+│   │   ├── chunk.rs            # Chunk structures
+│   │   ├── encoder.rs          # Compression codecs
+│   │   ├── query.rs            # Query execution
+│   │   ├── series_registry.rs  # Series tracking and indexing
+│   │   ├── index.rs            # Index structures
+│   │   └── wal.rs              # WAL implementation
+│   └── promql/                 # PromQL engine (feature-gated)
+│       ├── ast.rs              # Abstract syntax tree
+│       ├── lexer.rs            # Tokenizer
+│       ├── parser.rs           # Parser
+│       └── eval/               # Evaluation engine
+├── crates/
+│   └── tsink-server/           # Prometheus-compatible network server
+├── tests/                      # Integration tests
+├── benches/                    # Criterion benchmarks
+├── examples/                   # Usage examples
+└── scripts/                    # Development and CI scripts
 ```
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-### Development Setup
-
 ```bash
-# Clone the repository
 git clone https://github.com/h2337/tsink.git
 cd tsink
 
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Check formatting
-cargo fmt -- --check
-
-# Run clippy
-cargo clippy -- -D warnings
+cargo test                    # Run tests
+cargo test --features promql  # Include PromQL tests
+cargo bench                   # Run benchmarks
+cargo fmt -- --check          # Check formatting
+cargo clippy -- -D warnings   # Lint
 ```
+
+## Minimum Supported Rust Version
+
+Rust **2021 edition**. Tested on stable.
 
 ## License
 
-- MIT License
+MIT
