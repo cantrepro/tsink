@@ -82,6 +82,10 @@ impl ChunkBuilder {
         self.points.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.points.capacity()
+    }
+
     pub fn first_point(&self) -> Option<&ChunkPoint> {
         self.points.first()
     }

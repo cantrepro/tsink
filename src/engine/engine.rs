@@ -47,6 +47,7 @@ struct ChunkStorageOptions {
     partition_window: i64,
     max_writers: usize,
     write_timeout: Duration,
+    memory_budget_bytes: u64,
     compaction_interval: Duration,
 }
 
@@ -65,6 +66,7 @@ impl Default for ChunkStorageOptions {
             .max(1),
             max_writers: crate::cgroup::default_workers_limit().max(1),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            memory_budget_bytes: u64::MAX,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
         }
     }
@@ -237,6 +239,9 @@ pub struct ChunkStorage {
     partition_window: i64,
     write_limiter: Semaphore,
     write_timeout: Duration,
+    memory_used_bytes: AtomicU64,
+    memory_budget_bytes: AtomicU64,
+    memory_backpressure_lock: Mutex<()>,
     max_observed_timestamp: AtomicI64,
     lifecycle: Arc<AtomicU8>,
     compaction_lock: Arc<Mutex<()>>,
@@ -326,6 +331,9 @@ impl ChunkStorage {
             partition_window: options.partition_window.max(1),
             write_limiter: Semaphore::new(options.max_writers.max(1)),
             write_timeout: options.write_timeout,
+            memory_used_bytes: AtomicU64::new(0),
+            memory_budget_bytes: AtomicU64::new(options.memory_budget_bytes),
+            memory_backpressure_lock: Mutex::new(()),
             max_observed_timestamp: AtomicI64::new(i64::MIN),
             lifecycle,
             compaction_lock,
@@ -477,6 +485,195 @@ impl ChunkStorage {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn memory_budget_value(&self) -> usize {
+        self.memory_budget_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn memory_used_value(&self) -> usize {
+        self.memory_used_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn compute_memory_usage_bytes(&self) -> usize {
+        let mut total = 0usize;
+
+        for shard in &self.active_builders {
+            let active = shard.read();
+            for state in active.values() {
+                total = total.saturating_add(Self::active_state_memory_usage_bytes(state));
+            }
+        }
+
+        for shard in &self.sealed_chunks {
+            let sealed = shard.read();
+            for chunks in sealed.values() {
+                for chunk in chunks.values() {
+                    total = total.saturating_add(Self::chunk_memory_usage_bytes(chunk));
+                }
+            }
+        }
+
+        total
+    }
+
+    fn refresh_memory_usage(&self) -> usize {
+        let used = self.compute_memory_usage_bytes();
+        self.memory_used_bytes
+            .store(used.min(u64::MAX as usize) as u64, Ordering::Release);
+        used
+    }
+
+    fn active_state_memory_usage_bytes(state: &ActiveSeriesState) -> usize {
+        let mut bytes = std::mem::size_of::<ActiveSeriesState>().saturating_add(
+            state
+                .builder
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ChunkPoint>()),
+        );
+        for point in state.builder.points() {
+            bytes = bytes.saturating_add(value_heap_bytes(&point.value));
+        }
+        bytes
+    }
+
+    fn chunk_memory_usage_bytes(chunk: &Chunk) -> usize {
+        let mut bytes = std::mem::size_of::<Chunk>()
+            .saturating_add(
+                chunk
+                    .points
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ChunkPoint>()),
+            )
+            .saturating_add(chunk.encoded_payload.capacity());
+
+        for point in &chunk.points {
+            bytes = bytes.saturating_add(value_heap_bytes(&point.value));
+        }
+
+        bytes
+    }
+
+    fn prune_empty_active_series(&self) {
+        for shard in &self.active_builders {
+            let mut active = shard.write();
+            active.retain(|_, state| !state.builder.is_empty());
+        }
+    }
+
+    fn refresh_persisted_chunk_watermarks_from_sealed(&self) {
+        let mut persisted = self.persisted_chunk_watermarks.write();
+        persisted.clear();
+        for shard in &self.sealed_chunks {
+            let sealed = shard.read();
+            for (series_id, chunks) in sealed.iter() {
+                if let Some(watermark) = chunks.keys().map(|key| key.sequence).max() {
+                    persisted.insert(*series_id, watermark);
+                }
+            }
+        }
+    }
+
+    fn reload_persisted_indexes_from_disk(&self) -> Result<()> {
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            return Ok(());
+        }
+
+        let loaded_numeric = if let Some(path) = &self.numeric_lane_path {
+            load_segment_indexes(path)?
+        } else {
+            crate::engine::segment::LoadedSegmentIndexes::default()
+        };
+        let loaded_blob = if let Some(path) = &self.blob_lane_path {
+            load_segment_indexes(path)?
+        } else {
+            crate::engine::segment::LoadedSegmentIndexes::default()
+        };
+        let loaded_segments = merge_loaded_segment_indexes(loaded_numeric, loaded_blob)?;
+        self.apply_loaded_segment_indexes(loaded_segments)
+    }
+
+    fn find_oldest_evictable_sealed_chunk(&self) -> Option<(usize, SeriesId, SealedChunkKey)> {
+        let persisted = self.persisted_chunk_watermarks.read();
+        let mut oldest: Option<(usize, SeriesId, SealedChunkKey)> = None;
+
+        for (shard_idx, shard) in self.sealed_chunks.iter().enumerate() {
+            let sealed = shard.read();
+            for (series_id, chunks) in sealed.iter() {
+                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
+                for key in chunks.keys() {
+                    if key.sequence > persisted_sequence {
+                        continue;
+                    }
+                    let replace = oldest
+                        .map(|(_, _, current)| key.sequence < current.sequence)
+                        .unwrap_or(true);
+                    if replace {
+                        oldest = Some((shard_idx, *series_id, *key));
+                    }
+                }
+            }
+        }
+
+        oldest
+    }
+
+    fn evict_oldest_persisted_sealed_chunk(&self) -> bool {
+        let Some((shard_idx, series_id, key)) = self.find_oldest_evictable_sealed_chunk() else {
+            return false;
+        };
+
+        let mut sealed = self.sealed_chunks[shard_idx].write();
+        let Some(chunks) = sealed.get_mut(&series_id) else {
+            return false;
+        };
+        let removed = chunks.remove(&key).is_some();
+        if chunks.is_empty() {
+            sealed.remove(&series_id);
+        }
+
+        removed
+    }
+
+    fn enforce_memory_budget_if_needed(&self) -> Result<()> {
+        let budget = self.memory_budget_value();
+        if budget == usize::MAX || self.memory_used_value() <= budget {
+            return Ok(());
+        }
+
+        if self.numeric_lane_path.is_none() && self.blob_lane_path.is_none() {
+            // In-memory-only mode cannot spill to L0 segments.
+            return Ok(());
+        }
+
+        let _backpressure_guard = self.memory_backpressure_lock.lock();
+        let mut used = self.refresh_memory_usage();
+        if used <= budget {
+            return Ok(());
+        }
+
+        self.flush_all_active()?;
+        self.prune_empty_active_series();
+        used = self.refresh_memory_usage();
+        if used <= budget {
+            return Ok(());
+        }
+
+        self.persist_segment()?;
+        self.reload_persisted_indexes_from_disk()?;
+
+        while used > budget {
+            if !self.evict_oldest_persisted_sealed_chunk() {
+                break;
+            }
+            used = self.refresh_memory_usage();
+        }
+
         Ok(())
     }
 
@@ -710,6 +907,21 @@ impl ChunkStorage {
             if sealed_lane != lane {
                 return Err(TsinkError::ValueTypeMismatch {
                     expected: lane_name(sealed_lane).to_string(),
+                    actual: lane_name(lane).to_string(),
+                });
+            }
+        }
+
+        if let Some(persisted_lane) = self
+            .persisted_chunk_refs
+            .read()
+            .get(&series_id)
+            .and_then(|chunks| chunks.last())
+            .map(|chunk_ref| chunk_ref.lane)
+        {
+            if persisted_lane != lane {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: lane_name(persisted_lane).to_string(),
                     actual: lane_name(lane).to_string(),
                 });
             }
@@ -1041,16 +1253,14 @@ impl ChunkStorage {
         }
 
         {
-            let mut maps = self.persisted_segment_maps.write();
-            *maps = persisted_maps;
-        }
-        {
             let mut refs = self.persisted_chunk_refs.write();
             *refs = persisted_refs;
         }
         {
-            self.persisted_chunk_watermarks.write().clear();
+            let mut maps = self.persisted_segment_maps.write();
+            *maps = persisted_maps;
         }
+        self.refresh_persisted_chunk_watermarks_from_sealed();
 
         if loaded_max_timestamp != i64::MIN {
             self.update_max_observed_timestamp(loaded_max_timestamp);
@@ -1127,21 +1337,7 @@ impl ChunkStorage {
             }
         }
 
-        {
-            let mut persisted = self.persisted_chunk_watermarks.write();
-            persisted.clear();
-            for shard in &self.sealed_chunks {
-                let sealed = shard.read();
-                for (series_id, chunks) in sealed.iter() {
-                    let watermark = chunks
-                        .keys()
-                        .next_back()
-                        .map(|key| key.sequence)
-                        .unwrap_or(0);
-                    persisted.insert(*series_id, watermark);
-                }
-            }
-        }
+        self.refresh_persisted_chunk_watermarks_from_sealed();
 
         if let Some(wal) = &self.wal {
             wal.reset()?;
@@ -1246,7 +1442,15 @@ impl Storage for ChunkStorage {
             self.rollback_empty_series_lane_reservations(&reserved_series);
             let mut registry = self.registry.write();
             registry.rollback_created_series(&created_series);
+            if self.memory_budget_value() != usize::MAX {
+                self.refresh_memory_usage();
+            }
             return Err(err);
+        }
+
+        if self.memory_budget_value() != usize::MAX {
+            self.refresh_memory_usage();
+            self.enforce_memory_budget_if_needed()?;
         }
 
         Ok(())
@@ -1420,6 +1624,17 @@ impl Storage for ChunkStorage {
         Ok(metrics)
     }
 
+    fn memory_used(&self) -> usize {
+        let used = self.compute_memory_usage_bytes();
+        self.memory_used_bytes
+            .store(used.min(u64::MAX as usize) as u64, Ordering::Release);
+        used
+    }
+
+    fn memory_budget(&self) -> usize {
+        self.memory_budget_value()
+    }
+
     fn close(&self) -> Result<()> {
         if self
             .lifecycle
@@ -1440,6 +1655,9 @@ impl Storage for ChunkStorage {
             let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
             self.persist_segment()?;
+            if self.memory_budget_value() != usize::MAX {
+                self.refresh_memory_usage();
+            }
             self.compact_once_if_needed()
         })();
 
@@ -1480,6 +1698,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
         .max(1),
         max_writers: builder.max_writers(),
         write_timeout: builder.write_timeout(),
+        memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
         compaction_interval: DEFAULT_COMPACTION_INTERVAL,
     };
 
@@ -1531,6 +1750,10 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     ));
     storage.apply_loaded_segment_indexes(loaded_segments)?;
     storage.replay_from_wal()?;
+    if storage.memory_budget_value() != usize::MAX {
+        storage.refresh_memory_usage();
+        storage.enforce_memory_budget_if_needed()?;
+    }
 
     Ok(storage as Arc<dyn Storage>)
 }
@@ -1694,6 +1917,14 @@ fn dedupe_exact_duplicate_points(points: &mut Vec<DataPoint>) {
     points.dedup_by(|current, next| {
         current.timestamp == next.timestamp && current.value == next.value
     });
+}
+
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::Bytes(bytes) => bytes.capacity(),
+        Value::String(text) => text.capacity(),
+        _ => 0,
+    }
 }
 
 fn lane_for_value(value: &Value) -> ValueLane {
@@ -2165,6 +2396,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
@@ -2224,6 +2456,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
@@ -2327,6 +2560,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(2),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));
@@ -2767,6 +3001,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: Duration::from_millis(25),
             },
         );
@@ -2996,6 +3231,7 @@ mod tests {
                 partition_window: 1,
                 max_writers: 2,
                 write_timeout: Duration::from_secs(1),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         );
@@ -3027,6 +3263,93 @@ mod tests {
 
         let active = storage.active_builders[ChunkStorage::series_shard_idx(series_id)].read();
         assert_eq!(active.get(&series_id).unwrap().builder.len(), 1);
+    }
+
+    #[test]
+    fn memory_budget_spills_to_l0_and_preserves_query_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let labels = vec![Label::new("host", "a")];
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 2,
+                write_timeout: Duration::from_secs(1),
+                memory_budget_bytes: 1,
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            },
+        );
+
+        storage
+            .insert_rows(&[
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(1, 1.0)),
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(2, 2.0)),
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(3, 3.0)),
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(4, 4.0)),
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(5, 5.0)),
+                Row::with_labels("budget_metric", labels.clone(), DataPoint::new(6, 6.0)),
+            ])
+            .unwrap();
+
+        let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+        let l0_segments = load_segments_for_level(&lane_path, 0).unwrap();
+        assert!(
+            !l0_segments.is_empty(),
+            "budget pressure should flush sealed chunks to L0 before close"
+        );
+
+        let points = storage.select("budget_metric", &labels, 0, 10).unwrap();
+        assert_eq!(
+            points,
+            vec![
+                DataPoint::new(1, 1.0),
+                DataPoint::new(2, 2.0),
+                DataPoint::new(3, 3.0),
+                DataPoint::new(4, 4.0),
+                DataPoint::new(5, 5.0),
+                DataPoint::new(6, 6.0),
+            ]
+        );
+        assert_eq!(storage.memory_budget(), 1);
+        assert!(
+            storage.memory_used() <= storage.memory_budget(),
+            "memory usage should fall under budget after spill"
+        );
+
+        let series_id = storage
+            .registry
+            .read()
+            .resolve_existing("budget_metric", &labels)
+            .unwrap()
+            .series_id;
+        let sealed = storage.sealed_chunks[ChunkStorage::series_shard_idx(series_id)].read();
+        let sealed_count = sealed
+            .get(&series_id)
+            .map(|chunks| chunks.len())
+            .unwrap_or(0);
+        assert!(
+            sealed_count < 3,
+            "oldest sealed chunks should be evicted after spill"
+        );
+
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn memory_budget_stats_reflect_builder_configuration() {
+        let storage = StorageBuilder::new()
+            .with_memory_limit(1234)
+            .build()
+            .unwrap();
+
+        assert_eq!(storage.memory_budget(), 1234);
+        assert_eq!(storage.memory_used(), 0);
     }
 
     #[test]
@@ -3179,6 +3502,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 1,
                 write_timeout: Duration::ZERO,
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         );
@@ -3214,6 +3538,7 @@ mod tests {
                 partition_window: i64::MAX,
                 max_writers: 1,
                 write_timeout: Duration::from_secs(2),
+                memory_budget_bytes: u64::MAX,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             },
         ));

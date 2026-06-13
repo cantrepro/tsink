@@ -262,6 +262,16 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Returns currently estimated in-memory bytes owned by the storage engine.
+    pub fn memory_used(&self) -> usize {
+        self.runtime.storage.memory_used()
+    }
+
+    /// Returns configured in-memory byte budget.
+    pub fn memory_budget(&self) -> usize {
+        self.runtime.storage.memory_budget()
+    }
+
     /// Close the storage. Additional operations return `StorageClosed`.
     pub async fn close(&self) -> Result<()> {
         if self
@@ -388,6 +398,13 @@ impl AsyncStorageBuilder {
     #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.inner = self.inner.with_partition_duration(duration);
+        self
+    }
+
+    /// Sets global in-memory byte budget for the underlying storage.
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.with_memory_limit(bytes);
         self
     }
 

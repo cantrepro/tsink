@@ -79,6 +79,18 @@ pub trait Storage: Send + Sync {
         self.list_metrics()
     }
 
+    /// Returns currently estimated in-memory bytes owned by the storage engine.
+    fn memory_used(&self) -> usize {
+        0
+    }
+
+    /// Returns configured in-memory byte budget for the storage engine.
+    ///
+    /// `usize::MAX` means "no explicit budget configured".
+    fn memory_budget(&self) -> usize {
+        usize::MAX
+    }
+
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
 }
@@ -93,6 +105,7 @@ pub struct StorageBuilder {
     max_writers: usize,
     write_timeout: Duration,
     partition_duration: Duration,
+    memory_limit_bytes: usize,
     wal_enabled: bool,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
@@ -109,6 +122,7 @@ impl Default for StorageBuilder {
             max_writers: crate::cgroup::default_workers_limit(),
             write_timeout: Duration::from_secs(30),
             partition_duration: Duration::from_secs(3600),
+            memory_limit_bytes: usize::MAX,
             wal_enabled: true,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
@@ -185,6 +199,16 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets a global in-memory byte budget for active + sealed chunks.
+    ///
+    /// When exceeded, the engine applies backpressure by persisting sealed chunks to L0
+    /// and evicting the oldest sealed chunks from RAM.
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes;
+        self
+    }
+
     /// Enables or disables WAL.
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
@@ -241,6 +265,10 @@ impl StorageBuilder {
 
     pub(crate) fn partition_duration(&self) -> Duration {
         self.partition_duration
+    }
+
+    pub(crate) fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit_bytes
     }
 
     pub(crate) fn wal_enabled(&self) -> bool {
