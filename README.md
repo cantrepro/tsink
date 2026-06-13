@@ -6,6 +6,8 @@
 
 <p align="center">
   <a href="https://crates.io/crates/tsink"><img src="https://img.shields.io/crates/v/tsink.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/tsink/latest/tsink"><img src="https://img.shields.io/docsrs/tsink.svg" alt="docs.rs"></a>
+  <a href="https://pypi.org/project/tsink-uniffi"><img src="https://img.shields.io/pypi/v/tsink-uniffi.svg" alt="pypi.org"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
