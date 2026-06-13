@@ -619,10 +619,12 @@ impl FramedWal {
         writer: &mut BufWriter<File>,
         frame_start_len: u64,
     ) -> Result<()> {
-        writer.get_mut().set_len(frame_start_len)?;
-        writer.get_mut().sync_data()?;
-
         let active_path = self.path.lock().clone();
+        let truncation_file = OpenOptions::new().write(true).open(&active_path)?;
+        truncation_file.set_len(frame_start_len)?;
+        truncation_file.sync_data()?;
+        drop(truncation_file);
+
         let (replacement, _, _) = open_segment_for_append(&active_path)?;
         let capacity = writer.capacity();
         let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));

@@ -498,15 +498,7 @@ pub(super) fn open_segment_for_append(path: &Path) -> Result<(File, bool, u64)> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(e.into()),
     };
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg_attr(windows, allow(clippy::ineffective_open_options))]
-    #[cfg(windows)]
-    {
-        // Windows needs explicit write access for rollback truncation via `set_len`.
-        options.write(true);
-    }
-    let file = options.open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
     let initial_len = file.metadata()?.len();
     Ok((file, segment_created, initial_len))
 }

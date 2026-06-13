@@ -1793,7 +1793,25 @@ fn compute_only_storage_refreshes_remote_tombstones_without_segment_inventory_ch
     )
     .unwrap();
 
-    std::thread::sleep(Duration::from_millis(5));
+    let tombstone_refreshed =
+        wait_for_condition(Duration::from_secs(3), Duration::from_millis(25), || {
+            storage
+                .select("compute_only_tombstone_refresh_metric", &labels, 0, 10)
+                .unwrap()
+                .is_empty()
+                && storage.list_metrics().unwrap().is_empty()
+                && storage
+                    .select_series(
+                        &SeriesSelection::new()
+                            .with_metric("compute_only_tombstone_refresh_metric"),
+                    )
+                    .unwrap()
+                    .is_empty()
+        });
+    assert!(
+        tombstone_refreshed,
+        "compute-only storage did not refresh remote tombstones"
+    );
 
     assert!(storage
         .select("compute_only_tombstone_refresh_metric", &labels, 0, 10)
