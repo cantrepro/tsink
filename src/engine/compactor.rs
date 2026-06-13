@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,9 +14,11 @@ use crate::{Result, TsinkError};
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
+const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
+const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 64;
 
-type SeriesChunks = HashMap<SeriesId, Vec<Chunk>>;
-type MergeSegmentsOutput = (Vec<PersistedSeries>, SeriesChunks);
+type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
+type MergeSegmentsOutput<'a> = (Vec<PersistedSeries>, SeriesChunkRefs<'a>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionLevel {
@@ -90,17 +92,18 @@ impl Compactor {
             return Ok(false);
         }
 
-        self.compact_segments(source_level, target_level, &segments)?;
+        let window =
+            select_compaction_window(&segments, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
+        if window.len() < 2 {
+            return Ok(false);
+        }
+
+        self.compact_segments(target_level, &window)?;
         Ok(true)
     }
 
-    fn compact_segments(
-        &self,
-        _source_level: u8,
-        target_level: u8,
-        segments: &[LoadedSegment],
-    ) -> Result<()> {
-        let (series, chunks_by_series) = merge_segments(segments)?;
+    fn compact_segments(&self, target_level: u8, segments: &[&LoadedSegment]) -> Result<()> {
+        let (series, chunks_by_series) = collect_series_and_chunk_refs(segments)?;
         if chunks_by_series.is_empty() {
             return Ok(());
         }
@@ -114,14 +117,41 @@ impl Compactor {
             )?;
         }
 
-        let repacked = repack_chunks(chunks_by_series, self.point_cap)?;
+        let output_segment_point_budget = self
+            .point_cap
+            .saturating_mul(DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER)
+            .max(self.point_cap);
+        let mut pending_chunks = HashMap::<SeriesId, Vec<Chunk>>::new();
+        let mut pending_points = 0usize;
+        let mut emitted_segments = 0usize;
 
-        let next_segment_id = match &self.next_segment_id {
-            Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
-            None => load_segments(&self.data_path)?.next_segment_id,
-        };
-        let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
-        writer.write_segment(&registry, &repacked)?;
+        for series_def in &series {
+            let series_id = series_def.series_id;
+            let Some(chunks) = chunks_by_series.get(&series_id) else {
+                continue;
+            };
+
+            stream_merge_series_chunks(series_id, chunks, self.point_cap, |chunk| {
+                pending_points = pending_points.saturating_add(chunk.header.point_count as usize);
+                pending_chunks.entry(series_id).or_default().push(chunk);
+                if pending_points >= output_segment_point_budget {
+                    self.flush_compacted_segment(target_level, &registry, &pending_chunks)?;
+                    pending_chunks.clear();
+                    pending_points = 0;
+                    emitted_segments = emitted_segments.saturating_add(1);
+                }
+                Ok(())
+            })?;
+        }
+
+        if !pending_chunks.is_empty() {
+            self.flush_compacted_segment(target_level, &registry, &pending_chunks)?;
+            emitted_segments = emitted_segments.saturating_add(1);
+        }
+
+        if emitted_segments == 0 {
+            return Ok(());
+        }
 
         for segment in segments {
             fs::remove_dir_all(&segment.root)?;
@@ -129,11 +159,32 @@ impl Compactor {
 
         Ok(())
     }
+
+    fn flush_compacted_segment(
+        &self,
+        target_level: u8,
+        registry: &SeriesRegistry,
+        chunks_by_series: &HashMap<SeriesId, Vec<Chunk>>,
+    ) -> Result<()> {
+        if chunks_by_series.is_empty() {
+            return Ok(());
+        }
+
+        let next_segment_id = match &self.next_segment_id {
+            Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
+            None => load_segments(&self.data_path)?.next_segment_id,
+        };
+        let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
+        writer.write_segment(registry, chunks_by_series)?;
+        Ok(())
+    }
 }
 
-fn merge_segments(segments: &[LoadedSegment]) -> Result<MergeSegmentsOutput> {
+fn collect_series_and_chunk_refs<'a>(
+    segments: &[&'a LoadedSegment],
+) -> Result<MergeSegmentsOutput<'a>> {
     let mut series_by_id = BTreeMap::<SeriesId, PersistedSeries>::new();
-    let mut chunks_by_series = SeriesChunks::new();
+    let mut chunks_by_series = SeriesChunkRefs::new();
 
     for segment in segments {
         for series in &segment.series {
@@ -153,74 +204,104 @@ fn merge_segments(segments: &[LoadedSegment]) -> Result<MergeSegmentsOutput> {
         }
 
         for (series_id, chunks) in &segment.chunks_by_series {
-            chunks_by_series
-                .entry(*series_id)
-                .or_default()
-                .extend(chunks.clone());
+            let entry = chunks_by_series.entry(*series_id).or_default();
+            entry.extend(chunks.iter());
         }
     }
 
     Ok((series_by_id.into_values().collect(), chunks_by_series))
 }
 
-fn repack_chunks(mut chunks_by_series: SeriesChunks, point_cap: usize) -> Result<SeriesChunks> {
-    let mut out = HashMap::new();
+fn stream_merge_series_chunks<F>(
+    series_id: SeriesId,
+    chunks: &[&Chunk],
+    point_cap: usize,
+    mut emit_chunk: F,
+) -> Result<()>
+where
+    F: FnMut(Chunk) -> Result<()>,
+{
+    let lane = infer_lane_for_refs(chunks)?;
+    let point_cap = point_cap.max(1);
 
-    for (series_id, chunks) in chunks_by_series.drain() {
-        let lane = infer_lane(&chunks)?;
+    let mut cursors = Vec::with_capacity(chunks.len());
+    let mut heap = BinaryHeap::<MergeCursorKey>::new();
 
-        let mut all_points = Vec::new();
-        for chunk in chunks {
-            all_points.extend(decode_chunk_points_for_compaction(&chunk)?);
-        }
-
-        if all_points.is_empty() {
+    for (chunk_order, chunk) in chunks.iter().enumerate() {
+        let Some(cursor) = ChunkPointCursor::from_chunk(chunk_order, chunk)? else {
             continue;
-        }
+        };
 
-        all_points.sort_by_key(|point| point.ts);
-        let deduped = dedupe_last_value_per_timestamp(all_points);
+        let cursor_idx = cursors.len();
+        let first_ts = cursor.current().map(|point| point.ts).unwrap_or_default();
+        cursors.push(cursor);
+        heap.push(MergeCursorKey {
+            ts: first_ts,
+            chunk_order,
+            cursor_idx,
+        });
+    }
 
-        let mut series_chunks = Vec::new();
-        for points in deduped.chunks(point_cap.max(1)) {
-            if points.is_empty() {
-                continue;
-            }
+    if heap.is_empty() {
+        return Ok(());
+    }
 
-            let encoded = Encoder::encode_chunk_points(points, lane)?;
-            let point_count = u16::try_from(points.len()).map_err(|_| {
-                TsinkError::InvalidConfiguration(
-                    "compacted chunk point_count exceeds u16".to_string(),
-                )
-            })?;
+    let mut pending_point: Option<ChunkPoint> = None;
+    let mut chunk_points = Vec::with_capacity(point_cap);
 
-            let min_ts = points.first().map(|point| point.ts).unwrap_or(0);
-            let max_ts = points.last().map(|point| point.ts).unwrap_or(min_ts);
+    while let Some(key) = heap.pop() {
+        let Some(cursor) = cursors.get_mut(key.cursor_idx) else {
+            return Err(TsinkError::DataCorruption(
+                "compaction cursor index out of bounds".to_string(),
+            ));
+        };
 
-            series_chunks.push(Chunk {
-                header: ChunkHeader {
-                    series_id,
-                    lane,
-                    point_count,
-                    min_ts,
-                    max_ts,
-                    ts_codec: encoded.ts_codec,
-                    value_codec: encoded.value_codec,
-                },
-                points: points.to_vec(),
-                encoded_payload: encoded.payload,
+        let Some(point) = cursor.current().cloned() else {
+            return Err(TsinkError::DataCorruption(
+                "compaction cursor missing point".to_string(),
+            ));
+        };
+
+        cursor.advance();
+        if let Some(next_point) = cursor.current() {
+            heap.push(MergeCursorKey {
+                ts: next_point.ts,
+                chunk_order: cursor.chunk_order,
+                cursor_idx: key.cursor_idx,
             });
         }
 
-        if !series_chunks.is_empty() {
-            out.insert(series_id, series_chunks);
+        if pending_point
+            .as_ref()
+            .is_some_and(|pending| pending.ts == point.ts)
+        {
+            pending_point = Some(point);
+            continue;
         }
+
+        if let Some(previous) = pending_point.take() {
+            chunk_points.push(previous);
+            if chunk_points.len() >= point_cap {
+                let points = std::mem::replace(&mut chunk_points, Vec::with_capacity(point_cap));
+                emit_chunk(encode_compacted_chunk(series_id, lane, points)?)?;
+            }
+        }
+
+        pending_point = Some(point);
     }
 
-    Ok(out)
+    if let Some(point) = pending_point.take() {
+        chunk_points.push(point);
+    }
+
+    if !chunk_points.is_empty() {
+        emit_chunk(encode_compacted_chunk(series_id, lane, chunk_points)?)?;
+    }
+
+    Ok(())
 }
 
-fn infer_lane(chunks: &[Chunk]) -> Result<ValueLane> {
+fn infer_lane_for_refs(chunks: &[&Chunk]) -> Result<ValueLane> {
     let Some(first) = chunks.first() else {
         return Ok(ValueLane::Numeric);
     };
@@ -235,6 +316,40 @@ fn infer_lane(chunks: &[Chunk]) -> Result<ValueLane> {
     }
 
     Ok(expected)
+}
+
+fn encode_compacted_chunk(
+    series_id: SeriesId,
+    lane: ValueLane,
+    points: Vec<ChunkPoint>,
+) -> Result<Chunk> {
+    if points.is_empty() {
+        return Err(TsinkError::DataCorruption(
+            "attempted to encode empty compacted chunk".to_string(),
+        ));
+    }
+
+    let encoded = Encoder::encode_chunk_points(&points, lane)?;
+    let point_count = u16::try_from(points.len()).map_err(|_| {
+        TsinkError::InvalidConfiguration("compacted chunk point_count exceeds u16".to_string())
+    })?;
+
+    let min_ts = points.first().map(|point| point.ts).unwrap_or(0);
+    let max_ts = points.last().map(|point| point.ts).unwrap_or(min_ts);
+
+    Ok(Chunk {
+        header: ChunkHeader {
+            series_id,
+            lane,
+            point_count,
+            min_ts,
+            max_ts,
+            ts_codec: encoded.ts_codec,
+            value_codec: encoded.value_codec,
+        },
+        points,
+        encoded_payload: encoded.payload,
+    })
 }
 
 fn decode_chunk_points_for_compaction(chunk: &Chunk) -> Result<Vec<ChunkPoint>> {
@@ -253,23 +368,6 @@ fn decode_chunk_points_for_compaction(chunk: &Chunk) -> Result<Vec<ChunkPoint>> 
         chunk.header.point_count as usize,
         &chunk.encoded_payload,
     )
-}
-
-fn dedupe_last_value_per_timestamp(points: Vec<ChunkPoint>) -> Vec<ChunkPoint> {
-    let mut out: Vec<ChunkPoint> = Vec::with_capacity(points.len());
-
-    for point in points {
-        if let Some(last) = out.last_mut() {
-            if last.ts == point.ts {
-                *last = point;
-                continue;
-            }
-        }
-
-        out.push(point);
-    }
-
-    out
 }
 
 fn has_time_overlap(segments: &[LoadedSegment]) -> bool {
@@ -299,6 +397,144 @@ fn has_time_overlap(segments: &[LoadedSegment]) -> bool {
     }
 
     false
+}
+
+fn select_compaction_window(
+    segments: &[LoadedSegment],
+    count_trigger: usize,
+    max_segments: usize,
+) -> Vec<&LoadedSegment> {
+    let max_segments = max_segments.max(2);
+    if let Some(indexes) = overlapping_window_indexes(segments, max_segments) {
+        return indexes
+            .into_iter()
+            .filter_map(|index| segments.get(index))
+            .collect();
+    }
+
+    let window_len = count_trigger.max(2).min(max_segments).min(segments.len());
+    segments.iter().take(window_len).collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SegmentTimeRange {
+    index: usize,
+    segment_id: u64,
+    min_ts: i64,
+    max_ts: i64,
+}
+
+fn overlapping_window_indexes(
+    segments: &[LoadedSegment],
+    max_segments: usize,
+) -> Option<Vec<usize>> {
+    let mut ranges = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            Some(SegmentTimeRange {
+                index,
+                segment_id: segment.manifest.segment_id,
+                min_ts: segment.manifest.min_ts?,
+                max_ts: segment.manifest.max_ts?,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if ranges.len() < 2 {
+        return None;
+    }
+
+    ranges.sort_by_key(|range| (range.min_ts, range.segment_id));
+
+    let mut cluster_start = 0usize;
+    let mut cluster_max = ranges[0].max_ts;
+
+    for idx in 1..ranges.len() {
+        if ranges[idx].min_ts <= cluster_max {
+            cluster_max = cluster_max.max(ranges[idx].max_ts);
+            continue;
+        }
+
+        if idx.saturating_sub(cluster_start) >= 2 {
+            return Some(select_cluster_indexes(
+                &ranges[cluster_start..idx],
+                max_segments,
+            ));
+        }
+
+        cluster_start = idx;
+        cluster_max = ranges[idx].max_ts;
+    }
+
+    if ranges.len().saturating_sub(cluster_start) >= 2 {
+        return Some(select_cluster_indexes(
+            &ranges[cluster_start..],
+            max_segments,
+        ));
+    }
+
+    None
+}
+
+fn select_cluster_indexes(cluster: &[SegmentTimeRange], max_segments: usize) -> Vec<usize> {
+    let mut indexes = cluster.iter().map(|range| range.index).collect::<Vec<_>>();
+    indexes.sort_unstable();
+    indexes.truncate(max_segments.max(2));
+    indexes
+}
+
+#[derive(Debug)]
+struct ChunkPointCursor {
+    chunk_order: usize,
+    points: Vec<ChunkPoint>,
+    point_idx: usize,
+}
+
+impl ChunkPointCursor {
+    fn from_chunk(chunk_order: usize, chunk: &Chunk) -> Result<Option<Self>> {
+        let points = decode_chunk_points_for_compaction(chunk)?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            chunk_order,
+            points,
+            point_idx: 0,
+        }))
+    }
+
+    fn current(&self) -> Option<&ChunkPoint> {
+        self.points.get(self.point_idx)
+    }
+
+    fn advance(&mut self) {
+        self.point_idx = self.point_idx.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergeCursorKey {
+    ts: i64,
+    chunk_order: usize,
+    cursor_idx: usize,
+}
+
+impl PartialOrd for MergeCursorKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeCursorKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .ts
+            .cmp(&self.ts)
+            .then_with(|| other.chunk_order.cmp(&self.chunk_order))
+            .then_with(|| other.cursor_idx.cmp(&self.cursor_idx))
+    }
 }
 
 fn level_to_u8(level: CompactionLevel) -> u8 {
@@ -412,6 +648,89 @@ mod tests {
         assert_eq!(l1.len(), 1);
         assert_eq!(l1[0].manifest.segment_id, 100);
         assert_eq!(next_segment_id.load(Ordering::SeqCst), 101);
+    }
+
+    #[test]
+    fn compactor_limits_source_window_per_pass() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+
+        let series_id = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap()
+            .series_id;
+
+        for segment_id in 1..=6 {
+            let mut chunks = HashMap::new();
+            chunks.insert(
+                series_id,
+                vec![make_numeric_chunk(
+                    series_id,
+                    &[(segment_id as i64, segment_id as f64)],
+                )],
+            );
+            SegmentWriter::new(temp_dir.path(), 0, segment_id)
+                .unwrap()
+                .write_segment(&registry, &chunks)
+                .unwrap();
+        }
+
+        let compactor = Compactor::new(temp_dir.path(), 8);
+        compactor.compact_once().unwrap();
+
+        let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+        let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(
+            l0.iter()
+                .map(|segment| segment.manifest.segment_id)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
+
+    #[test]
+    fn compactor_splits_large_output_into_multiple_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = SeriesRegistry::new();
+
+        let series_id = registry
+            .resolve_or_insert("cpu", &[Label::new("host", "a")])
+            .unwrap()
+            .series_id;
+
+        for segment_id in 1..=4 {
+            let start = (segment_id as i64 - 1) * 50;
+            let points = (start..start + 50)
+                .map(|ts| (ts, ts as f64))
+                .collect::<Vec<_>>();
+
+            let mut chunks = HashMap::new();
+            chunks.insert(series_id, vec![make_numeric_chunk(series_id, &points)]);
+            SegmentWriter::new(temp_dir.path(), 0, segment_id)
+                .unwrap()
+                .write_segment(&registry, &chunks)
+                .unwrap();
+        }
+
+        let compactor = Compactor::new(temp_dir.path(), 2);
+        compactor.compact_once().unwrap();
+
+        let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+        let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+        assert!(l0.is_empty());
+        assert!(l1.len() >= 2);
+        assert!(l1.iter().all(|segment| segment.manifest.point_count <= 128));
+
+        let loaded = load_segments(temp_dir.path()).unwrap();
+        let chunks = loaded.chunks_by_series.get(&series_id).unwrap();
+        let total_points = chunks
+            .iter()
+            .map(|chunk| chunk.header.point_count as usize)
+            .sum::<usize>();
+        assert_eq!(total_points, 200);
     }
 
     fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {

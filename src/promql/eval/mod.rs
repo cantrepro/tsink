@@ -16,6 +16,11 @@ use self::time::{duration_to_units, step_times};
 
 const DEFAULT_LOOKBACK_DELTA_MS: i64 = 5 * 60 * 1_000;
 
+type LabelPoints = (Vec<Label>, Vec<DataPoint>);
+type MetricPrefetchRows = Vec<LabelPoints>;
+type RangeSeriesKey = (String, Vec<Label>);
+type RangeSeriesSamples = Vec<(i64, f64)>;
+
 pub struct Engine {
     storage: Arc<dyn Storage>,
     default_lookback_delta: i64,
@@ -30,15 +35,15 @@ pub(crate) struct QueryParams<'a> {
 
 #[derive(Clone, Default)]
 pub(crate) struct PrefetchCache {
-    by_metric: HashMap<String, Vec<(Vec<Label>, Vec<DataPoint>)>>,
+    by_metric: HashMap<String, MetricPrefetchRows>,
 }
 
 impl PrefetchCache {
-    fn insert(&mut self, metric: String, data: Vec<(Vec<Label>, Vec<DataPoint>)>) {
+    fn insert(&mut self, metric: String, data: MetricPrefetchRows) {
         self.by_metric.insert(metric, data);
     }
 
-    pub(crate) fn get(&self, metric: &str) -> Option<&Vec<(Vec<Label>, Vec<DataPoint>)>> {
+    pub(crate) fn get(&self, metric: &str) -> Option<&MetricPrefetchRows> {
         self.by_metric.get(metric)
     }
 }
@@ -91,7 +96,7 @@ impl Engine {
         let expr = crate::promql::parse(query_str)?;
         let prefetch = self.build_prefetch_cache(&expr, start, end)?;
 
-        let mut out: BTreeMap<(String, Vec<Label>), Vec<(i64, f64)>> = BTreeMap::new();
+        let mut out: BTreeMap<RangeSeriesKey, RangeSeriesSamples> = BTreeMap::new();
         for ts in step_times(start, end, step) {
             let params = QueryParams {
                 eval_time: ts,
@@ -114,7 +119,7 @@ impl Engine {
     }
 
     fn append_step_value(
-        out: &mut BTreeMap<(String, Vec<Label>), Vec<(i64, f64)>>,
+        out: &mut BTreeMap<RangeSeriesKey, RangeSeriesSamples>,
         step_ts: i64,
         value: PromqlValue,
     ) {

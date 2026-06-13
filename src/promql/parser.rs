@@ -412,19 +412,19 @@ impl Parser {
     }
 
     fn expect(&mut self, expect: TokenExpect) -> Result<()> {
-        let ok = match (expect, &self.peek().kind) {
+        let ok = matches!(
+            (expect, &self.peek().kind),
             (TokenExpect::Eof, TokenKind::Eof)
-            | (TokenExpect::LParen, TokenKind::LParen)
-            | (TokenExpect::RParen, TokenKind::RParen)
-            | (TokenExpect::LBrace, TokenKind::LBrace)
-            | (TokenExpect::RBrace, TokenKind::RBrace)
-            | (TokenExpect::RBracket, TokenKind::RBracket)
-            | (TokenExpect::Comma, TokenKind::Comma)
-            | (TokenExpect::Duration, TokenKind::Duration(_))
-            | (TokenExpect::Ident, TokenKind::Ident(_))
-            | (TokenExpect::String, TokenKind::String(_)) => true,
-            _ => false,
-        };
+                | (TokenExpect::LParen, TokenKind::LParen)
+                | (TokenExpect::RParen, TokenKind::RParen)
+                | (TokenExpect::LBrace, TokenKind::LBrace)
+                | (TokenExpect::RBrace, TokenKind::RBrace)
+                | (TokenExpect::RBracket, TokenKind::RBracket)
+                | (TokenExpect::Comma, TokenKind::Comma)
+                | (TokenExpect::Duration, TokenKind::Duration(_))
+                | (TokenExpect::Ident, TokenKind::Ident(_))
+                | (TokenExpect::String, TokenKind::String(_))
+        );
 
         if ok {
             self.advance();

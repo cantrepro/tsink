@@ -649,7 +649,7 @@ mod tests {
             .resolve_existing("phantom_metric", &phantom_labels)
             .is_some());
 
-        registry.rollback_created_series(&[created.clone()]);
+        registry.rollback_created_series(std::slice::from_ref(&created));
 
         assert_eq!(registry.series_count(), baseline_series);
         assert!(registry.metric_dictionary_len() >= baseline_metric_dict_len);
