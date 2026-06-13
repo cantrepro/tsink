@@ -180,7 +180,7 @@ fn test_value_types() {
             metric: "test.f64".into(),
             labels: vec![],
             data_point: UDataPoint {
-                value: UValue::F64 { v: 3.14 },
+                value: UValue::F64 { v: 3.125 },
                 timestamp: 1,
             },
         },
@@ -229,7 +229,7 @@ fn test_value_types() {
     ];
     db.insert_rows(rows).unwrap();
     let r = db.select("test.f64".into(), vec![], 0, 10).unwrap();
-    assert!(matches!(r[0].value, UValue::F64 { v } if (v - 3.14).abs() < 1e-10));
+    assert!(matches!(r[0].value, UValue::F64 { v } if (v - 3.125).abs() < 1e-10));
     let r = db.select("test.i64".into(), vec![], 0, 10).unwrap();
     assert!(matches!(r[0].value, UValue::I64 { v: -42 }));
     let r = db.select("test.bool".into(), vec![], 0, 10).unwrap();
