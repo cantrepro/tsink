@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
+use crate::{DataPoint, Label};
 use regex::Regex;
-use tsink::{DataPoint, Label};
 
-use crate::ast::{MatchOp, MatrixSelector, VectorSelector};
-use crate::error::{PromqlError, Result};
-use crate::types::{value_to_f64, PromqlValue, Sample, Series};
+use crate::promql::ast::{MatchOp, MatrixSelector, VectorSelector};
+use crate::promql::error::{PromqlError, Result};
+use crate::promql::types::{value_to_f64, PromqlValue, Sample, Series};
 
 use super::time::duration_to_units;
 use super::{Engine, QueryParams};
@@ -237,7 +237,10 @@ fn latest_point_as_sample(
         })
 }
 
-fn exact_equal_labels(metric: &str, matchers: &[crate::ast::LabelMatcher]) -> Option<Vec<Label>> {
+fn exact_equal_labels(
+    metric: &str,
+    matchers: &[crate::promql::ast::LabelMatcher],
+) -> Option<Vec<Label>> {
     if matchers.is_empty() {
         return None;
     }
@@ -285,7 +288,7 @@ fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<b
 pub(crate) fn matchers_match(
     metric: &str,
     labels: &[Label],
-    matchers: &[crate::ast::LabelMatcher],
+    matchers: &[crate::promql::ast::LabelMatcher],
 ) -> Result<bool> {
     for matcher in matchers {
         let actual = if matcher.name == "__name__" {

@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use tsink::Label;
+use crate::Label;
 
-use crate::ast::{BinaryExpr, BinaryOp, VectorMatching};
-use crate::error::{PromqlError, Result};
-use crate::types::{PromqlValue, Sample};
+use crate::promql::ast::{BinaryExpr, BinaryOp, VectorMatching};
+use crate::promql::error::{PromqlError, Result};
+use crate::promql::types::{PromqlValue, Sample};
 
 use super::{Engine, QueryParams};
 

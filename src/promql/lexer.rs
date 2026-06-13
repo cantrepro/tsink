@@ -1,4 +1,4 @@
-use crate::error::{PromqlError, Result};
+use crate::promql::error::{PromqlError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {

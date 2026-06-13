@@ -1,7 +1,11 @@
+#![cfg(feature = "promql")]
+
 use std::sync::Arc;
 
-use tsink::{DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision};
-use tsink_promql::{Engine, PromqlValue};
+use tsink::{
+    promql::{Engine, PromqlValue, Sample, Series},
+    DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision,
+};
 
 fn setup_storage() -> Arc<dyn Storage> {
     let storage = StorageBuilder::new()
@@ -31,14 +35,14 @@ fn setup_storage() -> Arc<dyn Storage> {
     storage
 }
 
-fn as_instant_vector(value: PromqlValue) -> Vec<tsink_promql::Sample> {
+fn as_instant_vector(value: PromqlValue) -> Vec<Sample> {
     match value {
         PromqlValue::InstantVector(v) => v,
         other => panic!("expected instant vector, got {other:?}"),
     }
 }
 
-fn as_range_vector(value: PromqlValue) -> Vec<tsink_promql::Series> {
+fn as_range_vector(value: PromqlValue) -> Vec<Series> {
     match value {
         PromqlValue::RangeVector(v) => v,
         other => panic!("expected range vector, got {other:?}"),

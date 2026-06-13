@@ -30,7 +30,7 @@ pub enum PromqlError {
     Regex(String),
 
     #[error("storage error: {0}")]
-    Storage(#[from] tsink::TsinkError),
+    Storage(#[from] crate::TsinkError),
 }
 
 impl From<regex::Error> for PromqlError {

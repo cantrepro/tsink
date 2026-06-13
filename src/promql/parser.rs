@@ -1,9 +1,9 @@
-use crate::ast::{
+use crate::promql::ast::{
     AggregationExpr, AggregationOp, BinaryExpr, BinaryOp, CallExpr, Expr, Grouping, LabelMatcher,
     MatchOp, MatrixSelector, UnaryExpr, UnaryOp, VectorMatching, VectorSelector,
 };
-use crate::error::{PromqlError, Result};
-use crate::lexer::{Lexer, Token, TokenKind};
+use crate::promql::error::{PromqlError, Result};
+use crate::promql::lexer::{Lexer, Token, TokenKind};
 
 pub fn parse(input: &str) -> Result<Expr> {
     let tokens = Lexer::new(input).tokenize()?;
@@ -470,7 +470,7 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use crate::ast::{AggregationOp, BinaryOp, Expr, MatchOp};
+    use crate::promql::ast::{AggregationOp, BinaryOp, Expr, MatchOp};
 
     use super::parse;
 

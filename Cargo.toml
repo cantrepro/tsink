@@ -30,6 +30,7 @@ memmap2 = "0.9"
 
 # Logging
 tracing = "0.1"
+regex = { version = "1.11", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
@@ -47,6 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
+promql = ["dep:regex"]
 
 [[bench]]
 name = "storage_benchmarks"
@@ -63,6 +65,3 @@ opt-level = 3
 
 [profile.bench]
 inherits = "release"
-
-[workspace]
-members = [".", "tsink-promql"]

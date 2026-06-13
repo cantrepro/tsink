@@ -8,6 +8,8 @@ pub mod engine;
 pub mod error;
 pub mod label;
 pub mod mmap;
+#[cfg(feature = "promql")]
+pub mod promql;
 pub mod storage;
 pub mod value;
 pub mod wal;

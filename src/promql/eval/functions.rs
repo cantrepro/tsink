@@ -1,9 +1,9 @@
+use crate::Label;
 use regex::Regex;
-use tsink::Label;
 
-use crate::ast::CallExpr;
-use crate::error::{PromqlError, Result};
-use crate::types::{PromqlValue, Sample};
+use crate::promql::ast::CallExpr;
+use crate::promql::error::{PromqlError, Result};
+use crate::promql::types::{PromqlValue, Sample};
 
 use super::{Engine, QueryParams};
 
@@ -432,7 +432,10 @@ fn expect_instant_vector(value: PromqlValue, func: &str) -> Result<Vec<Sample>> 
     }
 }
 
-fn expect_range_vector(value: PromqlValue, func: &str) -> Result<Vec<crate::types::Series>> {
+fn expect_range_vector(
+    value: PromqlValue,
+    func: &str,
+) -> Result<Vec<crate::promql::types::Series>> {
     match value {
         PromqlValue::RangeVector(v) => Ok(v),
         other => Err(PromqlError::Type(format!(

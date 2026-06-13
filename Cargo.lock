@@ -1173,6 +1173,7 @@ dependencies = [
  "num_cpus",
  "parking_lot",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -1181,15 +1182,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
-]
-
-[[package]]
-name = "tsink-promql"
-version = "0.1.0"
-dependencies = [
- "regex",
- "thiserror",
- "tsink",
 ]
 
 [[package]]

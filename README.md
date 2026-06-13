@@ -24,12 +24,20 @@ It stores time-series data in compressed chunks, persists immutable segment file
 - **WAL durability** — selectable sync mode (`Periodic` or `PerAppend`) with idempotent replay on recovery.
 - **Out-of-order writes** — data is returned sorted by timestamp regardless of insertion order.
 - **Concurrent writers** — multiple threads can insert simultaneously.
+- **Optional PromQL engine** — enable with the `promql` Cargo feature.
 
 ## Installation
 
 ```toml
 [dependencies]
-tsink = "0.7.1"
+tsink = "0.8.0"
+```
+
+Enable PromQL support:
+
+```toml
+[dependencies]
+tsink = { version = "0.8.0", features = ["promql"] }
 ```
 
 ## Quick Start

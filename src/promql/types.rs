@@ -1,4 +1,4 @@
-use tsink::{Label, Value};
+use crate::{Label, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {

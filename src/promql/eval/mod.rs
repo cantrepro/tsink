@@ -7,10 +7,10 @@ pub mod time;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::ast::{Expr, MatrixSelector, UnaryOp, VectorSelector};
-use crate::error::{PromqlError, Result};
-use crate::types::{PromqlValue, Series};
-use tsink::{DataPoint, Label, Storage, TimestampPrecision};
+use crate::promql::ast::{Expr, MatrixSelector, UnaryOp, VectorSelector};
+use crate::promql::error::{PromqlError, Result};
+use crate::promql::types::{PromqlValue, Series};
+use crate::{DataPoint, Label, Storage, TimestampPrecision};
 
 use self::time::{duration_to_units, step_times};
 
@@ -64,7 +64,7 @@ impl Engine {
     }
 
     pub fn instant_query(&self, query_str: &str, time: i64) -> Result<PromqlValue> {
-        let expr = crate::parse(query_str)?;
+        let expr = crate::promql::parse(query_str)?;
         let params = QueryParams {
             eval_time: time,
             prefetch: None,
@@ -88,7 +88,7 @@ impl Engine {
             )));
         }
 
-        let expr = crate::parse(query_str)?;
+        let expr = crate::promql::parse(query_str)?;
         let prefetch = self.build_prefetch_cache(&expr, start, end)?;
 
         let mut out: BTreeMap<(String, Vec<Label>), Vec<(i64, f64)>> = BTreeMap::new();
