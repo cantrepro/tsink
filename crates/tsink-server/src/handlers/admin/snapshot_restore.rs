@@ -43,12 +43,13 @@ pub(crate) async fn handle_admin_snapshot(
     )
     .await
     {
-        Ok(_) => json_response(
+        Ok(snapshot) => json_response(
             200,
             &json!({
                 "status": "success",
                 "data": {
-                    "path": response_path
+                    "path": response_path,
+                    "sizeBytes": snapshot.size_bytes
                 }
             }),
         ),

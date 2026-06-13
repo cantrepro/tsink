@@ -4,6 +4,10 @@ mod cluster;
 
 use self::cluster::ClusterMetrics;
 
+struct MetricsCollectionError {
+    collector: &'static str,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_metrics(
     storage: &Arc<dyn Storage>,
@@ -16,9 +20,19 @@ pub(super) fn render_metrics(
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
+    let mut collection_errors = Vec::new();
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
-    let metrics_list = storage.list_metrics().unwrap_or_default();
+    let metrics_list = match storage.list_metrics() {
+        Ok(metrics) => metrics,
+        Err(err) => {
+            eprintln!("metrics collection error in storage_list_metrics: {err}");
+            collection_errors.push(MetricsCollectionError {
+                collector: "storage_list_metrics",
+            });
+            Vec::new()
+        }
+    };
     let series_count = metrics_list.len();
     let uptime = server_start.elapsed().as_secs();
     let obs = storage.observability_snapshot();
@@ -35,10 +49,14 @@ pub(super) fn render_metrics(
     let read_admission_metrics = admission::read_admission_metrics_snapshot();
     let write_admission_metrics = admission::write_admission_metrics_snapshot();
     let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
-    let exemplar_metrics =
-        exemplar_store
-            .metrics_snapshot()
-            .unwrap_or(ExemplarStoreMetricsSnapshot {
+    let exemplar_metrics = match exemplar_store.metrics_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("metrics collection error in exemplar_store: {err}");
+            collection_errors.push(MetricsCollectionError {
+                collector: "exemplar_store",
+            });
+            ExemplarStoreMetricsSnapshot {
                 accepted_total: 0,
                 rejected_total: 0,
                 dropped_total: 0,
@@ -47,7 +65,9 @@ pub(super) fn render_metrics(
                 query_exemplars_total: 0,
                 stored_series: 0,
                 stored_exemplars: 0,
-            });
+            }
+        }
+    };
     let payload_status = payload_status_snapshot(cluster_context);
     let otlp_status = otlp_metrics_status_snapshot();
     let legacy_ingest_status = legacy_ingest::status_snapshot();
@@ -71,9 +91,19 @@ pub(super) fn render_metrics(
     let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
     let cluster_hotspot =
         cluster_hotspot_snapshot_for_request(&metrics_list, cluster_context, None);
-    let rules_snapshot = rules_runtime
-        .and_then(|runtime| runtime.snapshot().ok())
-        .unwrap_or_else(rules::empty_rules_snapshot);
+    let rules_snapshot = match rules_runtime {
+        Some(runtime) => match runtime.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                eprintln!("metrics collection error in rules_runtime: {err}");
+                collection_errors.push(MetricsCollectionError {
+                    collector: "rules_runtime",
+                });
+                rules::empty_rules_snapshot()
+            }
+        },
+        None => rules::empty_rules_snapshot(),
+    };
     let usage_status = usage_accounting
         .map(UsageAccounting::ledger_status)
         .unwrap_or_default();
@@ -623,9 +653,31 @@ pub(super) fn render_metrics(
     append_tenant_admission_metrics(&mut body, tenant_admission_metrics);
     append_security_metrics(&mut body, security_manager, rbac_registry);
     append_usage_metrics(&mut body, &usage_status);
+    append_metrics_collection_errors(&mut body, &collection_errors);
 
     HttpResponse::new(200, body.into_bytes())
         .with_header("Content-Type", "text/plain; version=0.0.4")
+}
+
+fn append_metrics_collection_errors(body: &mut String, errors: &[MetricsCollectionError]) {
+    body.push_str(
+        "# HELP tsink_metrics_collection_errors Number of metrics collectors that failed during this scrape\n\
+         # TYPE tsink_metrics_collection_errors gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_metrics_collection_errors {}\n",
+        errors.len()
+    ));
+    body.push_str(
+        "# HELP tsink_metrics_collection_error Whether a metrics collector failed during this scrape\n\
+         # TYPE tsink_metrics_collection_error gauge\n",
+    );
+    for error in errors {
+        let collector = prometheus_escape_label_value(error.collector);
+        body.push_str(&format!(
+            "tsink_metrics_collection_error{{collector=\"{collector}\"}} 1\n"
+        ));
+    }
 }
 
 fn append_security_metrics(

@@ -460,6 +460,19 @@ impl BackgroundWorkers {
     fn push(&mut self, task: JoinHandle<()>) {
         self.tasks.push(task);
     }
+
+    async fn shutdown(self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => eprintln!("background worker task failed during shutdown: {err}"),
+            }
+        }
+    }
 }
 
 struct ListenerBootstrap {
@@ -475,7 +488,7 @@ struct ServerRuntime {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     storage: Arc<dyn Storage>,
-    _background_workers: BackgroundWorkers,
+    background_workers: BackgroundWorkers,
 }
 
 impl ServerRuntime {
@@ -514,11 +527,11 @@ impl ServerRuntime {
             shutdown_tx,
             shutdown_rx,
             storage: Arc::clone(&storage.storage),
-            _background_workers: background_workers,
+            background_workers,
         })
     }
 
-    async fn run(self) {
+    async fn run(self) -> Result<(), String> {
         let ServerRuntime {
             listen_addr,
             app_context,
@@ -526,7 +539,7 @@ impl ServerRuntime {
             shutdown_tx,
             shutdown_rx,
             storage,
-            _background_workers,
+            background_workers,
         } = self;
         let ListenerBootstrap {
             listener,
@@ -539,13 +552,13 @@ impl ServerRuntime {
         run_accept_loop(listener, app_context, shutdown_rx, semaphore, &listen_addr).await;
         await_listener_task(statsd_task).await;
         await_listener_task(graphite_task).await;
-        close_storage_runtime(storage).await;
+        background_workers.shutdown().await;
+        close_storage_runtime(storage).await
     }
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<(), String> {
-    ServerRuntime::bootstrap(config).await?.run().await;
-    Ok(())
+    ServerRuntime::bootstrap(config).await?.run().await
 }
 
 fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, String> {
@@ -1059,8 +1072,12 @@ async fn await_listener_task(task: Option<JoinHandle<()>>) {
     }
 }
 
-async fn close_storage_runtime(storage: Arc<dyn Storage>) {
-    let _ = tokio::task::spawn_blocking(move || storage.close()).await;
+async fn close_storage_runtime(storage: Arc<dyn Storage>) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || storage.close()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!("storage close failed: {err}")),
+        Err(err) => Err(format!("storage close task failed: {err}")),
+    }
 }
 
 #[cfg(test)]
@@ -1539,7 +1556,7 @@ mod tests {
     use snap::raw::{Decoder as SnappyDecoder, Encoder as SnappyEncoder};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tsink::{Label, StorageBuilder};
+    use tsink::{DataPoint, Label, QueryOptions, StorageBuilder, TsinkError};
 
     fn make_storage() -> Arc<dyn Storage> {
         StorageBuilder::new()
@@ -1547,6 +1564,82 @@ mod tests {
             .with_metadata_shard_count(1)
             .build()
             .expect("storage should build")
+    }
+
+    struct CloseFailingStorage;
+
+    impl Storage for CloseFailingStorage {
+        fn insert_rows(&self, _rows: &[tsink::Row]) -> tsink::Result<()> {
+            Ok(())
+        }
+
+        fn select(
+            &self,
+            _metric: &str,
+            _labels: &[Label],
+            _start: i64,
+            _end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn select_with_options(
+            &self,
+            _metric: &str,
+            _opts: QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn select_all(
+            &self,
+            _metric: &str,
+            _start: i64,
+            _end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            Ok(Vec::new())
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            Err(TsinkError::Other("close boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn close_storage_runtime_reports_close_errors() {
+        let storage: Arc<dyn Storage> = Arc::new(CloseFailingStorage);
+        let err = close_storage_runtime(storage)
+            .await
+            .expect_err("close failure should be surfaced");
+        assert!(err.contains("close boom"));
+    }
+
+    #[tokio::test]
+    async fn background_workers_shutdown_aborts_and_awaits_tasks() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropNotify {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let task = tokio::spawn(async move {
+            let _drop_notify = DropNotify(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("worker future should start");
+        let mut workers = BackgroundWorkers::default();
+        workers.push(task);
+
+        workers.shutdown().await;
+        dropped_rx
+            .await
+            .expect("aborted worker future should be dropped");
     }
 
     fn malformed_disabled_cluster_config() -> ClusterConfig {

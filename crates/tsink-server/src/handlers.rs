@@ -108,6 +108,7 @@ use crate::security::{
 };
 use crate::tenant;
 use crate::usage::{UsageAccounting, UsageBucketWidth, UsageCategory, UsageRecordInput};
+use chrono::{DateTime, FixedOffset};
 use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -4425,6 +4426,42 @@ fn build_control_recovery_snapshot_file(
     })
 }
 
+fn snapshot_directory_size_bytes(path: &Path) -> Result<u64, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to stat snapshot artifact {}: {err}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(format!(
+            "snapshot artifact {} must not be a symlink",
+            path.display()
+        ));
+    }
+    if file_type.is_file() {
+        return Ok(metadata.len());
+    }
+    if !file_type.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    let entries = std::fs::read_dir(path).map_err(|err| {
+        format!(
+            "failed to read snapshot directory {}: {err}",
+            path.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read snapshot directory entry under {}: {err}",
+                path.display()
+            )
+        })?;
+        total = total.saturating_add(snapshot_directory_size_bytes(&entry.path())?);
+    }
+    Ok(total)
+}
+
 async fn perform_local_data_snapshot(
     storage: &Arc<dyn Storage>,
     metadata_store: &Arc<MetricMetadataStore>,
@@ -4464,18 +4501,11 @@ async fn perform_local_data_snapshot(
                 blocking_snapshot_path.display()
             ));
         }
-        std::fs::metadata(&blocking_snapshot_path)
-            .map(|metadata| metadata.len())
-            .map_err(|err| {
-                format!(
-                    "failed to stat snapshot artifact {}: {err}",
-                    blocking_snapshot_path.display()
-                )
-            })
+        Ok(())
     })
     .await;
     match result {
-        Ok(Ok(size_bytes)) => {
+        Ok(Ok(())) => {
             if let Some(rules_runtime) = rules_runtime {
                 rules_runtime.snapshot_into(&snapshot_path).map_err(|err| {
                     format!(
@@ -4484,6 +4514,11 @@ async fn perform_local_data_snapshot(
                     )
                 })?;
             }
+            let size_path = snapshot_path.clone();
+            let size_bytes =
+                tokio::task::spawn_blocking(move || snapshot_directory_size_bytes(&size_path))
+                    .await
+                    .map_err(|err| format!("snapshot size task failed: {err}"))??;
             Ok(InternalDataSnapshotResponse {
                 node_id,
                 path: snapshot_path_display,
@@ -6288,6 +6323,10 @@ fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String
     if let Ok(ts) = s.parse::<i64>() {
         return Ok(ts);
     }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(s) {
+        return datetime_to_units(datetime, precision)
+            .ok_or_else(|| format!("invalid timestamp: '{s}'"));
+    }
     let secs = s
         .parse::<f64>()
         .map_err(|_| format!("invalid timestamp: '{s}'"))?;
@@ -6295,8 +6334,8 @@ fn parse_timestamp(s: &str, precision: TimestampPrecision) -> Result<i64, String
 }
 
 fn parse_step(s: &str, precision: TimestampPrecision) -> Result<i64, String> {
-    if let Ok(secs) = s.parse::<f64>() {
-        return parse_step_seconds(secs, precision, s);
+    if let Ok(ms) = s.parse::<f64>() {
+        return parse_step_milliseconds(ms, precision, s);
     }
     let (num_str, unit) = if let Some(stripped) = s.strip_suffix("ms") {
         (stripped, "ms")
@@ -6340,6 +6379,21 @@ fn parse_step_seconds(secs: f64, precision: TimestampPrecision, raw: &str) -> Re
         .ok_or_else(|| format!("invalid step: '{raw}'"))
 }
 
+fn parse_step_milliseconds(
+    millis: f64,
+    precision: TimestampPrecision,
+    raw: &str,
+) -> Result<i64, String> {
+    if !millis.is_finite() {
+        return Err(format!("invalid step: '{raw}'"));
+    }
+    if millis <= 0.0 {
+        return Err("step must be positive".to_string());
+    }
+    let secs = millis / 1_000.0;
+    parse_step_seconds(secs, precision, raw)
+}
+
 fn scale_seconds_to_units(secs: f64, precision: TimestampPrecision) -> Option<i64> {
     if !secs.is_finite() {
         return None;
@@ -6354,6 +6408,22 @@ fn scale_seconds_to_units(secs: f64, precision: TimestampPrecision) -> Option<i6
 
     (scaled.is_finite() && scaled >= i64::MIN as f64 && scaled <= i64::MAX as f64)
         .then_some(scaled as i64)
+}
+
+fn datetime_to_units(
+    datetime: DateTime<FixedOffset>,
+    precision: TimestampPrecision,
+) -> Option<i64> {
+    let secs = datetime.timestamp() as i128;
+    let nanos = datetime.timestamp_subsec_nanos() as i128;
+    let total_nanos = secs.checked_mul(1_000_000_000)?.checked_add(nanos)?;
+    let units = match precision {
+        TimestampPrecision::Seconds => secs,
+        TimestampPrecision::Milliseconds => total_nanos / 1_000_000,
+        TimestampPrecision::Microseconds => total_nanos / 1_000,
+        TimestampPrecision::Nanoseconds => total_nanos,
+    };
+    (units >= i64::MIN as i128 && units <= i64::MAX as i128).then_some(units as i64)
 }
 
 type PromqlStorageSelection = (Arc<dyn Storage>, Option<Arc<DistributedStorageAdapter>>);
@@ -6613,6 +6683,63 @@ mod tests {
             .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
             .build()
             .expect("storage should build")
+    }
+
+    struct ListMetricsFailingStorage {
+        inner: Arc<dyn Storage>,
+    }
+
+    impl Storage for ListMetricsFailingStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<MetricSeries>> {
+            Err(TsinkError::Other("list_metrics boom".to_string()))
+        }
+
+        fn memory_used(&self) -> usize {
+            self.inner.memory_used()
+        }
+
+        fn memory_budget(&self) -> usize {
+            self.inner.memory_budget()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
     }
 
     fn make_engine(storage: &Arc<dyn Storage>) -> Engine {
@@ -14205,6 +14332,35 @@ mod tests {
         assert!(body.contains("tsink_cluster_rebalance_slo_guard_block_new_handoffs"));
         assert!(body.contains("tsink_cluster_hotspot_skewed_shards"));
         assert!(body.contains("tsink_cluster_hotspot_shard_pressure_score"));
+        assert!(body.contains("tsink_metrics_collection_errors 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_collection_errors() {
+        let inner = make_storage();
+        let storage: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage { inner });
+        let engine = make_engine(&storage);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
     }
 
     #[tokio::test]
@@ -17242,6 +17398,15 @@ mod tests {
         .await;
         assert_eq!(response.status, 200);
         assert!(snapshot_path.exists());
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("snapshot response should be JSON");
+        let reported_size = body["data"]["sizeBytes"]
+            .as_u64()
+            .expect("snapshot response should include sizeBytes");
+        let actual_size =
+            snapshot_directory_size_bytes(&snapshot_path).expect("snapshot size should calculate");
+        assert_eq!(reported_size, actual_size);
+        assert!(reported_size > 0);
 
         storage.close().expect("close should succeed");
     }
@@ -17627,11 +17792,40 @@ test_metric{job="test2"} 99 1700000000000
     }
 
     #[test]
+    fn parse_timestamp_accepts_rfc3339_values() {
+        assert_eq!(
+            parse_timestamp("2023-11-14T22:13:20Z", TimestampPrecision::Milliseconds)
+                .expect("RFC3339 timestamp should parse"),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_timestamp(
+                "2023-11-14T22:13:20.123456Z",
+                TimestampPrecision::Microseconds
+            )
+            .expect("RFC3339 timestamp should preserve subsecond precision"),
+            1_700_000_000_123_456
+        );
+    }
+
+    #[test]
     fn parse_step_rejects_non_finite_values() {
         assert!(parse_step("NaN", TimestampPrecision::Milliseconds).is_err());
         assert!(parse_step("inf", TimestampPrecision::Milliseconds).is_err());
         assert!(parse_step("1e309", TimestampPrecision::Milliseconds).is_err());
         assert!(parse_step("NaNs", TimestampPrecision::Milliseconds).is_err());
+    }
+
+    #[test]
+    fn parse_step_treats_bare_numeric_values_as_milliseconds() {
+        assert_eq!(
+            parse_step("15000", TimestampPrecision::Milliseconds).expect("step should parse"),
+            15_000
+        );
+        assert_eq!(
+            parse_step("15s", TimestampPrecision::Milliseconds).expect("step should parse"),
+            15_000
+        );
     }
 
     #[tokio::test]
