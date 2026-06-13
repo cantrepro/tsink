@@ -19,6 +19,7 @@ fn test_query_with_extreme_timestamps() {
     let temp_dir = TempDir::new().unwrap();
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
+        .with_retention_enforced(false)
         .build()
         .unwrap();
 

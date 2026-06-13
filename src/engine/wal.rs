@@ -251,9 +251,8 @@ fn replay_from_path(path: &Path) -> Result<Vec<ReplayFrame>> {
         }
 
         if header[0..4] != FRAME_MAGIC {
-            return Err(TsinkError::DataCorruption(
-                "WAL frame magic mismatch".to_string(),
-            ));
+            warn!("Stopping WAL replay at frame with magic mismatch");
+            break;
         }
 
         let frame_type = header[4];
@@ -587,9 +586,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FRAME_MAGIC, FRAME_TYPE_SERIES_DEF, FramedWal, ReplayFrame, SamplesBatchFrame,
-        SeriesDefinitionFrame, WAL_FILE_NAME, checksum32, encode_series_definition,
-        replay_from_path, scan_last_seq,
+        FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF, FramedWal, ReplayFrame,
+        SamplesBatchFrame, SeriesDefinitionFrame, WAL_FILE_NAME, checksum32,
+        encode_series_definition, replay_from_path, scan_last_seq,
     };
     use crate::engine::chunk::{ChunkPoint, ValueLane};
     use crate::{Label, Value, wal::WalSyncMode};
@@ -699,6 +698,31 @@ mod tests {
         {
             let mut file = OpenOptions::new().append(true).open(wal.path()).unwrap();
             file.write_all(b"W2FR\x02\x00\x00\x00\x00").unwrap();
+            file.flush().unwrap();
+        }
+
+        let replay = replay_from_path(wal.path()).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(replay[0], ReplayFrame::SeriesDefinition(_)));
+    }
+
+    #[test]
+    fn replay_stops_at_frame_with_magic_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "m".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+
+        {
+            let mut file = OpenOptions::new().append(true).open(wal.path()).unwrap();
+            let mut header = [0u8; FRAME_HEADER_LEN];
+            header[0..4].copy_from_slice(b"BAD!");
+            file.write_all(&header).unwrap();
             file.flush().unwrap();
         }
 

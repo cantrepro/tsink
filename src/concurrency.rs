@@ -372,16 +372,42 @@ impl<T: Send + 'static> WorkerPool<T> {
         self.shutdown.store(true, Ordering::Release);
 
         let mut first_error = None;
+        let mut completion_timed_out = false;
         if let Err(err) = self.wait_for_completion(completion_timeout) {
             error!(
                 "Timed out waiting for worker pool tasks to complete: {}",
                 err
             );
             first_error = Some(err);
+            completion_timed_out = true;
         }
 
         for _ in &self.workers {
-            let _ = self.sender.send(Message::Shutdown);
+            if completion_timed_out {
+                // Avoid blocking shutdown forever when workers are stuck in long-running tasks.
+                match self.sender.try_send(Message::Shutdown) {
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        warn!(
+                            "Worker pool queue full while signaling shutdown after timeout; detaching workers"
+                        );
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        debug!("Worker pool channel disconnected during timeout shutdown");
+                    }
+                }
+            } else {
+                let _ = self.sender.send(Message::Shutdown);
+            }
+        }
+
+        if completion_timed_out {
+            for worker in &mut self.workers {
+                if worker.thread.take().is_some() {
+                    warn!("Detaching worker {} after shutdown timeout", worker.id);
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
         }
 
         for worker in &mut self.workers {
@@ -593,6 +619,51 @@ mod tests {
         release_tx.send(()).unwrap();
         drop_handle.join().unwrap();
         assert!(task_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_worker_pool_shutdown_timeout_is_bounded() {
+        let (task_started_tx, task_started_rx) = bounded::<()>(1);
+        let (release_tx, release_rx) = bounded::<()>(1);
+
+        let mut pool = WorkerPool::new(1, move |_value: usize| {
+            let _ = task_started_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        pool.submit(1).unwrap();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not start task in time");
+
+        let (shutdown_result_tx, shutdown_result_rx) = bounded::<(Result<()>, Duration)>(1);
+        let shutdown_thread = thread::spawn(move || {
+            let start = Instant::now();
+            let result = pool.shutdown_internal(Duration::from_millis(100));
+            let elapsed = start.elapsed();
+            let _ = shutdown_result_tx.send((result, elapsed));
+        });
+
+        let (result, elapsed) = match shutdown_result_rx.recv_timeout(Duration::from_millis(750)) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let _ = release_tx.send(());
+                shutdown_thread.join().unwrap();
+                panic!("shutdown_internal did not return within the expected bound");
+            }
+        };
+
+        assert!(
+            matches!(result, Err(TsinkError::WriteTimeout { .. })),
+            "expected shutdown timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "shutdown should be bounded; elapsed={elapsed:?}"
+        );
+
+        let _ = release_tx.send(());
+        shutdown_thread.join().unwrap();
     }
 
     #[test]

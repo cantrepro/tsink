@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Represents a data point, the smallest unit of time series data.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataPoint {
     /// The actual value.
     pub value: Value,
@@ -52,6 +52,19 @@ impl DataPoint {
     /// Returns the value as a borrowed byte slice for raw payloads.
     pub fn value_as_bytes(&self) -> Option<&[u8]> {
         self.value.as_bytes()
+    }
+}
+
+impl PartialEq for DataPoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp && values_equal_for_datapoint(&self.value, &other.value)
+    }
+}
+
+fn values_equal_for_datapoint(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::F64(a), Value::F64(b)) => a == b || (a.is_nan() && b.is_nan()),
+        _ => left == right,
     }
 }
 
@@ -123,5 +136,21 @@ impl Row {
 impl fmt::Display for DataPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DataPoint(ts: {}, val: {})", self.timestamp, self.value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataPoint;
+
+    #[test]
+    fn datapoint_equality_treats_nan_values_as_equal() {
+        assert_eq!(DataPoint::new(1, f64::NAN), DataPoint::new(1, f64::NAN));
+    }
+
+    #[test]
+    fn datapoint_equality_keeps_standard_f64_behavior_for_non_nan_values() {
+        assert_eq!(DataPoint::new(1, 0.0_f64), DataPoint::new(1, -0.0_f64));
+        assert_ne!(DataPoint::new(1, 1.0_f64), DataPoint::new(1, 2.0_f64));
     }
 }

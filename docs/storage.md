@@ -361,7 +361,7 @@ A segment directory without a valid `manifest.bin` is ignored during startup.
 
 ## Retention and Compaction Expectations
 
-- Retention removes whole segments whose `max_ts < retention_cutoff`.
+- When retention enforcement is enabled, retention removes whole segments whose `max_ts < retention_cutoff`.
 - Compaction rewrites overlapping ranges into higher levels and emits new immutable segments.
 - Compaction must preserve per-series timestamp order and exact sample values.
 - Manifest statistics (`point_count`, `chunk_count`, `series_count`) must match file contents exactly.

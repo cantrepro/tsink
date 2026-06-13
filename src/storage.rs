@@ -86,6 +86,7 @@ pub trait Storage: Send + Sync {
 pub struct StorageBuilder {
     data_path: Option<PathBuf>,
     retention: Duration,
+    retention_enforced: bool,
     timestamp_precision: TimestampPrecision,
     chunk_points: usize,
     max_writers: usize,
@@ -101,6 +102,7 @@ impl Default for StorageBuilder {
         Self {
             data_path: None,
             retention: Duration::from_secs(14 * 24 * 3600), // 14 days
+            retention_enforced: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             chunk_points: crate::engine::DEFAULT_CHUNK_POINTS,
             max_writers: crate::cgroup::default_workers_limit(),
@@ -128,6 +130,14 @@ impl StorageBuilder {
     /// Sets the retention period.
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Enables or disables retention enforcement.
+    ///
+    /// When disabled, points are never rejected or filtered due to retention.
+    pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
+        self.retention_enforced = enforced;
         self
     }
 
@@ -198,6 +208,10 @@ impl StorageBuilder {
 
     pub(crate) fn retention(&self) -> Duration {
         self.retention
+    }
+
+    pub(crate) fn retention_enforced(&self) -> bool {
+        self.retention_enforced
     }
 
     pub(crate) fn timestamp_precision(&self) -> TimestampPrecision {

@@ -842,6 +842,9 @@ impl Storage for ChunkStorage {
     fn insert_rows(&self, rows: &[Row]) -> Result<()> {
         self.ensure_open()?;
         let _write_permit = self.write_limiter.try_acquire_for(self.write_timeout)?;
+        // A write may pass the first lifecycle check and then block on permits while close starts.
+        // Re-check after acquiring a permit so shutdown cannot race new writes through.
+        self.ensure_open()?;
 
         let mut pending_points = Vec::with_capacity(rows.len());
         let mut new_series_defs = Vec::new();
@@ -1061,6 +1064,7 @@ impl Storage for ChunkStorage {
         }
 
         let close_result = (|| {
+            let _write_permits = self.write_limiter.acquire_all(self.write_timeout)?;
             self.flush_all_active()?;
             self.persist_segment()?;
             self.compact_once_if_needed()
@@ -1092,7 +1096,7 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     let retention = builder.retention();
     let storage_options = ChunkStorageOptions {
         retention_window: duration_to_timestamp_units(retention, timestamp_precision),
-        retention_enforced: retention != DEFAULT_RETENTION,
+        retention_enforced: builder.retention_enforced(),
         partition_window: duration_to_timestamp_units(
             builder.partition_duration(),
             timestamp_precision,
@@ -1799,6 +1803,74 @@ mod tests {
     }
 
     #[test]
+    fn stale_wal_with_already_persisted_nan_points_does_not_duplicate_query_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let labels = vec![Label::new("host", "a")];
+        let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+
+        let stale_frames = {
+            let storage = StorageBuilder::new()
+                .with_data_path(temp_dir.path())
+                .with_timestamp_precision(TimestampPrecision::Seconds)
+                .with_chunk_points(2)
+                .build()
+                .unwrap();
+
+            storage
+                .insert_rows(&[
+                    Row::with_labels(
+                        "dupe_recovery_nan",
+                        labels.clone(),
+                        DataPoint::new(1, f64::NAN),
+                    ),
+                    Row::with_labels("dupe_recovery_nan", labels.clone(), DataPoint::new(2, 2.0)),
+                ])
+                .unwrap();
+
+            let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+            let frames = wal.replay_frames().unwrap();
+            assert!(
+                !frames.is_empty(),
+                "expected WAL frames before close so we can simulate crash window replay"
+            );
+
+            storage.close().unwrap();
+            frames
+        };
+
+        {
+            let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+            for frame in stale_frames {
+                match frame {
+                    ReplayFrame::SeriesDefinition(definition) => {
+                        wal.append_series_definition(&definition).unwrap();
+                    }
+                    ReplayFrame::Samples(batches) => {
+                        wal.append_samples(&batches).unwrap();
+                    }
+                }
+            }
+        }
+
+        let reopened = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(2)
+            .build()
+            .unwrap();
+
+        let points = reopened
+            .select("dupe_recovery_nan", &labels, 0, 10)
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp, 1);
+        assert!(points[0].value_as_f64().is_some_and(f64::is_nan));
+        assert_eq!(points[1], DataPoint::new(2, 2.0));
+
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn reenable_wal_after_wal_disabled_run_ignores_stale_wal_generation() {
         let temp_dir = TempDir::new().unwrap();
         let stale_labels = vec![Label::new("host", "stale")];
@@ -2061,6 +2133,82 @@ mod tests {
     }
 
     #[test]
+    fn default_retention_rejects_out_of_window_writes() {
+        let retention_secs = Duration::from_secs(14 * 24 * 3600).as_secs() as i64;
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new(
+                "default_retention_metric",
+                DataPoint::new(retention_secs + 1, 1.0),
+            )])
+            .unwrap();
+
+        let err = storage
+            .insert_rows(&[Row::new("default_retention_metric", DataPoint::new(0, 0.0))])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::OutOfRetention { timestamp: 0 }));
+    }
+
+    #[test]
+    fn explicitly_setting_default_retention_rejects_out_of_window_writes() {
+        let retention = Duration::from_secs(14 * 24 * 3600);
+        let storage = StorageBuilder::new()
+            .with_retention(retention)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new(
+                "explicit_default_retention_metric",
+                DataPoint::new(retention.as_secs() as i64 + 1, 1.0),
+            )])
+            .unwrap();
+
+        let err = storage
+            .insert_rows(&[Row::new(
+                "explicit_default_retention_metric",
+                DataPoint::new(0, 0.0),
+            )])
+            .unwrap_err();
+        assert!(matches!(err, TsinkError::OutOfRetention { timestamp: 0 }));
+    }
+
+    #[test]
+    fn disabling_retention_enforcement_never_expires_or_rejects_points() {
+        let storage = StorageBuilder::new()
+            .with_retention(Duration::from_secs(1))
+            .with_retention_enforced(false)
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .build()
+            .unwrap();
+
+        storage
+            .insert_rows(&[Row::new("no_retention_metric", DataPoint::new(100, 1.0))])
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("no_retention_metric", DataPoint::new(102, 2.0))])
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("no_retention_metric", DataPoint::new(0, 0.0))])
+            .unwrap();
+
+        let points = storage.select("no_retention_metric", &[], 0, 200).unwrap();
+        assert_eq!(
+            points,
+            vec![
+                DataPoint::new(0, 0.0),
+                DataPoint::new(100, 1.0),
+                DataPoint::new(102, 2.0)
+            ]
+        );
+    }
+
+    #[test]
     fn timestamp_precision_changes_retention_unit_conversion() {
         let seconds_storage = StorageBuilder::new()
             .with_retention(Duration::from_secs(1))
@@ -2119,5 +2267,66 @@ mod tests {
                 workers: 1
             }
         ));
+    }
+
+    #[test]
+    fn close_blocks_until_in_flight_writer_releases_permit() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let storage = Arc::new(ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_window: i64::MAX,
+                retention_enforced: false,
+                partition_window: i64::MAX,
+                max_writers: 1,
+                write_timeout: Duration::from_secs(2),
+            },
+        ));
+        let labels = vec![Label::new("host", "a")];
+
+        let held_permit = storage.write_limiter.acquire();
+
+        let writer_storage = Arc::clone(&storage);
+        let writer_labels = labels.clone();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result = writer_storage.insert_rows(&[Row::with_labels(
+                "close_race_metric",
+                writer_labels,
+                DataPoint::new(1, 1.0),
+            )]);
+            writer_tx.send(result).unwrap();
+        });
+
+        // Writer should be blocked waiting for permit acquisition.
+        assert!(writer_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        let close_storage = Arc::clone(&storage);
+        let (close_tx, close_rx) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            let result = close_storage.close();
+            close_tx.send(result).unwrap();
+        });
+
+        // Close should wait until in-flight writers release permits.
+        assert!(close_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(held_permit);
+
+        let close_result = close_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(close_result.is_ok());
+
+        let writer_result = writer_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(writer_result, Err(TsinkError::StorageClosed)));
+
+        writer.join().unwrap();
+        closer.join().unwrap();
     }
 }

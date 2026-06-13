@@ -207,6 +207,7 @@ The storage format uses CRC32c and XXH64 checksums for corruption detection and 
 | `with_wal_enabled(bool)` | `true` | Enable/disable write-ahead logging. |
 | `with_wal_sync_mode(mode)` | `Periodic(1s)` | WAL fsync policy. |
 | `with_retention(duration)` | 14 days | Data retention window. |
+| `with_retention_enforced(bool)` | `true` | Enforce retention window (`false` keeps data forever). |
 | `with_timestamp_precision(p)` | `Nanoseconds` | Timestamp unit (`Seconds`, `Milliseconds`, `Microseconds`, `Nanoseconds`). |
 | `with_max_writers(n)` | CPU count | Maximum concurrent writer threads. |
 | `with_write_timeout(duration)` | 30s | Timeout for write operations. |
