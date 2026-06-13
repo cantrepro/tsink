@@ -762,9 +762,8 @@ fn decode_value<R: Read>(reader: &mut R) -> Result<Value> {
             )));
         }
 
-        usize::try_from(len_u64).map_err(|_| {
-            TsinkError::DataCorruption(format!("{kind} payload length exceeds usize"))
-        })
+        usize::try_from(len_u64)
+            .map_err(|_| TsinkError::DataCorruption(format!("{kind} payload length exceeds usize")))
     }
 
     let mut tag = [0u8; 1];
