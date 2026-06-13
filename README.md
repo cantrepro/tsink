@@ -123,6 +123,12 @@ let points = storage.select(
     1600000000,
     1600000100,
 )?;
+
+// Query all label combinations for a metric
+let all_results = storage.select_all("http_requests", 1600000000, 1600000100)?;
+for (labels, points) in all_results {
+    println!("Labels: {:?}, Points: {}", labels, points.len());
+}
 ```
 
 ## Architecture
@@ -252,6 +258,59 @@ cargo bench
 | `error` | Comprehensive error types with context |
 
 ## Advanced Usage
+
+### Label Querying
+
+tsink provides querying capabilities for metrics with labels:
+
+```rust
+use tsink::{DataPoint, Label, Row};
+
+// Insert metrics with various label combinations
+let rows = vec![
+    Row::with_labels(
+        "cpu_usage",
+        vec![Label::new("host", "server1"), Label::new("region", "us-west")],
+        DataPoint::new(1600000000, 45.5),
+    ),
+    Row::with_labels(
+        "cpu_usage",
+        vec![Label::new("host", "server2"), Label::new("region", "us-east")],
+        DataPoint::new(1600000000, 52.1),
+    ),
+    Row::with_labels(
+        "cpu_usage",
+        vec![Label::new("host", "server3")],  // Different label set
+        DataPoint::new(1600000000, 48.3),
+    ),
+];
+storage.insert_rows(&rows)?;
+
+// Method 1: Query with exact label match
+let points = storage.select(
+    "cpu_usage",
+    &[Label::new("host", "server1"), Label::new("region", "us-west")],
+    1600000000,
+    1600000100,
+)?;
+
+// Method 2: Query all label combinations (discovers all variations)
+let all_results = storage.select_all("cpu_usage", 1600000000, 1600000100)?;
+
+// Process results grouped by labels
+for (labels, points) in all_results {
+    // Find which hosts have the most data points
+    if let Some(host_label) = labels.iter().find(|l| l.name == "host") {
+        println!("Host {} has {} data points", host_label.value, points.len());
+    }
+
+    // Aggregate metrics across regions
+    if let Some(region_label) = labels.iter().find(|l| l.name == "region") {
+        let avg: f64 = points.iter().map(|p| p.value).sum::<f64>() / points.len() as f64;
+        println!("Region {} average: {:.2}", region_label.value, avg);
+    }
+}
+```
 
 ### Concurrent Operations
 

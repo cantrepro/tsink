@@ -2,7 +2,7 @@
 
 use crate::disk::{DiskMetric, DiskPartition, PartitionMeta};
 use crate::encoding::GorillaEncoder;
-use crate::label::marshal_metric_name;
+use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::partition::{Partition, SharedPartition};
 use crate::wal::Wal;
 use crate::{DataPoint, Label, Result, Row, TimestampPrecision, TsinkError};
@@ -238,6 +238,33 @@ impl crate::partition::Partition for MemoryPartition {
             Some(metric) => Ok(metric.select_points(start, end)),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn select_all_labels(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        let mut results = Vec::new();
+
+        // Iterate through all metrics to find ones matching the base metric name
+        for entry in self.metrics.iter() {
+            let (marshaled_name, metric_ref) = entry.pair();
+
+            // Unmarshal the metric name to extract the base name and labels
+            if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_name) {
+                // Check if this is the metric we're looking for
+                if base_metric == metric {
+                    let points = metric_ref.select_points(start, end);
+                    if !points.is_empty() {
+                        results.push((labels, points));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     fn min_timestamp(&self) -> i64 {

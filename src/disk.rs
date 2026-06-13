@@ -1,7 +1,7 @@
 //! Disk partition implementation.
 
 use crate::encoding::GorillaDecoder;
-use crate::label::marshal_metric_name;
+use crate::label::{marshal_metric_name, unmarshal_metric_name};
 use crate::mmap::PlatformMmap;
 use crate::{DataPoint, Label, Result, Row, TsinkError};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,57 @@ pub struct DiskPartition {
 }
 
 impl DiskPartition {
+    /// Helper method to decode points from a disk metric.
+    fn decode_metric_points(
+        &self,
+        disk_metric: &DiskMetric,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<DataPoint>> {
+        // Early exit if query range is completely outside metric range
+        if end <= disk_metric.min_timestamp || start >= disk_metric.max_timestamp {
+            return Ok(Vec::new());
+        }
+
+        // Validate offset is within bounds
+        let offset = disk_metric.offset as usize;
+        if offset >= self.mapped_file.len() {
+            return Err(TsinkError::InvalidOffset {
+                offset: disk_metric.offset,
+                max: self.mapped_file.len() as u64,
+            });
+        }
+
+        // Create a cursor at the metric's offset with bounds checking
+        let data_slice = self.mapped_file.as_slice();
+        let end_offset = std::cmp::min(
+            data_slice.len(),
+            offset + (disk_metric.num_data_points * 16),
+        );
+        let metric_data = &data_slice[offset..end_offset];
+        let cursor = Cursor::new(metric_data.to_vec());
+
+        // Decode points
+        let mut decoder = GorillaDecoder::new(cursor.into_inner());
+        let mut points = Vec::with_capacity(disk_metric.num_data_points);
+
+        // Must decode all points sequentially due to delta encoding
+        for _ in 0..disk_metric.num_data_points {
+            let point = decoder.decode_point()?;
+
+            if point.timestamp < start {
+                continue;
+            }
+            if point.timestamp >= end {
+                break;
+            }
+
+            points.push(point);
+        }
+
+        Ok(points)
+    }
+
     /// Opens an existing disk partition.
     pub fn open(dir_path: impl AsRef<Path>, retention: Duration) -> Result<Self> {
         let dir_path = dir_path.as_ref();
@@ -137,50 +188,49 @@ impl crate::partition::Partition for DiskPartition {
             None => return Ok(Vec::new()),
         };
 
-        // Validate offset is within bounds
-        let offset = disk_metric.offset as usize;
-        if offset >= self.mapped_file.len() {
-            return Err(TsinkError::InvalidOffset {
-                offset: disk_metric.offset,
-                max: self.mapped_file.len() as u64,
+        self.decode_metric_points(disk_metric, start, end)
+    }
+
+    fn select_all_labels(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        if self.expired() {
+            return Err(TsinkError::NoDataPoints {
+                metric: metric.to_string(),
+                start,
+                end,
             });
         }
 
-        // Create a cursor at the metric's offset with bounds checking
-        let data_slice = self.mapped_file.as_slice();
-        let end_offset = std::cmp::min(
-            data_slice.len(),
-            offset + (disk_metric.num_data_points * 16),
-        );
-        let metric_data = &data_slice[offset..end_offset];
-        let cursor = Cursor::new(metric_data.to_vec());
+        let mut results = Vec::new();
 
-        // Decode points
-        let mut decoder = GorillaDecoder::new(cursor.into_inner());
+        // Iterate through all metrics in metadata
+        for (marshaled_name, disk_metric) in &self.meta.metrics {
+            // Try to unmarshal the name to extract base metric and labels
+            let marshaled_bytes = marshaled_name.as_bytes();
 
-        // Early exit if query range is completely outside metric range
-        if end <= disk_metric.min_timestamp || start >= disk_metric.max_timestamp {
-            return Ok(Vec::new());
+            // First try to unmarshal it as a marshaled name
+            if let Ok((base_metric, labels)) = unmarshal_metric_name(marshaled_bytes) {
+                if base_metric == metric {
+                    // Found a matching metric, decode its data points
+                    let points = self.decode_metric_points(disk_metric, start, end)?;
+                    if !points.is_empty() {
+                        results.push((labels, points));
+                    }
+                }
+            } else if marshaled_name == metric {
+                // It might be a plain metric name without labels
+                let points = self.decode_metric_points(disk_metric, start, end)?;
+                if !points.is_empty() {
+                    results.push((Vec::new(), points));
+                }
+            }
         }
 
-        let mut points = Vec::with_capacity(disk_metric.num_data_points);
-
-        // Must decode all points sequentially due to delta encoding
-        // Cannot skip ahead without corrupting decoder state
-        for _ in 0..disk_metric.num_data_points {
-            let point = decoder.decode_point()?;
-
-            if point.timestamp < start {
-                continue;
-            }
-            if point.timestamp >= end {
-                break;
-            }
-
-            points.push(point);
-        }
-
-        Ok(points)
+        Ok(results)
     }
 
     fn min_timestamp(&self) -> i64 {

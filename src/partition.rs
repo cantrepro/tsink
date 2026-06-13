@@ -21,6 +21,15 @@ pub trait Partition: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects data points for a metric regardless of labels.
+    /// Returns a map of label sets to their corresponding data points.
+    fn select_all_labels(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
+
     /// Returns the minimum timestamp in the partition.
     fn min_timestamp(&self) -> i64;
 

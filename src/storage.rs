@@ -41,6 +41,15 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects data points for a metric regardless of labels.
+    /// Returns a map of label sets to their corresponding data points.
+    fn select_all(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
+
     /// Closes the storage gracefully.
     fn close(&self) -> Result<()>;
 }
@@ -528,6 +537,59 @@ impl Storage for StorageImpl {
         }
 
         Ok(all_points)
+    }
+
+    fn select_all(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        if metric.is_empty() {
+            return Err(TsinkError::MetricRequired);
+        }
+
+        if start >= end {
+            return Err(TsinkError::InvalidTimeRange { start, end });
+        }
+
+        let mut results_map: std::collections::HashMap<Vec<Label>, Vec<DataPoint>> =
+            std::collections::HashMap::new();
+
+        for partition in self.partition_list.iter() {
+            // Skip only if partition is truly empty (size == 0)
+            if partition.size() == 0 {
+                continue;
+            }
+
+            // Perform selection
+            match partition.select_all_labels(metric, start, end) {
+                Ok(partition_results) => {
+                    for (labels, points) in partition_results {
+                        results_map
+                            .entry(labels)
+                            .or_insert_with(Vec::new)
+                            .extend(points);
+                    }
+                }
+                Err(TsinkError::NoDataPoints { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Sort points within each label set
+        let mut results: Vec<(Vec<Label>, Vec<DataPoint>)> = results_map
+            .into_iter()
+            .map(|(labels, mut points)| {
+                points.sort_by_key(|p| p.timestamp);
+                (labels, points)
+            })
+            .collect();
+
+        // Sort by label sets for consistent output
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(results)
     }
 
     fn close(&self) -> Result<()> {
