@@ -56,10 +56,10 @@ impl PartialOrd for Label {
     }
 }
 
-/// Marshals a metric name and labels into a unique string identifier.
-pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> String {
+/// Marshals a metric name and labels into a unique binary identifier.
+pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> Vec<u8> {
     if labels.is_empty() {
-        return metric.to_string();
+        return metric.as_bytes().to_vec();
     }
 
     // Sort labels by name for consistent marshaling
@@ -91,27 +91,14 @@ pub fn marshal_metric_name(metric: &str, labels: &[Label]) -> String {
         }
     }
 
-    // Convert to string - since we're creating binary data that may not be valid UTF-8,
-    // we need to use a different encoding strategy. Use base64 or hex encoding for safety.
-    // For performance, we'll use unsafe but validate the metric name is ASCII
-    if metric.is_ascii()
-        && labels
-            .iter()
-            .all(|l| l.name.is_ascii() && l.value.is_ascii())
-    {
-        // Safe to use String directly for ASCII-only content
-        unsafe { String::from_utf8_unchecked(out) }
-    } else {
-        // Fall back to lossy conversion for non-ASCII
-        String::from_utf8_lossy(&out).into_owned()
-    }
+    out
 }
 
 /// Unmarshals a metric name back into metric and labels.
-pub fn unmarshal_metric_name(marshaled: &str) -> crate::Result<(String, Vec<Label>)> {
-    let bytes = marshaled.as_bytes();
+pub fn unmarshal_metric_name(marshaled: &[u8]) -> crate::Result<(String, Vec<Label>)> {
+    let bytes = marshaled;
     if bytes.len() < 2 {
-        return Ok((marshaled.to_string(), Vec::new()));
+        return Ok((String::from_utf8_lossy(marshaled).into_owned(), Vec::new()));
     }
 
     // Try to parse as marshaled format
@@ -120,7 +107,7 @@ pub fn unmarshal_metric_name(marshaled: &str) -> crate::Result<(String, Vec<Labe
     // Read metric length
     if pos + 2 > bytes.len() {
         // Not marshaled format, return as plain metric name
-        return Ok((marshaled.to_string(), Vec::new()));
+        return Ok((String::from_utf8_lossy(marshaled).into_owned(), Vec::new()));
     }
 
     let metric_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
@@ -129,7 +116,7 @@ pub fn unmarshal_metric_name(marshaled: &str) -> crate::Result<(String, Vec<Labe
     // Read metric
     if pos + metric_len > bytes.len() {
         // Not marshaled format, return as plain metric name
-        return Ok((marshaled.to_string(), Vec::new()));
+        return Ok((String::from_utf8_lossy(marshaled).into_owned(), Vec::new()));
     }
 
     let metric = String::from_utf8(bytes[pos..pos + metric_len].to_vec())
@@ -211,7 +198,7 @@ mod tests {
         let metric = "cpu_usage";
 
         // Without labels
-        assert_eq!(marshal_metric_name(metric, &[]), metric);
+        assert_eq!(marshal_metric_name(metric, &[]), metric.as_bytes());
 
         // With labels
         let labels = vec![
@@ -219,7 +206,26 @@ mod tests {
             Label::new("region", "us-west"),
         ];
         let marshaled = marshal_metric_name(metric, &labels);
-        assert!(marshaled.contains(metric));
+        // Check that the marshaled data contains the metric name bytes
+        assert!(
+            marshaled
+                .windows(metric.len())
+                .any(|w| w == metric.as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_marshal_with_long_labels() {
+        // Test case that previously caused undefined behavior
+        let label = Label::new("a".repeat(0x80), "b");
+        let marshaled = marshal_metric_name("hello", &[label]);
+        // This should not panic or cause undefined behavior
+        assert!(!marshaled.is_empty());
+
+        // Test with label value > 127 chars
+        let label2 = Label::new("key", "b".repeat(0x80));
+        let marshaled2 = marshal_metric_name("world", &[label2]);
+        assert!(!marshaled2.is_empty());
     }
 
     #[test]

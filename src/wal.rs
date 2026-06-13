@@ -187,7 +187,7 @@ impl Wal for DiskWal {
                 segment.writer.write_all(&len_buf[..len_size])?;
 
                 // Write metric name
-                segment.writer.write_all(metric_name.as_bytes())?;
+                segment.writer.write_all(&metric_name)?;
 
                 // Write timestamp as varint
                 let mut ts_buf = [0u8; 10];
@@ -401,10 +401,8 @@ impl WalReader {
                     if reader.read_exact(&mut metric_buf).is_err() {
                         break; // Incomplete record
                     }
-                    let metric_name_raw = String::from_utf8_lossy(&metric_buf).to_string();
-
                     // Unmarshal metric name and labels
-                    let (metric, labels) = unmarshal_metric_name(&metric_name_raw)?;
+                    let (metric, labels) = unmarshal_metric_name(&metric_buf)?;
 
                     // Read timestamp
                     let timestamp = match decode_varint(&mut reader) {

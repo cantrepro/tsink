@@ -130,8 +130,9 @@ impl crate::partition::Partition for DiskPartition {
         }
 
         let metric_name = marshal_metric_name(metric, labels);
+        let metric_name_str = String::from_utf8_lossy(&metric_name);
 
-        let disk_metric = match self.meta.metrics.get(&metric_name) {
+        let disk_metric = match self.meta.metrics.get(metric_name_str.as_ref()) {
             Some(m) => m,
             None => return Ok(Vec::new()),
         };

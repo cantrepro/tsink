@@ -25,7 +25,7 @@ pub struct MemoryPartition {
     /// Maximum timestamp
     max_t: AtomicI64,
     /// Metrics storage - using DashMap for concurrent access
-    metrics: DashMap<String, Arc<MemoryMetric>>,
+    metrics: DashMap<Vec<u8>, Arc<MemoryMetric>>,
     /// Write-ahead log
     wal: Arc<dyn Wal>,
     /// Partition duration in the appropriate time unit
@@ -64,7 +64,7 @@ impl MemoryPartition {
     }
 
     /// Gets or creates a metric.
-    fn get_or_create_metric(&self, name: String) -> Arc<MemoryMetric> {
+    fn get_or_create_metric(&self, name: Vec<u8>) -> Arc<MemoryMetric> {
         self.metrics
             .entry(name.clone())
             .or_insert_with(|| Arc::new(MemoryMetric::new(name)))
@@ -100,10 +100,11 @@ impl MemoryPartition {
             encoder.flush()?;
 
             // Add to metadata
+            let name_string = String::from_utf8_lossy(&name).into_owned();
             metrics_map.insert(
-                name.clone(),
+                name_string.clone(),
                 DiskMetric {
-                    name: name.clone(),
+                    name: name_string,
                     offset,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
@@ -290,10 +291,11 @@ impl crate::partition::Partition for MemoryPartition {
             encoder.flush()?;
 
             // Add to metadata
+            let name_string = String::from_utf8_lossy(&name).into_owned();
             metrics_map.insert(
-                name.clone(),
+                name_string.clone(),
                 DiskMetric {
-                    name: name.clone(),
+                    name: name_string,
                     offset,
                     min_timestamp: metric.min_timestamp(),
                     max_timestamp: metric.max_timestamp(),
@@ -318,7 +320,7 @@ impl crate::partition::Partition for MemoryPartition {
 /// A memory metric holds ordered data points for a specific metric.
 struct MemoryMetric {
     #[allow(dead_code)]
-    name: String,
+    name: Vec<u8>,
     size: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
@@ -329,7 +331,7 @@ struct MemoryMetric {
 }
 
 impl MemoryMetric {
-    fn new(name: String) -> Self {
+    fn new(name: Vec<u8>) -> Self {
         Self {
             name,
             size: AtomicUsize::new(0),
