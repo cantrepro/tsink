@@ -1,0 +1,12 @@
+[package]
+name = "tsink-promql"
+version = "0.1.0"
+edition = "2021"
+authors = ["h2337"]
+description = "PromQL engine for tsink"
+license = "MIT"
+
+[dependencies]
+tsink = { path = ".." }
+thiserror = "2.0"
+regex = "1.11"

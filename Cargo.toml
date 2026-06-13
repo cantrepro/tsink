@@ -63,3 +63,6 @@ opt-level = 3
 
 [profile.bench]
 inherits = "release"
+
+[workspace]
+members = [".", "tsink-promql"]
