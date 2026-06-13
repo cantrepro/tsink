@@ -169,7 +169,11 @@ impl BitStreamReader {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
 
-        let bitmask = (1u64 << nbits) - 1;
+        let bitmask = if nbits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << nbits) - 1
+        };
         self.valid -= nbits;
 
         Ok((self.buffer >> self.valid) & bitmask)
