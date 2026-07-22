@@ -57,9 +57,16 @@ impl StartupFinalizePhase {
             storage.reconcile_live_metadata_indexes()?;
         }
 
+        // Startup must be able to repair or create the registry even when the configured logical
+        // cap is below existing usage. Recovery admission still enforces physical free-space
+        // headroom, and final reconciliation exposes over-limit state before foreground growth.
         match actions.registry_persistence {
-            RegistryPersistenceAction::Checkpoint => storage.checkpoint_series_registry_index()?,
-            RegistryPersistenceAction::Persist => storage.persist_series_registry_index()?,
+            RegistryPersistenceAction::Checkpoint => {
+                storage.checkpoint_series_registry_index_for_recovery()?
+            }
+            RegistryPersistenceAction::Persist => {
+                storage.persist_series_registry_index_for_recovery()?
+            }
         }
 
         if storage.memory_budget_value() != usize::MAX {
@@ -67,13 +74,19 @@ impl StartupFinalizePhase {
             storage.enforce_memory_budget_if_needed()?;
         }
 
+        if actions.schedule_startup_maintenance {
+            storage.schedule_startup_maintenance();
+        }
+
+        if let Some(local_disk_budget) = &storage.persisted.local_disk_budget {
+            local_disk_budget.reconcile()?;
+        }
+
         if actions.start_background_threads {
+            storage.start_background_compaction_thread()?;
             storage.start_background_flush_thread(DEFAULT_FLUSH_INTERVAL)?;
             storage.start_background_persisted_refresh_thread()?;
             storage.start_background_rollup_thread(DEFAULT_ROLLUP_INTERVAL)?;
-            if actions.schedule_startup_maintenance {
-                storage.schedule_startup_maintenance();
-            }
         }
 
         Ok(())

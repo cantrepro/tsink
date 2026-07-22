@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +8,7 @@ use super::super::{Result, TsinkError};
 use super::inventory::SegmentInventoryAccumulator;
 use super::layout::{relative_segment_path, SegmentPathResolver};
 use super::{PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry, SegmentLaneFamily};
-use crate::engine::fs_utils::write_file_atomically_and_sync_parent;
+use crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted;
 use crate::engine::segment::{SegmentManifest, WalHighWatermark};
 
 pub(in crate::engine::storage_engine) const SEGMENT_CATALOG_FILE_NAME: &str =
@@ -41,9 +42,18 @@ struct SegmentCatalogEntry {
     relative_path: String,
 }
 
+#[cfg(test)]
 pub(in crate::engine::storage_engine) fn persist_segment_catalog(
     path: &Path,
     inventory: &SegmentInventory,
+) -> Result<()> {
+    persist_segment_catalog_budgeted(path, inventory, None)
+}
+
+pub(in crate::engine::storage_engine) fn persist_segment_catalog_budgeted(
+    path: &Path,
+    inventory: &SegmentInventory,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let entries = inventory
         .entries()
@@ -70,7 +80,13 @@ pub(in crate::engine::storage_engine) fn persist_segment_catalog(
         version: SEGMENT_CATALOG_VERSION,
         entries,
     })?;
-    write_file_atomically_and_sync_parent(path, &bytes)
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &bytes,
+        local_disk_budget,
+        crate::DiskCategory::Registry,
+        crate::DiskReservationKind::Maintenance,
+    )
 }
 
 pub(in crate::engine::storage_engine) fn shared_segment_catalog_path(

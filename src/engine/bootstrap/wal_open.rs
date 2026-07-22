@@ -15,10 +15,11 @@ impl StartupWalOpenPhase {
         };
 
         if plan.wal_enabled() {
-            let wal = FramedWal::open_with_buffer_size(
+            let wal = FramedWal::open_with_buffer_size_and_disk_budget(
                 wal_path,
                 builder.wal_sync_mode(),
                 builder.wal_buffer_size(),
+                plan.local_disk_budget().cloned(),
             )?;
             wal.ensure_min_highwater(replay_highwater)?;
             Ok(Some(wal))

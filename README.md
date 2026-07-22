@@ -1,220 +1,168 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h2337/tsink/refs/heads/master/logo.svg" width="220" height="100" alt="tsink logo"><br>
-  A lightweight time-series database written in Rust.<br>
-  Embed it, run it as a server, or scale it as a cluster.
+  <img src="https://raw.githubusercontent.com/cantrepro/tsink/refs/heads/master/logo.svg" width="220" height="100" alt="tsink logo"><br>
+  <strong>Durable local Prometheus-style metrics and PromQL, embedded in your application.</strong>
 </p>
 
 <p align="center">
   <a href="https://crates.io/crates/tsink"><img src="https://img.shields.io/crates/v/tsink.svg" alt="crates.io"></a>
   <a href="https://docs.rs/tsink/latest/tsink"><img src="https://img.shields.io/docsrs/tsink.svg" alt="docs.rs"></a>
-  <a href="https://pypi.org/project/tsink"><img src="https://img.shields.io/pypi/v/tsink.svg" alt="pypi.org"></a>
+  <a href="https://pypi.org/project/tsink"><img src="https://img.shields.io/pypi/v/tsink.svg" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
----
+tsink is an embeddable metrics database for applications that need local history and
+PromQL without operating a separate database service. Think of it as a local database
+component for Prometheus-style metrics: one library, one data directory, and an
+optional server adapter when network protocols are useful.
 
-## Why tsink?
+The current Rust crate provides:
 
-- **Three deployment modes** — embed the library directly in your Rust or Python application, run a standalone server binary, or form a replicated cluster. Same engine everywhere.
-- **Robust engine** — segmented WAL with crash-safe sync, LSM-style leveled compaction, adaptive delta/XOR/zstd encoding, mmap zero-copy reads, and configurable memory backpressure.
-- **Tiered storage** — hot, warm, and cold tiers with automatic lifecycle management and optional object-store backing.
-- **Drop-in protocol support** — accepts Prometheus remote write/read, InfluxDB line protocol, OTLP, StatsD, and Graphite out of the box.
-- **Built-in PromQL** — query your data with a native PromQL parser and evaluator. No external query layer needed.
-- **Secure by default** — TLS (rustls, no OpenSSL), RBAC with OIDC, multi-tenant isolation, and mTLS between cluster nodes.
-- **Zero external dependencies at runtime** — single static binary for the server; `protoc` is vendored at build time.
+- an in-process synchronous API plus a runtime-independent async facade;
+- labeled metric storage backed by a write-ahead log and persisted segments;
+- direct reads and an embedded PromQL parser and evaluator;
+- write acknowledgements that distinguish volatile, WAL-appended, and durable results;
+- configurable memory, cardinality, WAL, retention, and concurrency controls;
+- snapshots and native Python bindings.
 
----
+## Embedded Rust quick start
 
-## Deployment modes
+Add the library:
 
-### Embedded library
+```toml
+[dependencies]
+tsink = "0.10"
+```
 
-Add `tsink` as a dependency and get a full time-series engine in-process — WAL durability, compaction, retention, and queries included.
+The current crate metadata declares Rust 1.89 as the minimum supported Rust version.
+
+Then open a local data directory, write a metric, and query it in-process:
 
 ```rust
-use tsink::{DataPoint, Row, StorageBuilder, TimestampPrecision};
+use tsink::promql::Engine;
+use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = StorageBuilder::new()
+    let db = StorageBuilder::new()
         .with_data_path("./tsink-data")
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        // Today's builder exposes individual limits; set the ones your host requires.
+        .with_memory_limit(64 * 1024 * 1024)
+        .with_cardinality_limit(50_000)
+        .with_wal_size_limit(64 * 1024 * 1024)
         .build()?;
 
-    storage.insert_rows(&[
-        Row::new("cpu_usage", DataPoint::new(1_700_000_000_000_i64, 42.0)),
-    ])?;
+    let timestamp = 1_700_000_000_000_i64;
+    let write = db.insert_rows_with_result(&[Row::with_labels(
+        "http_requests_total",
+        vec![Label::new("method", "GET")],
+        DataPoint::new(timestamp, 1.0),
+    )])?;
+    println!("write acknowledgement: {}", write.acknowledgement.as_str());
 
-    let points = storage.select("cpu_usage", &[], 1_700_000_000_000, 1_700_000_000_001)?;
-    println!("{points:?}");
+    let promql = Engine::with_precision(db.clone(), TimestampPrecision::Milliseconds);
+    let result = promql.instant_query(
+        r#"http_requests_total{method="GET"}"#,
+        timestamp,
+    )?;
+    println!("{result:?}");
 
-    storage.close()?;
+    db.close()?;
     Ok(())
 }
 ```
 
-UniFFI bindings expose the core API as a native Python module:
+No daemon, listener, or async runtime is required by this path. See the
+[embedded library guide](docs/embedded-library.md) for labels, direct queries, WAL
+configuration, snapshots, and the async API.
 
-```python
-from tsink import TsinkStorageBuilder, DataPoint, Row, Value
+## Where tsink fits
 
-builder = TsinkStorageBuilder()
-builder.with_data_path("./tsink-data")
-db = builder.build()
+tsink is aimed at applications where a separate TSDB would be disproportionate:
 
-db.insert_rows([
-    Row(
-        metric="cpu_usage",
-        labels=[],
-        data_point=DataPoint(timestamp=1_700_000_000_000, value=Value.F64(v=42.0)),
-    )
-])
-print(db.select("cpu_usage", [], 0, 2_000_000_000_000))
-```
+- self-hosted applications and developer tools with a built-in diagnostics history;
+- agents, gateways, and appliances that retain metrics locally;
+- Rust or Python applications that need direct metric queries or PromQL;
+- protocol integration tests that need a small local metrics backend.
 
-### Server mode
+The intended first adoption beachhead is integration testing, but the dedicated
+deterministic test fixture described below is still roadmap work.
 
-A single binary that speaks every major metrics protocol.
+## Maturity and compatibility
+
+tsink is a pre-1.0 project with a broad implementation surface. Evaluate the exact
+paths you depend on and pin versions. In particular:
+
+| Area | Current status |
+|---|---|
+| Resource bounds | Individual builder knobs and [effective-limit inspection](docs/resource-limits.md) exist, but finite `Test`, `Embedded`, `Edge`, and `Server` profiles are **not shipped**. Memory, cardinality, and WAL quotas default to no explicit limit, and a complete hard disk/query/resource envelope is roadmap work. |
+| Test support | A dedicated `tsink-test` crate, public manual clock, and deterministic maintenance loop are **not shipped**. |
+| Prometheus and OTLP compatibility | Implementations exist, but generated capability matrices and a differential compatibility suite are **not shipped**. Do not interpret “PromQL” or a protocol endpoint as a claim of complete upstream compatibility. |
+| Write results | `write_batch` reports indexed structured outcomes with explicit `Atomic` or `BestEffort` policy; `insert_rows_with_result` retains the compatibility batch acknowledgement. Principal HTTP adapters expose acknowledgement and known partial/indeterminate effects. Server sidecars and experimental cluster routing are not one cross-component transaction. |
+| API and storage stability | Public APIs and on-disk upgrade guarantees are still being hardened for 1.0. Test recovery and upgrades against the versions you deploy. |
+| Clustering | Cluster mode is **experimental**; it is not the primary product path or a production-readiness claim. |
+
+### Metrics integration tests without Docker — roadmap
+
+The roadmap calls for a `tsink-test` library that can run protocol endpoints on
+ephemeral loopback ports, advance a manual clock, drive maintenance explicitly, and
+assert PromQL results without Docker or arbitrary sleeps. That package and API do not
+exist in the current workspace, so there is no testkit quick start to copy yet.
+
+If this is your use case, the
+[design-partner guide](docs/design-partner-guide.md) explains how to record the
+constraints that should shape it.
+
+## Optional server adapter
+
+`tsink-server` wraps the same engine in network and operational adapters. It is
+optional; embedded applications do not need it.
 
 ```bash
-cargo run -p tsink-server --bin tsink-server --release -- \
+cargo run -p tsink-server --release -- \
   --listen 127.0.0.1:9201 \
   --data-path ./var/tsink
 ```
 
-Write data with any client you already have:
+The server currently includes Prometheus remote write/read, Prometheus instant and
+range query endpoints, Prometheus text import, OTLP HTTP metrics ingestion, and
+Influx line-protocol ingestion. These endpoints inherit the compatibility caveat
+above. See [server deployment](docs/server-deployment.md),
+[HTTP API](docs/http-api.md), and
+[ingestion protocols](docs/ingestion-protocols.md).
 
-```bash
-# Prometheus text exposition
-curl -X POST http://127.0.0.1:9201/api/v1/import/prometheus \
-  -H 'Content-Type: text/plain' \
-  -d 'http_requests_total{method="GET"} 1027 1700000000000'
+## Advanced and experimental capabilities
 
-# PromQL query
-curl 'http://127.0.0.1:9201/api/v1/query?query=http_requests_total'
-```
+These surfaces remain available, but they are secondary to the embedded local-engine
+contract:
 
-### Cluster mode
+- native [Python bindings](docs/python-bindings.md);
+- [tiered storage](docs/tiered-storage.md), rollups, snapshots, exemplars, and
+  non-Prometheus value types;
+- server-side TLS, authentication, RBAC, multi-tenancy, rules, monitoring, and
+  administrative APIs;
+- optional StatsD and Graphite listeners and the existing edge-sync machinery.
 
-Enable clustering with a flag and scale horizontally. tsink handles shard routing, replication, consistency, hinted handoff, repair, and rebalance automatically.
+Consult the linked documentation and test the exact configuration before relying on
+an advanced capability in production.
 
-```bash
-tsink-server \
-  --listen 0.0.0.0:9201 \
-  --data-path ./var/tsink \
-  --cluster-enabled \
-  --cluster-node-id node-1 \
-  --cluster-bind 0.0.0.0:9211 \
-  --cluster-replication-factor 3 \
-  --cluster-seeds node-2:9212,node-3:9213
-```
-
----
-
-## Storage engine
-
-| Capability | Details |
-|---|---|
-| **Durability** | Segmented WAL with configurable sync — per-append (crash-safe) or periodic (throughput-optimized). Strict or salvage replay on recovery. |
-| **Compaction** | LSM-style leveled compaction (L0 → L1 → L2) with tombstone-aware merging and atomic segment replacement. |
-| **Tiered storage** | Automatic hot → warm → cold lifecycle with configurable retention windows. Object-store backing for warm/cold tiers. |
-| **Encoding** | Adaptive timestamp codecs (fixed-step, delta-varint, delta-of-delta), Gorilla XOR float compression, and zstd for persisted segments. |
-| **Data types** | float64, bytes, and native Prometheus histograms. |
-| **Memory control** | Configurable memory budget with admission-based backpressure. Cardinality limits on unique series. |
-| **Reads** | mmap-based zero-copy segment reads. Downsampling, aggregation, and regex-capable label matchers built in. |
-
----
-
-## Ingestion protocols
-
-| Protocol | Endpoint | Notes |
-|---|---|---|
-| Prometheus Remote Write | `POST /api/v1/write` | Snappy-framed protobuf |
-| Prometheus Remote Read | `POST /api/v1/read` | |
-| Prometheus Text Exposition | `POST /api/v1/import/prometheus` | Bulk import |
-| InfluxDB Line Protocol | `POST /write`, `POST /api/v2/write` | v1 and v2 compatible |
-| OTLP HTTP | `POST /v1/metrics` | Protobuf; gauges, sums, histograms, summaries |
-| StatsD | UDP (`--statsd-listen`) | Counter, gauge, timer, set |
-| Graphite | TCP (`--graphite-listen`) | Plaintext protocol |
-
----
-
-## Clustering & replication
-
-- **Consistent hash-ring sharding** with configurable shard count
-- **Tunable replication factor** and consistency levels (One / Quorum / All) for writes and reads
-- **Node roles** — dedicated Storage, Query, or Hybrid nodes
-- **Hinted handoff** — queues writes for temporarily unavailable replicas
-- **Digest-based repair** — fingerprint exchange detects and resolves inconsistencies
-- **Online rebalance** — pause, resume, and monitor shard migration
-- **Distributed query fan-out** — concurrent shard-aware reads with merge limits
-- **Cluster-wide snapshots** — coordinated data + control-plane backup and restore
-- **Internal mTLS** — dedicated CA for peer-to-peer traffic
-
----
-
-## Security & multi-tenancy
-
-- **TLS** — rustls-based with hot-reloadable certificates
-- **Authentication** — bearer tokens (file or exec-based loading), OIDC JWT validation (RS256, HS256)
-- **RBAC** — roles, service accounts with rotation, and live audit logging
-- **Multi-tenant isolation** — per-tenant policies for write rate, query concurrency, admission budgets, and retention
-- **Secret rotation** — runtime rotation of auth tokens, TLS certs, and mTLS materials with overlap grace periods
-
----
-
-## Operations
-
-- **`/healthz`** and **`/ready`** — Kubernetes-compatible probes
-- **`/metrics`** — Prometheus-format self-instrumentation
-- **Recording & alerting rules** — built-in rules engine with configurable evaluation intervals
-- **Rollup policies** — persistent downsampled materialization with automated scheduling
-- **Migration tooling** — backfill, verify, and cutover from Prometheus, VictoriaMetrics, InfluxDB, OTLP, StatsD, and Graphite
-- **Support bundles** — bounded JSON diagnostic snapshots per tenant
-
----
+> **Experimental cluster mode:** the server contains sharding, replication, repair,
+> and rebalance code, but clustering is not the reason to adopt tsink and is not
+> presented as production-ready. Prefer the single-instance embedded or server path
+> unless you are explicitly evaluating experimental cluster behavior. See
+> [cluster setup](docs/cluster-setup.md) and
+> [clustering internals](docs/clustering-internals.md).
 
 ## Documentation
 
-### Getting started
-
-- [Embedded library guide](docs/embedded-library.md) — using tsink as a Rust dependency, `StorageBuilder` configuration, sync and async APIs, snapshots
-- [Python bindings guide](docs/python-bindings.md) — UniFFI setup, `TsinkStorageBuilder`, type mappings, error handling
-- [Server deployment](docs/server-deployment.md) — running the single-node server binary, CLI flags, environment variables
-- [Cluster setup](docs/cluster-setup.md) — multi-node deployment, peer discovery, shard count, replication factor, consistency levels, node roles
-
-### Architecture & design
-
-- [Architecture overview](docs/architecture.md) — high-level system design, component interactions, data flow
-- [Storage engine internals](docs/storage-engine.md) — WAL, segments, LSM-style compaction, encoding codecs, mmap reads, write buffer
-- [PromQL implementation](docs/promql.md) — lexer, parser, evaluator, supported functions, aggregations, subqueries
-- [Clustering internals](docs/clustering-internals.md) — consistent hash ring, replication protocol, hinted handoff, digest repair, rebalance, distributed queries
-
-### API & protocol reference
-
-- [HTTP API reference](docs/http-api.md) — all endpoints, request/response formats, authentication headers, error codes
-- [PromQL reference](docs/promql-reference.md) — function catalogue, operators, vector matching, type coercion rules
-- [Ingestion protocols](docs/ingestion-protocols.md) — Prometheus remote write, InfluxDB line protocol, OTLP, StatsD, Graphite wire formats and endpoints
-- [Configuration reference](docs/configuration.md) — complete list of server, engine, cluster, and security options with defaults
-
-### Features
-
-- [Tiered storage](docs/tiered-storage.md) — hot/warm/cold lifecycle, retention windows, object-store backing
-- [Compaction](docs/compaction.md) — L0/L1/L2 levels, merge strategies, tombstone handling, tuning
-- [Rollups & downsampling](docs/rollups.md) — rollup policies, materialization scheduling, query integration
-- [Data types & native histograms](docs/data-types.md) — float64, bytes, native histograms, timestamp precision modes
-- [Exemplars](docs/exemplars.md) — exemplar storage, querying, cardinality limits
-
-### Security & operations
-
-- [Security model](docs/security.md) — TLS/mTLS setup, RBAC roles, OIDC authentication, audit logging
-- [Multi-tenancy](docs/multi-tenancy.md) — tenant isolation, per-tenant quotas, admission budgets, usage accounting
-- [Secret rotation](docs/secret-rotation.md) — rotating auth tokens, TLS certificates, mTLS materials, grace periods
-- [Monitoring & observability](docs/monitoring.md) — `/metrics` endpoint, self-instrumentation, health probes, support bundles
-- [Recording & alerting rules](docs/rules.md) — rule definitions, evaluation intervals, recording rule output
-- [Performance tuning](docs/performance-tuning.md) — memory budgets, compaction tuning, write pipelining, cgroup-aware scheduling
-- [Migration guide](docs/migration.md) — migrating from Prometheus, VictoriaMetrics, InfluxDB; backfill, verify, cutover
-
----
+- [Product positioning](docs/product-positioning.md)
+- [Embedded library](docs/embedded-library.md)
+- [Storage engine](docs/storage-engine.md), [WAL and compaction](docs/compaction.md),
+  and [architecture](docs/architecture.md)
+- [PromQL overview](docs/promql.md) and [current reference](docs/promql-reference.md)
+- [Server deployment](docs/server-deployment.md), [HTTP API](docs/http-api.md), and
+  [configuration](docs/configuration.md)
+- [Python bindings](docs/python-bindings.md)
+- [Design-partner guide](docs/design-partner-guide.md)
 
 ## License
 

@@ -73,7 +73,10 @@ pub(crate) async fn handle_remote_write_with_admission(
     };
     let envelope = match normalize_remote_write_request(write_req, &tenant_id, precision) {
         Ok(envelope) => envelope,
-        Err(err) => return text_response(400, &err),
+        Err(err) => {
+            return text_response(400, bounded_write_rejection_diagnostic(&err))
+                .with_header(WRITE_ERROR_CODE_HEADER, "remote_write_invalid_payload")
+        }
     };
     let payload_config = prometheus_payload_config();
     let metadata_count = envelope.metadata_updates.len();
@@ -158,14 +161,57 @@ pub(crate) async fn handle_remote_write_with_admission(
     {
         Ok(result) => result,
         Err(response) => {
-            if histogram_count > 0 && response.status == 409 {
-                record_payload_rejected(PrometheusPayloadKind::Histogram, histogram_count);
+            let accepted_rows = response_header_count(&response, WRITE_ROWS_ACCEPTED_HEADER);
+            let accepted_metadata = response_header_count(&response, "X-Tsink-Metadata-Accepted");
+            let applied_metadata = response_header_count(&response, "X-Tsink-Metadata-Applied");
+            let accepted_exemplars = response_header_count(&response, "X-Tsink-Exemplars-Accepted");
+            let indeterminate = response_write_outcome_is_indeterminate(&response);
+
+            if histogram_count > 0 {
+                if accepted_rows > 0 {
+                    record_payload_accepted(PrometheusPayloadKind::Histogram, histogram_count);
+                } else if !indeterminate {
+                    record_payload_rejected(PrometheusPayloadKind::Histogram, histogram_count);
+                }
             }
-            if metadata_count > 0 && response.status >= 409 {
-                record_payload_rejected(PrometheusPayloadKind::Metadata, metadata_count);
+            if accepted_metadata > 0 {
+                record_payload_accepted(PrometheusPayloadKind::Metadata, accepted_metadata);
             }
-            if exemplar_count > 0 && response.status >= 409 {
-                record_payload_rejected(PrometheusPayloadKind::Exemplar, exemplar_count);
+            if !indeterminate && metadata_count > accepted_metadata {
+                record_payload_rejected(
+                    PrometheusPayloadKind::Metadata,
+                    metadata_count - accepted_metadata,
+                );
+            }
+            if accepted_exemplars > 0 {
+                record_payload_accepted(PrometheusPayloadKind::Exemplar, accepted_exemplars);
+            }
+            if !indeterminate && exemplar_count > accepted_exemplars {
+                record_payload_rejected(
+                    PrometheusPayloadKind::Exemplar,
+                    exemplar_count - accepted_exemplars,
+                );
+            }
+            if accepted_rows > 0 || accepted_metadata > 0 || accepted_exemplars > 0 {
+                record_ingest_usage(
+                    usage_accounting,
+                    &tenant_id,
+                    "remote_write",
+                    request.path_without_query(),
+                    IngestUsageMetrics::new(
+                        accepted_rows as u64,
+                        applied_metadata as u64,
+                        accepted_exemplars as u64,
+                        0,
+                        if accepted_rows > 0 {
+                            histogram_count as u64
+                        } else {
+                            0
+                        },
+                        elapsed_nanos_since(started),
+                        request.body.len() as u64,
+                    ),
+                );
             }
             return response;
         }
@@ -175,7 +221,10 @@ pub(crate) async fn handle_remote_write_with_admission(
         record_payload_accepted(PrometheusPayloadKind::Histogram, histogram_count);
     }
     if metadata_count > 0 {
-        record_payload_accepted(PrometheusPayloadKind::Metadata, metadata_count);
+        record_payload_accepted(
+            PrometheusPayloadKind::Metadata,
+            apply_result.accepted_metadata_updates,
+        );
     }
     if exemplar_count > 0 {
         record_payload_accepted(
@@ -212,11 +261,19 @@ pub(crate) async fn handle_remote_write_with_admission(
                 consistency.acknowledged_replicas_min.to_string(),
             );
     }
+    if let Some(acknowledgement) = apply_result.acknowledgement {
+        response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+    }
     if apply_result.applied_metadata_updates > 0 || metadata_count > 0 {
-        response = response.with_header(
-            "X-Tsink-Metadata-Applied",
-            apply_result.applied_metadata_updates.to_string(),
-        );
+        response = response
+            .with_header(
+                "X-Tsink-Metadata-Accepted",
+                apply_result.accepted_metadata_updates.to_string(),
+            )
+            .with_header(
+                "X-Tsink-Metadata-Applied",
+                apply_result.applied_metadata_updates.to_string(),
+            );
     }
     if histogram_count > 0 {
         response = response.with_header("X-Tsink-Histograms-Accepted", histogram_count.to_string());
@@ -294,11 +351,8 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
             && media_type != "application/protobuf"
         {
             record_otlp_request_rejected();
-            return HttpResponse::new(
-                415,
-                format!("unsupported content-type for /v1/metrics: {content_type}"),
-            )
-            .with_header("Content-Type", "text/plain");
+            return HttpResponse::new(415, "unsupported content-type for /v1/metrics")
+                .with_header("Content-Type", "text/plain");
         }
     }
 
@@ -340,7 +394,8 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
                 if let Some(kind) = err.stats.rejected_kind {
                     record_otlp_rejected_kind(kind);
                 }
-                return text_response(400, &err.to_string());
+                return text_response(400, bounded_write_rejection_diagnostic(&err.to_string()))
+                    .with_header(WRITE_ERROR_CODE_HEADER, "otlp_invalid_metrics_payload");
             }
         };
 
@@ -423,13 +478,62 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
         Ok(result) => result,
         Err(response) => {
             record_otlp_request_rejected();
-            OTLP_EXEMPLAR_REJECTED_TOTAL.fetch_add(exemplar_count as u64, Ordering::Relaxed);
+            let accepted_rows = response_header_count(&response, WRITE_ROWS_ACCEPTED_HEADER);
+            let accepted_metadata = response_header_count(&response, "X-Tsink-Metadata-Accepted");
+            let applied_metadata = response_header_count(&response, "X-Tsink-Metadata-Applied");
+            let accepted_exemplars = response_header_count(&response, "X-Tsink-Exemplars-Accepted");
+            let indeterminate = response_write_outcome_is_indeterminate(&response);
+
+            if accepted_rows > 0 {
+                record_otlp_points_accepted(&stats);
+            } else if !indeterminate {
+                record_otlp_points_rejected(&stats);
+            }
+            if accepted_metadata > 0 {
+                record_payload_accepted(PrometheusPayloadKind::Metadata, accepted_metadata);
+            }
+            if !indeterminate && metadata_count > accepted_metadata {
+                record_payload_rejected(
+                    PrometheusPayloadKind::Metadata,
+                    metadata_count - accepted_metadata,
+                );
+            }
+            OTLP_EXEMPLAR_ACCEPTED_TOTAL.fetch_add(accepted_exemplars as u64, Ordering::Relaxed);
+            if !indeterminate && exemplar_count > accepted_exemplars {
+                OTLP_EXEMPLAR_REJECTED_TOTAL.fetch_add(
+                    (exemplar_count - accepted_exemplars) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+            if accepted_rows > 0 || accepted_metadata > 0 || accepted_exemplars > 0 {
+                record_ingest_usage(
+                    usage_accounting,
+                    &tenant_id,
+                    "otlp_metrics",
+                    request.path_without_query(),
+                    IngestUsageMetrics::new(
+                        accepted_rows as u64,
+                        applied_metadata as u64,
+                        accepted_exemplars as u64,
+                        0,
+                        0,
+                        elapsed_nanos_since(started),
+                        request.body.len() as u64,
+                    ),
+                );
+            }
             return response;
         }
     };
 
     record_otlp_request_accepted();
     record_otlp_points_accepted(&stats);
+    if apply_result.accepted_metadata_updates > 0 {
+        record_payload_accepted(
+            PrometheusPayloadKind::Metadata,
+            apply_result.accepted_metadata_updates,
+        );
+    }
     OTLP_EXEMPLAR_ACCEPTED_TOTAL
         .fetch_add(apply_result.accepted_exemplars as u64, Ordering::Relaxed);
     record_ingest_usage(
@@ -471,15 +575,23 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
                 consistency.acknowledged_replicas_min.to_string(),
             );
     }
+    if let Some(acknowledgement) = apply_result.acknowledgement {
+        response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+    }
     response = response.with_header(
         "X-Tsink-OTLP-Data-Points-Accepted",
         total_points.to_string(),
     );
     if metadata_count > 0 || apply_result.applied_metadata_updates > 0 {
-        response = response.with_header(
-            "X-Tsink-Metadata-Applied",
-            apply_result.applied_metadata_updates.to_string(),
-        );
+        response = response
+            .with_header(
+                "X-Tsink-Metadata-Accepted",
+                apply_result.accepted_metadata_updates.to_string(),
+            )
+            .with_header(
+                "X-Tsink-Metadata-Applied",
+                apply_result.applied_metadata_updates.to_string(),
+            );
     }
     if exemplar_count > 0 {
         response = response
@@ -562,7 +674,7 @@ pub(crate) async fn handle_prometheus_import_with_admission(
     let now = current_timestamp(precision);
     let parsed = match parse_prometheus_text_with_exemplars(&body_str, now) {
         Ok(parsed) => parsed,
-        Err(err) => return text_response(400, &err),
+        Err(err) => return prometheus_import_parse_error_response(&err),
     };
     let payload_config = prometheus_payload_config();
     if !payload_config.exemplars_enabled && !parsed.exemplars.is_empty() {
@@ -673,7 +785,9 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                 .await
             {
                 Ok(stats) => Some(stats),
-                Err(err) => return write_routing_error_response(err),
+                Err(err) => {
+                    return indeterminate_cluster_write_response(write_routing_error_response(err))
+                }
             }
         };
         let exemplar_stats = if exemplars.is_empty() {
@@ -696,8 +810,14 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                     Some(stats)
                 }
                 Err(err) => {
-                    record_payload_rejected(PrometheusPayloadKind::Exemplar, exemplar_count);
-                    return text_response(409, &err);
+                    return indeterminate_cluster_write_response(partial_write_error_response(
+                        text_response(409, &err),
+                        row_count,
+                        (row_count > 0).then_some(WriteAcknowledgement::Volatile),
+                        0,
+                        0,
+                        0,
+                    ));
                 }
             }
         };
@@ -726,11 +846,10 @@ pub(crate) async fn handle_prometheus_import_with_admission(
         );
 
         let mut response = HttpResponse::new(200, Vec::<u8>::new());
-        if let Some(consistency) = row_stats
-            .as_ref()
-            .and_then(|stats| stats.consistency)
-            .or_else(|| exemplar_stats.as_ref().and_then(|stats| stats.consistency))
-        {
+        if let Some(consistency) = weakest_write_consistency(
+            row_stats.as_ref().and_then(|stats| stats.consistency),
+            exemplar_stats.as_ref().and_then(|stats| stats.consistency),
+        ) {
             response = response
                 .with_header("X-Tsink-Write-Consistency", consistency.mode.to_string())
                 .with_header(
@@ -753,19 +872,48 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                     stats.dropped_exemplars.to_string(),
                 );
         }
+        let acknowledgement = if exemplar_count > 0 {
+            // The exemplar sidecar has no WAL-backed durability contract, so it weakens the
+            // complete import even when every routed row replica reported a stronger result.
+            Some(WriteAcknowledgement::Volatile)
+        } else {
+            row_stats.as_ref().and_then(|stats| stats.acknowledgement)
+        };
+        if let Some(acknowledgement) = acknowledgement {
+            response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+        }
         return response;
     }
 
-    if !rows.is_empty() {
+    let mut acknowledgement = if rows.is_empty() {
+        None
+    } else {
         let edge_rows = rows.clone();
         let storage = Arc::clone(storage);
-        let result = tokio::task::spawn_blocking(move || storage.insert_rows(&rows)).await;
+        let result =
+            tokio::task::spawn_blocking(move || storage.write_batch(&rows, WriteMode::Atomic))
+                .await;
         match result {
-            Ok(Ok(())) => maybe_enqueue_edge_sync_rows(edge_sync_context, &edge_rows),
+            Ok(Ok(result)) => {
+                let acknowledgement =
+                    match validate_atomic_write_result("import", edge_rows.len(), &result) {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(response) => return response,
+                    };
+                if let Err(error) = maybe_enqueue_edge_sync_rows(edge_sync_context, &edge_rows) {
+                    return edge_sync_enqueue_error_response(
+                        "import",
+                        &error,
+                        edge_rows.len(),
+                        acknowledgement,
+                    );
+                }
+                Some(acknowledgement)
+            }
             Ok(Err(err)) => return storage_write_error_response("import", &err),
-            Err(err) => return text_response(500, &format!("import task failed: {err}")),
+            Err(_) => return backend_write_task_failure_response("import"),
         }
-    }
+    };
 
     if exemplars.is_empty() {
         record_ingest_usage(
@@ -783,7 +931,11 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                 request.body.len() as u64,
             ),
         );
-        return HttpResponse::new(200, Vec::<u8>::new());
+        let mut response = HttpResponse::new(200, Vec::<u8>::new());
+        if let Some(acknowledgement) = acknowledgement {
+            response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+        }
+        return response;
     }
     match exemplar_store.apply_writes(
         &exemplars
@@ -792,6 +944,8 @@ pub(crate) async fn handle_prometheus_import_with_admission(
             .collect::<Vec<_>>(),
     ) {
         Ok(outcome) => {
+            acknowledgement =
+                weakest_write_acknowledgement(acknowledgement, WriteAcknowledgement::Volatile);
             record_payload_accepted(PrometheusPayloadKind::Exemplar, outcome.accepted);
             record_ingest_usage(
                 usage_accounting,
@@ -808,13 +962,42 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                     request.body.len() as u64,
                 ),
             );
-            HttpResponse::new(200, Vec::<u8>::new())
+            let mut response = HttpResponse::new(200, Vec::<u8>::new())
                 .with_header("X-Tsink-Exemplars-Accepted", outcome.accepted.to_string())
-                .with_header("X-Tsink-Exemplars-Dropped", outcome.dropped.to_string())
+                .with_header("X-Tsink-Exemplars-Dropped", outcome.dropped.to_string());
+            if let Some(acknowledgement) = acknowledgement {
+                response =
+                    response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+            }
+            response
         }
         Err(err) => {
             record_payload_rejected(PrometheusPayloadKind::Exemplar, exemplar_count);
-            text_response(500, &format!("exemplar import failed: {err}"))
+            if row_count > 0 {
+                record_ingest_usage(
+                    usage_accounting,
+                    &tenant_id,
+                    "prometheus_import",
+                    request.path_without_query(),
+                    IngestUsageMetrics::new(
+                        row_count as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        elapsed_nanos_since(started),
+                        request.body.len() as u64,
+                    ),
+                );
+            }
+            partial_write_error_response(
+                text_response(500, &format!("exemplar import failed: {err}")),
+                row_count,
+                acknowledgement,
+                0,
+                0,
+                0,
+            )
         }
     }
 }
@@ -823,6 +1006,134 @@ pub(crate) async fn handle_prometheus_import_with_admission(
 struct ParsedPrometheusImport {
     rows: Vec<Row>,
     exemplars: Vec<NormalizedExemplar>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrometheusImportParseErrorClass {
+    UnclosedLabelBlock,
+    InvalidLabelName,
+    MissingLabelEquals,
+    UnquotedLabelValue,
+    UnterminatedLabelEscape,
+    UnterminatedLabelValue,
+    MissingLabelSeparator,
+    MissingSampleValue,
+    InvalidSampleValue,
+    InvalidSampleTimestamp,
+    InvalidExemplarFragment,
+    MissingExemplarValue,
+    InvalidExemplarValue,
+    InvalidExemplarTimestamp,
+}
+
+impl PrometheusImportParseErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnclosedLabelBlock => "unclosed_label_block",
+            Self::InvalidLabelName => "invalid_label_name",
+            Self::MissingLabelEquals => "missing_label_equals",
+            Self::UnquotedLabelValue => "unquoted_label_value",
+            Self::UnterminatedLabelEscape => "unterminated_label_escape",
+            Self::UnterminatedLabelValue => "unterminated_label_value",
+            Self::MissingLabelSeparator => "missing_label_separator",
+            Self::MissingSampleValue => "missing_sample_value",
+            Self::InvalidSampleValue => "invalid_sample_value",
+            Self::InvalidSampleTimestamp => "invalid_sample_timestamp",
+            Self::InvalidExemplarFragment => "invalid_exemplar_fragment",
+            Self::MissingExemplarValue => "missing_exemplar_value",
+            Self::InvalidExemplarValue => "invalid_exemplar_value",
+            Self::InvalidExemplarTimestamp => "invalid_exemplar_timestamp",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::UnclosedLabelBlock => "label block is not closed",
+            Self::InvalidLabelName => "label name is invalid",
+            Self::MissingLabelEquals => "label assignment is missing '='",
+            Self::UnquotedLabelValue => "label value must be quoted",
+            Self::UnterminatedLabelEscape => "label escape sequence is not terminated",
+            Self::UnterminatedLabelValue => "label value is not terminated",
+            Self::MissingLabelSeparator => "labels must be separated by ','",
+            Self::MissingSampleValue => "sample value is missing",
+            Self::InvalidSampleValue => "sample value is not a number",
+            Self::InvalidSampleTimestamp => "sample timestamp is not an integer",
+            Self::InvalidExemplarFragment => "exemplar fragment is malformed",
+            Self::MissingExemplarValue => "exemplar value is missing",
+            Self::InvalidExemplarValue => "exemplar value is not a number",
+            Self::InvalidExemplarTimestamp => "exemplar timestamp is not an integer",
+        }
+    }
+
+    fn http_error_code(self) -> &'static str {
+        match self {
+            Self::UnclosedLabelBlock
+            | Self::InvalidLabelName
+            | Self::MissingLabelEquals
+            | Self::UnquotedLabelValue
+            | Self::UnterminatedLabelEscape
+            | Self::UnterminatedLabelValue
+            | Self::MissingLabelSeparator => "prometheus_import_invalid_labels",
+            Self::MissingSampleValue => "prometheus_import_missing_value",
+            Self::InvalidSampleValue => "prometheus_import_invalid_value",
+            Self::InvalidSampleTimestamp => "prometheus_import_invalid_timestamp",
+            Self::InvalidExemplarFragment => "prometheus_import_invalid_exemplar",
+            Self::MissingExemplarValue => "prometheus_import_missing_exemplar_value",
+            Self::InvalidExemplarValue => "prometheus_import_invalid_exemplar_value",
+            Self::InvalidExemplarTimestamp => "prometheus_import_invalid_exemplar_timestamp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrometheusImportParseError {
+    class: PrometheusImportParseErrorClass,
+    line_number: Option<usize>,
+    label_index: Option<usize>,
+}
+
+impl PrometheusImportParseError {
+    fn new(class: PrometheusImportParseErrorClass) -> Self {
+        Self {
+            class,
+            line_number: None,
+            label_index: None,
+        }
+    }
+
+    fn at_line(mut self, line_number: usize) -> Self {
+        self.line_number = Some(line_number);
+        self
+    }
+
+    fn at_label(mut self, label_index: usize) -> Self {
+        self.label_index = Some(label_index);
+        self
+    }
+}
+
+impl std::fmt::Display for PrometheusImportParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("prometheus import parse error")?;
+        if let Some(line_number) = self.line_number {
+            write!(formatter, " at line {line_number}")?;
+        }
+        if let Some(label_index) = self.label_index {
+            write!(formatter, ", label {label_index}")?;
+        }
+        write!(
+            formatter,
+            ": {} ({})",
+            self.class.as_str(),
+            self.class.description()
+        )
+    }
+}
+
+fn prometheus_import_parse_error_response(error: &PrometheusImportParseError) -> HttpResponse {
+    let diagnostic = error.to_string();
+    text_response(400, bounded_write_rejection_diagnostic(&diagnostic))
+        .with_header(WRITE_ERROR_CODE_HEADER, error.class.http_error_code())
 }
 
 fn scope_exemplars_for_tenant(
@@ -858,18 +1169,21 @@ pub(crate) fn parse_prometheus_text(
     text: &str,
     default_timestamp: i64,
 ) -> Result<Vec<Row>, String> {
-    parse_prometheus_text_with_exemplars(text, default_timestamp).map(|parsed| parsed.rows)
+    parse_prometheus_text_with_exemplars(text, default_timestamp)
+        .map(|parsed| parsed.rows)
+        .map_err(|err| err.to_string())
 }
 
 fn parse_prometheus_text_with_exemplars(
     text: &str,
     default_timestamp: i64,
-) -> Result<ParsedPrometheusImport, String> {
+) -> Result<ParsedPrometheusImport, PrometheusImportParseError> {
     let mut parsed = ParsedPrometheusImport::default();
 
     let mut rows = Vec::new();
 
-    for line in text.lines() {
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -877,12 +1191,15 @@ fn parse_prometheus_text_with_exemplars(
         let (sample_text, exemplar_text) = split_openmetrics_exemplar(line);
 
         let (metric_and_labels, rest) = if let Some(brace_start) = sample_text.find('{') {
-            let brace_end = find_label_block_end(sample_text, brace_start)
-                .ok_or_else(|| format!("unclosed brace in line: {sample_text}"))?;
+            let brace_end = find_label_block_end(sample_text, brace_start).ok_or_else(|| {
+                PrometheusImportParseError::new(PrometheusImportParseErrorClass::UnclosedLabelBlock)
+                    .at_line(line_number)
+            })?;
             let metric_name = &sample_text[..brace_start];
             let labels_str = &sample_text[brace_start + 1..brace_end];
             let rest = sample_text[brace_end + 1..].trim();
-            let labels = parse_prom_labels(labels_str)?;
+            let labels =
+                parse_prom_labels_diagnostic(labels_str).map_err(|err| err.at_line(line_number))?;
             ((metric_name.to_string(), labels), rest)
         } else {
             let mut parts = sample_text.splitn(2, |c: char| c.is_whitespace());
@@ -897,17 +1214,22 @@ fn parse_prometheus_text_with_exemplars(
         }
 
         let mut value_parts = rest.split_whitespace();
-        let value_str = value_parts
-            .next()
-            .ok_or_else(|| format!("missing value in line: {line}"))?;
-        let value: f64 = value_str
-            .parse()
-            .map_err(|_| format!("invalid value '{value_str}' in line: {line}"))?;
+        let value_str = value_parts.next().ok_or_else(|| {
+            PrometheusImportParseError::new(PrometheusImportParseErrorClass::MissingSampleValue)
+                .at_line(line_number)
+        })?;
+        let value: f64 = value_str.parse().map_err(|_| {
+            PrometheusImportParseError::new(PrometheusImportParseErrorClass::InvalidSampleValue)
+                .at_line(line_number)
+        })?;
 
         let timestamp = if let Some(ts_str) = value_parts.next() {
-            ts_str
-                .parse::<i64>()
-                .map_err(|_| format!("invalid timestamp '{ts_str}' in line: {line}"))?
+            ts_str.parse::<i64>().map_err(|_| {
+                PrometheusImportParseError::new(
+                    PrometheusImportParseErrorClass::InvalidSampleTimestamp,
+                )
+                .at_line(line_number)
+            })?
         } else {
             default_timestamp
         };
@@ -918,12 +1240,10 @@ fn parse_prometheus_text_with_exemplars(
             DataPoint::new(timestamp, value),
         ));
         if let Some(exemplar_text) = exemplar_text {
-            parsed.exemplars.push(parse_openmetrics_exemplar(
-                exemplar_text,
-                &metric_name,
-                &labels,
-                timestamp,
-            )?);
+            parsed.exemplars.push(
+                parse_openmetrics_exemplar(exemplar_text, &metric_name, &labels, timestamp)
+                    .map_err(|err| err.at_line(line_number))?,
+            );
         }
     }
 
@@ -943,25 +1263,30 @@ fn parse_openmetrics_exemplar(
     metric: &str,
     labels: &[Label],
     sample_timestamp: i64,
-) -> Result<NormalizedExemplar, String> {
+) -> Result<NormalizedExemplar, PrometheusImportParseError> {
     if !text.starts_with('{') {
-        return Err(format!("invalid exemplar fragment: {text}"));
+        return Err(PrometheusImportParseError::new(
+            PrometheusImportParseErrorClass::InvalidExemplarFragment,
+        ));
     }
-    let brace_end = find_label_block_end(text, 0)
-        .ok_or_else(|| format!("invalid exemplar fragment: {text}"))?;
-    let exemplar_labels = parse_prom_labels(&text[1..brace_end])?;
+    let brace_end = find_label_block_end(text, 0).ok_or_else(|| {
+        PrometheusImportParseError::new(PrometheusImportParseErrorClass::InvalidExemplarFragment)
+    })?;
+    let exemplar_labels = parse_prom_labels_diagnostic(&text[1..brace_end])?;
     let rest = text[brace_end + 1..].trim();
     let mut parts = rest.split_whitespace();
-    let value_str = parts
-        .next()
-        .ok_or_else(|| format!("missing exemplar value in '{text}'"))?;
-    let value = value_str
-        .parse::<f64>()
-        .map_err(|_| format!("invalid exemplar value '{value_str}' in '{text}'"))?;
+    let value_str = parts.next().ok_or_else(|| {
+        PrometheusImportParseError::new(PrometheusImportParseErrorClass::MissingExemplarValue)
+    })?;
+    let value = value_str.parse::<f64>().map_err(|_| {
+        PrometheusImportParseError::new(PrometheusImportParseErrorClass::InvalidExemplarValue)
+    })?;
     let timestamp = match parts.next() {
-        Some(value) => value
-            .parse::<i64>()
-            .map_err(|_| format!("invalid exemplar timestamp '{value}' in '{text}'"))?,
+        Some(value) => value.parse::<i64>().map_err(|_| {
+            PrometheusImportParseError::new(
+                PrometheusImportParseErrorClass::InvalidExemplarTimestamp,
+            )
+        })?,
         None => sample_timestamp,
     };
     let mut series_labels = labels.to_vec();
@@ -996,7 +1321,14 @@ fn find_label_block_end(line: &str, open_brace: usize) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> {
+    parse_prom_labels_diagnostic(labels_str).map_err(|err| err.to_string())
+}
+
+fn parse_prom_labels_diagnostic(
+    labels_str: &str,
+) -> Result<Vec<Label>, PrometheusImportParseError> {
     let mut labels = Vec::new();
     let mut chars = labels_str.chars().peekable();
 
@@ -1008,6 +1340,7 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
         if chars.peek().is_none() {
             break;
         }
+        let label_index = labels.len() + 1;
 
         let mut name = String::new();
         while let Some(&ch) = chars.peek() {
@@ -1020,7 +1353,10 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
         }
 
         if name.is_empty() {
-            return Err(format!("invalid label in '{labels_str}'"));
+            return Err(PrometheusImportParseError::new(
+                PrometheusImportParseErrorClass::InvalidLabelName,
+            )
+            .at_label(label_index));
         }
 
         while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
@@ -1028,7 +1364,10 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
         }
 
         if chars.next() != Some('=') {
-            return Err(format!("invalid label pair for '{name}' in '{labels_str}'"));
+            return Err(PrometheusImportParseError::new(
+                PrometheusImportParseErrorClass::MissingLabelEquals,
+            )
+            .at_label(label_index));
         }
 
         while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
@@ -1036,9 +1375,10 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
         }
 
         if chars.next() != Some('"') {
-            return Err(format!(
-                "label '{name}' value must be quoted in '{labels_str}'"
-            ));
+            return Err(PrometheusImportParseError::new(
+                PrometheusImportParseErrorClass::UnquotedLabelValue,
+            )
+            .at_label(label_index));
         }
 
         let mut value = String::new();
@@ -1052,10 +1392,20 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
                     Some('t') => value.push('\t'),
                     Some('r') => value.push('\r'),
                     Some(other) => value.push(other),
-                    None => return Err(format!("unterminated escape sequence in '{labels_str}'")),
+                    None => {
+                        return Err(PrometheusImportParseError::new(
+                            PrometheusImportParseErrorClass::UnterminatedLabelEscape,
+                        )
+                        .at_label(label_index));
+                    }
                 },
                 Some(ch) => value.push(ch),
-                None => return Err(format!("unterminated label value in '{labels_str}'")),
+                None => {
+                    return Err(PrometheusImportParseError::new(
+                        PrometheusImportParseErrorClass::UnterminatedLabelValue,
+                    )
+                    .at_label(label_index));
+                }
             }
         }
 
@@ -1069,10 +1419,129 @@ pub(crate) fn parse_prom_labels(labels_str: &str) -> Result<Vec<Label>, String> 
             Some(',') => {
                 chars.next();
             }
-            Some(_) => return Err(format!("expected ',' separator in '{labels_str}'")),
+            Some(_) => {
+                return Err(PrometheusImportParseError::new(
+                    PrometheusImportParseErrorClass::MissingLabelSeparator,
+                )
+                .at_label(label_index));
+            }
             None => break,
         }
     }
 
     Ok(labels)
+}
+
+#[cfg(test)]
+mod import_diagnostic_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn long_sensitive_sample_and_label_values_are_not_echoed_in_import_diagnostics() {
+        let secret = format!("sensitive-token-{}", "x".repeat(8_192));
+        let text = format!("valid_metric 1\nprivate_metric{{token=\"{secret}\"}} {secret}\n");
+
+        let error = parse_prometheus_text_with_exemplars(&text, 0)
+            .expect_err("invalid sample value should be rejected");
+        let response = prometheus_import_parse_error_response(&error);
+
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("prometheus_import_invalid_value")
+        );
+        let body = String::from_utf8(response.body).expect("diagnostic should be UTF-8");
+        assert!(body.contains("line 2"));
+        assert!(body.contains("invalid_sample_value"));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+        assert!(!body.contains("sensitive-token"));
+        assert!(!body.contains("private_metric"));
+    }
+
+    #[test]
+    fn malformed_label_and_exemplar_diagnostics_use_positions_and_fixed_classes() {
+        let secret = format!("private-label-value-{}", "y".repeat(8_192));
+        let label_text = format!("metric{{token={secret}}} 1\n");
+        let label_error = parse_prometheus_text_with_exemplars(&label_text, 0)
+            .expect_err("unquoted label should be rejected");
+        let label_response = prometheus_import_parse_error_response(&label_error);
+        assert_eq!(label_response.status, 400);
+        assert_eq!(
+            response_header(&label_response, WRITE_ERROR_CODE_HEADER),
+            Some("prometheus_import_invalid_labels")
+        );
+        let label_body =
+            String::from_utf8(label_response.body).expect("diagnostic should be UTF-8");
+        assert!(label_body.contains("line 1, label 1"));
+        assert!(label_body.contains("unquoted_label_value"));
+        assert!(label_body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+        assert!(!label_body.contains("private-label-value"));
+
+        let exemplar_text = format!("metric 1 # {{trace_id=\"{secret}\"}} not-a-number-{secret}\n");
+        let exemplar_error = parse_prometheus_text_with_exemplars(&exemplar_text, 0)
+            .expect_err("invalid exemplar value should be rejected");
+        let exemplar_response = prometheus_import_parse_error_response(&exemplar_error);
+        assert_eq!(exemplar_response.status, 400);
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_ERROR_CODE_HEADER),
+            Some("prometheus_import_invalid_exemplar_value")
+        );
+        let exemplar_body =
+            String::from_utf8(exemplar_response.body).expect("diagnostic should be UTF-8");
+        assert!(exemplar_body.contains("line 1"));
+        assert!(exemplar_body.contains("invalid_exemplar_value"));
+        assert!(exemplar_body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+        assert!(!exemplar_body.contains("private-label-value"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_import_http_response_does_not_reflect_sensitive_payload_text() {
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let exemplar_store = Arc::new(ExemplarStore::in_memory());
+        let write_admission =
+            WriteAdmissionController::new(admission::WriteAdmissionGuardrails::default())
+                .expect("write admission should build");
+        let secret = format!("http-sensitive-token-{}", "z".repeat(8_192));
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/import/prometheus".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            body: format!("metric{{credential=\"{secret}\"}} {secret}\n").into_bytes(),
+        };
+
+        let response = handle_prometheus_import_with_admission(
+            &storage,
+            &exemplar_store,
+            &request,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &write_admission,
+        )
+        .await;
+
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("prometheus_import_invalid_value")
+        );
+        let body = std::str::from_utf8(&response.body).expect("diagnostic should be UTF-8");
+        assert!(body.contains("line 1"));
+        assert!(body.contains("invalid_sample_value"));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+        assert!(!body.contains("http-sensitive-token"));
+    }
 }

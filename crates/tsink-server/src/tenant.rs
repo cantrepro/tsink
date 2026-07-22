@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tsink::{
-    DataPoint, DeleteSeriesResult, Label, MetadataShardScope, MetricSeries, QueryOptions,
-    Result as TsinkResult, Row, SeriesMatcher, SeriesPoints, SeriesSelection, Storage,
-    StorageObservabilitySnapshot, TsinkError,
+    BatchWriteResult, DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label,
+    MetadataShardScope, MetricSeries, QueryOptions, Result as TsinkResult, Row, RowWriteOutcome,
+    RowWriteStatus, SeriesMatcher, SeriesPoints, SeriesSelection, Storage,
+    StorageObservabilitySnapshot, TsinkError, WriteMode, WriteRejection, WriteRejectionCategory,
 };
 
 pub const TENANT_HEADER: &str = "x-tsink-tenant";
@@ -1519,6 +1520,79 @@ fn visible_labels(labels: Vec<Label>, tenant_id: &str) -> Option<Vec<Label>> {
     }
 }
 
+fn validate_inner_write_batch_result(
+    expected_rows: usize,
+    mode: WriteMode,
+    result: &BatchWriteResult,
+) -> TsinkResult<()> {
+    let malformed = |detail: String| {
+        TsinkError::Other(format!(
+            "tenant-scoped storage received malformed canonical batch result: {detail}"
+        ))
+    };
+
+    if result.submitted != expected_rows {
+        return Err(malformed(format!(
+            "submitted count {} does not match {expected_rows} forwarded rows",
+            result.submitted
+        )));
+    }
+    if result.outcomes.len() != expected_rows {
+        return Err(malformed(format!(
+            "outcome count {} does not match {expected_rows} forwarded rows",
+            result.outcomes.len()
+        )));
+    }
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    for (position, outcome) in result.outcomes.iter().enumerate() {
+        if outcome.index != position {
+            return Err(malformed(format!(
+                "outcome at position {position} reported index {}",
+                outcome.index
+            )));
+        }
+        match &outcome.status {
+            RowWriteStatus::Accepted => accepted += 1,
+            RowWriteStatus::Rejected(rejection) => {
+                rejected += 1;
+                if let Some(cause_index) = rejection.cause_index {
+                    if cause_index >= expected_rows {
+                        return Err(malformed(format!(
+                            "rejection at index {position} reported out-of-range cause index {cause_index}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(malformed(format!(
+                    "outcome at position {position} used an unsupported status"
+                )));
+            }
+        }
+    }
+
+    if result.accepted != accepted || result.rejected != rejected {
+        return Err(malformed(format!(
+            "reported counts accepted={} rejected={} do not match outcomes accepted={accepted} rejected={rejected}",
+            result.accepted, result.rejected
+        )));
+    }
+    if result.acknowledgement.is_some() != (accepted > 0) {
+        return Err(malformed(format!(
+            "acknowledgement presence does not match accepted count {accepted}"
+        )));
+    }
+    if mode == WriteMode::Atomic && accepted > 0 && rejected > 0 {
+        return Err(malformed(format!(
+            "atomic result mixed {accepted} accepted and {rejected} rejected rows"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct TenantScopedStorage {
     inner: Arc<dyn Storage>,
@@ -1615,6 +1689,122 @@ impl Storage for TenantScopedStorage {
         let scoped = scope_rows_for_tenant(rows.to_vec(), &self.tenant_id)
             .map_err(TsinkError::InvalidLabel)?;
         self.inner.insert_rows(&scoped)
+    }
+
+    fn write_batch(&self, rows: &[Row], mode: WriteMode) -> TsinkResult<BatchWriteResult> {
+        validate_tenant_id(&self.tenant_id).map_err(TsinkError::InvalidLabel)?;
+
+        let reserved_label_message =
+            || format!("label '{TENANT_LABEL}' is reserved for server-managed tenant isolation");
+        let reserved_label_indices = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.labels()
+                    .iter()
+                    .any(|label| label.name == TENANT_LABEL)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        match mode {
+            WriteMode::Atomic if !reserved_label_indices.is_empty() => {
+                let cause_index = reserved_label_indices[0];
+                let rejection = WriteRejection::new(
+                    WriteRejectionCategory::InvalidLabels,
+                    Some(cause_index),
+                    reserved_label_message(),
+                );
+                Ok(BatchWriteResult::from_outcomes(
+                    None,
+                    (0..rows.len())
+                        .map(|index| RowWriteOutcome::rejected(index, rejection.clone()))
+                        .collect(),
+                ))
+            }
+            WriteMode::BestEffort if !reserved_label_indices.is_empty() => {
+                let mut forwarded_indices =
+                    Vec::with_capacity(rows.len().saturating_sub(reserved_label_indices.len()));
+                let mut forwarded_rows = Vec::with_capacity(forwarded_indices.capacity());
+                let mut outcomes = vec![None; rows.len()];
+
+                for (index, row) in rows.iter().enumerate() {
+                    if row.labels().iter().any(|label| label.name == TENANT_LABEL) {
+                        outcomes[index] = Some(RowWriteOutcome::rejected(
+                            index,
+                            WriteRejection::new(
+                                WriteRejectionCategory::InvalidLabels,
+                                Some(index),
+                                reserved_label_message(),
+                            ),
+                        ));
+                    } else {
+                        forwarded_indices.push(index);
+                        forwarded_rows.push(row.clone());
+                    }
+                }
+
+                let acknowledgement = if forwarded_rows.is_empty() {
+                    None
+                } else {
+                    let scoped = scope_rows_for_tenant(forwarded_rows, &self.tenant_id)
+                        .map_err(TsinkError::InvalidLabel)?;
+                    let inner = self.inner.write_batch(&scoped, mode)?;
+                    validate_inner_write_batch_result(scoped.len(), mode, &inner)?;
+
+                    for mut outcome in inner.outcomes {
+                        let forwarded_index = outcome.index;
+                        let original_index = forwarded_indices.get(forwarded_index).copied().ok_or_else(
+                            || {
+                                TsinkError::Other(format!(
+                                    "tenant-scoped batch received invalid inner outcome index {forwarded_index} for {} forwarded rows",
+                                    forwarded_indices.len()
+                                ))
+                            },
+                        )?;
+                        outcome.index = original_index;
+                        if let RowWriteStatus::Rejected(rejection) = &mut outcome.status {
+                            if let Some(cause_index) = rejection.cause_index {
+                                rejection.cause_index = Some(
+                                    forwarded_indices.get(cause_index).copied().ok_or_else(|| {
+                                        TsinkError::Other(format!(
+                                            "tenant-scoped batch received invalid inner cause index {cause_index} for {} forwarded rows",
+                                            forwarded_indices.len()
+                                        ))
+                                    })?,
+                                );
+                            }
+                        }
+                        if outcomes[original_index].replace(outcome).is_some() {
+                            return Err(TsinkError::Other(format!(
+                                "tenant-scoped batch received duplicate inner outcome for original row {original_index}"
+                            )));
+                        }
+                    }
+                    inner.acknowledgement
+                };
+
+                let outcomes = outcomes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, outcome)| {
+                        outcome.ok_or_else(|| {
+                            TsinkError::Other(format!(
+                                "tenant-scoped batch received no inner outcome for original row {index}"
+                            ))
+                        })
+                    })
+                    .collect::<TsinkResult<Vec<_>>>()?;
+                Ok(BatchWriteResult::from_outcomes(acknowledgement, outcomes))
+            }
+            _ => {
+                let scoped = scope_rows_for_tenant(rows.to_vec(), &self.tenant_id)
+                    .map_err(TsinkError::InvalidLabel)?;
+                let result = self.inner.write_batch(&scoped, mode)?;
+                validate_inner_write_batch_result(scoped.len(), mode, &result)?;
+                Ok(result)
+            }
+        }
     }
 
     fn select(
@@ -1728,6 +1918,10 @@ impl Storage for TenantScopedStorage {
         self.inner.memory_budget()
     }
 
+    fn effective_storage_limits(&self) -> EffectiveStorageLimits {
+        self.inner.effective_storage_limits()
+    }
+
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
         self.inner.observability_snapshot()
     }
@@ -1761,13 +1955,91 @@ mod tests {
     };
     use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
     use std::collections::HashMap;
-    use tsink::{StorageBuilder, TimestampPrecision};
+    use tsink::{StorageBuilder, TimestampPrecision, WriteAcknowledgement};
 
     fn make_storage() -> Arc<dyn Storage> {
         StorageBuilder::new()
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    struct FixedBatchResultStorage {
+        result: BatchWriteResult,
+    }
+
+    impl Storage for FixedBatchResultStorage {
+        fn insert_rows(&self, _rows: &[Row]) -> TsinkResult<()> {
+            Ok(())
+        }
+
+        fn write_batch(&self, _rows: &[Row], _mode: WriteMode) -> TsinkResult<BatchWriteResult> {
+            Ok(self.result.clone())
+        }
+
+        fn select(
+            &self,
+            _metric: &str,
+            _labels: &[Label],
+            _start: i64,
+            _end: i64,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn select_with_options(
+            &self,
+            _metric: &str,
+            _opts: QueryOptions,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            Ok(Vec::new())
+        }
+
+        fn select_all(
+            &self,
+            _metric: &str,
+            _start: i64,
+            _end: i64,
+        ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            Ok(Vec::new())
+        }
+
+        fn close(&self) -> TsinkResult<()> {
+            Ok(())
+        }
+    }
+
+    fn fixed_batch_storage(result: BatchWriteResult) -> Arc<dyn Storage> {
+        Arc::new(FixedBatchResultStorage { result })
+    }
+
+    fn accepted_batch_result(rows: usize) -> BatchWriteResult {
+        BatchWriteResult::from_outcomes(
+            Some(WriteAcknowledgement::Volatile),
+            (0..rows).map(RowWriteOutcome::accepted).collect(),
+        )
+    }
+
+    fn test_rejection(cause_index: Option<usize>) -> WriteRejection {
+        WriteRejection::new(
+            WriteRejectionCategory::Internal,
+            cause_index,
+            "mock rejection",
+        )
+    }
+
+    fn assert_malformed_batch_result(err: TsinkError, expected_detail: &str) {
+        let TsinkError::Other(message) = err else {
+            panic!("malformed backend result should use the outer error channel: {err}");
+        };
+        assert!(
+            message.contains("malformed canonical batch result"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(expected_detail),
+            "expected {expected_detail:?} in error: {message}"
+        );
     }
 
     fn managed_actor() -> ManagedControlPlaneActor {
@@ -2155,6 +2427,207 @@ mod tests {
             )])
             .expect_err("reserved label should be rejected");
         assert!(matches!(err, TsinkError::InvalidLabel(message) if message.contains(TENANT_LABEL)));
+    }
+
+    #[test]
+    fn scoped_storage_best_effort_batch_preserves_original_rejection_indices() {
+        let storage = scoped_storage(make_storage(), "tenant-a");
+        let result = storage
+            .write_batch(
+                &[
+                    Row::new("valid_before", DataPoint::new(1, 1_i64)),
+                    Row::with_labels(
+                        "reserved_label",
+                        vec![Label::new(TENANT_LABEL, "caller-supplied")],
+                        DataPoint::new(2, 2_i64),
+                    ),
+                    Row::new("", DataPoint::new(3, 3_i64)),
+                    Row::new("valid_after", DataPoint::new(4, 4_i64)),
+                ],
+                WriteMode::BestEffort,
+            )
+            .expect("best-effort tenant batch should report indexed outcomes");
+
+        assert_eq!(result.submitted, 4);
+        assert_eq!(result.accepted, 2);
+        assert_eq!(result.rejected, 2);
+        assert_eq!(result.acknowledgement, Some(WriteAcknowledgement::Volatile));
+        assert_eq!(
+            result
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(result.outcomes[0].status, RowWriteStatus::Accepted);
+        let RowWriteStatus::Rejected(reserved) = &result.outcomes[1].status else {
+            panic!("caller-supplied tenant label should be rejected");
+        };
+        assert_eq!(reserved.category, WriteRejectionCategory::InvalidLabels);
+        assert_eq!(reserved.cause_index, Some(1));
+        let RowWriteStatus::Rejected(invalid_metric) = &result.outcomes[2].status else {
+            panic!("invalid metric should be rejected");
+        };
+        assert_eq!(
+            invalid_metric.category,
+            WriteRejectionCategory::InvalidMetric
+        );
+        assert_eq!(invalid_metric.cause_index, Some(2));
+        assert_eq!(result.outcomes[3].status, RowWriteStatus::Accepted);
+
+        let series = storage
+            .list_metrics()
+            .expect("accepted tenant rows should be visible");
+        assert_eq!(
+            series
+                .iter()
+                .map(|series| series.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["valid_after", "valid_before"])
+        );
+    }
+
+    #[test]
+    fn scoped_storage_rejects_malformed_filtered_best_effort_results_before_remapping() {
+        let valid = accepted_batch_result(2);
+
+        let mut invalid_submitted = valid.clone();
+        invalid_submitted.submitted = 3;
+
+        let mut missing = valid.clone();
+        missing.outcomes.pop();
+
+        let mut duplicate = valid.clone();
+        duplicate.outcomes[1].index = 0;
+
+        let mut out_of_range = valid.clone();
+        out_of_range.outcomes[1].index = 2;
+
+        let mut invalid_counts = valid.clone();
+        invalid_counts.accepted = 1;
+        invalid_counts.rejected = 1;
+
+        let mut missing_acknowledgement = valid.clone();
+        missing_acknowledgement.acknowledgement = None;
+
+        let mut acknowledgement_without_acceptance = BatchWriteResult::from_outcomes(
+            None,
+            vec![
+                RowWriteOutcome::rejected(0, test_rejection(Some(0))),
+                RowWriteOutcome::rejected(1, test_rejection(Some(1))),
+            ],
+        );
+        acknowledgement_without_acceptance.acknowledgement = Some(WriteAcknowledgement::Volatile);
+
+        let invalid_cause_index = BatchWriteResult::from_outcomes(
+            None,
+            vec![
+                RowWriteOutcome::rejected(0, test_rejection(Some(2))),
+                RowWriteOutcome::rejected(1, test_rejection(Some(1))),
+            ],
+        );
+
+        let malformed_results = [
+            (invalid_submitted, "submitted count 3"),
+            (missing, "outcome count 1"),
+            (duplicate, "position 1 reported index 0"),
+            (out_of_range, "position 1 reported index 2"),
+            (invalid_counts, "reported counts accepted=1 rejected=1"),
+            (
+                missing_acknowledgement,
+                "acknowledgement presence does not match accepted count 2",
+            ),
+            (
+                acknowledgement_without_acceptance,
+                "acknowledgement presence does not match accepted count 0",
+            ),
+            (invalid_cause_index, "out-of-range cause index 2"),
+        ];
+        let rows = [
+            Row::new("valid_before", DataPoint::new(1, 1_i64)),
+            Row::with_labels(
+                "reserved_label",
+                vec![Label::new(TENANT_LABEL, "caller-supplied")],
+                DataPoint::new(2, 2_i64),
+            ),
+            Row::new("valid_after", DataPoint::new(3, 3_i64)),
+        ];
+
+        for (result, expected_detail) in malformed_results {
+            let storage = scoped_storage(fixed_batch_storage(result), "tenant-a");
+            let err = storage
+                .write_batch(&rows, WriteMode::BestEffort)
+                .expect_err("malformed inner outcomes must not be remapped or normalized");
+            assert_malformed_batch_result(err, expected_detail);
+        }
+    }
+
+    #[test]
+    fn scoped_storage_validates_pass_through_results_for_each_write_mode() {
+        let mixed_atomic = BatchWriteResult::from_outcomes(
+            Some(WriteAcknowledgement::Volatile),
+            vec![
+                RowWriteOutcome::accepted(0),
+                RowWriteOutcome::rejected(1, test_rejection(Some(1))),
+            ],
+        );
+        let atomic = scoped_storage(fixed_batch_storage(mixed_atomic), "tenant-a");
+        let rows = [
+            Row::new("first", DataPoint::new(1, 1_i64)),
+            Row::new("second", DataPoint::new(2, 2_i64)),
+        ];
+        let err = atomic
+            .write_batch(&rows, WriteMode::Atomic)
+            .expect_err("atomic backends must not report mixed outcomes");
+        assert_malformed_batch_result(err, "atomic result mixed 1 accepted and 1 rejected rows");
+
+        let mut missing_acknowledgement = accepted_batch_result(2);
+        missing_acknowledgement.acknowledgement = None;
+        let best_effort = scoped_storage(fixed_batch_storage(missing_acknowledgement), "tenant-a");
+        let err = best_effort
+            .write_batch(&rows, WriteMode::BestEffort)
+            .expect_err("best-effort pass-through results must retain canonical acknowledgements");
+        assert_malformed_batch_result(
+            err,
+            "acknowledgement presence does not match accepted count 2",
+        );
+    }
+
+    #[test]
+    fn scoped_storage_atomic_batch_rejects_all_rows_for_reserved_tenant_label() {
+        let storage = scoped_storage(make_storage(), "tenant-a");
+        let result = storage
+            .write_batch(
+                &[
+                    Row::new("valid_before", DataPoint::new(1, 1_i64)),
+                    Row::with_labels(
+                        "reserved_label",
+                        vec![Label::new(TENANT_LABEL, "caller-supplied")],
+                        DataPoint::new(2, 2_i64),
+                    ),
+                    Row::new("valid_after", DataPoint::new(3, 3_i64)),
+                ],
+                WriteMode::Atomic,
+            )
+            .expect("reserved label should be an atomic canonical rejection");
+
+        assert_eq!(result.submitted, 3);
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 3);
+        assert_eq!(result.acknowledgement, None);
+        for (index, outcome) in result.outcomes.iter().enumerate() {
+            assert_eq!(outcome.index, index);
+            let RowWriteStatus::Rejected(rejection) = &outcome.status else {
+                panic!("atomic policy rejection should reject every row");
+            };
+            assert_eq!(rejection.category, WriteRejectionCategory::InvalidLabels);
+            assert_eq!(rejection.cause_index, Some(1));
+        }
+        assert!(storage
+            .list_metrics()
+            .expect("atomic rejection should leave metadata unchanged")
+            .is_empty());
     }
 
     #[test]

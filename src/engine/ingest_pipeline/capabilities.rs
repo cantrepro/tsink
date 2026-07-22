@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -31,6 +31,14 @@ fn collect_pending_series_lanes(points: &[PendingPoint]) -> Result<BTreeMap<Seri
     }
 
     Ok(series_lanes)
+}
+
+struct StagedShardIngest {
+    active_states: BTreeMap<SeriesId, ActiveSeriesState>,
+    finalized: Vec<(SeriesId, Chunk)>,
+    materialized_series_ids: BTreeSet<SeriesId>,
+    observed_series_timestamps: Vec<(SeriesId, i64)>,
+    active_delta: MemoryDeltaBytes,
 }
 
 impl<'a> WriteSeriesValidationContext<'a> {
@@ -341,81 +349,128 @@ impl<'a> WriteApplyShardMutationContext<'a> {
             points_by_shard[shard_idx].push(point);
         }
 
+        // Keep every affected active shard locked while fallible chunk rotations are staged.
+        // This gives the staged copies a stable base and prevents any live mutation until all
+        // shards have completed validation and encoding successfully.
+        let mut shard_guards = Vec::new();
         for (shard_idx, shard_points) in points_by_shard.into_iter().enumerate() {
             if shard_points.is_empty() {
                 continue;
             }
-            self.ingest_pending_points_for_shard(memory, publication, shard_idx, shard_points)?;
+            shard_guards.push((
+                shard_idx,
+                shard_points,
+                self.chunks.active_builders[shard_idx].write(),
+            ));
         }
 
-        Ok(())
-    }
-
-    fn ingest_pending_points_for_shard(
-        self,
-        memory: WriteApplyMemoryAccountingContext<'a>,
-        publication: WriteApplyPublicationContext<'a>,
-        shard_idx: usize,
-        shard_points: Vec<PendingPoint>,
-    ) -> Result<()> {
-        if shard_points.is_empty() {
-            return Ok(());
+        let mut staged_shards = Vec::with_capacity(shard_guards.len());
+        for (_, shard_points, active) in &mut shard_guards {
+            staged_shards.push(self.stage_pending_points_for_shard(
+                memory,
+                active,
+                std::mem::take(shard_points),
+            )?);
         }
 
-        let mut finalized = Vec::<(SeriesId, Chunk)>::new();
+        // Timestamp bounds are infallible atomic updates. Record them only after every staged
+        // shard is known to be valid, but before the corresponding points become visible.
+        for staged in &staged_shards {
+            for (_, ts) in &staged.observed_series_timestamps {
+                self.timestamps.record_ingested_timestamp(*ts);
+            }
+        }
+
         let mut materialized_series_ids = BTreeSet::new();
-        let mut observed_series_timestamps =
-            Vec::<(SeriesId, i64)>::with_capacity(shard_points.len());
-        let mut active_delta = MemoryDeltaBytes::default();
-        {
-            let mut active = self.chunks.active_builders[shard_idx].write();
+        let mut observed_series_timestamps = Vec::new();
+        for ((shard_idx, _, active), staged) in shard_guards.iter_mut().zip(staged_shards) {
+            let StagedShardIngest {
+                active_states,
+                finalized,
+                materialized_series_ids: staged_materialized,
+                observed_series_timestamps: staged_timestamps,
+                active_delta,
+            } = staged;
 
-            for point in shard_points {
-                let state_bytes_before = active
-                    .get(&point.series_id)
-                    .map(|state| memory.active_state_bytes(state))
-                    .unwrap_or(0);
-                let state = active.entry(point.series_id).or_insert_with(|| {
-                    ActiveSeriesState::new(point.series_id, point.lane, self.chunk_point_cap)
-                });
-
-                if state.lane != point.lane {
-                    return Err(TsinkError::ValueTypeMismatch {
-                        expected: lane_name(state.lane).to_string(),
-                        actual: lane_name(point.lane).to_string(),
-                    });
-                }
-                materialized_series_ids.insert(point.series_id);
-                observed_series_timestamps.push((point.series_id, point.ts));
-
-                if let Some(chunk) = state.rotate_partition_if_needed(
-                    point.ts,
-                    self.partition_window,
-                    self.max_active_partition_heads_per_series,
-                )? {
-                    finalized.push((point.series_id, chunk));
-                }
-
-                state.append_point(point.ts, point.value, point.wal_highwater);
-                self.timestamps.record_ingested_timestamp(point.ts);
-
-                if let Some(chunk) = state.rotate_full_if_needed()? {
-                    finalized.push((point.series_id, chunk));
-                }
-
-                active_delta.record_change(state_bytes_before, memory.active_state_bytes(state));
+            for (series_id, state) in active_states {
+                active.insert(series_id, state);
             }
 
-            // Keep the active shard locked until finalized chunks are visible in sealed
-            // storage so readers never observe a committed handoff gap.
-            publication.publish_finalized_chunks(shard_idx, finalized);
+            // Keep every active shard locked until all finalized chunks are visible in sealed
+            // storage so readers cannot observe either a handoff gap or a partially committed
+            // multi-shard batch.
+            publication.publish_finalized_chunks(*shard_idx, finalized);
+            memory.account_shard_delta(*shard_idx, active_delta);
+            materialized_series_ids.extend(staged_materialized);
+            observed_series_timestamps.extend(staged_timestamps);
         }
-        memory.account_shard_delta(shard_idx, active_delta);
+        drop(shard_guards);
 
         self.timestamps
             .note_series_timestamps(observed_series_timestamps);
         publication.publish_materialized_series_ids(materialized_series_ids);
         Ok(())
+    }
+
+    fn stage_pending_points_for_shard(
+        self,
+        memory: WriteApplyMemoryAccountingContext<'a>,
+        active: &HashMap<SeriesId, ActiveSeriesState>,
+        shard_points: Vec<PendingPoint>,
+    ) -> Result<StagedShardIngest> {
+        let mut active_states = BTreeMap::<SeriesId, ActiveSeriesState>::new();
+        let mut finalized = Vec::<(SeriesId, Chunk)>::new();
+        let mut materialized_series_ids = BTreeSet::new();
+        let mut observed_series_timestamps =
+            Vec::<(SeriesId, i64)>::with_capacity(shard_points.len());
+
+        for point in shard_points {
+            let state = active_states.entry(point.series_id).or_insert_with(|| {
+                active.get(&point.series_id).cloned().unwrap_or_else(|| {
+                    ActiveSeriesState::new(point.series_id, point.lane, self.chunk_point_cap)
+                })
+            });
+
+            if state.lane != point.lane {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: lane_name(state.lane).to_string(),
+                    actual: lane_name(point.lane).to_string(),
+                });
+            }
+            materialized_series_ids.insert(point.series_id);
+            observed_series_timestamps.push((point.series_id, point.ts));
+
+            if let Some(chunk) = state.rotate_partition_if_needed(
+                point.ts,
+                self.partition_window,
+                self.max_active_partition_heads_per_series,
+            )? {
+                finalized.push((point.series_id, chunk));
+            }
+
+            state.append_point(point.ts, point.value, point.wal_highwater);
+
+            if let Some(chunk) = state.rotate_full_if_needed()? {
+                finalized.push((point.series_id, chunk));
+            }
+        }
+
+        let mut active_delta = MemoryDeltaBytes::default();
+        for (series_id, state) in &active_states {
+            let state_bytes_before = active
+                .get(series_id)
+                .map(|state| memory.active_state_bytes(state))
+                .unwrap_or(0);
+            active_delta.record_change(state_bytes_before, memory.active_state_bytes(state));
+        }
+
+        Ok(StagedShardIngest {
+            active_states,
+            finalized,
+            materialized_series_ids,
+            observed_series_timestamps,
+            active_delta,
+        })
     }
 }
 
@@ -509,7 +564,9 @@ impl<'a> WriteCommitStageContext<'a> {
 
         self.synchronize_series_lanes_before_wal_stage(points)?;
 
-        let mut wal_write = match wal.begin_logical_write(prepared_wal.encoded_bytes) {
+        let mut wal_write = match wal
+            .begin_limited_logical_write(prepared_wal.encoded_bytes, self.wal_size_limit_bytes)
+        {
             Ok(wal_write) => wal_write,
             Err(err) => {
                 self.wal_metrics.record_append_error();

@@ -18,6 +18,7 @@ const DEFAULT_DEDUPE_MAX_ENTRIES: usize = 250_000;
 const DEFAULT_DEDUPE_MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_DEDUPE_CLEANUP_INTERVAL_SECS: u64 = 30;
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 160;
+const MAX_PERSISTENCE_ERROR_DETAIL_BYTES: usize = 256;
 
 static CLUSTER_DEDUPE_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_DEDUPE_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -80,11 +81,117 @@ impl DedupeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DedupeBeginOutcome {
-    Accepted,
-    Duplicate,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "response_type", rename_all = "snake_case")]
+pub enum DedupeCompletion {
+    IngestRows {
+        inserted_rows: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_result: Option<tsink::BatchWriteResult>,
+    },
+    IngestWrite {
+        inserted_rows: usize,
+        accepted_metadata_updates: usize,
+        accepted_exemplars: usize,
+        dropped_exemplars: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acknowledgement: Option<tsink::WriteAcknowledgement>,
+    },
+}
+
+#[derive(Debug)]
+pub enum DedupeBeginOutcome<'a> {
+    Accepted(DedupeReservation<'a>),
+    Duplicate {
+        completion: Option<DedupeCompletion>,
+    },
     InFlight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupePersistenceStage {
+    Encode,
+    Append,
+    Flush,
+    Sync,
+    Compact,
+}
+
+impl DedupePersistenceStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Encode => "record encoding",
+            Self::Append => "record append",
+            Self::Flush => "log flush",
+            Self::Sync => "log fsync",
+            Self::Compact => "log compaction",
+        }
+    }
+}
+
+/// A bounded error identifying the durability stage that failed.
+///
+/// The underlying diagnostic is retained for local logs, but `Display` intentionally exposes only
+/// a fixed-size message suitable for an internal RPC response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupePersistenceError {
+    stage: DedupePersistenceStage,
+    detail: String,
+}
+
+impl DedupePersistenceError {
+    fn new(stage: DedupePersistenceStage, detail: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            detail: truncate_error_detail(&detail.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage(&self) -> DedupePersistenceStage {
+        self.stage
+    }
+}
+
+impl std::fmt::Display for DedupePersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cluster dedupe completion marker persistence failed during {}",
+            self.stage.as_str()
+        )
+    }
+}
+
+impl std::error::Error for DedupePersistenceError {}
+
+/// An accepted dedupe reservation that is automatically aborted unless committed.
+///
+/// This keeps request handlers exception-safe across every early return after `begin`: dropping
+/// the reservation releases the key so a retry cannot remain permanently stuck as in-flight.
+#[derive(Debug)]
+pub struct DedupeReservation<'a> {
+    store: &'a DedupeWindowStore,
+    key: String,
+    active: bool,
+}
+
+impl DedupeReservation<'_> {
+    pub fn commit(mut self, completion: DedupeCompletion) -> Result<(), DedupePersistenceError> {
+        let result = self.store.commit_with_result(&self.key, completion);
+        // Even on a persistence failure the completion remains in memory so an immediate retry
+        // receives the exact result instead of applying the already-committed write again.
+        self.active = false;
+        result
+    }
+}
+
+impl Drop for DedupeReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.store.abort(&self.key);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,18 +239,29 @@ pub struct DedupeWindowStore {
 
 #[derive(Debug)]
 struct DedupeState {
-    entries: HashMap<String, u64>,
+    entries: HashMap<String, DedupeEntry>,
     entries_by_expiry: BTreeMap<u64, BTreeSet<String>>,
     in_flight: HashSet<String>,
     file: File,
     log_bytes: u64,
     next_cleanup_unix_secs: u64,
+    persistence_error: Option<DedupePersistenceError>,
+    #[cfg(test)]
+    append_fault: Option<DedupePersistenceStage>,
+}
+
+#[derive(Debug, Clone)]
+struct DedupeEntry {
+    expires_at_unix_secs: u64,
+    completion: Option<DedupeCompletion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DedupeRecord {
     key: String,
     expires_at_unix_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion: Option<DedupeCompletion>,
 }
 
 impl DedupeWindowStore {
@@ -197,6 +315,9 @@ impl DedupeWindowStore {
             file,
             log_bytes,
             next_cleanup_unix_secs: now.saturating_add(config.cleanup_interval_secs),
+            persistence_error: None,
+            #[cfg(test)]
+            append_fault: None,
         };
 
         let store = Self {
@@ -211,12 +332,15 @@ impl DedupeWindowStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             update_gauges(&state);
+            if let Some(err) = state.persistence_error.clone() {
+                return Err(format!("failed to initialize cluster dedupe store: {err}"));
+            }
         }
 
         Ok(store)
     }
 
-    pub fn begin(&self, key: &str) -> Result<DedupeBeginOutcome, String> {
+    pub fn begin(&self, key: &str) -> Result<DedupeBeginOutcome<'_>, String> {
         validate_idempotency_key(key)?;
         CLUSTER_DEDUPE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
@@ -227,14 +351,23 @@ impl DedupeWindowStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         self.maybe_cleanup_locked(&mut state, now, false);
-        if let Some(expires_at) = state.entries.get(key).copied() {
-            if expires_at > now {
+        if let Some(entry) = state.entries.get(key).cloned() {
+            if entry.expires_at_unix_secs > now {
                 CLUSTER_DEDUPE_DUPLICATES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 update_gauges(&state);
-                return Ok(DedupeBeginOutcome::Duplicate);
+                return Ok(DedupeBeginOutcome::Duplicate {
+                    completion: entry.completion,
+                });
             }
-            remove_entry_locked(&mut state, key, expires_at);
+            remove_entry_locked(&mut state, key, entry.expires_at_unix_secs);
             CLUSTER_DEDUPE_EXPIRED_KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Exact results already held in memory remain replayable after a persistence failure, but
+        // accepting a new key would create a result that cannot be made restart-safe.
+        if let Some(err) = &state.persistence_error {
+            update_gauges(&state);
+            return Err(err.to_string());
         }
 
         if state.in_flight.contains(key) {
@@ -246,10 +379,27 @@ impl DedupeWindowStore {
         state.in_flight.insert(key.to_string());
         CLUSTER_DEDUPE_ACCEPTED_TOTAL.fetch_add(1, Ordering::Relaxed);
         update_gauges(&state);
-        Ok(DedupeBeginOutcome::Accepted)
+        drop(state);
+        Ok(DedupeBeginOutcome::Accepted(DedupeReservation {
+            store: self,
+            key: key.to_string(),
+            active: true,
+        }))
     }
 
-    pub fn commit(&self, key: &str) {
+    fn commit_with_result(
+        &self,
+        key: &str,
+        completion: DedupeCompletion,
+    ) -> Result<(), DedupePersistenceError> {
+        self.commit_locked(key, Some(completion))
+    }
+
+    fn commit_locked(
+        &self,
+        key: &str,
+        completion: Option<DedupeCompletion>,
+    ) -> Result<(), DedupePersistenceError> {
         let now = unix_timestamp_secs();
         let expires_at = now.saturating_add(self.config.window_secs);
 
@@ -259,22 +409,39 @@ impl DedupeWindowStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight.remove(key);
 
-        insert_entry_locked(&mut state, key.to_string(), expires_at);
-        while state.entries.len() > self.config.max_entries {
+        // Make room before publishing the just-completed key so capacity eviction cannot
+        // immediately discard the result required for a safe retry of this request.
+        while state.entries.len() >= self.config.max_entries {
             if !evict_oldest_entry_locked(&mut state) {
                 break;
             }
             CLUSTER_DEDUPE_EVICTED_KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
+        insert_entry_locked(&mut state, key.to_string(), expires_at, completion.clone());
 
-        if let Err(err) = append_record_locked(&mut state, key, expires_at) {
+        if let Some(err) = state.persistence_error.clone() {
+            update_gauges(&state);
+            return Err(err);
+        }
+
+        if let Err(err) = append_record_locked(&mut state, key, expires_at, completion) {
             CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            eprintln!("cluster dedupe append failed: {err}");
+            eprintln!(
+                "cluster dedupe append failed: {err}; detail: {}",
+                err.detail
+            );
+            state.persistence_error = Some(err.clone());
+            update_gauges(&state);
+            return Err(err);
         }
 
         CLUSTER_DEDUPE_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
         self.maybe_cleanup_locked(&mut state, now, false);
         update_gauges(&state);
+        if let Some(err) = state.persistence_error.clone() {
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn abort(&self, key: &str) {
@@ -308,6 +475,21 @@ impl DedupeWindowStore {
         &self.path
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_at(&self, stage: DedupePersistenceStage) {
+        assert!(matches!(
+            stage,
+            DedupePersistenceStage::Append
+                | DedupePersistenceStage::Flush
+                | DedupePersistenceStage::Sync
+        ));
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.append_fault = Some(stage);
+    }
+
     fn run_cleanup_cycle(&self, now: u64, force_compact: bool) {
         let mut state = self
             .state
@@ -338,6 +520,10 @@ impl DedupeWindowStore {
             if let Err(err) = compact_locked(&self.path, state) {
                 CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 eprintln!("cluster dedupe compaction failed: {err}");
+                state.persistence_error = Some(DedupePersistenceError::new(
+                    DedupePersistenceStage::Compact,
+                    err,
+                ));
             }
         }
 
@@ -371,7 +557,7 @@ pub fn validate_idempotency_key(value: &str) -> Result<(), String> {
 fn load_existing_records(
     path: &Path,
     now: u64,
-    entries: &mut HashMap<String, u64>,
+    entries: &mut HashMap<String, DedupeEntry>,
     entries_by_expiry: &mut BTreeMap<u64, BTreeSet<String>>,
 ) -> Result<(), String> {
     let file = File::open(path).map_err(|err| {
@@ -380,52 +566,92 @@ fn load_existing_records(
             path.display()
         )
     })?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line =
-            line.map_err(|err| format!("failed to read cluster dedupe marker log line: {err}"))?;
-        if line.trim().is_empty() {
-            continue;
+    let mut reader = BufReader::new(file);
+    let mut encoded_line = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        encoded_line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut encoded_line).map_err(|err| {
+            format!(
+                "failed to read cluster dedupe marker log at line {}: {err}",
+                line_number.saturating_add(1)
+            )
+        })?;
+        if bytes_read == 0 {
+            break;
         }
-        let parsed = match serde_json::from_str::<DedupeRecord>(&line) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
+        line_number = line_number.saturating_add(1);
+        if encoded_line.last() != Some(&b'\n') {
+            return Err(malformed_record_error(line_number, "incomplete record"));
+        }
+        encoded_line.pop();
+        if encoded_line.iter().all(u8::is_ascii_whitespace) {
+            return Err(malformed_record_error(line_number, "empty record"));
+        }
+        let parsed = serde_json::from_slice::<DedupeRecord>(&encoded_line)
+            .map_err(|_| malformed_record_error(line_number, "invalid JSON record"))?;
         if parsed.expires_at_unix_secs <= now {
             continue;
         }
         if validate_idempotency_key(&parsed.key).is_err() {
-            CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            continue;
+            return Err(malformed_record_error(
+                line_number,
+                "invalid idempotency key",
+            ));
         }
         insert_loaded_entry(
             entries,
             entries_by_expiry,
             parsed.key,
             parsed.expires_at_unix_secs,
+            parsed.completion,
         );
     }
     Ok(())
 }
 
+fn malformed_record_error(line_number: usize, reason: &str) -> String {
+    CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    format!("malformed cluster dedupe marker log record at line {line_number}: {reason}")
+}
+
 fn insert_loaded_entry(
-    entries: &mut HashMap<String, u64>,
+    entries: &mut HashMap<String, DedupeEntry>,
     entries_by_expiry: &mut BTreeMap<u64, BTreeSet<String>>,
     key: String,
     expires_at: u64,
+    completion: Option<DedupeCompletion>,
 ) {
-    if let Some(previous_expiry) = entries.insert(key.clone(), expires_at) {
-        remove_key_from_expiry_index(entries_by_expiry, &key, previous_expiry);
+    if let Some(previous) = entries.insert(
+        key.clone(),
+        DedupeEntry {
+            expires_at_unix_secs: expires_at,
+            completion,
+        },
+    ) {
+        remove_key_from_expiry_index(entries_by_expiry, &key, previous.expires_at_unix_secs);
     }
     entries_by_expiry.entry(expires_at).or_default().insert(key);
 }
 
-fn insert_entry_locked(state: &mut DedupeState, key: String, expires_at: u64) {
-    if let Some(previous_expiry) = state.entries.insert(key.clone(), expires_at) {
-        remove_key_from_expiry_index(&mut state.entries_by_expiry, &key, previous_expiry);
+fn insert_entry_locked(
+    state: &mut DedupeState,
+    key: String,
+    expires_at: u64,
+    completion: Option<DedupeCompletion>,
+) {
+    if let Some(previous) = state.entries.insert(
+        key.clone(),
+        DedupeEntry {
+            expires_at_unix_secs: expires_at,
+            completion,
+        },
+    ) {
+        remove_key_from_expiry_index(
+            &mut state.entries_by_expiry,
+            &key,
+            previous.expires_at_unix_secs,
+        );
     }
     state
         .entries_by_expiry
@@ -489,27 +715,57 @@ fn evict_oldest_entry_locked(state: &mut DedupeState) -> bool {
     true
 }
 
-fn append_record_locked(state: &mut DedupeState, key: &str, expires_at: u64) -> Result<(), String> {
+fn append_record_locked(
+    state: &mut DedupeState,
+    key: &str,
+    expires_at: u64,
+    completion: Option<DedupeCompletion>,
+) -> Result<(), DedupePersistenceError> {
     let record = DedupeRecord {
         key: key.to_string(),
         expires_at_unix_secs: expires_at,
+        completion,
     };
     let mut encoded = serde_json::to_vec(&record)
-        .map_err(|err| format!("failed to serialize dedupe marker record: {err}"))?;
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Encode, err))?;
     encoded.push(b'\n');
 
+    #[cfg(test)]
+    if state.append_fault == Some(DedupePersistenceStage::Append) {
+        state.append_fault = None;
+        return Err(DedupePersistenceError::new(
+            DedupePersistenceStage::Append,
+            "injected append failure",
+        ));
+    }
     state
         .file
         .write_all(&encoded)
-        .map_err(|err| format!("failed to append dedupe marker record: {err}"))?;
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Append, err))?;
+    #[cfg(test)]
+    if state.append_fault == Some(DedupePersistenceStage::Flush) {
+        state.append_fault = None;
+        return Err(DedupePersistenceError::new(
+            DedupePersistenceStage::Flush,
+            "injected flush failure",
+        ));
+    }
     state
         .file
         .flush()
-        .map_err(|err| format!("failed to flush dedupe marker log: {err}"))?;
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Flush, err))?;
+    #[cfg(test)]
+    if state.append_fault == Some(DedupePersistenceStage::Sync) {
+        state.append_fault = None;
+        return Err(DedupePersistenceError::new(
+            DedupePersistenceStage::Sync,
+            "injected fsync failure",
+        ));
+    }
     state
         .file
         .sync_data()
-        .map_err(|err| format!("failed to fsync dedupe marker log: {err}"))?;
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Sync, err))?;
     state.log_bytes = state.log_bytes.saturating_add(encoded.len() as u64);
     Ok(())
 }
@@ -533,6 +789,10 @@ fn compact_locked(path: &Path, state: &mut DedupeState) -> Result<(), String> {
                 let record = DedupeRecord {
                     key: key.clone(),
                     expires_at_unix_secs: *expires_at,
+                    completion: state
+                        .entries
+                        .get(key)
+                        .and_then(|entry| entry.completion.clone()),
                 };
                 let mut encoded = serde_json::to_vec(&record)
                     .map_err(|err| format!("failed to serialize dedupe marker record: {err}"))?;
@@ -595,6 +855,17 @@ fn parse_env_u64(name: &str, default: u64, must_be_positive: bool) -> Result<u64
     Ok(parsed)
 }
 
+fn truncate_error_detail(detail: &str) -> String {
+    if detail.len() <= MAX_PERSISTENCE_ERROR_DETAIL_BYTES {
+        return detail.to_string();
+    }
+    let mut boundary = MAX_PERSISTENCE_ERROR_DETAIL_BYTES;
+    while !detail.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    detail[..boundary].to_string()
+}
+
 fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -612,12 +883,34 @@ fn update_gauges(state: &DedupeState) {
 mod tests {
     use super::*;
 
+    fn expect_accepted<'a>(store: &'a DedupeWindowStore, key: &str) -> DedupeReservation<'a> {
+        match store.begin(key).expect("begin should succeed") {
+            DedupeBeginOutcome::Accepted(reservation) => reservation,
+            other => panic!("expected accepted reservation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn validate_idempotency_key_enforces_format() {
         assert!(validate_idempotency_key("tsink:node-a:1234:abcd").is_ok());
         assert!(validate_idempotency_key("").is_err());
         assert!(validate_idempotency_key(" leading-space").is_err());
         assert!(validate_idempotency_key("bad/key").is_err());
+    }
+
+    #[test]
+    fn legacy_ingest_rows_completion_remains_readable() {
+        let completion: DedupeCompletion =
+            serde_json::from_str(r#"{"response_type":"ingest_rows","inserted_rows":2}"#)
+                .expect("legacy completion should decode");
+
+        assert_eq!(
+            completion,
+            DedupeCompletion::IngestRows {
+                inserted_rows: 2,
+                write_result: None,
+            }
+        );
     }
 
     #[test]
@@ -634,26 +927,31 @@ mod tests {
         )
         .expect("store should open");
 
-        assert_eq!(
-            store.begin("tsink:key:1").expect("begin should succeed"),
-            DedupeBeginOutcome::Accepted
-        );
-        assert_eq!(
+        let first = expect_accepted(&store, "tsink:key:1");
+        assert!(matches!(
             store.begin("tsink:key:1").expect("begin should succeed"),
             DedupeBeginOutcome::InFlight
-        );
+        ));
 
-        store.abort("tsink:key:1");
-        assert_eq!(
-            store.begin("tsink:key:1").expect("begin should succeed"),
-            DedupeBeginOutcome::Accepted
-        );
-        store.commit("tsink:key:1");
+        drop(first);
+        let second = expect_accepted(&store, "tsink:key:1");
+        let completion = DedupeCompletion::IngestWrite {
+            inserted_rows: 3,
+            accepted_metadata_updates: 2,
+            accepted_exemplars: 1,
+            dropped_exemplars: 4,
+            acknowledgement: Some(tsink::WriteAcknowledgement::Durable),
+        };
+        second
+            .commit(completion.clone())
+            .expect("completion should persist");
 
-        assert_eq!(
-            store.begin("tsink:key:1").expect("begin should succeed"),
-            DedupeBeginOutcome::Duplicate
-        );
+        match store.begin("tsink:key:1").expect("begin should succeed") {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion))
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        };
     }
 
     #[test]
@@ -668,21 +966,176 @@ mod tests {
         };
 
         let store = DedupeWindowStore::open(path.clone(), config).expect("store should open");
-        assert_eq!(
-            store
-                .begin("tsink:key:restart")
-                .expect("begin should succeed"),
-            DedupeBeginOutcome::Accepted
-        );
-        store.commit("tsink:key:restart");
+        let completion = DedupeCompletion::IngestRows {
+            inserted_rows: 7,
+            write_result: Some(tsink::BatchWriteResult::from_outcomes(
+                Some(tsink::WriteAcknowledgement::Durable),
+                (0..7).map(tsink::RowWriteOutcome::accepted).collect(),
+            )),
+        };
+        expect_accepted(&store, "tsink:key:restart")
+            .commit(completion.clone())
+            .expect("completion should persist");
         drop(store);
 
         let reopened = DedupeWindowStore::open(path, config).expect("store should reopen");
+        match reopened
+            .begin("tsink:key:restart")
+            .expect("begin should succeed")
+        {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion))
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        };
+    }
+
+    #[test]
+    fn append_failure_is_returned_and_same_key_remains_replayable() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let store = DedupeWindowStore::open(
+            dir.path().join("dedupe.log"),
+            DedupeConfig {
+                window_secs: 60,
+                max_entries: 32,
+                max_log_bytes: 8 * 1024,
+                cleanup_interval_secs: 30,
+            },
+        )
+        .expect("store should open");
+        let completion = DedupeCompletion::IngestRows {
+            inserted_rows: 1,
+            write_result: Some(tsink::BatchWriteResult::from_outcomes(
+                Some(tsink::WriteAcknowledgement::Volatile),
+                vec![tsink::RowWriteOutcome::accepted(0)],
+            )),
+        };
+
+        store.fail_next_append_at(DedupePersistenceStage::Append);
+        let err = expect_accepted(&store, "tsink:key:append-failure")
+            .commit(completion.clone())
+            .expect_err("injected append failure must be returned");
+        assert_eq!(err.stage(), DedupePersistenceStage::Append);
         assert_eq!(
-            reopened
-                .begin("tsink:key:restart")
-                .expect("begin should succeed"),
-            DedupeBeginOutcome::Duplicate
+            err.to_string(),
+            "cluster dedupe completion marker persistence failed during record append"
         );
+        assert!(!err.to_string().contains("injected"));
+
+        match store
+            .begin("tsink:key:append-failure")
+            .expect("the completed key should remain replayable")
+        {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion));
+            }
+            other => panic!("expected exact duplicate replay, got {other:?}"),
+        }
+        let new_key_error = store
+            .begin("tsink:key:new-after-failure")
+            .expect_err("new keys must be fenced after persistence failure");
+        assert_eq!(
+            new_key_error,
+            "cluster dedupe completion marker persistence failed during record append"
+        );
+    }
+
+    #[test]
+    fn fsync_failure_is_returned_with_a_typed_bounded_stage() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let store = DedupeWindowStore::open(
+            dir.path().join("dedupe.log"),
+            DedupeConfig {
+                window_secs: 60,
+                max_entries: 32,
+                max_log_bytes: 8 * 1024,
+                cleanup_interval_secs: 30,
+            },
+        )
+        .expect("store should open");
+
+        store.fail_next_append_at(DedupePersistenceStage::Sync);
+        let err = expect_accepted(&store, "tsink:key:sync-failure")
+            .commit(DedupeCompletion::IngestRows {
+                inserted_rows: 0,
+                write_result: None,
+            })
+            .expect_err("injected fsync failure must be returned");
+
+        assert_eq!(err.stage(), DedupePersistenceStage::Sync);
+        assert_eq!(
+            err.to_string(),
+            "cluster dedupe completion marker persistence failed during log fsync"
+        );
+        assert!(err.to_string().len() < 128);
+    }
+
+    #[test]
+    fn malformed_marker_record_fails_open_with_line_number() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("dedupe.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"key\":\"tsink:key:valid\",\"expires_at_unix_secs\":4102444800}\n",
+                "{not-json}\n"
+            ),
+        )
+        .expect("marker fixture should be written");
+
+        let err = DedupeWindowStore::open(path, DedupeConfig::default())
+            .expect_err("malformed persisted records must fail open");
+        assert_eq!(
+            err,
+            "malformed cluster dedupe marker log record at line 2: invalid JSON record"
+        );
+        assert!(!err.contains("not-json"));
+    }
+
+    #[test]
+    fn unterminated_marker_record_is_rejected_as_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("dedupe.log");
+        std::fs::write(
+            &path,
+            b"{\"key\":\"tsink:key:torn\",\"expires_at_unix_secs\":4102444800}",
+        )
+        .expect("marker fixture should be written");
+
+        let err = DedupeWindowStore::open(path, DedupeConfig::default())
+            .expect_err("a torn final record must fail open");
+        assert_eq!(
+            err,
+            "malformed cluster dedupe marker log record at line 1: incomplete record"
+        );
+    }
+
+    #[test]
+    fn legacy_marker_without_completion_remains_readable() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("dedupe.log");
+        std::fs::write(
+            &path,
+            b"{\"key\":\"tsink:key:legacy\",\"expires_at_unix_secs\":4102444800}\n",
+        )
+        .expect("legacy marker should be written");
+        let store = DedupeWindowStore::open(
+            path,
+            DedupeConfig {
+                window_secs: 60,
+                max_entries: 32,
+                max_log_bytes: 8 * 1024,
+                cleanup_interval_secs: 1,
+            },
+        )
+        .expect("legacy marker store should open");
+
+        match store
+            .begin("tsink:key:legacy")
+            .expect("legacy key lookup should succeed")
+        {
+            DedupeBeginOutcome::Duplicate { completion } => assert_eq!(completion, None),
+            other => panic!("expected legacy marker to be a duplicate, got {other:?}"),
+        };
     }
 }

@@ -61,9 +61,10 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
         .collect::<Result<Vec<_>>>()
 }
 
-pub(super) fn persist_rollup_policies(
+pub(super) fn persist_rollup_policies_budgeted(
     path: Option<&Path>,
     policies: &[RollupPolicy],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let Some(path) = path else {
         if policies.is_empty() {
@@ -83,7 +84,13 @@ pub(super) fn persist_rollup_policies(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_file_atomically_and_sync_parent(path, &encoded)
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &encoded,
+        local_disk_budget,
+        crate::DiskCategory::Rollups,
+        crate::DiskReservationKind::Growth,
+    )
 }
 
 impl RollupQuerySelectionContext<'_> {

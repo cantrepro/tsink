@@ -10,6 +10,7 @@ use base64::Engine;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use tsink::label::{MAX_LABEL_NAME_LEN, MAX_LABEL_VALUE_LEN, MAX_METRIC_NAME_LEN};
 use tsink::{DataPoint, Label, TimestampPrecision};
 
 #[allow(clippy::all, dead_code)]
@@ -282,14 +283,12 @@ fn normalize_metric(
         Some(metric::Data::ExponentialHistogram(_)) => {
             stats.rejected_kind = Some(OtlpMetricKind::ExponentialHistogram);
             return Err(format!(
-                "{context} metric '{}' uses exponential histograms, which are not supported by /v1/metrics yet",
-                metric.name
+                "{context} uses exponential histograms, which are not supported by /v1/metrics yet"
             ));
         }
         None => {
             return Err(format!(
-                "{context} metric '{}' is missing a supported OTLP data payload",
-                metric.name
+                "{context} is missing a supported OTLP data payload"
             ));
         }
     }
@@ -334,13 +333,13 @@ fn normalize_sum(
     let temporality =
         AggregationTemporality::try_from(sum.aggregation_temporality).map_err(|_| {
             format!(
-                "{context} metric '{metric_name}' has unsupported aggregation temporality {}",
+                "{context} has unsupported aggregation temporality {}",
                 sum.aggregation_temporality
             )
         })?;
     if temporality != AggregationTemporality::Cumulative {
         return Err(format!(
-            "{context} metric '{metric_name}' uses {:?} temporality, but /v1/metrics currently accepts OTLP sums only with cumulative temporality",
+            "{context} uses {:?} temporality, but /v1/metrics currently accepts OTLP sums only with cumulative temporality",
             temporality
         ));
     }
@@ -379,16 +378,21 @@ fn normalize_histogram(
     context: &str,
     envelope: &mut NormalizedWriteEnvelope,
 ) -> Result<(), String> {
+    let bucket_metric_name = derived_metric_name(metric_name, "_bucket", context)?;
+    let count_metric_name = derived_metric_name(metric_name, "_count", context)?;
+    let sum_metric_name = derived_metric_name(metric_name, "_sum", context)?;
+    let min_metric_name = derived_metric_name(metric_name, "_min", context)?;
+    let max_metric_name = derived_metric_name(metric_name, "_max", context)?;
     let temporality =
         AggregationTemporality::try_from(histogram.aggregation_temporality).map_err(|_| {
             format!(
-                "{context} metric '{metric_name}' has unsupported aggregation temporality {}",
+                "{context} has unsupported aggregation temporality {}",
                 histogram.aggregation_temporality
             )
         })?;
     if temporality != AggregationTemporality::Cumulative {
         return Err(format!(
-            "{context} metric '{metric_name}' uses {:?} temporality, but /v1/metrics currently accepts OTLP histograms only with cumulative temporality",
+            "{context} uses {:?} temporality, but /v1/metrics currently accepts OTLP histograms only with cumulative temporality",
             temporality
         ));
     }
@@ -427,7 +431,7 @@ fn normalize_histogram(
                 "+Inf".to_string()
             };
             let identity = series_identity(
-                &format!("{metric_name}_bucket"),
+                &bucket_metric_name,
                 &point_labels,
                 &base_extra_labels,
                 Some(Label::new(HISTOGRAM_BUCKET_LABEL, boundary)),
@@ -441,7 +445,7 @@ fn normalize_histogram(
         }
 
         let count_identity = series_identity(
-            &format!("{metric_name}_count"),
+            &count_metric_name,
             &point_labels,
             &base_extra_labels,
             None,
@@ -455,7 +459,7 @@ fn normalize_histogram(
 
         if let Some(sum) = point.sum {
             let sum_identity = series_identity(
-                &format!("{metric_name}_sum"),
+                &sum_metric_name,
                 &point_labels,
                 &base_extra_labels,
                 None,
@@ -469,7 +473,7 @@ fn normalize_histogram(
         }
         if let Some(min) = point.min {
             let min_identity = series_identity(
-                &format!("{metric_name}_min"),
+                &min_metric_name,
                 &point_labels,
                 &base_extra_labels,
                 None,
@@ -483,7 +487,7 @@ fn normalize_histogram(
         }
         if let Some(max) = point.max {
             let max_identity = series_identity(
-                &format!("{metric_name}_max"),
+                &max_metric_name,
                 &point_labels,
                 &base_extra_labels,
                 None,
@@ -525,6 +529,8 @@ fn normalize_summary(
     context: &str,
     envelope: &mut NormalizedWriteEnvelope,
 ) -> Result<(), String> {
+    let count_metric_name = derived_metric_name(metric_name, "_count", context)?;
+    let sum_metric_name = derived_metric_name(metric_name, "_sum", context)?;
     let mut base_extra_labels = vec![Label::new(OTEL_METRIC_KIND_LABEL, "summary")];
     base_extra_labels.sort();
 
@@ -559,7 +565,7 @@ fn normalize_summary(
         }
 
         let count_identity = series_identity(
-            &format!("{metric_name}_count"),
+            &count_metric_name,
             &point_labels,
             &base_extra_labels,
             None,
@@ -572,7 +578,7 @@ fn normalize_summary(
         });
 
         let sum_identity = series_identity(
-            &format!("{metric_name}_sum"),
+            &sum_metric_name,
             &point_labels,
             &base_extra_labels,
             None,
@@ -750,7 +756,13 @@ fn normalize_attribute_labels(
         }
         let value = any_value_to_string(attribute.value, context)?;
         let mut name = prefix.unwrap_or_default().to_string();
-        name.push_str(&escape_prom_ident(&attribute.key));
+        let remaining = MAX_LABEL_NAME_LEN.saturating_sub(name.len());
+        let escaped = escape_prom_ident(&attribute.key, remaining).ok_or_else(|| {
+            format!(
+                "{context} contains an attribute key that exceeds the normalized label-name limit"
+            )
+        })?;
+        name.push_str(&escaped);
         labels.push(Label::new(name, value));
     }
     Ok(labels)
@@ -809,9 +821,7 @@ fn record_metadata(
                 || existing.help != candidate.help
                 || existing.unit != candidate.unit =>
         {
-            Err(format!(
-                "OTLP payload defines conflicting metadata for metric family '{metric_family_name}'"
-            ))
+            Err("OTLP payload defines conflicting metadata for one metric family".to_string())
         }
         Some(_) => Ok(()),
         None => {
@@ -889,13 +899,26 @@ fn normalize_metric_name(metric: &str, context: &str) -> Result<String, String> 
     if metric.is_empty() {
         return Err(format!("{context} metric name must not be empty"));
     }
-    let escaped = escape_prom_ident(metric);
-    if escaped.is_empty() {
+    escape_prom_ident(metric, MAX_METRIC_NAME_LEN)
+        .filter(|escaped| !escaped.is_empty())
+        .ok_or_else(|| format!("{context} metric name exceeds the normalized name limit"))
+}
+
+fn derived_metric_name(metric: &str, suffix: &str, context: &str) -> Result<String, String> {
+    let Some(capacity) = metric.len().checked_add(suffix.len()) else {
         return Err(format!(
-            "{context} metric name '{metric}' could not be normalized"
+            "{context} derived metric name exceeds the normalized name limit"
+        ));
+    };
+    if capacity > MAX_METRIC_NAME_LEN {
+        return Err(format!(
+            "{context} derived metric name exceeds the normalized name limit"
         ));
     }
-    Ok(escaped)
+    let mut derived = String::with_capacity(capacity);
+    derived.push_str(metric);
+    derived.push_str(suffix);
+    Ok(derived)
 }
 
 fn normalize_timestamp(
@@ -937,7 +960,7 @@ fn sort_and_validate_labels(
     allow_trace_labels: bool,
 ) -> Result<(), String> {
     let mut seen_names = BTreeSet::new();
-    for label in labels.iter() {
+    for (label_idx, label) in labels.iter().enumerate() {
         if label.name == TENANT_LABEL && !allow_trace_labels {
             // Tenant label is injected by the server and valid here.
         } else if label.name == TENANT_LABEL {
@@ -948,8 +971,7 @@ fn sort_and_validate_labels(
         validate_label(&label.name, &label.value, context)?;
         if !seen_names.insert(label.name.clone()) {
             return Err(format!(
-                "{context} contains duplicate label '{}'",
-                label.name
+                "{context} contains a duplicate label at index {label_idx}"
             ));
         }
     }
@@ -958,43 +980,67 @@ fn sort_and_validate_labels(
 }
 
 fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> {
-    let max_label_name_len = tsink::label::MAX_LABEL_NAME_LEN;
-    let max_label_value_len = tsink::label::MAX_LABEL_VALUE_LEN;
     if name.is_empty() {
         return Err(format!("{context} label name must not be empty"));
     }
-    if name.len() > max_label_name_len {
+    if name.len() > MAX_LABEL_NAME_LEN {
         return Err(format!(
-            "{context} label '{name}' exceeds the {max_label_name_len}-byte name limit"
+            "{context} label name exceeds the {MAX_LABEL_NAME_LEN}-byte limit"
         ));
     }
-    if value.len() > max_label_value_len {
+    if value.len() > MAX_LABEL_VALUE_LEN {
         return Err(format!(
-            "{context} label '{name}' exceeds the {max_label_value_len}-byte value limit"
+            "{context} label value exceeds the {MAX_LABEL_VALUE_LEN}-byte limit"
         ));
     }
     Ok(())
 }
 
-fn escape_prom_ident(raw: &str) -> String {
+fn escape_prom_ident(raw: &str, max_len: usize) -> Option<String> {
     let mut out = String::new();
     for byte in raw.bytes() {
         match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => out.push(byte as char),
-            b'_' => out.push_str("__"),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                if out.len() >= max_len {
+                    return None;
+                }
+                out.push(byte as char);
+            }
+            b'_' => {
+                if out.len().saturating_add(2) > max_len {
+                    return None;
+                }
+                out.push_str("__");
+            }
             _ => {
+                if out.len().saturating_add(5) > max_len {
+                    return None;
+                }
                 out.push_str("_x");
-                out.push_str(&format!("{byte:02x}"));
+                out.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+                out.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
                 out.push('_');
             }
         }
     }
     if out.is_empty() {
-        return out;
+        return Some(out);
     }
     match out.as_bytes()[0] {
-        b'a'..=b'z' | b'A'..=b'Z' | b'_' => out,
-        _ => format!("_x{:02x}_{}", raw.as_bytes()[0], &out[1..]),
+        b'a'..=b'z' | b'A'..=b'Z' | b'_' => Some(out),
+        _ => {
+            if out.len().saturating_add(4) > max_len {
+                return None;
+            }
+            let first = raw.as_bytes()[0];
+            let mut normalized = String::with_capacity(out.len().saturating_add(4));
+            normalized.push_str("_x");
+            normalized.push(char::from(b"0123456789abcdef"[(first >> 4) as usize]));
+            normalized.push(char::from(b"0123456789abcdef"[(first & 0x0f) as usize]));
+            normalized.push('_');
+            normalized.push_str(&out[1..]);
+            Some(normalized)
+        }
     }
 }
 
@@ -1026,6 +1072,7 @@ mod tests {
     use crate::otlp::generated::opentelemetry::proto::metrics::v1::{
         HistogramDataPoint, ResourceMetrics, ScopeMetrics, SummaryDataPoint, ValueAtQuantile,
     };
+    use tsink::MAX_WRITE_REJECTION_MESSAGE_BYTES;
 
     fn string_attr(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -1043,6 +1090,33 @@ mod tests {
                 value: Some(any_value::Value::IntValue(value)),
             }),
         }
+    }
+
+    #[test]
+    fn normalized_name_limits_do_not_echo_oversized_otlp_names() {
+        let private_metric_name = format!(
+            "private_metric_{}",
+            "x".repeat(MAX_METRIC_NAME_LEN.saturating_add(1))
+        );
+        let metric_err = normalize_metric_name(&private_metric_name, "test metric")
+            .expect_err("oversized normalized metric name must be rejected");
+        assert!(metric_err.contains("normalized name limit"));
+        assert!(!metric_err.contains("private_metric"));
+        assert!(metric_err.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+
+        let private_attribute_key = format!(
+            "private_attribute_{}",
+            "y".repeat(MAX_LABEL_NAME_LEN.saturating_add(1))
+        );
+        let attribute_err = normalize_attribute_labels(
+            vec![string_attr(&private_attribute_key, "value")],
+            None,
+            "test point",
+        )
+        .expect_err("oversized normalized attribute key must be rejected");
+        assert!(attribute_err.contains("normalized label-name limit"));
+        assert!(!attribute_err.contains("private_attribute"));
+        assert!(attribute_err.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
     }
 
     #[test]

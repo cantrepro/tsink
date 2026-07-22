@@ -73,6 +73,7 @@ impl MetricMetadataStore {
         }
 
         let mut entries = self.write_entries()?;
+        let mut staged_entries = entries.clone();
         let mut changed = 0usize;
         let mut updated_unix_ms = unix_timestamp_millis();
         for update in updates {
@@ -85,7 +86,7 @@ impl MetricMetadataStore {
                 unit: update.unit.clone(),
                 updated_unix_ms,
             };
-            let existing_matches = entries.get(&key).is_some_and(|existing| {
+            let existing_matches = staged_entries.get(&key).is_some_and(|existing| {
                 existing.metric_type == candidate.metric_type
                     && existing.help == candidate.help
                     && existing.unit == candidate.unit
@@ -94,13 +95,14 @@ impl MetricMetadataStore {
                 continue;
             }
 
-            entries.insert(key, candidate);
+            staged_entries.insert(key, candidate);
             changed = changed.saturating_add(1);
             updated_unix_ms = updated_unix_ms.saturating_add(1);
         }
 
         if changed > 0 {
-            self.persist_entries(&entries)?;
+            self.persist_entries(&staged_entries)?;
+            *entries = staged_entries;
         }
 
         Ok(changed)
@@ -419,5 +421,64 @@ mod tests {
             .expect("metadata query should succeed");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].metric_family_name, "cpu_usage");
+    }
+
+    #[test]
+    fn metadata_store_persistence_failure_does_not_publish_updates() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let store = MetricMetadataStore::open(Some(temp_dir.path()))
+            .expect("persistent metadata store should open");
+        store
+            .apply_updates(
+                "tenant-a",
+                &[NormalizedMetricMetadataUpdate {
+                    metric_family_name: "http_requests_total".to_string(),
+                    metric_type: MetricType::Counter,
+                    help: "original".to_string(),
+                    unit: "requests".to_string(),
+                }],
+            )
+            .expect("initial metadata update should persist");
+
+        let tmp_path = store
+            .file_path()
+            .expect("persistent store should expose file path")
+            .with_extension("tmp");
+        std::fs::create_dir(&tmp_path).expect("blocking temporary path should build");
+
+        let error = store
+            .apply_updates(
+                "tenant-a",
+                &[
+                    NormalizedMetricMetadataUpdate {
+                        metric_family_name: "http_requests_total".to_string(),
+                        metric_type: MetricType::Counter,
+                        help: "unpersisted replacement".to_string(),
+                        unit: "requests".to_string(),
+                    },
+                    NormalizedMetricMetadataUpdate {
+                        metric_family_name: "new_metric".to_string(),
+                        metric_type: MetricType::Gauge,
+                        help: "unpersisted insertion".to_string(),
+                        unit: "widgets".to_string(),
+                    },
+                ],
+            )
+            .expect_err("temporary-path collision should fail persistence");
+        assert!(error.contains("failed to open temporary metric metadata store"));
+
+        let records = store
+            .query("tenant-a", None, 10)
+            .expect("metadata query should succeed after failed persistence");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].metric_family_name, "http_requests_total");
+        assert_eq!(records[0].help, "original");
+
+        let reopened = MetricMetadataStore::open(Some(temp_dir.path()))
+            .expect("persisted metadata should remain readable");
+        let persisted_records = reopened
+            .query("tenant-a", None, 10)
+            .expect("reopened metadata query should succeed");
+        assert_eq!(persisted_records, records);
     }
 }

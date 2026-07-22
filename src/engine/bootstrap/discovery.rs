@@ -39,6 +39,7 @@ impl StartupDiscoveryPhase {
             plan.paths().numeric_lane_path.as_deref(),
             plan.paths().blob_lane_path.as_deref(),
             plan.storage_options().tiered_storage.as_ref(),
+            plan.local_disk_budget(),
         )?;
 
         let mut registry = StartupRegistryState::load(plan.paths().series_index_path.as_deref())?;
@@ -142,6 +143,7 @@ fn finalize_pending_compaction_replacements_for_storage_paths(
     numeric_lane_path: Option<&Path>,
     blob_lane_path: Option<&Path>,
     tiered_storage: Option<&config::TieredStorageConfig>,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let mut paths = BTreeSet::new();
     if let Some(path) = numeric_lane_path {
@@ -166,7 +168,10 @@ fn finalize_pending_compaction_replacements_for_storage_paths(
     }
 
     for path in paths {
-        crate::engine::compactor::finalize_pending_compaction_replacements(&path)?;
+        crate::engine::compactor::finalize_pending_compaction_replacements_with_disk_budget(
+            &path,
+            local_disk_budget,
+        )?;
     }
 
     Ok(())

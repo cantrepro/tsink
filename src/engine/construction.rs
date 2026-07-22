@@ -137,12 +137,37 @@ impl ChunkStorage {
         next_segment_id: u64,
         options: ChunkStorageOptions,
     ) -> Result<Self> {
+        let background_threads_enabled = options.background_threads_enabled;
+        let storage = Self::new_with_data_path_and_options_and_disk_budget(
+            chunk_point_cap,
+            wal,
+            numeric_lane_path,
+            blob_lane_path,
+            next_segment_id,
+            options,
+            None,
+        )?;
+        if background_threads_enabled {
+            storage.start_background_compaction_thread()?;
+        }
+        Ok(storage)
+    }
+
+    pub(super) fn new_with_data_path_and_options_and_disk_budget(
+        chunk_point_cap: usize,
+        wal: Option<FramedWal>,
+        numeric_lane_path: Option<PathBuf>,
+        blob_lane_path: Option<PathBuf>,
+        next_segment_id: u64,
+        options: ChunkStorageOptions,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Result<Self> {
         let resources = Self::prepare_construction_resources(
             chunk_point_cap,
             numeric_lane_path.as_ref(),
             blob_lane_path.as_ref(),
             next_segment_id,
-            &options,
+            local_disk_budget.clone(),
         )?;
         let storage_state = StorageStateAssembly::build(
             chunk_point_cap,
@@ -150,6 +175,7 @@ impl ChunkStorage {
             blob_lane_path,
             wal,
             &options,
+            local_disk_budget,
             resources,
         );
         let StorageStateAssembly {

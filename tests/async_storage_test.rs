@@ -6,9 +6,10 @@ use tokio::sync::Notify;
 
 use tempfile::TempDir;
 use tsink::{
-    Aggregation, AsyncStorage, AsyncStorageBuilder, DataPoint, Label, QueryOptions, Result,
-    RollupPolicy, Row, Storage, StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode,
-    WriteAcknowledgement,
+    Aggregation, AsyncStorage, AsyncStorageBuilder, BatchWriteResult, DataPoint, Label,
+    QueryOptions, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus, Storage,
+    StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement, WriteMode,
+    WriteRejectionCategory,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32,6 +33,60 @@ async fn basic_insert_and_select_roundtrip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effective_storage_limits_match_the_built_backend() -> Result<()> {
+    let storage = AsyncStorageBuilder::new()
+        .with_wal_enabled(false)
+        .with_memory_limit(8 * 1024 * 1024)
+        .with_cardinality_limit(512)
+        .with_max_writers(2)
+        .with_write_timeout(Duration::from_millis(23))
+        .with_max_active_partition_heads_per_series(3)
+        .build()?;
+
+    let limits = storage.effective_storage_limits();
+    assert!(limits.reported_by_backend);
+    assert!(!limits.persistent);
+    assert!(!limits.wal_enabled);
+    assert_eq!(limits.accounted_memory_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(limits.cardinality, Some(512));
+    assert_eq!(limits.wal_bytes, None);
+    assert_eq!(limits.local_disk_bytes, None);
+    assert!(storage.observability_snapshot().local_disk.is_none());
+    assert_eq!(limits.max_concurrent_writers, Some(2));
+    assert_eq!(limits.write_timeout_nanos, Some(23_000_000));
+    assert_eq!(limits.max_active_partition_heads_per_series, Some(3));
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_builder_reports_configured_local_disk_budget() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let storage = AsyncStorageBuilder::new()
+        .with_data_path(dir.path())
+        .with_wal_enabled(false)
+        .with_local_disk_limit(8 * 1024 * 1024)
+        .with_filesystem_free_headroom(1024)
+        .with_maintenance_temp_reserve(4096)
+        .build()?;
+
+    let limits = storage.effective_storage_limits();
+    assert_eq!(limits.local_disk_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(limits.filesystem_free_headroom_bytes, Some(1024));
+    assert_eq!(limits.maintenance_temp_reserve_bytes, Some(4096));
+    let disk = storage
+        .observability_snapshot()
+        .local_disk
+        .expect("persistent async storage should report the core disk coordinator");
+    assert_eq!(disk.limits.max_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(disk.active_reservations, 0);
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_rows_with_result_reports_periodic_acknowledgement() -> Result<()> {
     let dir = TempDir::new().unwrap();
     let storage = AsyncStorageBuilder::new()
@@ -45,6 +100,132 @@ async fn insert_rows_with_result_reports_periodic_acknowledgement() -> Result<()
 
     assert_eq!(result.acknowledgement, WriteAcknowledgement::Appended);
     assert!(!result.is_durable());
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_batch_atomic_invalid_middle_reports_no_acceptance() -> Result<()> {
+    let storage = AsyncStorageBuilder::new().build()?;
+
+    let result = storage
+        .write_batch(
+            vec![
+                Row::new("async_atomic_first", DataPoint::new(1, 1.0)),
+                Row::new("", DataPoint::new(2, 2.0)),
+                Row::new("async_atomic_last", DataPoint::new(3, 3.0)),
+            ],
+            WriteMode::Atomic,
+        )
+        .await?;
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 3);
+    assert_eq!(result.acknowledgement, None);
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(result
+        .outcomes
+        .iter()
+        .all(|outcome| matches!(outcome.status, RowWriteStatus::Rejected(_))));
+    assert!(storage
+        .select("async_atomic_first", vec![], 0, 10)
+        .await?
+        .is_empty());
+    assert!(storage
+        .select("async_atomic_last", vec![], 0, 10)
+        .await?
+        .is_empty());
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_batch_reports_future_skew_rejections_through_async_facade() -> Result<()> {
+    let storage = AsyncStorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_max_future_skew(Duration::ZERO)
+        .build()?;
+
+    let result = storage
+        .write_batch(
+            vec![Row::new(
+                "async_future_skew_rejection",
+                DataPoint::new(i64::MAX, 1.0),
+            )],
+            WriteMode::Atomic,
+        )
+        .await?;
+
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    assert_eq!(result.acknowledgement, None);
+    assert!(matches!(
+        &result.outcomes[0].status,
+        RowWriteStatus::Rejected(rejection)
+            if rejection.category == WriteRejectionCategory::FutureSkewExceeded
+    ));
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_batch_best_effort_preserves_indexed_outcomes_and_acknowledgement() -> Result<()> {
+    let storage = AsyncStorageBuilder::new().build()?;
+
+    let result = storage
+        .write_batch(
+            vec![
+                Row::new("async_best_effort_first", DataPoint::new(1, 1.0)),
+                Row::new("", DataPoint::new(2, 2.0)),
+                Row::new("async_best_effort_last", DataPoint::new(3, 3.0)),
+            ],
+            WriteMode::BestEffort,
+        )
+        .await?;
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 2);
+    assert_eq!(result.rejected, 1);
+    assert_eq!(result.acknowledgement, Some(WriteAcknowledgement::Volatile));
+    assert_eq!(result.outcomes.len(), 3);
+    assert_eq!(result.outcomes[0].index, 0);
+    assert!(matches!(
+        result.outcomes[0].status,
+        RowWriteStatus::Accepted
+    ));
+    assert_eq!(result.outcomes[1].index, 1);
+    assert!(matches!(
+        result.outcomes[1].status,
+        RowWriteStatus::Rejected(_)
+    ));
+    assert_eq!(result.outcomes[2].index, 2);
+    assert!(matches!(
+        result.outcomes[2].status,
+        RowWriteStatus::Accepted
+    ));
+    assert_eq!(
+        storage
+            .select("async_best_effort_first", vec![], 0, 10)
+            .await?,
+        vec![DataPoint::new(1, 1.0)]
+    );
+    assert_eq!(
+        storage
+            .select("async_best_effort_last", vec![], 0, 10)
+            .await?,
+        vec![DataPoint::new(3, 3.0)]
+    );
 
     storage.close().await?;
     Ok(())
@@ -111,6 +292,26 @@ async fn close_then_operations_error_with_storage_closed() -> Result<()> {
         Err(TsinkError::StorageClosed)
     ));
     assert!(matches!(
+        storage.write_batch(Vec::new(), WriteMode::Atomic).await,
+        Err(TsinkError::StorageClosed)
+    ));
+    for mode in [WriteMode::Atomic, WriteMode::BestEffort] {
+        let result = storage
+            .write_batch(
+                vec![Row::new("closed_canonical_write", DataPoint::new(1, 1.0))],
+                mode,
+            )
+            .await?;
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 1);
+        assert_eq!(result.acknowledgement, None);
+        assert!(matches!(
+            &result.outcomes[0].status,
+            RowWriteStatus::Rejected(rejection)
+                if rejection.category == WriteRejectionCategory::StorageClosed
+        ));
+    }
+    assert!(matches!(
         storage.select("closed_metric", vec![], 0, 10).await,
         Err(TsinkError::StorageClosed)
     ));
@@ -162,6 +363,59 @@ async fn persistent_storage_reopen_roundtrip() -> Result<()> {
         assert_eq!(points[0].value_as_f64(), Some(42.0));
         reopened.close().await?;
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_backed_async_pre_apply_batch_rejection_commits_none_across_reopen() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let rows = vec![
+        Row::new("async_atomic_batch_first", DataPoint::new(1, 1.0)),
+        Row::new("", DataPoint::new(2, 2.0)),
+        Row::new("async_atomic_batch_last", DataPoint::new(3, 3.0)),
+    ];
+
+    {
+        let storage = AsyncStorageBuilder::new()
+            .with_data_path(dir.path())
+            .with_wal_enabled(true)
+            .with_wal_sync_mode(WalSyncMode::PerAppend)
+            .build()?;
+
+        let err = storage.insert_rows(rows).await.unwrap_err();
+        assert!(matches!(err, TsinkError::MetricRequired));
+        assert!(storage
+            .select("async_atomic_batch_first", vec![], 0, 10)
+            .await?
+            .is_empty());
+        assert!(storage
+            .select("async_atomic_batch_last", vec![], 0, 10)
+            .await?
+            .is_empty());
+        assert!(storage.list_metrics().await?.is_empty());
+        assert!(storage.inner().list_metrics_with_wal()?.is_empty());
+
+        storage.close().await?;
+    }
+
+    let reopened = AsyncStorageBuilder::new()
+        .with_data_path(dir.path())
+        .with_wal_enabled(true)
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .build()?;
+
+    assert!(reopened
+        .select("async_atomic_batch_first", vec![], 0, 10)
+        .await?
+        .is_empty());
+    assert!(reopened
+        .select("async_atomic_batch_last", vec![], 0, 10)
+        .await?
+        .is_empty());
+    assert!(reopened.list_metrics().await?.is_empty());
+    assert!(reopened.inner().list_metrics_with_wal()?.is_empty());
+    reopened.close().await?;
 
     Ok(())
 }
@@ -350,6 +604,14 @@ impl Storage for BlockingInsertStorage {
         Ok(())
     }
 
+    fn write_batch(&self, rows: &[Row], _mode: WriteMode) -> Result<BatchWriteResult> {
+        self.insert_rows(rows)?;
+        Ok(BatchWriteResult::from_outcomes(
+            (!rows.is_empty()).then_some(WriteAcknowledgement::Volatile),
+            (0..rows.len()).map(RowWriteOutcome::accepted).collect(),
+        ))
+    }
+
     fn select(
         &self,
         _metric: &str,
@@ -413,6 +675,48 @@ async fn canceled_insert_still_commits_after_queue_accept() -> Result<()> {
 
     assert_eq!(storage.insert_calls.load(Ordering::SeqCst), 1);
     assert_eq!(storage.inserted.lock().len(), 1);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_write_batch_still_commits_after_queue_accept() -> Result<()> {
+    let storage = Arc::new(BlockingInsertStorage::new());
+    storage.block_inserts.store(true, Ordering::SeqCst);
+
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+    let write_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move {
+            async_storage
+                .write_batch(
+                    vec![
+                        Row::new("cancelled_batch_write", DataPoint::new(1, 10u64)),
+                        Row::new("cancelled_batch_write", DataPoint::new(2, 20u64)),
+                    ],
+                    WriteMode::Atomic,
+                )
+                .await
+        }
+    });
+
+    storage.insert_started.notified().await;
+
+    write_task.abort();
+    let _ = write_task.await;
+
+    storage.block_inserts.store(false, Ordering::SeqCst);
+    {
+        let mut released = storage.release_flag.lock();
+        *released = true;
+    }
+    storage.release_insert.notify_all();
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(storage.insert_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.inserted.lock().len(), 2);
 
     async_storage.close().await?;
     Ok(())

@@ -150,6 +150,9 @@ pub(in crate::engine::storage_engine) struct WriteAdmissionControlContext<'a> {
     pub(in crate::engine::storage_engine) write_timeout: Duration,
     pub(in crate::engine::storage_engine) admission_poll_interval: Duration,
     pub(in crate::engine::storage_engine) admission_backpressure_lock: &'a Mutex<()>,
+    pub(in crate::engine::storage_engine) active_memory_backpressured_writers: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) memory_backpressure_events_total: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +199,7 @@ pub(in crate::engine::storage_engine) struct WriteApplyPublicationContext<'a> {
 pub(in crate::engine::storage_engine) struct WriteCommitStageContext<'a> {
     pub(in crate::engine::storage_engine) chunks: ChunkContext<'a>,
     pub(in crate::engine::storage_engine) wal: Option<&'a FramedWal>,
+    pub(in crate::engine::storage_engine) wal_size_limit_bytes: u64,
     pub(in crate::engine::storage_engine) wal_metrics: WalMetricsContext<'a>,
     #[cfg(test)]
     pub(in crate::engine::storage_engine) test_hooks: WriteCommitTestHooksContext<'a>,

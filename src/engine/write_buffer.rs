@@ -109,77 +109,81 @@ impl ChunkStorage {
             for (shard_idx, shard) in self.chunks.active_builders.iter().enumerate() {
                 let mut active = shard.write();
                 let mut shard_delta = MemoryDeltaBytes::default();
-                for (series_id, state) in active.iter_mut() {
-                    let mut flushed_any_for_series = false;
-                    loop {
-                        let state_bytes_before = if account_memory {
-                            Self::active_state_memory_usage_bytes(state)
-                        } else {
-                            0
-                        };
-                        let chunk = match policy {
-                            ActiveFlushPolicy::All => state.flush_partial()?,
-                            ActiveFlushPolicy::BackgroundEligible => {
-                                state.flush_background_eligible_partial()?
-                            }
-                            ActiveFlushPolicy::BackgroundBounded => {
-                                let chunk = state.flush_background_eligible_partial()?;
-                                if chunk.is_some() {
-                                    chunk
-                                } else {
-                                    state.flush_current_partial()?
+                let shard_result = (|| -> Result<()> {
+                    for (series_id, state) in active.iter_mut() {
+                        let mut flushed_any_for_series = false;
+                        loop {
+                            let state_bytes_before = if account_memory {
+                                Self::active_state_memory_usage_bytes(state)
+                            } else {
+                                0
+                            };
+                            let chunk = match policy {
+                                ActiveFlushPolicy::All => state.flush_partial()?,
+                                ActiveFlushPolicy::BackgroundEligible => {
+                                    state.flush_background_eligible_partial()?
                                 }
+                                ActiveFlushPolicy::BackgroundBounded => {
+                                    let chunk = state.flush_background_eligible_partial()?;
+                                    if chunk.is_some() {
+                                        chunk
+                                    } else {
+                                        state.flush_current_partial()?
+                                    }
+                                }
+                            };
+                            let Some(chunk) = chunk else {
+                                break;
+                            };
+                            if account_memory {
+                                let state_bytes_after =
+                                    Self::active_state_memory_usage_bytes(state);
+                                shard_delta.record_change(state_bytes_before, state_bytes_after);
                             }
-                        };
-                        let Some(chunk) = chunk else {
-                            break;
-                        };
-                        if account_memory {
-                            let state_bytes_after = Self::active_state_memory_usage_bytes(state);
-                            shard_delta.record_change(state_bytes_before, state_bytes_after);
-                        }
 
-                        if !flushed_any_for_series {
-                            flushed_series = flushed_series.saturating_add(1);
-                            flushed_any_for_series = true;
-                        }
-                        flushed_chunks = flushed_chunks.saturating_add(1);
-                        flushed_points =
-                            flushed_points.saturating_add(chunk.header.point_count as usize);
+                            if !flushed_any_for_series {
+                                flushed_series = flushed_series.saturating_add(1);
+                                flushed_any_for_series = true;
+                            }
+                            flushed_chunks = flushed_chunks.saturating_add(1);
+                            flushed_points =
+                                flushed_points.saturating_add(chunk.header.point_count as usize);
 
-                        let mut sealed = self.chunks.sealed_chunks[shard_idx].write();
-                        self.append_finalized_chunks_to_sealed_locked(
-                            &mut sealed,
-                            std::iter::once((*series_id, chunk)),
-                            account_memory,
-                            &mut shard_delta,
-                        );
+                            let mut sealed = self.chunks.sealed_chunks[shard_idx].write();
+                            self.append_finalized_chunks_to_sealed_locked(
+                                &mut sealed,
+                                std::iter::once((*series_id, chunk)),
+                                account_memory,
+                                &mut shard_delta,
+                            );
+                        }
                     }
-                }
+                    Ok(())
+                })();
                 if account_memory {
                     self.account_memory_delta(shard_idx, shard_delta);
                 }
+                shard_result?;
             }
 
             Ok(())
         })();
 
+        self.observability
+            .flush
+            .active_flushed_series_total
+            .fetch_add(saturating_u64_from_usize(flushed_series), Ordering::Relaxed);
+        self.observability
+            .flush
+            .active_flushed_chunks_total
+            .fetch_add(saturating_u64_from_usize(flushed_chunks), Ordering::Relaxed);
+        self.observability
+            .flush
+            .active_flushed_points_total
+            .fetch_add(saturating_u64_from_usize(flushed_points), Ordering::Relaxed);
+
         match result {
-            Ok(()) => {
-                self.observability
-                    .flush
-                    .active_flushed_series_total
-                    .fetch_add(saturating_u64_from_usize(flushed_series), Ordering::Relaxed);
-                self.observability
-                    .flush
-                    .active_flushed_chunks_total
-                    .fetch_add(saturating_u64_from_usize(flushed_chunks), Ordering::Relaxed);
-                self.observability
-                    .flush
-                    .active_flushed_points_total
-                    .fetch_add(saturating_u64_from_usize(flushed_points), Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => {
                 self.observability
                     .flush

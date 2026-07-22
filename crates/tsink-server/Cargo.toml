@@ -2,10 +2,13 @@
 name = "tsink-server"
 version = "0.10.2"
 edition = "2021"
+rust-version = "1.89"
 build = "build.rs"
-description = "Server mode for tsink with Prometheus remote read/write wire compatibility"
-repository = "https://github.com/h2337/tsink"
-homepage = "https://github.com/h2337/tsink"
+authors = ["cantrepro"]
+description = "Optional standalone protocol server for the tsink embedded metrics engine"
+repository = "https://github.com/cantrepro/tsink"
+homepage = "https://github.com/cantrepro/tsink"
+documentation = "https://github.com/cantrepro/tsink/blob/master/docs/server-deployment.md"
 license = "MIT"
 
 [dependencies]

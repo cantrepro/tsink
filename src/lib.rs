@@ -10,6 +10,7 @@ pub mod r#async;
 pub(crate) mod cgroup;
 #[allow(dead_code)]
 pub(crate) mod concurrency;
+pub mod disk_budget;
 #[doc(hidden)]
 pub mod engine;
 pub mod error;
@@ -25,19 +26,25 @@ pub(crate) mod validation;
 pub mod value;
 pub mod wal;
 
+pub use disk_budget::{
+    DiskCategory, DiskCategoryUsage, LocalDiskBudget, LocalDiskBudgetSnapshot, LocalDiskLimits,
+};
+pub(crate) use disk_budget::{DiskReservation, DiskReservationKind};
 pub use error::{Result, TsinkError};
 pub use label::Label;
 pub use r#async::{AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder};
 pub use storage::{
-    Aggregation, CompactionObservabilitySnapshot, DeleteSeriesResult, DownsampleOptions,
-    FlushObservabilitySnapshot, MemoryObservabilitySnapshot, MetadataShardScope, MetricSeries,
-    QueryObservabilitySnapshot, QueryOptions, QueryRowsPage, QueryRowsScanOptions,
+    Aggregation, BatchWriteResult, CompactionObservabilitySnapshot, DeleteSeriesResult,
+    DownsampleOptions, EffectiveStorageLimits, FlushObservabilitySnapshot,
+    MemoryObservabilitySnapshot, MemoryPressureLevel, MemoryPressureSnapshot, MetadataShardScope,
+    MetricSeries, QueryObservabilitySnapshot, QueryOptions, QueryRowsPage, QueryRowsScanOptions,
     RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot, RetentionObservabilitySnapshot,
-    RollupObservabilitySnapshot, RollupPolicy, RollupPolicyStatus, SeriesMatcher, SeriesMatcherOp,
-    SeriesPoints, SeriesSelection, ShardWindowDigest, ShardWindowRowsPage, ShardWindowScanOptions,
-    Storage, StorageBuilder, StorageObservabilitySnapshot, StorageRuntimeMode, TimestampPrecision,
-    WalObservabilitySnapshot, WriteAcknowledgement, WriteResult,
-    DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+    RollupObservabilitySnapshot, RollupPolicy, RollupPolicyStatus, RowWriteOutcome, RowWriteStatus,
+    SeriesMatcher, SeriesMatcherOp, SeriesPoints, SeriesSelection, ShardWindowDigest,
+    ShardWindowRowsPage, ShardWindowScanOptions, Storage, StorageBuilder,
+    StorageObservabilitySnapshot, StorageRuntimeMode, TimestampPrecision, WalObservabilitySnapshot,
+    WriteAcknowledgement, WriteMode, WriteRejection, WriteRejectionCategory, WriteResult,
+    DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES, MAX_WRITE_REJECTION_MESSAGE_BYTES,
 };
 pub use value::{
     Aggregator, BytesAggregation, Codec, CodecAggregator, HistogramBucketSpan, HistogramCount,
@@ -48,14 +55,20 @@ pub use wal::{WalReplayMode, WalSyncMode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// One timestamped sample.
+/// One timestamped sample stored by tsink.
+///
+/// The unit of [`DataPoint::timestamp`] is selected with
+/// [`StorageBuilder::with_timestamp_precision`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPoint {
+    /// The sample payload.
     pub value: Value,
+    /// The sample timestamp in the storage instance's configured precision.
     pub timestamp: i64,
 }
 
 impl DataPoint {
+    /// Creates a sample at `timestamp`, converting `value` into a [`Value`].
     pub fn new(timestamp: i64, value: impl Into<Value>) -> Self {
         Self {
             timestamp,
@@ -63,20 +76,29 @@ impl DataPoint {
         }
     }
 
+    /// Returns the numeric payload as an exactly representable `f64`.
+    ///
+    /// Returns `None` for non-numeric values and integers that cannot be represented exactly.
     pub fn value_as_f64(&self) -> Option<f64> {
         self.value.as_f64()
     }
 
+    /// Returns the sample as bytes, or `None` when it has another value kind.
     pub fn value_as_bytes(&self) -> Option<&[u8]> {
         self.value.as_bytes()
     }
 
+    /// Returns the sample as a native histogram, or `None` for another value kind.
     pub fn value_as_histogram(&self) -> Option<&NativeHistogram> {
         self.value.as_histogram()
     }
 }
 
-/// Metric identity plus sample payload.
+/// A metric identity and one sample, used as the unit of ingestion.
+///
+/// A row without labels identifies the unlabeled series for its metric. Label order is
+/// preserved by this type; the built-in storage backend canonicalizes the series identity when
+/// processing the row.
 #[derive(Debug, Clone)]
 pub struct Row {
     metric: String,
@@ -85,6 +107,7 @@ pub struct Row {
 }
 
 impl Row {
+    /// Creates an unlabeled metric row.
     pub fn new(metric: impl Into<String>, data_point: DataPoint) -> Self {
         Self {
             metric: metric.into(),
@@ -93,6 +116,7 @@ impl Row {
         }
     }
 
+    /// Creates a metric row with the supplied labels.
     pub fn with_labels(
         metric: impl Into<String>,
         labels: Vec<Label>,
@@ -105,26 +129,32 @@ impl Row {
         }
     }
 
+    /// Returns the metric name.
     pub fn metric(&self) -> &str {
         &self.metric
     }
 
+    /// Returns the labels attached to the metric series.
     pub fn labels(&self) -> &[Label] {
         &self.labels
     }
 
+    /// Returns the row's sample.
     pub fn data_point(&self) -> &DataPoint {
         &self.data_point
     }
 
+    /// Replaces the metric name.
     pub fn set_metric(&mut self, metric: impl Into<String>) {
         self.metric = metric.into();
     }
 
+    /// Replaces all labels on the row.
     pub fn set_labels(&mut self, labels: Vec<Label>) {
         self.labels = labels;
     }
 
+    /// Replaces the row's sample.
     pub fn set_data_point(&mut self, data_point: DataPoint) {
         self.data_point = data_point;
     }

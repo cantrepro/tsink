@@ -4,6 +4,7 @@ pub(super) struct StartupPlan {
     wal_enabled: bool,
     storage_options: ChunkStorageOptions,
     paths: config::StoragePathLayout,
+    local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     runtime_inputs: StartupRuntimeInputs,
 }
 
@@ -19,18 +20,106 @@ impl StartupPlanningPhase {
     pub(super) fn prepare(builder: &StorageBuilder) -> Result<StartupPlan> {
         validate_tiered_storage_config(builder)?;
 
+        let data_path_process_lock = acquire_startup_data_path_process_lock(builder)?;
+        let local_disk_budget = resolve_local_disk_budget(builder)?;
+        validate_tiered_storage_disk_scope(builder, local_disk_budget.as_deref())?;
+        validate_disk_limit_relationships(builder, local_disk_budget.as_deref())?;
         let storage_options = ChunkStorageOptions::from(builder);
         Ok(StartupPlan {
             wal_enabled: builder.wal_enabled(),
             paths: config::StoragePathLayout::from(builder),
+            local_disk_budget,
             runtime_inputs: StartupRuntimeInputs {
                 background_threads_enabled: storage_options.background_threads_enabled,
                 background_fail_fast: storage_options.background_fail_fast,
-                data_path_process_lock: acquire_startup_data_path_process_lock(builder)?,
+                data_path_process_lock,
             },
             storage_options,
         })
     }
+}
+
+fn resolve_local_disk_budget(
+    builder: &StorageBuilder,
+) -> Result<Option<Arc<crate::LocalDiskBudget>>> {
+    let limits = builder.local_disk_limits().validate()?;
+    let disk_settings_requested = limits.max_bytes.is_some()
+        || limits.filesystem_free_headroom_bytes > 0
+        || limits.maintenance_temp_reserve_bytes > 0
+        || builder.shared_local_disk_budget().is_some();
+
+    let persistent_data_path = (builder.runtime_mode() == StorageRuntimeMode::ReadWrite)
+        .then(|| builder.data_path())
+        .flatten();
+    let Some(data_path) = persistent_data_path else {
+        if disk_settings_requested {
+            return Err(TsinkError::InvalidConfiguration(
+                "local disk limits require persistent read-write storage with a data path"
+                    .to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    if let Some(shared) = builder.shared_local_disk_budget() {
+        if !shared.matches_root(data_path)? {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "shared local disk budget root {} does not match data path {}",
+                shared.root().display(),
+                data_path.display()
+            )));
+        }
+        if shared.limits() != limits {
+            return Err(TsinkError::InvalidConfiguration(
+                "shared local disk budget limits do not match builder disk settings".to_string(),
+            ));
+        }
+        return Ok(Some(Arc::clone(shared)));
+    }
+
+    crate::LocalDiskBudget::open(data_path, limits).map(Some)
+}
+
+fn validate_disk_limit_relationships(
+    builder: &StorageBuilder,
+    local_disk_budget: Option<&crate::LocalDiskBudget>,
+) -> Result<()> {
+    let Some(local_disk_budget) = local_disk_budget else {
+        return Ok(());
+    };
+    let Some(max_bytes) = local_disk_budget.limits().max_bytes else {
+        return Ok(());
+    };
+    if builder.wal_enabled() && builder.wal_size_limit_bytes() != usize::MAX {
+        let wal_bytes = builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64;
+        let normal_growth_limit =
+            max_bytes.saturating_sub(local_disk_budget.limits().maintenance_temp_reserve_bytes);
+        if wal_bytes > normal_growth_limit {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "WAL size limit {wal_bytes} exceeds local disk growth capacity {normal_growth_limit} after maintenance reserve"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tiered_storage_disk_scope(
+    builder: &StorageBuilder,
+    local_disk_budget: Option<&crate::LocalDiskBudget>,
+) -> Result<()> {
+    let (Some(object_store_path), Some(local_disk_budget)) =
+        (builder.object_store_path(), local_disk_budget)
+    else {
+        return Ok(());
+    };
+    if local_disk_budget.governs(object_store_path)? {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "object store path {} must be outside managed local data path {}",
+            object_store_path.display(),
+            local_disk_budget.root().display()
+        )));
+    }
+    Ok(())
 }
 
 impl StartupPlan {
@@ -44,6 +133,10 @@ impl StartupPlan {
 
     pub(super) fn paths(&self) -> &config::StoragePathLayout {
         &self.paths
+    }
+
+    pub(super) fn local_disk_budget(&self) -> Option<&Arc<crate::LocalDiskBudget>> {
+        self.local_disk_budget.as_ref()
     }
 
     pub(super) fn lane_flags(&self) -> (bool, bool) {

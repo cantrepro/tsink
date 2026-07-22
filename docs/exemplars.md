@@ -52,7 +52,7 @@ Exemplars are read from the `exemplars` field of each `TimeSeries` entry in the 
 
 | Variable | Default | Description |
 |---|---|---|
-| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `true` | Accept exemplars in Prometheus remote-write payloads. Set to `false` to silently discard all exemplars (returns `422` instead). |
+| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `true` | Accept exemplars in Prometheus remote-write payloads. When `false`, a request containing exemplars is rejected with `422`; exemplars are not silently discarded. |
 
 **Per-request limit:** requests containing more than `max_exemplars_per_request` exemplars are rejected with `413`.
 
@@ -67,13 +67,21 @@ Exemplars are read from the `exemplars` field of each `TimeSeries` entry in the 
 
 **Endpoint:** `POST /api/v1/import/prometheus`
 
-The text-format parser extracts exemplar annotations (the `# {<labels>} <value> <timestamp>` suffix allowed on histogram and summary observations) alongside the metric rows. All samples and exemplars in the body are processed as a single atomic batch. The same `max_exemplars_per_request` limit and `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` flag apply.
+The text-format parser extracts exemplar annotations (the `# {<labels>} <value> <timestamp>` suffix
+allowed on histogram and summary observations) alongside the metric rows. The row batch and
+exemplar-store update are each atomic within their own component, but they are separate
+transactions. A later exemplar failure returns a non-success response that discloses already
+accepted rows. The same `max_exemplars_per_request` limit and
+`TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` flag apply.
 
 ### OTLP
 
 **Endpoint:** `POST /v1/metrics`
 
-Exemplar fields embedded in OTLP gauge, sum, histogram, summary, and exponential-histogram data points are extracted during normalisation and forwarded to the exemplar store. OTLP exemplars are subject to the same per-request limit.
+Exemplar fields embedded in supported OTLP gauge, sum, and explicit-histogram data points are
+extracted during normalisation and forwarded to the exemplar store. OTLP summaries do not carry
+exemplar fields in this mapping, and exponential histograms are rejected. OTLP exemplars are
+subject to the same per-request limit.
 
 ---
 
@@ -174,7 +182,10 @@ The exemplar store is persisted to a single JSON file named `exemplar-store.json
 }
 ```
 
-Writes are atomic: the new content is written to `exemplar-store.tmp`, `fsync`ed, then renamed over `exemplar-store.json`. This prevents partial writes from corrupting the store across crashes.
+Each store update writes complete replacement content to `exemplar-store.tmp`, syncs that file,
+renames it over `exemplar-store.json`, and only then publishes the corresponding in-memory state.
+The parent directory is not yet synchronized, so this is not reported as a crash-durable
+acknowledgement; see the [durability contract](durability.md).
 
 On startup the file is loaded back in full and reconstructed into the in-memory BTree index. If the file does not exist the store starts empty. A magic-string or schema-version mismatch causes the server to refuse to start with an error.
 
@@ -184,7 +195,10 @@ When no data path is configured (e.g. in unit tests or certain embedded contexts
 
 ## Cluster behaviour
 
-In a multi-node cluster, exemplars are written to the local node that receives the ingest request. There is no replication of the exemplar store across nodes; each node holds the exemplars it ingested.
+In a multi-node cluster, exemplars are hashed by series to a shard and routed to that shard's
+replica owners. A write succeeds after the configured `one`, `quorum`, or `all` consistency
+threshold is met for every affected shard. Each node stores only the exemplar replicas routed to
+it; there is no separate global exemplar-store replication layer.
 
 Query fan-out is performed transparently at query time:
 

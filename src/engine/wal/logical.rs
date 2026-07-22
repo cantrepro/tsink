@@ -70,6 +70,8 @@ pub(in crate::engine) struct LogicalWalWrite<'a> {
     writer: MutexGuard<'a, BufWriter<File>>,
     progress: LogicalWriteProgress,
     publication: LogicalWritePublication,
+    disk_reservation: Option<crate::DiskReservation>,
+    published_marker_size_before: u64,
 }
 
 impl LogicalWalWrite<'_> {
@@ -118,6 +120,7 @@ impl LogicalWalWrite<'_> {
 
         let committed_highwater = self.persist_pending()?;
         if committed_highwater == WalHighWatermark::default() {
+            self.settle_disk_after_success()?;
             self.publication.closed = true;
             return Ok(committed_highwater);
         }
@@ -146,6 +149,7 @@ impl LogicalWalWrite<'_> {
             .apply_cached_series_definition_frames_if_initialized(std::mem::take(
                 &mut self.publication.cached_series_definition_frames,
             ));
+        self.settle_disk_after_success()?;
         self.publication.closed = true;
 
         Ok(committed_highwater)
@@ -206,6 +210,7 @@ impl LogicalWalWrite<'_> {
                     &mut self.publication.cached_series_definition_frames,
                 ));
         }
+        self.settle_disk_after_success()?;
         self.publication.closed = true;
         Ok(committed_highwater)
     }
@@ -215,13 +220,23 @@ impl LogicalWalWrite<'_> {
             return Ok(());
         }
 
-        self.publication.closed = true;
         if !self.progress.has_frames() {
+            self.settle_disk_after_success()?;
+            self.publication.closed = true;
             return Ok(());
         }
-
-        self.wal
-            .rollback_partial_append(&mut self.writer, self.progress.frame_start_len)
+        let rollback_result = self
+            .wal
+            .rollback_partial_append(&mut self.writer, self.progress.frame_start_len);
+        let settlement_result = self.settle_disk_after_rollback();
+        self.publication.closed = true;
+        match (rollback_result, settlement_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Err(rollback_err), Err(settlement_err)) => Err(TsinkError::Other(format!(
+                "WAL abort rollback failed: {rollback_err}; disk settlement failed: {settlement_err}"
+            ))),
+        }
     }
 
     fn append_frame(&mut self, frame_type: u8, payload: &[u8]) -> Result<()> {
@@ -242,6 +257,7 @@ impl LogicalWalWrite<'_> {
         write_u32_at(&mut header, 16, payload.len() as u32)?;
         write_u32_at(&mut header, 20, payload_crc32)?;
         let appended_bytes = FramedWal::frame_size_bytes_for_payload_len(payload.len());
+        self.ensure_disk_capacity_for_frame(appended_bytes)?;
 
         let write_result = self
             .writer
@@ -266,9 +282,24 @@ impl LogicalWalWrite<'_> {
             .wal
             .rollback_partial_append(&mut self.writer, self.progress.frame_start_len)
         {
+            let settlement = self.settle_disk_after_rollback();
             return TsinkError::Wal {
                 operation: format!("{operation} rollback"),
-                details: format!("append failed: {write_err}; rollback failed: {recovery_err}"),
+                details: match settlement {
+                    Ok(()) => {
+                        format!("append failed: {write_err}; rollback failed: {recovery_err}")
+                    }
+                    Err(settlement_err) => format!(
+                        "append failed: {write_err}; rollback failed: {recovery_err}; disk settlement failed: {settlement_err}"
+                    ),
+                },
+            };
+        }
+
+        if let Err(settlement_err) = self.settle_disk_after_rollback() {
+            return TsinkError::Wal {
+                operation: format!("{operation} disk settlement"),
+                details: format!("append failed: {write_err}; {settlement_err}"),
             };
         }
 
@@ -278,15 +309,72 @@ impl LogicalWalWrite<'_> {
     fn rollback_after_failure(&mut self, operation: &str, err: TsinkError) -> TsinkError {
         self.publication.failed = true;
         self.publication.closed = true;
-        match self.wal.rollback_after_failure(
+        let rollback_result = self.wal.rollback_after_failure(
             &mut self.writer,
             self.progress.frame_start_len,
             operation,
             err,
-        ) {
-            Err(rollback_err) => rollback_err,
-            Ok(()) => unreachable!("WAL rollback helper must return an error on failure paths"),
+        );
+        let settlement_result = self.settle_disk_after_rollback();
+        match (rollback_result, settlement_result) {
+            (Err(rollback_err), Ok(())) => rollback_err,
+            (Err(rollback_err), Err(settlement_err)) => TsinkError::Wal {
+                operation: format!("{operation} disk settlement"),
+                details: format!("{rollback_err}; {settlement_err}"),
+            },
+            (Ok(()), _) => {
+                unreachable!("WAL rollback helper must return an error on failure paths")
+            }
         }
+    }
+
+    fn ensure_disk_capacity_for_frame(&mut self, appended_bytes: u64) -> Result<()> {
+        let Some(reservation) = self.disk_reservation.as_mut() else {
+            return Ok(());
+        };
+        let required = self
+            .progress
+            .appended_bytes
+            .saturating_add(appended_bytes)
+            .saturating_add(PUBLISHED_HIGHWATER_RECORD_LEN as u64);
+        if required > reservation.reserved_bytes() {
+            reservation.grow_by(required - reservation.reserved_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn settle_disk_after_success(&mut self) -> Result<()> {
+        let Some(reservation) = self.disk_reservation.take() else {
+            return Ok(());
+        };
+        let marker_size_after =
+            crate::disk_budget::measured_path_bytes(&self.wal.published_highwater_path)?;
+        reservation.commit(
+            self.progress.appended_bytes.saturating_add(
+                marker_size_after.saturating_sub(self.published_marker_size_before),
+            ),
+            self.published_marker_size_before
+                .saturating_sub(marker_size_after),
+        )
+    }
+
+    fn settle_disk_after_rollback(&mut self) -> Result<()> {
+        let Some(reservation) = self.disk_reservation.take() else {
+            return Ok(());
+        };
+        let current_size = self
+            .writer
+            .get_ref()
+            .metadata()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: self.wal.path.lock().clone(),
+                source,
+            })?
+            .len();
+        reservation.commit(
+            current_size.saturating_sub(self.progress.frame_start_len),
+            0,
+        )
     }
 }
 
@@ -302,6 +390,9 @@ impl Drop for LogicalWalWrite<'_> {
         {
             let _ = self.wal.refresh_runtime_accounting();
             warn!(error = %err, "logical WAL write dropped before publication");
+        }
+        if let Err(err) = self.settle_disk_after_rollback() {
+            warn!(error = %err, "logical WAL write disk reservation settlement failed");
         }
     }
 }
@@ -343,11 +434,45 @@ impl FramedWal {
         self.append_samples_payload(&payload)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::engine) fn begin_logical_write(
         &self,
         estimated_bytes: u64,
     ) -> Result<LogicalWalWrite<'_>> {
+        self.begin_limited_logical_write(estimated_bytes, u64::MAX)
+    }
+
+    pub(in crate::engine) fn begin_limited_logical_write(
+        &self,
+        estimated_bytes: u64,
+        size_limit_bytes: u64,
+    ) -> Result<LogicalWalWrite<'_>> {
         let mut writer = self.writer.lock();
+        if size_limit_bytes != u64::MAX {
+            let required = self
+                .total_size_bytes
+                .load(Ordering::Acquire)
+                .saturating_add(estimated_bytes);
+            if required > size_limit_bytes {
+                return Err(TsinkError::WalSizeLimitExceeded {
+                    limit: size_limit_bytes,
+                    required,
+                });
+            }
+        }
+        let published_marker_size_before =
+            crate::disk_budget::measured_path_bytes(&self.published_highwater_path)?;
+        let disk_reservation = self
+            .local_disk_budget
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    crate::DiskCategory::Wal,
+                    estimated_bytes.saturating_add(PUBLISHED_HIGHWATER_RECORD_LEN as u64),
+                    crate::DiskReservationKind::Growth,
+                )
+            })
+            .transpose()?;
         self.rotate_before_append_if_needed(&mut writer, estimated_bytes)?;
 
         Ok(LogicalWalWrite {
@@ -361,6 +486,8 @@ impl FramedWal {
                 last_frame_seq: None,
             },
             publication: LogicalWritePublication::default(),
+            disk_reservation,
+            published_marker_size_before,
         })
     }
 
@@ -422,6 +549,40 @@ impl FramedWal {
         )
     }
 
+    pub(super) fn persist_published_highwater_with_recovery_budget(
+        &self,
+        highwater: WalHighWatermark,
+        sync: bool,
+    ) -> Result<()> {
+        let Some(budget) = &self.local_disk_budget else {
+            return self.persist_published_highwater(highwater, sync);
+        };
+        let marker_before =
+            crate::disk_budget::measured_path_bytes(&self.published_highwater_path)?;
+        let temporary_before =
+            crate::disk_budget::measured_path_bytes(&self.published_highwater_tmp_path)?;
+        let reservation = budget.reserve(
+            crate::DiskCategory::Wal,
+            PUBLISHED_HIGHWATER_RECORD_LEN as u64,
+            crate::DiskReservationKind::Recovery,
+        )?;
+        let write_result = self.persist_published_highwater(highwater, sync);
+        let marker_after = crate::disk_budget::measured_path_bytes(&self.published_highwater_path)?;
+        let temporary_after =
+            crate::disk_budget::measured_path_bytes(&self.published_highwater_tmp_path)?;
+        let before = marker_before.saturating_add(temporary_before);
+        let after = marker_after.saturating_add(temporary_after);
+        let settlement =
+            reservation.commit(after.saturating_sub(before), before.saturating_sub(after));
+        match (write_result, settlement) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Err(write_err), Err(settlement_err)) => Err(TsinkError::Other(format!(
+                "WAL publication marker write failed: {write_err}; disk settlement failed: {settlement_err}"
+            ))),
+        }
+    }
+
     pub(super) fn publish_committed_highwater(
         &self,
         highwater: WalHighWatermark,
@@ -457,96 +618,10 @@ impl FramedWal {
             )));
         }
 
-        let payload_crc32 = checksum32(payload);
-
-        let mut writer = self.writer.lock();
-        let frame_start_len = self.active_segment_size_bytes();
-        let frame_seq = self.next_seq.load(Ordering::SeqCst);
-        let active_segment = self.active_segment.load(Ordering::SeqCst);
         let appended_bytes = Self::frame_size_bytes_for_payload_len(payload.len());
-
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        header[0..4].copy_from_slice(&FRAME_MAGIC);
-        header[4] = frame_type;
-        write_u64_at(&mut header, 8, frame_seq)?;
-        write_u32_at(&mut header, 16, payload.len() as u32)?;
-        write_u32_at(&mut header, 20, payload_crc32)?;
-
-        let write_result = writer
-            .write_all(&header)
-            .and_then(|_| writer.write_all(payload))
-            .and_then(|_| writer.flush());
-        if let Err(write_err) = write_result {
-            if let Err(recovery_err) = self.rollback_partial_append(&mut writer, frame_start_len) {
-                return Err(TsinkError::Wal {
-                    operation: "append frame rollback".to_string(),
-                    details: format!("append failed: {write_err}; rollback failed: {recovery_err}"),
-                });
-            }
-
-            return Err(write_err.into());
-        }
-
-        self.finalize_append(
-            &mut writer,
-            frame_start_len,
-            appended_bytes,
-            frame_seq.saturating_add(1),
-            WalHighWatermark {
-                segment: active_segment,
-                frame: frame_seq,
-            },
-            "append frame rollback",
-        )
-    }
-
-    fn finalize_append(
-        &self,
-        writer: &mut BufWriter<File>,
-        frame_start_len: u64,
-        appended_bytes: u64,
-        next_seq: u64,
-        highwater: WalHighWatermark,
-        rollback_operation: &str,
-    ) -> Result<()> {
-        let active_segment_size_after_append = frame_start_len.saturating_add(appended_bytes);
-        let rotated = match self.rotate_if_needed(writer, active_segment_size_after_append) {
-            Ok(rotated) => rotated,
-            Err(err) => {
-                return self.rollback_after_failure(
-                    writer,
-                    frame_start_len,
-                    rollback_operation,
-                    err,
-                );
-            }
-        };
-
-        let synced = if rotated {
-            true
-        } else {
-            match self.sync_after_append_if_needed(writer) {
-                Ok(synced) => synced,
-                Err(err) => {
-                    return self.rollback_after_failure(
-                        writer,
-                        frame_start_len,
-                        rollback_operation,
-                        err,
-                    );
-                }
-            }
-        };
-        self.publish_appended_write(
-            frame_start_len,
-            appended_bytes,
-            next_seq,
-            highwater,
-            synced,
-            rotated,
-        );
-        self.publish_committed_highwater(highwater, synced)?;
-        Ok(())
+        let mut logical = self.begin_logical_write(appended_bytes)?;
+        logical.append_frame(frame_type, payload)?;
+        logical.commit().map(|_| ())
     }
 
     fn publish_appended_write(
@@ -620,15 +695,23 @@ impl FramedWal {
         frame_start_len: u64,
     ) -> Result<()> {
         let active_path = self.path.lock().clone();
-        let truncation_file = OpenOptions::new().write(true).open(&active_path)?;
-        truncation_file.set_len(frame_start_len)?;
-        truncation_file.sync_data()?;
-        drop(truncation_file);
-
-        let (replacement, _, _) = open_segment_for_append(&active_path)?;
+        let replacement = match open_segment_for_append(&active_path) {
+            Ok((replacement, _, _)) => replacement,
+            Err(open_err) => writer.get_ref().try_clone().map_err(|clone_err| {
+                TsinkError::Wal {
+                    operation: "prepare WAL rollback writer".to_string(),
+                    details: format!(
+                        "failed to reopen active segment: {open_err}; failed to clone current handle: {clone_err}"
+                    ),
+                }
+            })?,
+        };
         let capacity = writer.capacity();
         let old_writer = std::mem::replace(writer, BufWriter::with_capacity(capacity, replacement));
+        // Never let bytes buffered by the failed logical write flush during a later operation.
         let _ = old_writer.into_parts();
+        writer.get_mut().set_len(frame_start_len)?;
+        writer.get_mut().sync_data()?;
         self.active_segment_size_bytes
             .store(frame_start_len, Ordering::Release);
 

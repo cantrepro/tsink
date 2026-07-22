@@ -13,15 +13,19 @@ impl StartupHydrationPhase {
         paths: &config::StoragePathLayout,
         next_segment_id: u64,
         wal: Option<FramedWal>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     ) -> Result<Arc<ChunkStorage>> {
-        Ok(Arc::new(ChunkStorage::new_with_data_path_and_options(
-            chunk_points,
-            wal,
-            paths.numeric_lane_path.clone(),
-            paths.blob_lane_path.clone(),
-            next_segment_id,
-            storage_options,
-        )?))
+        Ok(Arc::new(
+            ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+                chunk_points,
+                wal,
+                paths.numeric_lane_path.clone(),
+                paths.blob_lane_path.clone(),
+                next_segment_id,
+                storage_options,
+                local_disk_budget,
+            )?,
+        ))
     }
 
     pub(super) fn hydrate(

@@ -9,8 +9,10 @@ mod layout;
 #[path = "tiering/policy.rs"]
 mod policy;
 
+#[cfg(test)]
+pub(super) use catalog::persist_segment_catalog;
 pub(super) use catalog::{
-    load_segment_catalog, persist_segment_catalog, shared_segment_catalog_path,
+    load_segment_catalog, persist_segment_catalog_budgeted, shared_segment_catalog_path,
     SEGMENT_CATALOG_FILE_NAME,
 };
 #[allow(unused_imports)]

@@ -137,6 +137,27 @@ pub struct ChunkBuilder {
     last_ts: Option<i64>,
 }
 
+impl Clone for ChunkBuilder {
+    fn clone(&self) -> Self {
+        let mut frozen_point_blocks = Vec::with_capacity(self.frozen_point_blocks.capacity());
+        frozen_point_blocks.extend(self.frozen_point_blocks.iter().cloned());
+        let mut tail_points = Vec::with_capacity(self.tail_points.capacity());
+        tail_points.extend(self.tail_points.iter().cloned());
+
+        Self {
+            series_id: self.series_id,
+            lane: self.lane,
+            max_points: self.max_points,
+            point_block_max_points: self.point_block_max_points,
+            frozen_point_blocks,
+            tail_points,
+            point_count: self.point_count,
+            is_sorted_by_ts: self.is_sorted_by_ts,
+            last_ts: self.last_ts,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FrozenPointBlock {
     points: Arc<Vec<ChunkPoint>>,

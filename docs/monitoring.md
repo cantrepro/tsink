@@ -76,14 +76,19 @@ All metrics use the `tsink_` prefix. The sections below enumerate every metric g
 
 | Metric | Type | Description |
 |---|---|---|
-| `tsink_memory_used_bytes` | gauge | Bytes counted against the configured memory budget |
-| `tsink_memory_budget_bytes` | gauge | Configured memory budget |
-| `tsink_memory_excluded_bytes` | gauge | Memory intentionally excluded from the budget |
+| `tsink_memory_used_bytes` | gauge | Modeled engine bytes counted against the configured memory budget; not process RSS |
+| `tsink_memory_budget_bytes` | gauge | Configured modeled-engine memory budget |
+| `tsink_memory_excluded_bytes` | gauge | Measured excluded bytes; incomplete unless `tsink_memory_excluded_bytes_known` is 1 |
+| `tsink_memory_excluded_bytes_known` | gauge | `1` only when excluded bytes are completely measured; currently `0` for the built-in engine |
 | `tsink_memory_registry_bytes` | gauge | Budget bytes used by the in-memory series registry |
 | `tsink_memory_metadata_cache_bytes` | gauge | Budget bytes used by metadata caches and indexes |
 | `tsink_memory_persisted_index_bytes` | gauge | Budget bytes used by persisted chunk refs and timestamp indexes |
-| `tsink_memory_persisted_mmap_bytes` | gauge | Budget bytes used by mmap-backed segment payloads |
+| `tsink_memory_persisted_mmap_bytes` | gauge | Budgeted virtual mapped file length; not resident bytes |
 | `tsink_memory_tombstone_bytes` | gauge | Budget bytes used by tombstone state |
+| `tsink_memory_pressure_level{level=...}` | gauge | One-hot modeled-memory pressure state: normal, approaching, backpressured, rejecting, or degraded |
+| `tsink_memory_backpressured_writers` | gauge | Writers currently waiting on modeled storage memory |
+| `tsink_memory_backpressure_events_total` | counter | Writes that entered modeled storage-memory backpressure |
+| `tsink_memory_rejections_total` | counter | Writes rejected by the modeled storage-memory budget |
 
 ### Write-Ahead Log (WAL)
 
@@ -274,6 +279,8 @@ The flush pipeline moves active (in-memory) chunks into persisted segments and m
 | `tsink_prometheus_payload_feature_enabled{payload}` | gauge | Feature flag per payload kind (metadata, exemplar, histogram) |
 | `tsink_prometheus_payload_accepted_total{payload}` | counter | Payloads accepted per kind |
 | `tsink_prometheus_payload_rejected_total{payload}` | counter | Payloads rejected per kind |
+| `tsink_write_rejections_total{reason}` | counter | Canonical row rejections by fixed structured reason |
+| `tsink_write_indeterminate_requests_total` | counter | Failed requests whose row commit state could not be proven |
 
 #### OTLP
 
@@ -290,6 +297,13 @@ The flush pipeline moves active (in-memory) chunks into persisted segments and m
 | Metric | Type | Description |
 |---|---|---|
 | `tsink_legacy_ingest_enabled{adapter}` | gauge | `1` for each enabled legacy adapter |
+| `tsink_legacy_ingest_requests_total{adapter,outcome}` | counter | Requests or packets accepted, rejected, or throttled |
+| `tsink_legacy_ingest_samples_total{adapter,outcome}` | counter | Samples proven accepted or rejected |
+| `tsink_legacy_ingest_write_acknowledgements_total{adapter,level}` | counter | Storage attempts by `none`, `volatile`, `appended`, or `durable` acknowledgement |
+| `tsink_legacy_ingest_write_outcomes_total{adapter,outcome}` | counter | Complete, rejected, partial, or indeterminate storage outcomes |
+| `tsink_legacy_ingest_write_errors_total{adapter,reason}` | counter | Failures by a fixed structured reason set |
+| `tsink_legacy_ingest_sidecar_items_total{adapter,kind}` | counter | Metadata/exemplar components accepted or applied |
+| `tsink_legacy_ingest_limits{adapter,kind}` | gauge | Effective packet, line, and event limits |
 
 ### Admission control
 
@@ -479,7 +493,7 @@ The following metrics are good starting points for alerts:
 | Flush errors | `tsink_flush_pipeline_errors_total` | Rate > 0 for 2 minutes |
 | Persist errors | `tsink_flush_persist_errors_total` | Rate > 0 |
 | Compaction errors | `tsink_compaction_errors_total` | Rate > 0 |
-| Memory pressure | `tsink_memory_used_bytes / tsink_memory_budget_bytes` | > 0.90 |
+| Memory pressure | `tsink_memory_used_bytes / tsink_memory_budget_bytes` | > 0.90 when a finite budget is configured; this is modeled engine memory, not RSS |
 | Write admission rejections | `tsink_write_admission_rejections_total` | Rate sustained > 0 |
 | Read admission rejections | `tsink_read_admission_rejections_total` | Rate sustained > 0 |
 | Object-store inaccessible | `tsink_remote_storage_accessible` | == 0 for 2 minutes |

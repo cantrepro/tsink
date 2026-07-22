@@ -49,6 +49,48 @@ fn segment_writer_defers_final_dir_creation_until_publish() {
 }
 
 #[test]
+fn segment_quota_preflight_rejection_leaves_no_staging_or_live_reservation() {
+    let tmp = TempDir::new().unwrap();
+    let budget = crate::LocalDiskBudget::open(
+        tmp.path(),
+        crate::LocalDiskLimits {
+            max_bytes: Some(1),
+            ..crate::LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+    let writer = SegmentWriter::new_with_disk_budget(
+        tmp.path(),
+        0,
+        1,
+        Some(budget.clone()),
+        crate::DiskReservationKind::Maintenance,
+    )
+    .unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("segment must be rejected before staging");
+    assert!(matches!(
+        err,
+        TsinkError::InsufficientCompactionHeadroom {
+            limit: 1,
+            used: 0,
+            reserved: 0,
+            requested
+        } if requested > 1
+    ));
+    assert!(!writer.layout().root.exists());
+    assert!(!writer.staging_layout.root.exists());
+    let snapshot = budget.snapshot();
+    assert_eq!(snapshot.active_reservations, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+    assert_eq!(snapshot.rejections_total, 1);
+}
+
+#[test]
 fn segment_writer_replaces_stale_root_missing_manifest() {
     let tmp = TempDir::new().unwrap();
     let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();

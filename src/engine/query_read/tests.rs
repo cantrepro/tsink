@@ -23,6 +23,7 @@ fn test_options(current_time_override: Option<i64>) -> ChunkStorageOptions {
         timestamp_precision: TimestampPrecision::Nanoseconds,
         retention_window: i64::MAX,
         future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+        max_future_skew_window: None,
         retention_enforced: false,
         runtime_mode: StorageRuntimeMode::ReadWrite,
         partition_window: i64::MAX,

@@ -3,6 +3,7 @@ use super::super::*;
 use super::snapshot::record_active_series_snapshot_point_count;
 use super::snapshot::{ActivePartitionSnapshot, ActiveSeriesSnapshot};
 
+#[derive(Clone)]
 pub(in crate::engine::storage_engine) struct ActiveSeriesState {
     pub(in crate::engine::storage_engine) series_id: SeriesId,
     pub(in crate::engine::storage_engine) lane: ValueLane,
@@ -16,6 +17,21 @@ pub(in crate::engine::storage_engine) struct ActivePartitionHead {
     pub(in crate::engine::storage_engine) builder_value_heap_bytes: usize,
     pub(in crate::engine::storage_engine) min_wal_highwater: Option<WalHighWatermark>,
     pub(in crate::engine::storage_engine) max_wal_highwater: WalHighWatermark,
+}
+
+impl Clone for ActivePartitionHead {
+    fn clone(&self) -> Self {
+        let builder = self.builder.clone();
+        let builder_value_heap_bytes = builder.iter_points().fold(0usize, |total, point| {
+            total.saturating_add(super::super::value_heap_bytes(&point.value))
+        });
+        Self {
+            builder,
+            builder_value_heap_bytes,
+            min_wal_highwater: self.min_wal_highwater,
+            max_wal_highwater: self.max_wal_highwater,
+        }
+    }
 }
 
 pub(in crate::engine::storage_engine) enum PartitionHeadOpenAction {
@@ -297,22 +313,30 @@ impl ActiveSeriesState {
     }
 
     fn finalize_partition_head(&mut self, partition_id: i64) -> Result<Option<Chunk>> {
-        let Some(head) = self.partition_heads.remove(&partition_id) else {
+        let Some(head) = self.partition_heads.get(&partition_id) else {
             return Ok(None);
         };
+        let finalized = self.finalize_head_chunk(head.clone())?;
+
+        self.partition_heads.remove(&partition_id);
         if self.current_partition_id == Some(partition_id) {
             self.current_partition_id = self.partition_heads.keys().next_back().copied();
         }
 
-        self.finalize_head_chunk(head)
+        Ok(finalized)
     }
 
     fn finalize_full_partition_chunk(&mut self, partition_id: i64) -> Result<Option<Chunk>> {
-        let Some(head) = self.partition_heads.get_mut(&partition_id) else {
+        let Some(head) = self.partition_heads.get(&partition_id) else {
             return Ok(None);
         };
-        let sealed_head = head.replace_builder(self.series_id, self.lane, self.point_cap);
-        self.finalize_head_chunk(sealed_head)
+        let finalized = self.finalize_head_chunk(head.clone())?;
+
+        self.partition_heads
+            .get_mut(&partition_id)
+            .expect("partition head must remain present while finalization is staged")
+            .replace_builder(self.series_id, self.lane, self.point_cap);
+        Ok(finalized)
     }
 
     fn finalize_head_chunk(&self, head: ActivePartitionHead) -> Result<Option<Chunk>> {

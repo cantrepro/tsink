@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::{Result, TsinkError};
 
@@ -11,8 +12,26 @@ static STAGE_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);
 type DirectorySyncHook = dyn Fn(&Path) -> Result<()> + Send + Sync + 'static;
 
 #[cfg(test)]
+type TmpWriteFailureHook =
+    dyn Fn(&Path, &mut std::fs::File, &[u8]) -> Option<TsinkError> + Send + Sync + 'static;
+
+#[cfg(test)]
 pub(crate) struct DirectorySyncHookGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+struct TmpWriteFailureHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TmpWriteFailureHookGuard {
+    fn drop(&mut self) {
+        *tmp_write_failure_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
 }
 
 #[cfg(test)]
@@ -41,6 +60,22 @@ fn directory_sync_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 #[cfg(test)]
+fn tmp_write_failure_hook_slot(
+) -> &'static std::sync::Mutex<Option<std::sync::Arc<TmpWriteFailureHook>>> {
+    static TMP_WRITE_FAILURE_HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<TmpWriteFailureHook>>>,
+    > = std::sync::OnceLock::new();
+    TMP_WRITE_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn tmp_write_failure_test_lock() -> &'static std::sync::Mutex<()> {
+    static TMP_WRITE_FAILURE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    TMP_WRITE_FAILURE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 fn invoke_directory_sync_hook(path: &Path) -> Result<()> {
     let hook = directory_sync_hook_slot()
         .lock()
@@ -50,6 +85,19 @@ fn invoke_directory_sync_hook(path: &Path) -> Result<()> {
         hook(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn invoke_tmp_write_failure_hook(
+    path: &Path,
+    file: &mut std::fs::File,
+    bytes: &[u8],
+) -> Option<TsinkError> {
+    let hook = tmp_write_failure_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    hook.and_then(|hook| hook(path, file, bytes))
 }
 
 #[cfg(test)]
@@ -85,6 +133,47 @@ where
         Ok(())
     }));
     DirectorySyncHookGuard { _lock: lock }
+}
+
+#[cfg(test)]
+fn fail_tmp_write_after_bytes_once(
+    target: PathBuf,
+    bytes_before_failure: usize,
+    kind: std::io::ErrorKind,
+    message: impl Into<String>,
+) -> TmpWriteFailureHookGuard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let lock = tmp_write_failure_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let failed = Arc::new(AtomicBool::new(false));
+    let message = message.into();
+    let target_parent = target.parent().map(Path::to_path_buf);
+    let target_prefix = target
+        .file_name()
+        .map(|name| format!(".{}.tmp-", name.to_string_lossy()));
+    *tmp_write_failure_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::new(
+        move |candidate: &Path, file: &mut std::fs::File, bytes: &[u8]| {
+            let matches_target = candidate.parent().map(Path::to_path_buf) == target_parent
+                && candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .zip(target_prefix.as_deref())
+                    .is_some_and(|(name, prefix)| name.starts_with(prefix));
+            if !matches_target || failed.swap(true, Ordering::SeqCst) {
+                return None;
+            }
+            let prefix_len = bytes_before_failure.min(bytes.len());
+            if let Err(source) = file.write_all(&bytes[..prefix_len]) {
+                return Some(TsinkError::Io(source));
+            }
+            Some(TsinkError::Io(std::io::Error::new(kind, message.clone())))
+        },
+    ));
+    TmpWriteFailureHookGuard { _lock: lock }
 }
 
 pub(crate) fn path_exists_no_follow(path: &Path) -> std::io::Result<bool> {
@@ -189,6 +278,54 @@ pub(crate) fn remove_path_if_exists_and_sync_parent(path: &Path) -> Result<()> {
         sync_parent_dir(path)?;
     }
     Ok(())
+}
+
+/// Removes an owned path and credits the bytes that actually disappeared from a managed budget.
+///
+/// A zero-byte recovery reservation keeps a concurrent full-tree reconciliation from racing the
+/// deletion. Accounting remains conservatively unchanged until an exclusive reconciliation can
+/// scan the resulting tree, including any externally-added files.
+pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted(
+    path: &Path,
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+) -> Result<()> {
+    let Some(budget) = budget else {
+        return remove_path_if_exists_and_sync_parent(path);
+    };
+    if !budget.governs_entry(path)? {
+        return remove_path_if_exists_and_sync_parent(path);
+    }
+
+    let reservation = budget.reserve(category, 0, crate::DiskReservationKind::Recovery)?;
+    let removal_result = remove_path_if_exists_and_sync_parent(path);
+    let settlement_result = reservation.commit(0, 0);
+    let reconciliation_result = budget.reconcile_when_idle().map(|_| ());
+
+    let mut errors = Vec::new();
+    if let Err(err) = &removal_result {
+        errors.push(format!("remove failed: {err}"));
+    }
+    if let Err(err) = &settlement_result {
+        errors.push(format!("disk settlement failed: {err}"));
+    }
+    if let Err(err) = &reconciliation_result {
+        errors.push(format!("disk reconciliation failed: {err}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else if errors.len() == 1 {
+        match (removal_result, settlement_result, reconciliation_result) {
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+            _ => unreachable!("one recorded error must have a matching failed result"),
+        }
+    } else {
+        Err(TsinkError::Other(format!(
+            "budgeted removal of {} failed: {}",
+            path.display(),
+            errors.join("; ")
+        )))
+    }
 }
 
 pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
@@ -315,6 +452,16 @@ pub(crate) fn tmp_path_for(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{file_name}.tmp-{pid}-{nonce:016x}")))
 }
 
+fn cleanup_failed_tmp_write(tmp_path: &Path, write_err: TsinkError) -> TsinkError {
+    match remove_file_if_exists(tmp_path) {
+        Ok(_) => write_err,
+        Err(cleanup_err) => TsinkError::Other(format!(
+            "temporary file write failed: {write_err}; cleanup of {} failed: {cleanup_err}",
+            tmp_path.display()
+        )),
+    }
+}
+
 pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
@@ -335,10 +482,26 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),
         };
+
+        #[cfg(test)]
+        let mut file = file;
+        #[cfg(test)]
+        if let Some(write_err) = invoke_tmp_write_failure_hook(&tmp_path, &mut file, bytes) {
+            drop(file);
+            return Err(cleanup_failed_tmp_write(&tmp_path, write_err));
+        }
+
         let mut writer = BufWriter::new(file);
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        let write_result = (|| -> Result<()> {
+            writer.write_all(bytes)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        drop(writer);
+        if let Err(write_err) = write_result {
+            return Err(cleanup_failed_tmp_write(&tmp_path, write_err));
+        }
         return Ok(tmp_path);
     }
 
@@ -420,6 +583,103 @@ pub(crate) fn rename_and_sync_parents(source: &Path, destination: &Path) -> Resu
     Ok(())
 }
 
+pub(crate) fn rename_and_sync_parents_budgeted_reclassify(
+    source: &Path,
+    destination: &Path,
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    from: crate::DiskCategory,
+    _to: crate::DiskCategory,
+) -> Result<()> {
+    let Some(budget) = budget else {
+        return rename_and_sync_parents(source, destination);
+    };
+    if !budget.governs_entry(source)? || !budget.governs_entry(destination)? {
+        return rename_and_sync_parents(source, destination);
+    }
+
+    let reservation = budget.reserve(from, 0, crate::DiskReservationKind::Recovery)?;
+    let rename_result = rename_and_sync_parents(source, destination);
+    let rollback_result = if rename_result.is_err() {
+        rollback_rename_after_error(source, destination)
+    } else {
+        Ok(())
+    };
+    let settlement_result = reservation.commit(0, 0);
+    let reconciliation_result = budget.reconcile_when_idle().map(|_| ());
+    let post_rename_failure =
+        rename_result.is_ok() && (settlement_result.is_err() || reconciliation_result.is_err());
+    let post_rename_rollback_result = if post_rename_failure {
+        rollback_rename_after_error(source, destination)
+    } else {
+        Ok(())
+    };
+    let post_rollback_reconciliation_result = if post_rename_failure {
+        budget.reconcile_when_idle().map(|_| ())
+    } else {
+        Ok(())
+    };
+
+    match (
+        rename_result,
+        rollback_result,
+        settlement_result,
+        reconciliation_result,
+        post_rename_rollback_result,
+        post_rollback_reconciliation_result,
+    ) {
+        (Ok(()), Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Err(err),
+        (
+            rename_result,
+            rollback_result,
+            settlement_result,
+            reconciliation_result,
+            post_rename_rollback_result,
+            post_rollback_reconciliation_result,
+        ) => {
+            let mut errors = Vec::new();
+            if let Err(err) = rename_result {
+                errors.push(format!("rename failed: {err}"));
+            }
+            if let Err(err) = rollback_result {
+                errors.push(format!("rename rollback failed: {err}"));
+            }
+            if let Err(err) = settlement_result {
+                errors.push(format!("disk settlement failed: {err}"));
+            }
+            if let Err(err) = reconciliation_result {
+                errors.push(format!("disk reconciliation failed: {err}"));
+            }
+            if let Err(err) = post_rename_rollback_result {
+                errors.push(format!("post-rename rollback failed: {err}"));
+            }
+            if let Err(err) = post_rollback_reconciliation_result {
+                errors.push(format!("post-rollback disk reconciliation failed: {err}"));
+            }
+            Err(TsinkError::Other(format!(
+                "budgeted rename from {} to {} failed: {}",
+                source.display(),
+                destination.display(),
+                errors.join("; ")
+            )))
+        }
+    }
+}
+
+fn rollback_rename_after_error(source: &Path, destination: &Path) -> Result<()> {
+    let source_exists = path_exists_no_follow(source)?;
+    let destination_exists = path_exists_no_follow(destination)?;
+    match (source_exists, destination_exists) {
+        (false, true) => rename_and_sync_parents(destination, source),
+        (true, _) => Ok(()),
+        (false, false) => Err(TsinkError::Other(format!(
+            "rename failed and neither source {} nor destination {} exists",
+            source.display(),
+            destination.display()
+        ))),
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     let dir = std::fs::File::open(path).map_err(|source| TsinkError::IoWithPath {
@@ -460,6 +720,68 @@ pub fn write_file_atomically_and_sync_parent(path: &Path, bytes: &[u8]) -> Resul
     // and surface the error if the parent directory cannot be made crash-safe.
     sync_parent_dir(path)?;
     Ok(())
+}
+
+pub(crate) fn write_file_atomically_and_sync_parent_budgeted(
+    path: &Path,
+    bytes: &[u8],
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+    kind: crate::DiskReservationKind,
+) -> Result<()> {
+    let Some(budget) = budget else {
+        return write_file_atomically_and_sync_parent(path, bytes);
+    };
+    if !budget.governs_entry(path)? {
+        return write_file_atomically_and_sync_parent(path, bytes);
+    }
+
+    let previous_bytes = crate::disk_budget::measured_path_bytes(path)?;
+    let new_bytes = bytes.len() as u64;
+    let reservation = budget.reserve(category, new_bytes, kind)?;
+    match write_file_atomically_and_sync_parent(path, bytes) {
+        Ok(()) => {
+            // Do not subtract an aggregate category total for the replaced path: an external
+            // writer may have changed that entry since the last scan. Conservatively charge the
+            // complete new file, then obtain an exact exclusive scan for overwrites.
+            let settlement = reservation.commit(new_bytes, 0);
+            let reconciliation = if previous_bytes > 0 {
+                budget.reconcile_when_idle().map(|_| ())
+            } else {
+                Ok(())
+            };
+            match (settlement, reconciliation) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+                (Err(settlement_err), Err(reconciliation_err)) => Err(TsinkError::Other(format!(
+                    "atomic file write disk settlement failed: {settlement_err}; reconciliation failed: {reconciliation_err}"
+                ))),
+            }
+        }
+        Err(write_err) => {
+            // The legacy atomic helper can fail after the rename or leave an owned temporary file
+            // when a lower-level write fails. Charge the full admitted peak first, then reconcile
+            // if no other writer currently owns a reservation. This never understates a survivor.
+            let settlement = reservation.commit_as(crate::DiskCategory::Temporary, new_bytes, 0);
+            let reconciliation = budget.reconcile_when_idle().map(|_| ());
+            match (settlement, reconciliation) {
+                (Ok(()), Ok(())) => Err(write_err),
+                (settlement, reconciliation) => {
+                    let mut errors = vec![format!("write failed: {write_err}")];
+                    if let Err(err) = settlement {
+                        errors.push(format!("disk settlement failed: {err}"));
+                    }
+                    if let Err(err) = reconciliation {
+                        errors.push(format!("disk reconciliation failed: {err}"));
+                    }
+                    Err(TsinkError::Other(format!(
+                        "atomic file write failed: {}",
+                        errors.join("; ")
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +856,152 @@ mod tests {
 
         let payload = std::fs::read_to_string(path.as_ref()).expect("final payload should exist");
         assert!(payload.starts_with("worker-"));
+    }
+
+    #[test]
+    fn budgeted_removal_reconciles_exact_usage_while_over_limit() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let wal_dir = temp_dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::write(wal_dir.join("wal-0000000000000000.log"), vec![1u8; 11]).unwrap();
+        let unknown_path = temp_dir.path().join("host-owned.bin");
+        std::fs::write(&unknown_path, vec![2u8; 7]).unwrap();
+        let budget = crate::LocalDiskBudget::open(
+            temp_dir.path(),
+            crate::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..crate::LocalDiskLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(budget.snapshot().over_limit);
+
+        remove_path_if_exists_and_sync_parent_budgeted(
+            &wal_dir,
+            Some(&budget),
+            crate::DiskCategory::Wal,
+        )
+        .unwrap();
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 7);
+        assert_eq!(snapshot.unknown_bytes, 7);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+        assert_eq!(snapshot.reconciliations_total, 2);
+        assert!(unknown_path.exists());
+    }
+
+    #[test]
+    fn budgeted_rename_rolls_back_after_parent_sync_failure() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source = temp_dir.path().join(".tmp-tsink-promotion.bin");
+        let destination = temp_dir.path().join("published.bin");
+        std::fs::write(&source, b"staged").expect("staged payload should write");
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .expect("disk budget should open");
+        let _sync_failure = fail_directory_sync_once(
+            temp_dir.path().to_path_buf(),
+            "injected publication directory sync failure",
+        );
+
+        let err = rename_and_sync_parents_budgeted_reclassify(
+            &source,
+            &destination,
+            Some(&budget),
+            crate::DiskCategory::Temporary,
+            crate::DiskCategory::Segments,
+        )
+        .expect_err("publication should report the injected sync failure");
+
+        assert!(err
+            .to_string()
+            .contains("injected publication directory sync failure"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"staged");
+        assert!(!path_exists_no_follow(&destination).unwrap());
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 6);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|usage| usage.category == crate::DiskCategory::Temporary)
+                .map(|usage| usage.bytes),
+            Some(6)
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn budgeted_atomic_write_cleans_an_injected_partial_storage_full_write() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let target = temp_dir.path().join("series_index.bin");
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .expect("disk budget should open");
+        let _write_failure = fail_tmp_write_after_bytes_once(
+            target.clone(),
+            3,
+            std::io::ErrorKind::StorageFull,
+            "injected filesystem-full short write",
+        );
+
+        let err = write_file_atomically_and_sync_parent_budgeted(
+            &target,
+            b"0123456789",
+            Some(&budget),
+            crate::DiskCategory::Registry,
+            crate::DiskReservationKind::Growth,
+        )
+        .expect_err("the injected partial write should fail");
+
+        assert!(matches!(
+            err,
+            TsinkError::Io(ref source) if source.kind() == std::io::ErrorKind::StorageFull
+        ));
+        assert!(!path_exists_no_follow(&target).unwrap());
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.reconciliations_total, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budgeted_atomic_write_replaces_an_in_tree_symlink_without_touching_its_target() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let data_root = temp_dir.path().join("data");
+        let outside = temp_dir.path().join("outside.bin");
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let managed_entry = data_root.join("series_index.bin");
+        symlink(&outside, &managed_entry).unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(&data_root, crate::LocalDiskLimits::default()).unwrap();
+
+        assert!(!budget.governs(&managed_entry).unwrap());
+        assert!(budget.governs_entry(&managed_entry).unwrap());
+        write_file_atomically_and_sync_parent_budgeted(
+            &managed_entry,
+            b"replacement",
+            Some(&budget),
+            crate::DiskCategory::Registry,
+            crate::DiskReservationKind::Maintenance,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&managed_entry).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(!std::fs::symlink_metadata(&managed_entry)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(budget.snapshot().active_reservations, 0);
     }
 
     #[cfg(unix)]

@@ -205,6 +205,7 @@ mod tests {
             flush_thread_wakeup_requested: AtomicBool::new(false),
             persisted_refresh_thread: Mutex::new(None),
             rollup_thread: Mutex::new(None),
+            compaction_interval: Duration::from_secs(60),
             fail_fast_enabled: false,
         }
     }

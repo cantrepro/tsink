@@ -182,19 +182,17 @@ fn normalize_series_identity(
     let mut seen_names = BTreeSet::new();
     let mut normalized_labels = Vec::with_capacity(labels.len() + 1);
 
-    for label in labels {
-        if !seen_names.insert(label.name.clone()) {
-            return Err(format!(
-                "remote write timeseries index {series_idx} contains duplicate label '{}'",
-                label.name
-            ));
-        }
-
+    for (label_idx, label) in labels.into_iter().enumerate() {
         if label.name == "__name__" {
             validate_metric_name(
                 &label.value,
                 &format!("remote write timeseries index {series_idx} metric name"),
             )?;
+            if !seen_names.insert(label.name.clone()) {
+                return Err(format!(
+                    "remote write timeseries index {series_idx} contains a duplicate label at index {label_idx}"
+                ));
+            }
             metric_name = Some(label.value);
             continue;
         }
@@ -204,6 +202,11 @@ fn normalize_series_identity(
             &label.value,
             &format!("remote write timeseries index {series_idx}"),
         )?;
+        if !seen_names.insert(label.name.clone()) {
+            return Err(format!(
+                "remote write timeseries index {series_idx} contains a duplicate label at index {label_idx}"
+            ));
+        }
         if label.name == tenant::TENANT_LABEL {
             return Err(format!(
                 "remote write timeseries index {series_idx} label '{}' is reserved for server-managed tenant isolation",
@@ -324,14 +327,13 @@ fn normalize_auxiliary_labels(
 ) -> Result<Vec<Label>, String> {
     let mut seen_names = BTreeSet::new();
     let mut normalized = Vec::with_capacity(labels.len());
-    for label in labels {
+    for (label_idx, label) in labels.into_iter().enumerate() {
+        validate_label(&label.name, &label.value, context)?;
         if !seen_names.insert(label.name.clone()) {
             return Err(format!(
-                "{context} contains duplicate label '{}'",
-                label.name
+                "{context} contains a duplicate label at index {label_idx}"
             ));
         }
-        validate_label(&label.name, &label.value, context)?;
         if label.name == tenant::TENANT_LABEL {
             return Err(format!(
                 "{context} label '{}' is reserved for server-managed tenant isolation",
@@ -355,11 +357,13 @@ pub(crate) fn build_series_identity(
 
     let mut seen_names = BTreeSet::new();
     let mut normalized_labels = Vec::with_capacity(labels.len() + 1);
-    for (name, value) in labels {
-        if !seen_names.insert(name.clone()) {
-            return Err(format!("{context} contains duplicate label '{name}'"));
-        }
+    for (label_idx, (name, value)) in labels.into_iter().enumerate() {
         validate_label(&name, &value, context)?;
+        if !seen_names.insert(name.clone()) {
+            return Err(format!(
+                "{context} contains a duplicate label at index {label_idx}"
+            ));
+        }
         if name == tenant::TENANT_LABEL {
             return Err(format!(
                 "{context} label '{}' is reserved for server-managed tenant isolation",
@@ -416,19 +420,19 @@ fn validate_label(name: &str, value: &str, context: &str) -> Result<(), String> 
     if name.is_empty() {
         return Err(format!("{context} label name must not be empty"));
     }
-    if !is_prometheus_label_name(name) {
-        return Err(format!(
-            "{context} label '{name}' must match Prometheus label name syntax [a-zA-Z_][a-zA-Z0-9_]*"
-        ));
-    }
     if name.len() > MAX_LABEL_NAME_LEN {
         return Err(format!(
-            "{context} label '{name}' exceeds the {MAX_LABEL_NAME_LEN}-byte name limit"
+            "{context} label name exceeds the {MAX_LABEL_NAME_LEN}-byte limit"
+        ));
+    }
+    if !is_prometheus_label_name(name) {
+        return Err(format!(
+            "{context} label name must match Prometheus syntax [a-zA-Z_][a-zA-Z0-9_]*"
         ));
     }
     if value.len() > MAX_LABEL_VALUE_LEN {
         return Err(format!(
-            "{context} label '{name}' exceeds the {MAX_LABEL_VALUE_LEN}-byte value limit"
+            "{context} label value exceeds the {MAX_LABEL_VALUE_LEN}-byte limit"
         ));
     }
     Ok(())
@@ -618,7 +622,8 @@ mod tests {
         )
         .expect_err("duplicate labels must be rejected");
 
-        assert!(err.contains("duplicate label 'host'"));
+        assert!(err.contains("duplicate label at index 2"));
+        assert!(!err.contains("host"));
     }
 
     #[test]
@@ -756,7 +761,7 @@ mod tests {
             TimestampPrecision::Milliseconds,
         )
         .expect_err("invalid label name should be rejected");
-        assert!(invalid_label.contains("Prometheus label name syntax"));
+        assert!(invalid_label.contains("label name must match Prometheus syntax"));
 
         build_metadata_update("valid:metric_name", MetricType::Counter, "", "", "metadata")
             .expect("colon is valid in metric names");
@@ -806,7 +811,8 @@ mod tests {
             "test identity",
         )
         .expect_err("duplicate labels must be rejected");
-        assert!(err.contains("duplicate label 'host'"));
+        assert!(err.contains("duplicate label at index 1"));
+        assert!(!err.contains("host"));
 
         let registry = SeriesRegistry::new();
         let err = registry

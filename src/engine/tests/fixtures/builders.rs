@@ -21,6 +21,7 @@ pub(in crate::engine::storage_engine::tests) fn base_storage_test_options(
         timestamp_precision,
         retention_window: i64::MAX,
         future_skew_window: default_future_skew_window(timestamp_precision),
+        max_future_skew_window: None,
         retention_enforced: true,
         runtime_mode: StorageRuntimeMode::ReadWrite,
         partition_window: i64::MAX,

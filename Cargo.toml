@@ -2,14 +2,17 @@
 name = "tsink"
 version = "0.10.2"
 edition = "2021"
-authors = ["h2337"]
-description = "A lightweight embedded time-series database with a straightforward API"
-repository = "https://github.com/h2337/tsink"
-homepage = "https://github.com/h2337/tsink"
+rust-version = "1.89"
+authors = ["cantrepro"]
+description = "An embeddable Prometheus-native metrics database with durable local retention and PromQL"
+repository = "https://github.com/cantrepro/tsink"
+homepage = "https://github.com/cantrepro/tsink"
+documentation = "https://docs.rs/tsink"
 license = "MIT"
 keywords = ["time-series", "database", "embedded", "tsdb", "metrics"]
 categories = ["database", "embedded", "data-structures"]
 readme = "README.md"
+exclude = [".github/**", "GOAL.md", "docs/goal-progress.md", "scripts/**"]
 
 [workspace]
 members = [".", "crates/tsink-server", "crates/tsink-uniffi"]

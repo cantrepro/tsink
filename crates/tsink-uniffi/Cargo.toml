@@ -2,7 +2,12 @@
 name = "tsink-uniffi"
 version = "0.10.2"
 edition = "2021"
-description = "UniFFI bindings for tsink time-series database"
+rust-version = "1.89"
+authors = ["cantrepro"]
+description = "Python bindings for the tsink embedded Prometheus-native metrics database"
+repository = "https://github.com/cantrepro/tsink"
+homepage = "https://github.com/cantrepro/tsink"
+documentation = "https://github.com/cantrepro/tsink/blob/master/docs/python-bindings.md"
 license = "MIT"
 
 [lib]

@@ -70,16 +70,15 @@ tsink-server --memory-limit 2G --data-path ./var/tsink
 
 ### Sizing guidelines
 
-| Deployment | Recommended budget |
-|---|---|
-| Laptop / development | 256 MiB – 512 MiB |
-| Single-node server, moderate cardinality (< 100 k series) | 1 GiB – 4 GiB |
-| Single-node server, high cardinality (> 500 k series) | 4 GiB – 16 GiB |
-| Cluster node | Set to 50–70 % of available RAM; leave room for the OS page cache |
+tsink does not yet publish a measured standard memory profile. Measure both
+`tsink_memory_used_bytes` and process RSS under your own ingestion and query workload, then leave
+headroom for the excluded categories below and the operating-system page cache. The configured
+value bounds modeled storage state, not total process memory. See
+[Resource limits and profiles](resource-limits.md) for the exact scope.
 
 ### What uses memory
 
-The budget covers active chunk builders and sealed chunks pending flush. Several other categories consume memory but are **excluded** from the budget:
+The budget charges the following modeled categories:
 
 | Category | Visibility |
 |---|---|
@@ -89,17 +88,23 @@ The budget covers active chunk builders and sealed chunks pending flush. Several
 | mmap-mapped segment payloads | `tsink_memory_persisted_mmap_bytes` |
 | Tombstone state | `tsink_memory_tombstone_bytes` |
 
-Add a proportional allowance for these when calculating total process memory.
+`tsink_memory_persisted_mmap_bytes` is virtual mapped length, not resident pages. Query working
+sets, decompression buffers, pending write/WAL staging, WAL buffers and replay, rollup and remote
+refresh staging, thread stacks, allocator/runtime overhead, and host adapters remain excluded and
+unmeasured. `tsink_memory_excluded_bytes_known` is therefore `0`; do not use
+`tsink_memory_excluded_bytes` as a complete total.
 
 ### Backpressure behaviour
 
-When active + sealed bytes exceeds the budget:
+When projected modeled accounted bytes exceed the budget:
 
 1. The flush pipeline is triggered immediately to persist sealed chunks to L0 segments and free their memory.
 2. Incoming writes poll every 10 ms waiting for budget recovery.
 3. If the budget is still exhausted after `write_timeout` (default 30 s), the write returns an error.
 
-If `tsink_flush_admission_backpressure_delays_total` is climbing in `/metrics`, the budget is too small for your write rate. Either increase the budget or add a `--data-path` to enable background persistence.
+Use `tsink_memory_pressure_level`, `tsink_memory_backpressured_writers`,
+`tsink_memory_backpressure_events_total`, and `tsink_memory_rejections_total` for memory-specific
+pressure. The older flush admission counters combine memory and WAL pressure.
 
 ---
 
@@ -149,10 +154,10 @@ WAL sync mode is the primary durability vs. throughput tradeoff.
 
 | Mode | Durability | Typical overhead |
 |---|---|---|
-| `PerAppend` (default) | `fsync` per write — crash-safe | High latency per write, excellent for low-rate durable ingestion |
-| `Periodic(interval)` | OS-buffered; data in the crash window can be lost | 5–20× higher write throughput at equivalent concurrency |
+| `PerAppend` (default) | Synchronize each non-empty write before return | Higher latency; establishes the strongest software acknowledgement |
+| `Periodic(interval)` | OS-buffered; data in the crash window can be lost | Lower fsync overhead; throughput gain is workload- and platform-dependent |
 
-### Disabling crash-safety for maximum throughput
+### Choosing append-driven synchronization for higher throughput
 
 ```rust
 use tsink::wal::WalSyncMode;
@@ -169,11 +174,14 @@ let storage = StorageBuilder::new()
 tsink-server --wal-sync-mode periodic
 ```
 
-With `Periodic`, `insert_rows_with_result` returns `WriteAcknowledgement::Appended` instead of `::Durable`. A background thread fsync's the WAL at the configured interval; data written within the last interval window can be lost on process crash.
+With `Periodic`, `insert_rows_with_result` normally returns `WriteAcknowledgement::Appended`; the
+append that observes an elapsed interval and performs a sync can return `::Durable`. The interval is
+checked by appends—there is no autonomous periodic fsync timer—so unsynchronized data can be lost
+on process crash until a later append or lifecycle operation advances durability.
 
 ### Disabling the WAL entirely
 
-For in-memory or ephemeral deployments where crash-safety is not needed:
+For in-memory or ephemeral deployments where write-time WAL recovery is not needed:
 
 ```rust
 let storage = StorageBuilder::new()

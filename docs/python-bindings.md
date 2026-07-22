@@ -61,7 +61,7 @@ db.close()
 ## TsinkStorageBuilder
 
 Create a builder, call configuration methods, then call `build()` once to get a
-`TsinkDB` handle. The builder is consumed by `build()` and cannot be reused.
+`TsinkDb` handle. The builder is consumed by `build()` and cannot be reused.
 
 ```python
 from datetime import timedelta
@@ -137,7 +137,7 @@ All methods return `None` and mutate the builder in place.
 | `with_wal_enabled(bool)` | `True` | Enable/disable the write-ahead log. |
 | `with_wal_size_limit(bytes)` | unlimited | Maximum WAL size on disk. |
 | `with_wal_buffer_size(size)` | *default* | In-memory WAL buffer size. |
-| `with_wal_sync_mode(mode)` | `PerAppend` | `WalSyncMode.PER_APPEND` (crash-safe) or `WalSyncMode.PERIODIC(interval)`. |
+| `with_wal_sync_mode(mode)` | `PerAppend` | `WalSyncMode.PER_APPEND` synchronizes each non-empty write; `WalSyncMode.PERIODIC(interval)` uses an append-driven sync interval. |
 | `with_wal_replay_mode(mode)` | `Strict` | `WalReplayMode.STRICT` or `WalReplayMode.SALVAGE`. |
 
 #### Remote segments
@@ -158,9 +158,9 @@ All methods return `None` and mutate the builder in place.
 
 ---
 
-## TsinkDB
+## TsinkDb
 
-`TsinkDB` is the main database handle returned by `builder.build()`. It is
+`TsinkDb` is the main database handle returned by `builder.build()`. It is
 thread-safe and can be shared across Python threads.
 
 ### Writing data
@@ -201,6 +201,21 @@ rows = [
 db.insert_rows(rows)
 ```
 
+Use the canonical batch API when you need an outcome for every input index or intentionally choose
+best-effort admission:
+
+```python
+from tsink import WriteMode
+
+result = db.write_batch(rows, WriteMode.BEST_EFFORT)
+print(result.accepted, result.rejected, result.acknowledgement)
+for outcome in result.outcomes:
+    print(outcome.index, outcome.status)
+```
+
+`ATOMIC` accepts every row or rejects the complete batch. `BEST_EFFORT` creates one ordered atomic
+boundary per row. Rejection categories are machine-readable; diagnostic messages are bounded.
+
 #### Write acknowledgement
 
 `insert_rows_with_result` returns a `WriteResult` so you can inspect the
@@ -209,9 +224,10 @@ durability guarantee:
 ```python
 result = db.insert_rows_with_result(rows)
 print(result.acknowledgement)
-# WriteAcknowledgement.DURABLE   — fsync'd (PerAppend WAL mode)
-# WriteAcknowledgement.APPENDED  — in WAL buffer (Periodic mode)
-# WriteAcknowledgement.VOLATILE  — in memory only (WAL disabled)
+# WriteAcknowledgement.DURABLE   — the configured sync completed (normally PerAppend,
+#                                  or a Periodic append that performed an elapsed-interval sync)
+# WriteAcknowledgement.APPENDED  — committed to the WAL but not yet synchronized
+# WriteAcknowledgement.VOLATILE  — no crash-recovery log guarantee for the complete write
 ```
 
 ---
@@ -426,8 +442,12 @@ Inspect engine internals at runtime:
 
 ```python
 snap = db.observability_snapshot()
+limits = db.effective_storage_limits()
 
-print(f"memory: {snap.memory.active_and_sealed_bytes} / {snap.memory.budgeted_bytes} bytes")
+print(f"accounted memory limit: {limits.accounted_memory_bytes}")
+print(f"accounted memory: {snap.memory.accounted_bytes} bytes")
+print(f"memory pressure: {snap.memory.pressure.level}")
+print(f"excluded total known: {snap.memory.excluded_bytes_known}")
 print(f"WAL: {snap.wal.segment_count} segments, {snap.wal.size_bytes} bytes")
 print(f"compaction: {snap.compaction.runs_total} runs, {snap.compaction.errors_total} errors")
 print(f"queries: {snap.query.select_calls_total} selects")
@@ -436,8 +456,11 @@ if snap.health.degraded:
     print(f"engine degraded: {snap.health.last_background_error}")
 ```
 
-The snapshot covers memory, WAL, retention, flush pipeline, compaction, queries,
-rollups, remote storage, and overall health.
+The snapshot covers effective storage limits, memory, WAL, retention, flush pipeline, compaction,
+queries, rollups, remote storage, and overall health. `snap.limits` contains the same effective
+storage-side controls as `db.effective_storage_limits()`. An optional value of `None` means the
+built-in backend has no finite limit for that field; the memory value is not a process-RSS cap. See
+[Resource limits and profiles](resource-limits.md) for the current accounting boundary.
 
 ---
 
@@ -578,6 +601,9 @@ except TsinkUniFFIError as e:
 | `SeriesMatcher` | `name: str`, `op: SeriesMatcherOp`, `value: str` | Single label matcher. |
 | `RollupPolicy` | `id`, `metric`, `match_labels`, `interval`, `aggregation`, `bucket_origin` | Rollup definition. |
 | `WriteResult` | `acknowledgement: WriteAcknowledgement` | Write durability level. |
+| `WriteRejection` | `category`, `cause_index`, `message` | Structured, bounded rejection detail. |
+| `RowWriteOutcome` | `index`, `status` | Outcome for one submitted row. |
+| `BatchWriteResult` | `submitted`, `accepted`, `rejected`, `acknowledgement`, `outcomes` | Canonical complete batch result. |
 | `DeleteSeriesResult` | `matched_series: int`, `tombstones_applied: int` | Deletion outcome. |
 
 ### Enums
@@ -592,6 +618,9 @@ except TsinkUniFFIError as e:
 | `WalSyncMode` | `PER_APPEND`, `PERIODIC(interval)` |
 | `WalReplayMode` | `STRICT`, `SALVAGE` |
 | `WriteAcknowledgement` | `VOLATILE`, `APPENDED`, `DURABLE` |
+| `WriteMode` | `ATOMIC`, `BEST_EFFORT` |
+| `WriteRejectionCategory` | `INVALID_METRIC`, `INVALID_LABELS`, `UNSUPPORTED_VALUE`, `TIMESTAMP_OUT_OF_BOUNDS`, `BELOW_RETENTION_FLOOR`, `FUTURE_SKEW_EXCEEDED`, `CARDINALITY_LIMIT_EXCEEDED`, `CARDINALITY_CREATION_RATE_EXCEEDED`, `MEMORY_PRESSURE`, `DISK_QUOTA_EXCEEDED`, `WAL_QUOTA_EXCEEDED`, `POLICY_REJECTED`, `WRITE_TIMEOUT`, `STORAGE_CLOSED`, `STORAGE_DEGRADED`, `INTERNAL_IO`, `INTERNAL` |
+| `RowWriteStatus` | `ACCEPTED()`, `REJECTED(rejection)` |
 | `SeriesMatcherOp` | `EQUAL`, `NOT_EQUAL`, `REGEX_MATCH`, `REGEX_NO_MATCH` |
 | `HistogramCount` | `INT(v)`, `FLOAT(v)` |
 | `HistogramResetHint` | `UNKNOWN`, `YES`, `NO`, `GAUGE` |

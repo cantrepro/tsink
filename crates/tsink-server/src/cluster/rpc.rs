@@ -14,7 +14,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use tsink::{
-    DataPoint, Label, MetadataShardScope, MetricSeries, Row, SeriesPoints, SeriesSelection,
+    BatchWriteResult, DataPoint, Label, MetadataShardScope, MetricSeries, Row, SeriesPoints,
+    SeriesSelection,
 };
 
 pub const INTERNAL_RPC_PROTOCOL_VERSION: &str = "1";
@@ -29,6 +30,8 @@ pub const DEFAULT_RPC_MAX_RETRIES: usize = 2;
 pub const DEFAULT_INTERNAL_RING_VERSION: u64 = 1;
 const RETRYABLE_STATUS_CODES: [u16; 4] = [500, 502, 503, 504];
 const MAX_INTERNAL_RPC_RESPONSE_BYTES: usize = MAX_HEADER_BYTES + MAX_BODY_BYTES;
+const MAX_RPC_ERROR_DIAGNOSTIC_BYTES: usize = 512;
+const MAX_RPC_MISSING_CAPABILITIES: usize = 32;
 static RUSTLS_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
 pub const CLUSTER_CAPABILITY_RPC_V1: &str = "cluster_rpc_v1";
@@ -316,7 +319,15 @@ pub struct InternalIngestRowsRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InternalIngestRowsResponse {
+    /// Compatibility count retained for older internal clients.
     pub inserted_rows: usize,
+    /// Canonical per-row outcome and durability established by the receiving replica.
+    ///
+    /// This is optional on the wire so a rolling-upgrade coordinator can decode an older peer's
+    /// response. Write routing treats an absent result as unverified and does not count it as an
+    /// acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_result: Option<BatchWriteResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1286,10 +1297,10 @@ impl RpcClient {
             let mismatch = parsed_error.expect("checked is_some");
             return Err(RpcError::ProtocolVersionMismatch {
                 endpoint: endpoint.to_string(),
-                expected: mismatch
-                    .expected_protocol_version
-                    .unwrap_or_else(|| INTERNAL_RPC_PROTOCOL_VERSION.to_string()),
-                received: mismatch.received_protocol_version,
+                expected: INTERNAL_RPC_PROTOCOL_VERSION.to_string(),
+                received: mismatch
+                    .received_protocol_version
+                    .map(|value| sanitize_rpc_error_diagnostic(&value)),
             });
         }
         if parsed.status == 409
@@ -1301,8 +1312,13 @@ impl RpcClient {
             return Err(RpcError::CompatibilityRejected {
                 endpoint: endpoint.to_string(),
                 path: path.to_string(),
-                message: mismatch.error,
-                missing_capabilities: mismatch.missing_capabilities,
+                message: sanitize_rpc_error_diagnostic(&mismatch.error),
+                missing_capabilities: mismatch
+                    .missing_capabilities
+                    .into_iter()
+                    .take(MAX_RPC_MISSING_CAPABILITIES)
+                    .map(|capability| sanitize_rpc_error_diagnostic(&capability))
+                    .collect(),
             });
         }
 
@@ -1311,8 +1327,8 @@ impl RpcClient {
             .map(|err| err.retryable)
             .unwrap_or_else(|| RETRYABLE_STATUS_CODES.contains(&parsed.status));
         let message = parsed_error
-            .map(|err| err.error)
-            .unwrap_or_else(|| String::from_utf8_lossy(&parsed.body).to_string());
+            .map(|err| sanitize_rpc_error_diagnostic(&err.error))
+            .unwrap_or_else(|| "remote peer returned an unstructured error response".to_string());
 
         Err(RpcError::HttpStatus {
             endpoint: endpoint.to_string(),
@@ -1515,6 +1531,32 @@ struct ParsedHttpResponse {
     body: Vec<u8>,
 }
 
+fn sanitize_rpc_error_diagnostic(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len().min(MAX_RPC_ERROR_DIAGNOSTIC_BYTES));
+    let mut previous_space = false;
+    for character in message.chars() {
+        let character = if character.is_control() || character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' && previous_space {
+            continue;
+        }
+        if sanitized.len().saturating_add(character.len_utf8()) > MAX_RPC_ERROR_DIAGNOSTIC_BYTES {
+            break;
+        }
+        sanitized.push(character);
+        previous_space = character == ' ';
+    }
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        "remote peer returned an error".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
 fn parse_http_response(raw: &[u8]) -> Result<ParsedHttpResponse, String> {
     let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
         return Err("response is missing header terminator".to_string());
@@ -1534,7 +1576,7 @@ fn parse_http_response(raw: &[u8]) -> Result<ParsedHttpResponse, String> {
         .next()
         .ok_or_else(|| "response status line is missing HTTP version".to_string())?;
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(format!("unsupported HTTP version: {version}"));
+        return Err("unsupported HTTP version".to_string());
     }
     let status = status_parts
         .next()
@@ -1548,11 +1590,11 @@ fn parse_http_response(raw: &[u8]) -> Result<ParsedHttpResponse, String> {
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("malformed response header line: {line}"));
+            return Err("malformed response header line".to_string());
         };
         let name = name.trim();
         if name.is_empty() {
-            return Err(format!("malformed response header line: {line}"));
+            return Err("malformed response header line".to_string());
         }
         let name = name.to_ascii_lowercase();
         let value = value.trim().to_string();
@@ -1648,6 +1690,27 @@ mod tests {
     }
 
     #[test]
+    fn ingest_rows_response_decodes_legacy_count_without_claiming_canonical_outcome() {
+        let response: InternalIngestRowsResponse = serde_json::from_str(r#"{"inserted_rows":2}"#)
+            .expect("legacy response should remain readable");
+
+        assert_eq!(response.inserted_rows, 2);
+        assert_eq!(response.write_result, None);
+    }
+
+    #[test]
+    fn rpc_error_diagnostics_are_bounded_and_strip_control_characters() {
+        let diagnostic = sanitize_rpc_error_diagnostic(&format!(
+            "peer\r\nerror\0{}",
+            "é".repeat(MAX_RPC_ERROR_DIAGNOSTIC_BYTES)
+        ));
+
+        assert!(diagnostic.len() <= MAX_RPC_ERROR_DIAGNOSTIC_BYTES);
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(diagnostic.starts_with("peer error "));
+    }
+
+    #[test]
     fn parse_http_response_rejects_duplicate_content_length() {
         let err = parse_http_response(
             b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ntest!",
@@ -1672,7 +1735,7 @@ mod tests {
         let err = parse_http_response(b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n")
             .expect_err("unsupported version should be rejected");
 
-        assert_eq!(err, "unsupported HTTP version: HTTP/2");
+        assert_eq!(err, "unsupported HTTP version");
     }
 
     #[tokio::test]

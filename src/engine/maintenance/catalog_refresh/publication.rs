@@ -47,13 +47,18 @@ impl ChunkStorage {
             .store(cold, Ordering::Relaxed);
         if let Some(config) = &self.persisted.tiered_storage {
             if let Some(path) = config.segment_catalog_path.as_deref() {
-                tiering::persist_segment_catalog(path, inventory)?;
+                tiering::persist_segment_catalog_budgeted(
+                    path,
+                    inventory,
+                    self.persisted.local_disk_budget.as_ref(),
+                )?;
             }
             if self.runtime.runtime_mode != StorageRuntimeMode::ComputeOnly {
                 let shared_inventory = self.shared_remote_segment_inventory(inventory);
-                tiering::persist_segment_catalog(
+                tiering::persist_segment_catalog_budgeted(
                     &tiering::shared_segment_catalog_path(config),
                     &shared_inventory,
+                    self.persisted.local_disk_budget.as_ref(),
                 )?;
             }
         }

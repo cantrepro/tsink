@@ -96,8 +96,8 @@ When clustering is active, query responses include additional metadata headers:
 | Header | Description |
 |---|---|
 | `X-Tsink-Read-Consistency` | Effective read consistency level used (`one`, `quorum`, `all`). |
-| `X-Tsink-Read-Partial-Policy` | Active partial-response policy (`fail`, `warn`). |
-| `X-Tsink-Read-Response` | `true` if the response is partial (some shards unavailable). |
+| `X-Tsink-Read-Partial-Policy` | Active partial-response policy (`allow`, `deny`). |
+| `X-Tsink-Read-Partial-Response` | `true` if the response is partial (some shards unavailable). |
 | `X-Tsink-Read-Partial-Warnings` | Number of partial-response warning messages. |
 
 The JSON body of cluster query responses also contains a `partialResponse` object:
@@ -108,7 +108,7 @@ The JSON body of cluster query responses also contains a `partialResponse` objec
   "data": ...,
   "partialResponse": {
     "enabled": true,
-    "policy": "warn",
+    "policy": "allow",
     "consistency": "quorum",
     "warningCount": 1
   },
@@ -124,6 +124,13 @@ Write responses set per-request consistency headers when clustering is active:
 | `X-Tsink-Write-Required-Acks` | Number of replica acknowledgements required. |
 | `X-Tsink-Write-Acknowledged-Replicas` | Minimum replica acknowledgements actually received. |
 
+All successful non-empty HTTP ingestion responses report
+`X-Tsink-Write-Acknowledgement: volatile|appended|durable`. When a failure follows a proven row
+commit, `X-Tsink-Write-Partial: true`, `X-Tsink-Rows-Accepted`, and component counts disclose the
+effect. If the backend or experimental cluster cannot determine whether rows committed, the
+response instead uses `X-Tsink-Write-Partial: possible` and
+`X-Tsink-Write-Outcome: indeterminate_backend|indeterminate_cluster`.
+
 To override the write consistency on a per-request basis, set:
 
 ```
@@ -133,7 +140,7 @@ x-tsink-write-consistency: one|quorum|all
 To override the partial-response behaviour on reads, set:
 
 ```
-x-tsink-read-partial-response: true|false
+x-tsink-read-partial-response: allow|deny
 ```
 
 ---
@@ -352,7 +359,15 @@ Returns exemplars for the series matched by a PromQL expression.
 
 ### `GET /api/v1/status/tsdb`
 
-Returns a comprehensive JSON status snapshot covering memory usage, WAL state, compaction levels, cluster topology, admission guardrails, ingestion protocol status, exemplar store metrics, rules and rollup state, edge-sync state, and tenant policy.
+Returns a comprehensive JSON status snapshot covering effective storage limits, memory usage, WAL
+state, compaction levels, cluster topology, admission guardrails, ingestion protocol status,
+exemplar store metrics, rules and rollup state, edge-sync state, and tenant policy.
+
+`data.effectiveStorageLimits` reports the controls enforced by the built storage backend. Optional
+fields are JSON `null` when the built-in backend has no finite limit; when
+`reportedByBackend` is `false`, they are unknown. `writeTimeoutNanos` preserves the configured
+duration without millisecond rounding. These are storage-side controls, not a complete process
+memory, local-disk, or query envelope; see [Resource limits and profiles](resource-limits.md).
 
 **Authentication:** public scope, read permission.
 
@@ -454,11 +469,14 @@ OTLP HTTP metrics ingest. Accepts protobuf-encoded `ExportMetricsServiceRequest`
 |---|---|
 | `Content-Type` | `application/x-protobuf` or `application/protobuf` |
 
-Supported metric kinds: gauges, monotonic sums, histograms, summaries, and exponential histograms. Exemplars within OTLP payloads are forwarded to the exemplar store.
+Supported metric kinds: gauges, monotonic sums, histograms, and summaries. Exponential histograms
+are rejected explicitly. Exemplars within supported OTLP payloads are forwarded to the exemplar
+store.
 
 Feature flag: `TSINK_OTLP_METRICS_ENABLED` (default `true`).
 
-**Response:** `200 application/json` — OTLP `ExportMetricsServiceResponse` JSON.
+**Response:** `200 application/x-protobuf` — protobuf-encoded OTLP
+`ExportMetricsServiceResponse`.
 
 **Error codes:** `415` unsupported content type, `422` OTLP ingest disabled.
 
@@ -977,9 +995,11 @@ All control-plane mutation requests require a JSON body. Responses follow `{"sta
 | `409` | Conflict (e.g. scheduler already running, duplicate provisioning). |
 | `413` | Request exceeds a configured quota (rows, queries, range points, histogram buckets). |
 | `415` | Unsupported `Content-Type`. |
-| `422` | Feature disabled on this node. |
+| `422` | Semantically unsupported or policy-rejected data, including retention/future-skew bounds, or a disabled payload feature. |
+| `429` | Retryable admission pressure or write timeout. |
 | `500` | Internal server error. |
 | `503` | Required subsystem not configured or unavailable. |
+| `507` | A persistent queue or local storage resource could not accept more data. |
 
 On write and read admission errors the response also sets:
 
@@ -987,3 +1007,7 @@ On write and read admission errors the response also sets:
 |---|---|
 | `X-Tsink-Write-Error-Code` | Machine-readable write rejection code. |
 | `X-Tsink-Read-Error-Code` | Machine-readable read rejection code. |
+
+Write diagnostics are bounded. Expected canonical row rejections use stable reason-specific codes;
+malformed backend results use `write_invalid_outcome`, and post-dispatch failures with unknown
+commit state are explicitly marked indeterminate rather than reported as a definite rejection.

@@ -40,6 +40,7 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
     let wal = StartupWalOpenPhase::open(&builder, &plan, replay_highwater)?;
     let storage_options = plan.storage_options().clone();
     let paths = plan.paths().clone();
+    let local_disk_budget = plan.local_disk_budget().cloned();
     let runtime_inputs = plan.into_runtime_inputs();
 
     let storage = StartupHydrationPhase::create_storage(
@@ -48,6 +49,7 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         &paths,
         next_segment_id,
         wal,
+        local_disk_budget,
     )?;
     StartupHydrationPhase::hydrate(
         storage.as_ref(),

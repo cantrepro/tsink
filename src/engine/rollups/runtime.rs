@@ -1,9 +1,12 @@
-use super::policy::{load_rollup_policies, persist_rollup_policies};
+use super::policy::{load_rollup_policies, persist_rollup_policies_budgeted};
 use super::*;
 use crate::engine::series::SeriesKey;
 
 impl RollupRuntimeState {
-    pub(in crate::engine) fn new(data_path: Option<PathBuf>) -> Self {
+    pub(in crate::engine) fn new_with_disk_budget(
+        data_path: Option<PathBuf>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Self {
         let dir_path = data_path.map(|path| path.join(ROLLUP_DIR_NAME));
         let policies_path = dir_path
             .as_ref()
@@ -15,6 +18,7 @@ impl RollupRuntimeState {
             dir_path,
             policies_path,
             state_path,
+            local_disk_budget,
             policies: RwLock::new(Vec::new()),
             checkpoints: RwLock::new(HashMap::new()),
             pending_materializations: RwLock::new(HashMap::new()),
@@ -153,12 +157,31 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
     })
 }
 
+#[cfg(test)]
 pub(super) fn persist_rollup_state(
     path: Option<&Path>,
     checkpoints: &HashMap<String, BTreeMap<String, i64>>,
     generations: &HashMap<String, u64>,
     pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
     pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+) -> Result<()> {
+    persist_rollup_state_budgeted(
+        path,
+        checkpoints,
+        generations,
+        pending_materializations,
+        pending_delete_invalidations,
+        None,
+    )
+}
+
+fn persist_rollup_state_budgeted(
+    path: Option<&Path>,
+    checkpoints: &HashMap<String, BTreeMap<String, i64>>,
+    generations: &HashMap<String, u64>,
+    pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
+    pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let Some(path) = path else {
         if checkpoints.is_empty()
@@ -239,7 +262,13 @@ pub(super) fn persist_rollup_state(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_file_atomically_and_sync_parent(path, &encoded)
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &encoded,
+        local_disk_budget,
+        crate::DiskCategory::Rollups,
+        crate::DiskReservationKind::Growth,
+    )
 }
 
 pub(super) fn normalize_pending_delete_invalidations(
@@ -464,12 +493,13 @@ impl<'a> RollupStateStoreContext<'a> {
     ) -> Result<()> {
         #[cfg(test)]
         self.state.invoke_state_persist_hook()?;
-        persist_rollup_state(
+        persist_rollup_state_budgeted(
             self.state.state_path(),
             checkpoints,
             generations,
             pending_materializations,
             pending_delete_invalidations,
+            self.state.local_disk_budget.as_ref(),
         )
     }
 
@@ -485,15 +515,20 @@ impl<'a> RollupStateStoreContext<'a> {
     }
 
     pub(super) fn persist_snapshot(self, snapshot: &RollupRuntimeSnapshot) -> Result<()> {
-        persist_rollup_policies(self.state.policies_path(), &snapshot.policies)?;
+        persist_rollup_policies_budgeted(
+            self.state.policies_path(),
+            &snapshot.policies,
+            self.state.local_disk_budget.as_ref(),
+        )?;
         #[cfg(test)]
         self.state.invoke_state_persist_hook()?;
-        persist_rollup_state(
+        persist_rollup_state_budgeted(
             self.state.state_path(),
             &snapshot.checkpoints,
             &snapshot.generations,
             &snapshot.pending_materializations,
             &snapshot.pending_delete_invalidations,
+            self.state.local_disk_budget.as_ref(),
         )
     }
 

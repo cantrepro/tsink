@@ -21,6 +21,7 @@ impl StorageStateAssembly {
         blob_lane_path: Option<PathBuf>,
         wal: Option<FramedWal>,
         options: &ChunkStorageOptions,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
         resources: StorageAssemblyResources,
     ) -> Self {
         let StorageAssemblyResources {
@@ -30,7 +31,6 @@ impl StorageStateAssembly {
             blob_compactor,
             lifecycle,
             compaction_lock,
-            compaction_thread,
             persisted_index_dirty,
             pending_persisted_segment_diff,
             observability,
@@ -48,6 +48,7 @@ impl StorageStateAssembly {
                 numeric_compactor,
                 blob_compactor,
                 wal,
+                local_disk_budget.clone(),
                 options.tiered_storage.clone(),
                 options.remote_segment_cache_policy,
                 options.remote_segment_refresh_interval,
@@ -58,10 +59,10 @@ impl StorageStateAssembly {
             memory: Self::build_memory_accounting_state(options),
             coordination: Self::build_coordination_state(lifecycle, compaction_lock),
             background: Self::build_background_worker_supervision_state(
-                compaction_thread,
+                options.compaction_interval,
                 options.background_fail_fast,
             ),
-            rollups: Self::build_rollup_state(series_index_path),
+            rollups: Self::build_rollup_state(series_index_path, local_disk_budget),
             observability,
         }
     }
@@ -96,6 +97,7 @@ impl StorageStateAssembly {
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
         wal: Option<FramedWal>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
         tiered_storage: Option<config::TieredStorageConfig>,
         remote_segment_cache_policy: RemoteSegmentCachePolicy,
         remote_segment_refresh_interval: Duration,
@@ -112,6 +114,7 @@ impl StorageStateAssembly {
             numeric_compactor,
             blob_compactor,
             wal,
+            local_disk_budget,
             tiered_storage,
             remote_segment_cache_policy,
             remote_segment_refresh_interval,
@@ -126,6 +129,7 @@ impl StorageStateAssembly {
             timestamp_precision: options.timestamp_precision,
             retention_window: options.retention_window.max(0),
             future_skew_window: options.future_skew_window.max(0),
+            max_future_skew_window: options.max_future_skew_window.map(|window| window.max(0)),
             retention_enforced: options.retention_enforced,
             runtime_mode: options.runtime_mode,
             partition_window: options.partition_window.max(1),
@@ -152,6 +156,9 @@ impl StorageStateAssembly {
             persisted_mmap_used_bytes: AtomicU64::new(0),
             tombstone_used_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(options.memory_budget_bytes),
+            active_backpressured_writers: AtomicU64::new(0),
+            backpressure_events_total: AtomicU64::new(0),
+            rejections_total: AtomicU64::new(0),
             backpressure_lock: Mutex::new(()),
             admission_backpressure_lock: Mutex::new(()),
         }
@@ -172,25 +179,30 @@ impl StorageStateAssembly {
     }
 
     fn build_background_worker_supervision_state(
-        compaction_thread: Option<std::thread::JoinHandle<()>>,
+        compaction_interval: Duration,
         background_fail_fast: bool,
     ) -> BackgroundWorkerSupervisorState {
         BackgroundWorkerSupervisorState {
-            compaction_thread: Mutex::new(compaction_thread),
+            compaction_thread: Mutex::new(None),
             flush_thread: Mutex::new(None),
             flush_thread_wakeup_requested: AtomicBool::new(false),
             persisted_refresh_thread: Mutex::new(None),
             rollup_thread: Mutex::new(None),
+            compaction_interval,
             fail_fast_enabled: background_fail_fast,
         }
     }
 
-    fn build_rollup_state(series_index_path: Option<PathBuf>) -> RollupState {
+    fn build_rollup_state(
+        series_index_path: Option<PathBuf>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> RollupState {
         RollupState {
-            runtime: rollups::RollupRuntimeState::new(
+            runtime: rollups::RollupRuntimeState::new_with_disk_budget(
                 series_index_path
                     .as_ref()
                     .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
+                local_disk_budget,
             ),
             run_lock: Mutex::new(()),
         }

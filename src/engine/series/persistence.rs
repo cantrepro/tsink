@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -13,7 +14,7 @@ use crate::engine::binio::{
     encode_optional_zstd_framed_file, read_array, read_bytes, read_u16, read_u32, read_u64,
 };
 use crate::engine::fs_utils::{
-    path_exists_no_follow, sync_parent_dir, write_file_atomically_and_sync_parent,
+    path_exists_no_follow, sync_parent_dir, write_file_atomically_and_sync_parent_budgeted,
 };
 use crate::{Result, TsinkError};
 
@@ -65,7 +66,21 @@ impl SeriesRegistry {
         Ok(loaded)
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_incremental_to_snapshot_path(&self, snapshot_path: &Path) -> Result<()> {
+        self.persist_incremental_to_snapshot_path_with_disk_budget_and_kind(
+            snapshot_path,
+            None,
+            crate::DiskReservationKind::Maintenance,
+        )
+    }
+
+    pub(crate) fn persist_incremental_to_snapshot_path_with_disk_budget_and_kind(
+        &self,
+        snapshot_path: &Path,
+        local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+        reservation_kind: crate::DiskReservationKind,
+    ) -> Result<()> {
         if self.is_empty() {
             return Ok(());
         }
@@ -92,10 +107,35 @@ impl SeriesRegistry {
         }
 
         let segment_path = Self::allocate_incremental_segment_path(&dir_path)?;
-        self.persist_to_path(&segment_path)
+        self.persist_to_path_with_disk_budget_and_kind(
+            &segment_path,
+            local_disk_budget,
+            reservation_kind,
+        )
     }
 
     pub fn persist_to_path(&self, path: &Path) -> Result<()> {
+        self.persist_to_path_with_disk_budget(path, None)
+    }
+
+    pub(crate) fn persist_to_path_with_disk_budget(
+        &self,
+        path: &Path,
+        local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    ) -> Result<()> {
+        self.persist_to_path_with_disk_budget_and_kind(
+            path,
+            local_disk_budget,
+            crate::DiskReservationKind::Maintenance,
+        )
+    }
+
+    pub(crate) fn persist_to_path_with_disk_budget_and_kind(
+        &self,
+        path: &Path,
+        local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+        reservation_kind: crate::DiskReservationKind,
+    ) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -145,7 +185,13 @@ impl SeriesRegistry {
         }
 
         let bytes = encode_optional_zstd_framed_file(&bytes)?;
-        write_file_atomically_and_sync_parent(path, &bytes)?;
+        write_file_atomically_and_sync_parent_budgeted(
+            path,
+            &bytes,
+            local_disk_budget,
+            crate::DiskCategory::Registry,
+            reservation_kind,
+        )?;
         Ok(())
     }
 

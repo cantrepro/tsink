@@ -6,7 +6,7 @@ use xxhash_rust::xxh64::Xxh64;
 
 use super::tiering::SegmentLaneFamily;
 use super::*;
-use crate::engine::fs_utils::{path_exists_no_follow, write_file_atomically_and_sync_parent};
+use crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted;
 use crate::engine::segment::IndexedSegment;
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::Label;
@@ -73,12 +73,30 @@ pub(super) fn validate_registry_catalog(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<Option<ValidatedRegistryCatalog>> {
     let path = catalog_path(snapshot_path);
-    if !path_exists_no_follow(&path)? {
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
         return Ok(None);
     }
+    if !metadata.is_file() {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted registry catalog is not a regular file: {}",
+            path.display()
+        )));
+    }
 
+    let catalog_bytes = std::fs::read(&path)?;
+    let actual = match serde_json::from_slice::<PersistedRegistryCatalogFile>(&catalog_bytes) {
+        Ok(actual) => actual,
+        Err(_) => return Ok(None),
+    };
+    if actual.version != REGISTRY_CATALOG_VERSION {
+        return Ok(None);
+    }
     let expected_segments = build_catalog_entries(sources)?;
-    let actual = serde_json::from_slice::<PersistedRegistryCatalogFile>(&std::fs::read(&path)?)?;
     if actual.segments != expected_segments {
         return Ok(None);
     }
@@ -88,13 +106,21 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
-pub(super) fn persist_registry_catalog(
+pub(super) fn persist_registry_catalog_budgeted_with_kind(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
 ) -> Result<()> {
     let path = catalog_path(snapshot_path);
     let bytes = serde_json::to_vec_pretty(&build_catalog(sources)?)?;
-    write_file_atomically_and_sync_parent(&path, &bytes)
+    write_file_atomically_and_sync_parent_budgeted(
+        &path,
+        &bytes,
+        local_disk_budget,
+        crate::DiskCategory::Registry,
+        reservation_kind,
+    )
 }
 
 pub(super) fn inventory_sources(

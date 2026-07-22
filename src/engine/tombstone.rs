@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::engine::fs_utils::{
-    path_exists_no_follow, remove_path_if_exists, sync_dir, sync_parent_dir,
-    write_file_atomically_and_sync_parent,
+    remove_path_if_exists_and_sync_parent_budgeted, write_file_atomically_and_sync_parent_budgeted,
 };
 use crate::engine::series::SeriesId;
 use crate::{Result, TsinkError};
@@ -251,7 +251,13 @@ fn load_sharded_tombstones(
     Ok(tombstones)
 }
 
-fn write_shard_file(path: &Path, shard_index: usize, map: TombstoneMap) -> Result<Option<String>> {
+fn write_shard_file(
+    path: &Path,
+    shard_index: usize,
+    map: TombstoneMap,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<Option<String>> {
     if map.is_empty() {
         return Ok(None);
     }
@@ -262,7 +268,13 @@ fn write_shard_file(path: &Path, shard_index: usize, map: TombstoneMap) -> Resul
     );
     let shard_path = tombstone_shards_dir(path).join(&file_name);
     let payload = encode_shard(shard_entries_from_map(map))?;
-    write_file_atomically_and_sync_parent(&shard_path, &payload)?;
+    write_file_atomically_and_sync_parent_budgeted(
+        &shard_path,
+        &payload,
+        local_disk_budget,
+        crate::DiskCategory::Tombstones,
+        reservation_kind,
+    )?;
     Ok(Some(file_name))
 }
 
@@ -270,34 +282,39 @@ fn cleanup_replaced_shards(
     path: &Path,
     previous: &[Option<String>],
     next: &[Option<String>],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let shards_dir = tombstone_shards_dir(path);
     let keep = next.iter().flatten().cloned().collect::<HashSet<_>>();
-    let mut removed_any = false;
     for file_name in previous.iter().flatten() {
         if keep.contains(file_name) {
             continue;
         }
         let shard_path = shards_dir.join(file_name);
-        let existed = path_exists_no_follow(&shard_path)?;
-        remove_path_if_exists(&shard_path)?;
-        removed_any |= existed;
-    }
-    if removed_any {
-        sync_dir(&shards_dir)?;
+        remove_path_if_exists_and_sync_parent_budgeted(
+            &shard_path,
+            local_disk_budget,
+            crate::DiskCategory::Tombstones,
+        )?;
     }
     Ok(())
 }
 
-fn remove_tombstone_store(path: &Path) -> Result<()> {
+fn remove_tombstone_store(
+    path: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
     let store_dir = tombstone_store_dir(path);
-    let manifest_exists = path_exists_no_follow(path)?;
-    let store_exists = path_exists_no_follow(&store_dir)?;
-    remove_path_if_exists(path)?;
-    remove_path_if_exists(&store_dir)?;
-    if manifest_exists || store_exists {
-        sync_parent_dir(path)?;
-    }
+    remove_path_if_exists_and_sync_parent_budgeted(
+        path,
+        local_disk_budget,
+        crate::DiskCategory::Tombstones,
+    )?;
+    remove_path_if_exists_and_sync_parent_budgeted(
+        &store_dir,
+        local_disk_budget,
+        crate::DiskCategory::Tombstones,
+    )?;
     Ok(())
 }
 
@@ -305,6 +322,8 @@ fn write_full_sharded_store(
     path: &Path,
     tombstones: &TombstoneMap,
     previous_manifest: Option<&TombstoneStoreManifestV2>,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
 ) -> Result<()> {
     let mut shards = vec![TombstoneMap::new(); TOMBSTONE_STORE_SHARD_COUNT];
     for (&series_id, ranges) in tombstones {
@@ -313,13 +332,30 @@ fn write_full_sharded_store(
 
     let mut manifest = empty_store_manifest();
     for (shard_index, shard_map) in shards.into_iter().enumerate() {
-        manifest.shards[shard_index] = write_shard_file(path, shard_index, shard_map)?;
+        manifest.shards[shard_index] = write_shard_file(
+            path,
+            shard_index,
+            shard_map,
+            local_disk_budget,
+            reservation_kind,
+        )?;
     }
 
     let payload = encode_store_manifest(&manifest)?;
-    write_file_atomically_and_sync_parent(path, &payload)?;
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &payload,
+        local_disk_budget,
+        crate::DiskCategory::Tombstones,
+        reservation_kind,
+    )?;
     if let Some(previous_manifest) = previous_manifest {
-        cleanup_replaced_shards(path, &previous_manifest.shards, &manifest.shards)?;
+        cleanup_replaced_shards(
+            path,
+            &previous_manifest.shards,
+            &manifest.shards,
+            local_disk_budget,
+        )?;
     }
     Ok(())
 }
@@ -365,11 +401,26 @@ pub(crate) fn load_tombstones(path: &Path) -> Result<TombstoneMap> {
     Ok(tombstones)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_tombstones(path: &Path, tombstones: &TombstoneMap) -> Result<()> {
+    persist_tombstones_with_disk_budget_and_kind(
+        path,
+        tombstones,
+        None,
+        crate::DiskReservationKind::Maintenance,
+    )
+}
+
+pub(crate) fn persist_tombstones_with_disk_budget_and_kind(
+    path: &Path,
+    tombstones: &TombstoneMap,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<()> {
     let mut normalized = tombstones.clone();
     normalize_tombstone_map(&mut normalized)?;
     if normalized.is_empty() {
-        return remove_tombstone_store(path);
+        return remove_tombstone_store(path, local_disk_budget);
     }
     let previous_manifest = match std::fs::read(path) {
         Ok(bytes) => load_store_manifest_from_bytes(&bytes)?,
@@ -381,10 +432,25 @@ pub(crate) fn persist_tombstones(path: &Path, tombstones: &TombstoneMap) -> Resu
             })
         }
     };
-    write_full_sharded_store(path, &normalized, previous_manifest.as_ref())
+    write_full_sharded_store(
+        path,
+        &normalized,
+        previous_manifest.as_ref(),
+        local_disk_budget,
+        reservation_kind,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn persist_tombstone_updates(path: &Path, updates: &TombstoneMap) -> Result<()> {
+    persist_tombstone_updates_with_disk_budget(path, updates, None)
+}
+
+pub(crate) fn persist_tombstone_updates_with_disk_budget(
+    path: &Path,
+    updates: &TombstoneMap,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
     let mut normalized_updates = updates.clone();
     normalize_tombstone_map(&mut normalized_updates)?;
     if normalized_updates.is_empty() {
@@ -414,7 +480,13 @@ pub(crate) fn persist_tombstone_updates(path: &Path, updates: &TombstoneMap) -> 
             merged.insert(series_id, ranges);
         }
         normalize_tombstone_map(&mut merged)?;
-        return write_full_sharded_store(path, &merged, None);
+        return write_full_sharded_store(
+            path,
+            &merged,
+            None,
+            local_disk_budget,
+            crate::DiskReservationKind::Maintenance,
+        );
     }
 
     let previous_manifest = previous_manifest.unwrap_or_else(empty_store_manifest);
@@ -441,12 +513,30 @@ pub(crate) fn persist_tombstone_updates(path: &Path, updates: &TombstoneMap) -> 
             }
         }
         normalize_tombstone_map(&mut shard_map)?;
-        next_manifest.shards[shard_index] = write_shard_file(path, shard_index, shard_map)?;
+        next_manifest.shards[shard_index] = write_shard_file(
+            path,
+            shard_index,
+            shard_map,
+            local_disk_budget,
+            crate::DiskReservationKind::Maintenance,
+        )?;
     }
 
     let payload = encode_store_manifest(&next_manifest)?;
-    write_file_atomically_and_sync_parent(path, &payload)?;
-    cleanup_replaced_shards(path, &previous_manifest.shards, &next_manifest.shards)
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &payload,
+        local_disk_budget,
+        crate::DiskCategory::Tombstones,
+        crate::DiskReservationKind::Maintenance,
+    )?;
+    cleanup_replaced_shards(
+        path,
+        &previous_manifest.shards,
+        &next_manifest.shards,
+        local_disk_budget,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -33,6 +33,106 @@ fn internal_storage_write_error_response(
     internal_error_response(fallback_status, fallback_code, message, fallback_retryable)
 }
 
+#[derive(Debug, Clone)]
+enum InternalAtomicWriteDisposition {
+    Accepted(WriteAcknowledgement),
+    Rejected(tsink::WriteRejection),
+}
+
+fn inspect_internal_atomic_write_result(
+    expected_rows: usize,
+    result: &BatchWriteResult,
+) -> Result<InternalAtomicWriteDisposition, HttpResponse> {
+    let invalid_result_response = || {
+        internal_error_response(
+            500,
+            "write_invalid_outcome",
+            "internal ingest failed: storage returned an invalid canonical write result",
+            false,
+        )
+    };
+    let indexed_outcomes_are_complete = result.submitted == expected_rows
+        && result.outcomes.len() == expected_rows
+        && result
+            .outcomes
+            .iter()
+            .enumerate()
+            .all(|(index, outcome)| outcome.index == index);
+    let accepted_outcomes = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Accepted))
+        .count();
+    let rejected_outcomes = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Rejected(_)))
+        .count();
+    let counts_are_consistent = result.accepted == accepted_outcomes
+        && result.rejected == rejected_outcomes
+        && accepted_outcomes.saturating_add(rejected_outcomes) == expected_rows;
+    if !indexed_outcomes_are_complete || !counts_are_consistent {
+        return Err(invalid_result_response());
+    }
+
+    if result.rejected > 0 {
+        if result.accepted != 0 || result.acknowledgement.is_some() {
+            return Err(invalid_result_response());
+        }
+        record_canonical_write_rejections(result);
+        let Some(rejection) = result
+            .outcomes
+            .iter()
+            .find_map(|outcome| match &outcome.status {
+                RowWriteStatus::Rejected(rejection) => Some(rejection.clone()),
+                RowWriteStatus::Accepted => None,
+                _ => None,
+            })
+        else {
+            return Err(invalid_result_response());
+        };
+        return Ok(InternalAtomicWriteDisposition::Rejected(rejection));
+    }
+
+    if result.accepted != expected_rows {
+        return Err(invalid_result_response());
+    }
+    let Some(acknowledgement) = result.acknowledgement else {
+        return Err(invalid_result_response());
+    };
+
+    Ok(InternalAtomicWriteDisposition::Accepted(acknowledgement))
+}
+
+fn validate_internal_atomic_write_result(
+    expected_rows: usize,
+    result: &BatchWriteResult,
+) -> Result<WriteAcknowledgement, HttpResponse> {
+    match inspect_internal_atomic_write_result(expected_rows, result)? {
+        InternalAtomicWriteDisposition::Accepted(acknowledgement) => Ok(acknowledgement),
+        InternalAtomicWriteDisposition::Rejected(rejection) => {
+            let (status, error_code, retry_after) =
+                write_rejection_http_mapping(rejection.category);
+            let retryable = retry_after.is_some()
+                || matches!(
+                    rejection.category,
+                    WriteRejectionCategory::InternalIo | WriteRejectionCategory::Internal
+                );
+            let diagnostic = bounded_write_rejection_diagnostic(&rejection.message);
+            let mut response = internal_error_response(
+                status,
+                error_code,
+                format!("internal ingest rejected: {diagnostic}"),
+                retryable,
+            );
+            if let Some(retry_after) = retry_after {
+                response = response.with_header("Retry-After", retry_after);
+            }
+            Err(response)
+        }
+    }
+}
+
 pub(super) fn cluster_ring_version(cluster_context: Option<&ClusterRequestContext>) -> u64 {
     cluster_context
         .and_then(|context| context.control_consensus.as_ref())
@@ -84,6 +184,36 @@ fn effective_internal_dedupe_store<'a>(
     cluster_context
         .and_then(|context| context.dedupe_store.as_deref())
         .or_else(|| edge_sync_context.and_then(|context| context.accept_dedupe_store.as_deref()))
+}
+
+fn unavailable_dedupe_replay_response(key: &str) -> HttpResponse {
+    internal_error_response(
+        409,
+        "idempotency_result_unavailable",
+        format!(
+            "the completed result for idempotency_key '{key}' is unavailable or belongs to a different internal ingest endpoint"
+        ),
+        false,
+    )
+    .with_header("X-Tsink-Idempotency-Replayed", "true")
+}
+
+fn dedupe_persistence_failure_response(
+    err: &crate::cluster::dedupe::DedupePersistenceError,
+    accepted_rows: usize,
+    acknowledgement: Option<WriteAcknowledgement>,
+    accepted_metadata_updates: usize,
+    applied_metadata_updates: usize,
+    accepted_exemplars: usize,
+) -> HttpResponse {
+    partial_write_error_response(
+        internal_error_response(503, "dedupe_persistence_failed", err.to_string(), true),
+        accepted_rows,
+        acknowledgement,
+        accepted_metadata_updates,
+        applied_metadata_updates,
+        accepted_exemplars,
+    )
 }
 
 pub(super) fn membership_from_control_state(
@@ -1250,7 +1380,7 @@ pub(super) async fn handle_internal_ingest_write(
 
     let dedupe_store = effective_internal_dedupe_store(cluster_context, edge_sync_context);
     let request_idempotency_key = payload.idempotency_key.clone();
-    let mut dedupe_key_to_commit = None::<String>;
+    let mut dedupe_reservation = None;
     if let Some(dedupe_store) = dedupe_store {
         let key = match request_idempotency_key.as_deref() {
             Some(key) => key,
@@ -1269,17 +1399,34 @@ pub(super) async fn handle_internal_ingest_write(
         }
 
         match dedupe_store.begin(key) {
-            Ok(DedupeBeginOutcome::Duplicate) => {
-                return json_response(
+            Ok(DedupeBeginOutcome::Duplicate {
+                completion:
+                    Some(crate::cluster::dedupe::DedupeCompletion::IngestWrite {
+                        inserted_rows,
+                        accepted_metadata_updates,
+                        accepted_exemplars,
+                        dropped_exemplars,
+                        acknowledgement,
+                    }),
+            }) => {
+                let mut response = json_response(
                     200,
                     &InternalIngestWriteResponse {
                         inserted_rows,
                         accepted_metadata_updates,
                         accepted_exemplars,
-                        dropped_exemplars: 0,
+                        dropped_exemplars,
                     },
                 )
                 .with_header("X-Tsink-Idempotency-Replayed", "true");
+                if let Some(acknowledgement) = acknowledgement {
+                    response = response
+                        .with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+                }
+                return response;
+            }
+            Ok(DedupeBeginOutcome::Duplicate { .. }) => {
+                return unavailable_dedupe_replay_response(key);
             }
             Ok(DedupeBeginOutcome::InFlight) => {
                 return internal_error_response(
@@ -1289,8 +1436,8 @@ pub(super) async fn handle_internal_ingest_write(
                     true,
                 );
             }
-            Ok(DedupeBeginOutcome::Accepted) => {
-                dedupe_key_to_commit = Some(key.to_string());
+            Ok(DedupeBeginOutcome::Accepted(reservation)) => {
+                dedupe_reservation = Some(reservation);
             }
             Err(err) => {
                 return internal_error_response(503, "dedupe_unavailable", err.to_string(), true);
@@ -1298,7 +1445,9 @@ pub(super) async fn handle_internal_ingest_write(
         }
     }
 
-    if !payload.rows.is_empty() {
+    let row_acknowledgement = if payload.rows.is_empty() {
+        None
+    } else {
         let storage = Arc::clone(storage);
         let rows = payload
             .rows
@@ -1306,9 +1455,15 @@ pub(super) async fn handle_internal_ingest_write(
             .into_iter()
             .map(InternalRow::into_row)
             .collect::<Vec<_>>();
-        let result = tokio::task::spawn_blocking(move || storage.insert_rows(&rows)).await;
+        let row_count = rows.len();
+        let result =
+            tokio::task::spawn_blocking(move || storage.write_batch(&rows, WriteMode::Atomic))
+                .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(result)) => match validate_internal_atomic_write_result(row_count, &result) {
+                Ok(acknowledgement) => Some(acknowledgement),
+                Err(response) => return response,
+            },
             Ok(Err(err)) => {
                 return internal_storage_write_error_response(
                     &err,
@@ -1327,7 +1482,7 @@ pub(super) async fn handle_internal_ingest_write(
                 );
             }
         }
-    }
+    };
 
     let metadata_applied = if metadata_updates.is_empty() {
         0usize
@@ -1337,11 +1492,18 @@ pub(super) async fn handle_internal_ingest_write(
         {
             Ok(applied) => applied,
             Err(err) => {
-                return internal_error_response(
-                    500,
-                    "metadata_store_failed",
-                    format!("internal metadata ingest failed: {err}"),
-                    true,
+                return partial_write_error_response(
+                    internal_error_response(
+                        500,
+                        "metadata_store_failed",
+                        format!("internal metadata ingest failed: {err}"),
+                        true,
+                    ),
+                    inserted_rows,
+                    row_acknowledgement,
+                    0,
+                    0,
+                    0,
                 );
             }
         }
@@ -1356,28 +1518,66 @@ pub(super) async fn handle_internal_ingest_write(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
-            return internal_error_response(
-                500,
-                "exemplar_store_failed",
-                format!("internal exemplar ingest failed: {err}"),
-                true,
+            let acknowledgement = if accepted_metadata_updates > 0 {
+                Some(WriteAcknowledgement::Volatile)
+            } else {
+                row_acknowledgement
+            };
+            return partial_write_error_response(
+                internal_error_response(
+                    500,
+                    "exemplar_store_failed",
+                    format!("internal exemplar ingest failed: {err}"),
+                    true,
+                ),
+                inserted_rows,
+                acknowledgement,
+                accepted_metadata_updates,
+                metadata_applied,
+                0,
             );
         }
     };
 
-    if let (Some(dedupe_store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
-        dedupe_store.commit(key);
+    let acknowledgement = if accepted_metadata_updates > 0 || accepted_exemplars > 0 {
+        Some(WriteAcknowledgement::Volatile)
+    } else {
+        row_acknowledgement
+    };
+    if let Some(reservation) = dedupe_reservation.take() {
+        if let Err(err) =
+            reservation.commit(crate::cluster::dedupe::DedupeCompletion::IngestWrite {
+                inserted_rows,
+                accepted_metadata_updates,
+                accepted_exemplars: exemplar_outcome.accepted,
+                dropped_exemplars: exemplar_outcome.dropped,
+                acknowledgement,
+            })
+        {
+            return dedupe_persistence_failure_response(
+                &err,
+                inserted_rows,
+                acknowledgement,
+                accepted_metadata_updates,
+                metadata_applied,
+                exemplar_outcome.accepted,
+            );
+        }
     }
 
-    json_response(
+    let mut response = json_response(
         200,
         &InternalIngestWriteResponse {
             inserted_rows,
-            accepted_metadata_updates: metadata_applied,
+            accepted_metadata_updates,
             accepted_exemplars: exemplar_outcome.accepted,
             dropped_exemplars: exemplar_outcome.dropped,
         },
-    )
+    );
+    if let Some(acknowledgement) = acknowledgement {
+        response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+    }
+    response
 }
 
 pub(super) async fn handle_internal_query_exemplars(
@@ -1558,12 +1758,18 @@ pub(super) async fn handle_internal_ingest_rows(
 
     let inserted_rows = payload.rows.len();
     if inserted_rows == 0 {
-        return json_response(200, &InternalIngestRowsResponse { inserted_rows: 0 });
+        return json_response(
+            200,
+            &InternalIngestRowsResponse {
+                inserted_rows: 0,
+                write_result: Some(BatchWriteResult::empty()),
+            },
+        );
     }
 
     let dedupe_store = effective_internal_dedupe_store(cluster_context, edge_sync_context);
     let request_idempotency_key = payload.idempotency_key.clone();
-    let mut dedupe_key_to_commit = None::<String>;
+    let mut dedupe_reservation = None;
     if let Some(dedupe_store) = dedupe_store {
         let key = match request_idempotency_key.as_deref() {
             Some(key) => key,
@@ -1582,9 +1788,32 @@ pub(super) async fn handle_internal_ingest_rows(
         }
 
         match dedupe_store.begin(key) {
-            Ok(DedupeBeginOutcome::Duplicate) => {
-                return json_response(200, &InternalIngestRowsResponse { inserted_rows })
-                    .with_header("X-Tsink-Idempotency-Replayed", "true");
+            Ok(DedupeBeginOutcome::Duplicate {
+                completion:
+                    Some(crate::cluster::dedupe::DedupeCompletion::IngestRows {
+                        inserted_rows,
+                        write_result,
+                    }),
+            }) => {
+                let mut response = json_response(
+                    200,
+                    &InternalIngestRowsResponse {
+                        inserted_rows,
+                        write_result: write_result.clone(),
+                    },
+                )
+                .with_header("X-Tsink-Idempotency-Replayed", "true");
+                if let Some(acknowledgement) = write_result
+                    .as_ref()
+                    .and_then(|result| result.acknowledgement)
+                {
+                    response = response
+                        .with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+                }
+                return response;
+            }
+            Ok(DedupeBeginOutcome::Duplicate { .. }) => {
+                return unavailable_dedupe_replay_response(key);
             }
             Ok(DedupeBeginOutcome::InFlight) => {
                 return internal_error_response(
@@ -1594,8 +1823,8 @@ pub(super) async fn handle_internal_ingest_rows(
                     true,
                 );
             }
-            Ok(DedupeBeginOutcome::Accepted) => {
-                dedupe_key_to_commit = Some(key.to_string());
+            Ok(DedupeBeginOutcome::Accepted(reservation)) => {
+                dedupe_reservation = Some(reservation);
             }
             Err(err) => {
                 return internal_error_response(
@@ -1618,10 +1847,37 @@ pub(super) async fn handle_internal_ingest_rows(
         .map(InternalRow::into_row)
         .collect();
     let storage = Arc::clone(storage);
-    let result = tokio::task::spawn_blocking(move || storage.insert_rows(&rows)).await;
+    let result =
+        tokio::task::spawn_blocking(move || storage.write_batch(&rows, WriteMode::Atomic)).await;
 
     match result {
-        Ok(Ok(())) => {
+        Ok(Ok(write_result)) => {
+            let acknowledgement =
+                match inspect_internal_atomic_write_result(inserted_rows, &write_result) {
+                    Ok(InternalAtomicWriteDisposition::Accepted(acknowledgement)) => {
+                        acknowledgement
+                    }
+                    Ok(InternalAtomicWriteDisposition::Rejected(_)) => {
+                        if let Some(reservation) = dedupe_reservation.take() {
+                            if let Err(err) = reservation.commit(
+                                crate::cluster::dedupe::DedupeCompletion::IngestRows {
+                                    inserted_rows: 0,
+                                    write_result: Some(write_result.clone()),
+                                },
+                            ) {
+                                return dedupe_persistence_failure_response(&err, 0, None, 0, 0, 0);
+                            }
+                        }
+                        return json_response(
+                            200,
+                            &InternalIngestRowsResponse {
+                                inserted_rows: 0,
+                                write_result: Some(write_result),
+                            },
+                        );
+                    }
+                    Err(response) => return response,
+                };
             if let Err(err) = mirror_handoff_ingest_rows(
                 &ring_validation,
                 request_idempotency_key.as_deref(),
@@ -1629,46 +1885,78 @@ pub(super) async fn handle_internal_ingest_rows(
             )
             .await
             {
-                if let (Some(store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
+                if let Some(reservation) = dedupe_reservation.take() {
                     // Local storage insert already succeeded, so preserve idempotency for
                     // client retries even if post-write mirroring fails.
-                    store.commit(key);
+                    if let Err(commit_err) =
+                        reservation.commit(crate::cluster::dedupe::DedupeCompletion::IngestRows {
+                            inserted_rows,
+                            write_result: Some(write_result.clone()),
+                        })
+                    {
+                        return dedupe_persistence_failure_response(
+                            &commit_err,
+                            inserted_rows,
+                            Some(acknowledgement),
+                            0,
+                            0,
+                            0,
+                        );
+                    }
                 }
-                return internal_error_response(
-                    503,
-                    "handoff_mirror_failed",
-                    format!("internal ingest handoff mirror failed: {err}"),
-                    true,
+                return partial_write_error_response(
+                    internal_error_response(
+                        503,
+                        "handoff_mirror_failed",
+                        format!("internal ingest handoff mirror failed: {err}"),
+                        true,
+                    ),
+                    inserted_rows,
+                    Some(acknowledgement),
+                    0,
+                    0,
+                    0,
                 );
             }
-            if let (Some(store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
-                store.commit(key);
+            if let Some(reservation) = dedupe_reservation.take() {
+                if let Err(err) =
+                    reservation.commit(crate::cluster::dedupe::DedupeCompletion::IngestRows {
+                        inserted_rows,
+                        write_result: Some(write_result.clone()),
+                    })
+                {
+                    return dedupe_persistence_failure_response(
+                        &err,
+                        inserted_rows,
+                        Some(acknowledgement),
+                        0,
+                        0,
+                        0,
+                    );
+                }
             }
-            json_response(200, &InternalIngestRowsResponse { inserted_rows })
-        }
-        Ok(Err(err)) => {
-            if let (Some(store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
-                store.abort(key);
-            }
-            internal_storage_write_error_response(
-                &err,
-                503,
-                "storage_insert_failed",
-                format!("internal ingest failed: {err}"),
-                true,
+            json_response(
+                200,
+                &InternalIngestRowsResponse {
+                    inserted_rows,
+                    write_result: Some(write_result),
+                },
             )
+            .with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str())
         }
-        Err(err) => {
-            if let (Some(store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
-                store.abort(key);
-            }
-            internal_error_response(
-                503,
-                "storage_insert_task_failed",
-                format!("internal ingest task failed: {err}"),
-                true,
-            )
-        }
+        Ok(Err(err)) => internal_storage_write_error_response(
+            &err,
+            503,
+            "storage_insert_failed",
+            format!("internal ingest failed: {err}"),
+            true,
+        ),
+        Err(err) => internal_error_response(
+            503,
+            "storage_insert_task_failed",
+            format!("internal ingest task failed: {err}"),
+            true,
+        ),
     }
 }
 
@@ -2909,6 +3197,16 @@ mod tests {
         let ingest_body: InternalIngestRowsResponse =
             serde_json::from_slice(&ingest_response.body).expect("response JSON should decode");
         assert_eq!(ingest_body.inserted_rows, 1);
+        let write_result = ingest_body
+            .write_result
+            .expect("canonical write result should be present");
+        assert_eq!(write_result.submitted, 1);
+        assert_eq!(write_result.accepted, 1);
+        assert_eq!(write_result.rejected, 0);
+        assert_eq!(
+            write_result.acknowledgement,
+            Some(WriteAcknowledgement::Volatile)
+        );
 
         let select_request = HttpRequest {
             method: "POST".to_string(),
@@ -2935,6 +3233,248 @@ mod tests {
             serde_json::from_slice(&select_response.body).expect("response JSON should decode");
         assert_eq!(select_body.points.len(), 1);
         assert_eq!(select_body.points[0].value.as_f64(), Some(12.5));
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_rows_returns_canonical_atomic_rejection() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_rows".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestRowsRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some("tsink:test:internal-row-rejection".to_string()),
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: "internal_rejected_metric".to_string(),
+                    labels: vec![Label::new("duplicate", "a"), Label::new("duplicate", "b")],
+                    data_point: DataPoint::new(1_700_000_000_000, 1.0),
+                }],
+            })
+            .expect("payload should serialize"),
+        };
+
+        let response =
+            handle_internal_ingest_rows(&storage, &request, Some(&internal_api), None, None).await;
+        assert_eq!(response.status, 200);
+        let body: InternalIngestRowsResponse =
+            serde_json::from_slice(&response.body).expect("response should decode");
+        assert_eq!(body.inserted_rows, 0);
+        let result = body
+            .write_result
+            .expect("canonical rejection result should be present");
+        assert_eq!(result.submitted, 1);
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 1);
+        assert_eq!(result.acknowledgement, None);
+        assert!(matches!(
+            &result.outcomes[0].status,
+            RowWriteStatus::Rejected(rejection)
+                if rejection.category == WriteRejectionCategory::InvalidLabels
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_rows_replays_exact_canonical_result_after_restart() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let dedupe_path = temp_dir.path().join("row-dedupe.log");
+        let dedupe_config = crate::cluster::dedupe::DedupeConfig {
+            window_secs: 60,
+            max_entries: 32,
+            max_log_bytes: 8 * 1024,
+            cleanup_interval_secs: 1,
+        };
+        let dedupe_store = Arc::new(
+            DedupeWindowStore::open(dedupe_path.clone(), dedupe_config)
+                .expect("dedupe store should open"),
+        );
+        let edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(Arc::clone(&dedupe_store)),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_rows".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestRowsRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some("tsink:test:internal-row-replay".to_string()),
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: "internal_replay_metric".to_string(),
+                    labels: vec![Label::new("node", "a")],
+                    data_point: DataPoint::new(1_700_000_000_000, 3.0),
+                }],
+            })
+            .expect("payload should serialize"),
+        };
+
+        let first = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(first.status, 200);
+        let first_body: InternalIngestRowsResponse =
+            serde_json::from_slice(&first.body).expect("first response should decode");
+        assert_eq!(first_body.inserted_rows, 1);
+        assert!(first_body.write_result.is_some());
+        let first_acknowledgement = first
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(WRITE_ACKNOWLEDGEMENT_HEADER))
+            .map(|(_, value)| value.clone());
+
+        drop(edge_sync_context);
+        drop(dedupe_store);
+        let reopened = Arc::new(
+            DedupeWindowStore::open(dedupe_path, dedupe_config)
+                .expect("dedupe store should reopen"),
+        );
+        let reopened_edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(reopened),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let replay = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&reopened_edge_sync_context),
+        )
+        .await;
+
+        assert_eq!(replay.status, 200);
+        assert_eq!(replay.body, first.body);
+        assert!(replay.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-Tsink-Idempotency-Replayed") && value == "true"
+        }));
+        let replay_acknowledgement = replay
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(WRITE_ACKNOWLEDGEMENT_HEADER))
+            .map(|(_, value)| value.clone());
+        assert_eq!(replay_acknowledgement, first_acknowledgement);
+        let points = storage
+            .select(
+                "internal_replay_metric",
+                &[Label::new("node", "a")],
+                1_700_000_000_000,
+                1_700_000_000_001,
+            )
+            .expect("stored point should be readable");
+        assert_eq!(points.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_rows_surfaces_dedupe_persistence_failure_after_row_commit() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let dedupe_config = crate::cluster::dedupe::DedupeConfig {
+            window_secs: 60,
+            max_entries: 32,
+            max_log_bytes: 8 * 1024,
+            cleanup_interval_secs: 30,
+        };
+        let dedupe_store = Arc::new(
+            DedupeWindowStore::open(temp_dir.path().join("dedupe.log"), dedupe_config)
+                .expect("dedupe store should open"),
+        );
+        let edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(Arc::clone(&dedupe_store)),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_rows".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestRowsRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some("tsink:test:dedupe-persist-failure".to_string()),
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: "dedupe_persist_failure_metric".to_string(),
+                    labels: vec![Label::new("node", "a")],
+                    data_point: DataPoint::new(1_700_000_000_000, 9.0),
+                }],
+            })
+            .expect("payload should serialize"),
+        };
+
+        dedupe_store.fail_next_append_at(crate::cluster::dedupe::DedupePersistenceStage::Append);
+        let first = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+
+        assert_eq!(first.status, 503);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&first.body).expect("error response should decode");
+        assert_eq!(error.code, "dedupe_persistence_failed");
+        assert_eq!(
+            error.error,
+            "cluster dedupe completion marker persistence failed during record append"
+        );
+        assert!(error.retryable);
+        assert!(first.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_PARTIAL_HEADER) && value == "true"
+        }));
+        assert!(first.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ROWS_ACCEPTED_HEADER) && value == "1"
+        }));
+        assert!(first.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ACKNOWLEDGEMENT_HEADER)
+                && value == WriteAcknowledgement::Volatile.as_str()
+        }));
+
+        let replay = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(replay.status, 200);
+        assert!(replay.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-Tsink-Idempotency-Replayed") && value == "true"
+        }));
+        let points = storage
+            .select(
+                "dedupe_persist_failure_metric",
+                &[Label::new("node", "a")],
+                1_700_000_000_000,
+                1_700_000_000_001,
+            )
+            .expect("stored point should be readable");
+        assert_eq!(points.len(), 1);
     }
 
     #[tokio::test]
@@ -2979,7 +3519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_handlers_reject_out_of_retention_rows_with_422() {
+    async fn internal_handlers_return_canonical_out_of_retention_rejection() {
         let now = crate::handlers::unix_timestamp_millis() as i64;
         let old_ts = now.saturating_sub(120_000);
         let storage: Arc<dyn Storage> = StorageBuilder::new()
@@ -3013,13 +3553,253 @@ mod tests {
 
         let response =
             handle_internal_ingest_rows(&storage, &request, Some(&internal_api), None, None).await;
-        assert_eq!(response.status, 422);
+        assert_eq!(response.status, 200);
 
-        let body: InternalErrorResponse =
+        let body: InternalIngestRowsResponse =
             serde_json::from_slice(&response.body).expect("response JSON should decode");
-        assert_eq!(body.code, "write_out_of_retention");
-        assert!(!body.retryable);
-        assert!(body.error.contains("outside the retention window"));
+        assert_eq!(body.inserted_rows, 0);
+        let result = body
+            .write_result
+            .expect("canonical result should be present");
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 1);
+        assert!(matches!(
+            &result.outcomes[0].status,
+            RowWriteStatus::Rejected(rejection)
+                if rejection.category == WriteRejectionCategory::BelowRetentionFloor
+                    && rejection.message.contains("outside the retention window")
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_write_failure_releases_dedupe_reservation() {
+        let storage = make_storage();
+        storage.close().expect("storage should close");
+        let metadata_store = Arc::new(MetricMetadataStore::in_memory());
+        let exemplar_store = Arc::new(ExemplarStore::in_memory());
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let dedupe_config = crate::cluster::dedupe::DedupeConfig {
+            window_secs: 60,
+            max_entries: 32,
+            max_log_bytes: 8 * 1024,
+            cleanup_interval_secs: 1,
+        };
+        let dedupe_store = Arc::new(
+            DedupeWindowStore::open(temp_dir.path().join("dedupe.log"), dedupe_config)
+                .expect("dedupe store should open"),
+        );
+        let edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(Arc::clone(&dedupe_store)),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let key = "tsink:test:internal-write-storage-failure";
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_write".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestWriteRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some(key.to_string()),
+                tenant_id: None,
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: "closed_storage_metric".to_string(),
+                    labels: Vec::new(),
+                    data_point: DataPoint::new(1_700_000_000_000, 1.0),
+                }],
+                metadata_updates: Vec::new(),
+                exemplars: Vec::new(),
+            })
+            .expect("payload should serialize"),
+        };
+
+        let first = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(first.status, 503);
+
+        let second = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(second.status, 503);
+        let body: InternalErrorResponse =
+            serde_json::from_slice(&second.body).expect("error response should decode");
+        assert_ne!(body.code, "idempotency_in_flight");
+
+        match dedupe_store
+            .begin(key)
+            .expect("reservation should be reusable")
+        {
+            DedupeBeginOutcome::Accepted(reservation) => drop(reservation),
+            other => panic!("failed write left an unexpected dedupe state: {other:?}"),
+        };
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_write_replays_original_result_after_restart() {
+        let storage = make_storage();
+        let metadata_store = Arc::new(MetricMetadataStore::in_memory());
+        let exemplar_store = Arc::new(ExemplarStore::in_memory_with_config(ExemplarStoreConfig {
+            max_total_exemplars: 8,
+            max_exemplars_per_series: 1,
+            max_exemplars_per_request: 8,
+            max_query_results: 8,
+            max_query_selectors: 8,
+        }));
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let dedupe_path = temp_dir.path().join("dedupe.log");
+        let dedupe_config = crate::cluster::dedupe::DedupeConfig {
+            window_secs: 60,
+            max_entries: 32,
+            max_log_bytes: 8 * 1024,
+            cleanup_interval_secs: 1,
+        };
+        let dedupe_store = Arc::new(
+            DedupeWindowStore::open(dedupe_path.clone(), dedupe_config)
+                .expect("dedupe store should open"),
+        );
+        let edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(dedupe_store),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_write".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestWriteRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some("tsink:test:internal-write-replay".to_string()),
+                tenant_id: Some("tenant-a".to_string()),
+                required_capabilities: Vec::new(),
+                rows: Vec::new(),
+                metadata_updates: vec![InternalMetricMetadataUpdate {
+                    metric_family_name: "request_duration_seconds".to_string(),
+                    metric_type: MetricType::Histogram as i32,
+                    help: "request duration".to_string(),
+                    unit: "seconds".to_string(),
+                }],
+                exemplars: vec![
+                    InternalWriteExemplar {
+                        metric: "request_duration_seconds".to_string(),
+                        series_labels: vec![Label::new("service", "api")],
+                        exemplar_labels: vec![Label::new("trace_id", "one")],
+                        timestamp: 100,
+                        value: 1.0,
+                    },
+                    InternalWriteExemplar {
+                        metric: "request_duration_seconds".to_string(),
+                        series_labels: vec![Label::new("service", "api")],
+                        exemplar_labels: vec![Label::new("trace_id", "two")],
+                        timestamp: 200,
+                        value: 2.0,
+                    },
+                ],
+            })
+            .expect("payload should serialize"),
+        };
+
+        let first = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(first.status, 200);
+        let first_body: InternalIngestWriteResponse =
+            serde_json::from_slice(&first.body).expect("first response should decode");
+        assert_eq!(first_body.accepted_metadata_updates, 1);
+        assert_eq!(first_body.accepted_exemplars, 2);
+        assert_eq!(first_body.dropped_exemplars, 1);
+        let first_acknowledgement = first
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(WRITE_ACKNOWLEDGEMENT_HEADER))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            first_acknowledgement,
+            Some(WriteAcknowledgement::Volatile.as_str())
+        );
+
+        drop(edge_sync_context);
+        let reopened = Arc::new(
+            DedupeWindowStore::open(dedupe_path, dedupe_config)
+                .expect("dedupe store should reopen"),
+        );
+        let reopened_edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(reopened),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let replay = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&reopened_edge_sync_context),
+        )
+        .await;
+        assert_eq!(replay.status, 200);
+        assert!(replay.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-Tsink-Idempotency-Replayed") && value == "true"
+        }));
+        let replay_acknowledgement = replay
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(WRITE_ACKNOWLEDGEMENT_HEADER))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(replay_acknowledgement, first_acknowledgement);
+        let replay_body: InternalIngestWriteResponse =
+            serde_json::from_slice(&replay.body).expect("replay response should decode");
+        assert_eq!(replay.body, first.body);
+        assert_eq!(replay_body.inserted_rows, first_body.inserted_rows);
+        assert_eq!(
+            replay_body.accepted_metadata_updates,
+            first_body.accepted_metadata_updates
+        );
+        assert_eq!(
+            replay_body.accepted_exemplars,
+            first_body.accepted_exemplars
+        );
+        assert_eq!(replay_body.dropped_exemplars, first_body.dropped_exemplars);
+        assert_eq!(
+            exemplar_store
+                .metrics_snapshot()
+                .expect("exemplar metrics should be readable")
+                .accepted_total,
+            2
+        );
     }
 
     #[test]

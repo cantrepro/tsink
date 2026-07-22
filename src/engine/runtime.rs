@@ -295,6 +295,27 @@ impl ChunkStorage {
         Ok(Some(handle))
     }
 
+    pub(super) fn start_background_compaction_thread(&self) -> Result<()> {
+        if self.persisted.numeric_compactor.is_none() && self.persisted.blob_compactor.is_none() {
+            return Ok(());
+        }
+
+        self.background
+            .install_thread(BackgroundThreadKind::Compaction, || {
+                Self::spawn_background_compaction_thread(
+                    Arc::downgrade(&self.coordination.lifecycle),
+                    Arc::clone(&self.coordination.compaction_lock),
+                    self.persisted.numeric_compactor.clone(),
+                    self.persisted.blob_compactor.clone(),
+                    Arc::clone(&self.persisted.persisted_index_dirty),
+                    Arc::clone(&self.persisted.pending_persisted_segment_diff),
+                    self.background.compaction_interval,
+                    Arc::clone(&self.observability),
+                    self.background.fail_fast_enabled,
+                )
+            })
+    }
+
     fn spawn_background_flush_thread(
         storage: std::sync::Weak<Self>,
         flush_interval: Duration,

@@ -1,7 +1,9 @@
 # Server deployment
 
-Run tsink as a standalone HTTP server that speaks every major metrics protocol.
-A single static binary — no external runtime dependencies, no OpenSSL.
+Run tsink as an optional standalone adapter around the embedded engine. The server exposes the
+Prometheus, OTLP, and legacy ingest/query endpoints listed in this guide; their presence is not a
+claim of complete upstream compatibility. TLS uses rustls rather than OpenSSL, and the protobuf
+compiler needed at build time is vendored.
 
 ```bash
 cargo build -p tsink-server --release
@@ -70,11 +72,11 @@ Use `--help` to print the full listing with types and defaults.
 | `--data-path PATH` | *none* | Directory for WAL, segments, metadata, and rules. Required for persistent storage. |
 | `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. |
 | `--wal-enabled BOOL` | `true` | Enable or disable the write-ahead log. |
-| `--wal-sync-mode MODE` | `per-append` | WAL durability policy: `per-append` (crash-safe) or `periodic` (higher throughput). |
+| `--wal-sync-mode MODE` | `per-append` | WAL durability policy: `per-append` synchronizes each non-empty write; `periodic` uses an append-driven interval for higher throughput. |
 | `--timestamp-precision PRECISION` | `ms` | Interpret ingested timestamps as `s`, `ms`, `us`, or `ns`. |
 | `--retention DURATION` | 14 days | Global data retention window (e.g. `30d`, `720h`). |
-| `--hot-tier-retention DURATION` | *none* | Age threshold before segments move from hot to warm. |
-| `--warm-tier-retention DURATION` | *none* | Age threshold before segments move from warm to cold. |
+| `--hot-tier-retention DURATION` | same as effective global retention | Age threshold before segments move from hot to warm. |
+| `--warm-tier-retention DURATION` | same as effective global retention | Age threshold before segments move from warm to cold. |
 | `--storage-mode MODE` | `read-write` | `read-write` for full local persistence, `compute-only` for query-only nodes backed by object store. |
 | `--remote-segment-refresh-interval DURATION` | *default* | Metadata refresh TTL for `compute-only` nodes. |
 | `--mirror-hot-segments-to-object-store BOOL` | `false` | Copy hot-tier segments to the object store for DR. Requires `--object-store-path`. |
@@ -103,7 +105,7 @@ TLS uses rustls — no OpenSSL is required.
 |---|---|---|
 | `--auth-token TOKEN` | *none* | Bearer token required on all public requests. |
 | `--auth-token-file PATH` | *none* | Load the public Bearer token from a file or exec manifest. Mutually exclusive with `--auth-token`. |
-| `--admin-auth-token TOKEN` | *none* | Bearer token required for `PUT /api/v1/admin/*` endpoints only. |
+| `--admin-auth-token TOKEN` | *none* | Bearer token accepted for authenticated `/api/v1/admin/*` endpoints. |
 | `--admin-auth-token-file PATH` | *none* | Load the admin Bearer token from a file or exec manifest. Mutually exclusive with `--admin-auth-token`. |
 | `--rbac-config PATH` | *none* | RBAC roles, service accounts, and OIDC mappings (JSON). Supersedes legacy token auth when present. |
 | `--tenant-config PATH` | *none* | Per-tenant authorization quotas and admission policies (JSON). |
@@ -115,12 +117,15 @@ TLS uses rustls — no OpenSSL is required.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--enable-admin-api` | *disabled* | Enable snapshot, restore, rollup, cluster, and RBAC admin endpoints. Requires at least one auth option. |
+| `--enable-admin-api` | *disabled* | Enable snapshot, restore, rollup, RBAC, and experimental cluster admin endpoints. Requires at least one auth option. |
 | `--admin-path-prefix PATH` | *none* | Restrict admin file-system operations (snapshot/restore) to paths under PATH. Requires `--enable-admin-api`. |
 
 ### Edge sync
 
-Edge sync lets an edge node queue writes locally and replay them to a central server, tolerating network partitions.
+Edge sync lets an edge node queue accepted row batches locally and replay them to a central server,
+tolerating network partitions. Metadata and exemplar sidecars are not included in the source
+queue. Queue records are flushed to an append-only log but are not currently synchronized with
+`sync_data`/`sync_all`, so queue acceptance is not a crash-durable upload guarantee.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -131,19 +136,29 @@ Edge sync lets an edge node queue writes locally and replay them to a central se
 
 Edge sync and cluster mode are mutually exclusive.
 
-### Cluster
+On successful replay, the source removes a queued entry only after the upstream returns a complete,
+validated canonical atomic result for every row and after the local queue acknowledgement record is
+successfully appended and flushed. Pending entries can also be expired without an upstream acknowledgement after
+`TSINK_EDGE_SYNC_PRE_ACK_RETENTION_SECS`; retention drops are exposed in status and metrics. The
+admin status snapshot exposes the last successful result as `lastUpstreamAcknowledgement`. Any
+valid upstream acknowledgement, including `Volatile`, currently completes replay; deployments that
+require crash-durable upstream acceptance must configure the upstream for durable WAL
+acknowledgement. There is not yet a source-side minimum-acknowledgement policy, and edge sync is not
+an end-to-end exactly-once protocol.
 
-See the [cluster setup guide](cluster-setup.md) for full cluster documentation.
+### Cluster (experimental)
+
+Cluster mode is an experimental advanced capability, not part of tsink's primary embedded, single-node product. See the [cluster setup guide](cluster-setup.md) for full cluster documentation.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled BOOL` | `false` | Enable cluster mode. |
-| `--cluster-node-id ID` | *none* | Stable identifier for this node. |
-| `--cluster-bind HOST:PORT` | *none* | Internal RPC bind/advertise address. |
+| `--cluster-enabled BOOL` | `false` | Enable experimental cluster mode. |
+| `--cluster-node-id ID` | *none* | Stable identifier for this node; required when cluster mode is enabled. |
+| `--cluster-bind HOST:PORT` | *none* | Internal RPC bind/advertise address; required when cluster mode is enabled. |
 | `--cluster-node-role ROLE` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. |
 | `--cluster-seeds HOST:PORT,...` | *none* | Comma-separated seed peers for bootstrap. |
-| `--cluster-shards N` | *default* | Logical shard count for the consistent hash ring. |
-| `--cluster-replication-factor N` | *default* | Replicas per shard. |
+| `--cluster-shards N` | `128` | Logical shard count for the consistent hash ring. |
+| `--cluster-replication-factor N` | `1` | Replicas per shard. |
 | `--cluster-write-consistency MODE` | `quorum` | Write consistency: `one`, `quorum`, or `all`. |
 | `--cluster-read-consistency MODE` | `eventual` | Read consistency: `eventual`, `quorum`, or `strict`. |
 | `--cluster-read-partial-response MODE` | `allow` | Partial read policy: `allow` or `deny`. |
@@ -180,12 +195,12 @@ Admission control, rules evaluation, and edge sync behaviour are tuned through e
 
 | Variable | Default | Description |
 |---|---|---|
-| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `false` | Accept metric metadata in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `true` | Accept metric metadata in Prometheus remote write payloads. |
 | `TSINK_REMOTE_WRITE_MAX_METADATA_UPDATES` | `512` | Maximum metadata updates accepted per remote write request. |
-| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `false` | Accept exemplars in Prometheus remote write payloads. |
-| `TSINK_REMOTE_WRITE_HISTOGRAMS_ENABLED` | `false` | Accept native histograms in Prometheus remote write payloads. |
-| `TSINK_REMOTE_WRITE_MAX_HISTOGRAM_BUCKET_ENTRIES` | `16384` | Maximum bucket entries per histogram in a remote write payload. |
-| `TSINK_OTLP_METRICS_ENABLED` | `false` | Enable the OTLP `/v1/metrics` endpoint. |
+| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `true` | Accept exemplars in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_HISTOGRAMS_ENABLED` | `true` | Accept native histograms in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_MAX_HISTOGRAM_BUCKET_ENTRIES` | `16384` | Maximum total native-histogram bucket entries per remote write request. |
+| `TSINK_OTLP_METRICS_ENABLED` | `true` | Enable the OTLP `/v1/metrics` endpoint. |
 
 ### Rules engine
 
@@ -204,7 +219,7 @@ Admission control, rules evaluation, and edge sync behaviour are tuned through e
 | `TSINK_EDGE_SYNC_MAX_LOG_BYTES` | `2147483648` (2 GiB) | Maximum total log file size. |
 | `TSINK_EDGE_SYNC_MAX_RECORD_BYTES` | `2097152` (2 MiB) | Maximum size of a single queued record. |
 | `TSINK_EDGE_SYNC_REPLAY_INTERVAL_SECS` | `2` | Seconds between upstream replay attempts. |
-| `TSINK_EDGE_SYNC_REPLAY_BATCH_SIZE` | `256` | Rows per replay batch. |
+| `TSINK_EDGE_SYNC_REPLAY_BATCH_SIZE` | `256` | Maximum queued entries considered per replay pass. |
 | `TSINK_EDGE_SYNC_MAX_BACKOFF_SECS` | `30` | Maximum retry back-off on upstream failures. |
 | `TSINK_EDGE_SYNC_CLEANUP_INTERVAL_SECS` | `30` | Seconds between queue cleanup passes. |
 | `TSINK_EDGE_SYNC_PRE_ACK_RETENTION_SECS` | `86400` (24 h) | How long to retain entries pending upstream acknowledgment. |
@@ -246,7 +261,7 @@ All other endpoints require a valid `Authorization: Bearer <token>` header when 
 
 | Method | Path | Protocol |
 |---|---|---|
-| `POST` | `/api/v1/write` | Prometheus remote write (snappy-framed protobuf). |
+| `POST` | `/api/v1/write` | Prometheus remote write (Snappy block-compressed protobuf). |
 | `POST` | `/api/v1/read` | Prometheus remote read. |
 | `POST` | `/api/v1/import/prometheus` | Prometheus text exposition bulk import. |
 | `POST` | `/write` | InfluxDB line protocol (v1 path). |
@@ -277,7 +292,7 @@ Admin endpoints are only served when `--enable-admin-api` is set and require the
 | `POST` | `/api/v1/admin/rbac/service_accounts/enable` | Re-enable a disabled service account. |
 | `GET` | `/api/v1/admin/support_bundle` | Download a bounded JSON diagnostic snapshot for one tenant. |
 
-Cluster admin endpoints (`/api/v1/admin/cluster/*`) are documented in the [cluster setup guide](cluster-setup.md).
+Experimental cluster admin endpoints (`/api/v1/admin/cluster/*`) are documented in the [cluster setup guide](cluster-setup.md). They are not part of tsink's primary product.
 
 ---
 

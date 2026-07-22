@@ -57,6 +57,7 @@ struct FlushSnapshotContext<'a> {
     numeric_lane_path: Option<&'a Path>,
     blob_lane_path: Option<&'a Path>,
     wal: Option<&'a crate::engine::wal::FramedWal>,
+    local_disk_budget: Option<&'a Arc<crate::LocalDiskBudget>>,
 }
 
 #[derive(Clone, Copy)]
@@ -193,7 +194,13 @@ impl ChunkStorage {
         published_segment_roots: &mut Vec<PathBuf>,
     ) -> Result<()> {
         let segment_id = snapshot_ctx.next_segment_id.fetch_add(1, Ordering::SeqCst);
-        let writer = SegmentWriter::new(lane_path, 0, segment_id)?;
+        let writer = SegmentWriter::new_with_disk_budget(
+            lane_path,
+            0,
+            segment_id,
+            snapshot_ctx.local_disk_budget.cloned(),
+            crate::DiskReservationKind::Maintenance,
+        )?;
         writer.write_segment_with_wal_highwater(registry, chunks, wal_highwater)?;
         published_segment_roots.push(writer.layout().root.clone());
         Ok(())
@@ -512,6 +519,7 @@ impl ChunkStorage {
                 numeric_lane_path: self.persisted.numeric_lane_path.as_deref(),
                 blob_lane_path: self.persisted.blob_lane_path.as_deref(),
                 wal: self.persisted.wal.as_ref(),
+                local_disk_budget: self.persisted.local_disk_budget.as_ref(),
             };
             let publish_ctx = FlushPublishContext(&self.persisted.persisted_index_dirty);
             let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx)? else {

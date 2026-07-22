@@ -56,6 +56,8 @@ async fn run() -> Result<(), String> {
 }
 
 const CLI_ENDPOINTS_HELP: &str = r#"Endpoints:
+  NOTE: /api/v1/admin/cluster/* endpoints are EXPERIMENTAL and are not part of
+        tsink's primary product.
   GET  /healthz
   GET  /ready
   GET  /metrics
@@ -315,7 +317,7 @@ struct ServerCliArgs {
         value_name = "BOOL",
         default_value = "false",
         value_parser = parse_bool,
-        help = "Enable cluster mode"
+        help = "Enable experimental cluster mode (not part of tsink's primary product)"
     )]
     cluster_enabled: bool,
     #[arg(
@@ -676,6 +678,18 @@ fn parse_cluster_read_partial_response_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_labels_cluster_mode_and_admin_endpoints_experimental() {
+        let err = ServerCliArgs::try_parse_from(["tsink-server", "--help"])
+            .expect_err("--help should return clap's display-help result");
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+
+        let help = err.to_string();
+        assert!(help.contains("Enable experimental cluster mode"));
+        assert!(help.contains("/api/v1/admin/cluster/* endpoints are EXPERIMENTAL"));
+        assert!(help.contains("tsink's primary product"));
+    }
 
     #[test]
     fn parse_duration_rejects_non_finite_values() {

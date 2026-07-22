@@ -10,8 +10,9 @@ use tempfile::TempDir;
 use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
     DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, MetricSeries,
-    NativeHistogram, QueryOptions, Row, SeriesMatcher, SeriesSelection, StorageBuilder,
-    TimestampPrecision, TsinkError, Value, WalSyncMode, WriteAcknowledgement,
+    NativeHistogram, QueryOptions, Row, RowWriteStatus, SeriesMatcher, SeriesSelection, Storage,
+    StorageBuilder, TimestampPrecision, TsinkError, Value, WalSyncMode, WriteAcknowledgement,
+    WriteMode, WriteRejection, WriteRejectionCategory, MAX_WRITE_REJECTION_MESSAGE_BYTES,
 };
 
 fn sample_histogram() -> NativeHistogram {
@@ -33,6 +34,84 @@ fn sample_histogram() -> NativeHistogram {
         reset_hint: HistogramResetHint::Gauge,
         custom_values: vec![0.25, 0.5],
     }
+}
+
+#[test]
+fn effective_storage_limits_distinguish_unbounded_defaults() {
+    let storage = StorageBuilder::new()
+        .with_wal_enabled(false)
+        .build()
+        .unwrap();
+
+    let limits = storage.effective_storage_limits();
+    assert!(limits.reported_by_backend);
+    assert!(!limits.persistent);
+    assert!(!limits.wal_enabled);
+    assert_eq!(limits.accounted_memory_bytes, None);
+    assert_eq!(limits.cardinality, None);
+    assert_eq!(limits.wal_bytes, None);
+    assert_eq!(limits.local_disk_bytes, None);
+    assert_eq!(limits.filesystem_free_headroom_bytes, None);
+    assert_eq!(limits.maintenance_temp_reserve_bytes, None);
+    assert!(limits.max_concurrent_writers.is_some_and(|value| value > 0));
+    assert_eq!(limits.write_timeout_nanos, Some(30_000_000_000));
+    assert_eq!(limits.max_active_partition_heads_per_series, Some(8));
+    let observability = storage.observability_snapshot();
+    assert_eq!(observability.limits, limits);
+    assert!(observability.local_disk.is_none());
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn effective_storage_limits_report_configured_persistent_controls() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_memory_limit(16 * 1024 * 1024)
+        .with_cardinality_limit(1_024)
+        .with_wal_size_limit(4 * 1024 * 1024)
+        .with_local_disk_limit(64 * 1024 * 1024)
+        .with_filesystem_free_headroom(1024 * 1024)
+        .with_maintenance_temp_reserve(2 * 1024 * 1024)
+        .with_max_writers(3)
+        .with_write_timeout(Duration::from_nanos(17))
+        .with_max_active_partition_heads_per_series(4)
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        storage.effective_storage_limits(),
+        tsink::EffectiveStorageLimits {
+            reported_by_backend: true,
+            persistent: true,
+            wal_enabled: true,
+            accounted_memory_bytes: Some(16 * 1024 * 1024),
+            cardinality: Some(1_024),
+            wal_bytes: Some(4 * 1024 * 1024),
+            local_disk_bytes: Some(64 * 1024 * 1024),
+            filesystem_free_headroom_bytes: Some(1024 * 1024),
+            maintenance_temp_reserve_bytes: Some(2 * 1024 * 1024),
+            max_concurrent_writers: Some(3),
+            write_timeout_nanos: Some(17),
+            max_active_partition_heads_per_series: Some(4),
+        }
+    );
+    let local_disk = storage
+        .observability_snapshot()
+        .local_disk
+        .expect("persistent built-in storage should report local disk accounting");
+    assert_eq!(local_disk.limits.max_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(
+        local_disk.limits.filesystem_free_headroom_bytes,
+        1024 * 1024
+    );
+    assert_eq!(
+        local_disk.limits.maintenance_temp_reserve_bytes,
+        2 * 1024 * 1024
+    );
+
+    storage.close().unwrap();
 }
 
 #[test]
@@ -123,6 +202,59 @@ fn test_insert_rejects_overlong_metric_name() {
 
     let result = storage.select(&metric, &[], 0, 2000);
     assert!(matches!(result, Err(TsinkError::InvalidMetricName(_))));
+}
+
+#[test]
+fn wal_backed_pre_apply_batch_rejection_commits_none_across_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let rows = vec![
+        Row::new("atomic_batch_first", DataPoint::new(1, 1.0)),
+        Row::new("", DataPoint::new(2, 2.0)),
+        Row::new("atomic_batch_last", DataPoint::new(3, 3.0)),
+    ];
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(true)
+            .with_wal_sync_mode(WalSyncMode::PerAppend)
+            .build()
+            .unwrap();
+
+        let err = storage.insert_rows(&rows).unwrap_err();
+        assert!(matches!(err, TsinkError::MetricRequired));
+        assert!(storage
+            .select("atomic_batch_first", &[], 0, 10)
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .select("atomic_batch_last", &[], 0, 10)
+            .unwrap()
+            .is_empty());
+        assert!(storage.list_metrics().unwrap().is_empty());
+        assert!(storage.list_metrics_with_wal().unwrap().is_empty());
+
+        storage.close().unwrap();
+    }
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(true)
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .build()
+        .unwrap();
+
+    assert!(reopened
+        .select("atomic_batch_first", &[], 0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .select("atomic_batch_last", &[], 0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(reopened.list_metrics().unwrap().is_empty());
+    assert!(reopened.list_metrics_with_wal().unwrap().is_empty());
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -307,6 +439,48 @@ fn test_snapshot_requires_persistent_storage() {
 
     let err = storage.snapshot(&snapshot_path).unwrap_err();
     assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+}
+
+#[test]
+fn test_snapshot_rejects_managed_descendants_before_creating_staging_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .build()
+        .unwrap();
+
+    let direct = data_path.join("snapshot");
+    let err = storage.snapshot(&direct).unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+    assert!(!direct.exists());
+
+    let dotdot = data_path.join("not-created/../snapshot-through-dotdot");
+    let err = storage.snapshot(&dotdot).unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+    assert!(!data_path.join("not-created").exists());
+
+    storage.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_rejects_managed_destination_through_symlinked_parent() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let data_alias = temp_dir.path().join("data-alias");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .build()
+        .unwrap();
+    symlink(&data_path, &data_alias).unwrap();
+
+    let destination = data_alias.join("snapshot");
+    let err = storage.snapshot(&destination).unwrap_err();
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+    assert!(!data_path.join("snapshot").exists());
+
+    storage.close().unwrap();
 }
 
 #[cfg(unix)]
@@ -1081,6 +1255,497 @@ fn write_result_reports_wal_acknowledgement_level() {
 }
 
 #[test]
+fn canonical_atomic_batch_reports_all_rows_accepted() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let rows = [
+        Row::new("atomic_batch", DataPoint::new(1, 1_i64)),
+        Row::new("atomic_batch", DataPoint::new(2, 2_i64)),
+    ];
+
+    let result = storage.write_batch(&rows, WriteMode::Atomic).unwrap();
+
+    assert_eq!(result.submitted, 2);
+    assert_eq!(result.accepted, 2);
+    assert_eq!(result.rejected, 0);
+    assert_eq!(result.acknowledgement, Some(WriteAcknowledgement::Volatile));
+    assert_eq!(result.outcomes.len(), 2);
+    for (index, outcome) in result.outcomes.iter().enumerate() {
+        assert_eq!(outcome.index, index);
+        assert_eq!(outcome.status, RowWriteStatus::Accepted);
+    }
+    assert_eq!(storage.select("atomic_batch", &[], 0, 3).unwrap().len(), 2);
+}
+
+#[test]
+fn canonical_atomic_batch_rejects_every_row_when_one_is_invalid() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let rows = [
+        Row::new("atomic_valid_before", DataPoint::new(1, 1_i64)),
+        Row::new("", DataPoint::new(2, 2_i64)),
+        Row::new("atomic_valid_after", DataPoint::new(3, 3_i64)),
+    ];
+
+    let result = storage.write_batch(&rows, WriteMode::Atomic).unwrap();
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 3);
+    assert_eq!(result.acknowledgement, None);
+    assert_eq!(result.outcomes.len(), 3);
+    for (index, outcome) in result.outcomes.iter().enumerate() {
+        assert_eq!(outcome.index, index);
+        let RowWriteStatus::Rejected(rejection) = &outcome.status else {
+            panic!("atomic rejection must reject every input row");
+        };
+        assert_eq!(rejection.category, WriteRejectionCategory::InvalidMetric);
+        assert_eq!(rejection.cause_index, None);
+    }
+    assert!(storage
+        .select("atomic_valid_before", &[], 0, 4)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .select("atomic_valid_after", &[], 0, 4)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn canonical_best_effort_batch_reports_middle_rejection_by_index() {
+    let storage = StorageBuilder::new().build().unwrap();
+    let rows = [
+        Row::new("best_effort", DataPoint::new(1, 1_i64)),
+        Row::new("", DataPoint::new(2, 2_i64)),
+        Row::new("best_effort", DataPoint::new(3, 3_i64)),
+    ];
+
+    let result = storage.write_batch(&rows, WriteMode::BestEffort).unwrap();
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 2);
+    assert_eq!(result.rejected, 1);
+    assert_eq!(result.acknowledgement, Some(WriteAcknowledgement::Volatile));
+    assert_eq!(result.outcomes[0].index, 0);
+    assert_eq!(result.outcomes[0].status, RowWriteStatus::Accepted);
+    assert_eq!(result.outcomes[1].index, 1);
+    let RowWriteStatus::Rejected(rejection) = &result.outcomes[1].status else {
+        panic!("invalid middle row must be rejected");
+    };
+    assert_eq!(rejection.category, WriteRejectionCategory::InvalidMetric);
+    assert_eq!(rejection.cause_index, Some(1));
+    assert_eq!(result.outcomes[2].index, 2);
+    assert_eq!(result.outcomes[2].status, RowWriteStatus::Accepted);
+    assert_eq!(storage.select("best_effort", &[], 0, 4).unwrap().len(), 2);
+}
+
+#[test]
+fn canonical_atomic_batch_reports_cardinality_limit_without_partial_commit() {
+    let storage = StorageBuilder::new()
+        .with_cardinality_limit(1)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("existing_series", DataPoint::new(1, 1_i64))])
+        .unwrap();
+
+    let result = storage
+        .write_batch(
+            &[
+                Row::new("existing_series", DataPoint::new(2, 2_i64)),
+                Row::new("new_series", DataPoint::new(2, 3_i64)),
+            ],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 2);
+    assert_eq!(result.acknowledgement, None);
+    for outcome in &result.outcomes {
+        let RowWriteStatus::Rejected(rejection) = &outcome.status else {
+            panic!("cardinality-limited atomic batch must reject every row");
+        };
+        assert_eq!(
+            rejection.category,
+            WriteRejectionCategory::CardinalityLimitExceeded
+        );
+    }
+    assert_eq!(
+        storage.select("existing_series", &[], 0, 3).unwrap(),
+        vec![DataPoint::new(1, 1_i64)]
+    );
+    assert!(storage.select("new_series", &[], 0, 3).unwrap().is_empty());
+}
+
+#[test]
+fn canonical_atomic_batch_reports_memory_pressure_without_visibility() {
+    let storage = StorageBuilder::new()
+        .with_wal_enabled(false)
+        .with_memory_limit(1)
+        .with_write_timeout(Duration::ZERO)
+        .build()
+        .unwrap();
+
+    let result = storage
+        .write_batch(
+            &[Row::new("memory_pressure", DataPoint::new(1, 1_i64))],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    let RowWriteStatus::Rejected(rejection) = &result.outcomes[0].status else {
+        panic!("memory-limited write must be rejected");
+    };
+    assert_eq!(rejection.category, WriteRejectionCategory::MemoryPressure);
+    assert!(storage
+        .select("memory_pressure", &[], 0, 2)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn canonical_atomic_batch_reports_wal_quota_without_publishing_series() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(true)
+        .with_wal_size_limit(1)
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .with_write_timeout(Duration::ZERO)
+        .build()
+        .unwrap();
+
+    let result = storage
+        .write_batch(
+            &[Row::new("wal_quota", DataPoint::new(1, 1_i64))],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    let RowWriteStatus::Rejected(rejection) = &result.outcomes[0].status else {
+        panic!("WAL-limited write must be rejected");
+    };
+    assert_eq!(rejection.category, WriteRejectionCategory::WalQuotaExceeded);
+    assert!(storage.list_metrics_with_wal().unwrap().is_empty());
+    assert!(storage.select("wal_quota", &[], 0, 2).unwrap().is_empty());
+}
+
+#[test]
+fn canonical_atomic_batch_reports_disk_quota_after_over_limit_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
+            .with_wal_sync_mode(WalSyncMode::PerAppend)
+            .build()
+            .unwrap();
+        storage
+            .write_batch(
+                &[Row::new("disk_quota_reopen", DataPoint::new(1, 1_i64))],
+                WriteMode::Atomic,
+            )
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_local_disk_limit(1)
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .build()
+        .unwrap();
+    let disk = reopened
+        .observability_snapshot()
+        .local_disk
+        .expect("persistent storage must report disk accounting");
+    assert!(disk.over_limit);
+    assert!(disk.accounted_bytes > 1);
+    assert_eq!(
+        reopened.select("disk_quota_reopen", &[], 0, 3).unwrap(),
+        vec![DataPoint::new(1, 1_i64)]
+    );
+
+    let result = reopened
+        .write_batch(
+            &[Row::new("disk_quota_reopen", DataPoint::new(2, 2_i64))],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    let RowWriteStatus::Rejected(rejection) = &result.outcomes[0].status else {
+        panic!("over-limit write must be rejected");
+    };
+    assert_eq!(
+        rejection.category,
+        WriteRejectionCategory::DiskQuotaExceeded
+    );
+    assert_eq!(
+        reopened.select("disk_quota_reopen", &[], 0, 3).unwrap(),
+        vec![DataPoint::new(1, 1_i64)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn persistent_reopen_reconciles_disk_categories_and_unknown_files() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
+            .with_wal_sync_mode(WalSyncMode::PerAppend)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new("disk_category_reopen", DataPoint::new(1, 1_i64))])
+            .unwrap();
+        storage.close().unwrap();
+    }
+    let host_file = temp_dir.path().join("host-owned.bin");
+    fs::write(&host_file, vec![7u8; 13]).unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_local_disk_limit(64 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let disk = reopened
+        .observability_snapshot()
+        .local_disk
+        .expect("persistent storage must report disk accounting");
+    let category_bytes = |category| {
+        disk.categories
+            .iter()
+            .find(|usage| usage.category == category)
+            .map(|usage| usage.bytes)
+            .unwrap_or(0)
+    };
+    assert!(category_bytes(tsink::DiskCategory::Wal) > 0);
+    assert!(category_bytes(tsink::DiskCategory::Segments) > 0);
+    assert!(category_bytes(tsink::DiskCategory::Registry) > 0);
+    assert!(category_bytes(tsink::DiskCategory::Unknown) >= 13);
+    assert_eq!(
+        disk.categories.iter().map(|usage| usage.bytes).sum::<u64>(),
+        disk.accounted_bytes
+    );
+    assert_eq!(disk.active_reservations, 0);
+    assert_eq!(disk.reserved_bytes, 0);
+    assert!(disk.reconciliations_total >= 2);
+    assert!(host_file.exists());
+    assert_eq!(
+        reopened.select("disk_category_reopen", &[], 0, 2).unwrap(),
+        vec![DataPoint::new(1, 1_i64)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn canonical_atomic_batch_reports_retention_floor_without_visibility() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_retention(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let timestamp = now - 120;
+
+    let result = storage
+        .write_batch(
+            &[Row::new(
+                "below_retention_floor",
+                DataPoint::new(timestamp, 1_i64),
+            )],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    let RowWriteStatus::Rejected(rejection) = &result.outcomes[0].status else {
+        panic!("expired write must be rejected");
+    };
+    assert_eq!(
+        rejection.category,
+        WriteRejectionCategory::BelowRetentionFloor
+    );
+    assert!(storage
+        .select("below_retention_floor", &[], timestamp - 1, now + 1)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn canonical_empty_and_all_rejected_batches_have_no_acknowledgement() {
+    let storage = StorageBuilder::new().build().unwrap();
+
+    for mode in [WriteMode::Atomic, WriteMode::BestEffort] {
+        let result = storage.write_batch(&[], mode).unwrap();
+        assert_eq!(result.submitted, 0);
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 0);
+        assert_eq!(result.acknowledgement, None);
+        assert!(result.outcomes.is_empty());
+    }
+
+    let result = storage
+        .write_batch(
+            &[
+                Row::new("", DataPoint::new(1, 1_i64)),
+                Row::new("", DataPoint::new(2, 2_i64)),
+            ],
+            WriteMode::BestEffort,
+        )
+        .unwrap();
+    assert_eq!(result.submitted, 2);
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 2);
+    assert_eq!(result.acknowledgement, None);
+    assert_eq!(result.outcomes.len(), 2);
+    for (index, outcome) in result.outcomes.iter().enumerate() {
+        assert_eq!(outcome.index, index);
+        let RowWriteStatus::Rejected(rejection) = &outcome.status else {
+            panic!("all-invalid best-effort batch must reject every row");
+        };
+        assert_eq!(rejection.category, WriteRejectionCategory::InvalidMetric);
+        assert_eq!(rejection.cause_index, Some(index));
+    }
+
+    storage.close().unwrap();
+    for mode in [WriteMode::Atomic, WriteMode::BestEffort] {
+        assert!(matches!(
+            storage.write_batch(&[], mode),
+            Err(TsinkError::StorageClosed)
+        ));
+    }
+}
+
+#[test]
+fn write_acknowledgement_weakest_uses_durability_order() {
+    use WriteAcknowledgement::{Appended, Durable, Volatile};
+
+    assert_eq!(Durable.weakest(Durable), Durable);
+    assert_eq!(Durable.weakest(Appended), Appended);
+    assert_eq!(Appended.weakest(Durable), Appended);
+    assert_eq!(Appended.weakest(Volatile), Volatile);
+    assert_eq!(Volatile.weakest(Durable), Volatile);
+}
+
+#[test]
+fn canonical_rejection_messages_are_bounded_at_utf8_boundaries() {
+    let rejection = WriteRejection::new(
+        WriteRejectionCategory::Internal,
+        Some(7),
+        "é".repeat(MAX_WRITE_REJECTION_MESSAGE_BYTES),
+    );
+
+    assert!(rejection.message.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+    assert!(rejection.message.is_char_boundary(rejection.message.len()));
+    assert_eq!(rejection.cause_index, Some(7));
+}
+
+#[derive(Default)]
+struct LegacyStorage {
+    limits: tsink::EffectiveStorageLimits,
+}
+
+impl Storage for LegacyStorage {
+    fn insert_rows(&self, _rows: &[Row]) -> tsink::Result<()> {
+        Ok(())
+    }
+
+    fn select(
+        &self,
+        _metric: &str,
+        _labels: &[Label],
+        _start: i64,
+        _end: i64,
+    ) -> tsink::Result<Vec<DataPoint>> {
+        Ok(Vec::new())
+    }
+
+    fn select_with_options(
+        &self,
+        _metric: &str,
+        _opts: QueryOptions,
+    ) -> tsink::Result<Vec<DataPoint>> {
+        Ok(Vec::new())
+    }
+
+    fn select_all(
+        &self,
+        _metric: &str,
+        _start: i64,
+        _end: i64,
+    ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        Ok(Vec::new())
+    }
+
+    fn close(&self) -> tsink::Result<()> {
+        Ok(())
+    }
+
+    fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+        self.limits
+    }
+}
+
+#[test]
+fn legacy_storage_limits_are_explicitly_unreported() {
+    let storage = LegacyStorage::default();
+    assert_eq!(
+        storage.effective_storage_limits(),
+        tsink::EffectiveStorageLimits::default()
+    );
+    assert_eq!(storage.observability_snapshot().limits, storage.limits);
+    assert!(storage.observability_snapshot().local_disk.is_none());
+}
+
+#[test]
+fn default_observability_preserves_third_party_reported_limits() {
+    let storage = LegacyStorage {
+        limits: tsink::EffectiveStorageLimits {
+            reported_by_backend: true,
+            max_concurrent_writers: Some(1),
+            ..tsink::EffectiveStorageLimits::default()
+        },
+    };
+
+    assert_eq!(
+        storage.observability_snapshot().limits,
+        storage.effective_storage_limits()
+    );
+}
+
+#[test]
+fn canonical_batch_is_unsupported_for_legacy_storage_backends() {
+    let error = LegacyStorage::default()
+        .write_batch(
+            &[Row::new("legacy", DataPoint::new(1, 1_i64))],
+            WriteMode::Atomic,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: "write_batch",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn test_close_handles_partition_name_conflict() {
     let temp_dir = TempDir::new().unwrap();
     let storage = StorageBuilder::new()
@@ -1120,7 +1785,13 @@ fn test_close_failure_can_be_retried_on_same_handle() {
     fs::write(&numeric_lane_root, b"conflict").unwrap();
 
     let first_close_err = storage.close().unwrap_err();
-    assert!(matches!(first_close_err, TsinkError::Io(_)));
+    assert!(
+        matches!(
+            &first_close_err,
+            TsinkError::Io(_) | TsinkError::IoWithPath { .. }
+        ),
+        "unexpected first close error: {first_close_err:?}"
+    );
 
     fs::remove_file(&numeric_lane_root).unwrap();
     storage.close().unwrap();

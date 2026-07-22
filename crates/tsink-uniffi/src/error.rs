@@ -50,6 +50,7 @@ impl From<TsinkError> for TsinkUniFFIError {
             | TsinkError::UnsupportedAggregation { .. }
             | TsinkError::ValueTypeMismatch { .. }
             | TsinkError::OutOfRetention { .. }
+            | TsinkError::FutureSkewExceeded { .. }
             | TsinkError::LateWritePartitionFanoutExceeded { .. } => {
                 TsinkUniFFIError::InvalidInput { msg }
             }
@@ -70,6 +71,8 @@ impl From<TsinkError> for TsinkUniFFIError {
             TsinkError::MemoryBudgetExceeded { .. }
             | TsinkError::CardinalityLimitExceeded { .. }
             | TsinkError::WalSizeLimitExceeded { .. }
+            | TsinkError::DiskQuotaExceeded { .. }
+            | TsinkError::InsufficientCompactionHeadroom { .. }
             | TsinkError::WriteTimeout { .. } => TsinkUniFFIError::ResourceExhausted { msg },
 
             TsinkError::PartitionNotFound { .. }

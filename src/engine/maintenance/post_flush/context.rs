@@ -15,6 +15,19 @@ type RetentionRewriteStage = (
     usize,
 );
 
+fn combine_post_flush_cleanup_error(
+    context: &str,
+    primary: TsinkError,
+    cleanup: Result<()>,
+) -> TsinkError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_err) => TsinkError::Other(format!(
+            "{context} failed: {primary}; cleanup failed: {cleanup_err}"
+        )),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct RetentionMaintenanceContext<'a> {
     persisted_index: &'a RwLock<PersistedIndexState>,
@@ -28,6 +41,7 @@ pub(super) struct RetentionMaintenanceContext<'a> {
     retention_enforced: bool,
     retention_window: i64,
     observability: &'a StorageObservabilityCounters,
+    local_disk_budget: Option<&'a Arc<crate::LocalDiskBudget>>,
     #[cfg(test)]
     persist_test_hooks: &'a PersistTestHooks,
 }
@@ -219,16 +233,30 @@ impl<'a> RetentionMaintenanceContext<'a> {
         let source_fingerprint = verify_segment_fingerprint(source_root)?;
         let staging_root =
             crate::engine::fs_utils::stage_dir_path(final_root, POST_FLUSH_COPY_STAGE_PURPOSE)?;
-        crate::engine::fs_utils::copy_dir_recursive(source_root, &staging_root)?;
-        crate::engine::fs_utils::sync_dir(&staging_root)?;
-        let staged_fingerprint = verify_segment_fingerprint(&staging_root)?;
-        if staged_fingerprint != source_fingerprint {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging_root);
-            return Err(TsinkError::Other(format!(
-                "staged maintenance copy {} did not match source {}",
-                staging_root.display(),
-                source_root.display()
-            )));
+        let stage_result = (|| -> Result<()> {
+            crate::engine::fs_utils::copy_dir_recursive(source_root, &staging_root)?;
+            crate::engine::fs_utils::sync_dir(&staging_root)?;
+            let staged_fingerprint = verify_segment_fingerprint(&staging_root)?;
+            if staged_fingerprint != source_fingerprint {
+                return Err(TsinkError::Other(format!(
+                    "staged maintenance copy {} did not match source {}",
+                    staging_root.display(),
+                    source_root.display()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(primary) = stage_result {
+            let cleanup = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                &staging_root,
+                self.local_disk_budget,
+                crate::DiskCategory::Temporary,
+            );
+            return Err(combine_post_flush_cleanup_error(
+                "staged maintenance verification",
+                primary,
+                cleanup,
+            ));
         }
 
         Ok(StagedSegmentPromotion {
@@ -250,15 +278,20 @@ impl<'a> RetentionMaintenanceContext<'a> {
                     promotion.final_root.display()
                 )));
             }
-            crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(
+            crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
                 &promotion.staging_root,
+                self.local_disk_budget,
+                crate::DiskCategory::Temporary,
             )?;
             return Ok(());
         }
 
-        crate::engine::fs_utils::rename_and_sync_parents(
+        crate::engine::fs_utils::rename_and_sync_parents_budgeted_reclassify(
             &promotion.staging_root,
             &promotion.final_root,
+            self.local_disk_budget,
+            crate::DiskCategory::Temporary,
+            crate::DiskCategory::Segments,
         )
     }
 
@@ -266,20 +299,46 @@ impl<'a> RetentionMaintenanceContext<'a> {
         self,
         promotions: &[StagedSegmentPromotion],
         staging_cleanup_paths: &[PathBuf],
-    ) {
+    ) -> Result<()> {
+        let mut cleanup_errors = Vec::new();
         for promotion in promotions {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(
-                &promotion.staging_root,
-            );
+            if let Err(err) =
+                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                    &promotion.staging_root,
+                    self.local_disk_budget,
+                    crate::DiskCategory::Temporary,
+                )
+            {
+                cleanup_errors.push(format!("{}: {err}", promotion.staging_root.display()));
+            }
         }
         for path in staging_cleanup_paths {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path);
+            if let Err(err) =
+                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                    path,
+                    self.local_disk_budget,
+                    crate::DiskCategory::Temporary,
+                )
+            {
+                cleanup_errors.push(format!("{}: {err}", path.display()));
+            }
         }
+        if !cleanup_errors.is_empty() {
+            return Err(TsinkError::Other(format!(
+                "failed to clean staged post-flush paths: {}",
+                cleanup_errors.join("; ")
+            )));
+        }
+        Ok(())
     }
 
     fn record_expired_segment_if_removed(self, path: &Path) -> Result<bool> {
         let existed = crate::engine::fs_utils::path_exists_no_follow(path)?;
-        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)?;
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            path,
+            self.local_disk_budget,
+            crate::DiskCategory::Temporary,
+        )?;
         if existed {
             self.observability
                 .flush
@@ -301,50 +360,83 @@ impl<'a> RetentionMaintenanceContext<'a> {
             POST_FLUSH_REWRITE_STAGE_PURPOSE,
         )?;
         std::fs::create_dir_all(&staging_base)?;
-        let rewriter = Compactor::new_with_segment_id_allocator(
+        let rewriter = Compactor::new_with_segment_id_allocator_and_disk_budget(
             &staging_base,
             self.chunk_point_cap,
             Arc::clone(self.next_segment_id),
-        );
-        let loaded_segment = crate::engine::segment::load_segment(&entry.root)?;
-        let outcome = rewriter
-            .stage_segment_rewrite_with_retention(&loaded_segment, policy.retention_cutoff())?;
+            self.local_disk_budget.cloned(),
+        )
+        .with_output_disk_category(crate::DiskCategory::Temporary);
         let mut final_entries = Vec::new();
         let mut promotions = Vec::new();
         let mut tier_moves = 0usize;
+        let rewrite_result = (|| -> Result<()> {
+            let loaded_segment = crate::engine::segment::load_segment(&entry.root)?;
+            let outcome = rewriter
+                .stage_segment_rewrite_with_retention(&loaded_segment, policy.retention_cutoff())?;
 
-        for output_root in outcome.output_roots {
-            let manifest = crate::engine::segment::read_segment_manifest(&output_root)?;
-            let Some(desired_tier) = policy.desired_tier_for_manifest(&manifest) else {
-                self.record_expired_segment_if_removed(&output_root)?;
-                continue;
-            };
-
-            let final_tier =
-                if desired_tier == PersistedSegmentTier::Hot || desired_tier <= entry.tier {
-                    entry.tier
-                } else {
-                    tier_moves = tier_moves.saturating_add(1);
-                    desired_tier
+            for output_root in outcome.output_roots {
+                let manifest = crate::engine::segment::read_segment_manifest(&output_root)?;
+                let Some(desired_tier) = policy.desired_tier_for_manifest(&manifest) else {
+                    self.record_expired_segment_if_removed(&output_root)?;
+                    continue;
                 };
-            let final_root = paths.segment_root(entry.lane, final_tier, &manifest)?;
-            let promotion = if final_tier == entry.tier {
-                StagedSegmentPromotion {
-                    staging_root: output_root,
-                    final_root: final_root.clone(),
-                }
-            } else {
-                let promotion = self.stage_segment_copy_for_publish(&output_root, &final_root)?;
-                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&output_root)?;
-                promotion
-            };
-            promotions.push(promotion);
-            final_entries.push(SegmentInventoryEntry {
-                lane: entry.lane,
-                tier: final_tier,
-                root: final_root,
-                manifest,
-            });
+
+                let final_tier =
+                    if desired_tier == PersistedSegmentTier::Hot || desired_tier <= entry.tier {
+                        entry.tier
+                    } else {
+                        tier_moves = tier_moves.saturating_add(1);
+                        desired_tier
+                    };
+                let final_root = paths.segment_root(entry.lane, final_tier, &manifest)?;
+                let promotion = if final_tier == entry.tier {
+                    StagedSegmentPromotion {
+                        staging_root: output_root,
+                        final_root: final_root.clone(),
+                    }
+                } else {
+                    let promotion =
+                        self.stage_segment_copy_for_publish(&output_root, &final_root)?;
+                    if let Err(primary) =
+                        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                            &output_root,
+                            self.local_disk_budget,
+                            crate::DiskCategory::Temporary,
+                        )
+                    {
+                        let cleanup =
+                            crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                                &promotion.staging_root,
+                                self.local_disk_budget,
+                                crate::DiskCategory::Temporary,
+                            );
+                        return Err(combine_post_flush_cleanup_error(
+                            "post-flush tier-copy source cleanup",
+                            primary,
+                            cleanup,
+                        ));
+                    }
+                    promotion
+                };
+                promotions.push(promotion);
+                final_entries.push(SegmentInventoryEntry {
+                    lane: entry.lane,
+                    tier: final_tier,
+                    root: final_root,
+                    manifest,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(primary) = rewrite_result {
+            let cleanup = self
+                .cleanup_staged_post_flush_paths(&promotions, std::slice::from_ref(&staging_base));
+            return Err(combine_post_flush_cleanup_error(
+                "post-flush retention rewrite",
+                primary,
+                cleanup,
+            ));
         }
 
         Ok((final_entries, promotions, vec![staging_base], tier_moves))
@@ -437,8 +529,12 @@ impl<'a> RetentionMaintenanceContext<'a> {
             Ok(())
         })();
         if let Err(err) = stage_result {
-            self.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
-            return Err(err);
+            let cleanup = self.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+            return Err(combine_post_flush_cleanup_error(
+                "post-flush staging",
+                err,
+                cleanup,
+            ));
         }
 
         let final_inventory = SegmentInventory::from_entries(final_entries.into_values().collect());
@@ -479,8 +575,13 @@ impl<'a> RetentionMaintenanceContext<'a> {
         let loaded_segments = match load_result {
             Ok(loaded_segments) => loaded_segments,
             Err(err) => {
-                self.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
-                return Err(err);
+                let cleanup =
+                    self.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                return Err(combine_post_flush_cleanup_error(
+                    "post-flush staged index load",
+                    err,
+                    cleanup,
+                ));
             }
         };
 
@@ -507,10 +608,21 @@ impl<'a> RetentionMaintenanceContext<'a> {
         retired_roots: &[RetiredPostFlushRoot],
     ) -> Result<usize> {
         let mut removed = 0usize;
+        let mut removal_errors = Vec::new();
         for retired_root in retired_roots {
-            let existed = crate::engine::fs_utils::path_exists_no_follow(&retired_root.root)?;
+            let existed = match crate::engine::fs_utils::path_exists_no_follow(&retired_root.root) {
+                Ok(existed) => existed,
+                Err(err) => {
+                    removal_errors.push(format!("{}: {err}", retired_root.root.display()));
+                    continue;
+                }
+            };
             if let Err(err) =
-                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&retired_root.root)
+                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                    &retired_root.root,
+                    self.local_disk_budget,
+                    crate::DiskCategory::Segments,
+                )
             {
                 if !retired_root.counts_as_expired {
                     self.observability
@@ -518,7 +630,8 @@ impl<'a> RetentionMaintenanceContext<'a> {
                         .tier_move_errors_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                return Err(err);
+                removal_errors.push(format!("{}: {err}", retired_root.root.display()));
+                continue;
             }
 
             if existed && retired_root.counts_as_expired {
@@ -528,6 +641,13 @@ impl<'a> RetentionMaintenanceContext<'a> {
                     .expired_segments_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        if !removal_errors.is_empty() {
+            return Err(TsinkError::Other(format!(
+                "failed to retire post-flush segment roots: {}",
+                removal_errors.join("; ")
+            )));
         }
 
         Ok(removed)
@@ -587,6 +707,7 @@ impl ChunkStorage {
             retention_enforced: self.runtime.retention_enforced,
             retention_window: self.runtime.retention_window,
             observability: self.observability.as_ref(),
+            local_disk_budget: self.persisted.local_disk_budget.as_ref(),
             #[cfg(test)]
             persist_test_hooks: &self.persist_test_hooks,
         }

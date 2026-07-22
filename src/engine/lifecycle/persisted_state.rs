@@ -158,8 +158,23 @@ impl ChunkStorage {
         &self,
         segment_roots: &[PathBuf],
     ) -> Result<()> {
+        let mut rollback_errors = Vec::new();
         for root in segment_roots.iter().rev() {
-            crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(root)?;
+            if let Err(err) =
+                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                    root,
+                    self.persisted.local_disk_budget.as_ref(),
+                    crate::DiskCategory::Segments,
+                )
+            {
+                rollback_errors.push(format!("{}: {err}", root.display()));
+            }
+        }
+        if !rollback_errors.is_empty() {
+            return Err(TsinkError::Other(format!(
+                "failed to roll back published segment roots: {}",
+                rollback_errors.join("; ")
+            )));
         }
 
         Ok(())

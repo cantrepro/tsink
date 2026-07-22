@@ -89,6 +89,11 @@ impl<'a> WriteResolveContext<'a> {
             .min(usize::MAX as u64) as usize;
         let required = used.saturating_add(estimated_registry_growth);
         if required > budget {
+            let _ = self.memory_rejections_total.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |value| Some(value.saturating_add(1)),
+            );
             return Err(TsinkError::MemoryBudgetExceeded { budget, required });
         }
 
@@ -112,6 +117,12 @@ impl<'a> WriteResolver<'a> {
         let mut pending_new_series = HashMap::<RawSeriesKey, usize>::new();
         let mut pending_new_series_plans = Vec::<PendingNewSeriesPlan>::new();
         let mut pending_new_point_refs = Vec::<(usize, usize)>::new();
+        let max_future_timestamp = self.engine.max_future_skew_window.map(|window| {
+            self.engine
+                .clock
+                .current_timestamp_units()
+                .saturating_add(window)
+        });
 
         self.engine.with_registry(|registry| {
             for row in rows {
@@ -119,6 +130,14 @@ impl<'a> WriteResolver<'a> {
                 validate_labels(row.labels())?;
 
                 let data_point = row.data_point();
+                if let Some(cutoff) = max_future_timestamp {
+                    if data_point.timestamp > cutoff {
+                        return Err(TsinkError::FutureSkewExceeded {
+                            timestamp: data_point.timestamp,
+                            cutoff,
+                        });
+                    }
+                }
                 let lane = lane_for_value(&data_point.value);
 
                 if let Some(resolution) = registry.resolve_existing(row.metric(), row.labels()) {

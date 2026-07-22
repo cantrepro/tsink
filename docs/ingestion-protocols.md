@@ -1,6 +1,8 @@
 # Ingestion Protocols
 
-tsink accepts data over seven protocols. Three are HTTP-based and handled by the main listener; two are side-channel listeners (UDP for StatsD, TCP for Graphite); one is the built-in Prometheus text exposition import; and one is the Prometheus remote read endpoint for reading data back out.
+tsink exposes four HTTP ingestion endpoints and two optional side-channel listeners (UDP for
+StatsD and TCP for Graphite). Prometheus remote read is listed for completeness, but it is a read
+protocol rather than an ingestion path.
 
 ---
 
@@ -8,8 +10,8 @@ tsink accepts data over seven protocols. Three are HTTP-based and handled by the
 
 | Protocol | Transport | Endpoint(s) | Notes |
 |---|---|---|---|
-| Prometheus Remote Write | HTTP POST | `POST /api/v1/write` | Snappy-framed protobuf |
-| Prometheus Remote Read | HTTP POST | `POST /api/v1/read` | Snappy-framed protobuf |
+| Prometheus Remote Write | HTTP POST | `POST /api/v1/write` | Snappy block-compressed protobuf |
+| Prometheus Remote Read | HTTP POST | `POST /api/v1/read` | Snappy block-compressed protobuf |
 | Prometheus Text Exposition | HTTP POST | `POST /api/v1/import/prometheus` | Bulk plain-text import |
 | InfluxDB Line Protocol | HTTP POST | `POST /write`, `POST /api/v2/write` | v1 and v2 compatible |
 | OTLP HTTP | HTTP POST | `POST /v1/metrics` | Protobuf only |
@@ -18,19 +20,45 @@ tsink accepts data over seven protocols. Three are HTTP-based and handled by the
 
 ---
 
+## Common write results
+
+Successful non-empty HTTP writes report `X-Tsink-Write-Acknowledgement` as `volatile`,
+`appended`, or `durable`. The value is the weakest guarantee for every accepted component. A
+metadata or exemplar sidecar is outside the core row WAL transaction and therefore weakens the
+complete response to `volatile`. A successful empty no-op has no acknowledgement.
+
+Canonical storage rejections and mapped admission failures include a stable
+`X-Tsink-Write-Error-Code`. Protocol framing, disabled-feature, decode, and some sidecar
+persistence failures are instead identified by their HTTP status and bounded response body. If
+rows committed before a later component failed, the response includes `X-Tsink-Write-Partial: true`,
+`X-Tsink-Rows-Accepted`, the acknowledgement for those rows, and relevant metadata/exemplar
+counts. A failure whose commit state cannot be proven uses `X-Tsink-Write-Partial: possible` and
+`X-Tsink-Write-Outcome: indeterminate_backend` or `indeterminate_cluster`.
+
+Diagnostics are bounded and do not echo metric, label, attribute, tag, or field values. The UDP
+StatsD and TCP Graphite protocols have no response frame that can carry these headers; their
+acknowledgements, outcomes, and fixed-cardinality error reasons are exported as server metrics.
+
+---
+
 ## Prometheus Remote Write
 
 **Endpoint:** `POST /api/v1/write`
 
-The standard [Prometheus Remote Write](https://prometheus.io/docs/specs/remote_write_spec/) endpoint. The request body must be a Snappy-compressed protobuf `WriteRequest`.
+The standard [Prometheus Remote Write](https://prometheus.io/docs/specs/remote_write_spec/)
+endpoint normally receives a Snappy block-compressed protobuf `WriteRequest`. For compatibility,
+tsink also accepts raw protobuf when `Content-Encoding` is omitted or set to `identity`.
 
-### Required headers
+### Headers
+
+Standard Prometheus clients send the headers below. The server uses `Content-Encoding` when it is
+present, but currently accepts a missing content type and version header.
 
 | Header | Value |
 |---|---|
 | `Content-Encoding` | `snappy` |
 | `Content-Type` | `application/x-protobuf` |
-| `X-Prometheus-Remote-Write-Version` | `0.1.0` |
+| `X-Prometheus-Remote-Write-Version` | `0.1.0` (optional) |
 
 ### Supported payload features
 
@@ -52,13 +80,16 @@ In cluster mode, tsink uses the Prometheus remote write capability header mechan
 
 A successful write returns `200` with an empty body.
 
+Every successful non-empty response includes `X-Tsink-Write-Acknowledgement`. Optional payloads
+also return accepted/applied or dropped component counts.
+
 In cluster mode the response also includes:
 
 | Header | Description |
 |---|---|
 | `X-Tsink-Write-Consistency` | Consistency mode that was applied (`one`, `quorum`, or `all`) |
 | `X-Tsink-Write-Required-Acks` | Number of replica acknowledgements required |
-| `X-Tsink-Write-Metric-Count` | Number of data-point rows written |
+| `X-Tsink-Write-Acknowledged-Replicas` | Minimum complete replica acknowledgements received across routed shards |
 
 ### Example
 
@@ -77,9 +108,13 @@ curl -X POST http://127.0.0.1:9201/api/v1/write \
 
 **Endpoint:** `POST /api/v1/read`
 
-The standard Prometheus Remote Read endpoint. The request body must be a Snappy-compressed protobuf `ReadRequest`.
+The standard Prometheus Remote Read endpoint normally receives a Snappy block-compressed protobuf
+`ReadRequest`. tsink also accepts raw protobuf when `Content-Encoding` is omitted or set to
+`identity`.
 
-### Required headers
+### Standard request headers
+
+These are sent by standard clients; the server currently accepts either header being absent.
 
 | Header | Value |
 |---|---|
@@ -106,7 +141,9 @@ Returns `200` with a Snappy-compressed protobuf `ReadResponse`.
 
 Accepts a body in the [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/). This is intended for bulk historical imports or one-shot pushes from scripts.
 
-All samples in the body are processed as a single atomic batch. Exemplars embedded in the text format are also parsed and stored.
+All sample rows in the body are processed as a single atomic batch. Embedded exemplars are parsed
+and applied as a separate atomic exemplar-store update; a failure in that later component reports
+the already accepted row effect rather than claiming one cross-component transaction.
 
 ### Content type
 
@@ -147,7 +184,9 @@ Enabled by default. Set `TSINK_INFLUX_LINE_PROTOCOL_ENABLED=false` to disable.
 measurement[,tag_key=tag_value]... field_key=field_value[,field_key=field_value]... [unix_timestamp]
 ```
 
-Each field in a measurement becomes its own metric series:
+Only numeric float, signed-integer, and unsigned-integer fields are supported. String or boolean
+fields reject the request explicitly. Each field in an accepted measurement becomes its own metric
+series:
 - A field named `value` maps to `measurement`.
 - Any other field named `field_name` maps to `measurement_field_name`.
 
@@ -155,7 +194,10 @@ Tag key-value pairs are stored as series labels.
 
 ### Precision
 
-The optional `precision` query parameter controls the timestamp unit. Accepted values: `ns`, `us`, `µs`, `ms`, `s`. If omitted, the server's configured `--timestamp-precision` value is assumed for incoming timestamps. Samples without a timestamp use the current server time.
+The optional `precision` query parameter controls the input timestamp unit. Accepted values are
+`ns`, `u`/`us`, `ms`, `s`, `m`, and `h`. If omitted, input timestamps are interpreted as
+nanoseconds. Samples without a timestamp use the current server time, converted to the configured
+storage precision.
 
 ```
 POST /write?precision=s
@@ -164,7 +206,9 @@ POST /api/v2/write?precision=ms
 
 ### Labels from query parameters
 
-Additional labels can be injected via query string parameters prefixed with `db=` (preserved for InfluxDB compatibility) or any other recognized label-key parameter. In practice tsink passes all non-precision, non-bucket query parameters through as extra labels on all resulting series.
+The recognized compatibility parameters `db`, `rp`, `bucket`, and `org` become the labels
+`influx_db`, `influx_rp`, `influx_bucket`, and `influx_org`, respectively. Other query parameters
+are not copied into series labels.
 
 ### Limits
 
@@ -172,7 +216,7 @@ Additional labels can be injected via query string parameters prefixed with `db=
 |---|---|---|
 | `TSINK_INFLUX_LINE_PROTOCOL_MAX_LINES_PER_REQUEST` | `4096` | Maximum lines per HTTP request |
 
-Requests exceeding the line limit are rejected with `400`.
+Requests exceeding the line limit are rejected with `413`.
 
 ### Example
 
@@ -195,7 +239,8 @@ Enabled by default. Set `TSINK_OTLP_METRICS_ENABLED=false` to disable. Requests 
 
 ### Content type
 
-Must be `application/x-protobuf` or `application/protobuf`. Other content types are rejected with `415`.
+When present, `Content-Type` must be `application/x-protobuf` or `application/protobuf`. An omitted
+content type is accepted; another explicit content type is rejected with `415`.
 
 ### Supported metric shapes
 
@@ -217,7 +262,9 @@ Must be `application/x-protobuf` or `application/protobuf`. Other content types 
 
 ### Timestamps
 
-OTLP uses nanosecond Unix timestamps. tsink converts them to the server's configured `--timestamp-precision` before storage. Data points with the `NO_RECORDED_VALUE` flag set are skipped.
+OTLP uses nanosecond Unix timestamps. tsink converts them to the server's configured
+`--timestamp-precision` before storage. Data points with `NO_RECORDED_VALUE`, unknown flags, or
+unsupported shapes reject the atomic request with `400`; they are not silently skipped.
 
 ### Example
 
@@ -277,7 +324,11 @@ Tags in `key:value` format are stored as series labels. The metric name is norma
 | `TSINK_STATSD_MAX_PACKET_BYTES` | `8192` | Maximum UDP packet size in bytes |
 | `TSINK_STATSD_MAX_EVENTS_PER_PACKET` | `1024` | Maximum events per packet |
 
-Packets exceeding either limit are dropped entirely.
+Packets exceeding either limit, failing parsing, or receiving a row rejection are dropped as a
+request. A later metadata-sidecar failure can follow proven row acceptance and is recorded as a
+partial outcome; relative-gauge state advances only when every packet row is proven accepted.
+Because UDP has no reply channel, the sender receives no per-packet acknowledgement; inspect
+`tsink_legacy_ingest_*` metrics for the result.
 
 ---
 
@@ -317,7 +368,9 @@ metric.path[;tag1=val1;tag2=val2] value [unix_timestamp]
 |---|---|---|
 | `TSINK_GRAPHITE_MAX_LINE_BYTES` | `8192` | Maximum bytes per line |
 
-Lines exceeding the byte limit are rejected without closing the connection.
+An oversized, malformed, admission-rejected, or storage-rejected line closes the connection. The
+plaintext protocol has no per-line error frame, so connection closure is the transport-visible
+failure signal and `tsink_legacy_ingest_*` metrics retain the structured outcome.
 
 ---
 
@@ -375,4 +428,6 @@ All ingest paths are subject to global and per-tenant admission control:
 - **Global write admission** — controls the maximum number of in-flight write requests and total in-flight row count. Configurable via environment variables; tuned at startup.
 - **Tenant quotas** — maximum rows per request per tenant, maximum in-flight write requests and units per tenant, configurable in the tenant config JSON.
 
-Requests rejected by admission return `413` with a plain-text error body.
+HTTP admission failures return a non-success response with a stable write error code (normally
+`413` for a non-retryable request limit or `429` for timed admission pressure). StatsD drops the
+datagram and Graphite closes the connection; both increment bounded rejection/throttle metrics.

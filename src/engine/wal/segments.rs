@@ -67,11 +67,42 @@ impl FramedWal {
         Self::open_with_options(dir, sync_mode, buffer_size, DEFAULT_WAL_SEGMENT_MAX_BYTES)
     }
 
+    pub(in crate::engine) fn open_with_buffer_size_and_disk_budget(
+        dir: impl AsRef<Path>,
+        sync_mode: WalSyncMode,
+        buffer_size: usize,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Result<Self> {
+        Self::open_with_options_and_disk_budget(
+            dir,
+            sync_mode,
+            buffer_size,
+            DEFAULT_WAL_SEGMENT_MAX_BYTES,
+            local_disk_budget,
+        )
+    }
+
     pub(crate) fn open_with_options(
         dir: impl AsRef<Path>,
         sync_mode: WalSyncMode,
         buffer_size: usize,
         segment_max_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_with_options_and_disk_budget(
+            dir,
+            sync_mode,
+            buffer_size,
+            segment_max_bytes,
+            None,
+        )
+    }
+
+    fn open_with_options_and_disk_budget(
+        dir: impl AsRef<Path>,
+        sync_mode: WalSyncMode,
+        buffer_size: usize,
+        segment_max_bytes: u64,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -147,6 +178,7 @@ impl FramedWal {
             sync_mode,
             last_sync: Mutex::new(Instant::now()),
             segment_max_bytes: segment_max_bytes.max(1),
+            local_disk_budget,
             #[cfg(test)]
             append_sync_hook: Mutex::new(None),
             #[cfg(test)]
@@ -154,7 +186,7 @@ impl FramedWal {
         };
 
         if existing_published_highwater.is_none() {
-            wal.persist_published_highwater(published_highwater, true)?;
+            wal.persist_published_highwater_with_recovery_budget(published_highwater, true)?;
         }
 
         Ok(wal)
@@ -210,24 +242,35 @@ impl FramedWal {
     }
 
     fn reset_locked(&self, mut writer: MutexGuard<'_, BufWriter<File>>) -> Result<()> {
-        writer.flush()?;
-        writer.get_mut().sync_data()?;
-        let active_path = self.path.lock().clone();
-        let replacement = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&active_path)?;
-        let capacity = writer.capacity();
-        let old_writer = std::mem::replace(
-            &mut *writer,
-            BufWriter::with_capacity(capacity, replacement),
-        );
-        let _ = old_writer.into_parts();
-        writer.get_ref().sync_data()?;
-        drop(writer);
-
+        let mut disk_reservation = self
+            .local_disk_budget
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    crate::DiskCategory::Wal,
+                    PUBLISHED_HIGHWATER_RECORD_LEN as u64,
+                    crate::DiskReservationKind::Recovery,
+                )
+            })
+            .transpose()?;
+        let reset_highwater = self.current_appended_highwater();
         let reset_result = (|| -> Result<()> {
+            writer.flush()?;
+            writer.get_mut().sync_data()?;
+            let active_path = self.path.lock().clone();
+            let replacement = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&active_path)?;
+            let capacity = writer.capacity();
+            let old_writer = std::mem::replace(
+                &mut *writer,
+                BufWriter::with_capacity(capacity, replacement),
+            );
+            let _ = old_writer.into_parts();
+            writer.get_ref().sync_data()?;
+
             for segment in collect_wal_segment_files(&self.dir)? {
                 if segment.path == active_path {
                     continue;
@@ -241,24 +284,67 @@ impl FramedWal {
             }
 
             sync_dir_path(&self.dir)?;
+            self.persist_published_highwater(reset_highwater, true)?;
             Ok(())
         })();
 
-        if let Err(err) = reset_result {
-            let _ = self.refresh_runtime_accounting();
-            return Err(err);
+        if reset_result.is_ok() {
+            self.clear_cached_series_definition_index_if_initialized();
+            self.mark_published_through(reset_highwater);
+            self.mark_durable_through(reset_highwater);
+            *self.last_sync.lock() = Instant::now();
         }
 
-        let reset_highwater = self.current_appended_highwater();
-        self.total_size_bytes.store(0, Ordering::Release);
-        self.segment_count.store(1, Ordering::Release);
-        self.active_segment_size_bytes.store(0, Ordering::Release);
-        self.clear_cached_series_definition_index_if_initialized();
-        self.persist_published_highwater(reset_highwater, true)?;
-        self.mark_published_through(reset_highwater);
-        self.mark_durable_through(reset_highwater);
-        *self.last_sync.lock() = Instant::now();
-        Ok(())
+        // Conservatively charge the complete marker until the exclusive scan below replaces all
+        // WAL accounting with the exact post-reset tree. Settling first is required because an
+        // active reservation would prevent idle reconciliation from beginning.
+        let settlement_result = match disk_reservation.take() {
+            Some(reservation) => reservation.commit(PUBLISHED_HIGHWATER_RECORD_LEN as u64, 0),
+            None => Ok(()),
+        };
+        let runtime_reconciliation_result = self.refresh_runtime_accounting();
+        let disk_reconciliation_result = match &self.local_disk_budget {
+            Some(budget) => budget.reconcile_when_idle().map(|_| ()),
+            None => Ok(()),
+        };
+        drop(writer);
+
+        let mut errors = Vec::new();
+        if let Err(err) = &reset_result {
+            errors.push(format!("reset operation failed: {err}"));
+        }
+        if let Err(err) = &settlement_result {
+            errors.push(format!("disk settlement failed: {err}"));
+        }
+        if let Err(err) = &runtime_reconciliation_result {
+            errors.push(format!("runtime accounting reconciliation failed: {err}"));
+        }
+        if let Err(err) = &disk_reconciliation_result {
+            errors.push(format!("local disk reconciliation failed: {err}"));
+        }
+
+        if errors.is_empty() {
+            return Ok(());
+        }
+        if errors.len() == 1 {
+            return match (
+                reset_result,
+                settlement_result,
+                runtime_reconciliation_result,
+                disk_reconciliation_result,
+            ) {
+                (Err(err), _, _, _)
+                | (_, Err(err), _, _)
+                | (_, _, Err(err), _)
+                | (_, _, _, Err(err)) => Err(err),
+                _ => unreachable!("one recorded WAL reset error must match one failed result"),
+            };
+        }
+
+        Err(TsinkError::Other(format!(
+            "WAL reset failed: {}",
+            errors.join("; ")
+        )))
     }
 
     pub fn reset(&self) -> Result<()> {

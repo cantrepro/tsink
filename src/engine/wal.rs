@@ -3,7 +3,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -194,6 +193,7 @@ pub struct FramedWal {
     sync_mode: WalSyncMode,
     last_sync: Mutex<Instant>,
     segment_max_bytes: u64,
+    local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     #[cfg(test)]
     append_sync_hook: Mutex<Option<Arc<WalAppendSyncHook>>>,
     #[cfg(test)]

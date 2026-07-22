@@ -37,9 +37,12 @@ pub(in crate::engine::storage_engine) struct WriteSeriesValidationContext<'a> {
 pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) catalog: CatalogContext<'a>,
     pub(in crate::engine::storage_engine) support: WriteResolveSupportContext<'a>,
+    pub(in crate::engine::storage_engine) clock: ClockContext<'a>,
+    pub(in crate::engine::storage_engine) max_future_skew_window: Option<i64>,
     pub(in crate::engine::storage_engine) cardinality_limit: usize,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -273,9 +276,12 @@ impl ChunkStorage {
             support: WriteResolveSupportContext {
                 registry_memory: self.registry_memory_context(),
             },
+            clock: self.clock_context(),
+            max_future_skew_window: self.runtime.max_future_skew_window,
             cardinality_limit: self.runtime.cardinality_limit,
             used_bytes: &self.memory.used_bytes,
             budget_bytes: &self.memory.budget_bytes,
+            memory_rejections_total: &self.memory.rejections_total,
         }
     }
 
@@ -318,6 +324,9 @@ impl ChunkStorage {
                 write_timeout: self.runtime.write_timeout,
                 admission_poll_interval: self.runtime.admission_poll_interval,
                 admission_backpressure_lock: &self.memory.admission_backpressure_lock,
+                active_memory_backpressured_writers: &self.memory.active_backpressured_writers,
+                memory_backpressure_events_total: &self.memory.backpressure_events_total,
+                memory_rejections_total: &self.memory.rejections_total,
             },
         }
     }
@@ -367,6 +376,7 @@ impl ChunkStorage {
             stage: WriteCommitStageContext {
                 chunks: self.chunk_context(),
                 wal: self.persisted.wal.as_ref(),
+                wal_size_limit_bytes: self.runtime.wal_size_limit_bytes,
                 wal_metrics: self.wal_metrics_context(),
                 #[cfg(test)]
                 test_hooks: self.write_commit_test_hooks_context(),

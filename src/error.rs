@@ -72,6 +72,26 @@ pub enum TsinkError {
     #[error("Insufficient disk space: required {required} bytes, available {available} bytes")]
     InsufficientDiskSpace { required: u64, available: u64 },
 
+    #[error(
+        "Local disk quota exceeded: limit {limit} bytes, used {used} bytes, reserved {reserved} bytes, requested {requested} bytes"
+    )]
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+
+    #[error(
+        "Insufficient maintenance headroom: limit {limit} bytes, used {used} bytes, reserved {reserved} bytes, requested {requested} bytes"
+    )]
+    InsufficientCompactionHeadroom {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+
     #[error("IO error at path {path:?}: {source}")]
     IoWithPath {
         path: PathBuf,
@@ -120,6 +140,11 @@ pub enum TsinkError {
 
     #[error("Data point with timestamp {timestamp} is outside the retention window")]
     OutOfRetention { timestamp: i64 },
+
+    #[error(
+        "Data point with timestamp {timestamp} exceeds the configured future-skew cutoff {cutoff}"
+    )]
+    FutureSkewExceeded { timestamp: i64, cutoff: i64 },
 
     #[error(
         "Late write at timestamp {timestamp} would open partition {partition_id} beyond the active-head limit {max_active_partition_heads_per_series} (active range {oldest_active_partition_id}..={newest_active_partition_id})"

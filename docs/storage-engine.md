@@ -58,27 +58,50 @@ Every data point carries a typed `Value`:
 | `bytes` / `string` | Bytes delta block | Blob |
 | `NativeHistogram` | Bytes delta block | Blob |
 
-Points for a series are written to one of two **value lanes**: `Numeric` or `Blob`. The lane is determined once per batch by inspecting the first value; mixing types within a batch returns an error. Lanes are stored in separate directory trees on disk (`lane_numeric/` and `lane_blob/`), which keeps numeric and blob compaction independent.
+Every point is classified as `Numeric` or `Blob` from its own value. A batch may contain different
+lanes and value families when they belong to different series. Within one series, however, the
+engine enforces one lane and one compatible value family across the batch and existing history;
+an incompatible value returns `TsinkError::ValueTypeMismatch` for the whole batch. Lanes are stored
+in separate directory trees on disk (`lane_numeric/` and `lane_blob/`), which keeps numeric and blob
+compaction independent. The batch failure boundary is specified in
+[ADR 0001](adr/0001-write-contract.md).
 
 ---
 
 ## Write Path
 
-A call to `insert_rows` is processed through a five-stage ingest pipeline:
+A non-empty call to `insert_rows` is processed through a five-stage ingest pipeline:
 
 ```
 insert_rows(rows)
     │
-    ├─ 1. Resolve     — look up or create series IDs in the registry
-    ├─ 2. Prepare     — validate metrics/labels, check memory budget, pick WAL codec
-    ├─ 3. Stage       — write encoded frames to the WAL (fsync depending on sync mode)
-    ├─ 4. Apply       — append points to the active ChunkBuilder for each series
-    └─ 5. Publish     — advance visibility so new points become query-visible
+    ├─ 1. Resolve     — validate metrics/labels; look up or provisionally create series IDs
+    ├─ 2. Prepare     — validate lanes, value families, retention/partitions, and admission;
+    │                  encode the candidate WAL payloads
+    ├─ 3. Stage       — persist an unpublished logical WAL write (depending on WAL configuration)
+    ├─ 4. Apply       — install all points in the active write buffers
+    └─ 5. Publish     — commit the WAL boundary when present and establish the batch acknowledgement
 ```
 
-Stages 3–5 run inside a registry write-transaction shard lock scoped to the set of unique series being written. This prevents a series definition from becoming query-visible before its WAL frame is committed. The lock is a fine-grained shard lock (one of 64 shards, keyed by series ID) rather than a global mutex.
+All five phases run inside registry write-transaction shard locks scoped to the unique series in the
+batch. These locks keep provisional series identity, staged WAL state, and in-memory application
+inside one intended write boundary. They are fine-grained shards rather than one global mutex.
 
-A write permit is acquired from a semaphore bounded by `max_writers` before entering stage 1. If the memory budget is exhausted, admission control parks the writer until flushing reclaims budget.
+For a non-empty batch, a write permit is acquired from a semaphore bounded by `max_writers` before
+entering stage 1. If the memory budget is exhausted, admission control parks the writer until
+flushing reclaims budget.
+
+Both public insert methods return one batch error, rather than per-row outcomes, when the input is
+rejected; none of those rows is accepted. Apply stages fallible active-state rotations and chunk
+encoding for every affected shard before publishing any of them, so a later-shard failure cannot
+leave an earlier shard installed. See [ADR 0001](adr/0001-write-contract.md) for the atomic batch,
+acknowledgement, and empty-batch contract.
+
+`Storage::write_batch` is the canonical result-bearing entry point. `Atomic` uses the pipeline once
+and reports every row accepted or every row rejected. `BestEffort` uses ordered singleton pipeline
+calls, preserves each original index, and reports the weakest acknowledgement among accepted rows.
+The default trait implementation is unsupported so third-party backends cannot accidentally claim
+these semantics through a legacy adapter.
 
 ---
 
@@ -114,10 +137,17 @@ Both frame types use the same length-prefixed codec as the on-disk chunk format,
 
 | Mode | Durability | Notes |
 |---|---|---|
-| `PerAppend` (default) | Crash-safe | Each append calls `fsync` before acknowledging the write. |
-| `Periodic(interval)` | OS-buffered | Frames are flushed to the OS; a periodic background task calls `fsync`. Writes in the crash window since the last sync can be lost. |
+| `PerAppend` (default) | Synchronized software path when published | Syncs the staged batch; successful WAL publication normally establishes `Durable`. |
+| `Periodic(interval)` | Append-driven sync | Checks elapsed time during append; the batch is normally `Appended`, or `Durable` if that append performs a sync. |
 
-`WriteResult` from `insert_rows_with_result` reflects whether the write is already durable.
+`insert_rows_with_result` returns one `WriteResult` for the entire successful batch. It reflects
+whether that batch is already durable; it is not a list of per-row outcomes. On an open read-write
+engine, an empty batch is a successful no-op acknowledged as `Durable`. See
+[the durability contract](durability.md) and [ADR 0001](adr/0001-write-contract.md).
+
+If logical WAL publication degrades after in-memory apply, either sync mode can instead return a
+successful `Volatile` acknowledgement. Periodic mode has no autonomous timer; another append or
+lifecycle/persistence work is needed to advance durability.
 
 ### WAL high-watermark
 

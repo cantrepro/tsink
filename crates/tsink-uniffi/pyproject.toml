@@ -5,8 +5,15 @@ build-backend = "maturin"
 [project]
 name = "tsink"
 requires-python = ">=3.8"
-description = "Python bindings for tsink time-series database"
+description = "Python bindings for the tsink embedded Prometheus-native metrics database"
 license = { text = "MIT" }
+authors = [{ name = "cantrepro" }]
+keywords = ["metrics", "prometheus", "embedded", "tsdb"]
+
+[project.urls]
+Homepage = "https://github.com/cantrepro/tsink"
+Repository = "https://github.com/cantrepro/tsink"
+Documentation = "https://github.com/cantrepro/tsink/tree/master/docs"
 
 [tool.maturin]
 bindings = "uniffi"

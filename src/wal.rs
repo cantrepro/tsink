@@ -18,10 +18,15 @@ pub enum WalSyncMode {
 }
 
 impl WalSyncMode {
+    /// Returns whether the policy synchronizes every acknowledged non-empty write immediately.
+    ///
+    /// Periodic sync reports `false` because it checks the interval during an append and does not
+    /// guarantee that every append performs a sync.
     pub fn acknowledged_writes_are_durable(self) -> bool {
         matches!(self, Self::PerAppend)
     }
 
+    /// Returns the kebab-case policy name used by observability and adapters.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PerAppend => "per-append",
@@ -29,6 +34,7 @@ impl WalSyncMode {
         }
     }
 
+    /// Returns the configured periodic sync interval, or `None` for per-append sync.
     pub fn periodic_interval(self) -> Option<Duration> {
         match self {
             Self::PerAppend => None,

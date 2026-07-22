@@ -6,6 +6,19 @@ use roaring::RoaringTreemap;
 use super::super::MemoryDeltaBytes;
 use super::super::*;
 
+const MEMORY_APPROACHING_LIMIT_BASIS_POINTS: u16 = 9_000;
+const KNOWN_EXCLUDED_MEMORY_CATEGORIES: &[&str] = &[
+    "query_working_sets",
+    "decompression_buffers",
+    "pending_write_batches",
+    "wal_buffers_and_replay",
+    "rollup_working_state",
+    "remote_refresh_staging",
+    "thread_stacks",
+    "allocator_and_runtime_overhead",
+    "adapter_and_server_state",
+];
+
 impl ChunkStorage {
     pub(in super::super) fn memory_budget_value(&self) -> usize {
         self.memory_accounting_context().budget_value()
@@ -200,9 +213,46 @@ impl ChunkStorage {
             memory_accounting.refresh_memory_usage();
         }
 
+        let accounted_bytes = memory_accounting.used_value();
+        let persisted_mmap_bytes = context::MemoryAccountingContext::component_value(
+            &self.memory.persisted_mmap_used_bytes,
+        );
+        let budget = memory_accounting.budget_value();
+        let finite_budget = (budget != usize::MAX).then_some(budget);
+        let approaching_limit_bytes = finite_budget.map(|budget| {
+            let numerator = (budget as u128)
+                .saturating_mul(u128::from(MEMORY_APPROACHING_LIMIT_BASIS_POINTS))
+                .saturating_add(9_999);
+            u64::try_from((numerator / 10_000).min(u64::MAX.into())).unwrap_or(u64::MAX)
+        });
+        let active_backpressured_writers = self
+            .memory
+            .active_backpressured_writers
+            .load(Ordering::Acquire);
+        let pressure_level = if self.storage_health_degraded() {
+            crate::MemoryPressureLevel::Degraded
+        } else if active_backpressured_writers > 0 {
+            crate::MemoryPressureLevel::Backpressured
+        } else if finite_budget.is_some_and(|budget| accounted_bytes >= budget) {
+            crate::MemoryPressureLevel::Rejecting
+        } else if approaching_limit_bytes
+            .is_some_and(|threshold| (accounted_bytes as u128) >= u128::from(threshold))
+        {
+            crate::MemoryPressureLevel::ApproachingLimit
+        } else {
+            crate::MemoryPressureLevel::Normal
+        };
+
         crate::MemoryObservabilitySnapshot {
-            budgeted_bytes: memory_accounting.used_value(),
+            accounted_bytes,
+            estimated_accounted_bytes: accounted_bytes.saturating_sub(persisted_mmap_bytes),
+            budgeted_bytes: accounted_bytes,
             excluded_bytes: 0,
+            excluded_bytes_known: false,
+            excluded_categories: KNOWN_EXCLUDED_MEMORY_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
             active_and_sealed_bytes: memory_accounting.active_and_sealed_used_value(),
             registry_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.registry_used_bytes,
@@ -213,13 +263,23 @@ impl ChunkStorage {
             persisted_index_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.persisted_index_used_bytes,
             ),
-            persisted_mmap_bytes: context::MemoryAccountingContext::component_value(
-                &self.memory.persisted_mmap_used_bytes,
-            ),
+            persisted_mmap_bytes,
             tombstone_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.tombstone_used_bytes,
             ),
             excluded_persisted_mmap_bytes: 0,
+            pressure: crate::MemoryPressureSnapshot {
+                level: Some(pressure_level),
+                approaching_limit_basis_points: finite_budget
+                    .map(|_| MEMORY_APPROACHING_LIMIT_BASIS_POINTS),
+                approaching_limit_bytes,
+                active_backpressured_writers,
+                backpressure_events_total: self
+                    .memory
+                    .backpressure_events_total
+                    .load(Ordering::Acquire),
+                rejections_total: self.memory.rejections_total.load(Ordering::Acquire),
+            },
         }
     }
 

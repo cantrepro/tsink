@@ -99,6 +99,79 @@ fn test_full_lifecycle() {
 }
 
 #[test]
+fn effective_storage_limits_are_available_through_uniffi() {
+    let builder = TsinkStorageBuilder::new();
+    builder.with_wal_enabled(false).unwrap();
+    builder.with_memory_limit(4 * 1024 * 1024).unwrap();
+    builder.with_cardinality_limit(256).unwrap();
+    builder.with_max_writers(2).unwrap();
+    builder
+        .with_write_timeout(Duration::from_millis(19))
+        .unwrap();
+    builder
+        .with_max_active_partition_heads_per_series(3)
+        .unwrap();
+    let db = builder.build().unwrap();
+
+    let limits = db.effective_storage_limits();
+    assert!(limits.reported_by_backend);
+    assert!(!limits.persistent);
+    assert!(!limits.wal_enabled);
+    assert_eq!(limits.accounted_memory_bytes, Some(4 * 1024 * 1024));
+    assert_eq!(limits.cardinality, Some(256));
+    assert_eq!(limits.wal_bytes, None);
+    assert_eq!(limits.local_disk_bytes, None);
+    assert!(db.observability_snapshot().local_disk.is_none());
+    assert_eq!(limits.max_concurrent_writers, Some(2));
+    assert_eq!(limits.write_timeout_nanos, Some(19_000_000));
+    assert_eq!(limits.max_active_partition_heads_per_series, Some(3));
+    assert_eq!(
+        db.observability_snapshot().limits.accounted_memory_bytes,
+        Some(4 * 1024 * 1024)
+    );
+    let memory = db.observability_snapshot().memory;
+    assert_eq!(memory.accounted_bytes, memory.budgeted_bytes);
+    assert!(!memory.excluded_bytes_known);
+    assert!(!memory.excluded_categories.is_empty());
+    assert!(matches!(
+        memory.pressure.level,
+        Some(UMemoryPressureLevel::Normal)
+    ));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn local_disk_limits_and_accounting_are_available_through_uniffi() {
+    let dir = tempdir().unwrap();
+    let builder = TsinkStorageBuilder::new();
+    builder
+        .with_data_path(dir.path().to_string_lossy().into_owned())
+        .unwrap();
+    builder.with_wal_enabled(false).unwrap();
+    builder.with_local_disk_limit(8 * 1024 * 1024).unwrap();
+    builder.with_filesystem_free_headroom(2048).unwrap();
+    builder.with_maintenance_temp_reserve(4096).unwrap();
+    let db = builder.build().unwrap();
+
+    let limits = db.effective_storage_limits();
+    assert_eq!(limits.local_disk_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(limits.filesystem_free_headroom_bytes, Some(2048));
+    assert_eq!(limits.maintenance_temp_reserve_bytes, Some(4096));
+    let disk = db
+        .observability_snapshot()
+        .local_disk
+        .expect("persistent UniFFI storage should report local disk accounting");
+    assert_eq!(disk.limits.max_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(disk.limits.filesystem_free_headroom_bytes, 2048);
+    assert_eq!(disk.limits.maintenance_temp_reserve_bytes, 4096);
+    assert_eq!(disk.active_reservations, 0);
+    assert!(disk.reconciliations_total >= 1);
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_select_series() {
     let builder = TsinkStorageBuilder::new();
     builder.with_wal_enabled(false).unwrap();
@@ -419,6 +492,146 @@ fn test_embedded_surface_snapshot_shards_and_restore() {
         .unwrap();
     assert_eq!(restored_points.len(), 2);
     restored.close().unwrap();
+}
+
+#[test]
+fn write_batch_best_effort_preserves_indexed_outcomes() {
+    let builder = TsinkStorageBuilder::new();
+    builder.with_wal_enabled(false).unwrap();
+    let db = builder.build().unwrap();
+
+    let result = db
+        .write_batch(
+            vec![
+                row(
+                    "best_effort_metric",
+                    vec![label("host", "a")],
+                    10,
+                    UValue::F64 { v: 1.0 },
+                ),
+                row("", vec![], 20, UValue::F64 { v: 2.0 }),
+                row(
+                    "best_effort_metric",
+                    vec![label("host", "b")],
+                    30,
+                    UValue::F64 { v: 3.0 },
+                ),
+            ],
+            UWriteMode::BestEffort,
+        )
+        .unwrap();
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 2);
+    assert_eq!(result.rejected, 1);
+    assert!(matches!(
+        result.acknowledgement,
+        Some(UWriteAcknowledgement::Volatile)
+    ));
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(matches!(
+        result.outcomes[0].status,
+        URowWriteStatus::Accepted
+    ));
+    assert!(matches!(
+        &result.outcomes[1].status,
+        URowWriteStatus::Rejected { rejection }
+            if matches!(&rejection.category, UWriteRejectionCategory::InvalidMetric)
+                && rejection.cause_index == Some(1)
+    ));
+    assert!(matches!(
+        result.outcomes[2].status,
+        URowWriteStatus::Accepted
+    ));
+
+    assert_eq!(
+        db.select(
+            "best_effort_metric".into(),
+            vec![label("host", "a")],
+            0,
+            100,
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(
+        db.select(
+            "best_effort_metric".into(),
+            vec![label("host", "b")],
+            0,
+            100,
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_atomic_rejection_commits_no_rows() {
+    let builder = TsinkStorageBuilder::new();
+    builder.with_wal_enabled(false).unwrap();
+    let db = builder.build().unwrap();
+
+    let result = db
+        .write_batch(
+            vec![
+                row(
+                    "atomic_metric",
+                    vec![label("host", "a")],
+                    10,
+                    UValue::F64 { v: 1.0 },
+                ),
+                row("", vec![], 20, UValue::F64 { v: 2.0 }),
+                row(
+                    "atomic_metric",
+                    vec![label("host", "b")],
+                    30,
+                    UValue::F64 { v: 3.0 },
+                ),
+            ],
+            UWriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(result.submitted, 3);
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 3);
+    assert!(result.acknowledgement.is_none());
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(result.outcomes.iter().all(|outcome| matches!(
+        &outcome.status,
+        URowWriteStatus::Rejected { rejection }
+            if matches!(&rejection.category, UWriteRejectionCategory::InvalidMetric)
+                && rejection.cause_index.is_none()
+    )));
+    assert!(db
+        .select("atomic_metric".into(), vec![label("host", "a")], 0, 100)
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .select("atomic_metric".into(), vec![label("host", "b")], 0, 100)
+        .unwrap()
+        .is_empty());
+
+    db.close().unwrap();
 }
 
 #[test]

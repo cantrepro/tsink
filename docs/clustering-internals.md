@@ -1,5 +1,8 @@
 # Clustering internals
 
+> [!WARNING]
+> **Experimental, non-primary capability.** This document describes tsink's experimental cluster implementation, not its primary embedded, single-node product. Implementation detail and feature coverage here do not imply production readiness.
+
 This document describes how tsink distributes data across nodes: how the hash ring is built, how writes are routed and replicated, how the control plane reaches consensus, how temporarily unreachable replicas are handled via hinted handoff, how background digest-based repair keeps replicas consistent, and how queries fan out and merge across shards.
 
 ---
@@ -65,7 +68,7 @@ Series are assigned to shards deterministically. The ring is built at startup an
 2. The shard index is computed as:
 
    ```
-   shard = series_id % shard_count
+   shard = stable_series_identity_hash % shard_count
    ```
 
 3. For each shard a token is computed:
@@ -147,19 +150,43 @@ The coordinator tracks per-shard acknowledgements. If the required ack count can
 - **Local rows** — rows whose primary shard is owned by the local node.
 - **Remote batches** — rows grouped by destination node. Remote batches are bounded by `TSINK_CLUSTER_WRITE_MAX_BATCH_ROWS` (default 1,024 rows) and sent concurrently with a cap of `TSINK_CLUSTER_WRITE_MAX_INFLIGHT_BATCHES` (default 32) in-flight batches.
 
-Each remote batch carries a stable idempotency key so that exactly-once delivery can be guaranteed end-to-end through the deduplication window on the receiver.
+Each remote batch carries a stable idempotency key. The receiving replica uses that key to suppress
+and replay duplicate internal requests within a bounded window. This is a per-replica retry aid, not
+an end-to-end exactly-once guarantee: the window can expire or evict entries, cluster writes are not
+atomic across nodes, and a process failure can follow a local write before its completion marker is
+durable.
 
-For a replica that is currently unreachable the write is handed off to `HintedHandoffOutbox` rather than immediately failing, as long as the consistency quorum was already satisfied by successful acks.
+Retryable remote-delivery failures are placed in `HintedHandoffOutbox` before the final consistency
+decision. If the required acknowledgement threshold is not met, the client request still fails
+while the queued hint remains available for later replica repair.
 
 ### Idempotency and deduplication
 
-`DedupeWindowStore` maintains a durable, append-only log of accepted idempotency keys with expiry timestamps. On each incoming internal write, the key is looked up:
+`DedupeWindowStore` maintains an append-only log of completed idempotency keys, expiry timestamps,
+and (for current-format records) the exact internal ingest result. On each incoming internal write,
+the key is looked up:
 
-- **Accepted** — key is new; the write proceeds and the key is committed on success.
+- **Accepted** — key is new; the write proceeds under an in-flight reservation. Dropping the
+  reservation after any failure releases it for retry.
 - **InFlight** — a write with the same key is already in progress; the request is rejected to prevent concurrent processing of the same batch.
-- **Duplicate** — key was seen within the window and already committed; the request is silently dropped and a success is returned.
+- **Duplicate** — key completed within the window. Current-format records replay the original row
+  outcome, counts, and acknowledgement. A legacy marker without a stored completion returns
+  `409 idempotency_result_unavailable` rather than inventing a success response.
 
-Keys expire after `TSINK_CLUSTER_DEDUPE_WINDOW_SECS` (default 15 minutes). The log is compacted periodically to reclaim space.
+A completion is reported as committed only after its marker has been appended, flushed, and synced.
+If one of those steps fails, the receiver returns retryable
+`503 dedupe_persistence_failed`. When rows or sidecars were already accepted, the response also
+contains the partial-write counts and the established acknowledgement. The completion remains in
+memory so an immediate same-process retry receives the exact result; the store fences new keys after
+the persistence failure because it cannot make them restart-safe. A malformed, empty, or torn marker
+record causes opening the store to fail with a bounded line-number diagnostic instead of silently
+discarding deduplication state.
+
+Keys expire after `TSINK_CLUSTER_DEDUPE_WINDOW_SECS` (default 15 minutes) and can also be evicted by
+the entry bound. The log is compacted periodically to reclaim space. Idempotency keys are not
+currently bound to a receiver-verified payload fingerprint, so internal callers must never reuse a
+key for a different payload. These bounds and the write-before-marker failure window mean the
+mechanism provides bounded duplicate suppression and result replay, not exactly-once delivery.
 
 | Parameter | Default |
 |---|---|
@@ -209,7 +236,12 @@ The control log is written to a JSON file on disk (`tsink-control-log`). The sch
 
 ## Hinted handoff
 
-When a remote write fails for a replica that is only temporarily unavailable, `HintedHandoffOutbox` stores the rows in a durable per-peer queue so they can be replayed once the peer recovers.
+When a remote write fails for a replica that is only temporarily unavailable,
+`HintedHandoffOutbox` stores the rows in a bounded per-peer queue backed by an append-only log so
+they can be replayed once the peer recovers. The log is flushed for process-restart recovery, but
+each Put or Ack record is also synchronized with `sync_data` before the corresponding in-memory
+state change. Compaction synchronizes its replacement file before rename but does not yet sync the
+parent directory afterward.
 
 The outbox maintains:
 - An in-memory queue per destination node, bounded by `TSINK_CLUSTER_OUTBOX_MAX_PEER_BYTES` (default 256 MiB).

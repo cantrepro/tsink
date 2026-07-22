@@ -1,4 +1,5 @@
 use crate::cluster::dedupe::validate_idempotency_key;
+use crate::cluster::replication::validate_confirmed_atomic_ingest_response;
 use crate::cluster::rpc::{
     normalize_capabilities, InternalIngestRowsRequest, InternalRow, RpcClient,
     DEFAULT_INTERNAL_RING_VERSION,
@@ -658,32 +659,31 @@ impl HintedHandoffOutbox {
             };
 
             match rpc_client.ingest_rows(&entry.endpoint, &request).await {
-                Ok(response) if response.inserted_rows == request.rows.len() => {
-                    match self.ack_entry(entry.id) {
-                        Ok(()) => {
-                            CLUSTER_OUTBOX_REPLAY_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        }
+                Ok(response) => {
+                    match validate_confirmed_atomic_ingest_response(request.rows.len(), &response) {
+                        Ok(_) => match self.ack_entry(entry.id) {
+                            Ok(()) => {
+                                CLUSTER_OUTBOX_REPLAY_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                CLUSTER_OUTBOX_REPLAY_FAILURES_TOTAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "cluster outbox ack persistence failed for entry {}: {err}",
+                                    entry.id
+                                );
+                            }
+                        },
                         Err(err) => {
                             CLUSTER_OUTBOX_REPLAY_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL
-                                .fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "cluster outbox ack persistence failed for entry {}: {err}",
-                                entry.id
-                            );
+                            if let Err(update_err) = self.reschedule_entry(entry, &err) {
+                                CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                eprintln!("cluster outbox replay reschedule failed: {update_err}");
+                            }
                         }
-                    }
-                }
-                Ok(response) => {
-                    CLUSTER_OUTBOX_REPLAY_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    let err = format!(
-                        "replayed ingest inserted {} rows but expected {}",
-                        response.inserted_rows,
-                        request.rows.len()
-                    );
-                    if let Err(update_err) = self.reschedule_entry(entry, &err) {
-                        CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("cluster outbox replay reschedule failed: {update_err}");
                     }
                 }
                 Err(err) => {
@@ -1269,6 +1269,43 @@ mod tests {
                 200,
                 serde_json::to_vec(&InternalIngestRowsResponse {
                     inserted_rows: ingest_request.rows.len(),
+                    write_result: Some(tsink::BatchWriteResult::from_outcomes(
+                        Some(tsink::WriteAcknowledgement::Volatile),
+                        (0..ingest_request.rows.len())
+                            .map(tsink::RowWriteOutcome::accepted)
+                            .collect(),
+                    )),
+                })
+                .expect("response should encode"),
+            )
+            .with_header("Content-Type", "application/json");
+            write_http_response(&mut stream, &response)
+                .await
+                .expect("response should write");
+        });
+
+        (endpoint, task)
+    }
+
+    async fn spawn_count_only_ingest_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let endpoint = listener.local_addr().expect("local address").to_string();
+
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection expected");
+            let mut read_buffer = Vec::new();
+            let request = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("request should decode");
+            let ingest_request: InternalIngestRowsRequest =
+                serde_json::from_slice(&request.body).expect("request body should decode");
+            let response = HttpResponse::new(
+                200,
+                serde_json::to_vec(&InternalIngestRowsResponse {
+                    inserted_rows: ingest_request.rows.len(),
+                    write_result: None,
                 })
                 .expect("response should encode"),
             )
@@ -1378,6 +1415,30 @@ mod tests {
             .expect("replay should run");
         assert_eq!(outbox.backlog_snapshot().queued_entries, 0);
 
+        server.await.expect("server should finish without panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_preserves_entry_when_canonical_result_is_missing() {
+        let temp = TempDir::new().expect("temp dir");
+        let outbox = open_outbox(temp.path().join("outbox.log"));
+        let (endpoint, server) = spawn_count_only_ingest_server().await;
+        outbox
+            .enqueue_replica_write("node-b", &endpoint, "tsink:test:outbox:1", &sample_rows())
+            .expect("enqueue should succeed");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(250),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            ..RpcClientConfig::default()
+        });
+
+        outbox
+            .replay_due_once(&rpc_client)
+            .await
+            .expect("replay iteration should complete");
+
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 1);
         server.await.expect("server should finish without panic");
     }
 

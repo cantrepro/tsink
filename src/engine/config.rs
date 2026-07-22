@@ -28,6 +28,7 @@ pub(super) struct ChunkStorageOptions {
     pub(super) timestamp_precision: TimestampPrecision,
     pub(super) retention_window: i64,
     pub(super) future_skew_window: i64,
+    pub(super) max_future_skew_window: Option<i64>,
     pub(super) retention_enforced: bool,
     pub(super) runtime_mode: StorageRuntimeMode,
     pub(super) partition_window: i64,
@@ -62,6 +63,7 @@ impl Default for ChunkStorageOptions {
                 TimestampPrecision::Nanoseconds,
             )
             .max(0),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: duration_to_timestamp_units(
@@ -147,6 +149,9 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
                 timestamp_precision,
             )
             .max(0),
+            max_future_skew_window: builder
+                .max_future_skew()
+                .map(|duration| duration_to_timestamp_units(duration, timestamp_precision).max(0)),
             retention_enforced: builder.retention_enforced(),
             runtime_mode,
             partition_window: duration_to_timestamp_units(

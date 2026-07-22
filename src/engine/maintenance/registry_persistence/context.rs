@@ -12,6 +12,8 @@ pub(super) struct RegistryPersistenceContext<'a> {
     metadata_used_bytes: &'a AtomicU64,
     shared_used_bytes: &'a AtomicU64,
     used_bytes: &'a AtomicU64,
+    local_disk_budget: Option<&'a Arc<crate::LocalDiskBudget>>,
+    disk_reservation_kind: crate::DiskReservationKind,
 }
 
 impl<'a> RegistryPersistenceContext<'a> {
@@ -115,8 +117,18 @@ impl<'a> RegistryPersistenceContext<'a> {
             .series_subset(pending_series_ids.iter().copied())
     }
 
-    fn persist_registry_snapshot(self, checkpoint_path: &Path) -> Result<()> {
-        self.registry.read().persist_to_path(checkpoint_path)
+    fn persist_registry_snapshot(self, checkpoint_path: &Path) -> Result<Vec<SeriesId>> {
+        let registry = self.registry.read();
+        // Capture only pending IDs known while the registry snapshot is read-locked. A writer can
+        // add another pending ID after serialization; removing the entire set would then lose the
+        // only signal that the new series still needs durable registry persistence.
+        let persisted_pending_series_ids = self.pending_series_ids_snapshot();
+        registry.persist_to_path_with_disk_budget_and_kind(
+            checkpoint_path,
+            self.local_disk_budget,
+            self.disk_reservation_kind,
+        )?;
+        Ok(persisted_pending_series_ids)
     }
 
     fn delta_series_count_value(self) -> u64 {
@@ -139,10 +151,18 @@ impl<'a> RegistryPersistenceContext<'a> {
     where
         PersistCatalog: Fn(&Path) -> Result<()>,
     {
-        self.persist_registry_snapshot(checkpoint_path)?;
-        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(delta_path)?;
-        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(delta_dir_path)?;
-        self.clear_pending_series_ids();
+        let persisted_pending_series_ids = self.persist_registry_snapshot(checkpoint_path)?;
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            delta_path,
+            self.local_disk_budget,
+            crate::DiskCategory::Registry,
+        )?;
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            delta_dir_path,
+            self.local_disk_budget,
+            crate::DiskCategory::Registry,
+        )?;
+        self.remove_pending_series_ids(persisted_pending_series_ids);
         self.set_delta_series_count(0);
         if let Err(err) = persist_catalog_index(checkpoint_path) {
             if allow_invalid_catalog && segment_validation_error_message(&err).is_some() {
@@ -232,7 +252,13 @@ impl<'a> RegistryPersistenceContext<'a> {
             );
         }
 
-        if let Err(err) = pending_registry.persist_incremental_to_snapshot_path(checkpoint_path) {
+        if let Err(err) = pending_registry
+            .persist_incremental_to_snapshot_path_with_disk_budget_and_kind(
+                checkpoint_path,
+                self.local_disk_budget,
+                self.disk_reservation_kind,
+            )
+        {
             return match err {
                 TsinkError::DataCorruption(_) | TsinkError::InvalidConfiguration(_) => self
                     .persist_series_registry_checkpoint_locked(
@@ -257,6 +283,15 @@ impl<'a> RegistryPersistenceContext<'a> {
 
 impl ChunkStorage {
     pub(super) fn registry_persistence_context(&self) -> RegistryPersistenceContext<'_> {
+        self.registry_persistence_context_with_disk_reservation_kind(
+            crate::DiskReservationKind::Maintenance,
+        )
+    }
+
+    pub(super) fn registry_persistence_context_with_disk_reservation_kind(
+        &self,
+        disk_reservation_kind: crate::DiskReservationKind,
+    ) -> RegistryPersistenceContext<'_> {
         RegistryPersistenceContext {
             accounting_enabled: self.memory.accounting_enabled,
             registry: &self.catalog.registry,
@@ -267,6 +302,8 @@ impl ChunkStorage {
             metadata_used_bytes: &self.memory.metadata_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
             used_bytes: &self.memory.used_bytes,
+            local_disk_budget: self.persisted.local_disk_budget.as_ref(),
+            disk_reservation_kind,
         }
     }
 }

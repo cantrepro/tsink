@@ -58,54 +58,84 @@ impl ChunkStorage {
         Ok(sources.into_values().collect())
     }
 
-    fn persist_series_registry_catalog_index_with_sources(
+    fn persist_series_registry_catalog_index_with_sources_and_kind(
         &self,
         checkpoint_path: &Path,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
+        reservation_kind: crate::DiskReservationKind,
     ) -> Result<()> {
-        if matches!(
-            registry_catalog::validate_registry_catalog(checkpoint_path, sources)?,
-            Some(registry_catalog::ValidatedRegistryCatalog {
+        match registry_catalog::validate_registry_catalog(checkpoint_path, sources) {
+            Ok(Some(registry_catalog::ValidatedRegistryCatalog {
                 series_fingerprint: Some(_),
-            })
-        ) {
-            return Ok(());
+            })) => return Ok(()),
+            Ok(_) | Err(TsinkError::DataCorruption(_) | TsinkError::Json(_)) => {}
+            Err(err) => return Err(err),
         }
-        registry_catalog::persist_registry_catalog(checkpoint_path, sources)
+        registry_catalog::persist_registry_catalog_budgeted_with_kind(
+            checkpoint_path,
+            sources,
+            self.persisted.local_disk_budget.as_ref(),
+            reservation_kind,
+        )
     }
 
-    fn persist_series_registry_catalog_index(&self, checkpoint_path: &Path) -> Result<()> {
-        let sources = self.persisted_registry_catalog_sources();
-        self.persist_series_registry_catalog_index_with_sources(checkpoint_path, &sources)
-    }
-
+    #[cfg(test)]
     fn checkpoint_series_registry_index_with_policy(
         &self,
         allow_invalid_catalog: bool,
+    ) -> Result<()> {
+        self.checkpoint_series_registry_index_with_policy_and_kind(
+            allow_invalid_catalog,
+            crate::DiskReservationKind::Maintenance,
+        )
+    }
+
+    fn checkpoint_series_registry_index_with_policy_and_kind(
+        &self,
+        allow_invalid_catalog: bool,
+        reservation_kind: crate::DiskReservationKind,
     ) -> Result<()> {
         let Some(checkpoint_path) = &self.persisted.series_index_path else {
             return Ok(());
         };
         let delta_path = SeriesRegistry::incremental_path(checkpoint_path);
         let delta_dir_path = SeriesRegistry::incremental_dir(checkpoint_path);
-        self.registry_persistence_context()
+        self.registry_persistence_context_with_disk_reservation_kind(reservation_kind)
             .checkpoint_series_registry_index(
                 checkpoint_path,
                 &delta_path,
                 &delta_dir_path,
                 allow_invalid_catalog,
-                |checkpoint_path| self.persist_series_registry_catalog_index(checkpoint_path),
+                |checkpoint_path| {
+                    let sources = self.persisted_registry_catalog_sources();
+                    self.persist_series_registry_catalog_index_with_sources_and_kind(
+                        checkpoint_path,
+                        &sources,
+                        reservation_kind,
+                    )
+                },
             )
     }
 
+    #[cfg(test)]
     pub(in super::super) fn checkpoint_series_registry_index(&self) -> Result<()> {
         self.checkpoint_series_registry_index_with_policy(false)
     }
 
-    pub(in super::super) fn checkpoint_series_registry_index_allow_invalid_catalog(
+    pub(in super::super) fn checkpoint_series_registry_index_for_recovery(&self) -> Result<()> {
+        self.checkpoint_series_registry_index_with_policy_and_kind(
+            false,
+            crate::DiskReservationKind::Recovery,
+        )
+    }
+
+    pub(in super::super) fn checkpoint_series_registry_index_allow_invalid_catalog_for_recovery(
         &self,
     ) -> Result<()> {
-        self.checkpoint_series_registry_index_with_policy(true)
+        self.checkpoint_series_registry_index_with_policy_and_kind(
+            true,
+            crate::DiskReservationKind::Recovery,
+        )
     }
 
     pub(in super::super) fn persist_series_registry_index(&self) -> Result<()> {
@@ -113,25 +143,45 @@ impl ChunkStorage {
         self.persist_series_registry_index_with_catalog_sources(&sources)
     }
 
+    pub(in super::super) fn persist_series_registry_index_for_recovery(&self) -> Result<()> {
+        let sources = self.persisted_registry_catalog_sources();
+        self.persist_series_registry_index_with_catalog_sources_and_kind(
+            &sources,
+            crate::DiskReservationKind::Recovery,
+        )
+    }
+
     pub(in super::super) fn persist_series_registry_index_with_catalog_sources(
         &self,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
+    ) -> Result<()> {
+        self.persist_series_registry_index_with_catalog_sources_and_kind(
+            sources,
+            crate::DiskReservationKind::Maintenance,
+        )
+    }
+
+    fn persist_series_registry_index_with_catalog_sources_and_kind(
+        &self,
+        sources: &[registry_catalog::PersistedRegistryCatalogSource],
+        reservation_kind: crate::DiskReservationKind,
     ) -> Result<()> {
         let Some(checkpoint_path) = &self.persisted.series_index_path else {
             return Ok(());
         };
         let delta_path = SeriesRegistry::incremental_path(checkpoint_path);
         let delta_dir_path = SeriesRegistry::incremental_dir(checkpoint_path);
-        self.registry_persistence_context()
+        self.registry_persistence_context_with_disk_reservation_kind(reservation_kind)
             .persist_series_registry_index(
                 checkpoint_path,
                 &delta_path,
                 &delta_dir_path,
                 sources,
                 |checkpoint_path, sources| {
-                    self.persist_series_registry_catalog_index_with_sources(
+                    self.persist_series_registry_catalog_index_with_sources_and_kind(
                         checkpoint_path,
                         sources,
+                        reservation_kind,
                     )
                 },
             )

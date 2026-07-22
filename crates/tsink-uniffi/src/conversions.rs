@@ -374,6 +374,21 @@ impl From<tsink_core::StorageRuntimeMode> for UStorageRuntimeMode {
     }
 }
 
+impl From<tsink_core::MemoryPressureLevel> for UMemoryPressureLevel {
+    fn from(level: tsink_core::MemoryPressureLevel) -> Self {
+        match level {
+            tsink_core::MemoryPressureLevel::Normal => UMemoryPressureLevel::Normal,
+            tsink_core::MemoryPressureLevel::ApproachingLimit => {
+                UMemoryPressureLevel::ApproachingLimit
+            }
+            tsink_core::MemoryPressureLevel::Backpressured => UMemoryPressureLevel::Backpressured,
+            tsink_core::MemoryPressureLevel::Rejecting => UMemoryPressureLevel::Rejecting,
+            tsink_core::MemoryPressureLevel::Degraded => UMemoryPressureLevel::Degraded,
+            _ => UMemoryPressureLevel::Degraded,
+        }
+    }
+}
+
 impl From<URemoteSegmentCachePolicy> for tsink_core::RemoteSegmentCachePolicy {
     fn from(policy: URemoteSegmentCachePolicy) -> Self {
         match policy {
@@ -472,6 +487,173 @@ impl From<tsink_core::WriteAcknowledgement> for UWriteAcknowledgement {
     }
 }
 
+impl From<UWriteMode> for tsink_core::WriteMode {
+    fn from(mode: UWriteMode) -> Self {
+        match mode {
+            UWriteMode::Atomic => tsink_core::WriteMode::Atomic,
+            UWriteMode::BestEffort => tsink_core::WriteMode::BestEffort,
+        }
+    }
+}
+
+impl From<UWriteRejectionCategory> for tsink_core::WriteRejectionCategory {
+    fn from(category: UWriteRejectionCategory) -> Self {
+        match category {
+            UWriteRejectionCategory::InvalidMetric => {
+                tsink_core::WriteRejectionCategory::InvalidMetric
+            }
+            UWriteRejectionCategory::InvalidLabels => {
+                tsink_core::WriteRejectionCategory::InvalidLabels
+            }
+            UWriteRejectionCategory::UnsupportedValue => {
+                tsink_core::WriteRejectionCategory::UnsupportedValue
+            }
+            UWriteRejectionCategory::TimestampOutOfBounds => {
+                tsink_core::WriteRejectionCategory::TimestampOutOfBounds
+            }
+            UWriteRejectionCategory::BelowRetentionFloor => {
+                tsink_core::WriteRejectionCategory::BelowRetentionFloor
+            }
+            UWriteRejectionCategory::FutureSkewExceeded => {
+                tsink_core::WriteRejectionCategory::FutureSkewExceeded
+            }
+            UWriteRejectionCategory::CardinalityLimitExceeded => {
+                tsink_core::WriteRejectionCategory::CardinalityLimitExceeded
+            }
+            UWriteRejectionCategory::CardinalityCreationRateExceeded => {
+                tsink_core::WriteRejectionCategory::CardinalityCreationRateExceeded
+            }
+            UWriteRejectionCategory::MemoryPressure => {
+                tsink_core::WriteRejectionCategory::MemoryPressure
+            }
+            UWriteRejectionCategory::DiskQuotaExceeded => {
+                tsink_core::WriteRejectionCategory::DiskQuotaExceeded
+            }
+            UWriteRejectionCategory::WalQuotaExceeded => {
+                tsink_core::WriteRejectionCategory::WalQuotaExceeded
+            }
+            UWriteRejectionCategory::PolicyRejected => {
+                tsink_core::WriteRejectionCategory::PolicyRejected
+            }
+            UWriteRejectionCategory::WriteTimeout => {
+                tsink_core::WriteRejectionCategory::WriteTimeout
+            }
+            UWriteRejectionCategory::StorageClosed => {
+                tsink_core::WriteRejectionCategory::StorageClosed
+            }
+            UWriteRejectionCategory::StorageDegraded => {
+                tsink_core::WriteRejectionCategory::StorageDegraded
+            }
+            UWriteRejectionCategory::InternalIo => tsink_core::WriteRejectionCategory::InternalIo,
+            UWriteRejectionCategory::Internal => tsink_core::WriteRejectionCategory::Internal,
+        }
+    }
+}
+
+impl From<tsink_core::WriteRejectionCategory> for UWriteRejectionCategory {
+    fn from(category: tsink_core::WriteRejectionCategory) -> Self {
+        match category {
+            tsink_core::WriteRejectionCategory::InvalidMetric => {
+                UWriteRejectionCategory::InvalidMetric
+            }
+            tsink_core::WriteRejectionCategory::InvalidLabels => {
+                UWriteRejectionCategory::InvalidLabels
+            }
+            tsink_core::WriteRejectionCategory::UnsupportedValue => {
+                UWriteRejectionCategory::UnsupportedValue
+            }
+            tsink_core::WriteRejectionCategory::TimestampOutOfBounds => {
+                UWriteRejectionCategory::TimestampOutOfBounds
+            }
+            tsink_core::WriteRejectionCategory::BelowRetentionFloor => {
+                UWriteRejectionCategory::BelowRetentionFloor
+            }
+            tsink_core::WriteRejectionCategory::FutureSkewExceeded => {
+                UWriteRejectionCategory::FutureSkewExceeded
+            }
+            tsink_core::WriteRejectionCategory::CardinalityLimitExceeded => {
+                UWriteRejectionCategory::CardinalityLimitExceeded
+            }
+            tsink_core::WriteRejectionCategory::CardinalityCreationRateExceeded => {
+                UWriteRejectionCategory::CardinalityCreationRateExceeded
+            }
+            tsink_core::WriteRejectionCategory::MemoryPressure => {
+                UWriteRejectionCategory::MemoryPressure
+            }
+            tsink_core::WriteRejectionCategory::DiskQuotaExceeded => {
+                UWriteRejectionCategory::DiskQuotaExceeded
+            }
+            tsink_core::WriteRejectionCategory::WalQuotaExceeded => {
+                UWriteRejectionCategory::WalQuotaExceeded
+            }
+            tsink_core::WriteRejectionCategory::PolicyRejected => {
+                UWriteRejectionCategory::PolicyRejected
+            }
+            tsink_core::WriteRejectionCategory::WriteTimeout => {
+                UWriteRejectionCategory::WriteTimeout
+            }
+            tsink_core::WriteRejectionCategory::StorageClosed => {
+                UWriteRejectionCategory::StorageClosed
+            }
+            tsink_core::WriteRejectionCategory::StorageDegraded => {
+                UWriteRejectionCategory::StorageDegraded
+            }
+            tsink_core::WriteRejectionCategory::InternalIo => UWriteRejectionCategory::InternalIo,
+            tsink_core::WriteRejectionCategory::Internal => UWriteRejectionCategory::Internal,
+            _ => UWriteRejectionCategory::Internal,
+        }
+    }
+}
+
+impl From<tsink_core::WriteRejection> for UWriteRejection {
+    fn from(rejection: tsink_core::WriteRejection) -> Self {
+        UWriteRejection {
+            category: rejection.category.into(),
+            cause_index: rejection.cause_index.map(usize_to_u64),
+            message: rejection.message,
+        }
+    }
+}
+
+impl From<tsink_core::RowWriteStatus> for URowWriteStatus {
+    fn from(status: tsink_core::RowWriteStatus) -> Self {
+        match status {
+            tsink_core::RowWriteStatus::Accepted => URowWriteStatus::Accepted,
+            tsink_core::RowWriteStatus::Rejected(rejection) => URowWriteStatus::Rejected {
+                rejection: rejection.into(),
+            },
+            _ => URowWriteStatus::Rejected {
+                rejection: UWriteRejection {
+                    category: UWriteRejectionCategory::Internal,
+                    cause_index: None,
+                    message: "unrecognized row write status".to_string(),
+                },
+            },
+        }
+    }
+}
+
+impl From<tsink_core::RowWriteOutcome> for URowWriteOutcome {
+    fn from(outcome: tsink_core::RowWriteOutcome) -> Self {
+        URowWriteOutcome {
+            index: usize_to_u64(outcome.index),
+            status: outcome.status.into(),
+        }
+    }
+}
+
+impl From<tsink_core::BatchWriteResult> for UBatchWriteResult {
+    fn from(result: tsink_core::BatchWriteResult) -> Self {
+        UBatchWriteResult {
+            submitted: usize_to_u64(result.submitted),
+            accepted: usize_to_u64(result.accepted),
+            rejected: usize_to_u64(result.rejected),
+            acknowledgement: result.acknowledgement.map(Into::into),
+            outcomes: result.outcomes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl From<tsink_core::WriteResult> for UWriteResult {
     fn from(result: tsink_core::WriteResult) -> Self {
         UWriteResult {
@@ -489,11 +671,92 @@ impl From<tsink_core::DeleteSeriesResult> for UDeleteSeriesResult {
     }
 }
 
+impl From<tsink_core::EffectiveStorageLimits> for UEffectiveStorageLimits {
+    fn from(limits: tsink_core::EffectiveStorageLimits) -> Self {
+        UEffectiveStorageLimits {
+            reported_by_backend: limits.reported_by_backend,
+            persistent: limits.persistent,
+            wal_enabled: limits.wal_enabled,
+            accounted_memory_bytes: limits.accounted_memory_bytes,
+            cardinality: limits.cardinality,
+            wal_bytes: limits.wal_bytes,
+            local_disk_bytes: limits.local_disk_bytes,
+            filesystem_free_headroom_bytes: limits.filesystem_free_headroom_bytes,
+            maintenance_temp_reserve_bytes: limits.maintenance_temp_reserve_bytes,
+            max_concurrent_writers: limits.max_concurrent_writers,
+            write_timeout_nanos: limits.write_timeout_nanos,
+            max_active_partition_heads_per_series: limits.max_active_partition_heads_per_series,
+        }
+    }
+}
+
+impl From<tsink_core::DiskCategory> for UDiskCategory {
+    fn from(category: tsink_core::DiskCategory) -> Self {
+        match category {
+            tsink_core::DiskCategory::Wal => UDiskCategory::Wal,
+            tsink_core::DiskCategory::Segments => UDiskCategory::Segments,
+            tsink_core::DiskCategory::Registry => UDiskCategory::Registry,
+            tsink_core::DiskCategory::Tombstones => UDiskCategory::Tombstones,
+            tsink_core::DiskCategory::Rollups => UDiskCategory::Rollups,
+            tsink_core::DiskCategory::Metadata => UDiskCategory::Metadata,
+            tsink_core::DiskCategory::Exemplars => UDiskCategory::Exemplars,
+            tsink_core::DiskCategory::Cluster => UDiskCategory::Cluster,
+            tsink_core::DiskCategory::EdgeSync => UDiskCategory::EdgeSync,
+            tsink_core::DiskCategory::ServerState => UDiskCategory::ServerState,
+            tsink_core::DiskCategory::Temporary => UDiskCategory::Temporary,
+            tsink_core::DiskCategory::Unknown => UDiskCategory::Unknown,
+            _ => UDiskCategory::Unknown,
+        }
+    }
+}
+
+impl From<tsink_core::LocalDiskLimits> for ULocalDiskLimits {
+    fn from(limits: tsink_core::LocalDiskLimits) -> Self {
+        Self {
+            max_bytes: limits.max_bytes,
+            filesystem_free_headroom_bytes: limits.filesystem_free_headroom_bytes,
+            maintenance_temp_reserve_bytes: limits.maintenance_temp_reserve_bytes,
+        }
+    }
+}
+
+impl From<tsink_core::DiskCategoryUsage> for UDiskCategoryUsage {
+    fn from(usage: tsink_core::DiskCategoryUsage) -> Self {
+        Self {
+            category: usage.category.into(),
+            bytes: usage.bytes,
+        }
+    }
+}
+
+impl From<tsink_core::LocalDiskBudgetSnapshot> for ULocalDiskBudgetSnapshot {
+    fn from(snapshot: tsink_core::LocalDiskBudgetSnapshot) -> Self {
+        Self {
+            limits: snapshot.limits.into(),
+            accounted_bytes: snapshot.accounted_bytes,
+            reserved_bytes: snapshot.reserved_bytes,
+            maintenance_reserved_bytes: snapshot.maintenance_reserved_bytes,
+            unknown_bytes: snapshot.unknown_bytes,
+            filesystem_available_bytes: snapshot.filesystem_available_bytes,
+            over_limit: snapshot.over_limit,
+            active_reservations: snapshot.active_reservations,
+            rejections_total: snapshot.rejections_total,
+            reconciliations_total: snapshot.reconciliations_total,
+            reservation_overruns_total: snapshot.reservation_overruns_total,
+            categories: snapshot.categories.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl From<tsink_core::MemoryObservabilitySnapshot> for UMemoryObservabilitySnapshot {
     fn from(snapshot: tsink_core::MemoryObservabilitySnapshot) -> Self {
         UMemoryObservabilitySnapshot {
+            accounted_bytes: usize_to_u64(snapshot.accounted_bytes),
+            estimated_accounted_bytes: usize_to_u64(snapshot.estimated_accounted_bytes),
             budgeted_bytes: usize_to_u64(snapshot.budgeted_bytes),
             excluded_bytes: usize_to_u64(snapshot.excluded_bytes),
+            excluded_bytes_known: snapshot.excluded_bytes_known,
+            excluded_categories: snapshot.excluded_categories,
             active_and_sealed_bytes: usize_to_u64(snapshot.active_and_sealed_bytes),
             registry_bytes: usize_to_u64(snapshot.registry_bytes),
             metadata_cache_bytes: usize_to_u64(snapshot.metadata_cache_bytes),
@@ -501,6 +764,14 @@ impl From<tsink_core::MemoryObservabilitySnapshot> for UMemoryObservabilitySnaps
             persisted_mmap_bytes: usize_to_u64(snapshot.persisted_mmap_bytes),
             tombstone_bytes: usize_to_u64(snapshot.tombstone_bytes),
             excluded_persisted_mmap_bytes: usize_to_u64(snapshot.excluded_persisted_mmap_bytes),
+            pressure: UMemoryPressureSnapshot {
+                level: snapshot.pressure.level.map(Into::into),
+                approaching_limit_basis_points: snapshot.pressure.approaching_limit_basis_points,
+                approaching_limit_bytes: snapshot.pressure.approaching_limit_bytes,
+                active_backpressured_writers: snapshot.pressure.active_backpressured_writers,
+                backpressure_events_total: snapshot.pressure.backpressure_events_total,
+                rejections_total: snapshot.pressure.rejections_total,
+            },
         }
     }
 }
@@ -745,6 +1016,8 @@ impl From<tsink_core::storage::StorageHealthSnapshot> for UStorageHealthSnapshot
 impl From<tsink_core::StorageObservabilitySnapshot> for UStorageObservabilitySnapshot {
     fn from(snapshot: tsink_core::StorageObservabilitySnapshot) -> Self {
         UStorageObservabilitySnapshot {
+            limits: snapshot.limits.into(),
+            local_disk: snapshot.local_disk.map(Into::into),
             memory: snapshot.memory.into(),
             wal: snapshot.wal.into(),
             retention: snapshot.retention.into(),

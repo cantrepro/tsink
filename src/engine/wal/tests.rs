@@ -13,15 +13,15 @@ use super::{
     replay_from_path_with_mode, scan_last_seq, segment_path, CachedSeriesDefinitionFrame,
     CachedSeriesDefinitionIndex, FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame,
     DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF,
-    WAL_FILE_NAME,
+    PUBLISHED_HIGHWATER_RECORD_LEN, WAL_FILE_NAME, WAL_PUBLISHED_HIGHWATER_FILE_NAME,
 };
 use crate::engine::binio::{write_u32_at, write_u64_at};
 use crate::engine::chunk::{ChunkPoint, ValueLane};
 use crate::engine::segment::WalHighWatermark;
 use crate::{
     wal::{WalReplayMode, WalSyncMode},
-    HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, NativeHistogram, TsinkError,
-    Value,
+    DiskCategory, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, LocalDiskBudget,
+    LocalDiskLimits, NativeHistogram, TsinkError, Value,
 };
 
 fn series_def_frame_header(seq: u64, payload_len: usize, crc32: u32) -> [u8; FRAME_HEADER_LEN] {
@@ -551,6 +551,58 @@ fn cached_committed_series_definitions_snapshot_waits_for_inflight_rebuild() {
 }
 
 #[test]
+fn limited_logical_writes_check_quota_under_the_writer_lock() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    let payload = FramedWal::encode_series_definition_frame_payload(&SeriesDefinitionFrame {
+        series_id: 17,
+        metric: "quota_race".to_string(),
+        labels: Vec::new(),
+    })
+    .unwrap();
+    let estimated_bytes = FramedWal::frame_size_bytes_for_payload_len(payload.len());
+    let limit = wal
+        .total_size_bytes()
+        .unwrap()
+        .saturating_add(estimated_bytes);
+    let start = Arc::new(Barrier::new(3));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let wal = Arc::clone(&wal);
+        let payload = payload.clone();
+        let start = Arc::clone(&start);
+        handles.push(thread::spawn(move || -> crate::Result<()> {
+            start.wait();
+            let mut logical = wal.begin_limited_logical_write(estimated_bytes, limit)?;
+            logical.append_series_definition_payload(&payload)?;
+            logical.persist_pending()?;
+            logical.publish_persisted()?;
+            Ok(())
+        }));
+    }
+
+    start.wait();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(TsinkError::WalSizeLimitExceeded { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(wal.total_size_bytes().unwrap(), limit);
+    assert_runtime_accounting_matches_disk(&wal, temp_dir.path());
+}
+
+#[test]
 fn cached_committed_series_definitions_snapshot_clears_after_reset() {
     let temp_dir = TempDir::new().unwrap();
     let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
@@ -846,6 +898,123 @@ fn wal_reset_clears_existing_frames() {
     assert_eq!(wal.replay_frames().unwrap().len(), 1);
     wal.reset().unwrap();
     assert!(wal.replay_frames().unwrap().is_empty());
+}
+
+#[test]
+fn wal_reset_reconciles_disk_budget_while_over_logical_quota() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+    {
+        let wal = FramedWal::open_with_options(
+            &wal_dir,
+            WalSyncMode::PerAppend,
+            128,
+            (FRAME_HEADER_LEN as u64) + 40,
+        )
+        .unwrap();
+        for series_id in 0..8 {
+            wal.append_series_definition(&SeriesDefinitionFrame {
+                series_id,
+                metric: format!("reset_budget_{series_id}"),
+                labels: vec![Label::new("host", "a")],
+            })
+            .unwrap();
+        }
+        assert!(collect_wal_segment_files(&wal_dir).unwrap().len() > 1);
+    }
+
+    let budget = LocalDiskBudget::open(
+        temp_dir.path(),
+        LocalDiskLimits {
+            max_bytes: Some(1),
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(budget.snapshot().over_limit);
+    let wal = FramedWal::open_with_buffer_size_and_disk_budget(
+        &wal_dir,
+        WalSyncMode::PerAppend,
+        128,
+        Some(Arc::clone(&budget)),
+    )
+    .unwrap();
+
+    wal.reset().unwrap();
+
+    assert!(wal.replay_frames().unwrap().is_empty());
+    assert_runtime_accounting_matches_disk(&wal, &wal_dir);
+    assert_eq!(wal.total_size_bytes().unwrap(), 0);
+    assert_eq!(wal.segment_count().unwrap(), 1);
+    let marker_bytes = fs::metadata(wal_dir.join(WAL_PUBLISHED_HIGHWATER_FILE_NAME))
+        .unwrap()
+        .len();
+    let snapshot = budget.snapshot();
+    let accounted_wal_bytes = snapshot
+        .categories
+        .iter()
+        .find(|usage| usage.category == DiskCategory::Wal)
+        .map(|usage| usage.bytes)
+        .unwrap_or(0);
+    assert_eq!(accounted_wal_bytes, marker_bytes);
+    assert_eq!(snapshot.accounted_bytes, marker_bytes);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+    assert_eq!(snapshot.active_reservations, 0);
+    assert_eq!(snapshot.reconciliations_total, 2);
+    assert!(snapshot.over_limit);
+}
+
+#[test]
+fn wal_reset_preserves_frames_when_recovery_headroom_is_unavailable() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+    {
+        let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 7,
+            metric: "reset_headroom".to_string(),
+            labels: vec![Label::new("host", "a")],
+        })
+        .unwrap();
+    }
+
+    let budget = LocalDiskBudget::open(
+        temp_dir.path(),
+        LocalDiskLimits {
+            filesystem_free_headroom_bytes: u64::MAX,
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+    let wal = FramedWal::open_with_buffer_size_and_disk_budget(
+        &wal_dir,
+        WalSyncMode::PerAppend,
+        128,
+        Some(Arc::clone(&budget)),
+    )
+    .unwrap();
+    let frames_before = wal.replay_frames().unwrap();
+    let accounted_before = budget.snapshot().accounted_bytes;
+
+    let err = wal.reset().unwrap_err();
+
+    assert!(matches!(
+        err,
+        TsinkError::InsufficientDiskSpace {
+            required,
+            available: 0
+        } if required == PUBLISHED_HIGHWATER_RECORD_LEN as u64
+    ));
+    assert_eq!(wal.replay_frames().unwrap().len(), frames_before.len());
+    assert_runtime_accounting_matches_disk(&wal, &wal_dir);
+    let snapshot = budget.snapshot();
+    assert_eq!(snapshot.accounted_bytes, accounted_before);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+    assert_eq!(snapshot.active_reservations, 0);
+    assert_eq!(snapshot.rejections_total, 1);
+    assert_eq!(snapshot.reconciliations_total, 1);
 }
 
 #[test]
@@ -1688,6 +1857,7 @@ fn failed_append_does_not_advance_next_seq() {
         sync_mode: WalSyncMode::PerAppend,
         last_sync: parking_lot::Mutex::new(Instant::now()),
         segment_max_bytes: DEFAULT_WAL_SEGMENT_MAX_BYTES,
+        local_disk_budget: None,
         append_sync_hook: parking_lot::Mutex::new(None),
         cached_series_definition_rebuild_hook: parking_lot::Mutex::new(None),
     };

@@ -117,7 +117,7 @@ struct SeriesKey {
     labels: Vec<Label>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ExemplarStoreState {
     series: BTreeMap<SeriesKey, BTreeMap<i64, ExemplarSample>>,
 }
@@ -202,6 +202,7 @@ impl ExemplarStore {
         }
 
         let mut state = self.write_state()?;
+        let mut staged_state = state.clone();
         let mut accepted = 0usize;
         let mut dropped = 0usize;
         let mut changed = false;
@@ -211,7 +212,7 @@ impl ExemplarStore {
                 metric: exemplar.metric.clone(),
                 labels: exemplar.series_labels.clone(),
             };
-            let series = state.series.entry(key).or_default();
+            let series = staged_state.series.entry(key).or_default();
             let replaced = series.insert(
                 exemplar.timestamp,
                 ExemplarSample {
@@ -234,17 +235,20 @@ impl ExemplarStore {
             }
         }
 
-        while state.exemplar_count() > self.config.max_total_exemplars {
-            if !drop_oldest_exemplar(&mut state) {
+        while staged_state.exemplar_count() > self.config.max_total_exemplars {
+            if !drop_oldest_exemplar(&mut staged_state) {
                 break;
             }
             dropped = dropped.saturating_add(1);
             changed = true;
         }
 
-        state.series.retain(|_, exemplars| !exemplars.is_empty());
+        staged_state
+            .series
+            .retain(|_, exemplars| !exemplars.is_empty());
         if changed {
-            self.persist_state(&state)?;
+            self.persist_state(&staged_state)?;
+            *state = staged_state;
         }
 
         self.metrics
@@ -703,5 +707,69 @@ mod tests {
                 .expect("query should succeed");
         assert_eq!(queried.len(), 1);
         assert_eq!(queried[0].metric, "metric_a");
+    }
+
+    #[test]
+    fn exemplar_store_persistence_failure_does_not_publish_writes_or_counters() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = ExemplarStore::open_with_config(
+            Some(temp_dir.path()),
+            ExemplarStoreConfig {
+                max_total_exemplars: 8,
+                max_exemplars_per_series: 1,
+                max_exemplars_per_request: 8,
+                max_query_results: 8,
+                max_query_selectors: 4,
+            },
+        )
+        .expect("store should open");
+        let selection = SeriesSelection::new()
+            .with_metric("metric_a")
+            .with_matcher(SeriesMatcher::equal("job", "api"));
+        store
+            .apply_writes(&[ExemplarWrite {
+                metric: "metric_a".to_string(),
+                series_labels: vec![Label::new("job", "api")],
+                exemplar_labels: vec![Label::new("trace_id", "persisted")],
+                timestamp: 10,
+                value: 1.0,
+            }])
+            .expect("initial exemplar should persist");
+        let metrics_before = store.metrics_snapshot().expect("metrics should load");
+
+        let tmp_path = store
+            .path
+            .as_deref()
+            .expect("persistent store should expose file path")
+            .with_extension("tmp");
+        std::fs::create_dir(&tmp_path).expect("blocking temporary path should build");
+
+        let error = store
+            .apply_writes(&[ExemplarWrite {
+                metric: "metric_a".to_string(),
+                series_labels: vec![Label::new("job", "api")],
+                exemplar_labels: vec![Label::new("trace_id", "unpersisted")],
+                timestamp: 20,
+                value: 2.0,
+            }])
+            .expect_err("temporary-path collision should fail persistence");
+        assert!(error.contains("failed to open temporary exemplar store"));
+        let metrics_after_failure = store.metrics_snapshot().expect("metrics should load");
+        assert_eq!(metrics_after_failure, metrics_before);
+
+        let queried = store
+            .query(std::slice::from_ref(&selection), 0, 30, 8)
+            .expect("query should succeed after failed persistence");
+        assert_eq!(queried.len(), 1);
+        assert_eq!(queried[0].exemplars.len(), 1);
+        assert_eq!(queried[0].exemplars[0].timestamp, 10);
+        assert_eq!(queried[0].exemplars[0].labels[0].value, "persisted");
+
+        let reopened = ExemplarStore::open_with_config(Some(temp_dir.path()), store.config())
+            .expect("persisted exemplars should remain readable");
+        let persisted = reopened
+            .query(&[selection], 0, 30, 8)
+            .expect("reopened exemplar query should succeed");
+        assert_eq!(persisted, queried);
     }
 }

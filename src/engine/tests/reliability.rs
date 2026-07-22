@@ -1,4 +1,5 @@
 use super::*;
+use crate::{RowWriteStatus, WriteMode, WriteRejectionCategory};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -286,6 +287,102 @@ fn background_flush_failures_fence_new_work_by_default() {
         .insert_rows(&[Row::new("background_fail_fast", DataPoint::new(2, 2.0))])
         .unwrap_err();
     assert!(matches!(err, TsinkError::StorageShuttingDown));
+}
+
+#[test]
+fn canonical_writes_report_degraded_without_committing_after_fail_fast_fence() {
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            background_threads_enabled: false,
+            background_fail_fast: true,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage.observability.record_background_worker_error(
+        "test",
+        &TsinkError::Other("injected background persistence failure".to_string()),
+        true,
+    );
+    assert!(storage.observability_snapshot().health.fail_fast_triggered);
+
+    let series_before = storage.catalog.registry.read().series_count();
+    let memory_before = storage.refresh_memory_usage();
+    let rows = [
+        Row::new("fenced_atomic", DataPoint::new(1, 1.0)),
+        Row::new("fenced_best_effort", DataPoint::new(2, 2.0)),
+    ];
+
+    for mode in [WriteMode::Atomic, WriteMode::BestEffort] {
+        let result = storage.write_batch(&rows, mode).unwrap();
+        assert_eq!(result.submitted, rows.len());
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, rows.len());
+        assert_eq!(result.acknowledgement, None);
+        assert!(result.outcomes.iter().all(|outcome| {
+            matches!(
+                &outcome.status,
+                RowWriteStatus::Rejected(rejection)
+                    if rejection.category == WriteRejectionCategory::StorageDegraded
+            )
+        }));
+    }
+
+    let compatibility_error = storage.insert_rows(&rows).unwrap_err();
+    assert!(matches!(
+        compatibility_error,
+        TsinkError::StorageShuttingDown
+    ));
+    assert_eq!(
+        storage.catalog.registry.read().series_count(),
+        series_before
+    );
+    assert_eq!(storage.refresh_memory_usage(), memory_before);
+}
+
+#[test]
+fn canonical_write_after_lifecycle_close_remains_storage_closed() {
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage.close().unwrap();
+
+    let series_before = storage.catalog.registry.read().series_count();
+    let memory_before = storage.refresh_memory_usage();
+    let rows = [Row::new("closed_write", DataPoint::new(1, 1.0))];
+    let result = storage.write_batch(&rows, WriteMode::Atomic).unwrap();
+    assert_eq!(result.accepted, 0);
+    assert_eq!(result.rejected, 1);
+    assert_eq!(result.acknowledgement, None);
+    assert!(matches!(
+        &result.outcomes[0].status,
+        RowWriteStatus::Rejected(rejection)
+            if rejection.category == WriteRejectionCategory::StorageClosed
+    ));
+    assert!(matches!(
+        storage.insert_rows(&rows),
+        Err(TsinkError::StorageClosed)
+    ));
+    assert_eq!(
+        storage.catalog.registry.read().series_count(),
+        series_before
+    );
+    assert_eq!(storage.refresh_memory_usage(), memory_before);
 }
 
 #[test]
@@ -792,6 +889,7 @@ fn retention_maintenance_rejects_corrupt_runtime_inventory_before_tiering_other_
             timestamp_precision: TimestampPrecision::Seconds,
             retention_window: 100,
             future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
+            max_future_skew_window: None,
             retention_enforced: true,
             background_threads_enabled: false,
             tiered_storage: Some(super::super::config::TieredStorageConfig {

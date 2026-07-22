@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::super::super::{
@@ -274,6 +274,12 @@ impl<'a> WritePrepareWalContext<'a> {
     }
 }
 
+fn increment_atomic_saturating(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
 impl<'a> WriteAdmissionControlContext<'a> {
     fn ensure_accepting_writes(self) -> Result<()> {
         if self
@@ -324,6 +330,8 @@ impl<'a> WriteAdmissionControlContext<'a> {
     ) -> Result<()> {
         let deadline = Instant::now() + self.write_timeout;
         let mut relief_requested = false;
+        let mut memory_backpressure_recorded = false;
+        let mut active_memory_backpressure = None;
 
         loop {
             // A writer owns a limiter permit while it waits here. Shutdown pauses the workers
@@ -331,27 +339,39 @@ impl<'a> WriteAdmissionControlContext<'a> {
             // after the lifecycle transition would hold close() hostage until the write timeout.
             self.ensure_accepting_writes()?;
 
-            if let Some((budget, _required)) =
+            let memory_shortfall = if let Some((budget, _required)) =
                 memory_budget.shortfall(estimated_memory_growth_bytes)
             {
                 self.budget.evict_persisted_sealed_chunks_to_budget(budget);
+                memory_budget.shortfall(estimated_memory_growth_bytes)
+            } else {
+                None
+            };
 
-                if let Some((post_budget, post_required)) =
-                    memory_budget.shortfall(estimated_memory_growth_bytes)
-                {
-                    if Instant::now() >= deadline {
-                        return Err(TsinkError::MemoryBudgetExceeded {
-                            budget: post_budget,
-                            required: post_required,
-                        });
-                    }
-                    if !relief_requested {
-                        relief_requested = self.request_admission_pressure_relief();
-                    }
-                    self.delay_for_admission_backpressure(deadline);
-                    continue;
+            if let Some((post_budget, post_required)) = memory_shortfall {
+                if active_memory_backpressure.is_none() {
+                    active_memory_backpressure = Some(ActiveMemoryBackpressureGuard::new(
+                        self.active_memory_backpressured_writers,
+                    ));
                 }
+                if !memory_backpressure_recorded {
+                    increment_atomic_saturating(self.memory_backpressure_events_total);
+                    memory_backpressure_recorded = true;
+                }
+                if Instant::now() >= deadline {
+                    increment_atomic_saturating(self.memory_rejections_total);
+                    return Err(TsinkError::MemoryBudgetExceeded {
+                        budget: post_budget,
+                        required: post_required,
+                    });
+                }
+                if !relief_requested {
+                    relief_requested = self.request_admission_pressure_relief();
+                }
+                self.delay_for_admission_backpressure(deadline);
+                continue;
             }
+            active_memory_backpressure = None;
 
             if let Some((_limit, _required)) = wal.size_shortfall(estimated_wal_growth_bytes)? {
                 if let Some((post_limit, post_required)) =
@@ -377,6 +397,27 @@ impl<'a> WriteAdmissionControlContext<'a> {
             }
             return Ok(());
         }
+    }
+}
+
+struct ActiveMemoryBackpressureGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl<'a> ActiveMemoryBackpressureGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        increment_atomic_saturating(counter);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveMemoryBackpressureGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_sub(1))
+            });
     }
 }
 

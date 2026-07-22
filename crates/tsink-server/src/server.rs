@@ -1158,13 +1158,19 @@ async fn run_statsd_listener(
 ) -> Result<(), String> {
     let config = legacy_ingest::statsd_config();
     let adapter = StatsdAdapter::new();
-    let mut buffer = vec![0_u8; config.max_packet_bytes.max(64)];
+    // Read one byte beyond the configured limit so an oversized UDP datagram cannot be
+    // silently truncated into a valid-looking StatsD packet.
+    let mut buffer = vec![0_u8; config.max_packet_bytes.saturating_add(1)];
 
     loop {
         let received = tokio::select! {
             result = socket.recv_from(&mut buffer) => result.map_err(|err| format!("statsd recv failed: {err}"))?,
             _ = shutdown_rx.changed() => return Ok(()),
         };
+        if received.0 > config.max_packet_bytes {
+            legacy_ingest::record_request_throttled(legacy_ingest::LegacyAdapterKind::Statsd, 0);
+            continue;
+        }
         let packet = match std::str::from_utf8(&buffer[..received.0]) {
             Ok(packet) => packet,
             Err(_) => {
@@ -1172,7 +1178,7 @@ async fn run_statsd_listener(
                 continue;
             }
         };
-        let normalized = match adapter.normalize_packet(
+        let prepared = match adapter.prepare_packet(
             packet,
             tenant_id,
             current_timestamp_for_precision(app_context.timestamp_precision),
@@ -1194,7 +1200,9 @@ async fn run_statsd_listener(
                 continue;
             }
         };
+        let (normalized, gauge_commit) = prepared.into_parts();
         if normalized.request_units == 0 {
+            gauge_commit.commit()?;
             continue;
         }
         match handlers::ingest_adapter_write_envelope(
@@ -1212,22 +1220,38 @@ async fn run_statsd_listener(
         )
         .await
         {
-            Ok(()) => legacy_ingest::record_request_accepted(
-                legacy_ingest::LegacyAdapterKind::Statsd,
-                normalized.sample_count,
-            ),
+            Ok(outcome) => {
+                gauge_commit.commit()?;
+                legacy_ingest::record_adapter_write(
+                    legacy_ingest::LegacyAdapterKind::Statsd,
+                    legacy_ingest::AdapterWriteObservation {
+                        outcome: legacy_ingest::AdapterWriteOutcome::Complete,
+                        acknowledgement: outcome.acknowledgement,
+                        accepted_samples: normalized.sample_count,
+                        rejected_samples: 0,
+                        accepted_metadata_updates: outcome.accepted_metadata_updates,
+                        applied_metadata_updates: outcome.applied_metadata_updates,
+                        accepted_exemplars: outcome.accepted_exemplars,
+                        error_code: None,
+                        throttled: false,
+                    },
+                );
+            }
             Err(err) => {
-                if legacy_ingest_error_is_throttled(&err) {
-                    legacy_ingest::record_request_throttled(
-                        legacy_ingest::LegacyAdapterKind::Statsd,
-                        normalized.sample_count,
-                    );
+                let observation =
+                    handlers::legacy_adapter_write_error_observation(&err, normalized.sample_count);
+                if observation.accepted_samples == normalized.sample_count {
+                    gauge_commit.commit()?;
                 } else {
-                    legacy_ingest::record_request_rejected(
-                        legacy_ingest::LegacyAdapterKind::Statsd,
-                        normalized.sample_count,
-                    );
+                    // Only proven row acceptance may advance relative-gauge state. A
+                    // sidecar failure can make the overall result indeterminate while
+                    // the row acceptance headers remain authoritative.
+                    drop(gauge_commit);
                 }
+                legacy_ingest::record_adapter_write(
+                    legacy_ingest::LegacyAdapterKind::Statsd,
+                    observation,
+                );
             }
         }
     }
@@ -1303,7 +1327,10 @@ async fn handle_graphite_connection(
                         legacy_ingest::LegacyAdapterKind::Graphite,
                         0,
                     );
-                    return Ok(());
+                    return Err(format!(
+                        "graphite plaintext line exceeds byte limit: > {}",
+                        config.max_line_bytes
+                    ));
                 }
             };
         if bytes_read == 0 {
@@ -1316,7 +1343,7 @@ async fn handle_graphite_connection(
                     legacy_ingest::LegacyAdapterKind::Graphite,
                     0,
                 );
-                continue;
+                return Err("graphite plaintext line is not valid UTF-8".to_string());
             }
         };
         let normalized = match legacy_ingest::normalize_graphite_plaintext_line(
@@ -1327,7 +1354,8 @@ async fn handle_graphite_connection(
         ) {
             Ok(normalized) => normalized,
             Err(err) => {
-                if legacy_ingest_error_is_throttled(&err) {
+                let throttled = legacy_ingest_error_is_throttled(&err);
+                if throttled {
                     legacy_ingest::record_request_throttled(
                         legacy_ingest::LegacyAdapterKind::Graphite,
                         0,
@@ -1338,7 +1366,11 @@ async fn handle_graphite_connection(
                         0,
                     );
                 }
-                continue;
+                return Err(if throttled {
+                    "graphite plaintext line rejected by an ingest limit".to_string()
+                } else {
+                    "graphite plaintext line rejected".to_string()
+                });
             }
         };
         if normalized.request_units == 0 {
@@ -1359,22 +1391,37 @@ async fn handle_graphite_connection(
         )
         .await
         {
-            Ok(()) => legacy_ingest::record_request_accepted(
-                legacy_ingest::LegacyAdapterKind::Graphite,
-                normalized.sample_count,
-            ),
+            Ok(outcome) => {
+                legacy_ingest::record_adapter_write(
+                    legacy_ingest::LegacyAdapterKind::Graphite,
+                    legacy_ingest::AdapterWriteObservation {
+                        outcome: legacy_ingest::AdapterWriteOutcome::Complete,
+                        acknowledgement: outcome.acknowledgement,
+                        accepted_samples: normalized.sample_count,
+                        rejected_samples: 0,
+                        accepted_metadata_updates: outcome.accepted_metadata_updates,
+                        applied_metadata_updates: outcome.applied_metadata_updates,
+                        accepted_exemplars: outcome.accepted_exemplars,
+                        error_code: None,
+                        throttled: false,
+                    },
+                );
+            }
             Err(err) => {
-                if legacy_ingest_error_is_throttled(&err) {
-                    legacy_ingest::record_request_throttled(
-                        legacy_ingest::LegacyAdapterKind::Graphite,
-                        normalized.sample_count,
-                    );
+                let observation =
+                    handlers::legacy_adapter_write_error_observation(&err, normalized.sample_count);
+                let throttled = observation.throttled;
+                legacy_ingest::record_adapter_write(
+                    legacy_ingest::LegacyAdapterKind::Graphite,
+                    observation,
+                );
+                // Graphite plaintext has no per-line acknowledgement frame. Closing the TCP
+                // connection is the only transport-visible failure signal available.
+                return Err(if throttled {
+                    "graphite write throttled".to_string()
                 } else {
-                    legacy_ingest::record_request_rejected(
-                        legacy_ingest::LegacyAdapterKind::Graphite,
-                        normalized.sample_count,
-                    );
-                }
+                    "graphite write rejected".to_string()
+                });
             }
         }
     }
@@ -1634,6 +1681,129 @@ mod tests {
             .expect("storage should build")
     }
 
+    fn make_legacy_listener_context(
+        storage: Arc<dyn Storage>,
+        metadata_store: Arc<MetricMetadataStore>,
+        exemplar_store: Arc<ExemplarStore>,
+    ) -> ServerContext {
+        let usage_accounting =
+            crate::usage::UsageAccounting::open(None).expect("usage store should open");
+        let rules_runtime = RulesRuntime::open(
+            None,
+            Arc::clone(&storage),
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+        )
+        .expect("rules runtime should open");
+        ServerContext {
+            storage: Arc::clone(&storage),
+            metadata_store,
+            exemplar_store,
+            rules_runtime,
+            engine: Arc::new(Engine::with_precision(
+                storage,
+                TimestampPrecision::Milliseconds,
+            )),
+            server_start: Instant::now(),
+            timestamp_precision: TimestampPrecision::Milliseconds,
+            admin_api_enabled: false,
+            admin_path_prefix: None,
+            security_manager: SecurityManager::from_config(&ServerConfig::default())
+                .expect("security runtime should build"),
+            auth_token: None,
+            admin_auth_token: None,
+            internal_api: None,
+            cluster_context: None,
+            tenant_registry: None,
+            rbac_registry: None,
+            edge_sync_context: None,
+            usage_accounting,
+            managed_control_plane: Arc::new(
+                ManagedControlPlane::open(None)
+                    .expect("managed control plane should open in memory"),
+            ),
+        }
+    }
+
+    async fn spawn_statsd_test_listener(
+        storage: Arc<dyn Storage>,
+        metadata_store: Arc<MetricMetadataStore>,
+    ) -> (std::net::SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
+        let listener_context = make_legacy_listener_context(
+            storage,
+            metadata_store,
+            Arc::new(ExemplarStore::in_memory()),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("statsd listener socket should bind");
+        let listen_addr = socket
+            .local_addr()
+            .expect("statsd listener should expose local addr");
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(async move {
+            run_statsd_listener(
+                socket,
+                &listener_context,
+                tenant::DEFAULT_TENANT_ID,
+                &mut shutdown_rx,
+            )
+            .await
+            .expect("statsd listener should run");
+        });
+        (listen_addr, shutdown_tx, listener_task)
+    }
+
+    async fn spawn_graphite_test_listener(
+        storage: Arc<dyn Storage>,
+    ) -> (std::net::SocketAddr, watch::Sender<bool>, JoinHandle<()>) {
+        let listener_context = make_legacy_listener_context(
+            storage,
+            Arc::new(MetricMetadataStore::in_memory()),
+            Arc::new(ExemplarStore::in_memory()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("graphite listener should bind");
+        let listen_addr = listener
+            .local_addr()
+            .expect("graphite listener should expose local addr");
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(async move {
+            run_graphite_listener(
+                listener,
+                &listener_context,
+                tenant::DEFAULT_TENANT_ID,
+                &mut shutdown_rx,
+            )
+            .await
+            .expect("graphite listener should run");
+        });
+        (listen_addr, shutdown_tx, listener_task)
+    }
+
+    async fn assert_graphite_failure_closes_connection(
+        listen_addr: std::net::SocketAddr,
+        line: &[u8],
+    ) {
+        let mut client = tokio::net::TcpStream::connect(listen_addr)
+            .await
+            .expect("graphite client should connect");
+        client
+            .write_all(line)
+            .await
+            .expect("graphite line should send");
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("server should close a failed Graphite connection promptly");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "Graphite failure must be observable as EOF or reset, got {read:?}"
+        );
+    }
+
     struct CloseFailingStorage;
 
     impl Storage for CloseFailingStorage {
@@ -1670,6 +1840,84 @@ mod tests {
 
         fn close(&self) -> tsink::Result<()> {
             Err(TsinkError::Other("close boom".to_string()))
+        }
+    }
+
+    struct RejectFirstBatchStorage {
+        inner: Arc<dyn Storage>,
+        write_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RejectFirstBatchStorage {
+        fn new(inner: Arc<dyn Storage>) -> Self {
+            Self {
+                inner,
+                write_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Storage for RejectFirstBatchStorage {
+        fn insert_rows(&self, rows: &[tsink::Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn write_batch(
+            &self,
+            rows: &[tsink::Row],
+            mode: tsink::WriteMode,
+        ) -> tsink::Result<tsink::BatchWriteResult> {
+            let call = self
+                .write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                let rejection = tsink::WriteRejection::new(
+                    tsink::WriteRejectionCategory::PolicyRejected,
+                    Some(0),
+                    "injected first-write rejection",
+                );
+                return Ok(tsink::BatchWriteResult::from_outcomes(
+                    None,
+                    rows.iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            tsink::RowWriteOutcome::rejected(index, rejection.clone())
+                        })
+                        .collect(),
+                ));
+            }
+            self.inner.write_batch(rows, mode)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
         }
     }
 
@@ -2392,44 +2640,11 @@ mod tests {
             .local_addr()
             .expect("statsd listener should expose local addr");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let usage_accounting =
-            crate::usage::UsageAccounting::open(None).expect("usage store should open");
-        let rules_runtime = RulesRuntime::open(
-            None,
+        let listener_context = make_legacy_listener_context(
             Arc::clone(&storage),
-            TimestampPrecision::Milliseconds,
-            None,
-            None,
-        )
-        .expect("rules runtime should open");
-        let listener_context = ServerContext {
-            storage: Arc::clone(&storage),
-            metadata_store: Arc::clone(&metadata_store),
-            exemplar_store: Arc::clone(&exemplar_store),
-            rules_runtime,
-            engine: Arc::new(Engine::with_precision(
-                Arc::clone(&storage),
-                TimestampPrecision::Milliseconds,
-            )),
-            server_start: Instant::now(),
-            timestamp_precision: TimestampPrecision::Milliseconds,
-            admin_api_enabled: false,
-            admin_path_prefix: None,
-            security_manager: SecurityManager::from_config(&ServerConfig::default())
-                .expect("security runtime should build"),
-            auth_token: None,
-            admin_auth_token: None,
-            internal_api: None,
-            cluster_context: None,
-            tenant_registry: None,
-            rbac_registry: None,
-            edge_sync_context: None,
-            usage_accounting,
-            managed_control_plane: Arc::new(
-                ManagedControlPlane::open(None)
-                    .expect("managed control plane should open in memory"),
-            ),
-        };
+            Arc::clone(&metadata_store),
+            Arc::clone(&exemplar_store),
+        );
         let listener_task = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             run_statsd_listener(
@@ -2468,6 +2683,156 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statsd_storage_rejection_rolls_back_relative_gauge_state() {
+        let inner = make_storage();
+        let rejecting = Arc::new(RejectFirstBatchStorage::new(Arc::clone(&inner)));
+        let storage: Arc<dyn Storage> = rejecting.clone();
+        let scoped = tenant::scoped_storage(Arc::clone(&storage), tenant::DEFAULT_TENANT_ID);
+        let (listen_addr, shutdown_tx, listener_task) = spawn_statsd_test_listener(
+            Arc::clone(&storage),
+            Arc::new(MetricMetadataStore::in_memory()),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("statsd client socket should bind");
+        client
+            .send_to(b"transactional.gauge:+5|g", listen_addr)
+            .await
+            .expect("first gauge datagram should send");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rejecting
+                .write_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the injected rejection should be observed");
+
+        client
+            .send_to(b"transactional.gauge:+2|g", listen_addr)
+            .await
+            .expect("second gauge datagram should send");
+        let points = wait_for_points(&scoped, "transactional_gauge", &[]).await;
+        assert_eq!(points.len(), 1);
+        assert_eq!(
+            points[0].value_as_f64(),
+            Some(2.0),
+            "the rejected +5 update must not leak into the next accepted gauge value"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statsd_committed_rows_publish_gauge_state_when_metadata_sidecar_fails() {
+        let storage = make_storage();
+        let scoped = tenant::scoped_storage(Arc::clone(&storage), tenant::DEFAULT_TENANT_ID);
+        let temp_dir = TempDir::new().expect("metadata temp dir should build");
+        let metadata_store = Arc::new(
+            MetricMetadataStore::open(Some(temp_dir.path()))
+                .expect("persistent metadata store should open"),
+        );
+        let metadata_tmp_path = metadata_store
+            .file_path()
+            .expect("persistent metadata store should expose its path")
+            .with_extension("tmp");
+        std::fs::create_dir(&metadata_tmp_path)
+            .expect("blocking metadata temporary path should build");
+        let (listen_addr, shutdown_tx, listener_task) =
+            spawn_statsd_test_listener(Arc::clone(&storage), Arc::clone(&metadata_store)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("statsd client socket should bind");
+        client
+            .send_to(b"partial.gauge:+5|g", listen_addr)
+            .await
+            .expect("first gauge datagram should send");
+        let first = wait_for_points(&scoped, "partial_gauge", &[]).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].value_as_f64(), Some(5.0));
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        client
+            .send_to(b"partial.gauge:+2|g", listen_addr)
+            .await
+            .expect("second gauge datagram should send");
+        let points = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let points = scoped
+                    .select("partial_gauge", &[], 0, i64::MAX)
+                    .expect("partial gauge query should succeed");
+                if points.len() >= 2 {
+                    break points;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both committed rows should become visible");
+        assert_eq!(points.last().and_then(DataPoint::value_as_f64), Some(7.0));
+        assert!(
+            metadata_store
+                .query(tenant::DEFAULT_TENANT_ID, None, 10)
+                .expect("metadata query should succeed")
+                .is_empty(),
+            "the injected sidecar failure should not publish metadata"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statsd_listener_rejects_datagrams_larger_than_the_packet_limit() {
+        let storage = make_storage();
+        let scoped = tenant::scoped_storage(Arc::clone(&storage), tenant::DEFAULT_TENANT_ID);
+        let (listen_addr, shutdown_tx, listener_task) = spawn_statsd_test_listener(
+            Arc::clone(&storage),
+            Arc::new(MetricMetadataStore::in_memory()),
+        )
+        .await;
+
+        let config = legacy_ingest::statsd_config();
+        let suffix = ":1|c";
+        let oversized_metric = "a".repeat(config.max_packet_bytes - suffix.len());
+        let mut oversized = format!("{oversized_metric}{suffix}").into_bytes();
+        assert_eq!(oversized.len(), config.max_packet_bytes);
+        oversized.push(b'X');
+
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("statsd client socket should bind");
+        client
+            .send_to(&oversized, listen_addr)
+            .await
+            .expect("oversized datagram should send");
+        client
+            .send_to(b"after_oversized:1|c", listen_addr)
+            .await
+            .expect("sentinel datagram should send");
+
+        let sentinel = wait_for_points(&scoped, "after_oversized", &[]).await;
+        assert_eq!(sentinel.len(), 1);
+        let truncated_prefix_points = scoped
+            .select(&oversized_metric, &[], 0, i64::MAX)
+            .expect("oversized metric query should succeed");
+        assert!(
+            truncated_prefix_points.is_empty(),
+            "an oversized datagram must not be truncated into an accepted packet"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graphite_listener_ingests_plaintext_lines_into_storage() {
         let storage = make_storage();
         let scoped = tenant::scoped_storage(Arc::clone(&storage), tenant::DEFAULT_TENANT_ID);
@@ -2480,44 +2845,11 @@ mod tests {
             .local_addr()
             .expect("graphite listener should expose local addr");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let usage_accounting =
-            crate::usage::UsageAccounting::open(None).expect("usage store should open");
-        let rules_runtime = RulesRuntime::open(
-            None,
+        let listener_context = make_legacy_listener_context(
             Arc::clone(&storage),
-            TimestampPrecision::Milliseconds,
-            None,
-            None,
-        )
-        .expect("rules runtime should open");
-        let listener_context = ServerContext {
-            storage: Arc::clone(&storage),
-            metadata_store: Arc::clone(&metadata_store),
-            exemplar_store: Arc::clone(&exemplar_store),
-            rules_runtime,
-            engine: Arc::new(Engine::with_precision(
-                Arc::clone(&storage),
-                TimestampPrecision::Milliseconds,
-            )),
-            server_start: Instant::now(),
-            timestamp_precision: TimestampPrecision::Milliseconds,
-            admin_api_enabled: false,
-            admin_path_prefix: None,
-            security_manager: SecurityManager::from_config(&ServerConfig::default())
-                .expect("security runtime should build"),
-            auth_token: None,
-            admin_auth_token: None,
-            internal_api: None,
-            cluster_context: None,
-            tenant_registry: None,
-            rbac_registry: None,
-            edge_sync_context: None,
-            usage_accounting,
-            managed_control_plane: Arc::new(
-                ManagedControlPlane::open(None)
-                    .expect("managed control plane should open in memory"),
-            ),
-        };
+            Arc::clone(&metadata_store),
+            Arc::clone(&exemplar_store),
+        );
         let listener_task = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             run_graphite_listener(
@@ -2551,6 +2883,35 @@ mod tests {
         assert_eq!(
             metadata[0].metric_type,
             crate::prom_remote::MetricType::Gauge as i32
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphite_parse_failure_closes_the_connection() {
+        let storage = make_storage();
+        let (listen_addr, shutdown_tx, listener_task) = spawn_graphite_test_listener(storage).await;
+        assert_graphite_failure_closes_connection(listen_addr, b"malformed graphite line\n").await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphite_storage_rejection_closes_the_connection() {
+        let inner = make_storage();
+        let rejecting = Arc::new(RejectFirstBatchStorage::new(inner));
+        let storage: Arc<dyn Storage> = rejecting.clone();
+        let (listen_addr, shutdown_tx, listener_task) = spawn_graphite_test_listener(storage).await;
+        assert_graphite_failure_closes_connection(listen_addr, b"graphite.rejected 1 1700000000\n")
+            .await;
+        assert_eq!(
+            rejecting
+                .write_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
 
         let _ = shutdown_tx.send(true);

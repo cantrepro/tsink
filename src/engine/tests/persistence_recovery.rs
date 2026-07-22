@@ -1578,6 +1578,197 @@ fn startup_self_heals_corrupt_registry_checkpoint_after_segment_rebuild() {
     reopened.close().unwrap();
 }
 
+fn seed_registry_catalog_restart_fixture(
+    data_path: &Path,
+    metric: &str,
+) -> (PathBuf, PathBuf, Vec<Label>, Vec<DataPoint>) {
+    let checkpoint_path = data_path.join(SERIES_INDEX_FILE_NAME);
+    let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+    let labels = vec![Label::new("host", "catalog-recovery")];
+    let expected_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+
+    let storage = StorageBuilder::new()
+        .with_data_path(data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::with_labels(metric, labels.clone(), expected_points[0].clone()),
+            Row::with_labels(metric, labels.clone(), expected_points[1].clone()),
+        ])
+        .unwrap();
+    storage.close().unwrap();
+
+    assert!(checkpoint_path.is_file());
+    assert!(catalog_path.is_file());
+    (checkpoint_path, catalog_path, labels, expected_points)
+}
+
+fn open_registry_catalog_restart_fixture(data_path: &Path) -> Arc<dyn Storage> {
+    StorageBuilder::new()
+        .with_data_path(data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap()
+}
+
+fn assert_registry_catalog_restart_fixture_is_healthy(
+    storage: &Arc<dyn Storage>,
+    data_path: &Path,
+    checkpoint_path: &Path,
+    metric: &str,
+    labels: &[Label],
+    expected_points: &[DataPoint],
+) {
+    assert_eq!(
+        storage.select(metric, labels, 0, 10).unwrap(),
+        expected_points
+    );
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        Some(&data_path.join(NUMERIC_LANE_ROOT)),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn startup_self_heals_malformed_registry_catalog_sidecar() {
+    let temp_dir = TempDir::new().unwrap();
+    let metric = "startup_malformed_registry_catalog";
+    let (checkpoint_path, catalog_path, labels, expected_points) =
+        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    let malformed_catalog = b"{ definitely-not-valid-json";
+    std::fs::write(&catalog_path, malformed_catalog).unwrap();
+
+    let reopened = open_registry_catalog_restart_fixture(temp_dir.path());
+
+    assert_registry_catalog_restart_fixture_is_healthy(
+        &reopened,
+        temp_dir.path(),
+        &checkpoint_path,
+        metric,
+        &labels,
+        &expected_points,
+    );
+    assert_ne!(std::fs::read(&catalog_path).unwrap(), malformed_catalog);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn startup_self_heals_wrong_version_registry_catalog_sidecar() {
+    let temp_dir = TempDir::new().unwrap();
+    let metric = "startup_wrong_version_registry_catalog";
+    let (checkpoint_path, catalog_path, labels, expected_points) =
+        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    let mut catalog =
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&catalog_path).unwrap())
+            .unwrap();
+    let current_version = catalog["version"]
+        .as_u64()
+        .expect("seeded catalog must expose a numeric version");
+    catalog["version"] = serde_json::Value::from(current_version.saturating_add(1));
+    let wrong_version_catalog = serde_json::to_vec_pretty(&catalog).unwrap();
+    std::fs::write(&catalog_path, &wrong_version_catalog).unwrap();
+
+    let reopened = open_registry_catalog_restart_fixture(temp_dir.path());
+
+    assert_registry_catalog_restart_fixture_is_healthy(
+        &reopened,
+        temp_dir.path(),
+        &checkpoint_path,
+        metric,
+        &labels,
+        &expected_points,
+    );
+    assert_ne!(std::fs::read(&catalog_path).unwrap(), wrong_version_catalog);
+    reopened.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_replaces_registry_catalog_symlink_without_mutating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let external_dir = TempDir::new().unwrap();
+    let metric = "startup_symlink_registry_catalog";
+    let (checkpoint_path, catalog_path, labels, expected_points) =
+        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    let original_catalog = std::fs::read(&catalog_path).unwrap();
+    let external_catalog = external_dir.path().join("external-catalog.json");
+    std::fs::write(&external_catalog, &original_catalog).unwrap();
+    std::fs::remove_file(&catalog_path).unwrap();
+    symlink(&external_catalog, &catalog_path).unwrap();
+
+    let reopened = open_registry_catalog_restart_fixture(temp_dir.path());
+
+    assert_registry_catalog_restart_fixture_is_healthy(
+        &reopened,
+        temp_dir.path(),
+        &checkpoint_path,
+        metric,
+        &labels,
+        &expected_points,
+    );
+    assert!(
+        !std::fs::symlink_metadata(&catalog_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "startup repair must replace the in-tree symlink entry"
+    );
+    assert_eq!(std::fs::read(&external_catalog).unwrap(), original_catalog);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn over_limit_startup_repairs_missing_registry_catalog_sidecar() {
+    let temp_dir = TempDir::new().unwrap();
+    let metric = "startup_over_limit_registry_catalog";
+    let (checkpoint_path, catalog_path, labels, expected_points) =
+        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    std::fs::remove_file(&catalog_path).unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .with_local_disk_limit(1)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+
+    assert_registry_catalog_restart_fixture_is_healthy(
+        &reopened,
+        temp_dir.path(),
+        &checkpoint_path,
+        metric,
+        &labels,
+        &expected_points,
+    );
+    let disk = reopened
+        .observability_snapshot()
+        .local_disk
+        .expect("disk-limited persistent storage must expose accounting");
+    assert!(disk.over_limit);
+    assert!(disk.accounted_bytes > 1);
+    assert_eq!(disk.active_reservations, 0);
+    assert_eq!(disk.reserved_bytes, 0);
+    reopened.close().unwrap();
+}
+
 #[test]
 fn startup_reopens_from_registry_catalog_without_segment_series_files() {
     let temp_dir = TempDir::new().unwrap();

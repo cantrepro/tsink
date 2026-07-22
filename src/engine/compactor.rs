@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
-use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
     is_not_found_error, list_segment_dirs, load_segments_for_level_runtime_strict,
     load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,
@@ -27,7 +26,9 @@ mod execution;
 #[path = "compactor/planning.rs"]
 mod planning;
 
+#[cfg(test)]
 pub(in crate::engine) use self::execution::finalize_pending_compaction_replacements;
+pub(in crate::engine) use self::execution::finalize_pending_compaction_replacements_with_disk_budget;
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
@@ -82,6 +83,8 @@ pub struct Compactor {
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
+    local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    output_disk_category: crate::DiskCategory,
 }
 
 impl Compactor {
@@ -92,6 +95,8 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
+            local_disk_budget: None,
+            output_disk_category: crate::DiskCategory::Segments,
         }
     }
 
@@ -106,7 +111,34 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
+            local_disk_budget: None,
+            output_disk_category: crate::DiskCategory::Segments,
         }
+    }
+
+    pub(in crate::engine) fn new_with_segment_id_allocator_and_disk_budget(
+        data_path: impl AsRef<Path>,
+        point_cap: usize,
+        next_segment_id: Arc<AtomicU64>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Self {
+        Self {
+            data_path: data_path.as_ref().to_path_buf(),
+            point_cap: point_cap.clamp(1, u16::MAX as usize),
+            l0_trigger: DEFAULT_L0_TRIGGER,
+            l1_trigger: DEFAULT_L1_TRIGGER,
+            next_segment_id: Some(next_segment_id),
+            local_disk_budget,
+            output_disk_category: crate::DiskCategory::Segments,
+        }
+    }
+
+    pub(in crate::engine) fn with_output_disk_category(
+        mut self,
+        category: crate::DiskCategory,
+    ) -> Self {
+        self.output_disk_category = category;
+        self
     }
 
     pub fn compact_once(&self) -> Result<bool> {

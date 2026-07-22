@@ -39,10 +39,20 @@ fn replacement_marker_path(data_path: &Path) -> PathBuf {
     compaction_replacement_dir(data_path).join(format!("replace-{ts_nanos:016x}-{nonce:016x}.json"))
 }
 
+#[cfg(test)]
 pub(super) fn write_compaction_replacement_marker(
     data_path: &Path,
     source_segments: &[PathBuf],
     output_segments: &[PathBuf],
+) -> Result<PathBuf> {
+    write_compaction_replacement_marker_budgeted(data_path, source_segments, output_segments, None)
+}
+
+fn write_compaction_replacement_marker_budgeted(
+    data_path: &Path,
+    source_segments: &[PathBuf],
+    output_segments: &[PathBuf],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<PathBuf> {
     if source_segments.is_empty() || output_segments.is_empty() {
         return Err(TsinkError::InvalidConfiguration(
@@ -68,7 +78,13 @@ pub(super) fn write_compaction_replacement_marker(
     fs::create_dir_all(&marker_dir)?;
     let marker_path = replacement_marker_path(data_path);
     let payload = serde_json::to_vec(&marker)?;
-    write_file_atomically_and_sync_parent(&marker_path, &payload)?;
+    crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted(
+        &marker_path,
+        &payload,
+        local_disk_budget,
+        crate::DiskCategory::Temporary,
+        crate::DiskReservationKind::Maintenance,
+    )?;
     Ok(marker_path)
 }
 
@@ -89,7 +105,11 @@ fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacem
     Ok(marker)
 }
 
-fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> Result<()> {
+fn apply_compaction_replacement_marker(
+    data_path: &Path,
+    marker_path: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
     let marker = parse_compaction_replacement_marker(marker_path)?;
 
     let output_segments = marker
@@ -119,37 +139,45 @@ fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> 
     }
 
     for source in &source_segments {
-        remove_dir_if_exists(source).map_err(|err| TsinkError::IoWithPath {
-            path: source.clone(),
-            source: err,
-        })?;
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            source,
+            local_disk_budget,
+            crate::DiskCategory::Segments,
+        )?;
     }
 
-    match fs::remove_file(marker_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(TsinkError::IoWithPath {
-                path: marker_path.to_path_buf(),
-                source: err,
-            });
-        }
-    }
+    crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+        marker_path,
+        local_disk_budget,
+        crate::DiskCategory::Temporary,
+    )?;
 
     Ok(())
 }
 
-fn rollback_output_segments(output_segments: &[PathBuf]) -> Result<()> {
+fn rollback_output_segments(
+    output_segments: &[PathBuf],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
     for segment in output_segments.iter().rev() {
-        remove_dir_if_exists(segment).map_err(|err| TsinkError::IoWithPath {
-            path: segment.clone(),
-            source: err,
-        })?;
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            segment,
+            local_disk_budget,
+            crate::DiskCategory::Segments,
+        )?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Path) -> Result<()> {
+    finalize_pending_compaction_replacements_with_disk_budget(data_path, None)
+}
+
+pub(in crate::engine) fn finalize_pending_compaction_replacements_with_disk_budget(
+    data_path: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
     let marker_dir = compaction_replacement_dir(data_path);
     let read_dir = match fs::read_dir(&marker_dir) {
         Ok(read_dir) => read_dir,
@@ -182,7 +210,7 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Pa
     marker_paths.sort();
 
     for marker_path in marker_paths {
-        apply_compaction_replacement_marker(data_path, &marker_path)?;
+        apply_compaction_replacement_marker(data_path, &marker_path, local_disk_budget)?;
     }
 
     Ok(())
@@ -330,7 +358,9 @@ impl Compactor {
             Ok(())
         })();
         if let Err(err) = write_outputs_result {
-            if let Err(rollback_err) = rollback_output_segments(&output_roots) {
+            if let Err(rollback_err) =
+                rollback_output_segments(&output_roots, self.local_disk_budget.as_ref())
+            {
                 return Err(TsinkError::Other(format!(
                     "compaction output write failed and rollback failed: write={err}, rollback={rollback_err}"
                 )));
@@ -357,9 +387,29 @@ impl Compactor {
         }
 
         if apply_replacement {
-            let replacement_marker_path =
-                write_compaction_replacement_marker(&self.data_path, &source_roots, &output_roots)?;
-            apply_compaction_replacement_marker(&self.data_path, &replacement_marker_path)?;
+            let replacement_marker_path = match write_compaction_replacement_marker_budgeted(
+                &self.data_path,
+                &source_roots,
+                &output_roots,
+                self.local_disk_budget.as_ref(),
+            ) {
+                Ok(path) => path,
+                Err(marker_err) => {
+                    if let Err(rollback_err) =
+                        rollback_output_segments(&output_roots, self.local_disk_budget.as_ref())
+                    {
+                        return Err(TsinkError::Other(format!(
+                            "compaction replacement marker failed and output rollback failed: marker={marker_err}, rollback={rollback_err}"
+                        )));
+                    }
+                    return Err(marker_err);
+                }
+            };
+            apply_compaction_replacement_marker(
+                &self.data_path,
+                &replacement_marker_path,
+                self.local_disk_budget.as_ref(),
+            )?;
         }
 
         Ok(CompactionOutcome {
@@ -396,7 +446,14 @@ impl Compactor {
             Some(next_segment_id) => next_segment_id.fetch_add(1, Ordering::SeqCst),
             None => load_segments_runtime_strict(&self.data_path)?.next_segment_id,
         };
-        let writer = SegmentWriter::new(&self.data_path, target_level, next_segment_id)?;
+        let writer = SegmentWriter::new_with_disk_budget_and_category(
+            &self.data_path,
+            target_level,
+            next_segment_id,
+            self.local_disk_budget.clone(),
+            crate::DiskReservationKind::Maintenance,
+            self.output_disk_category,
+        )?;
         writer.write_segment_with_wal_highwater(registry, chunks_by_series, wal_highwater)?;
         Ok(writer.layout().root.clone())
     }

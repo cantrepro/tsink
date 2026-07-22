@@ -118,6 +118,15 @@ impl ChunkStorage {
             || matches!(err, TsinkError::Other(message) if message.contains("during runtime refresh"))
     }
 
+    fn close_should_defer_resource_maintenance_error(err: &TsinkError) -> bool {
+        matches!(
+            err,
+            TsinkError::DiskQuotaExceeded { .. }
+                | TsinkError::InsufficientCompactionHeadroom { .. }
+                | TsinkError::InsufficientDiskSpace { .. }
+        )
+    }
+
     fn execute_close_pipeline(&self) -> Result<()> {
         let shutdown = self.lifecycle_shutdown_context();
         let _background_maintenance_guard = shutdown.background_maintenance_gate();
@@ -125,11 +134,31 @@ impl ChunkStorage {
         let _write_permits = shutdown.acquire_close_write_permits()?;
         self.flush_all_active()?;
         self.persist_segment()?;
-        self.sweep_expired_persisted_segments()?;
+        if let Err(err) = self.sweep_expired_persisted_segments() {
+            if Self::close_should_defer_resource_maintenance_error(&err) {
+                shutdown.record_deferred_dirty_refresh(&err);
+                tracing::warn!(
+                    error = %err,
+                    "Close deferred retention maintenance because disk headroom was unavailable"
+                );
+            } else {
+                return Err(err);
+            }
+        }
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
-        shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+        if let Err(err) = shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES) {
+            if Self::close_should_defer_resource_maintenance_error(&err) {
+                shutdown.record_deferred_dirty_refresh(&err);
+                tracing::warn!(
+                    error = %err,
+                    "Close deferred compaction because disk headroom was unavailable"
+                );
+            } else {
+                return Err(err);
+            }
+        }
         if shutdown.persisted_index_dirty() || self.has_known_persisted_segment_changes() {
             if let Err(err) = self.refresh_dirty_persisted_segments_claimed() {
                 if Self::close_should_defer_dirty_refresh_error(&err) {
@@ -144,11 +173,11 @@ impl ChunkStorage {
                 }
             }
         }
-        self.persist_tombstones_index()?;
+        self.persist_tombstones_index_for_recovery()?;
         if deferred_dirty_refresh {
-            self.checkpoint_series_registry_index_allow_invalid_catalog()?;
+            self.checkpoint_series_registry_index_allow_invalid_catalog_for_recovery()?;
         } else {
-            self.checkpoint_series_registry_index()?;
+            self.checkpoint_series_registry_index_for_recovery()?;
         }
         Ok(())
     }

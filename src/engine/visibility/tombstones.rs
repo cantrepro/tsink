@@ -10,6 +10,8 @@ pub(in crate::engine::storage_engine) struct TombstoneIndexContext<'a> {
     pub(in crate::engine::storage_engine) tiered_storage:
         Option<&'a super::super::config::TieredStorageConfig>,
     pub(in crate::engine::storage_engine) runtime_mode: StorageRuntimeMode,
+    pub(in crate::engine::storage_engine) local_disk_budget:
+        Option<&'a Arc<crate::LocalDiskBudget>>,
 }
 
 impl<'a> TombstoneIndexContext<'a> {
@@ -66,17 +68,37 @@ impl<'a> TombstoneIndexContext<'a> {
             return Ok(());
         }
         for path in self.tombstone_index_persist_paths() {
-            tombstone::persist_tombstone_updates(&path, updates)?;
+            tombstone::persist_tombstone_updates_with_disk_budget(
+                &path,
+                updates,
+                self.local_disk_budget,
+            )?;
         }
         Ok(())
     }
 
-    pub(in crate::engine::storage_engine) fn persist_tombstones_index_snapshot(
+    pub(in crate::engine::storage_engine) fn persist_tombstones_index_snapshot_for_recovery(
         self,
         snapshot: &TombstoneMap,
     ) -> Result<()> {
+        self.persist_tombstones_index_snapshot_with_kind(
+            snapshot,
+            crate::DiskReservationKind::Recovery,
+        )
+    }
+
+    fn persist_tombstones_index_snapshot_with_kind(
+        self,
+        snapshot: &TombstoneMap,
+        reservation_kind: crate::DiskReservationKind,
+    ) -> Result<()> {
         for path in self.tombstone_index_persist_paths() {
-            tombstone::persist_tombstones(&path, snapshot)?;
+            tombstone::persist_tombstones_with_disk_budget_and_kind(
+                &path,
+                snapshot,
+                self.local_disk_budget,
+                reservation_kind,
+            )?;
         }
         Ok(())
     }
@@ -247,6 +269,7 @@ impl ChunkStorage {
             blob_lane_path: self.persisted.blob_lane_path.as_deref(),
             tiered_storage: self.persisted.tiered_storage.as_ref(),
             runtime_mode: self.runtime.runtime_mode,
+            local_disk_budget: self.persisted.local_disk_budget.as_ref(),
         }
     }
 
@@ -274,9 +297,13 @@ impl ChunkStorage {
             .replace_loaded_tombstones_index(self, merged)
     }
 
-    pub(in crate::engine::storage_engine) fn persist_tombstones_index(&self) -> Result<()> {
+    pub(in crate::engine::storage_engine) fn persist_tombstones_index_for_recovery(
+        &self,
+    ) -> Result<()> {
         self.tombstone_index_context()
-            .persist_tombstones_index_snapshot(&self.tombstone_read_context().snapshot())
+            .persist_tombstones_index_snapshot_for_recovery(
+                &self.tombstone_read_context().snapshot(),
+            )
     }
 
     pub(in crate::engine::storage_engine) fn timestamp_survives_tombstones(

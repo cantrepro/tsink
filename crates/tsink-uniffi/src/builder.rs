@@ -121,6 +121,18 @@ impl TsinkStorageBuilder {
         self.with_builder(|b| b.with_wal_size_limit(bytes as usize))
     }
 
+    pub fn with_local_disk_limit(&self, bytes: u64) -> Result<()> {
+        self.with_builder(|b| b.with_local_disk_limit(bytes))
+    }
+
+    pub fn with_filesystem_free_headroom(&self, bytes: u64) -> Result<()> {
+        self.with_builder(|b| b.with_filesystem_free_headroom(bytes))
+    }
+
+    pub fn with_maintenance_temp_reserve(&self, bytes: u64) -> Result<()> {
+        self.with_builder(|b| b.with_maintenance_temp_reserve(bytes))
+    }
+
     pub fn with_wal_buffer_size(&self, size: u64) -> Result<()> {
         self.with_builder(|b| b.with_wal_buffer_size(size as usize))
     }

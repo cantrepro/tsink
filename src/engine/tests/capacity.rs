@@ -1,5 +1,7 @@
 use super::*;
 use crate::engine::series::SeriesKey;
+use crate::MemoryPressureLevel;
+use std::sync::atomic::Ordering;
 
 fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) -> ChunkStorage {
     ChunkStorage::new_with_data_path_and_options(
@@ -12,6 +14,7 @@ fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) 
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -183,8 +186,79 @@ fn memory_budget_stats_reflect_builder_configuration() {
     let snapshot = storage.observability_snapshot();
 
     assert_eq!(storage.memory_budget(), 1234);
+    assert_eq!(
+        snapshot.memory.accounted_bytes,
+        snapshot.memory.budgeted_bytes
+    );
+    assert_eq!(
+        snapshot
+            .memory
+            .estimated_accounted_bytes
+            .saturating_add(snapshot.memory.persisted_mmap_bytes),
+        snapshot.memory.accounted_bytes
+    );
     assert_eq!(storage.memory_used(), snapshot.memory.budgeted_bytes);
     assert_eq!(snapshot.memory.excluded_bytes, 0);
+    assert!(!snapshot.memory.excluded_bytes_known);
+    assert!(!snapshot.memory.excluded_categories.is_empty());
+    assert_eq!(
+        snapshot.memory.pressure.level,
+        Some(MemoryPressureLevel::Normal)
+    );
+    assert_eq!(
+        snapshot.memory.pressure.approaching_limit_basis_points,
+        Some(9_000)
+    );
+    assert_eq!(
+        snapshot.memory.pressure.approaching_limit_bytes,
+        Some(1_111)
+    );
+}
+
+#[test]
+fn memory_pressure_levels_have_deterministic_precedence() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, 1_000);
+
+    storage.memory.used_bytes.store(899, Ordering::Release);
+    let normal = storage.memory_observability_snapshot();
+    assert_eq!(normal.pressure.level, Some(MemoryPressureLevel::Normal));
+    assert_eq!(normal.pressure.approaching_limit_bytes, Some(900));
+
+    storage.memory.used_bytes.store(900, Ordering::Release);
+    assert_eq!(
+        storage.memory_observability_snapshot().pressure.level,
+        Some(MemoryPressureLevel::ApproachingLimit)
+    );
+
+    storage
+        .memory
+        .active_backpressured_writers
+        .store(1, Ordering::Release);
+    assert_eq!(
+        storage.memory_observability_snapshot().pressure.level,
+        Some(MemoryPressureLevel::Backpressured)
+    );
+
+    storage
+        .memory
+        .active_backpressured_writers
+        .store(0, Ordering::Release);
+    storage.memory.used_bytes.store(1_000, Ordering::Release);
+    assert_eq!(
+        storage.memory_observability_snapshot().pressure.level,
+        Some(MemoryPressureLevel::Rejecting)
+    );
+
+    storage
+        .observability
+        .health
+        .maintenance_errors_total
+        .store(1, Ordering::Release);
+    assert_eq!(
+        storage.memory_observability_snapshot().pressure.level,
+        Some(MemoryPressureLevel::Degraded)
+    );
 }
 
 #[test]
@@ -211,6 +285,10 @@ fn memory_budget_guard_rejects_writes_when_in_memory_budget_cannot_be_relaxed() 
             .is_empty(),
         "rejected writes must not mutate in-memory state"
     );
+    let pressure = storage.observability_snapshot().memory.pressure;
+    assert_eq!(pressure.active_backpressured_writers, 0);
+    assert_eq!(pressure.backpressure_events_total, 0);
+    assert_eq!(pressure.rejections_total, 1);
 }
 
 #[test]
@@ -226,6 +304,7 @@ fn memory_budget_rejects_registry_heavy_new_series_before_mutating_registry() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -708,6 +787,7 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,

@@ -4,6 +4,10 @@ Complete listing of every configuration knob in tsink — the embedded library A
 
 Sections are ordered from most commonly used to most advanced.
 
+The individual memory, cardinality, WAL, and concurrency controls below are not a complete resource
+profile. Their exact enforcement scope, effective post-build inspection API, and missing disk/query
+budgets are documented in [Resource limits and profiles](resource-limits.md).
+
 ---
 
 ## Contents
@@ -14,12 +18,12 @@ Sections are ordered from most commonly used to most advanced.
    - [Storage & WAL](#22-storage--wal)
    - [Memory & cardinality](#23-memory--cardinality)
    - [Security & auth](#24-security--auth)
-   - [Cluster](#25-cluster)
+   - [Cluster (experimental)](#25-cluster-experimental)
    - [Edge sync](#26-edge-sync)
 3. [Environment variables — server admission](#3-environment-variables--server-admission)
 4. [Environment variables — ingestion protocols](#4-environment-variables--ingestion-protocols)
 5. [Environment variables — rules engine](#5-environment-variables--rules-engine)
-6. [Environment variables — cluster](#6-environment-variables--cluster)
+6. [Environment variables — cluster (experimental)](#6-environment-variables--cluster-experimental)
    - [RPC & writes](#61-rpc--writes)
    - [Reads](#62-reads)
    - [Hinted handoff outbox](#63-hinted-handoff-outbox)
@@ -33,7 +37,9 @@ Sections are ordered from most commonly used to most advanced.
 
 ## 1. Embedded library — `StorageBuilder`
 
-These are the options exposed through the `StorageBuilder` Rust API and the equivalent `TsinkStorageBuilder` Python bindings. See the [embedded library guide](embedded-library.md) and [Python bindings guide](python-bindings.md) for usage examples.
+These are options on the Rust `StorageBuilder` API. The Python builder exposes a documented subset;
+see the [embedded library guide](embedded-library.md) and
+[Python bindings guide](python-bindings.md) for the exact surface and usage examples.
 
 ### Storage & persistence
 
@@ -49,10 +55,9 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 | Builder method | Type | Default | Description |
 |---|---|---|---|
 | `with_retention(duration)` | `Duration` | `14 days` | How long data is retained. Writes outside this window are rejected when `retention_enforced` is set (which `with_retention` enables automatically). |
-| `with_hot_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from local (hot) to object-store warm tier. |
-| `with_warm_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from warm to cold tier. |
+| `with_tiered_retention_policy(hot, warm)` | `(Duration, Duration)` | *(both fall back to `retention`)* | Sets the ages at which data moves from local hot storage to the warm tier and then to the cold tier. Calling it also enables retention enforcement. |
 | `with_mirror_hot_segments_to_object_store(bool)` | `bool` | `false` | Copy freshly-persisted hot segments into `<object_store_path>/hot/` in addition to writing locally. Useful for cross-node availability. |
-| `with_remote_segment_cache_policy(policy)` | `RemoteSegmentCachePolicy` | `MetadataOnly` | What to hold in memory for remote (object-store) segments: `MetadataOnly` or `Full`. |
+| `with_remote_segment_cache_policy(policy)` | `RemoteSegmentCachePolicy` | `MetadataOnly` | Selects the remote segment cache policy. `MetadataOnly` is the only policy currently available. |
 | `with_remote_segment_refresh_interval(duration)` | `Duration` | `5s` | How often a `ComputeOnly` node refreshes its view of remote segment metadata. |
 
 ### Chunk & partition tuning
@@ -61,30 +66,31 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 |---|---|---|---|
 | `with_chunk_points(n)` | `usize` | `2048` | Target number of data points per chunk before the chunk is sealed. Clamped to `1..=65535`. Larger values improve compression; smaller values reduce read amplification on recent data. |
 | `with_partition_duration(duration)` | `Duration` | `1 hour` | Time window covered by a single partition. All series data within this window is co-located. |
-| `with_max_active_partition_heads_per_series(n)` | `usize` | `8` | Maximum number of simultaneously open partition heads per series. When the limit is reached the oldest head is sealed and compacted. |
+| `with_max_active_partition_heads_per_series(n)` | `usize` | `8` | Maximum simultaneously open partition heads per series. A newer partition can seal the oldest head to make room; a write that would open another older partition is rejected once the bound is full. |
 
 ### Write pipeline
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
-| `with_max_writers(n)` | `usize` | CPU-count (cgroup-aware) | Size of the writer thread pool. Higher values increase throughput under concurrent write load at the cost of memory. |
+| `with_max_writers(n)` | `usize` | CPU-count (cgroup-aware) | Maximum writes admitted concurrently by the synchronous engine. |
 | `with_write_timeout(duration)` | `Duration` | `30s` | Maximum time a write call will wait for a writer slot before returning a backpressure error. |
+| `with_max_future_skew(duration)` | `Duration` | *(unset)* | Opt-in clock-relative admission cutoff. A timestamp exactly at `now + duration` is accepted; a later timestamp is rejected before series or WAL state is created. |
 
 ### Memory & cardinality
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
-| `with_memory_limit_bytes(n)` | `usize` | `usize::MAX` (unlimited) | Global byte budget for all in-memory chunks (active + sealed). New writes are back-pressured when the budget is exhausted. |
+| `with_memory_limit(n)` | `usize` | `usize::MAX` (no explicit limit) | Budget for the engine's accounted storage memory. This is not a hard total-process RSS cap; inspect `observability_snapshot()` for accounted and excluded categories. |
 | `with_cardinality_limit(n)` | `usize` | `usize::MAX` (unlimited) | Hard cap on the total number of unique series. Writes that would create a new series beyond this limit are rejected with a cardinality error. |
 
 ### WAL
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
-| `with_wal_enabled(bool)` | `bool` | `true` | Enable or disable the write-ahead log. Disabling removes crash-safety guarantees. |
-| `with_wal_size_limit_bytes(n)` | `usize` | `usize::MAX` (unlimited) | Maximum total on-disk size for WAL files. Oldest segments are pruned when the limit is reached. |
+| `with_wal_enabled(bool)` | `bool` | `true` | Enable or disable the write-ahead log. Disabling removes write-time WAL recovery guarantees. |
+| `with_wal_size_limit(n)` | `usize` | `usize::MAX` (no explicit limit) | Maximum projected on-disk WAL size. A batch that would exceed the limit is rejected; WAL space is reclaimed after persisted state makes older records unnecessary. |
 | `with_wal_buffer_size(n)` | `usize` | `4096` | I/O buffer size for WAL writes. Larger buffers reduce syscall overhead on high-throughput workloads. |
-| `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` — `fsync` after every write (crash-safe, higher latency). `Periodic(duration)` — flush without fsync on a fixed interval (higher throughput, potential data loss on crash). |
+| `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` synchronizes each non-empty batch. `Periodic(duration)` checks the elapsed interval during a later append; it has no autonomous timer, so successful writes may be `Appended` until another write or lifecycle action synchronizes them. |
 | `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. |
 
 ### Background workers
@@ -133,7 +139,7 @@ tsink-server --help
 | `--remote-segment-refresh-interval <DURATION>` | `5s` | Metadata refresh interval for `compute-only` nodes. |
 | `--mirror-hot-segments-to-object-store` | `false` | Copy hot segments to object store as they are sealed. |
 | `--wal-enabled <BOOL>` | `true` | Enable (`true`) or disable (`false`) the WAL. |
-| `--wal-sync-mode <MODE>` | `per-append` | `per-append` (crash-safe) or `periodic` (higher throughput). |
+| `--wal-sync-mode <MODE>` | `per-append` | `per-append` (synchronize each non-empty write) or `periodic` (append-driven interval, higher throughput). |
 | `--chunk-points <N>` | `2048` | Target data points per chunk (1–65535). |
 
 ### 2.3 Memory & cardinality
@@ -151,21 +157,21 @@ tsink-server --help
 | `--tls-cert <PATH>` | *(none)* | PEM-encoded TLS certificate. Both `--tls-cert` and `--tls-key` must be set to enable TLS. |
 | `--tls-key <PATH>` | *(none)* | PEM-encoded TLS private key. |
 | `--auth-token <TOKEN>` | *(none)* | Static bearer token required on all non-admin requests. |
-| `--auth-token-file <PATH>` | *(none)* | File or exec-based token manifest (JSON). Takes precedence over `--auth-token`. |
+| `--auth-token-file <PATH>` | *(none)* | File or exec-based token manifest (JSON). Mutually exclusive with `--auth-token`. |
 | `--admin-auth-token <TOKEN>` | *(none)* | Static bearer token required on `/api/v1/admin/*` endpoints. |
-| `--admin-auth-token-file <PATH>` | *(none)* | File or exec-based admin token manifest. Takes precedence over `--admin-auth-token`. |
+| `--admin-auth-token-file <PATH>` | *(none)* | File or exec-based admin token manifest. Mutually exclusive with `--admin-auth-token`. |
 | `--tenant-config <PATH>` | *(none)* | JSON file defining per-tenant auth, quotas, and policies. See [Multi-tenancy](multi-tenancy.md). |
 | `--rbac-config <PATH>` | *(none)* | JSON file defining RBAC roles, service accounts, and OIDC settings. See [Security model](security.md). |
-| `--enable-admin-api` | `false` | Expose admin snapshot, restore, and cluster management endpoints. |
+| `--enable-admin-api` | `false` | Expose admin snapshot, restore, and experimental cluster management endpoints. |
 | `--admin-path-prefix <PATH>` | *(none)* | Restrict admin file I/O operations to this directory prefix. |
 
-### 2.5 Cluster
+### 2.5 Cluster (experimental)
 
-These flags are only relevant when `--cluster-enabled` is set. See [Cluster setup](cluster-setup.md) and [Clustering internals](clustering-internals.md) for deployment guidance.
+Cluster mode is an experimental advanced capability, not part of tsink's primary embedded, single-node product. These flags are only relevant when `--cluster-enabled` is set. See [Cluster setup](cluster-setup.md) and [Clustering internals](clustering-internals.md) for deployment guidance.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable cluster mode. |
+| `--cluster-enabled` | `false` | Enable experimental cluster mode. |
 | `--cluster-node-id <ID>` | *(required)* | Stable, unique identifier for this node. Must not change after initial startup. |
 | `--cluster-bind <HOST:PORT>` | *(none)* | Internal RPC bind/advertise address. Peers will connect to this address. |
 | `--cluster-node-role <ROLE>` | `hybrid` | `storage` — data only; `query` — query fan-out only; `hybrid` — both. |
@@ -184,13 +190,15 @@ These flags are only relevant when `--cluster-enabled` is set. See [Cluster setu
 
 ### 2.6 Edge sync
 
-Replays locally-written data to an upstream tsink instance. Useful for edge deployments or write aggregation.
+Queues locally accepted row batches and replays them to an upstream tsink instance. Metadata and
+exemplar sidecars are not included in the source queue. This is useful for edge deployments or row
+write aggregation.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--edge-sync-upstream <HOST:PORT>` | *(disabled)* | Upstream server to replay writes to. Omit to disable edge sync. |
 | `--edge-sync-auth-token <TOKEN>` | *(none)* | Bearer token used when writing to the upstream server. |
-| `--edge-sync-source-id <ID>` | *(none)* | Stable identifier for this edge node, used to generate idempotency keys. |
+| `--edge-sync-source-id <ID>` | `--listen` address | Stable identifier for this edge node, used to generate idempotency keys. |
 | `--edge-sync-static-tenant <ID>` | *(none)* | Rewrite all tenant labels to this value before forwarding writes upstream. |
 
 ---
@@ -216,7 +224,7 @@ These variables control per-protocol feature flags and per-request limits.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `true` | Accept metric metadata in Prometheus remote-write requests (capped at 512 metadata entries per request). Set to `false` to ignore all metadata. |
+| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `true` | Accept metric metadata in Prometheus remote-write requests (capped at 512 metadata entries per request). When `false`, a request containing metadata is rejected explicitly. |
 | `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `true` | Accept exemplar records in Prometheus remote-write requests. |
 | `TSINK_REMOTE_WRITE_HISTOGRAMS_ENABLED` | `true` | Accept native histogram samples in Prometheus remote-write requests (capped at 16,384 bucket entries per request). |
 | `TSINK_INFLUX_LINE_PROTOCOL_ENABLED` | `true` | Enable the InfluxDB line-protocol endpoints (`POST /write`, `POST /api/v2/write`). |
@@ -238,9 +246,9 @@ These variables control per-protocol feature flags and per-request limits.
 
 ---
 
-## 6. Environment variables — cluster
+## 6. Environment variables — cluster (experimental)
 
-These variables control every aspect of cluster internals. They are all read once at startup unless otherwise noted.
+These variables configure the experimental cluster subsystem. They are all read once at startup unless otherwise noted.
 
 ### 6.1 RPC & writes
 
@@ -275,7 +283,7 @@ When a replica is temporarily unreachable, writes are queued in an on-disk outbo
 | `TSINK_CLUSTER_OUTBOX_MAX_LOG_BYTES` | `2147483648` (2 GiB) | Maximum on-disk WAL size for the outbox log. |
 | `TSINK_CLUSTER_OUTBOX_MAX_RECORD_BYTES` | `2097152` (2 MiB) | Maximum size of a single outbox record. |
 | `TSINK_CLUSTER_OUTBOX_REPLAY_INTERVAL_SECS` | `2` | Interval in seconds between replay attempts for queued entries. |
-| `TSINK_CLUSTER_OUTBOX_REPLAY_BATCH_SIZE` | `256` | Rows per replay batch sent to a recovering replica. |
+| `TSINK_CLUSTER_OUTBOX_REPLAY_BATCH_SIZE` | `256` | Maximum queued outbox entries considered per replay pass. |
 | `TSINK_CLUSTER_OUTBOX_MAX_BACKOFF_SECS` | `30` | Maximum backoff in seconds between replay attempts when the peer remains unresponsive. |
 | `TSINK_CLUSTER_OUTBOX_CLEANUP_INTERVAL_SECS` | `30` | Interval at which stale delivered records are pruned from the outbox log. |
 | `TSINK_CLUSTER_OUTBOX_CLEANUP_MIN_STALE_RECORDS` | `1024` | Minimum number of stale records required to trigger an early cleanup pass. |
@@ -332,7 +340,9 @@ The control plane uses a Raft-based consensus protocol to manage cluster members
 
 ### 6.8 Write deduplication
 
-Cluster writes carry idempotency keys so that retried requests from the client or from hinted handoff replay are not applied twice.
+Cluster writes carry idempotency keys to suppress and replay duplicate internal requests within a
+bounded window. This is a retry aid, not an exactly-once guarantee: entries can expire or be
+evicted, and a failure can occur after rows are applied but before the completion marker is synced.
 
 | Variable | Default | Description |
 |---|---|---|

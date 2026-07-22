@@ -37,6 +37,26 @@ pub(super) fn render_metrics(
     let uptime = server_start.elapsed().as_secs();
     let obs = storage.observability_snapshot();
     let memory_obs = &obs.memory;
+    let memory_pressure_normal = u8::from(matches!(
+        memory_obs.pressure.level,
+        Some(tsink::MemoryPressureLevel::Normal)
+    ));
+    let memory_pressure_approaching = u8::from(matches!(
+        memory_obs.pressure.level,
+        Some(tsink::MemoryPressureLevel::ApproachingLimit)
+    ));
+    let memory_pressure_backpressured = u8::from(matches!(
+        memory_obs.pressure.level,
+        Some(tsink::MemoryPressureLevel::Backpressured)
+    ));
+    let memory_pressure_rejecting = u8::from(matches!(
+        memory_obs.pressure.level,
+        Some(tsink::MemoryPressureLevel::Rejecting)
+    ));
+    let memory_pressure_degraded = u8::from(matches!(
+        memory_obs.pressure.level,
+        Some(tsink::MemoryPressureLevel::Degraded)
+    ));
     let wal_enabled = u8::from(obs.wal.enabled);
     let cluster_write_metrics = write_routing_metrics_snapshot();
     let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
@@ -115,7 +135,7 @@ pub(super) fn render_metrics(
          # HELP tsink_memory_budget_bytes Configured memory budget\n\
          # TYPE tsink_memory_budget_bytes gauge\n\
          tsink_memory_budget_bytes {memory_budget}\n\
-         # HELP tsink_memory_excluded_bytes Estimated memory intentionally excluded from the configured memory budget\n\
+         # HELP tsink_memory_excluded_bytes Measured excluded bytes; incomplete unless tsink_memory_excluded_bytes_known is 1\n\
          # TYPE tsink_memory_excluded_bytes gauge\n\
          tsink_memory_excluded_bytes {memory_excluded}\n\
          # HELP tsink_memory_registry_bytes Estimated budgeted bytes used by the in-memory series registry\n\
@@ -127,12 +147,31 @@ pub(super) fn render_metrics(
          # HELP tsink_memory_persisted_index_bytes Estimated budgeted bytes used by persisted chunk refs and timestamp indexes\n\
          # TYPE tsink_memory_persisted_index_bytes gauge\n\
          tsink_memory_persisted_index_bytes {memory_persisted_index}\n\
-         # HELP tsink_memory_persisted_mmap_bytes Estimated budgeted bytes used by persisted mmap-backed segment payloads\n\
+         # HELP tsink_memory_persisted_mmap_bytes Budgeted virtual length of persisted mmap-backed segment payloads, not resident bytes\n\
          # TYPE tsink_memory_persisted_mmap_bytes gauge\n\
          tsink_memory_persisted_mmap_bytes {memory_persisted_mmap}\n\
          # HELP tsink_memory_tombstone_bytes Estimated budgeted bytes used by tombstone state\n\
          # TYPE tsink_memory_tombstone_bytes gauge\n\
          tsink_memory_tombstone_bytes {memory_tombstones}\n\
+         # HELP tsink_memory_excluded_bytes_known Whether excluded memory bytes are completely measured\n\
+         # TYPE tsink_memory_excluded_bytes_known gauge\n\
+         tsink_memory_excluded_bytes_known {memory_excluded_known}\n\
+         # HELP tsink_memory_pressure_level Current modeled storage-memory pressure level\n\
+         # TYPE tsink_memory_pressure_level gauge\n\
+         tsink_memory_pressure_level{{level=\"normal\"}} {memory_pressure_normal}\n\
+         tsink_memory_pressure_level{{level=\"approaching_limit\"}} {memory_pressure_approaching}\n\
+         tsink_memory_pressure_level{{level=\"backpressured\"}} {memory_pressure_backpressured}\n\
+         tsink_memory_pressure_level{{level=\"rejecting\"}} {memory_pressure_rejecting}\n\
+         tsink_memory_pressure_level{{level=\"degraded\"}} {memory_pressure_degraded}\n\
+         # HELP tsink_memory_backpressured_writers Writers currently waiting on modeled storage memory\n\
+         # TYPE tsink_memory_backpressured_writers gauge\n\
+         tsink_memory_backpressured_writers {memory_active_backpressured_writers}\n\
+         # HELP tsink_memory_backpressure_events_total Writes that entered modeled storage-memory backpressure\n\
+         # TYPE tsink_memory_backpressure_events_total counter\n\
+         tsink_memory_backpressure_events_total {memory_backpressure_events_total}\n\
+         # HELP tsink_memory_rejections_total Writes rejected by the modeled storage-memory budget\n\
+         # TYPE tsink_memory_rejections_total counter\n\
+         tsink_memory_rejections_total {memory_rejections_total}\n\
          # HELP tsink_series_total Number of known metric series\n\
          # TYPE tsink_series_total gauge\n\
          tsink_series_total {series_count}\n\
@@ -490,6 +529,10 @@ pub(super) fn render_metrics(
         memory_persisted_index = memory_obs.persisted_index_bytes,
         memory_persisted_mmap = memory_obs.persisted_mmap_bytes,
         memory_tombstones = memory_obs.tombstone_bytes,
+        memory_excluded_known = u8::from(memory_obs.excluded_bytes_known),
+        memory_active_backpressured_writers = memory_obs.pressure.active_backpressured_writers,
+        memory_backpressure_events_total = memory_obs.pressure.backpressure_events_total,
+        memory_rejections_total = memory_obs.pressure.rejections_total,
         wal_size_bytes = obs.wal.size_bytes,
         wal_segments = obs.wal.segment_count,
         wal_active_segment = obs.wal.active_segment,
@@ -619,6 +662,7 @@ pub(super) fn render_metrics(
         cluster_dedupe_log_bytes = cluster_dedupe_metrics.log_bytes,
     );
 
+    append_local_disk_metrics(&mut body, obs.local_disk.as_ref());
     cluster::append_metrics(
         &mut body,
         ClusterMetrics {
@@ -650,6 +694,7 @@ pub(super) fn render_metrics(
     );
     append_read_admission_metrics(&mut body, read_admission_metrics);
     append_write_admission_metrics(&mut body, write_admission_metrics);
+    append_write_rejection_metrics(&mut body);
     append_tenant_admission_metrics(&mut body, tenant_admission_metrics);
     append_security_metrics(&mut body, security_manager, rbac_registry);
     append_usage_metrics(&mut body, &usage_status);
@@ -657,6 +702,143 @@ pub(super) fn render_metrics(
 
     HttpResponse::new(200, body.into_bytes())
         .with_header("Content-Type", "text/plain; version=0.0.4")
+}
+
+fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+
+    body.push_str(
+        "# HELP tsink_local_disk_accounted_bytes Bytes accounted beneath the core managed data directory\n\
+         # TYPE tsink_local_disk_accounted_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_accounted_bytes {}\n",
+        snapshot.accounted_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_reserved_bytes Bytes held by live core local-disk reservations\n\
+         # TYPE tsink_local_disk_reserved_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_reserved_bytes {}\n",
+        snapshot.reserved_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_maintenance_reserved_bytes Live reservation bytes held by core maintenance work\n\
+         # TYPE tsink_local_disk_maintenance_reserved_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_maintenance_reserved_bytes {}\n",
+        snapshot.maintenance_reserved_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_unknown_bytes Accounted bytes not recognized as tsink-owned files\n\
+         # TYPE tsink_local_disk_unknown_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_unknown_bytes {}\n",
+        snapshot.unknown_bytes
+    ));
+    if let Some(available) = snapshot.filesystem_available_bytes {
+        body.push_str(
+            "# HELP tsink_local_disk_filesystem_available_bytes Filesystem bytes available to the current user for the managed data directory\n\
+             # TYPE tsink_local_disk_filesystem_available_bytes gauge\n",
+        );
+        body.push_str(&format!(
+            "tsink_local_disk_filesystem_available_bytes {available}\n"
+        ));
+    }
+    if let Some(limit) = snapshot.limits.max_bytes {
+        body.push_str(
+            "# HELP tsink_local_disk_limit_bytes Configured logical byte limit for the core managed data directory\n\
+             # TYPE tsink_local_disk_limit_bytes gauge\n",
+        );
+        body.push_str(&format!("tsink_local_disk_limit_bytes {limit}\n"));
+    }
+    body.push_str(
+        "# HELP tsink_local_disk_filesystem_headroom_bytes Configured filesystem free-space floor for core local storage\n\
+         # TYPE tsink_local_disk_filesystem_headroom_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_filesystem_headroom_bytes {}\n",
+        snapshot.limits.filesystem_free_headroom_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_maintenance_reserve_bytes Configured logical bytes reserved for core maintenance output\n\
+         # TYPE tsink_local_disk_maintenance_reserve_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_maintenance_reserve_bytes {}\n",
+        snapshot.limits.maintenance_temp_reserve_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_over_limit Whether reconciled core usage exceeds its logical limit\n\
+         # TYPE tsink_local_disk_over_limit gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_over_limit {}\n",
+        u8::from(snapshot.over_limit)
+    ));
+    body.push_str(
+        "# HELP tsink_local_disk_active_reservations Live core local-disk reservations\n\
+         # TYPE tsink_local_disk_active_reservations gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_local_disk_active_reservations {}\n",
+        snapshot.active_reservations
+    ));
+    for (name, help, value) in [
+        (
+            "tsink_local_disk_rejections_total",
+            "Core local-disk reservations rejected by logical or physical limits",
+            snapshot.rejections_total,
+        ),
+        (
+            "tsink_local_disk_reconciliations_total",
+            "Successful full scans of the core managed data directory",
+            snapshot.reconciliations_total,
+        ),
+        (
+            "tsink_local_disk_reservation_overruns_total",
+            "Core disk commits whose surviving growth exceeded their reservation",
+            snapshot.reservation_overruns_total,
+        ),
+    ] {
+        body.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_local_disk_category_bytes Accounted bytes beneath the core managed data directory by category\n\
+         # TYPE tsink_local_disk_category_bytes gauge\n",
+    );
+    for usage in &snapshot.categories {
+        body.push_str(&format!(
+            "tsink_local_disk_category_bytes{{category=\"{}\"}} {}\n",
+            disk_category_name(usage.category),
+            usage.bytes
+        ));
+    }
+}
+
+fn disk_category_name(category: tsink::DiskCategory) -> &'static str {
+    match category {
+        tsink::DiskCategory::Wal => "wal",
+        tsink::DiskCategory::Segments => "segments",
+        tsink::DiskCategory::Registry => "registry",
+        tsink::DiskCategory::Tombstones => "tombstones",
+        tsink::DiskCategory::Rollups => "rollups",
+        tsink::DiskCategory::Metadata => "metadata",
+        tsink::DiskCategory::Exemplars => "exemplars",
+        tsink::DiskCategory::Cluster => "cluster",
+        tsink::DiskCategory::EdgeSync => "edge_sync",
+        tsink::DiskCategory::ServerState => "server_state",
+        tsink::DiskCategory::Temporary => "temporary",
+        tsink::DiskCategory::Unknown => "unknown",
+        _ => "unknown",
+    }
 }
 
 fn append_metrics_collection_errors(body: &mut String, errors: &[MetricsCollectionError]) {
@@ -1362,6 +1544,30 @@ fn append_legacy_ingest_metrics(body: &mut String, snapshot: &LegacyIngestStatus
     append_legacy_sample_metrics(body, "graphite", snapshot.graphite.counters);
 
     body.push_str(
+        "# HELP tsink_legacy_ingest_write_acknowledgements_total Legacy adapter storage attempts by bounded acknowledgement level\n\
+         # TYPE tsink_legacy_ingest_write_acknowledgements_total counter\n",
+    );
+    body.push_str(
+        "# HELP tsink_legacy_ingest_write_outcomes_total Legacy adapter storage attempts by complete, rejected, partial, or indeterminate outcome\n\
+         # TYPE tsink_legacy_ingest_write_outcomes_total counter\n",
+    );
+    body.push_str(
+        "# HELP tsink_legacy_ingest_write_errors_total Legacy adapter storage failures by bounded structured reason\n\
+         # TYPE tsink_legacy_ingest_write_errors_total counter\n",
+    );
+    body.push_str(
+        "# HELP tsink_legacy_ingest_sidecar_items_total Legacy adapter metadata and exemplar items accepted or applied during storage attempts\n\
+         # TYPE tsink_legacy_ingest_sidecar_items_total counter\n",
+    );
+    append_legacy_write_observability(
+        body,
+        "influx_line_protocol",
+        &snapshot.influx.write_observability,
+    );
+    append_legacy_write_observability(body, "statsd", &snapshot.statsd.write_observability);
+    append_legacy_write_observability(body, "graphite", &snapshot.graphite.write_observability);
+
+    body.push_str(
         "# HELP tsink_legacy_ingest_limits Legacy protocol adapter request and listener guardrails\n\
          # TYPE tsink_legacy_ingest_limits gauge\n",
     );
@@ -1505,6 +1711,52 @@ fn append_legacy_sample_metrics(
     ));
 }
 
+fn append_legacy_write_observability(
+    body: &mut String,
+    adapter: &str,
+    snapshot: &legacy_ingest::AdapterWriteObservabilitySnapshot,
+) {
+    for (index, level) in ["none", "volatile", "appended", "durable"]
+        .iter()
+        .enumerate()
+    {
+        body.push_str(&format!(
+            "tsink_legacy_ingest_write_acknowledgements_total{{adapter=\"{adapter}\",level=\"{level}\"}} {}\n",
+            snapshot.acknowledgements_total[index]
+        ));
+    }
+    for (index, outcome) in ["complete", "rejected", "partial", "indeterminate"]
+        .iter()
+        .enumerate()
+    {
+        body.push_str(&format!(
+            "tsink_legacy_ingest_write_outcomes_total{{adapter=\"{adapter}\",outcome=\"{outcome}\"}} {}\n",
+            snapshot.outcomes_total[index]
+        ));
+    }
+    for (index, reason) in legacy_ingest::LEGACY_WRITE_ERROR_REASON_NAMES
+        .iter()
+        .enumerate()
+    {
+        body.push_str(&format!(
+            "tsink_legacy_ingest_write_errors_total{{adapter=\"{adapter}\",reason=\"{reason}\"}} {}\n",
+            snapshot.error_reasons_total[index]
+        ));
+    }
+    for (kind, value) in [
+        (
+            "metadata_accepted",
+            snapshot.accepted_metadata_updates_total,
+        ),
+        ("metadata_applied", snapshot.applied_metadata_updates_total),
+        ("exemplars_accepted", snapshot.accepted_exemplars_total),
+    ] {
+        body.push_str(&format!(
+            "tsink_legacy_ingest_sidecar_items_total{{adapter=\"{adapter}\",kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+}
+
 fn append_write_admission_metrics(body: &mut String, snapshot: WriteAdmissionMetricsSnapshot) {
     body.push_str(
         "# HELP tsink_write_admission_rejections_total Public write admission rejections across request-slot, row-budget, and oversize guardrails\n\
@@ -1561,6 +1813,27 @@ fn append_write_admission_metrics(body: &mut String, snapshot: WriteAdmissionMet
     body.push_str(&format!(
         "tsink_write_admission_active_rows {}\n",
         snapshot.active_rows
+    ));
+}
+
+fn append_write_rejection_metrics(body: &mut String) {
+    body.push_str(
+        "# HELP tsink_write_rejections_total Rows rejected by the canonical storage write path, partitioned by structured reason\n\
+         # TYPE tsink_write_rejections_total counter\n",
+    );
+    for (index, reason) in WRITE_REJECTION_REASON_NAMES.iter().enumerate() {
+        body.push_str(&format!(
+            "tsink_write_rejections_total{{reason=\"{reason}\"}} {}\n",
+            WRITE_REJECTION_REASON_TOTALS[index].load(Ordering::Relaxed)
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_write_indeterminate_requests_total Write requests whose failure may nevertheless have committed rows\n\
+         # TYPE tsink_write_indeterminate_requests_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_write_indeterminate_requests_total {}\n",
+        WRITE_INDETERMINATE_REQUESTS_TOTAL.load(Ordering::Relaxed)
     ));
 }
 
@@ -1708,4 +1981,36 @@ fn prometheus_escape_label_value(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_write_observability_renders_fixed_cardinality_labels() {
+        let snapshot = legacy_ingest::AdapterWriteObservabilitySnapshot {
+            acknowledgements_total: [1, 2, 3, 4],
+            outcomes_total: [5, 6, 7, 8],
+            error_reasons_total: [0; legacy_ingest::LEGACY_WRITE_ERROR_REASON_NAMES.len()],
+            accepted_metadata_updates_total: 9,
+            applied_metadata_updates_total: 10,
+            accepted_exemplars_total: 11,
+        };
+        let mut body = String::new();
+        append_legacy_write_observability(&mut body, "statsd", &snapshot);
+
+        assert!(body.contains(
+            "tsink_legacy_ingest_write_acknowledgements_total{adapter=\"statsd\",level=\"durable\"} 4"
+        ));
+        assert!(body.contains(
+            "tsink_legacy_ingest_write_outcomes_total{adapter=\"statsd\",outcome=\"indeterminate\"} 8"
+        ));
+        assert!(body.contains(
+            "tsink_legacy_ingest_write_errors_total{adapter=\"statsd\",reason=\"other\"} 0"
+        ));
+        assert!(body.contains(
+            "tsink_legacy_ingest_sidecar_items_total{adapter=\"statsd\",kind=\"exemplars_accepted\"} 11"
+        ));
+    }
 }

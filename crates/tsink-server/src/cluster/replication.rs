@@ -3,8 +3,8 @@ use crate::cluster::membership::MembershipView;
 use crate::cluster::outbox::{HintedHandoffOutbox, OutboxEnqueueError};
 use crate::cluster::ring::ShardRing;
 use crate::cluster::rpc::{
-    required_capabilities_for_rows, InternalIngestRowsRequest, InternalRow, RpcClient, RpcError,
-    DEFAULT_INTERNAL_RING_VERSION,
+    required_capabilities_for_rows, InternalIngestRowsRequest, InternalIngestRowsResponse,
+    InternalRow, RpcClient, RpcError, DEFAULT_INTERNAL_RING_VERSION,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::task::JoinSet;
-use tsink::{Label, Row, Storage, Value};
+use tsink::{
+    BatchWriteResult, Label, Row, RowWriteStatus, Storage, Value, WriteAcknowledgement, WriteMode,
+    WriteRejection, WriteRejectionCategory,
+};
 
 pub const WRITE_CONSISTENCY_OVERRIDE_HEADER: &str = "x-tsink-write-consistency";
 pub const CLUSTER_WRITE_MAX_BATCH_ROWS_ENV: &str = "TSINK_CLUSTER_WRITE_MAX_BATCH_ROWS";
@@ -47,6 +50,15 @@ pub struct WriteConsistencyOutcome {
     pub acknowledged_replicas_min: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteConsistencyFailureContext {
+    pub shard: u32,
+    pub mode: ClusterWriteConsistency,
+    pub required_acks: u16,
+    pub acknowledged_acks: u16,
+    pub max_possible_acks: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct RoutedWriteBatch {
     pub owner_node_id: String,
@@ -71,6 +83,10 @@ pub struct RoutedWriteStats {
     pub local_rows: usize,
     pub remote_rows: usize,
     pub remote_batches: usize,
+    /// Weakest durability guarantee reported by every replica counted as acknowledged.
+    ///
+    /// This is a per-replica durability aggregate and does not imply cross-node atomicity.
+    pub acknowledgement: Option<WriteAcknowledgement>,
     pub consistency: Option<WriteConsistencyOutcome>,
 }
 
@@ -188,6 +204,39 @@ pub enum WriteRoutingError {
         expected: usize,
         actual: usize,
     },
+    RemoteCanonicalResultMissing {
+        node_id: String,
+        endpoint: String,
+    },
+    RemoteInvalidAtomicWriteResult {
+        node_id: String,
+        endpoint: String,
+        message: String,
+    },
+    RemoteWriteRejected {
+        node_id: String,
+        endpoint: String,
+        rejection: WriteRejection,
+        rejected_rows: usize,
+        consistency: Option<WriteConsistencyFailureContext>,
+    },
+    LocalWriteRejected {
+        rejection: WriteRejection,
+        rejected_rows: usize,
+        shard: u32,
+        mode: ClusterWriteConsistency,
+        required_acks: u16,
+        acknowledged_acks: u16,
+        max_possible_acks: u16,
+    },
+    LocalInvalidAtomicWriteResult {
+        message: String,
+        shard: u32,
+        mode: ClusterWriteConsistency,
+        required_acks: u16,
+        acknowledged_acks: u16,
+        max_possible_acks: u16,
+    },
     OutboxEnqueue {
         node_id: String,
         source: OutboxEnqueueError,
@@ -218,7 +267,16 @@ impl WriteRoutingError {
             | Self::MissingShardOwners { .. }
             | Self::MissingOwnerEndpoint { .. }
             | Self::RemoteInsertedRowsMismatch { .. }
+            | Self::RemoteCanonicalResultMissing { .. }
+            | Self::RemoteInvalidAtomicWriteResult { .. }
+            | Self::LocalInvalidAtomicWriteResult { .. }
             | Self::InsufficientReplicas { .. } => false,
+            Self::RemoteWriteRejected { rejection, .. } => {
+                write_rejection_is_retryable(rejection.category)
+            }
+            Self::LocalWriteRejected { rejection, .. } => {
+                write_rejection_is_retryable(rejection.category)
+            }
             Self::ConsistencyTimeout { .. } | Self::TaskJoin { .. } => true,
             Self::OutboxEnqueue { source, .. } => source.retryable(),
             Self::RemoteIngest { source, .. } => source.retryable(),
@@ -266,6 +324,75 @@ impl fmt::Display for WriteRoutingError {
                 write!(
                     f,
                     "remote write to node '{node_id}' ({endpoint}) inserted {actual} rows but expected {expected}"
+                )
+            }
+            Self::RemoteCanonicalResultMissing { node_id, endpoint } => {
+                write!(
+                    f,
+                    "remote write to node '{node_id}' ({endpoint}) did not report a canonical write result; commit and durability are unverified"
+                )
+            }
+            Self::RemoteInvalidAtomicWriteResult {
+                node_id,
+                endpoint,
+                message,
+            } => {
+                write!(
+                    f,
+                    "remote write to node '{node_id}' ({endpoint}) returned an invalid atomic write result: {message}"
+                )
+            }
+            Self::RemoteWriteRejected {
+                node_id,
+                endpoint,
+                rejection,
+                rejected_rows,
+                consistency,
+            } => {
+                write!(
+                    f,
+                    "remote write to node '{node_id}' ({endpoint}) rejected {rejected_rows} rows ({:?}): {}",
+                    rejection.category, rejection.message,
+                )?;
+                if let Some(consistency) = consistency {
+                    write!(
+                        f,
+                        "; shard {} in {} mode required {} acks, got {}, max possible {}",
+                        consistency.shard,
+                        consistency.mode,
+                        consistency.required_acks,
+                        consistency.acknowledged_acks,
+                        consistency.max_possible_acks
+                    )?;
+                }
+                Ok(())
+            }
+            Self::LocalWriteRejected {
+                rejection,
+                rejected_rows,
+                shard,
+                mode,
+                required_acks,
+                acknowledged_acks,
+                max_possible_acks,
+            } => {
+                write!(
+                    f,
+                    "local replica rejected {rejected_rows} rows ({:?}) for shard {shard} in {mode} mode: {}; required {required_acks} acks, got {acknowledged_acks}, max possible {max_possible_acks}",
+                    rejection.category, rejection.message,
+                )
+            }
+            Self::LocalInvalidAtomicWriteResult {
+                message,
+                shard,
+                mode,
+                required_acks,
+                acknowledged_acks,
+                max_possible_acks,
+            } => {
+                write!(
+                    f,
+                    "local replica returned an invalid atomic write result for shard {shard} in {mode} mode: {message}; required {required_acks} acks, got {acknowledged_acks}, max possible {max_possible_acks}"
                 )
             }
             Self::OutboxEnqueue { node_id, source } => {
@@ -432,6 +559,94 @@ impl ConsistencyFailure {
             }
         }
     }
+
+    fn into_local_rejection_error(
+        self,
+        mode: ClusterWriteConsistency,
+        rejection: WriteRejection,
+        rejected_rows: usize,
+    ) -> WriteRoutingError {
+        WriteRoutingError::LocalWriteRejected {
+            rejection,
+            rejected_rows,
+            shard: self.shard,
+            mode,
+            required_acks: self.required_acks,
+            acknowledged_acks: self.acknowledged_acks,
+            max_possible_acks: self.max_possible_acks,
+        }
+    }
+
+    fn into_local_invalid_result_error(
+        self,
+        mode: ClusterWriteConsistency,
+        message: String,
+    ) -> WriteRoutingError {
+        WriteRoutingError::LocalInvalidAtomicWriteResult {
+            message,
+            shard: self.shard,
+            mode,
+            required_acks: self.required_acks,
+            acknowledged_acks: self.acknowledged_acks,
+            max_possible_acks: self.max_possible_acks,
+        }
+    }
+
+    fn context(self, mode: ClusterWriteConsistency) -> WriteConsistencyFailureContext {
+        WriteConsistencyFailureContext {
+            shard: self.shard,
+            mode,
+            required_acks: self.required_acks,
+            acknowledged_acks: self.acknowledged_acks,
+            max_possible_acks: self.max_possible_acks,
+        }
+    }
+}
+
+fn attach_consistency_failure(
+    error: WriteRoutingError,
+    failure: ConsistencyFailure,
+    mode: ClusterWriteConsistency,
+) -> WriteRoutingError {
+    match error {
+        WriteRoutingError::RemoteWriteRejected {
+            node_id,
+            endpoint,
+            rejection,
+            rejected_rows,
+            ..
+        } => WriteRoutingError::RemoteWriteRejected {
+            node_id,
+            endpoint,
+            rejection,
+            rejected_rows,
+            consistency: Some(failure.context(mode)),
+        },
+        other => other,
+    }
+}
+
+fn routed_consistency_failure_error(
+    failure: ConsistencyFailure,
+    mode: ClusterWriteConsistency,
+    local_shard_row_counts: &BTreeMap<u32, u64>,
+    local_rows_count: usize,
+    local_invalid_result: Option<&String>,
+    local_rejection: Option<&WriteRejection>,
+    remote_result_errors_by_shard: &BTreeMap<u32, WriteRoutingError>,
+) -> WriteRoutingError {
+    if local_shard_row_counts.contains_key(&failure.shard) {
+        if let Some(message) = local_invalid_result {
+            return failure.into_local_invalid_result_error(mode, message.clone());
+        }
+        if let Some(rejection) = local_rejection {
+            return failure.into_local_rejection_error(mode, rejection.clone(), local_rows_count);
+        }
+    }
+    if let Some(error) = remote_result_errors_by_shard.get(&failure.shard) {
+        return attach_consistency_failure(error.clone(), failure, mode);
+    }
+    failure.into_error(mode)
 }
 
 #[derive(Debug, Clone)]
@@ -476,29 +691,6 @@ impl WriteCoordinatorState {
                 state.record_failure(timeout);
             }
         }
-    }
-
-    fn first_impossible_failure(&self) -> Option<ConsistencyFailure> {
-        for (shard, state) in &self.shards {
-            if state.is_satisfied() {
-                continue;
-            }
-            if state.max_possible_acks() < state.required_acks {
-                let kind = if state.timeout_failures > 0 {
-                    ConsistencyFailureKind::Timeout
-                } else {
-                    ConsistencyFailureKind::InsufficientReplicas
-                };
-                return Some(ConsistencyFailure {
-                    shard: *shard,
-                    required_acks: state.required_acks,
-                    acknowledged_acks: state.acknowledged_acks,
-                    max_possible_acks: state.max_possible_acks(),
-                    kind,
-                });
-            }
-        }
-        None
     }
 
     fn first_unsatisfied_failure(&self) -> Option<ConsistencyFailure> {
@@ -546,10 +738,241 @@ impl WriteCoordinatorState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaFragmentOutcome {
+    Accepted(WriteAcknowledgement),
+    Failed { timed_out: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplicaShardProgress {
+    remaining_fragments: usize,
+    failed: bool,
+    timed_out: bool,
+    acknowledgement: Option<WriteAcknowledgement>,
+}
+
+impl ReplicaShardProgress {
+    fn new() -> Self {
+        Self {
+            remaining_fragments: 0,
+            failed: false,
+            timed_out: false,
+            acknowledgement: None,
+        }
+    }
+}
+
+/// Resolves the coordinator's acknowledgement unit, which is one replica for one shard.
+///
+/// A transport batch is only a fragment of that unit: tuning can split rows for the same
+/// `(owner, shard)` across several batches. The replica is acknowledged exactly once, and only
+/// after every fragment succeeds. A failed fragment invalidates the whole replica/shard ack while
+/// later successful fragments can still be accounted as physical commits by the caller.
+#[derive(Debug, Clone, Default)]
+struct ReplicaShardAckTracker {
+    progress: BTreeMap<(String, u32), ReplicaShardProgress>,
+}
+
+impl ReplicaShardAckTracker {
+    fn from_plan(
+        local_node_id: &str,
+        local_shard_row_counts: &BTreeMap<u32, u64>,
+        remote_batches: &[RoutedWriteBatch],
+    ) -> Self {
+        let mut tracker = Self::default();
+        if !local_shard_row_counts.is_empty() {
+            tracker.register_fragment(local_node_id, local_shard_row_counts);
+        }
+        for batch in remote_batches {
+            tracker.register_fragment(&batch.owner_node_id, &batch.shard_row_counts);
+        }
+        tracker
+    }
+
+    fn register_fragment(&mut self, owner_node_id: &str, shard_row_counts: &BTreeMap<u32, u64>) {
+        for shard in shard_row_counts.keys() {
+            let progress = self
+                .progress
+                .entry((owner_node_id.to_string(), *shard))
+                .or_insert_with(ReplicaShardProgress::new);
+            progress.remaining_fragments = progress.remaining_fragments.saturating_add(1);
+        }
+    }
+
+    fn record_fragment(
+        &mut self,
+        owner_node_id: &str,
+        shard_row_counts: &BTreeMap<u32, u64>,
+        outcome: ReplicaFragmentOutcome,
+        coordinator: &mut WriteCoordinatorState,
+    ) -> Option<WriteAcknowledgement> {
+        let mut newly_acknowledged = None;
+        for shard in shard_row_counts.keys() {
+            let key = (owner_node_id.to_string(), *shard);
+            let progress = self
+                .progress
+                .get_mut(&key)
+                .expect("every resolved replica/shard fragment must be present in the plan");
+            debug_assert_ne!(
+                progress.remaining_fragments, 0,
+                "replica/shard fragment resolved more than once: {key:?}"
+            );
+            if progress.remaining_fragments == 0 {
+                continue;
+            }
+
+            progress.remaining_fragments -= 1;
+            match outcome {
+                ReplicaFragmentOutcome::Accepted(acknowledgement) => {
+                    progress.acknowledgement =
+                        weakest_acknowledgement(progress.acknowledgement, acknowledgement);
+                }
+                ReplicaFragmentOutcome::Failed { timed_out } => {
+                    progress.failed = true;
+                    progress.timed_out |= timed_out;
+                }
+            }
+
+            if progress.remaining_fragments != 0 {
+                continue;
+            }
+            if progress.failed {
+                coordinator.record_failure_for_shards(std::iter::once(shard), progress.timed_out);
+            } else {
+                coordinator.record_success_for_shards(std::iter::once(shard));
+                let acknowledgement = progress
+                    .acknowledgement
+                    .expect("a successful replica/shard must have an acknowledgement");
+                newly_acknowledged = weakest_acknowledgement(newly_acknowledged, acknowledgement);
+            }
+        }
+        newly_acknowledged
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RemoteBatchResult {
     batch: RoutedWriteBatch,
-    result: Result<(), WriteRoutingError>,
+    result: Result<WriteAcknowledgement, WriteRoutingError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AtomicWriteDisposition {
+    Accepted(WriteAcknowledgement),
+    Rejected(WriteRejection),
+}
+
+fn validate_atomic_write_result(
+    expected_rows: usize,
+    result: &BatchWriteResult,
+) -> Result<AtomicWriteDisposition, String> {
+    if result.submitted != expected_rows {
+        return Err(format!(
+            "submitted count {} does not match expected {expected_rows}",
+            result.submitted
+        ));
+    }
+    if result.outcomes.len() != expected_rows {
+        return Err(format!(
+            "outcome count {} does not match expected {expected_rows}",
+            result.outcomes.len()
+        ));
+    }
+    if let Some((position, outcome)) = result
+        .outcomes
+        .iter()
+        .enumerate()
+        .find(|(position, outcome)| outcome.index != *position)
+    {
+        return Err(format!(
+            "outcome at position {position} reported index {}",
+            outcome.index
+        ));
+    }
+
+    let accepted = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Accepted))
+        .count();
+    let rejected = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Rejected(_)))
+        .count();
+    if result.accepted != accepted
+        || result.rejected != rejected
+        || accepted.saturating_add(rejected) != expected_rows
+    {
+        return Err(format!(
+            "reported counts accepted={} rejected={} do not match indexed outcomes accepted={accepted} rejected={rejected}",
+            result.accepted, result.rejected
+        ));
+    }
+
+    if accepted == expected_rows && rejected == 0 {
+        return result
+            .acknowledgement
+            .map(AtomicWriteDisposition::Accepted)
+            .ok_or_else(|| "an accepted atomic write omitted its acknowledgement".to_string());
+    }
+    if accepted == 0 && rejected == expected_rows && result.acknowledgement.is_none() {
+        let rejection = result
+            .outcomes
+            .iter()
+            .find_map(|outcome| match &outcome.status {
+                RowWriteStatus::Rejected(rejection) => Some(rejection.clone()),
+                RowWriteStatus::Accepted => None,
+                _ => None,
+            })
+            .ok_or_else(|| "an all-rejected atomic write omitted rejection detail".to_string())?;
+        return Ok(AtomicWriteDisposition::Rejected(rejection));
+    }
+
+    Err(format!(
+        "atomic write reported a partial outcome accepted={accepted} rejected={rejected} acknowledgement={:?}",
+        result.acknowledgement
+    ))
+}
+
+pub(crate) fn validate_confirmed_atomic_ingest_response(
+    expected_rows: usize,
+    response: &InternalIngestRowsResponse,
+) -> Result<WriteAcknowledgement, String> {
+    let result = response
+        .write_result
+        .as_ref()
+        .ok_or_else(|| "remote response omitted its canonical write result".to_string())?;
+    match validate_atomic_write_result(expected_rows, result)? {
+        AtomicWriteDisposition::Accepted(acknowledgement)
+            if response.inserted_rows == result.accepted =>
+        {
+            Ok(acknowledgement)
+        }
+        AtomicWriteDisposition::Accepted(_) => Err(format!(
+            "remote response reported inserted_rows={} but canonical accepted={}",
+            response.inserted_rows, result.accepted
+        )),
+        AtomicWriteDisposition::Rejected(rejection) => Err(format!(
+            "remote canonical write rejected all {expected_rows} rows ({:?}): {}",
+            rejection.category, rejection.message
+        )),
+    }
+}
+
+fn write_rejection_is_retryable(category: WriteRejectionCategory) -> bool {
+    matches!(
+        category,
+        WriteRejectionCategory::MemoryPressure
+            | WriteRejectionCategory::DiskQuotaExceeded
+            | WriteRejectionCategory::WalQuotaExceeded
+            | WriteRejectionCategory::WriteTimeout
+            | WriteRejectionCategory::StorageClosed
+            | WriteRejectionCategory::StorageDegraded
+            | WriteRejectionCategory::InternalIo
+            | WriteRejectionCategory::Internal
+    )
 }
 
 async fn execute_remote_batch_with_ring_version(
@@ -575,16 +998,58 @@ async fn execute_remote_batch_with_ring_version(
                 request_duration_nanos,
                 false,
             );
-            if response.inserted_rows != expected_rows {
+            let Some(write_result) = response.write_result.as_ref() else {
                 record_write_remote_failure(&batch.owner_node_id);
-                Err(WriteRoutingError::RemoteInsertedRowsMismatch {
-                    node_id: batch.owner_node_id.clone(),
-                    endpoint: batch.endpoint.clone(),
-                    expected: expected_rows,
-                    actual: response.inserted_rows,
-                })
-            } else {
-                Ok(())
+                return RemoteBatchResult {
+                    result: Err(WriteRoutingError::RemoteCanonicalResultMissing {
+                        node_id: batch.owner_node_id.clone(),
+                        endpoint: batch.endpoint.clone(),
+                    }),
+                    batch,
+                };
+            };
+            match validate_atomic_write_result(expected_rows, write_result) {
+                Ok(AtomicWriteDisposition::Accepted(acknowledgement))
+                    if response.inserted_rows == write_result.accepted =>
+                {
+                    Ok(acknowledgement)
+                }
+                Ok(AtomicWriteDisposition::Accepted(_)) => {
+                    record_write_remote_failure(&batch.owner_node_id);
+                    Err(WriteRoutingError::RemoteInsertedRowsMismatch {
+                        node_id: batch.owner_node_id.clone(),
+                        endpoint: batch.endpoint.clone(),
+                        expected: write_result.accepted,
+                        actual: response.inserted_rows,
+                    })
+                }
+                Ok(AtomicWriteDisposition::Rejected(rejection)) if response.inserted_rows == 0 => {
+                    record_write_remote_failure(&batch.owner_node_id);
+                    Err(WriteRoutingError::RemoteWriteRejected {
+                        node_id: batch.owner_node_id.clone(),
+                        endpoint: batch.endpoint.clone(),
+                        rejection,
+                        rejected_rows: expected_rows,
+                        consistency: None,
+                    })
+                }
+                Ok(AtomicWriteDisposition::Rejected(_)) => {
+                    record_write_remote_failure(&batch.owner_node_id);
+                    Err(WriteRoutingError::RemoteInsertedRowsMismatch {
+                        node_id: batch.owner_node_id.clone(),
+                        endpoint: batch.endpoint.clone(),
+                        expected: 0,
+                        actual: response.inserted_rows,
+                    })
+                }
+                Err(message) => {
+                    record_write_remote_failure(&batch.owner_node_id);
+                    Err(WriteRoutingError::RemoteInvalidAtomicWriteResult {
+                        node_id: batch.owner_node_id.clone(),
+                        endpoint: batch.endpoint.clone(),
+                        message,
+                    })
+                }
             }
         }
         Err(err) => {
@@ -810,6 +1275,11 @@ impl WriteRouter {
             return Ok(RoutedWriteStats::default());
         }
         record_write_plan_metrics(&plan);
+        let mut replica_ack_tracker = ReplicaShardAckTracker::from_plan(
+            &self.local_node_id,
+            &plan.local_shard_row_counts,
+            &plan.remote_batches,
+        );
 
         let WritePlan {
             local_rows,
@@ -839,45 +1309,111 @@ impl WriteRouter {
         let mut local_rows_written = 0usize;
         let mut remote_rows_count = 0usize;
         let mut remote_batches_count = 0usize;
+        let mut acknowledgement = None;
+        let mut local_rejection = None;
+        let mut local_invalid_result = None;
+        let mut remote_result_errors_by_shard = BTreeMap::new();
+        let mut first_terminal_error = None;
 
         if local_rows_count > 0 {
             let storage = Arc::clone(storage);
-            let result =
-                tokio::task::spawn_blocking(move || storage.insert_rows(&local_rows)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                storage.write_batch(&local_rows, WriteMode::Atomic)
+            })
+            .await;
             match result {
-                Ok(Ok(())) => {
-                    local_rows_written = local_rows_count;
-                    coordinator.record_success_for_shards(local_shard_row_counts.keys());
-                }
+                Ok(Ok(result)) => match validate_atomic_write_result(local_rows_count, &result) {
+                    Ok(AtomicWriteDisposition::Accepted(local_acknowledgement)) => {
+                        local_rows_written = local_rows_count;
+                        record_known_local_commit(local_rows_count);
+                        if let Some(replica_acknowledgement) = replica_ack_tracker.record_fragment(
+                            &self.local_node_id,
+                            &local_shard_row_counts,
+                            ReplicaFragmentOutcome::Accepted(local_acknowledgement),
+                            &mut coordinator,
+                        ) {
+                            acknowledgement =
+                                weakest_acknowledgement(acknowledgement, replica_acknowledgement);
+                        }
+                    }
+                    Ok(AtomicWriteDisposition::Rejected(rejection)) => {
+                        local_rejection = Some(rejection);
+                        replica_ack_tracker.record_fragment(
+                            &self.local_node_id,
+                            &local_shard_row_counts,
+                            ReplicaFragmentOutcome::Failed { timed_out: false },
+                            &mut coordinator,
+                        );
+                    }
+                    Err(message) => {
+                        local_invalid_result = Some(message);
+                        replica_ack_tracker.record_fragment(
+                            &self.local_node_id,
+                            &local_shard_row_counts,
+                            ReplicaFragmentOutcome::Failed { timed_out: false },
+                            &mut coordinator,
+                        );
+                    }
+                },
                 Ok(Err(_)) | Err(_) => {
-                    coordinator.record_failure_for_shards(local_shard_row_counts.keys(), false);
+                    replica_ack_tracker.record_fragment(
+                        &self.local_node_id,
+                        &local_shard_row_counts,
+                        ReplicaFragmentOutcome::Failed { timed_out: false },
+                        &mut coordinator,
+                    );
                 }
             }
-        }
-
-        if let Some(failure) = coordinator.first_impossible_failure() {
-            CLUSTER_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return Err(failure.into_error(policy.mode()));
         }
 
         while let Some(joined) = remote_tasks.join_next().await {
             let batch = match joined {
                 Ok(batch) => batch,
                 Err(err) => {
-                    CLUSTER_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    return Err(WriteRoutingError::TaskJoin {
+                    first_terminal_error.get_or_insert_with(|| WriteRoutingError::TaskJoin {
                         message: err.to_string(),
                     });
+                    if let Some(next_batch) = remote_batches_iter.next() {
+                        let rpc_client = rpc_client.clone();
+                        remote_tasks.spawn(execute_remote_batch_with_ring_version(
+                            rpc_client,
+                            next_batch,
+                            ring_version,
+                        ));
+                    }
+                    continue;
                 }
             };
 
             match batch.result {
-                Ok(()) => {
+                Ok(remote_acknowledgement) => {
                     remote_rows_count = remote_rows_count.saturating_add(batch.batch.rows.len());
                     remote_batches_count = remote_batches_count.saturating_add(1);
-                    coordinator.record_success_for_shards(batch.batch.shard_row_counts.keys());
+                    record_known_remote_commit(batch.batch.rows.len(), 1);
+                    if let Some(replica_acknowledgement) = replica_ack_tracker.record_fragment(
+                        &batch.batch.owner_node_id,
+                        &batch.batch.shard_row_counts,
+                        ReplicaFragmentOutcome::Accepted(remote_acknowledgement),
+                        &mut coordinator,
+                    ) {
+                        acknowledgement =
+                            weakest_acknowledgement(acknowledgement, replica_acknowledgement);
+                    }
                 }
                 Err(err) => {
+                    if matches!(
+                        &err,
+                        WriteRoutingError::RemoteWriteRejected { .. }
+                            | WriteRoutingError::RemoteCanonicalResultMissing { .. }
+                            | WriteRoutingError::RemoteInvalidAtomicWriteResult { .. }
+                            | WriteRoutingError::RemoteInsertedRowsMismatch { .. }
+                    ) {
+                        for shard in batch.batch.shard_row_counts.keys() {
+                            remote_result_errors_by_shard
+                                .entry(*shard)
+                                .or_insert_with(|| err.clone());
+                        }
+                    }
                     let timed_out = matches!(
                         &err,
                         WriteRoutingError::RemoteIngest {
@@ -890,12 +1426,15 @@ impl WriteRouter {
                         if let Err(outbox_err) =
                             self.enqueue_failed_batch(&batch.batch, ring_version)
                         {
-                            CLUSTER_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            return Err(outbox_err);
+                            first_terminal_error.get_or_insert(outbox_err);
                         }
                     }
-                    coordinator
-                        .record_failure_for_shards(batch.batch.shard_row_counts.keys(), timed_out);
+                    replica_ack_tracker.record_fragment(
+                        &batch.batch.owner_node_id,
+                        &batch.batch.shard_row_counts,
+                        ReplicaFragmentOutcome::Failed { timed_out },
+                        &mut coordinator,
+                    );
                 }
             }
 
@@ -909,21 +1448,31 @@ impl WriteRouter {
             }
         }
 
-        if let Some(failure) = coordinator.first_unsatisfied_failure() {
+        if let Some(error) = first_terminal_error {
             CLUSTER_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return Err(failure.into_error(policy.mode()));
+            return Err(error);
         }
 
-        CLUSTER_WRITE_LOCAL_ROWS_TOTAL.fetch_add(local_rows_written as u64, Ordering::Relaxed);
-        CLUSTER_WRITE_ROUTED_ROWS_TOTAL.fetch_add(remote_rows_count as u64, Ordering::Relaxed);
-        CLUSTER_WRITE_ROUTED_BATCHES_TOTAL
-            .fetch_add(remote_batches_count as u64, Ordering::Relaxed);
+        if let Some(failure) = coordinator.first_unsatisfied_failure() {
+            CLUSTER_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let error = routed_consistency_failure_error(
+                failure,
+                policy.mode(),
+                &local_shard_row_counts,
+                local_rows_count,
+                local_invalid_result.as_ref(),
+                local_rejection.as_ref(),
+                &remote_result_errors_by_shard,
+            );
+            return Err(error);
+        }
 
         Ok(RoutedWriteStats {
             inserted_rows: local_rows_written + remote_rows_count,
             local_rows: local_rows_written,
             remote_rows: remote_rows_count,
             remote_batches: remote_batches_count,
+            acknowledgement,
             consistency: coordinator.consistency_outcome(),
         })
     }
@@ -1087,6 +1636,25 @@ fn record_write_remote_failure(node_id: &str) {
             .or_insert_with(PerPeerRoutingMetrics::default);
         entry.remote_failures_total = entry.remote_failures_total.saturating_add(1);
     });
+}
+
+fn weakest_acknowledgement(
+    current: Option<WriteAcknowledgement>,
+    acknowledgement: WriteAcknowledgement,
+) -> Option<WriteAcknowledgement> {
+    Some(match current {
+        Some(current) => current.weakest(acknowledgement),
+        None => acknowledgement,
+    })
+}
+
+fn record_known_local_commit(rows: usize) {
+    CLUSTER_WRITE_LOCAL_ROWS_TOTAL.fetch_add(rows as u64, Ordering::Relaxed);
+}
+
+fn record_known_remote_commit(rows: usize, batches: usize) {
+    CLUSTER_WRITE_ROUTED_ROWS_TOTAL.fetch_add(rows as u64, Ordering::Relaxed);
+    CLUSTER_WRITE_ROUTED_BATCHES_TOTAL.fetch_add(batches as u64, Ordering::Relaxed);
 }
 
 fn saturating_elapsed_nanos(duration: std::time::Duration) -> u64 {
@@ -1285,6 +1853,22 @@ mod tests {
         replication_factor: u16,
         default_write_consistency: ClusterWriteConsistency,
     ) -> WriteRouter {
+        build_router_with_endpoints_and_shards(
+            local_endpoint,
+            seed_nodes,
+            64,
+            replication_factor,
+            default_write_consistency,
+        )
+    }
+
+    fn build_router_with_endpoints_and_shards(
+        local_endpoint: String,
+        seed_nodes: Vec<(&str, String)>,
+        shards: u32,
+        replication_factor: u16,
+        default_write_consistency: ClusterWriteConsistency,
+    ) -> WriteRouter {
         let cfg = ClusterConfig {
             enabled: true,
             node_id: Some("node-a".to_string()),
@@ -1293,7 +1877,7 @@ mod tests {
                 .iter()
                 .map(|(node_id, endpoint)| format!("{node_id}@{endpoint}"))
                 .collect(),
-            shards: 64,
+            shards,
             replication_factor,
             ..ClusterConfig::default()
         };
@@ -1343,6 +1927,108 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn build_same_series_rows(count: usize) -> Vec<Row> {
+        (0..count)
+            .map(|idx| {
+                Row::with_labels(
+                    "same_series_cpu_usage",
+                    vec![Label::new("instance", "same-instance")],
+                    DataPoint::new(1_700_000_000_000 + idx as i64, idx as f64),
+                )
+            })
+            .collect()
+    }
+
+    fn accepted_atomic_result(
+        row_count: usize,
+        acknowledgement: WriteAcknowledgement,
+    ) -> BatchWriteResult {
+        BatchWriteResult::from_outcomes(
+            Some(acknowledgement),
+            (0..row_count)
+                .map(tsink::RowWriteOutcome::accepted)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn confirmed_ingest_response_requires_complete_accepted_canonical_result() {
+        let missing = InternalIngestRowsResponse {
+            inserted_rows: 1,
+            write_result: None,
+        };
+        assert!(validate_confirmed_atomic_ingest_response(1, &missing).is_err());
+
+        let mut malformed = accepted_atomic_result(1, WriteAcknowledgement::Durable);
+        malformed.outcomes.clear();
+        let malformed = InternalIngestRowsResponse {
+            inserted_rows: 1,
+            write_result: Some(malformed),
+        };
+        assert!(validate_confirmed_atomic_ingest_response(1, &malformed).is_err());
+
+        let rejection = WriteRejection::new(
+            WriteRejectionCategory::PolicyRejected,
+            Some(0),
+            "replica policy rejected the row",
+        );
+        let rejected = InternalIngestRowsResponse {
+            inserted_rows: 0,
+            write_result: Some(BatchWriteResult::from_outcomes(
+                None,
+                vec![tsink::RowWriteOutcome::rejected(0, rejection)],
+            )),
+        };
+        assert!(validate_confirmed_atomic_ingest_response(1, &rejected).is_err());
+    }
+
+    struct MalformedCanonicalStorage {
+        inner: Arc<dyn Storage>,
+    }
+
+    impl Storage for MalformedCanonicalStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn write_batch(&self, rows: &[Row], _mode: WriteMode) -> tsink::Result<BatchWriteResult> {
+            let mut result = accepted_atomic_result(rows.len(), WriteAcknowledgement::Volatile);
+            result.outcomes.clear();
+            Ok(result)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            options: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, options)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
     }
 
     fn build_test_outbox(temp_dir: &TempDir, max_record_bytes: u64) -> Arc<HintedHandoffOutbox> {
@@ -1413,6 +2099,10 @@ mod tests {
                 200,
                 serde_json::to_vec(&InternalIngestRowsResponse {
                     inserted_rows: parsed.rows.len(),
+                    write_result: Some(accepted_atomic_result(
+                        parsed.rows.len(),
+                        WriteAcknowledgement::Durable,
+                    )),
                 })
                 .expect("response should encode"),
             )
@@ -1452,6 +2142,10 @@ mod tests {
                 200,
                 serde_json::to_vec(&InternalIngestRowsResponse {
                     inserted_rows: parsed.rows.len(),
+                    write_result: Some(accepted_atomic_result(
+                        parsed.rows.len(),
+                        WriteAcknowledgement::Durable,
+                    )),
                 })
                 .expect("response should encode"),
             )
@@ -1459,6 +2153,134 @@ mod tests {
             tolerate_test_client_disconnect(write_http_response(&mut stream, &response).await)
                 .expect("response should write");
         })
+    }
+
+    async fn spawn_rejected_ingest_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address")
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection expected");
+            let mut read_buffer = Vec::new();
+            let request = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("request should decode");
+            let parsed: InternalIngestRowsRequest =
+                serde_json::from_slice(&request.body).expect("ingest payload should decode");
+            let rejection = WriteRejection::new(
+                WriteRejectionCategory::InvalidLabels,
+                Some(0),
+                "replica policy rejected labels",
+            );
+            let write_result = BatchWriteResult::from_outcomes(
+                None,
+                (0..parsed.rows.len())
+                    .map(|index| tsink::RowWriteOutcome::rejected(index, rejection.clone()))
+                    .collect(),
+            );
+            let response = HttpResponse::new(
+                200,
+                serde_json::to_vec(&InternalIngestRowsResponse {
+                    inserted_rows: 0,
+                    write_result: Some(write_result),
+                })
+                .expect("response should encode"),
+            )
+            .with_header("Content-Type", "application/json");
+            tolerate_test_client_disconnect(write_http_response(&mut stream, &response).await)
+                .expect("response should write");
+        });
+        (addr, server)
+    }
+
+    async fn spawn_scripted_single_row_ingest_server(
+        accepted_fragments: Vec<bool>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address")
+            .to_string();
+        let server = tokio::spawn(async move {
+            for accepted in accepted_fragments {
+                let (mut stream, _) = listener.accept().await.expect("connection expected");
+                let mut read_buffer = Vec::new();
+                let request = read_http_request(&mut stream, &mut read_buffer)
+                    .await
+                    .expect("request should decode");
+                assert_eq!(request.path_without_query(), "/internal/v1/ingest_rows");
+                let parsed: InternalIngestRowsRequest =
+                    serde_json::from_slice(&request.body).expect("ingest payload should decode");
+                assert_eq!(
+                    parsed.rows.len(),
+                    1,
+                    "tuning should route one row per fragment"
+                );
+
+                let write_result = if accepted {
+                    accepted_atomic_result(1, WriteAcknowledgement::Durable)
+                } else {
+                    let rejection = WriteRejection::new(
+                        WriteRejectionCategory::InvalidLabels,
+                        Some(0),
+                        "scripted replica rejection",
+                    );
+                    BatchWriteResult::from_outcomes(
+                        None,
+                        vec![tsink::RowWriteOutcome::rejected(0, rejection)],
+                    )
+                };
+                let response = HttpResponse::new(
+                    200,
+                    serde_json::to_vec(&InternalIngestRowsResponse {
+                        inserted_rows: usize::from(accepted),
+                        write_result: Some(write_result),
+                    })
+                    .expect("response should encode"),
+                )
+                .with_header("Content-Type", "application/json");
+                tolerate_test_client_disconnect(write_http_response(&mut stream, &response).await)
+                    .expect("response should write");
+            }
+        });
+        (addr, server)
+    }
+
+    async fn spawn_legacy_count_only_ingest_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address")
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection expected");
+            let mut read_buffer = Vec::new();
+            let request = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("request should decode");
+            let parsed: InternalIngestRowsRequest =
+                serde_json::from_slice(&request.body).expect("ingest payload should decode");
+            let response = HttpResponse::new(
+                200,
+                serde_json::to_vec(&InternalIngestRowsResponse {
+                    inserted_rows: parsed.rows.len(),
+                    write_result: None,
+                })
+                .expect("response should encode"),
+            )
+            .with_header("Content-Type", "application/json");
+            tolerate_test_client_disconnect(write_http_response(&mut stream, &response).await)
+                .expect("response should write");
+        });
+        (addr, server)
     }
 
     fn tolerate_test_client_disconnect(result: Result<(), String>) -> Result<(), String> {
@@ -1561,6 +2383,135 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_shard_remote_fragments_count_as_one_replica_ack() {
+        let (endpoint, server) =
+            spawn_scripted_single_row_ingest_server(vec![true, true, true]).await;
+        let router = build_router_with_endpoints_and_shards(
+            "127.0.0.1:9313".to_string(),
+            vec![("node-b", endpoint)],
+            1,
+            2,
+            ClusterWriteConsistency::All,
+        )
+        .with_tuning(WriteRouterTuning {
+            max_remote_batch_rows: 1,
+            max_inflight_remote_batches: 1,
+        });
+        let rows = build_same_series_rows(3);
+        let plan = router
+            .plan_rows(rows.clone())
+            .expect("same-shard plan should build");
+        assert_eq!(plan.shard_replica_owners.len(), 1);
+        assert_eq!(plan.remote_batches.len(), 3);
+        assert!(plan
+            .remote_batches
+            .iter()
+            .all(|batch| batch.shard_row_counts.len() == 1));
+
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let stats = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect("all fragments should establish the remote replica ack");
+        assert_eq!(stats.local_rows, 3);
+        assert_eq!(stats.remote_rows, 3);
+        assert_eq!(stats.remote_batches, 3);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Volatile));
+        assert_eq!(
+            stats.consistency,
+            Some(WriteConsistencyOutcome {
+                mode: ClusterWriteConsistency::All,
+                required_acks: 2,
+                acknowledged_replicas_min: 2,
+            })
+        );
+
+        server.await.expect("remote server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_shard_partial_remote_fragment_failure_invalidates_replica_ack() {
+        let (endpoint, server) =
+            spawn_scripted_single_row_ingest_server(vec![true, false, true]).await;
+        let router = build_router_with_endpoints_and_shards(
+            "127.0.0.1:9314".to_string(),
+            vec![("node-b", endpoint)],
+            1,
+            2,
+            ClusterWriteConsistency::All,
+        )
+        .with_tuning(WriteRouterTuning {
+            max_remote_batch_rows: 1,
+            max_inflight_remote_batches: 1,
+        });
+        let rows = build_same_series_rows(3);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+        let metrics_before = write_routing_metrics_snapshot();
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect_err("one failed fragment must invalidate the remote replica ack");
+        assert!(matches!(
+            error,
+            WriteRoutingError::RemoteWriteRejected {
+                rejected_rows: 1,
+                consistency: Some(WriteConsistencyFailureContext {
+                    mode: ClusterWriteConsistency::All,
+                    required_acks: 2,
+                    acknowledged_acks: 1,
+                    max_possible_acks: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let metrics_after = write_routing_metrics_snapshot();
+        assert!(
+            metrics_after.routed_rows_total >= metrics_before.routed_rows_total.saturating_add(2),
+            "both confirmed remote fragment commits must remain accounted"
+        );
+        assert!(
+            metrics_after.routed_batches_total
+                >= metrics_before.routed_batches_total.saturating_add(2),
+            "both confirmed remote fragment batches must remain accounted"
+        );
+        let points = storage
+            .select(
+                "same_series_cpu_usage",
+                &[Label::new("instance", "same-instance")],
+                1_700_000_000_000,
+                1_700_000_000_003,
+            )
+            .expect("the local replica's committed rows should remain visible");
+        assert_eq!(points.len(), 3);
+
+        server.await.expect("remote server task should complete");
+    }
+
     #[tokio::test]
     async fn route_and_write_inserts_rows_locally_when_single_node() {
         let router = build_local_only_router(ClusterWriteConsistency::Quorum);
@@ -1582,6 +2533,7 @@ mod tests {
         assert_eq!(stats.local_rows, 3);
         assert_eq!(stats.remote_rows, 0);
         assert_eq!(stats.inserted_rows, 3);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Volatile));
         let consistency = stats
             .consistency
             .expect("consistency metadata should be set");
@@ -1601,6 +2553,297 @@ mod tests {
                 .expect("local point should exist");
             assert_eq!(points.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn local_atomic_rejection_preserves_category_and_consistency_facts() {
+        let router = build_local_only_router(ClusterWriteConsistency::Quorum);
+        let row = Row::with_labels(
+            "local_rejected_metric",
+            vec![Label::new("duplicate", "a"), Label::new("duplicate", "b")],
+            DataPoint::new(1_700_000_000_000, 1.0),
+        );
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, vec![row])
+            .await
+            .expect_err("invalid labels should be rejected locally");
+        assert!(matches!(
+            error,
+            WriteRoutingError::LocalWriteRejected {
+                rejection,
+                mode: ClusterWriteConsistency::Quorum,
+                required_acks: 1,
+                acknowledged_acks: 0,
+                max_possible_acks: 0,
+                ..
+            } if rejection.category == WriteRejectionCategory::InvalidLabels
+        ));
+        assert!(storage
+            .list_metrics()
+            .expect("metric listing should succeed")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_local_canonical_result_surfaces_as_contract_violation() {
+        let router = build_local_only_router(ClusterWriteConsistency::Quorum);
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let storage: Arc<dyn Storage> = Arc::new(MalformedCanonicalStorage { inner });
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, build_rows(1))
+            .await
+            .expect_err("malformed canonical result must fail routing");
+        assert!(matches!(
+            error,
+            WriteRoutingError::LocalInvalidAtomicWriteResult {
+                message,
+                mode: ClusterWriteConsistency::Quorum,
+                required_acks: 1,
+                acknowledged_acks: 0,
+                max_possible_acks: 0,
+                ..
+            } if message.contains("outcome count 0 does not match expected 1")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_all_consistency_still_accounts_known_remote_commit() {
+        let (endpoint, server) = spawn_success_ingest_server().await;
+        let router = build_router_with_endpoints(
+            "127.0.0.1:9390".to_string(),
+            vec![("node-b", endpoint)],
+            2,
+            ClusterWriteConsistency::All,
+        );
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let storage: Arc<dyn Storage> = Arc::new(MalformedCanonicalStorage { inner });
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+        let metrics_before = write_routing_metrics_snapshot();
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, build_rows(2))
+            .await
+            .expect_err("invalid local result must fail all consistency");
+        assert!(matches!(
+            error,
+            WriteRoutingError::LocalInvalidAtomicWriteResult {
+                mode: ClusterWriteConsistency::All,
+                required_acks: 2,
+                acknowledged_acks: 1,
+                max_possible_acks: 1,
+                ..
+            }
+        ));
+        let metrics_after = write_routing_metrics_snapshot();
+        assert!(
+            metrics_after.routed_rows_total >= metrics_before.routed_rows_total.saturating_add(2),
+            "the confirmed remote commit must be accounted before returning the consistency error"
+        );
+
+        server.await.expect("remote server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_and_write_preserves_remote_durable_acknowledgement() {
+        let (endpoint, server) = spawn_success_ingest_server().await;
+        let router = build_router_with_endpoints(
+            "127.0.0.1:9391".to_string(),
+            vec![("node-b", endpoint)],
+            1,
+            ClusterWriteConsistency::One,
+        );
+        let rows = build_rows_for_owner(&router, "node-b", 3);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let stats = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect("remote routing should succeed");
+        assert_eq!(stats.local_rows, 0);
+        assert_eq!(stats.remote_rows, 3);
+        assert_eq!(stats.inserted_rows, 3);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Durable));
+
+        server.await.expect("remote server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn count_only_remote_response_is_decodable_but_not_acknowledged() {
+        let (endpoint, server) = spawn_legacy_count_only_ingest_server().await;
+        let router = build_router_with_endpoints(
+            "127.0.0.1:9394".to_string(),
+            vec![("node-b", endpoint)],
+            1,
+            ClusterWriteConsistency::One,
+        );
+        let rows = build_rows_for_owner(&router, "node-b", 2);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect_err("count-only result must not establish a canonical acknowledgement");
+        assert!(matches!(
+            error,
+            WriteRoutingError::RemoteCanonicalResultMissing { .. }
+        ));
+
+        server.await.expect("legacy server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_batch_rejection_is_not_counted_as_an_acknowledgement() {
+        let (endpoint, server) = spawn_rejected_ingest_server().await;
+        let rows = build_rows(2);
+        let batch = RoutedWriteBatch {
+            owner_node_id: "node-b".to_string(),
+            endpoint,
+            idempotency_key: "tsink:test:remote-rejection".to_string(),
+            rows: rows.clone(),
+            shard_row_counts: BTreeMap::from([(7, rows.len() as u64)]),
+        };
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let result = execute_remote_batch_with_ring_version(rpc_client, batch, 1).await;
+        assert!(matches!(
+            result.result,
+            Err(WriteRoutingError::RemoteWriteRejected { rejection, .. })
+                if rejection.category == WriteRejectionCategory::InvalidLabels
+        ));
+
+        server.await.expect("remote server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_rejection_surfaces_only_when_consistency_is_unsatisfied() {
+        let (endpoint, server) = spawn_rejected_ingest_server().await;
+        let router = build_router_with_endpoints(
+            "127.0.0.1:9392".to_string(),
+            vec![("node-b", endpoint)],
+            2,
+            ClusterWriteConsistency::Quorum,
+        );
+        let rows = build_rows(2);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let error = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect_err("remote rejection must fail quorum");
+        assert!(matches!(
+            error,
+            WriteRoutingError::RemoteWriteRejected {
+                rejection,
+                rejected_rows: 2,
+                consistency: Some(WriteConsistencyFailureContext {
+                    mode: ClusterWriteConsistency::Quorum,
+                    required_acks: 2,
+                    acknowledged_acks: 1,
+                    max_possible_acks: 1,
+                    ..
+                }),
+                ..
+            } if rejection.category == WriteRejectionCategory::InvalidLabels
+        ));
+
+        server.await.expect("remote server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_rejection_does_not_fail_an_already_satisfied_write() {
+        let (endpoint, server) = spawn_rejected_ingest_server().await;
+        let router = build_router_with_endpoints(
+            "127.0.0.1:9393".to_string(),
+            vec![("node-b", endpoint)],
+            2,
+            ClusterWriteConsistency::One,
+        );
+        let rows = build_rows(2);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+            internal_auth_token: "cluster-test-token".to_string(),
+            internal_auth_runtime: None,
+            ..RpcClientConfig::default()
+        });
+
+        let stats = router
+            .route_and_write(&storage, &rpc_client, rows)
+            .await
+            .expect("one local acknowledgement should satisfy consistency");
+        assert_eq!(stats.local_rows, 2);
+        assert_eq!(stats.remote_rows, 0);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Volatile));
+
+        server.await.expect("remote server task should complete");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1640,6 +2883,7 @@ mod tests {
         assert_eq!(stats.local_rows, 3);
         assert_eq!(stats.remote_rows, 3);
         assert_eq!(stats.inserted_rows, 6);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Volatile));
 
         server.await.expect("server task should complete");
     }
@@ -1676,6 +2920,7 @@ mod tests {
         assert_eq!(stats.local_rows, 5);
         assert_eq!(stats.remote_rows, 5);
         assert_eq!(stats.inserted_rows, 10);
+        assert_eq!(stats.acknowledgement, Some(WriteAcknowledgement::Volatile));
         let consistency = stats
             .consistency
             .expect("consistency metadata should be present");
@@ -1982,6 +3227,7 @@ mod tests {
             ..RpcClientConfig::default()
         });
 
+        let metrics_before = write_routing_metrics_snapshot();
         let err = router
             .route_and_write(&storage, &rpc_client, rows)
             .await
@@ -1996,6 +3242,15 @@ mod tests {
             } => assert!(acknowledged_acks <= 2),
             other => panic!("unexpected write error: {other:?}"),
         }
+        let metrics_after = write_routing_metrics_snapshot();
+        assert!(
+            metrics_after.local_rows_total >= metrics_before.local_rows_total.saturating_add(3),
+            "known local commits must be accounted even when all consistency fails"
+        );
+        assert!(
+            metrics_after.routed_rows_total >= metrics_before.routed_rows_total.saturating_add(3),
+            "known remote commits must be accounted even when all consistency fails"
+        );
 
         healthy_server
             .await

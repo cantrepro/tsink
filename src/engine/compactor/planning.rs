@@ -2,7 +2,10 @@ use super::*;
 
 impl Compactor {
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
-        finalize_pending_compaction_replacements(&self.data_path)?;
+        finalize_pending_compaction_replacements_with_disk_budget(
+            &self.data_path,
+            self.local_disk_budget.as_ref(),
+        )?;
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 
         if let Some(outcome) = self.try_compact_level(

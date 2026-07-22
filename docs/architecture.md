@@ -80,7 +80,8 @@ All interaction with the engine goes through the `Storage` trait. Key methods:
 | Method                                  | Description                                                             |
 | --------------------------------------- | ----------------------------------------------------------------------- |
 | `insert_rows(&[Row])`                   | Synchronous batch write.                                                |
-| `insert_rows_with_result`               | Batch write returning per-row `WriteResult`.                            |
+| `insert_rows_with_result`               | Batch write returning one batch-level durability `WriteResult`.         |
+| `write_batch(&[Row], WriteMode)`        | Canonical indexed outcomes with explicit atomic or best-effort policy.  |
 | `select(metric, labels, start, end)`    | Range read for a single series.                                         |
 | `select_with_options`                   | Range read with `QueryOptions` (aggregation, downsampling, pagination). |
 | `select_all`                            | Bulk range read across all series matching a selector.                  |
@@ -151,7 +152,7 @@ Higher-level operations that drive the shell:
 | Module                                         | Role                                                                              |
 | ---------------------------------------------- | --------------------------------------------------------------------------------- |
 | `bootstrap`                                    | Six-phase startup: discovery → recovery → WAL open → hydrate → replay → finalize. |
-| `ingest` + `ingest_pipeline`                   | Five-phase write pipeline (resolve → prepare → apply → commit).                   |
+| `ingest` + `ingest_pipeline`                   | Five-phase write pipeline (resolve → prepare → stage → apply → publish).          |
 | `write_buffer`                                 | Active-head flush policies.                                                       |
 | `lifecycle`                                    | Flush, persist, replay, and shutdown orchestration.                               |
 | `query_exec` + `query_read`                    | High-level query execution and low-level read path.                               |
@@ -175,7 +176,8 @@ To contain lock contention, `ChunkStorage` organises mutable state into five sep
 
 ## 5. Write path
 
-A single `insert_rows` call traverses six steps before returning to the caller.
+A non-empty `insert_rows` call passes two entry gates and then traverses five ingest phases before
+returning to the caller.
 
 ```text
 insert_rows(&[Row])
@@ -187,30 +189,48 @@ insert_rows(&[Row])
 [2] Shard lock acquisition     (minimal set of write_txn_shards, ascending order)
     │
     ▼
-[3] WriteResolver              — validate labels, resolve or mint SeriesId,
-    │                            append WAL SeriesDefinitionFrame for new series
+[3] Resolve                    — validate metrics/labels, resolve or provisionally mint SeriesId
     ▼
-[4] WritePreparer              — normalise timestamps, reject future skew,
-    │                            reject below retention floor,
-    │                            admission control: memory budget, cardinality limit, WAL size
+[4] Prepare                    — validate per-series lane/value family, retention and partition
+    │                            constraints; enforce admission limits; encode WAL payloads
     ▼
-[5] WriteApplier               — append ChunkPoint to ActivePartitionHead (ChunkBuilder),
-    │                            append WAL SamplesBatchFrame
+[5] Stage                      — persist series definitions and samples as one unpublished
+    │                            logical WAL write (when enabled)
     ▼
-[6] WriteCommitter             — seal full chunks, publish visibility,
-                                 update tombstone/rollup cross-references,
-                                 notify background flush/compaction workers
+[6] Apply                      — install every point in the active write buffers
+    │
+    ▼
+[7] Publish                    — commit the logical WAL boundary when present,
+                                 establish one batch-level acknowledgement, and notify workers
 ```
 
-Each `Row` carries a `metric`, `Vec<Label>`, and a `DataPoint`. The 64-shard split means that independent series in the same batch can be admitted concurrently.
+Each `Row` carries a `metric`, `Vec<Label>`, and a `DataPoint`. A call is intended to remain one
+atomic acceptance unit; the 64-shard split limits interference between concurrent calls that touch
+independent series.
 
-**Admission control** in the prepare phase enforces:
+**Admission control** across resolve and prepare enforces:
 
 - `memory_budget_bytes` — total in-memory chunk bytes.
 - `cardinality_limit` — maximum unique series count.
 - WAL size limit — maximum outstanding un-flushed WAL bytes.
+- optional maximum future skew — rejects timestamps beyond the configured clock-relative cutoff.
 
-Admission failures return a per-Row `WriteResult` when calling `insert_rows_with_result`; the synchronous `insert_rows` drops rejected rows silently.
+Any validation or admission failure returns a structured `TsinkError` for the whole batch, and no
+row from that batch is committed. `insert_rows` propagates the same error rather than silently
+dropping rejected rows. `insert_rows_with_result` returns one durability acknowledgement only after
+the whole batch succeeds. See [ADR 0001: Core batch write contract](adr/0001-write-contract.md).
+
+The canonical `write_batch` surface adds explicit `Atomic` and `BestEffort` modes. It returns one
+indexed outcome per row, structured rejection categories, and the weakest acknowledgement among
+accepted rows. Best effort deliberately submits singleton atomic writes in order; it is never an
+implicit fallback from an atomic call. Legacy `Storage` implementations must opt in rather than
+inheriting assumed semantics.
+
+Apply holds every affected active-shard lock and runs fallible rotations and encoding against
+staged active-series states. Only after all affected shards succeed are those states and any sealed
+chunks published. A later-shard encoding error therefore cannot expose an earlier shard from the
+rejected batch. Active-head flush finalization likewise leaves the live head intact when encoding
+fails.
 
 ---
 
@@ -269,14 +289,21 @@ Offset  Size  Field
 
 **`SeriesDefinitionFrame`** — written once per new series: `(series_id, metric, labels)`.
 
-**`SamplesBatchFrame`** — written per chunk flush: `(series_id, lane, timestamp_codec_id, value_codec_id, point_count, base_timestamp, encoded_timestamps, encoded_values)`.
+**`SamplesBatchFrame`** — staged during a live logical batch write; each item contains
+`(series_id, lane, timestamp_codec_id, value_codec_id, point_count, base_timestamp, encoded_timestamps, encoded_values)`.
 
 ### Durability modes
 
 | Mode                       | Behavior                                                                                               |
 | -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `WalSyncMode::PerAppend`   | `fsync` on every frame append. Crash-safe; throughput-limited.                                         |
-| `WalSyncMode::Periodic(d)` | Background `fsync` every duration `d`. Higher throughput; up to `d` of data can be lost on hard crash. |
+| `WalSyncMode::PerAppend`   | Sync each staged batch; successful WAL publication normally establishes `Durable`.                   |
+| `WalSyncMode::Periodic(d)` | Check elapsed time on append; a batch can be `Appended` or, when that append syncs, `Durable`.          |
+
+Either mode can return a successful `Volatile` acknowledgement if logical WAL publication fails
+after in-memory apply. `Periodic` does not run an autonomous WAL-sync timer; later writes and
+lifecycle/persistence work can advance durability. See
+[the durability contract](durability.md) and
+[ADR 0001](adr/0001-write-contract.md#durability-acknowledgement-is-batch-level).
 
 ### Replay modes
 
@@ -528,7 +555,7 @@ The `tsink-server` crate wraps the library engine in a full HTTP server.
 
 | Protocol                     | Endpoint                                                           |
 | ---------------------------- | ------------------------------------------------------------------ |
-| Prometheus Remote Write      | `POST /api/v1/write` (Snappy-framed protobuf)                      |
+| Prometheus Remote Write      | `POST /api/v1/write` (Snappy block-compressed protobuf)            |
 | Prometheus Remote Read       | `POST /api/v1/read`                                                |
 | Prometheus Text Exposition   | `POST /api/v1/import/prometheus`                                   |
 | InfluxDB Line Protocol v1/v2 | `POST /write`, `POST /api/v2/write`                                |
@@ -678,20 +705,21 @@ Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and sto
 
 Key engine knobs and their defaults:
 
-| Option                                  | Default                 | Notes                                                   |    |    |     |
-| --------------------------------------- | ----------------------- | ------------------------------------------------------- | --- | --- | --- |
-| `timestamp_precision`                   | Nanoseconds             | \`Ns                                                    | µs | ms | s\` |
-| `retention_window`                      | 14 days                 | Data older than this is eligible for expiry.            |    |    |     |
-| `future_skew_window`                    | 15 min                  | Writes with future timestamps beyond this are rejected. |    |    |     |
-| `partition_window`                      | 1 hour                  | Time-bucket width for active partition heads.           |    |    |     |
-| `max_active_partition_heads_per_series` | 8                       | Maximum concurrent open partitions per series.          |    |    |     |
-| `max_writers`                           | cgroup CPU count        | Write parallelism gate (`Semaphore` permits).           |    |    |     |
-| `write_timeout`                         | 30 s                    | Maximum wait time for a write permit.                   |    |    |     |
-| `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Total in-memory chunk budget.                           |    |    |     |
-| `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                            |    |    |     |
-| `chunk_points`                          | 2048                    | Points per sealed chunk.                                |    |    |     |
-| `compaction_interval`                   | 5 s                     | Background compaction frequency.                        |    |    |     |
-| `flush_interval`                        | 250 ms                  | Background flush frequency.                             |    |    |     |
-| `background_fail_fast`                  | `true`                  | Worker panic triggers engine failure mode.              |    |    |     |
+| Option                                  | Default                 | Notes                                                                                  |
+| --------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
+| `timestamp_precision`                   | Nanoseconds             | Timestamp unit: ns, µs, ms, or s.                                                      |
+| `retention_window`                      | 14 days                 | Data older than this is eligible for expiry.                                           |
+| `future_skew_window`                    | 15 min                  | Observability/bounded-recency window; it does not reject future writes by itself.      |
+| `max_future_skew_window`                | unset                   | Optional admission cutoff configured with `with_max_future_skew`.                     |
+| `partition_window`                      | 1 hour                  | Time-bucket width for active partition heads.                                          |
+| `max_active_partition_heads_per_series` | 8                       | Maximum concurrent open partitions per series.                                         |
+| `max_writers`                           | cgroup CPU count        | Write parallelism gate (`Semaphore` permits).                                          |
+| `write_timeout`                         | 30 s                    | Maximum wait time for a write permit.                                                  |
+| `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Accounted storage-memory budget.                                                       |
+| `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                                                           |
+| `chunk_points`                          | 2048                    | Points per sealed chunk.                                                               |
+| `compaction_interval`                   | 5 s                     | Background compaction frequency.                                                       |
+| `flush_interval`                        | 250 ms                  | Background flush frequency.                                                            |
+| `background_fail_fast`                  | `true`                  | A background durability failure fences new writes.                                     |
 
 Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.

@@ -8,7 +8,6 @@ pub(in crate::engine::storage_engine) struct StorageAssemblyResources {
     pub(in crate::engine::storage_engine) blob_compactor: Option<Compactor>,
     pub(in crate::engine::storage_engine) lifecycle: Arc<AtomicU8>,
     pub(in crate::engine::storage_engine) compaction_lock: Arc<Mutex<()>>,
-    pub(in crate::engine::storage_engine) compaction_thread: Option<std::thread::JoinHandle<()>>,
     pub(in crate::engine::storage_engine) persisted_index_dirty: Arc<AtomicBool>,
     pub(in crate::engine::storage_engine) pending_persisted_segment_diff:
         Arc<Mutex<PendingPersistedSegmentDiff>>,
@@ -62,7 +61,7 @@ impl ChunkStorage {
         numeric_lane_path: Option<&PathBuf>,
         blob_lane_path: Option<&PathBuf>,
         next_segment_id: u64,
-        options: &ChunkStorageOptions,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     ) -> Result<StorageAssemblyResources> {
         let series_index_path = Self::series_index_path_for_lanes(
             numeric_lane_path.map(|path| path.as_path()),
@@ -70,17 +69,19 @@ impl ChunkStorage {
         );
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
         let numeric_compactor = numeric_lane_path.map(|path| {
-            Compactor::new_with_segment_id_allocator(
+            Compactor::new_with_segment_id_allocator_and_disk_budget(
                 path,
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
+                local_disk_budget.clone(),
             )
         });
         let blob_compactor = blob_lane_path.map(|path| {
-            Compactor::new_with_segment_id_allocator(
+            Compactor::new_with_segment_id_allocator_and_disk_budget(
                 path,
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
+                local_disk_budget.clone(),
             )
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
@@ -89,21 +90,6 @@ impl ChunkStorage {
         let pending_persisted_segment_diff =
             Arc::new(Mutex::new(PendingPersistedSegmentDiff::default()));
         let observability = Arc::new(StorageObservabilityCounters::default());
-        let compaction_thread = if options.background_threads_enabled {
-            Self::spawn_background_compaction_thread(
-                Arc::downgrade(&lifecycle),
-                Arc::clone(&compaction_lock),
-                numeric_compactor.clone(),
-                blob_compactor.clone(),
-                Arc::clone(&persisted_index_dirty),
-                Arc::clone(&pending_persisted_segment_diff),
-                options.compaction_interval,
-                Arc::clone(&observability),
-                options.background_fail_fast,
-            )?
-        } else {
-            None
-        };
 
         Ok(StorageAssemblyResources {
             series_index_path,
@@ -112,7 +98,6 @@ impl ChunkStorage {
             blob_compactor,
             lifecycle,
             compaction_lock,
-            compaction_thread,
             persisted_index_dirty,
             pending_persisted_segment_diff,
             observability,

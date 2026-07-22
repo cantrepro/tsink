@@ -315,6 +315,22 @@ impl From<&RollupObservabilityCounters> for RollupObservabilitySnapshot {
 }
 
 impl ChunkStorage {
+    pub(super) fn storage_health_degraded(&self) -> bool {
+        self.observability
+            .health
+            .background_errors_total
+            .load(Ordering::Relaxed)
+            > 0
+            || self
+                .observability
+                .health
+                .maintenance_errors_total
+                .load(Ordering::Relaxed)
+                > 0
+            || (self.persisted.tiered_storage.is_some()
+                && !self.observability.remote.accessible_or_default(true))
+    }
+
     pub(super) fn observability_snapshot_impl(&self) -> StorageObservabilitySnapshot {
         let now_unix_ms = current_unix_millis_u64();
         let last_refresh_attempt_unix_ms = {
@@ -342,6 +358,12 @@ impl ChunkStorage {
             (ts > 0).then_some(ts)
         };
         StorageObservabilitySnapshot {
+            limits: self.effective_storage_limits(),
+            local_disk: self
+                .persisted
+                .local_disk_budget
+                .as_ref()
+                .map(|budget| budget.snapshot()),
             memory: self.memory_observability_snapshot(),
             wal: WalObservabilitySnapshot::from(WalSnapshotView {
                 counters: &self.observability.wal,
@@ -407,20 +429,7 @@ impl ChunkStorage {
                     .health
                     .maintenance_errors_total
                     .load(Ordering::Relaxed),
-                degraded: self
-                    .observability
-                    .health
-                    .background_errors_total
-                    .load(Ordering::Relaxed)
-                    > 0
-                    || self
-                        .observability
-                        .health
-                        .maintenance_errors_total
-                        .load(Ordering::Relaxed)
-                        > 0
-                    || (self.persisted.tiered_storage.is_some()
-                        && !self.observability.remote.accessible_or_default(true)),
+                degraded: self.storage_health_degraded(),
                 fail_fast_enabled: self.background.fail_fast_enabled,
                 fail_fast_triggered: self
                     .observability

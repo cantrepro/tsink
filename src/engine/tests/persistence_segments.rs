@@ -450,6 +450,7 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: 1,

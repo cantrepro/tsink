@@ -4,6 +4,28 @@ mod context;
 use super::super::*;
 use super::*;
 
+fn post_flush_failure_with_recovery(
+    primary: TsinkError,
+    rollback: Result<()>,
+    cleanup: Result<()>,
+) -> TsinkError {
+    let mut recovery_errors = Vec::new();
+    if let Err(err) = rollback {
+        recovery_errors.push(format!("rollback failed: {err}"));
+    }
+    if let Err(err) = cleanup {
+        recovery_errors.push(format!("cleanup failed: {err}"));
+    }
+    if recovery_errors.is_empty() {
+        primary
+    } else {
+        TsinkError::Other(format!(
+            "post-flush operation failed: {primary}; {}",
+            recovery_errors.join("; ")
+        ))
+    }
+}
+
 impl ChunkStorage {
     pub(in super::super) fn active_retention_cutoff(&self) -> Option<i64> {
         self.retention_maintenance_context()
@@ -160,34 +182,50 @@ impl ChunkStorage {
             for promotion in &promotions {
                 if let Err(err) = retention.promote_staged_segment_for_publish(promotion) {
                     drop(publication);
-                    let _ = self.rollback_published_segment_roots(&promoted_roots);
-                    retention.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
-                    return Err(err);
+                    let rollback = self.rollback_published_segment_roots(&promoted_roots);
+                    let cleanup = retention
+                        .cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                    return Err(post_flush_failure_with_recovery(err, rollback, cleanup));
                 }
                 promoted_roots.push(promotion.final_root.clone());
             }
 
             if let Err(err) = publication.publish_transition(transition) {
                 drop(publication);
-                let rollback_result = self.rollback_published_segment_roots(&promoted_roots);
-                retention.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
-                return match rollback_result {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(TsinkError::Other(format!(
-                        "post-flush publication failed and rollback failed: publish={err}, rollback={rollback_err}"
-                    ))),
-                };
+                let rollback = self.rollback_published_segment_roots(&promoted_roots);
+                let cleanup =
+                    retention.cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                return Err(post_flush_failure_with_recovery(err, rollback, cleanup));
             }
             self.evict_persisted_sealed_chunks();
             retention.record_tier_moves(tier_moves);
         }
 
-        self.reconcile_live_metadata_indexes()?;
-
-        for path in &staging_cleanup_paths {
-            crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)?;
+        let metadata_reconciliation = self.reconcile_live_metadata_indexes();
+        let staging_cleanup =
+            retention.cleanup_staged_post_flush_paths(&[], &staging_cleanup_paths);
+        let retirement = retention.finalize_retired_roots(&retired_roots);
+        match (metadata_reconciliation, staging_cleanup, retirement) {
+            (Ok(()), Ok(()), Ok(removed)) => Ok(removed),
+            (Err(err), Ok(()), Ok(_)) | (Ok(()), Err(err), Ok(_)) | (Ok(()), Ok(()), Err(err)) => {
+                Err(err)
+            }
+            (metadata, cleanup, retirement) => {
+                let mut errors = Vec::new();
+                if let Err(err) = metadata {
+                    errors.push(format!("metadata reconciliation failed: {err}"));
+                }
+                if let Err(err) = cleanup {
+                    errors.push(format!("staging cleanup failed: {err}"));
+                }
+                if let Err(err) = retirement {
+                    errors.push(format!("retired-root cleanup failed: {err}"));
+                }
+                Err(TsinkError::Other(format!(
+                    "post-flush finalization failed: {}",
+                    errors.join("; ")
+                )))
+            }
         }
-
-        retention.finalize_retired_roots(&retired_roots)
     }
 }

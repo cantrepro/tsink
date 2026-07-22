@@ -1,6 +1,7 @@
 use crate::cluster::dedupe::{
     dedupe_metrics_snapshot, validate_idempotency_key, DedupeConfig, DedupeWindowStore,
 };
+use crate::cluster::replication::validate_confirmed_atomic_ingest_response;
 use crate::cluster::rpc::{
     normalize_capabilities, required_capabilities_for_rows, CompatibilityProfile,
     InternalApiConfig, InternalIngestRowsRequest, InternalRow, RpcClient, RpcClientConfig,
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::{Label, Row};
+use tsink::{Label, Row, WriteAcknowledgement};
 
 pub const EDGE_SYNC_MAX_ENTRIES_ENV: &str = "TSINK_EDGE_SYNC_MAX_ENTRIES";
 pub const EDGE_SYNC_MAX_BYTES_ENV: &str = "TSINK_EDGE_SYNC_MAX_BYTES";
@@ -235,6 +236,7 @@ pub struct EdgeSyncSourceRuntime {
     last_successful_replay_unix_ms: AtomicU64,
     last_enqueue_error: RwLock<Option<String>>,
     last_replay_error: RwLock<Option<String>>,
+    last_upstream_acknowledgement: RwLock<Option<WriteAcknowledgement>>,
     replayed_rows_total: AtomicU64,
 }
 
@@ -244,6 +246,25 @@ pub struct EdgeSyncRuntimeContext {
     pub accept_dedupe_store: Option<Arc<DedupeWindowStore>>,
     pub accept_dedupe_config: Option<DedupeConfig>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSyncEnqueueError {
+    pub submitted_rows: usize,
+    pub queued_rows: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for EdgeSyncEnqueueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "queued {} of {} rows before edge-sync enqueue failed: {}",
+            self.queued_rows, self.submitted_rows, self.message
+        )
+    }
+}
+
+impl std::error::Error for EdgeSyncEnqueueError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeSyncQueueSnapshot {
@@ -286,6 +307,7 @@ pub struct EdgeSyncSourceStatusSnapshot {
     pub last_successful_replay_unix_ms: Option<u64>,
     pub last_enqueue_error: Option<String>,
     pub last_replay_error: Option<String>,
+    pub last_upstream_acknowledgement: Option<WriteAcknowledgement>,
     pub degraded: bool,
 }
 
@@ -323,6 +345,7 @@ impl Default for EdgeSyncSourceStatusSnapshot {
             last_successful_replay_unix_ms: None,
             last_enqueue_error: None,
             last_replay_error: None,
+            last_upstream_acknowledgement: None,
             degraded: false,
         }
     }
@@ -391,6 +414,14 @@ struct EdgeSyncQueueState {
 impl EdgeSyncSourceRuntime {
     pub fn open(base_data_path: &Path, bootstrap: EdgeSyncSourceBootstrap) -> Result<Self, String> {
         let config = EdgeSyncQueueConfig::from_env()?;
+        Self::open_with_config(base_data_path, bootstrap, config)
+    }
+
+    fn open_with_config(
+        base_data_path: &Path,
+        bootstrap: EdgeSyncSourceBootstrap,
+        config: EdgeSyncQueueConfig,
+    ) -> Result<Self, String> {
         config.validate()?;
 
         let queue_path = edge_sync_dir(base_data_path).join(EDGE_SYNC_QUEUE_FILE_NAME);
@@ -424,6 +455,7 @@ impl EdgeSyncSourceRuntime {
             last_successful_replay_unix_ms: AtomicU64::new(0),
             last_enqueue_error: RwLock::new(None),
             last_replay_error: RwLock::new(None),
+            last_upstream_acknowledgement: RwLock::new(None),
             replayed_rows_total: AtomicU64::new(0),
         })
     }
@@ -456,26 +488,38 @@ impl EdgeSyncSourceRuntime {
         })
     }
 
-    pub fn enqueue_rows(&self, rows: &[Row]) {
+    pub fn enqueue_rows(&self, rows: &[Row]) -> Result<usize, EdgeSyncEnqueueError> {
         if rows.is_empty() {
-            return;
+            return Ok(0);
         }
 
         match self.prepare_rows(rows) {
             Ok(mapped_rows) => {
+                let mut queued_rows = 0usize;
                 for chunk in mapped_rows.chunks(MAX_INTERNAL_INGEST_ROWS) {
                     if let Err(err) = self.queue.enqueue_rows(&self.source_id, chunk) {
                         self.enqueue_rejected_total.fetch_add(1, Ordering::Relaxed);
-                        self.set_last_enqueue_error(Some(err));
-                        return;
+                        self.set_last_enqueue_error(Some(err.clone()));
+                        return Err(EdgeSyncEnqueueError {
+                            submitted_rows: rows.len(),
+                            queued_rows,
+                            message: err,
+                        });
                     }
+                    queued_rows = queued_rows.saturating_add(chunk.len());
                     self.enqueued_total.fetch_add(1, Ordering::Relaxed);
                     self.set_last_enqueue_error(None);
                 }
+                Ok(queued_rows)
             }
             Err(err) => {
                 self.enqueue_rejected_total.fetch_add(1, Ordering::Relaxed);
-                self.set_last_enqueue_error(Some(err));
+                self.set_last_enqueue_error(Some(err.clone()));
+                Err(EdgeSyncEnqueueError {
+                    submitted_rows: rows.len(),
+                    queued_rows: 0,
+                    message: err,
+                })
             }
         }
     }
@@ -498,6 +542,10 @@ impl EdgeSyncSourceRuntime {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let last_upstream_acknowledgement = *self
+            .last_upstream_acknowledgement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         EdgeSyncSourceStatusSnapshot {
             enabled: true,
             source_id: Some(self.source_id.clone()),
@@ -534,6 +582,7 @@ impl EdgeSyncSourceRuntime {
             last_successful_replay_unix_ms,
             last_enqueue_error: last_enqueue_error.clone(),
             last_replay_error: last_replay_error.clone(),
+            last_upstream_acknowledgement,
             degraded: queue.queued_entries > 0
                 && (last_enqueue_error.is_some() || last_replay_error.is_some()),
         }
@@ -556,27 +605,31 @@ impl EdgeSyncSourceRuntime {
                 .ingest_rows(&self.upstream_endpoint, &request)
                 .await
             {
-                Ok(response) if response.inserted_rows == request.rows.len() => {
-                    self.queue.ack_entry(entry.id)?;
-                    self.replay_success_total.fetch_add(1, Ordering::Relaxed);
-                    self.replayed_rows_total.fetch_add(
-                        u64::try_from(request.rows.len()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                    self.last_successful_replay_unix_ms
-                        .store(unix_timestamp_millis(), Ordering::Relaxed);
-                    self.set_last_replay_error(None);
-                }
                 Ok(response) => {
-                    self.replay_failures_total.fetch_add(1, Ordering::Relaxed);
-                    let err = format!(
-                        "edge sync replay inserted {} rows but expected {}",
-                        response.inserted_rows,
-                        request.rows.len()
-                    );
-                    self.queue
-                        .reschedule_entry(entry.id, self.config.max_backoff_secs)?;
-                    self.set_last_replay_error(Some(err));
+                    match validate_confirmed_atomic_ingest_response(request.rows.len(), &response) {
+                        Ok(acknowledgement) => {
+                            *self
+                                .last_upstream_acknowledgement
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(acknowledgement);
+                            self.queue.ack_entry(entry.id)?;
+                            self.replay_success_total.fetch_add(1, Ordering::Relaxed);
+                            self.replayed_rows_total.fetch_add(
+                                u64::try_from(request.rows.len()).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            );
+                            self.last_successful_replay_unix_ms
+                                .store(unix_timestamp_millis(), Ordering::Relaxed);
+                            self.set_last_replay_error(None);
+                        }
+                        Err(err) => {
+                            self.replay_failures_total.fetch_add(1, Ordering::Relaxed);
+                            self.queue
+                                .reschedule_entry(entry.id, self.config.max_backoff_secs)?;
+                            self.set_last_replay_error(Some(err));
+                        }
+                    }
                 }
                 Err(err) => {
                     self.replay_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -826,10 +879,11 @@ impl EdgeSyncQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(entry) = state.pending.remove(&id) else {
+        let Some(entry) = state.pending.get(&id).cloned() else {
             return Ok(());
         };
         append_log_record_locked(&mut state, &EdgeSyncLogRecord::Ack { id })?;
+        state.pending.remove(&id);
         state.queued_bytes = state.queued_bytes.saturating_sub(entry.queue_bytes);
         if state.log_bytes > self.config.max_log_bytes {
             compact_locked(&self.path, &mut state)?;
@@ -868,10 +922,11 @@ impl EdgeSyncQueue {
         let mut expired_entries = 0u64;
         let mut expired_bytes = 0u64;
         for id in to_remove {
-            let Some(entry) = state.pending.remove(&id) else {
+            let Some(entry) = state.pending.get(&id).cloned() else {
                 continue;
             };
             append_log_record_locked(&mut state, &EdgeSyncLogRecord::Ack { id })?;
+            state.pending.remove(&id);
             state.queued_bytes = state.queued_bytes.saturating_sub(entry.queue_bytes);
             expired_entries = expired_entries.saturating_add(1);
             expired_bytes = expired_bytes.saturating_add(entry.queue_bytes);
@@ -1165,6 +1220,69 @@ mod tests {
         assert!(snapshot.queued_bytes > 0);
     }
 
+    fn force_queue_append_failure(queue: &EdgeSyncQueue, path: &Path) {
+        let read_only_file = File::open(path).expect("queue log should reopen read-only");
+        let mut state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.file = read_only_file;
+    }
+
+    #[test]
+    fn ack_append_failure_keeps_entry_pending_in_memory_and_after_restart() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let queue = EdgeSyncQueue::open(path.clone(), EdgeSyncQueueConfig::default())
+            .expect("queue should open");
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("enqueue should succeed");
+        let entry = queue
+            .collect_due_entries(1)
+            .into_iter()
+            .next()
+            .expect("entry should be pending");
+        let before = queue.snapshot();
+        force_queue_append_failure(&queue, &path);
+
+        let error = queue
+            .ack_entry(entry.id)
+            .expect_err("read-only queue log should reject the ack append");
+        assert!(error.contains("failed to append edge sync queue record"));
+        assert_eq!(queue.snapshot(), before);
+        drop(queue);
+
+        let reopened =
+            EdgeSyncQueue::open(path, EdgeSyncQueueConfig::default()).expect("queue should reopen");
+        assert_eq!(reopened.snapshot().queued_entries, 1);
+        assert_eq!(reopened.collect_due_entries(1)[0].id, entry.id);
+    }
+
+    #[test]
+    fn expiry_ack_append_failure_keeps_entry_pending_in_memory_and_after_restart() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let queue = EdgeSyncQueue::open(path.clone(), EdgeSyncQueueConfig::default())
+            .expect("queue should open");
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("enqueue should succeed");
+        let before = queue.snapshot();
+        force_queue_append_failure(&queue, &path);
+
+        let error = queue
+            .expire_before(u64::MAX)
+            .expect_err("read-only queue log should reject the expiry ack append");
+        assert!(error.contains("failed to append edge sync queue record"));
+        assert_eq!(queue.snapshot(), before);
+        drop(queue);
+
+        let reopened =
+            EdgeSyncQueue::open(path, EdgeSyncQueueConfig::default()).expect("queue should reopen");
+        assert_eq!(reopened.snapshot().queued_entries, 1);
+    }
+
     #[test]
     fn queue_expires_stale_entries() {
         let dir = tempdir();
@@ -1191,8 +1309,43 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = [0u8; 4096];
             let _ = stream.read(&mut request).await.expect("read");
-            let response = serde_json::to_vec(&InternalIngestRowsResponse { inserted_rows: 2 })
-                .expect("response encode");
+            let response = serde_json::to_vec(&InternalIngestRowsResponse {
+                inserted_rows: 2,
+                write_result: Some(tsink::BatchWriteResult::from_outcomes(
+                    Some(tsink::WriteAcknowledgement::Volatile),
+                    (0..2).map(tsink::RowWriteOutcome::accepted).collect(),
+                )),
+            })
+            .expect("response encode");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("headers");
+            stream.write_all(&response).await.expect("body");
+        });
+        (endpoint, task)
+    }
+
+    async fn spawn_count_only_ingest_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let endpoint = listener.local_addr().expect("local addr").to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read");
+            let response = serde_json::to_vec(&InternalIngestRowsResponse {
+                inserted_rows: 2,
+                write_result: None,
+            })
+            .expect("response encode");
             stream
                 .write_all(
                     format!(
@@ -1222,7 +1375,9 @@ mod tests {
             },
         )
         .expect("runtime should open");
-        runtime.enqueue_rows(&test_rows());
+        runtime
+            .enqueue_rows(&test_rows())
+            .expect("rows should enqueue");
         runtime
             .replay_due_once()
             .await
@@ -1230,6 +1385,83 @@ mod tests {
         let snapshot = runtime.status_snapshot();
         assert_eq!(snapshot.queued_entries, 0);
         assert_eq!(snapshot.replay_success_total, 1);
+        assert_eq!(
+            snapshot.last_upstream_acknowledgement,
+            Some(WriteAcknowledgement::Volatile)
+        );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn source_runtime_preserves_entry_without_canonical_result() {
+        let dir = tempdir();
+        let (endpoint, server) = spawn_count_only_ingest_server().await;
+        let runtime = EdgeSyncSourceRuntime::open(
+            dir.path(),
+            EdgeSyncSourceBootstrap {
+                source_id: "edge-a".to_string(),
+                upstream_endpoint: endpoint,
+                shared_auth_token: "secret".to_string(),
+                tenant_mapping: EdgeSyncTenantMapping::preserve(),
+            },
+        )
+        .expect("runtime should open");
+        runtime
+            .enqueue_rows(&test_rows())
+            .expect("rows should enqueue");
+
+        runtime
+            .replay_due_once()
+            .await
+            .expect("replay iteration should complete");
+
+        let snapshot = runtime.status_snapshot();
+        assert_eq!(snapshot.queued_entries, 1);
+        assert_eq!(snapshot.replay_success_total, 0);
+        assert_eq!(snapshot.replay_failures_total, 1);
+        assert!(snapshot
+            .last_replay_error
+            .as_deref()
+            .is_some_and(|message| message.contains("omitted its canonical write result")));
+        server.await.expect("server should finish");
+    }
+
+    #[test]
+    fn source_enqueue_reports_rows_persisted_before_chunk_failure() {
+        let dir = tempdir();
+        let runtime = EdgeSyncSourceRuntime::open_with_config(
+            dir.path(),
+            EdgeSyncSourceBootstrap {
+                source_id: "edge-a".to_string(),
+                upstream_endpoint: "127.0.0.1:1".to_string(),
+                shared_auth_token: "secret".to_string(),
+                tenant_mapping: EdgeSyncTenantMapping::preserve(),
+            },
+            EdgeSyncQueueConfig {
+                max_entries: 1,
+                ..EdgeSyncQueueConfig::default()
+            },
+        )
+        .expect("runtime should open");
+        let rows = (0..=MAX_INTERNAL_INGEST_ROWS)
+            .map(|index| {
+                Row::with_labels(
+                    "edge_partial",
+                    vec![Label::new(tenant::TENANT_LABEL, "tenant-a")],
+                    tsink::DataPoint::new(index as i64, index as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let error = runtime
+            .enqueue_rows(&rows)
+            .expect_err("second queue chunk should exceed the entry limit");
+
+        assert_eq!(error.submitted_rows, MAX_INTERNAL_INGEST_ROWS + 1);
+        assert_eq!(error.queued_rows, MAX_INTERNAL_INGEST_ROWS);
+        let snapshot = runtime.status_snapshot();
+        assert_eq!(snapshot.queued_entries, 1);
+        assert_eq!(snapshot.enqueued_total, 1);
+        assert_eq!(snapshot.enqueue_rejected_total, 1);
     }
 }

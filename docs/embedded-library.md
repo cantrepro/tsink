@@ -59,6 +59,9 @@ let storage = StorageBuilder::new()
     .with_timestamp_precision(TimestampPrecision::Milliseconds)
     .with_memory_limit(512 * 1024 * 1024)                  // 512 MiB
     .with_cardinality_limit(1_000_000)
+    .with_local_disk_limit(10 * 1024 * 1024 * 1024)        // 10 GiB data tree
+    .with_filesystem_free_headroom(512 * 1024 * 1024)      // leave 512 MiB free
+    .with_maintenance_temp_reserve(1024 * 1024 * 1024)     // reserve 1 GiB
     .build()?;
 ```
 
@@ -75,6 +78,7 @@ let storage = StorageBuilder::new()
 |---|---|---|
 | `with_retention(duration)` | 14 days | Global retention window. Data older than this is eligible for removal. |
 | `with_retention_enforced(bool)` | `false` | When `true`, out-of-retention writes are rejected immediately. |
+| `with_max_future_skew(duration)` | *unset* | Opt-in cutoff for samples farther than this duration ahead of the storage clock. |
 | `with_tiered_retention_policy(hot, warm)` | *none* | Set distinct retention durations for the hot and warm tiers. |
 
 ### Timestamp precision
@@ -114,6 +118,22 @@ let storage = StorageBuilder::new()
 | `with_wal_buffer_size(size)` | *default* | In-memory buffer size for WAL frame batching before flush. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | Durability policy — see [WAL sync modes](#wal-sync-modes). |
 | `with_wal_replay_mode(mode)` | `Strict` | Corruption handling during WAL replay — see [WAL replay modes](#wal-replay-modes). |
+
+### Local disk
+
+| Method | Default | Description |
+|---|---|---|
+| `with_local_disk_limit(bytes)` | *unlimited* | Cap bytes admitted beneath the persistent core data directory. Existing over-limit data remains readable, while new growth is rejected. |
+| `with_filesystem_free_headroom(bytes)` | 0 | Leave at least this much filesystem space available to the host. |
+| `with_maintenance_temp_reserve(bytes)` | 0 | Keep this portion of the logical quota available to compaction and other maintenance output. |
+
+Persistent storage always creates the accounting coordinator; the logical quota remains unlimited
+until configured. It accounts WAL, segments and indexes, registry/catalog state, tombstones, rollup
+state, recognized temporary output, and unknown files beneath the configured data path. Unknown
+files are counted but never deleted. The WAL limit remains an additional WAL-only sublimit.
+Object-store roots and snapshot destinations outside the data directory are excluded; while a disk
+coordinator is active, snapshot destinations that resolve inside the managed tree are rejected.
+Separate server-side stores are not automatically included in this core envelope.
 
 ### Remote segments
 
@@ -172,25 +192,59 @@ let rows: Vec<Row> = metrics
 storage.insert_rows(&rows)?;
 ```
 
+The slice is one atomic core batch. If any row is rejected or an apply-time encoding step fails, the
+call returns a structured `TsinkError` and commits none of the rows; `insert_rows` does not silently
+drop the rejected row. Fallible work is staged across all affected active shards before live state
+is published. An empty slice is a successful no-op. See
+[ADR 0001: Core batch write contract](adr/0001-write-contract.md).
+
+Use the canonical API when every input index needs an explicit outcome or when partial acceptance
+is intentional:
+
+```rust
+use tsink::{RowWriteStatus, WriteMode};
+
+let result = storage.write_batch(&rows, WriteMode::BestEffort)?;
+for outcome in &result.outcomes {
+    if let RowWriteStatus::Rejected(rejection) = &outcome.status {
+        eprintln!("row {} rejected: {:?}", outcome.index, rejection.category);
+    }
+}
+```
+
+`Atomic` commits every row or none. `BestEffort` uses one atomic boundary per row in input order.
+Its optional batch acknowledgement is the weakest guarantee among accepted rows and is `None` when
+none were accepted. Rejection messages are diagnostic and bounded; match on the structured category.
+
 ### Write acknowledgement
 
-Use `insert_rows_with_result` to inspect durability guarantees:
+Use `insert_rows_with_result` to inspect the single durability guarantee for the whole successful
+batch:
 
 ```rust
 let result = storage.insert_rows_with_result(&rows)?;
 
 match result.acknowledgement {
-    WriteAcknowledgement::Durable  => { /* crash-safe */ }
-    WriteAcknowledgement::Appended => { /* in WAL buffer, not yet fsync'd */ }
-    WriteAcknowledgement::Volatile => { /* in memory only */ }
+    WriteAcknowledgement::Durable  => { /* configured WAL synchronization completed */ }
+    WriteAcknowledgement::Appended => { /* committed to the WAL, not yet fsync'd */ }
+    WriteAcknowledgement::Volatile => { /* no complete WAL recovery guarantee */ }
 }
 ```
 
-The acknowledgement level depends on the configured WAL sync mode:
+The acknowledgement level reflects the guarantee actually established for the batch:
 
-- **`PerAppend`** — every write returns `Durable`.
-- **`Periodic(interval)`** — writes return `Appended`; they become durable after the next periodic sync.
-- **WAL disabled** — writes return `Volatile`.
+- **`PerAppend`** — normally `Durable` after the batch is synced and WAL publication succeeds.
+- **`Periodic(interval)`** — normally `Appended`, or `Durable` when that append observes the elapsed
+  interval and performs a sync. This mode has no autonomous timer.
+- **WAL disabled** — non-empty writes return `Volatile`.
+- **Degraded WAL publication** — either sync mode can return `Volatile` after in-memory apply if the
+  engine cannot publish the logical WAL boundary.
+
+For an empty batch, `insert_rows_with_result` returns `Durable` because there is no state to lose,
+regardless of WAL configuration.
+
+The full storage-mode, failure, server-sidecar, and platform matrix is documented in
+[Durability contract](durability.md).
 
 ---
 
@@ -499,8 +553,11 @@ for p in &points {
 
 | Mode | Acknowledgement | Trade-off |
 |---|---|---|
-| `WalSyncMode::PerAppend` (default) | `Durable` | Every write is fsync'd before returning. Crash-safe but higher latency. |
-| `WalSyncMode::Periodic(interval)` | `Appended` | Writes are buffered and fsync'd on a timer. Lower latency; a crash may lose up to one interval of writes. |
+| `WalSyncMode::PerAppend` (default) | Normally `Durable` | Sync every non-empty batch before WAL publication. Higher latency. |
+| `WalSyncMode::Periodic(interval)` | `Appended` or `Durable` | Check the interval during append and sync only when due; there is no standalone timer. |
+
+In either mode, a post-apply WAL-publication failure is reported by a successful `Volatile`
+acknowledgement because the engine cannot promise recovery of that batch.
 
 ```rust
 use std::time::Duration;
@@ -528,12 +585,24 @@ Inspect engine internals at runtime:
 ```rust
 let snap = storage.observability_snapshot();
 
+println!("limits: {:?}", storage.effective_storage_limits());
+assert_eq!(snap.limits, storage.effective_storage_limits());
+
 println!("memory: {} / {} bytes",
-    snap.memory.active_and_sealed_bytes,
-    snap.memory.budgeted_bytes);
+    snap.memory.accounted_bytes,
+    snap.limits.accounted_memory_bytes.unwrap_or(usize::MAX as u64));
+
+println!("memory pressure: {:?}", snap.memory.pressure.level);
+assert!(!snap.memory.excluded_bytes_known);
 
 println!("WAL: {} segments, {} bytes",
     snap.wal.segment_count, snap.wal.size_bytes);
+
+if let Some(disk) = &snap.local_disk {
+    println!("local disk: {} accounted, {} reserved, over_limit={}",
+        disk.accounted_bytes, disk.reserved_bytes, disk.over_limit);
+    println!("disk categories: {:?}", disk.categories);
+}
 
 println!("compaction: {} runs, {} errors",
     snap.compaction.runs_total, snap.compaction.errors_total);
@@ -546,8 +615,12 @@ if snap.health.degraded {
 }
 ```
 
-The snapshot covers memory, WAL, retention, flush pipeline, compaction, queries, rollups,
-remote storage, and overall health.
+The snapshot covers effective storage limits, memory, WAL, retention, flush pipeline, compaction,
+queries, rollups, remote storage, and overall health. An optional effective limit is `None` when the
+built-in backend has no finite limit for that field. The memory value is modeled engine accounting,
+not a hard process-RSS cap. Local-disk values describe the persistent core data-directory scope,
+not every file written by the optional server. See [Resource limits and profiles](resource-limits.md)
+for the exact accounted scopes and the query/server limits that remain unfinished.
 
 ---
 
@@ -561,13 +634,20 @@ Key error variants to handle:
 | `MemoryBudgetExceeded` | Write would push memory usage past the configured limit. |
 | `CardinalityLimitExceeded` | A new series would exceed the cardinality cap. |
 | `WalSizeLimitExceeded` | WAL on-disk size exceeds the configured limit. |
+| `DiskQuotaExceeded` | Normal local growth would exceed the logical data-directory envelope. |
+| `InsufficientCompactionHeadroom` | Maintenance output cannot fit inside the logical envelope. |
 | `WriteTimeout` | No writer slot became available within `write_timeout`. |
 | `InvalidTimeRange` | `start > end` in a query. |
 | `InvalidMetricName` / `InvalidLabel` | Metric or label name/value violates naming rules. |
-| `StorageClosed` / `StorageShuttingDown` | Operation attempted after `close()`. |
+| `StorageClosed` | Operation attempted while storage is closing or after `close()`. |
+| `StorageShuttingDown` | The operation was fenced after a fail-fast background failure; canonical writes report `StorageDegraded`. |
 | `DataCorruption` | Segment or WAL integrity check failed. |
-| `InsufficientDiskSpace` | Not enough disk space for WAL or segment writes. |
+| `InsufficientDiskSpace` | A write would cross the configured physical free-space floor. |
 | `OutOfRetention` | Write timestamp falls outside the retention window (when enforcement is enabled). |
+
+Canonical write results map all three local-space failures to
+`WriteRejectionCategory::DiskQuotaExceeded`. Direct maintenance APIs retain the more specific
+`TsinkError` variant.
 
 ---
 
@@ -584,4 +664,6 @@ Key error variants to handle:
 
 1. **Build** — `StorageBuilder::new()...build()` opens (or creates) the data directory, replays the WAL, and starts background threads.
 2. **Use** — `insert_rows`, `select`, `select_with_options`, etc.  The `Storage` trait object is `Send + Sync` and safe to share across threads via `Arc`.
-3. **Close** — `storage.close()` flushes remaining data, syncs the WAL, and shuts down background workers. Calling any method after `close()` returns `StorageClosed`.
+3. **Close** — `storage.close()` flushes remaining data, syncs the WAL, and shuts down background
+   workers. Later writes and queries that require the live engine return `StorageClosed`; an
+   idempotent close and selected inspection/snapshot-style accessors remain available.

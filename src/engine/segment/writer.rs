@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::engine::chunk::Chunk;
 use crate::engine::fs_utils::{
     remove_path_if_exists, rename_tmp, sync_dir, sync_parent_dir, write_tmp_and_sync,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
-use crate::{Result, TsinkError};
+use crate::{DiskCategory, DiskReservationKind, LocalDiskBudget, Result, TsinkError};
 
 use super::format::{
     build_chunk_index_file, build_chunks_and_index, build_manifest_file, build_postings_file,
@@ -23,6 +24,9 @@ pub struct SegmentWriter {
     pub(super) staging_layout: SegmentLayout,
     segment_id: u64,
     level: u8,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    reservation_kind: DiskReservationKind,
+    disk_category: DiskCategory,
 }
 
 impl SegmentWriter {
@@ -37,7 +41,42 @@ impl SegmentWriter {
             staging_layout,
             segment_id,
             level,
+            local_disk_budget: None,
+            reservation_kind: DiskReservationKind::Growth,
+            disk_category: DiskCategory::Segments,
         })
+    }
+
+    pub(in crate::engine) fn new_with_disk_budget(
+        base: impl AsRef<Path>,
+        level: u8,
+        segment_id: u64,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+        reservation_kind: DiskReservationKind,
+    ) -> Result<Self> {
+        let mut writer = Self::new(base, level, segment_id)?;
+        writer.local_disk_budget = local_disk_budget;
+        writer.reservation_kind = reservation_kind;
+        Ok(writer)
+    }
+
+    pub(in crate::engine) fn new_with_disk_budget_and_category(
+        base: impl AsRef<Path>,
+        level: u8,
+        segment_id: u64,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+        reservation_kind: DiskReservationKind,
+        disk_category: DiskCategory,
+    ) -> Result<Self> {
+        let mut writer = Self::new_with_disk_budget(
+            base,
+            level,
+            segment_id,
+            local_disk_budget,
+            reservation_kind,
+        )?;
+        writer.disk_category = disk_category;
+        Ok(writer)
     }
 
     pub fn layout(&self) -> &SegmentLayout {
@@ -68,8 +107,6 @@ impl SegmentWriter {
     where
         T: AsRef<Chunk>,
     {
-        prepare_staging_dir(&self.staging_layout.root)?;
-
         let (chunks_bytes, mut chunk_index, chunk_count, point_count, min_ts, max_ts) =
             build_chunks_and_index(self.level, chunks_by_series)?;
         let series_data = build_segment_series_data(registry, chunks_by_series)?;
@@ -99,22 +136,6 @@ impl SegmentWriter {
             },
         ];
 
-        let data_files = [
-            (&self.staging_layout.chunks_path, chunks_bytes),
-            (&self.staging_layout.chunk_index_path, chunk_index_bytes),
-            (&self.staging_layout.series_path, series_bytes),
-            (&self.staging_layout.postings_path, postings_bytes),
-        ];
-
-        let mut staged_files = Vec::with_capacity(data_files.len());
-        for (path, bytes) in &data_files {
-            staged_files.push((write_tmp_and_sync(path, bytes)?, *path));
-        }
-
-        for (tmp_path, path) in &staged_files {
-            rename_tmp(tmp_path, path)?;
-        }
-
         let manifest = SegmentManifest {
             segment_id: self.segment_id,
             level: self.level,
@@ -127,31 +148,102 @@ impl SegmentWriter {
         };
 
         let manifest_bytes = build_manifest_file(&manifest, manifest_files)?;
-        let manifest_tmp_path =
-            write_tmp_and_sync(&self.staging_layout.manifest_path, &manifest_bytes)?;
-        rename_tmp(&manifest_tmp_path, &self.staging_layout.manifest_path)?;
+        let segment_bytes = [
+            chunks_bytes.len(),
+            chunk_index_bytes.len(),
+            series_bytes.len(),
+            postings_bytes.len(),
+            manifest_bytes.len(),
+        ]
+        .into_iter()
+        .fold(0u64, |total, bytes| total.saturating_add(bytes as u64));
+        let governed_budget = match self.local_disk_budget.as_ref() {
+            Some(budget) if budget.governs_entry(&self.layout.root)? => Some(budget),
+            _ => None,
+        };
+        let reservation = governed_budget
+            .map(|budget| budget.reserve(self.disk_category, segment_bytes, self.reservation_kind))
+            .transpose()?;
 
-        sync_dir(&self.staging_layout.root)?;
-        ensure_publish_target_clear(&self.layout)?;
-        fs::rename(&self.staging_layout.root, &self.layout.root)?;
+        let data_files = [
+            (&self.staging_layout.chunks_path, chunks_bytes),
+            (&self.staging_layout.chunk_index_path, chunk_index_bytes),
+            (&self.staging_layout.series_path, series_bytes),
+            (&self.staging_layout.postings_path, postings_bytes),
+        ];
+        let mut published = false;
+        let write_result = (|| -> Result<()> {
+            prepare_staging_dir(&self.staging_layout.root)?;
+            let mut staged_files = Vec::with_capacity(data_files.len());
+            for (path, bytes) in &data_files {
+                staged_files.push((write_tmp_and_sync(path, bytes)?, *path));
+            }
+            for (tmp_path, path) in &staged_files {
+                rename_tmp(tmp_path, path)?;
+            }
+            let manifest_tmp_path =
+                write_tmp_and_sync(&self.staging_layout.manifest_path, &manifest_bytes)?;
+            rename_tmp(&manifest_tmp_path, &self.staging_layout.manifest_path)?;
 
-        let publish_sync_result = (|| -> Result<()> {
+            sync_dir(&self.staging_layout.root)?;
+            ensure_publish_target_clear(&self.layout)?;
+            fs::rename(&self.staging_layout.root, &self.layout.root)?;
+            published = true;
             sync_dir(&self.layout.root)?;
             if let Some(level_root) = self.layout.root.parent() {
                 sync_dir(level_root)?;
             }
             Ok(())
         })();
-        if let Err(err) = publish_sync_result {
-            if let Err(rollback_err) = rollback_failed_segment_publish(&self.layout.root) {
-                return Err(TsinkError::Other(format!(
-                    "segment publish sync failed and rollback failed: publish={err}, rollback={rollback_err}"
-                )));
-            }
-            return Err(err);
-        }
 
-        Ok(manifest)
+        match write_result {
+            Ok(()) => {
+                if let Some(reservation) = reservation {
+                    reservation.commit(segment_bytes, 0)?;
+                }
+                Ok(manifest)
+            }
+            Err(write_err) => {
+                let mut cleanup_errors = Vec::new();
+                if published {
+                    if let Err(err) = rollback_failed_segment_publish(&self.layout.root) {
+                        cleanup_errors.push(format!("published segment rollback failed: {err}"));
+                    } else {
+                        published = false;
+                    }
+                }
+                if let Err(err) = remove_path_if_exists(&self.staging_layout.root) {
+                    cleanup_errors.push(format!("staging cleanup failed: {err}"));
+                }
+
+                if let Some(reservation) = reservation {
+                    let surviving_root = if published {
+                        &self.layout.root
+                    } else {
+                        &self.staging_layout.root
+                    };
+                    let surviving_bytes = crate::disk_budget::measured_path_bytes(surviving_root)
+                        .unwrap_or(segment_bytes);
+                    let category = if published {
+                        self.disk_category
+                    } else {
+                        DiskCategory::Temporary
+                    };
+                    if let Err(err) = reservation.commit_as(category, surviving_bytes, 0) {
+                        cleanup_errors.push(format!("disk reservation settlement failed: {err}"));
+                    }
+                }
+
+                if cleanup_errors.is_empty() {
+                    Err(write_err)
+                } else {
+                    Err(TsinkError::Other(format!(
+                        "segment write failed: {write_err}; {}",
+                        cleanup_errors.join("; ")
+                    )))
+                }
+            }
+        }
     }
 }
 

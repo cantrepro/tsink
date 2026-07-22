@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tsink::{
-    DataPoint, DeleteSeriesResult, Label, MetricSeries, QueryOptions, Result as TsinkResult, Row,
-    SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage, StorageObservabilitySnapshot,
-    TsinkError,
+    DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryOptions,
+    Result as TsinkResult, Row, SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage,
+    StorageObservabilitySnapshot, TsinkError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +426,10 @@ impl Storage for DistributedStorageAdapter {
 
     fn memory_budget(&self) -> usize {
         self.local_storage.memory_budget()
+    }
+
+    fn effective_storage_limits(&self) -> EffectiveStorageLimits {
+        self.local_storage.effective_storage_limits()
     }
 
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {

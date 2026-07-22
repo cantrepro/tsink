@@ -78,7 +78,8 @@ use crate::exemplar_store::{
 };
 use crate::http::{json_response, text_response, HttpRequest, HttpResponse, MAX_BODY_BYTES};
 use crate::legacy_ingest::{
-    self, AdapterCounterSnapshot, LegacyAdapterKind, LegacyIngestStatusSnapshot,
+    self, AdapterCounterSnapshot, AdapterWriteObservation, AdapterWriteOutcome, LegacyAdapterKind,
+    LegacyIngestStatusSnapshot,
 };
 use crate::managed_control_plane::{
     ManagedBackupPolicyApplyRequest, ManagedBackupRunRecordRequest, ManagedControlPlane,
@@ -124,9 +125,10 @@ use tsink::promql::ast::{Expr, MatchOp};
 use tsink::promql::types::{histogram_buckets, histogram_count_value, PromqlValue};
 use tsink::promql::Engine;
 use tsink::{
-    DataPoint, Label, MetadataShardScope, MetricSeries, RollupPolicy, Row, SeriesMatcher,
-    SeriesMatcherOp, SeriesSelection, ShardWindowScanOptions, Storage, StorageBuilder,
-    TimestampPrecision,
+    BatchWriteResult, DataPoint, Label, MetadataShardScope, MetricSeries, RollupPolicy, Row,
+    RowWriteStatus, SeriesMatcher, SeriesMatcherOp, SeriesSelection, ShardWindowScanOptions,
+    Storage, StorageBuilder, TimestampPrecision, WriteAcknowledgement, WriteMode,
+    WriteRejectionCategory, MAX_WRITE_REJECTION_MESSAGE_BYTES,
 };
 
 mod admin;
@@ -167,6 +169,10 @@ const READ_PARTIAL_RESPONSE_HEADER: &str = "X-Tsink-Read-Partial-Response";
 const READ_PARTIAL_WARNINGS_HEADER: &str = "X-Tsink-Read-Partial-Warnings";
 const READ_ERROR_CODE_HEADER: &str = "X-Tsink-Read-Error-Code";
 const WRITE_ERROR_CODE_HEADER: &str = "X-Tsink-Write-Error-Code";
+const WRITE_ACKNOWLEDGEMENT_HEADER: &str = "X-Tsink-Write-Acknowledgement";
+const WRITE_PARTIAL_HEADER: &str = "X-Tsink-Write-Partial";
+const WRITE_ROWS_ACCEPTED_HEADER: &str = "X-Tsink-Rows-Accepted";
+const WRITE_OUTCOME_HEADER: &str = "X-Tsink-Write-Outcome";
 const AUDIT_ACTOR_ID_HEADER: &str = "x-tsink-actor-id";
 const AUDIT_FORWARDED_USER_HEADER: &str = "x-forwarded-user";
 const METADATA_API_DEFAULT_LIMIT: usize = 1_000;
@@ -211,6 +217,29 @@ static OTLP_EXPONENTIAL_HISTOGRAM_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXPONENTIAL_HISTOGRAM_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXEMPLAR_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXEMPLAR_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+const WRITE_REJECTION_REASON_COUNT: usize = 17;
+static WRITE_REJECTION_REASON_TOTALS: [AtomicU64; WRITE_REJECTION_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; WRITE_REJECTION_REASON_COUNT];
+static WRITE_INDETERMINATE_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+const WRITE_REJECTION_REASON_NAMES: [&str; WRITE_REJECTION_REASON_COUNT] = [
+    "invalid_metric",
+    "invalid_labels",
+    "unsupported_value",
+    "timestamp_out_of_bounds",
+    "below_retention_floor",
+    "future_skew_exceeded",
+    "cardinality_limit_exceeded",
+    "cardinality_creation_rate_exceeded",
+    "memory_pressure",
+    "disk_quota_exceeded",
+    "wal_quota_exceeded",
+    "policy_rejected",
+    "write_timeout",
+    "storage_closed",
+    "storage_degraded",
+    "internal_io",
+    "internal",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrometheusPayloadKind {
@@ -449,6 +478,13 @@ fn record_otlp_points_accepted(stats: &OtlpNormalizationStats) {
     OTLP_SUM_ACCEPTED_TOTAL.fetch_add(stats.sums as u64, Ordering::Relaxed);
     OTLP_HISTOGRAM_ACCEPTED_TOTAL.fetch_add(stats.histograms as u64, Ordering::Relaxed);
     OTLP_SUMMARY_ACCEPTED_TOTAL.fetch_add(stats.summaries as u64, Ordering::Relaxed);
+}
+
+fn record_otlp_points_rejected(stats: &OtlpNormalizationStats) {
+    OTLP_GAUGE_REJECTED_TOTAL.fetch_add(stats.gauges as u64, Ordering::Relaxed);
+    OTLP_SUM_REJECTED_TOTAL.fetch_add(stats.sums as u64, Ordering::Relaxed);
+    OTLP_HISTOGRAM_REJECTED_TOTAL.fetch_add(stats.histograms as u64, Ordering::Relaxed);
+    OTLP_SUMMARY_REJECTED_TOTAL.fetch_add(stats.summaries as u64, Ordering::Relaxed);
 }
 
 fn record_otlp_rejected_kind(kind: OtlpMetricKind) {
@@ -2061,6 +2097,44 @@ fn cluster_rebalance_snapshot(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn local_disk_status_json(snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) -> JsonValue {
+    let Some(snapshot) = snapshot else {
+        return JsonValue::Null;
+    };
+    let categories = snapshot
+        .categories
+        .iter()
+        .map(|usage| {
+            json!({
+                "category": serde_json::to_value(usage.category)
+                    .unwrap_or_else(|_| JsonValue::String("unknown".to_string())),
+                "bytes": usage.bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "limits": {
+            "maxBytes": snapshot.limits.max_bytes,
+            "filesystemFreeHeadroomBytes": snapshot.limits.filesystem_free_headroom_bytes,
+            "maintenanceTempReserveBytes": snapshot.limits.maintenance_temp_reserve_bytes,
+        },
+        "accountedBytes": snapshot.accounted_bytes,
+        "reservedBytes": snapshot.reserved_bytes,
+        "maintenanceReservedBytes": snapshot.maintenance_reserved_bytes,
+        "unknownBytes": snapshot.unknown_bytes,
+        "filesystemAvailableBytes": snapshot.filesystem_available_bytes,
+        "overLimit": snapshot.over_limit,
+        "activeReservations": snapshot.active_reservations,
+        "rejectionsTotal": snapshot.rejections_total,
+        "reconciliationsTotal": snapshot.reconciliations_total,
+        "reservationOverrunsTotal": snapshot.reservation_overruns_total,
+        "categories": categories,
+    })
+}
+
+// The status adapter assembles independent optional server subsystems without making them core
+// storage dependencies; keeping those borrowed inputs explicit makes that boundary visible.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tsdb_status(
     storage: &Arc<dyn Storage>,
     exemplar_store: &Arc<ExemplarStore>,
@@ -2098,6 +2172,7 @@ async fn handle_tsdb_status(
     let storage = tenant::scoped_storage(Arc::clone(storage), tenant_id.clone());
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
+    let effective_storage_limits = storage.effective_storage_limits();
     let storage = Arc::clone(&storage);
     let result = tokio::task::spawn_blocking(move || {
         let metrics = storage.list_metrics().unwrap_or_default();
@@ -2258,16 +2333,43 @@ async fn handle_tsdb_status(
                 "seriesCount": series_count,
                 "memoryUsedBytes": memory_used,
                 "memoryBudgetBytes": memory_budget,
+                "effectiveStorageLimits": {
+                    "reportedByBackend": effective_storage_limits.reported_by_backend,
+                    "persistent": effective_storage_limits.persistent,
+                    "walEnabled": effective_storage_limits.wal_enabled,
+                    "accountedMemoryBytes": effective_storage_limits.accounted_memory_bytes,
+                    "cardinality": effective_storage_limits.cardinality,
+                    "walBytes": effective_storage_limits.wal_bytes,
+                    "localDiskBytes": effective_storage_limits.local_disk_bytes,
+                    "filesystemFreeHeadroomBytes": effective_storage_limits.filesystem_free_headroom_bytes,
+                    "maintenanceTempReserveBytes": effective_storage_limits.maintenance_temp_reserve_bytes,
+                    "maxConcurrentWriters": effective_storage_limits.max_concurrent_writers,
+                    "writeTimeoutNanos": effective_storage_limits.write_timeout_nanos,
+                    "maxActivePartitionHeadsPerSeries": effective_storage_limits.max_active_partition_heads_per_series
+                },
+                "localDisk": local_disk_status_json(observability.local_disk.as_ref()),
                 "memory": {
+                    "accountedBytes": observability.memory.accounted_bytes,
+                    "estimatedAccountedBytes": observability.memory.estimated_accounted_bytes,
                     "budgetedBytes": observability.memory.budgeted_bytes,
                     "excludedBytes": observability.memory.excluded_bytes,
+                    "excludedBytesKnown": observability.memory.excluded_bytes_known,
+                    "excludedCategories": observability.memory.excluded_categories,
                     "activeAndSealedBytes": observability.memory.active_and_sealed_bytes,
                     "registryBytes": observability.memory.registry_bytes,
                     "metadataCacheBytes": observability.memory.metadata_cache_bytes,
                     "persistedIndexBytes": observability.memory.persisted_index_bytes,
                     "persistedMmapBytes": observability.memory.persisted_mmap_bytes,
                     "tombstoneBytes": observability.memory.tombstone_bytes,
-                    "excludedPersistedMmapBytes": observability.memory.excluded_persisted_mmap_bytes
+                    "excludedPersistedMmapBytes": observability.memory.excluded_persisted_mmap_bytes,
+                    "pressure": {
+                        "level": observability.memory.pressure.level,
+                        "approachingLimitBasisPoints": observability.memory.pressure.approaching_limit_basis_points,
+                        "approachingLimitBytes": observability.memory.pressure.approaching_limit_bytes,
+                        "activeBackpressuredWriters": observability.memory.pressure.active_backpressured_writers,
+                        "backpressureEventsTotal": observability.memory.pressure.backpressure_events_total,
+                        "rejectionsTotal": observability.memory.pressure.rejections_total
+                    }
                 },
                 "wal": {
                     "enabled": observability.wal.enabled,
@@ -2517,6 +2619,7 @@ async fn handle_tsdb_status(
                         "lastSuccessfulReplayUnixMs": edge_sync_source_status.last_successful_replay_unix_ms,
                         "lastEnqueueError": edge_sync_source_status.last_enqueue_error,
                         "lastReplayError": edge_sync_source_status.last_replay_error,
+                        "lastUpstreamAcknowledgement": edge_sync_source_status.last_upstream_acknowledgement,
                         "degraded": edge_sync_source_status.degraded
                     },
                     "accept": {
@@ -4976,7 +5079,7 @@ async fn preflight_ingest_write_capabilities(
     if required_capabilities.is_empty() {
         return Ok(());
     }
-    cluster_context
+    let response = cluster_context
         .rpc_client
         .ingest_write(
             endpoint,
@@ -4991,8 +5094,33 @@ async fn preflight_ingest_write_capabilities(
             },
         )
         .await
-        .map(|_| ())
-        .map_err(|err| format!("{err}"))
+        .map_err(|err| format!("{err}"))?;
+    validate_internal_ingest_write_response(&response, 0, 0, 0)
+}
+
+fn validate_internal_ingest_write_response(
+    response: &InternalIngestWriteResponse,
+    expected_rows: usize,
+    expected_metadata_updates: usize,
+    expected_exemplars: usize,
+) -> Result<(), String> {
+    if response.inserted_rows != expected_rows
+        || response.accepted_metadata_updates != expected_metadata_updates
+        || response.accepted_exemplars != expected_exemplars
+        || response.dropped_exemplars > expected_exemplars
+    {
+        return Err(format!(
+            "peer returned inconsistent ingest counts: rows={}/{} metadata={}/{} exemplars={}/{} dropped={}",
+            response.inserted_rows,
+            expected_rows,
+            response.accepted_metadata_updates,
+            expected_metadata_updates,
+            response.accepted_exemplars,
+            expected_exemplars,
+            response.dropped_exemplars,
+        ));
+    }
+    Ok(())
 }
 
 async fn preflight_histogram_rows_with_cluster(
@@ -5070,7 +5198,7 @@ async fn replicate_metadata_updates_with_cluster(
         .map(normalized_metadata_to_internal_update)
         .collect::<Vec<_>>();
     for node in &remote_nodes {
-        cluster_context
+        let response = cluster_context
             .rpc_client
             .ingest_write(
                 &node.endpoint,
@@ -5096,6 +5224,14 @@ async fn replicate_metadata_updates_with_cluster(
                     node.id, node.endpoint
                 )
             })?;
+        validate_internal_ingest_write_response(&response, 0, internal_updates.len(), 0).map_err(
+            |err| {
+                format!(
+                    "remote metadata write to node '{}' ({}) returned an invalid result: {err}",
+                    node.id, node.endpoint
+                )
+            },
+        )?;
     }
 
     metadata_store.apply_updates(tenant_id, updates)
@@ -5227,6 +5363,7 @@ async fn route_exemplars_with_consistency_and_ring_version(
     if exemplars.is_empty() {
         return Ok(ExemplarClusterWriteStats::default());
     }
+    let logical_exemplar_count = exemplars.len();
 
     let (membership, ring) = effective_write_topology(cluster_context)?;
     let local_node_id = membership.local_node_id.clone();
@@ -5280,38 +5417,34 @@ async fn route_exemplars_with_consistency_and_ring_version(
 
     let exemplar_required_capabilities =
         payload_required_capabilities(PrometheusPayloadKind::Exemplar);
-    let mut preflight_endpoints = BTreeSet::new();
-    for batch in remote_batches.values() {
-        preflight_endpoints.insert(batch.endpoint.clone());
-    }
-    for endpoint in preflight_endpoints {
-        preflight_ingest_write_capabilities(
-            cluster_context,
-            &endpoint,
-            ring_version,
-            &exemplar_required_capabilities,
-        )
-        .await
-        .map_err(|err| {
-            format!("exemplar peer capability preflight failed for {endpoint}: {err}")
-        })?;
-    }
-
-    let mut accepted_exemplars = 0usize;
-    let mut dropped_exemplars = 0usize;
+    let mut dropped_exemplars_per_replica_max = 0usize;
+    let mut first_replica_failure = None::<String>;
 
     if !local_exemplars.is_empty() {
-        let outcome = exemplar_store.apply_writes(
+        let local_exemplar_count = local_exemplars.len();
+        match exemplar_store.apply_writes(
             &local_exemplars
                 .into_iter()
                 .map(internal_write_exemplar_to_store_write)
                 .collect::<Vec<_>>(),
-        )?;
-        accepted_exemplars = accepted_exemplars.saturating_add(outcome.accepted);
-        dropped_exemplars = dropped_exemplars.saturating_add(outcome.dropped);
-        for shard in &local_shards {
-            if let Some(state) = shard_state.get_mut(shard) {
-                state.acknowledged_acks = state.acknowledged_acks.saturating_add(1);
+        ) {
+            Ok(outcome) if outcome.accepted == local_exemplar_count => {
+                dropped_exemplars_per_replica_max =
+                    dropped_exemplars_per_replica_max.max(outcome.dropped);
+                for shard in &local_shards {
+                    if let Some(state) = shard_state.get_mut(shard) {
+                        state.acknowledged_acks = state.acknowledged_acks.saturating_add(1);
+                    }
+                }
+            }
+            Ok(outcome) => {
+                first_replica_failure = Some(format!(
+                    "local exemplar store reported {} accepted for {local_exemplar_count} writes",
+                    outcome.accepted
+                ));
+            }
+            Err(err) => {
+                first_replica_failure = Some(format!("local exemplar write failed: {err}"));
             }
         }
     }
@@ -5319,14 +5452,33 @@ async fn route_exemplars_with_consistency_and_ring_version(
     let remote_exemplar_limit = exemplar_store.config().max_exemplars_per_request;
     for (_, mut batch) in remote_batches {
         if batch.exemplars.len() > remote_exemplar_limit {
-            return Err(format!(
+            first_replica_failure.get_or_insert_with(|| format!(
                 "exemplar routing failed for node '{}': remote batch exceeds exemplar limit {} > {remote_exemplar_limit}",
                 batch.owner_node_id,
                 batch.exemplars.len(),
             ));
+            continue;
         }
 
-        let response = cluster_context
+        if let Err(err) = preflight_ingest_write_capabilities(
+            cluster_context,
+            &batch.endpoint,
+            ring_version,
+            &exemplar_required_capabilities,
+        )
+        .await
+        {
+            first_replica_failure.get_or_insert_with(|| {
+                format!(
+                    "exemplar peer capability preflight failed for {}: {err}",
+                    batch.endpoint
+                )
+            });
+            continue;
+        }
+
+        let remote_exemplar_count = batch.exemplars.len();
+        let response = match cluster_context
             .rpc_client
             .ingest_write(
                 &batch.endpoint,
@@ -5345,15 +5497,32 @@ async fn route_exemplars_with_consistency_and_ring_version(
                 },
             )
             .await
-            .map_err(|err| {
+        {
+            Ok(response) => response,
+            Err(err) => {
+                first_replica_failure.get_or_insert_with(|| {
+                    format!(
+                        "remote exemplar write to node '{}' ({}) failed: {err}",
+                        batch.owner_node_id, batch.endpoint
+                    )
+                });
+                continue;
+            }
+        };
+
+        if let Err(err) =
+            validate_internal_ingest_write_response(&response, 0, 0, remote_exemplar_count)
+        {
+            first_replica_failure.get_or_insert_with(|| {
                 format!(
-                    "remote exemplar write to node '{}' ({}) failed: {err}",
+                    "remote exemplar write to node '{}' ({}) returned an invalid result: {err}",
                     batch.owner_node_id, batch.endpoint
                 )
-            })?;
-
-        accepted_exemplars = accepted_exemplars.saturating_add(response.accepted_exemplars);
-        dropped_exemplars = dropped_exemplars.saturating_add(response.dropped_exemplars);
+            });
+            continue;
+        }
+        dropped_exemplars_per_replica_max =
+            dropped_exemplars_per_replica_max.max(response.dropped_exemplars);
         for shard in &batch.shards {
             if let Some(state) = shard_state.get_mut(shard) {
                 state.acknowledged_acks = state.acknowledged_acks.saturating_add(1);
@@ -5365,15 +5534,18 @@ async fn route_exemplars_with_consistency_and_ring_version(
         .iter()
         .find(|(_, state)| state.acknowledged_acks < state.required_acks)
     {
+        let failure_context = first_replica_failure
+            .as_deref()
+            .unwrap_or("no replica returned an explicit failure detail");
         return Err(format!(
-            "exemplar replication failed for shard {shard} in {mode} mode: required {} acks, got {}",
+            "exemplar replication failed for shard {shard} in {mode} mode: required {} acks, got {}; first failure: {failure_context}",
             state.required_acks, state.acknowledged_acks
         ));
     }
 
     Ok(ExemplarClusterWriteStats {
-        accepted_exemplars,
-        dropped_exemplars,
+        accepted_exemplars: logical_exemplar_count,
+        dropped_exemplars: dropped_exemplars_per_replica_max,
         consistency: shard_state
             .values()
             .map(|state| state.acknowledged_acks)
@@ -5391,11 +5563,239 @@ async fn route_exemplars_with_consistency_and_ring_version(
 }
 
 #[derive(Debug, Clone, Default)]
-struct AppliedWriteEnvelope {
-    consistency: Option<WriteConsistencyOutcome>,
+pub(crate) struct AppliedWriteEnvelope {
+    pub(crate) consistency: Option<WriteConsistencyOutcome>,
+    pub(crate) acknowledgement: Option<WriteAcknowledgement>,
+    pub(crate) accepted_metadata_updates: usize,
+    pub(crate) applied_metadata_updates: usize,
+    pub(crate) accepted_exemplars: usize,
+    pub(crate) dropped_exemplars: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterWriteError {
+    pub(crate) status: u16,
+    pub(crate) message: String,
+    pub(crate) error_code: Option<String>,
+    pub(crate) accepted_rows: usize,
+    pub(crate) acknowledgement: Option<WriteAcknowledgement>,
+    pub(crate) accepted_metadata_updates: usize,
+    pub(crate) applied_metadata_updates: usize,
+    pub(crate) accepted_exemplars: usize,
+    pub(crate) indeterminate: bool,
+}
+
+impl AdapterWriteError {
+    fn from_response(response: HttpResponse) -> Self {
+        let status = response.status;
+        let error_code =
+            response_header_value(&response, WRITE_ERROR_CODE_HEADER).map(str::to_string);
+        let accepted_rows = response_header_count(&response, WRITE_ROWS_ACCEPTED_HEADER);
+        let accepted_metadata_updates =
+            response_header_count(&response, "X-Tsink-Metadata-Accepted");
+        let applied_metadata_updates = response_header_count(&response, "X-Tsink-Metadata-Applied");
+        let accepted_exemplars = response_header_count(&response, "X-Tsink-Exemplars-Accepted");
+        let acknowledgement = match response_header_value(&response, WRITE_ACKNOWLEDGEMENT_HEADER) {
+            Some("volatile") => Some(WriteAcknowledgement::Volatile),
+            Some("appended") => Some(WriteAcknowledgement::Appended),
+            Some("durable") => Some(WriteAcknowledgement::Durable),
+            _ => None,
+        };
+        let indeterminate = response_write_outcome_is_indeterminate(&response)
+            || error_code.as_deref() == Some("write_invalid_outcome");
+        Self {
+            status,
+            message: http_response_message(response),
+            error_code,
+            accepted_rows,
+            acknowledgement,
+            accepted_metadata_updates,
+            applied_metadata_updates,
+            accepted_exemplars,
+            indeterminate,
+        }
+    }
+
+    fn internal(message: String) -> Self {
+        Self {
+            status: 500,
+            message,
+            error_code: None,
+            accepted_rows: 0,
+            acknowledgement: None,
+            accepted_metadata_updates: 0,
+            applied_metadata_updates: 0,
+            accepted_exemplars: 0,
+            indeterminate: false,
+        }
+    }
+
+    pub(crate) fn throttled(&self) -> bool {
+        self.status == 429
+            || self.status == 507
+            || matches!(
+                self.error_code.as_deref(),
+                Some(
+                    "write_overloaded"
+                        | "write_resource_limit_exceeded"
+                        | "write_cardinality_limit_exceeded"
+                        | "write_cardinality_creation_rate_exceeded"
+                        | "write_memory_pressure"
+                        | "write_disk_quota_exceeded"
+                        | "write_wal_quota_exceeded"
+                        | "write_timeout"
+                )
+            )
+    }
+}
+
+pub(crate) fn legacy_adapter_write_error_observation<'a>(
+    err: &'a AdapterWriteError,
+    submitted_samples: usize,
+) -> AdapterWriteObservation<'a> {
+    // Accepted-row headers remain proven progress even when another cluster component is
+    // indeterminate. Only the unaccounted remainder must stay unknown.
+    let accepted_samples = err.accepted_rows.min(submitted_samples);
+    let rejected_samples = if err.indeterminate {
+        0
+    } else {
+        submitted_samples.saturating_sub(accepted_samples)
+    };
+    let outcome = if err.indeterminate {
+        AdapterWriteOutcome::Indeterminate
+    } else if accepted_samples > 0
+        || err.accepted_metadata_updates > 0
+        || err.accepted_exemplars > 0
+    {
+        AdapterWriteOutcome::Partial
+    } else {
+        AdapterWriteOutcome::Rejected
+    };
+
+    AdapterWriteObservation {
+        outcome,
+        acknowledgement: err.acknowledgement,
+        accepted_samples,
+        rejected_samples,
+        accepted_metadata_updates: err.accepted_metadata_updates,
+        applied_metadata_updates: err.applied_metadata_updates,
+        accepted_exemplars: err.accepted_exemplars,
+        error_code: err.error_code.as_deref(),
+        throttled: err.throttled(),
+    }
+}
+
+impl std::fmt::Display for AdapterWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdapterWriteError {}
+
+impl From<String> for AdapterWriteError {
+    fn from(message: String) -> Self {
+        Self::internal(message)
+    }
+}
+
+fn weakest_write_acknowledgement(
+    current: Option<WriteAcknowledgement>,
+    component: WriteAcknowledgement,
+) -> Option<WriteAcknowledgement> {
+    Some(match current {
+        Some(current) => current.weakest(component),
+        None => component,
+    })
+}
+
+fn weakest_write_consistency(
+    first: Option<WriteConsistencyOutcome>,
+    second: Option<WriteConsistencyOutcome>,
+) -> Option<WriteConsistencyOutcome> {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            let mode = match (first.mode, second.mode) {
+                (ClusterWriteConsistency::One, _) | (_, ClusterWriteConsistency::One) => {
+                    ClusterWriteConsistency::One
+                }
+                (ClusterWriteConsistency::Quorum, _) | (_, ClusterWriteConsistency::Quorum) => {
+                    ClusterWriteConsistency::Quorum
+                }
+                (ClusterWriteConsistency::All, ClusterWriteConsistency::All) => {
+                    ClusterWriteConsistency::All
+                }
+            };
+            Some(WriteConsistencyOutcome {
+                mode,
+                required_acks: first.required_acks.min(second.required_acks),
+                acknowledged_replicas_min: first
+                    .acknowledged_replicas_min
+                    .min(second.acknowledged_replicas_min),
+            })
+        }
+        (Some(outcome), None) | (None, Some(outcome)) => Some(outcome),
+        (None, None) => None,
+    }
+}
+
+fn partial_write_error_response(
+    response: HttpResponse,
+    accepted_rows: usize,
+    acknowledgement: Option<WriteAcknowledgement>,
+    accepted_metadata_updates: usize,
     applied_metadata_updates: usize,
     accepted_exemplars: usize,
-    dropped_exemplars: usize,
+) -> HttpResponse {
+    if accepted_rows == 0 && accepted_metadata_updates == 0 && accepted_exemplars == 0 {
+        return response;
+    }
+
+    let mut response = response
+        .with_header(WRITE_PARTIAL_HEADER, "true")
+        .with_header(WRITE_OUTCOME_HEADER, "partial")
+        .with_header(WRITE_ROWS_ACCEPTED_HEADER, accepted_rows.to_string())
+        .with_header(
+            "X-Tsink-Metadata-Accepted",
+            accepted_metadata_updates.to_string(),
+        )
+        .with_header(
+            "X-Tsink-Metadata-Applied",
+            applied_metadata_updates.to_string(),
+        )
+        .with_header("X-Tsink-Exemplars-Accepted", accepted_exemplars.to_string());
+    if let Some(acknowledgement) = acknowledgement {
+        response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+    }
+    response
+}
+
+fn indeterminate_cluster_write_response(response: HttpResponse) -> HttpResponse {
+    WRITE_INDETERMINATE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    response
+        .with_header(WRITE_PARTIAL_HEADER, "possible")
+        .with_header(WRITE_OUTCOME_HEADER, "indeterminate_cluster")
+}
+
+fn response_header_value<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn response_write_outcome_is_indeterminate(response: &HttpResponse) -> bool {
+    matches!(
+        response_header_value(response, WRITE_OUTCOME_HEADER),
+        Some("indeterminate_cluster" | "indeterminate_backend")
+    )
+}
+
+fn response_header_count(response: &HttpResponse, name: &str) -> usize {
+    response_header_value(response, name)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5416,6 +5816,7 @@ async fn apply_normalized_write_envelope(
     let metadata_updates = envelope.metadata_updates.clone();
     let exemplars = envelope.exemplars.clone();
     let rows = envelope.into_rows();
+    let row_count = rows.len();
 
     if rows.is_empty() && exemplars.is_empty() && metadata_updates.is_empty() {
         return Ok(AppliedWriteEnvelope::default());
@@ -5484,9 +5885,14 @@ async fn apply_normalized_write_envelope(
                 .await
             {
                 Ok(stats) => Some(stats),
-                Err(err) => return Err(write_routing_error_response(err)),
+                Err(err) => {
+                    return Err(indeterminate_cluster_write_response(
+                        write_routing_error_response(err),
+                    ))
+                }
             }
         };
+        let mut acknowledgement = row_stats.as_ref().and_then(|stats| stats.acknowledgement);
 
         let applied_metadata_updates = if metadata_updates.is_empty() {
             0usize
@@ -5502,13 +5908,23 @@ async fn apply_normalized_write_envelope(
             {
                 Ok(applied) => applied,
                 Err(err) => {
-                    return Err(text_response(
-                        409,
-                        &format!("cluster metadata write rejected: {err}"),
+                    return Err(indeterminate_cluster_write_response(
+                        partial_write_error_response(
+                            text_response(409, &format!("cluster metadata write rejected: {err}")),
+                            row_count,
+                            acknowledgement,
+                            0,
+                            0,
+                            0,
+                        ),
                     ))
                 }
             }
         };
+        if !metadata_updates.is_empty() {
+            acknowledgement =
+                weakest_write_acknowledgement(acknowledgement, WriteAcknowledgement::Volatile);
+        }
 
         let exemplar_stats = if exemplars.is_empty() {
             None
@@ -5523,15 +5939,35 @@ async fn apply_normalized_write_envelope(
             .await
             {
                 Ok(stats) => Some(stats),
-                Err(err) => return Err(text_response(409, &err)),
+                Err(err) => {
+                    return Err(indeterminate_cluster_write_response(
+                        partial_write_error_response(
+                            text_response(409, &err),
+                            row_count,
+                            acknowledgement,
+                            metadata_updates.len(),
+                            applied_metadata_updates,
+                            0,
+                        ),
+                    ))
+                }
             }
         };
+        if exemplar_stats.is_some() {
+            acknowledgement =
+                weakest_write_acknowledgement(acknowledgement, WriteAcknowledgement::Volatile);
+        }
 
         return Ok(AppliedWriteEnvelope {
-            consistency: row_stats
-                .as_ref()
-                .and_then(|stats| stats.consistency)
-                .or_else(|| exemplar_stats.as_ref().and_then(|stats| stats.consistency)),
+            consistency: weakest_write_consistency(
+                row_stats.as_ref().and_then(|stats| stats.consistency),
+                exemplar_stats.as_ref().and_then(|stats| stats.consistency),
+            ),
+            // Row routing reports the weakest acknowledgement returned by the replicas that
+            // satisfied the requested consistency. Server sidecars remain outside that WAL
+            // boundary and therefore weaken the complete envelope to Volatile.
+            acknowledgement,
+            accepted_metadata_updates: metadata_updates.len(),
             applied_metadata_updates,
             accepted_exemplars: exemplar_stats
                 .as_ref()
@@ -5544,16 +5980,32 @@ async fn apply_normalized_write_envelope(
         });
     }
 
-    if !rows.is_empty() {
+    let mut acknowledgement = if rows.is_empty() {
+        None
+    } else {
         let edge_rows = rows.clone();
         let storage = Arc::clone(storage);
-        let result = tokio::task::spawn_blocking(move || storage.insert_rows(&rows)).await;
+        let result =
+            tokio::task::spawn_blocking(move || storage.write_batch(&rows, WriteMode::Atomic))
+                .await;
         match result {
-            Ok(Ok(())) => maybe_enqueue_edge_sync_rows(edge_sync_context, &edge_rows),
+            Ok(Ok(result)) => {
+                let acknowledgement =
+                    validate_atomic_write_result("insert", edge_rows.len(), &result)?;
+                if let Err(error) = maybe_enqueue_edge_sync_rows(edge_sync_context, &edge_rows) {
+                    return Err(edge_sync_enqueue_error_response(
+                        "insert",
+                        &error,
+                        edge_rows.len(),
+                        acknowledgement,
+                    ));
+                }
+                Some(acknowledgement)
+            }
             Ok(Err(err)) => return Err(storage_write_error_response("insert", &err)),
-            Err(err) => return Err(text_response(500, &format!("insert task failed: {err}"))),
+            Err(_) => return Err(backend_write_task_failure_response("insert")),
         }
-    }
+    };
 
     let applied_metadata_updates = if metadata_updates.is_empty() {
         0usize
@@ -5561,17 +6013,30 @@ async fn apply_normalized_write_envelope(
         match metadata_store.apply_updates(tenant_id, &metadata_updates) {
             Ok(applied) => applied,
             Err(err) => {
-                return Err(text_response(
-                    500,
-                    &format!("metadata update failed: {err}"),
+                return Err(partial_write_error_response(
+                    text_response(500, &format!("metadata update failed: {err}")),
+                    row_count,
+                    acknowledgement,
+                    0,
+                    0,
+                    0,
                 ))
             }
         }
     };
 
+    if !metadata_updates.is_empty() {
+        // The sidecar store fsyncs its replacement file but does not yet fsync the parent
+        // directory, so do not let it inherit a stronger core-WAL acknowledgement.
+        acknowledgement =
+            weakest_write_acknowledgement(acknowledgement, WriteAcknowledgement::Volatile);
+    }
+
     if exemplars.is_empty() {
         return Ok(AppliedWriteEnvelope {
             consistency: None,
+            acknowledgement,
+            accepted_metadata_updates: metadata_updates.len(),
             applied_metadata_updates,
             accepted_exemplars: 0,
             dropped_exemplars: 0,
@@ -5586,13 +6051,22 @@ async fn apply_normalized_write_envelope(
     ) {
         Ok(outcome) => Ok(AppliedWriteEnvelope {
             consistency: None,
+            acknowledgement: weakest_write_acknowledgement(
+                acknowledgement,
+                WriteAcknowledgement::Volatile,
+            ),
+            accepted_metadata_updates: metadata_updates.len(),
             applied_metadata_updates,
             accepted_exemplars: outcome.accepted,
             dropped_exemplars: outcome.dropped,
         }),
-        Err(err) => Err(text_response(
-            500,
-            &format!("exemplar insert failed: {err}"),
+        Err(err) => Err(partial_write_error_response(
+            text_response(500, &format!("exemplar insert failed: {err}")),
+            row_count,
+            acknowledgement,
+            metadata_updates.len(),
+            applied_metadata_updates,
+            0,
         )),
     }
 }
@@ -5610,7 +6084,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
     tenant_id: &str,
     source: &str,
     envelope: NormalizedWriteEnvelope,
-) -> Result<(), String> {
+) -> Result<AppliedWriteEnvelope, AdapterWriteError> {
     let started = Instant::now();
     let write_admission = admission::global_public_write_admission()
         .map_err(|err| format!("write admission unavailable: {err}"))?;
@@ -5622,14 +6096,16 @@ pub(crate) async fn ingest_adapter_write_envelope(
         tenant_id,
         tenant::TenantAccessScope::Write,
     )
-    .map_err(|err| http_response_message(err.to_http_response()))?;
+    .map_err(|err| AdapterWriteError::from_response(err.to_http_response()))?;
     if let Err(err) = tenant::enforce_write_rows_quota(tenant_plan.policy(), ingest_units) {
         tenant_plan.record_rejected(
             tenant::TenantAdmissionSurface::Ingest,
             ingest_units,
             err.clone(),
         );
-        return Err(err);
+        return Err(AdapterWriteError::from_response(
+            HttpResponse::new(413, err).with_header("Content-Type", "text/plain"),
+        ));
     }
     let tenant_request = tenant_plan
         .admit_with_usage(
@@ -5637,7 +6113,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
             ingest_units,
             usage_accounting,
         )
-        .map_err(|err| http_response_message(err.to_http_response()))?;
+        .map_err(|err| AdapterWriteError::from_response(err.to_http_response()))?;
     let request_slot = match write_admission.acquire_request_slot().await {
         Ok(lease) => lease,
         Err(err) => {
@@ -5646,7 +6122,9 @@ pub(crate) async fn ingest_adapter_write_envelope(
                 ingest_units,
                 err.to_string(),
             );
-            return Err(write_admission_error_text(err));
+            return Err(AdapterWriteError::from_response(
+                write_admission_error_response(err),
+            ));
         }
     };
     let request = HttpRequest {
@@ -5670,7 +6148,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
         false,
     )
     .await
-    .map(|result| {
+    .inspect(|result| {
         record_ingest_usage(
             usage_accounting,
             tenant_id,
@@ -5687,19 +6165,51 @@ pub(crate) async fn ingest_adapter_write_envelope(
             ),
         );
     })
-    .map_err(http_response_message)
+    .map_err(AdapterWriteError::from_response)
 }
 
 fn maybe_enqueue_edge_sync_rows(
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     rows: &[Row],
-) {
+) -> Result<usize, edge_sync::EdgeSyncEnqueueError> {
     if rows.is_empty() {
-        return;
+        return Ok(0);
     }
     if let Some(runtime) = edge_sync_context.and_then(|context| context.source.as_ref()) {
-        runtime.enqueue_rows(rows);
+        return runtime.enqueue_rows(rows);
     }
+    Ok(0)
+}
+
+fn edge_sync_enqueue_error_response(
+    action: &str,
+    error: &edge_sync::EdgeSyncEnqueueError,
+    accepted_rows: usize,
+    acknowledgement: WriteAcknowledgement,
+) -> HttpResponse {
+    partial_write_error_response(
+        text_response(
+            503,
+            &format!(
+                "{action} accepted locally but could not be fully persisted to the edge-sync queue"
+            ),
+        )
+        .with_header(WRITE_ERROR_CODE_HEADER, "edge_sync_enqueue_failed")
+        .with_header("Retry-After", "1")
+        .with_header(
+            "X-Tsink-Edge-Sync-Rows-Submitted",
+            error.submitted_rows.to_string(),
+        )
+        .with_header(
+            "X-Tsink-Edge-Sync-Rows-Queued",
+            error.queued_rows.to_string(),
+        ),
+        accepted_rows,
+        Some(acknowledgement),
+        0,
+        0,
+        0,
+    )
 }
 
 fn http_response_message(response: HttpResponse) -> String {
@@ -5709,10 +6219,6 @@ fn http_response_message(response: HttpResponse) -> String {
     } else {
         body
     }
-}
-
-fn write_admission_error_text(err: WriteAdmissionError) -> String {
-    http_response_message(write_admission_error_response(err))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5757,7 +6263,8 @@ async fn handle_influx_line_protocol(
         Ok(body) => body,
         Err(_) => {
             legacy_ingest::record_request_rejected(LegacyAdapterKind::InfluxLineProtocol, 0);
-            return text_response(400, "influx line protocol body must be valid UTF-8");
+            return text_response(400, "influx line protocol body must be valid UTF-8")
+                .with_header(WRITE_ERROR_CODE_HEADER, "influx_invalid_line_protocol");
         }
     };
 
@@ -5787,12 +6294,20 @@ async fn handle_influx_line_protocol(
     ) {
         Ok(normalized) => normalized,
         Err(err) => {
-            if legacy_ingest_error_is_throttled(&err) {
+            let throttled = legacy_ingest_error_is_throttled(&err);
+            if throttled {
                 legacy_ingest::record_request_throttled(LegacyAdapterKind::InfluxLineProtocol, 0);
-                return HttpResponse::new(413, err).with_header("Content-Type", "text/plain");
+            } else {
+                legacy_ingest::record_request_rejected(LegacyAdapterKind::InfluxLineProtocol, 0);
             }
-            legacy_ingest::record_request_rejected(LegacyAdapterKind::InfluxLineProtocol, 0);
-            return text_response(400, &err);
+            let status = if throttled { 413 } else { 400 };
+            let error_code = if throttled {
+                "write_resource_limit_exceeded"
+            } else {
+                "influx_invalid_line_protocol"
+            };
+            return text_response(status, bounded_write_rejection_diagnostic(&err))
+                .with_header(WRITE_ERROR_CODE_HEADER, error_code);
         }
     };
 
@@ -5848,18 +6363,46 @@ async fn handle_influx_line_protocol(
     .await
     {
         Ok(result) => {
-            legacy_ingest::record_request_accepted(
+            legacy_ingest::record_adapter_write(
                 LegacyAdapterKind::InfluxLineProtocol,
-                normalized.sample_count,
+                AdapterWriteObservation {
+                    outcome: AdapterWriteOutcome::Complete,
+                    acknowledgement: result.acknowledgement,
+                    accepted_samples: normalized.sample_count,
+                    rejected_samples: 0,
+                    accepted_metadata_updates: result.accepted_metadata_updates,
+                    applied_metadata_updates: result.applied_metadata_updates,
+                    accepted_exemplars: result.accepted_exemplars,
+                    error_code: None,
+                    throttled: false,
+                },
             );
             result
         }
         Err(response) => {
-            record_legacy_ingest_failure(
-                LegacyAdapterKind::InfluxLineProtocol,
-                response.status,
-                normalized.sample_count,
-            );
+            let err = AdapterWriteError::from_response(response.clone());
+            let observation = legacy_adapter_write_error_observation(&err, normalized.sample_count);
+            legacy_ingest::record_adapter_write(LegacyAdapterKind::InfluxLineProtocol, observation);
+            if observation.accepted_samples > 0
+                || observation.applied_metadata_updates > 0
+                || observation.accepted_exemplars > 0
+            {
+                record_ingest_usage(
+                    usage_accounting,
+                    &tenant_id,
+                    "influx_line_protocol",
+                    request.path_without_query(),
+                    IngestUsageMetrics::new(
+                        observation.accepted_samples as u64,
+                        observation.applied_metadata_updates as u64,
+                        observation.accepted_exemplars as u64,
+                        0,
+                        0,
+                        elapsed_nanos_since(started),
+                        request.body.len() as u64,
+                    ),
+                );
+            }
             return response;
         }
     };
@@ -5869,7 +6412,7 @@ async fn handle_influx_line_protocol(
         "influx_line_protocol",
         request.path_without_query(),
         IngestUsageMetrics::new(
-            normalized.request_units as u64,
+            normalized.sample_count as u64,
             apply_result.applied_metadata_updates as u64,
             apply_result.accepted_exemplars as u64,
             apply_result.dropped_exemplars as u64,
@@ -5900,6 +6443,9 @@ async fn handle_influx_line_protocol(
                 consistency.acknowledged_replicas_min.to_string(),
             );
     }
+    if let Some(acknowledgement) = apply_result.acknowledgement {
+        response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
+    }
     if apply_result.applied_metadata_updates > 0 {
         response = response.with_header(
             "X-Tsink-Metadata-Applied",
@@ -5907,14 +6453,6 @@ async fn handle_influx_line_protocol(
         );
     }
     response
-}
-
-fn record_legacy_ingest_failure(kind: LegacyAdapterKind, status: u16, sample_count: usize) {
-    if status == 413 || status == 429 {
-        legacy_ingest::record_request_throttled(kind, sample_count);
-    } else {
-        legacy_ingest::record_request_rejected(kind, sample_count);
-    }
 }
 
 fn legacy_ingest_error_is_throttled(err: &str) -> bool {
@@ -5951,6 +6489,32 @@ fn decode_body(request: &HttpRequest) -> Result<Vec<u8>, String> {
 }
 
 fn write_routing_error_response(err: WriteRoutingError) -> HttpResponse {
+    let structured_rejection = match &err {
+        WriteRoutingError::LocalWriteRejected {
+            rejection,
+            rejected_rows,
+            ..
+        } => Some((rejection, *rejected_rows)),
+        WriteRoutingError::RemoteWriteRejected {
+            rejection,
+            rejected_rows,
+            ..
+        } => Some((rejection, *rejected_rows)),
+        _ => None,
+    };
+    if let Some((rejection, rejected_rows)) = structured_rejection {
+        WRITE_REJECTION_REASON_TOTALS[write_rejection_category_index(rejection.category)]
+            .fetch_add(rejected_rows as u64, Ordering::Relaxed);
+        let (status, error_code, retry_after) = write_rejection_http_mapping(rejection.category);
+        let diagnostic = bounded_write_rejection_diagnostic(&rejection.message);
+        let mut response = text_response(status, &format!("cluster write rejected: {diagnostic}"))
+            .with_header(WRITE_ERROR_CODE_HEADER, error_code);
+        if let Some(retry_after) = retry_after {
+            response = response.with_header("Retry-After", retry_after);
+        }
+        return response;
+    }
+
     let status = match &err {
         WriteRoutingError::InvalidConsistencyOverride { .. } => 400,
         WriteRoutingError::ConsistencyTimeout { .. } => 504,
@@ -6176,12 +6740,193 @@ fn classify_storage_write_error(err: &tsink::TsinkError) -> Option<(u16, &'stati
 }
 
 fn storage_write_error_response(action: &str, err: &tsink::TsinkError) -> HttpResponse {
-    let (status, error_code) = classify_storage_write_error(err).unwrap_or((500, ""));
-    let mut response = text_response(status, &format!("{action} failed: {err}"));
-    if !error_code.is_empty() {
-        response = response.with_header(WRITE_ERROR_CODE_HEADER, error_code);
+    let (status, error_code, message) = match classify_storage_write_error(err) {
+        Some((status, error_code)) => (status, error_code, format!("{action} failed: {err}")),
+        None => (
+            500,
+            "write_internal",
+            format!("{action} failed: storage backend error"),
+        ),
+    };
+    indeterminate_backend_write_error_response(status, error_code, &message)
+}
+
+fn backend_write_task_failure_response(action: &str) -> HttpResponse {
+    indeterminate_backend_write_error_response(
+        500,
+        "write_internal",
+        &format!("{action} failed: storage write task did not complete"),
+    )
+}
+
+fn indeterminate_backend_write_error_response(
+    status: u16,
+    error_code: &'static str,
+    message: &str,
+) -> HttpResponse {
+    WRITE_INDETERMINATE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    text_response(status, bounded_write_rejection_diagnostic(message))
+        .with_header(WRITE_ERROR_CODE_HEADER, error_code)
+        .with_header(WRITE_PARTIAL_HEADER, "possible")
+        .with_header(WRITE_OUTCOME_HEADER, "indeterminate_backend")
+}
+
+fn validate_atomic_write_result(
+    action: &str,
+    expected_rows: usize,
+    result: &BatchWriteResult,
+) -> Result<WriteAcknowledgement, HttpResponse> {
+    let indexed_outcomes_are_complete = result.submitted == expected_rows
+        && result.outcomes.len() == expected_rows
+        && result
+            .outcomes
+            .iter()
+            .enumerate()
+            .all(|(index, outcome)| outcome.index == index);
+    let accepted_outcomes = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Accepted))
+        .count();
+    let rejected_outcomes = result
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Rejected(_)))
+        .count();
+    let counts_are_consistent = result.accepted == accepted_outcomes
+        && result.rejected == rejected_outcomes
+        && accepted_outcomes.saturating_add(rejected_outcomes) == expected_rows;
+    if !indexed_outcomes_are_complete || !counts_are_consistent {
+        return Err(invalid_canonical_write_result_response(action));
+    }
+
+    if result.rejected > 0 {
+        if result.accepted != 0 || result.acknowledgement.is_some() {
+            return Err(invalid_canonical_write_result_response(action));
+        }
+        return Err(canonical_write_rejection_response(action, result));
+    }
+
+    if result.accepted != expected_rows {
+        return Err(invalid_canonical_write_result_response(action));
+    }
+    let Some(acknowledgement) = result.acknowledgement else {
+        return Err(invalid_canonical_write_result_response(action));
+    };
+
+    Ok(acknowledgement)
+}
+
+fn canonical_write_rejection_response(action: &str, result: &BatchWriteResult) -> HttpResponse {
+    record_canonical_write_rejections(result);
+    let Some(rejection) = result
+        .outcomes
+        .iter()
+        .find_map(|outcome| match &outcome.status {
+            RowWriteStatus::Rejected(rejection) => Some(rejection),
+            RowWriteStatus::Accepted => None,
+            _ => None,
+        })
+    else {
+        return invalid_canonical_write_result_response(action);
+    };
+    let (status, error_code, retry_after) = write_rejection_http_mapping(rejection.category);
+    let message = format!("{action} rejected: {}", rejection.message);
+    let mut response = text_response(status, bounded_write_rejection_diagnostic(&message))
+        .with_header(WRITE_ERROR_CODE_HEADER, error_code);
+    if let Some(retry_after) = retry_after {
+        response = response.with_header("Retry-After", retry_after);
     }
     response
+}
+
+fn record_canonical_write_rejections(result: &BatchWriteResult) {
+    for outcome in &result.outcomes {
+        if let RowWriteStatus::Rejected(rejection) = &outcome.status {
+            record_write_rejection_category(rejection.category);
+        }
+    }
+}
+
+fn record_write_rejection_category(category: WriteRejectionCategory) {
+    WRITE_REJECTION_REASON_TOTALS[write_rejection_category_index(category)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn write_rejection_category_index(category: WriteRejectionCategory) -> usize {
+    match category {
+        WriteRejectionCategory::InvalidMetric => 0,
+        WriteRejectionCategory::InvalidLabels => 1,
+        WriteRejectionCategory::UnsupportedValue => 2,
+        WriteRejectionCategory::TimestampOutOfBounds => 3,
+        WriteRejectionCategory::BelowRetentionFloor => 4,
+        WriteRejectionCategory::FutureSkewExceeded => 5,
+        WriteRejectionCategory::CardinalityLimitExceeded => 6,
+        WriteRejectionCategory::CardinalityCreationRateExceeded => 7,
+        WriteRejectionCategory::MemoryPressure => 8,
+        WriteRejectionCategory::DiskQuotaExceeded => 9,
+        WriteRejectionCategory::WalQuotaExceeded => 10,
+        WriteRejectionCategory::PolicyRejected => 11,
+        WriteRejectionCategory::WriteTimeout => 12,
+        WriteRejectionCategory::StorageClosed => 13,
+        WriteRejectionCategory::StorageDegraded => 14,
+        WriteRejectionCategory::InternalIo => 15,
+        WriteRejectionCategory::Internal => 16,
+        _ => 16,
+    }
+}
+
+fn invalid_canonical_write_result_response(action: &str) -> HttpResponse {
+    WRITE_INDETERMINATE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    text_response(
+        500,
+        &format!("{action} failed: storage returned an invalid canonical write result"),
+    )
+    .with_header(WRITE_ERROR_CODE_HEADER, "write_invalid_outcome")
+    .with_header(WRITE_PARTIAL_HEADER, "possible")
+    .with_header(WRITE_OUTCOME_HEADER, "indeterminate_backend")
+}
+
+fn bounded_write_rejection_diagnostic(message: &str) -> &str {
+    if message.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES {
+        return message;
+    }
+    let mut boundary = MAX_WRITE_REJECTION_MESSAGE_BYTES;
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &message[..boundary]
+}
+
+fn write_rejection_http_mapping(
+    category: WriteRejectionCategory,
+) -> (u16, &'static str, Option<&'static str>) {
+    match category {
+        WriteRejectionCategory::InvalidMetric => (400, "write_invalid_metric", None),
+        WriteRejectionCategory::InvalidLabels => (400, "write_invalid_labels", None),
+        WriteRejectionCategory::UnsupportedValue => (422, "write_unsupported_value", None),
+        WriteRejectionCategory::TimestampOutOfBounds => {
+            (422, "write_timestamp_out_of_bounds", None)
+        }
+        WriteRejectionCategory::BelowRetentionFloor => (422, "write_out_of_retention", None),
+        WriteRejectionCategory::FutureSkewExceeded => (422, "write_future_skew_exceeded", None),
+        WriteRejectionCategory::CardinalityLimitExceeded => {
+            (413, "write_cardinality_limit_exceeded", None)
+        }
+        WriteRejectionCategory::CardinalityCreationRateExceeded => {
+            (429, "write_cardinality_creation_rate_exceeded", Some("1"))
+        }
+        WriteRejectionCategory::MemoryPressure => (413, "write_memory_pressure", None),
+        WriteRejectionCategory::DiskQuotaExceeded => (413, "write_disk_quota_exceeded", None),
+        WriteRejectionCategory::WalQuotaExceeded => (413, "write_wal_quota_exceeded", None),
+        WriteRejectionCategory::PolicyRejected => (422, "write_policy_rejected", None),
+        WriteRejectionCategory::WriteTimeout => (429, "write_timeout", Some("1")),
+        WriteRejectionCategory::StorageClosed => (503, "write_storage_closed", Some("1")),
+        WriteRejectionCategory::StorageDegraded => (503, "write_storage_degraded", Some("1")),
+        WriteRejectionCategory::InternalIo => (500, "write_internal_io", None),
+        WriteRejectionCategory::Internal => (500, "write_internal", None),
+        _ => (500, "write_internal", None),
+    }
 }
 
 fn read_admission_error_response(err: ReadAdmissionError) -> HttpResponse {
@@ -7527,6 +8272,7 @@ mod tests {
                 if let Err(err) = storage.insert_rows(&rows) {
                     return text_response(500, &format!("mock ingest_write rows failed: {err}"));
                 }
+                let metadata_update_count = payload.metadata_updates.len();
                 let accepted_metadata_updates = if payload.metadata_updates.is_empty() {
                     0usize
                 } else {
@@ -7551,7 +8297,7 @@ mod tests {
                         Err(err) => return text_response(400, &err),
                     };
                     match metadata_store.apply_updates(tenant_id, &metadata_updates) {
-                        Ok(applied) => applied,
+                        Ok(_) => metadata_update_count,
                         Err(err) => {
                             return text_response(
                                 500,
@@ -7602,7 +8348,18 @@ mod tests {
                 if let Err(err) = storage.insert_rows(&rows) {
                     return text_response(500, &format!("mock ingest failed: {err}"));
                 }
-                json_response(200, &InternalIngestRowsResponse { inserted_rows })
+                json_response(
+                    200,
+                    &InternalIngestRowsResponse {
+                        inserted_rows,
+                        write_result: Some(BatchWriteResult::from_outcomes(
+                            Some(WriteAcknowledgement::Volatile),
+                            (0..inserted_rows)
+                                .map(tsink::RowWriteOutcome::accepted)
+                                .collect(),
+                        )),
+                    },
+                )
             }
             "/internal/v1/select" => {
                 let payload: InternalSelectRequest = match serde_json::from_slice(&request.body) {
@@ -10744,6 +11501,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 200);
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
+        );
 
         let points = storage
             .select(
@@ -10758,6 +11519,184 @@ mod tests {
             .expect("point must be persisted");
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value.as_f64(), Some(11.5));
+    }
+
+    #[tokio::test]
+    async fn remote_write_discloses_rows_committed_before_metadata_failure() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(Some(temp_dir.path()));
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+        std::fs::create_dir(temp_dir.path().join("metric-metadata-store.tmp"))
+            .expect("temporary-path collision should build");
+        let write = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![PromLabel {
+                    name: "__name__".to_string(),
+                    value: "metadata_partial_metric".to_string(),
+                }],
+                samples: vec![PromSample {
+                    value: 1.0,
+                    timestamp: 1_700_000_000_000,
+                }],
+                ..Default::default()
+            }],
+            metadata: vec![MetricMetadata {
+                r#type: MetricType::Gauge as i32,
+                metric_family_name: "metadata_partial_metric".to_string(),
+                help: "must fail persistence".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let mut encoded = Vec::new();
+        write
+            .encode(&mut encoded)
+            .expect("protobuf encode should work");
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("partial")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Metadata-Applied"),
+            Some("0")
+        );
+        assert!(storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .any(|series| series.name == "metadata_partial_metric"));
+        assert!(metadata_store
+            .query(
+                tenant::DEFAULT_TENANT_ID,
+                Some("metadata_partial_metric"),
+                10,
+            )
+            .expect("metadata query should succeed")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_write_discloses_rows_committed_before_exemplar_failure() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(Some(temp_dir.path()));
+        let engine = make_engine(&storage);
+        std::fs::create_dir(temp_dir.path().join("exemplar-store.tmp"))
+            .expect("temporary-path collision should build");
+        let write = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![PromLabel {
+                    name: "__name__".to_string(),
+                    value: "exemplar_partial_metric".to_string(),
+                }],
+                samples: vec![PromSample {
+                    value: 2.0,
+                    timestamp: 1_700_000_000_000,
+                }],
+                exemplars: vec![Exemplar {
+                    labels: vec![PromLabel {
+                        name: "trace_id".to_string(),
+                        value: "not-published".to_string(),
+                    }],
+                    value: 2.0,
+                    timestamp: 1_700_000_000_000,
+                }],
+                ..Default::default()
+            }],
+            metadata: Vec::new(),
+        };
+        let mut encoded = Vec::new();
+        write
+            .encode(&mut encoded)
+            .expect("protobuf encode should work");
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Exemplars-Accepted"),
+            Some("0")
+        );
+        assert!(storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .any(|series| series.name == "exemplar_partial_metric"));
+        let exemplar_metrics = exemplar_store
+            .metrics_snapshot()
+            .expect("exemplar metrics should remain readable");
+        assert_eq!(exemplar_metrics.accepted_total, 0);
+        assert_eq!(exemplar_metrics.stored_exemplars, 0);
     }
 
     #[tokio::test]
@@ -10909,6 +11848,10 @@ mod tests {
             Some("4")
         );
         assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
+        );
+        assert_eq!(
             response_header(&response, "X-Tsink-Exemplars-Accepted"),
             Some("1")
         );
@@ -10990,6 +11933,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn otlp_metrics_atomic_retention_rejection_commits_no_points() {
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_retention(Duration::from_secs(60))
+            .build()
+            .expect("retention storage should build");
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the epoch")
+            .as_millis() as u64;
+        let old_ms = now_ms.saturating_sub(120_000);
+        let rejection_index =
+            write_rejection_category_index(WriteRejectionCategory::BelowRetentionFloor);
+        let rejections_before =
+            WRITE_REJECTION_REASON_TOTALS[rejection_index].load(Ordering::Relaxed);
+
+        let export = OtlpExportMetricsServiceRequest {
+            resource_metrics: vec![OtlpResourceMetrics {
+                resource: None,
+                scope_metrics: vec![OtlpScopeMetrics {
+                    scope: None,
+                    metrics: vec![OtlpMetric {
+                        name: "atomic.otlp.retention".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        data: Some(otlp_metric::Data::Gauge(OtlpGauge {
+                            data_points: vec![
+                                OtlpNumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 1,
+                                    time_unix_nano: now_ms.saturating_mul(1_000_000),
+                                    value: Some(otlp_number_data_point::Value::AsInt(1)),
+                                    exemplars: vec![],
+                                    flags: 0,
+                                },
+                                OtlpNumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 1,
+                                    time_unix_nano: old_ms.saturating_mul(1_000_000),
+                                    value: Some(otlp_number_data_point::Value::AsInt(2)),
+                                    exemplars: vec![],
+                                    flags: 0,
+                                },
+                            ],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut encoded = Vec::new();
+        export
+            .encode(&mut encoded)
+            .expect("protobuf encode should work");
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/metrics".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/x-protobuf".to_string(),
+                )]),
+                body: encoded,
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_out_of_retention")
+        );
+        assert_eq!(response_header(&response, WRITE_OUTCOME_HEADER), None);
+        assert_eq!(response_header(&response, WRITE_PARTIAL_HEADER), None);
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            None
+        );
+        assert!(storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .all(|series| series.name != "atomic_x2e_otlp_x2e_retention"));
+        assert!(
+            WRITE_REJECTION_REASON_TOTALS[rejection_index].load(Ordering::Relaxed)
+                >= rejections_before.saturating_add(2)
+        );
+    }
+
+    #[tokio::test]
     async fn influx_line_protocol_endpoint_ingests_numeric_fields() {
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
@@ -11019,6 +12063,10 @@ mod tests {
         assert_eq!(
             response_header(&response, "X-Tsink-Influx-Samples-Accepted"),
             Some("2")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
         );
 
         let base_labels = vec![
@@ -11055,6 +12103,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn influx_line_protocol_atomic_retention_rejection_commits_no_points() {
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_retention(Duration::from_secs(60))
+            .build()
+            .expect("retention storage should build");
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the epoch")
+            .as_millis() as u64;
+        let old_ms = now_ms.saturating_sub(120_000);
+        let rejection_index =
+            write_rejection_category_index(WriteRejectionCategory::BelowRetentionFloor);
+        let rejections_before =
+            WRITE_REJECTION_REASON_TOTALS[rejection_index].load(Ordering::Relaxed);
+        let body = format!(
+            "atomic_retention value=1i {}\natomic_retention value=2i {}",
+            now_ms.saturating_mul(1_000_000),
+            old_ms.saturating_mul(1_000_000),
+        );
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/write?precision=ns".to_string(),
+                headers: HashMap::new(),
+                body: body.into_bytes(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_out_of_retention")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            None
+        );
+        assert!(storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .all(|series| series.name != "atomic_retention"));
+        assert!(
+            WRITE_REJECTION_REASON_TOTALS[rejection_index].load(Ordering::Relaxed)
+                >= rejections_before.saturating_add(2)
+        );
+    }
+
+    #[tokio::test]
     async fn influx_line_protocol_endpoint_rejects_boolean_fields() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -11076,6 +12185,84 @@ mod tests {
         assert!(std::str::from_utf8(&response.body)
             .expect("response body should be utf8")
             .contains("boolean fields are not supported"));
+    }
+
+    #[tokio::test]
+    async fn influx_line_protocol_parse_errors_are_bounded_and_redacted() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let secret = "private-field-value".repeat(128);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/write".to_string(),
+                headers: HashMap::new(),
+                body: format!("weather value={secret}").into_bytes(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("influx_invalid_line_protocol")
+        );
+        let body = String::from_utf8(response.body).expect("response body should be utf8");
+        assert!(body.contains("field index 0 has an invalid numeric value"));
+        assert!(!body.contains("private-field-value"));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn influx_line_protocol_accounts_for_rows_committed_before_metadata_failure() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(Some(temp_dir.path()));
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+        std::fs::create_dir(temp_dir.path().join("metric-metadata-store.tmp"))
+            .expect("temporary-path collision should build");
+        let before = legacy_ingest::status_snapshot().influx;
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/write?precision=ns".to_string(),
+                headers: HashMap::new(),
+                body: b"partial_metric value=1i,temperature=2i 1700000000000000000".to_vec(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("partial")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("2")
+        );
+        let after = legacy_ingest::status_snapshot().influx;
+        assert!(
+            after.counters.accepted_samples_total
+                >= before.counters.accepted_samples_total.saturating_add(2)
+        );
+        assert!(
+            after.write_observability.outcomes_total[2]
+                >= before.write_observability.outcomes_total[2].saturating_add(1)
+        );
     }
 
     #[tokio::test]
@@ -11220,10 +12407,16 @@ mod tests {
                     name: "__name__".to_string(),
                     value: "cpu_usage".to_string(),
                 }],
-                samples: vec![PromSample {
-                    value: 11.5,
-                    timestamp: old_ts,
-                }],
+                samples: vec![
+                    PromSample {
+                        value: 11.5,
+                        timestamp: now,
+                    },
+                    PromSample {
+                        value: 12.5,
+                        timestamp: old_ts,
+                    },
+                ],
                 ..Default::default()
             }],
             metadata: Vec::new(),
@@ -11262,6 +12455,11 @@ mod tests {
         );
         let body = String::from_utf8(response.body).expect("response body should decode");
         assert!(body.contains("outside the retention window"));
+        assert!(!storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .any(|series| series.name == "cpu_usage"));
     }
 
     #[tokio::test]
@@ -12137,8 +13335,14 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 400);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("remote_write_invalid_payload")
+        );
         let body = String::from_utf8(response.body).expect("response body should be utf8");
-        assert!(body.contains("duplicate label 'host'"));
+        assert!(body.contains("duplicate label at index 2"));
+        assert!(!body.contains("host"));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
         assert!(storage
             .list_metrics()
             .expect("list_metrics should succeed")
@@ -12673,6 +13877,36 @@ mod tests {
             max_possible_acks: 2,
         });
         assert_eq!(insufficient.status, 503);
+    }
+
+    #[test]
+    fn write_routing_error_response_preserves_structured_local_rejection() {
+        let reason_index =
+            write_rejection_category_index(WriteRejectionCategory::FutureSkewExceeded);
+        let before = WRITE_REJECTION_REASON_TOTALS[reason_index].load(Ordering::Relaxed);
+        let response = write_routing_error_response(WriteRoutingError::LocalWriteRejected {
+            rejection: tsink::WriteRejection::new(
+                WriteRejectionCategory::FutureSkewExceeded,
+                None,
+                "future cutoff exceeded",
+            ),
+            rejected_rows: 1,
+            shard: 7,
+            mode: crate::cluster::config::ClusterWriteConsistency::Quorum,
+            required_acks: 2,
+            acknowledged_acks: 0,
+            max_possible_acks: 1,
+        });
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_future_skew_exceeded")
+        );
+        assert!(
+            WRITE_REJECTION_REASON_TOTALS[reason_index].load(Ordering::Relaxed)
+                >= before.saturating_add(1)
+        );
     }
 
     #[test]
@@ -14159,6 +15393,232 @@ mod tests {
     }
 
     #[test]
+    fn storage_write_error_response_redacts_unclassified_backend_details() {
+        let secret = "private-storage-detail".repeat(1_024);
+        let response = storage_write_error_response("insert", &TsinkError::Other(secret.clone()));
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_internal")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        let body = String::from_utf8(response.body).expect("response body should decode");
+        assert_eq!(body, "insert failed: storage backend error");
+        assert!(!body.contains(&secret));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn adapter_observation_preserves_proven_rows_for_indeterminate_backend_failure() {
+        let response = text_response(500, "backend outcome unknown")
+            .with_header(WRITE_ERROR_CODE_HEADER, "write_internal")
+            .with_header(WRITE_ROWS_ACCEPTED_HEADER, "2")
+            .with_header(WRITE_PARTIAL_HEADER, "possible")
+            .with_header(WRITE_OUTCOME_HEADER, "indeterminate_backend");
+        let err = AdapterWriteError::from_response(response);
+        let observation = legacy_adapter_write_error_observation(&err, 3);
+
+        assert!(err.indeterminate);
+        assert_eq!(observation.outcome, AdapterWriteOutcome::Indeterminate);
+        assert_eq!(observation.accepted_samples, 2);
+        assert_eq!(observation.rejected_samples, 0);
+    }
+
+    #[test]
+    fn canonical_atomic_result_validation_rejects_malformed_backend_counts() {
+        let rejection = tsink::WriteRejection::new(
+            WriteRejectionCategory::InvalidMetric,
+            Some(0),
+            "invalid metric",
+        );
+        let mut result = BatchWriteResult::from_outcomes(
+            None,
+            vec![tsink::RowWriteOutcome::rejected(0, rejection)],
+        );
+        result.accepted = 1;
+
+        let response = validate_atomic_write_result("insert", 1, &result)
+            .expect_err("inconsistent counts must not be trusted as a rejection");
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_invalid_outcome")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+    }
+
+    #[test]
+    fn canonical_atomic_rejections_increment_structured_reason_counter() {
+        let reason_index = write_rejection_category_index(WriteRejectionCategory::InvalidLabels);
+        let before = WRITE_REJECTION_REASON_TOTALS[reason_index].load(Ordering::Relaxed);
+        let rejection = tsink::WriteRejection::new(
+            WriteRejectionCategory::InvalidLabels,
+            Some(1),
+            "reserved label",
+        );
+        let result = BatchWriteResult::from_outcomes(
+            None,
+            vec![
+                tsink::RowWriteOutcome::rejected(0, rejection.clone()),
+                tsink::RowWriteOutcome::rejected(1, rejection),
+            ],
+        );
+
+        let response = validate_atomic_write_result("insert", 2, &result)
+            .expect_err("canonical rejection should map to an HTTP error");
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_invalid_labels")
+        );
+        assert!(
+            WRITE_REJECTION_REASON_TOTALS[reason_index].load(Ordering::Relaxed)
+                >= before.saturating_add(2)
+        );
+    }
+
+    #[test]
+    fn partial_write_errors_disclose_committed_components_and_weakest_ack() {
+        let response = partial_write_error_response(
+            text_response(500, "sidecar failure"),
+            3,
+            Some(WriteAcknowledgement::Appended),
+            2,
+            2,
+            1,
+        );
+
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("partial")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("3")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("appended")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Metadata-Accepted"),
+            Some("2")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Metadata-Applied"),
+            Some("2")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Exemplars-Accepted"),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn edge_sync_enqueue_failure_discloses_local_commit_and_queue_progress() {
+        let response = edge_sync_enqueue_error_response(
+            "insert",
+            &edge_sync::EdgeSyncEnqueueError {
+                submitted_rows: 5,
+                queued_rows: 3,
+                message: "sensitive internal queue path".to_string(),
+            },
+            5,
+            WriteAcknowledgement::Durable,
+        );
+
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("edge_sync_enqueue_failed")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("5")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("durable")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Edge-Sync-Rows-Submitted"),
+            Some("5")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Edge-Sync-Rows-Queued"),
+            Some("3")
+        );
+        assert!(!String::from_utf8_lossy(&response.body).contains("sensitive internal queue path"));
+    }
+
+    #[test]
+    fn internal_ingest_write_count_validation_rejects_cross_component_mismatch() {
+        let valid = InternalIngestWriteResponse {
+            inserted_rows: 0,
+            accepted_metadata_updates: 2,
+            accepted_exemplars: 0,
+            dropped_exemplars: 0,
+        };
+        assert!(validate_internal_ingest_write_response(&valid, 0, 2, 0).is_ok());
+
+        let malformed = InternalIngestWriteResponse {
+            inserted_rows: 1,
+            accepted_metadata_updates: 2,
+            accepted_exemplars: 0,
+            dropped_exemplars: 0,
+        };
+        assert!(validate_internal_ingest_write_response(&malformed, 0, 2, 0).is_err());
+
+        let rejected_metadata = InternalIngestWriteResponse {
+            inserted_rows: 0,
+            accepted_metadata_updates: 1,
+            accepted_exemplars: 0,
+            dropped_exemplars: 0,
+        };
+        assert!(validate_internal_ingest_write_response(&rejected_metadata, 0, 2, 0).is_err());
+    }
+
+    #[test]
+    fn combined_cluster_consistency_reports_the_weakest_component() {
+        let combined = weakest_write_consistency(
+            Some(WriteConsistencyOutcome {
+                mode: ClusterWriteConsistency::All,
+                required_acks: 3,
+                acknowledged_replicas_min: 3,
+            }),
+            Some(WriteConsistencyOutcome {
+                mode: ClusterWriteConsistency::Quorum,
+                required_acks: 2,
+                acknowledged_replicas_min: 2,
+            }),
+        )
+        .expect("two component outcomes should combine");
+
+        assert_eq!(combined.mode, ClusterWriteConsistency::Quorum);
+        assert_eq!(combined.required_acks, 2);
+        assert_eq!(combined.acknowledged_replicas_min, 2);
+    }
+
+    #[test]
     fn read_admission_error_response_maps_retryable_resource_limit_to_429_with_retry_after() {
         let response = read_admission_error_response(ReadAdmissionError::ResourceLimitExceeded {
             resource: "global_inflight_read_requests",
@@ -14215,6 +15675,10 @@ mod tests {
         let body = std::str::from_utf8(&response.body).expect("valid utf8");
         assert!(body.contains("tsink_memory_used_bytes"));
         assert!(body.contains("tsink_memory_excluded_bytes"));
+        assert!(body.contains("tsink_memory_excluded_bytes_known"));
+        assert!(body.contains("tsink_memory_pressure_level"));
+        assert!(body.contains("tsink_memory_backpressure_events_total"));
+        assert!(body.contains("tsink_memory_rejections_total"));
         assert!(body.contains("tsink_memory_persisted_mmap_bytes"));
         assert!(body.contains("tsink_memory_registry_bytes"));
         assert!(body.contains("tsink_series_total"));
@@ -14254,6 +15718,7 @@ mod tests {
         assert!(body.contains("tsink_read_admission_active_queries"));
         assert!(body.contains("tsink_write_admission_rejections_total"));
         assert!(body.contains("tsink_write_admission_active_rows"));
+        assert!(body.contains("tsink_write_rejections_total{reason=\"invalid_metric\"}"));
         assert!(body.contains("tsink_tenant_admission_write_rejections_total"));
         assert!(body.contains("tsink_tenant_admission_active_reads"));
         assert!(body.contains("tsink_prometheus_payload_feature_enabled"));
@@ -16524,7 +17989,22 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert!(body["data"]["seriesCount"].is_number());
         assert!(body["data"]["memoryUsedBytes"].is_number());
+        assert_eq!(
+            body["data"]["effectiveStorageLimits"]["reportedByBackend"],
+            true
+        );
+        assert_eq!(body["data"]["effectiveStorageLimits"]["persistent"], false);
+        assert_eq!(body["data"]["effectiveStorageLimits"]["walEnabled"], false);
+        assert!(body["data"]["effectiveStorageLimits"]["accountedMemoryBytes"].is_null());
+        assert!(body["data"]["effectiveStorageLimits"]["maxConcurrentWriters"].is_number());
+        assert!(body["data"]["effectiveStorageLimits"]["writeTimeoutNanos"].is_number());
+        assert!(body["data"]["memory"]["accountedBytes"].is_number());
+        assert!(body["data"]["memory"]["estimatedAccountedBytes"].is_number());
         assert!(body["data"]["memory"]["budgetedBytes"].is_number());
+        assert_eq!(body["data"]["memory"]["excludedBytesKnown"], false);
+        assert!(body["data"]["memory"]["excludedCategories"].is_array());
+        assert_eq!(body["data"]["memory"]["pressure"]["level"], "normal");
+        assert!(body["data"]["memory"]["pressure"]["backpressureEventsTotal"].is_number());
         assert!(body["data"]["memory"]["registryBytes"].is_number());
         assert!(body["data"]["memory"]["persistedIndexBytes"].is_number());
         assert!(body["data"]["memory"]["persistedMmapBytes"].is_number());
@@ -16709,6 +18189,113 @@ mod tests {
         assert!(body["data"]["cluster"]["hotspot"]["generatedUnixMs"].is_number());
         assert!(body["data"]["cluster"]["hotspot"]["hotShards"].is_array());
         assert!(body["data"]["cluster"]["hotspot"]["tenantPressure"].is_array());
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_reports_configured_effective_storage_limits() {
+        let storage = StorageBuilder::new()
+            .with_wal_enabled(false)
+            .with_memory_limit(8 * 1024 * 1024)
+            .with_cardinality_limit(321)
+            .with_max_writers(2)
+            .with_write_timeout(Duration::from_nanos(29))
+            .with_max_active_partition_heads_per_series(3)
+            .build()
+            .unwrap();
+        let engine = make_engine(&storage);
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/status/tsdb".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            request,
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        let limits = &body["data"]["effectiveStorageLimits"];
+        assert_eq!(limits["reportedByBackend"], true);
+        assert_eq!(limits["accountedMemoryBytes"], 8 * 1024 * 1024);
+        assert_eq!(limits["cardinality"], 321);
+        assert!(limits["walBytes"].is_null());
+        assert!(limits["localDiskBytes"].is_null());
+        assert!(body["data"]["localDisk"].is_null());
+        assert_eq!(limits["maxConcurrentWriters"], 2);
+        assert_eq!(limits["writeTimeoutNanos"], 29);
+        assert_eq!(limits["maxActivePartitionHeadsPerSeries"], 3);
+        assert_eq!(
+            body["data"]["memory"]["pressure"]["approachingLimitBasisPoints"],
+            9_000
+        );
+
+        storage.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_and_metrics_report_core_local_disk_scope_when_persistent() {
+        let dir = TempDir::new().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(dir.path())
+            .with_wal_enabled(false)
+            .with_local_disk_limit(8 * 1024 * 1024)
+            .with_filesystem_free_headroom(2048)
+            .with_maintenance_temp_reserve(4096)
+            .build()
+            .unwrap();
+        let engine = make_engine(&storage);
+
+        let status = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(status.status, 200);
+        let status_body: JsonValue = serde_json::from_slice(&status.body).unwrap();
+        let limits = &status_body["data"]["effectiveStorageLimits"];
+        assert_eq!(limits["localDiskBytes"], 8 * 1024 * 1024);
+        assert_eq!(limits["filesystemFreeHeadroomBytes"], 2048);
+        assert_eq!(limits["maintenanceTempReserveBytes"], 4096);
+        let disk = &status_body["data"]["localDisk"];
+        assert_eq!(disk["limits"]["maxBytes"], 8 * 1024 * 1024);
+        assert_eq!(disk["activeReservations"], 0);
+        assert!(disk["categories"].is_array());
+
+        let metrics = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(metrics.status, 200);
+        let metrics_body = std::str::from_utf8(&metrics.body).unwrap();
+        assert!(metrics_body.contains("tsink_local_disk_accounted_bytes"));
+        assert!(metrics_body.contains("tsink_local_disk_limit_bytes 8388608"));
+        assert!(metrics_body.contains("tsink_local_disk_reconciliations_total"));
+
+        storage.close().unwrap();
     }
 
     #[tokio::test]
@@ -17657,6 +19244,10 @@ test_metric{job="test2"} 99 1700000000000
         )
         .await;
         assert_eq!(response.status, 200);
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("volatile")
+        );
 
         let points = storage
             .select(
@@ -17714,7 +19305,10 @@ test_metric{job="test2"} 99 1700000000000
             method: "POST".to_string(),
             path: "/api/v1/import/prometheus".to_string(),
             headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-            body: format!("test_metric{{job=\"test\"}} 42 {old_ts}\n").into_bytes(),
+            body: format!(
+                "test_metric{{job=\"test\"}} 41 {now}\ntest_metric{{job=\"test\"}} 42 {old_ts}\n"
+            )
+            .into_bytes(),
         };
 
         let response = handle_request_with_metadata_and_exemplar_store(
@@ -17735,6 +19329,11 @@ test_metric{job="test2"} 99 1700000000000
         );
         let body = String::from_utf8(response.body).expect("response body should decode");
         assert!(body.contains("outside the retention window"));
+        assert!(!storage
+            .list_metrics()
+            .expect("series listing should succeed")
+            .iter()
+            .any(|series| series.name == "test_metric"));
     }
 
     #[test]

@@ -4,8 +4,9 @@ use crate::prom_write::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use tsink::{DataPoint, TimestampPrecision};
+use std::sync::{Arc, Mutex};
+use tsink::label::{MAX_LABEL_NAME_LEN, MAX_METRIC_NAME_LEN};
+use tsink::{DataPoint, TimestampPrecision, WriteAcknowledgement};
 
 pub const INFLUX_LINE_PROTOCOL_ENABLED_ENV: &str = "TSINK_INFLUX_LINE_PROTOCOL_ENABLED";
 pub const INFLUX_LINE_PROTOCOL_MAX_LINES_PER_REQUEST_ENV: &str =
@@ -38,6 +39,63 @@ static GRAPHITE_REJECTED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_THROTTLED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_ACCEPTED_SAMPLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_REJECTED_SAMPLES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub const LEGACY_WRITE_ERROR_REASON_NAMES: [&str; 22] = [
+    "none",
+    "write_overloaded",
+    "write_resource_limit_exceeded",
+    "write_invalid_metric",
+    "write_invalid_labels",
+    "write_unsupported_value",
+    "write_timestamp_out_of_bounds",
+    "write_out_of_retention",
+    "write_future_skew_exceeded",
+    "write_cardinality_limit_exceeded",
+    "write_cardinality_creation_rate_exceeded",
+    "write_memory_pressure",
+    "write_disk_quota_exceeded",
+    "write_wal_quota_exceeded",
+    "write_policy_rejected",
+    "write_timeout",
+    "write_storage_closed",
+    "write_storage_degraded",
+    "write_internal_io",
+    "write_internal",
+    "write_invalid_outcome",
+    "other",
+];
+
+const LEGACY_WRITE_ACKNOWLEDGEMENT_COUNT: usize = 4;
+const LEGACY_WRITE_OUTCOME_COUNT: usize = 4;
+
+struct AdapterWriteObservabilityCounters {
+    acknowledgements: [AtomicU64; LEGACY_WRITE_ACKNOWLEDGEMENT_COUNT],
+    outcomes: [AtomicU64; LEGACY_WRITE_OUTCOME_COUNT],
+    error_reasons: [AtomicU64; LEGACY_WRITE_ERROR_REASON_NAMES.len()],
+    accepted_metadata_updates: AtomicU64,
+    applied_metadata_updates: AtomicU64,
+    accepted_exemplars: AtomicU64,
+}
+
+impl AdapterWriteObservabilityCounters {
+    const fn new() -> Self {
+        Self {
+            acknowledgements: [const { AtomicU64::new(0) }; LEGACY_WRITE_ACKNOWLEDGEMENT_COUNT],
+            outcomes: [const { AtomicU64::new(0) }; LEGACY_WRITE_OUTCOME_COUNT],
+            error_reasons: [const { AtomicU64::new(0) }; LEGACY_WRITE_ERROR_REASON_NAMES.len()],
+            accepted_metadata_updates: AtomicU64::new(0),
+            applied_metadata_updates: AtomicU64::new(0),
+            accepted_exemplars: AtomicU64::new(0),
+        }
+    }
+}
+
+static INFLUX_WRITE_OBSERVABILITY: AdapterWriteObservabilityCounters =
+    AdapterWriteObservabilityCounters::new();
+static STATSD_WRITE_OBSERVABILITY: AdapterWriteObservabilityCounters =
+    AdapterWriteObservabilityCounters::new();
+static GRAPHITE_WRITE_OBSERVABILITY: AdapterWriteObservabilityCounters =
+    AdapterWriteObservabilityCounters::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyAdapterKind {
@@ -73,10 +131,42 @@ pub struct AdapterCounterSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterWriteObservabilitySnapshot {
+    pub acknowledgements_total: [u64; LEGACY_WRITE_ACKNOWLEDGEMENT_COUNT],
+    pub outcomes_total: [u64; LEGACY_WRITE_OUTCOME_COUNT],
+    pub error_reasons_total: [u64; LEGACY_WRITE_ERROR_REASON_NAMES.len()],
+    pub accepted_metadata_updates_total: u64,
+    pub applied_metadata_updates_total: u64,
+    pub accepted_exemplars_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterWriteOutcome {
+    Complete,
+    Rejected,
+    Partial,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AdapterWriteObservation<'a> {
+    pub outcome: AdapterWriteOutcome,
+    pub acknowledgement: Option<WriteAcknowledgement>,
+    pub accepted_samples: usize,
+    pub rejected_samples: usize,
+    pub accepted_metadata_updates: usize,
+    pub applied_metadata_updates: usize,
+    pub accepted_exemplars: usize,
+    pub error_code: Option<&'a str>,
+    pub throttled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfluxLineProtocolStatusSnapshot {
     pub enabled: bool,
     pub max_lines_per_request: usize,
     pub counters: AdapterCounterSnapshot,
+    pub write_observability: AdapterWriteObservabilitySnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +175,7 @@ pub struct StatsdStatusSnapshot {
     pub max_packet_bytes: usize,
     pub max_events_per_packet: usize,
     pub counters: AdapterCounterSnapshot,
+    pub write_observability: AdapterWriteObservabilitySnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +183,7 @@ pub struct GraphiteStatusSnapshot {
     pub enabled: bool,
     pub max_line_bytes: usize,
     pub counters: AdapterCounterSnapshot,
+    pub write_observability: AdapterWriteObservabilitySnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,16 +202,109 @@ pub struct NormalizedLegacyWrite {
 
 #[derive(Debug)]
 pub struct StatsdAdapter {
-    gauge_state: Mutex<BTreeMap<String, f64>>,
+    gauge_state: Arc<Mutex<StatsdGaugeState>>,
+}
+
+#[derive(Debug, Default)]
+struct StatsdGaugeState {
+    values: BTreeMap<String, f64>,
+    transaction_active: bool,
+}
+
+/// A normalized StatsD packet whose relative-gauge updates have not been published yet.
+#[derive(Debug)]
+pub struct PreparedStatsdWrite {
+    write: NormalizedLegacyWrite,
+    gauge_commit: StatsdGaugeStateCommit,
+}
+
+impl PreparedStatsdWrite {
+    pub fn into_parts(self) -> (NormalizedLegacyWrite, StatsdGaugeStateCommit) {
+        (self.write, self.gauge_commit)
+    }
+}
+
+/// Staged StatsD relative-gauge state that can be published after storage accepts the packet.
+#[derive(Debug)]
+pub struct StatsdGaugeStateCommit {
+    state: Arc<Mutex<StatsdGaugeState>>,
+    staged_values: BTreeMap<String, f64>,
+    active: bool,
+}
+
+impl StatsdGaugeStateCommit {
+    fn begin(state: &Arc<Mutex<StatsdGaugeState>>) -> Result<Self, String> {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.transaction_active {
+            return Err("statsd gauge state transaction already active".to_string());
+        }
+        guard.transaction_active = true;
+        drop(guard);
+        Ok(Self {
+            state: Arc::clone(state),
+            staged_values: BTreeMap::new(),
+            active: true,
+        })
+    }
+
+    fn value(&self, key: &str) -> Option<f64> {
+        self.staged_values.get(key).copied().or_else(|| {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values
+                .get(key)
+                .copied()
+        })
+    }
+
+    fn stage(&mut self, key: String, value: f64) {
+        self.staged_values.insert(key, value);
+    }
+
+    pub fn commit(mut self) -> Result<(), String> {
+        if !self.active {
+            return Err("statsd gauge state transaction already completed".to_string());
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.transaction_active {
+            return Err("statsd gauge state transaction is no longer active".to_string());
+        }
+        guard.values.append(&mut self.staged_values);
+        guard.transaction_active = false;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StatsdGaugeStateCommit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.transaction_active = false;
+    }
 }
 
 impl StatsdAdapter {
     pub fn new() -> Self {
         Self {
-            gauge_state: Mutex::new(BTreeMap::new()),
+            gauge_state: Arc::new(Mutex::new(StatsdGaugeState::default())),
         }
     }
 
+    // The migration binary includes this module directly and commits immediately after complete
+    // capture-packet normalization. The live listener uses `prepare_packet` instead.
+    #[allow(dead_code)]
     pub fn normalize_packet(
         &self,
         packet: &str,
@@ -127,6 +312,19 @@ impl StatsdAdapter {
         received_at: i64,
         config: StatsdConfig,
     ) -> Result<NormalizedLegacyWrite, String> {
+        let prepared = self.prepare_packet(packet, tenant_id, received_at, config)?;
+        let (write, gauge_commit) = prepared.into_parts();
+        gauge_commit.commit()?;
+        Ok(write)
+    }
+
+    pub fn prepare_packet(
+        &self,
+        packet: &str,
+        tenant_id: &str,
+        received_at: i64,
+        config: StatsdConfig,
+    ) -> Result<PreparedStatsdWrite, String> {
         if packet.len() > config.max_packet_bytes {
             return Err(format!(
                 "statsd packet exceeds byte limit: {} > {}",
@@ -135,6 +333,7 @@ impl StatsdAdapter {
             ));
         }
 
+        let mut gauge_commit = StatsdGaugeStateCommit::begin(&self.gauge_state)?;
         let mut envelope = NormalizedWriteEnvelope::default();
         let mut metadata_updates = BTreeMap::new();
         let mut request_units = 0usize;
@@ -175,7 +374,7 @@ impl StatsdAdapter {
                         metric.as_str(),
                         &labels,
                         &event.value,
-                        &self.gauge_state,
+                        &mut gauge_commit,
                         &context,
                     )?;
                     (value, MetricType::Gauge, "StatsD gauge sample")
@@ -226,7 +425,7 @@ impl StatsdAdapter {
                     labels.push(("statsd_set_member".to_string(), event.value));
                     (1.0, MetricType::Stateset, "StatsD set membership event")
                 }
-                other => return Err(format!("{context} uses unsupported StatsD type '{other}'")),
+                _ => return Err(format!("{context} uses an unsupported StatsD type")),
             };
 
             let series = build_series_identity(metric.clone(), labels, tenant_id, &context)?;
@@ -245,10 +444,13 @@ impl StatsdAdapter {
 
         envelope.metadata_updates = metadata_updates.into_values().collect();
         let sample_count = envelope.scalar_samples.len();
-        Ok(NormalizedLegacyWrite {
-            envelope,
-            request_units,
-            sample_count,
+        Ok(PreparedStatsdWrite {
+            write: NormalizedLegacyWrite {
+                envelope,
+                request_units,
+                sample_count,
+            },
+            gauge_commit,
         })
     }
 }
@@ -349,9 +551,10 @@ pub fn normalize_graphite_plaintext_line(
 
     let parts = line.split_whitespace().collect::<Vec<_>>();
     if !(parts.len() == 2 || parts.len() == 3) {
-        return Err(format!(
-            "graphite plaintext line must contain metric, value, and optional timestamp: '{line}'"
-        ));
+        return Err(
+            "graphite plaintext line must contain metric, value, and optional timestamp"
+                .to_string(),
+        );
     }
 
     let context = "graphite plaintext line";
@@ -459,23 +662,81 @@ pub fn record_request_throttled(kind: LegacyAdapterKind, rejected_samples: usize
     samples.fetch_add(rejected_samples, Ordering::Relaxed);
 }
 
+pub fn record_adapter_write(kind: LegacyAdapterKind, observation: AdapterWriteObservation<'_>) {
+    match observation.outcome {
+        AdapterWriteOutcome::Complete => {
+            record_request_accepted(kind, observation.accepted_samples);
+        }
+        AdapterWriteOutcome::Rejected
+        | AdapterWriteOutcome::Partial
+        | AdapterWriteOutcome::Indeterminate => {
+            let request_outcome = if observation.throttled {
+                Outcome::Throttled
+            } else {
+                Outcome::Rejected
+            };
+            let (requests, rejected_sample_counter) = counter_pair(kind, request_outcome);
+            requests.fetch_add(1, Ordering::Relaxed);
+            rejected_sample_counter.fetch_add(
+                usize_to_u64_saturating(observation.rejected_samples),
+                Ordering::Relaxed,
+            );
+
+            // A request can fail after the canonical row batch commits (for example, in a
+            // metadata sidecar). Count those rows as accepted without claiming request success.
+            let (_, accepted_sample_counter) = counter_pair(kind, Outcome::Accepted);
+            accepted_sample_counter.fetch_add(
+                usize_to_u64_saturating(observation.accepted_samples),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    let counters = write_observability_counters(kind);
+    counters.acknowledgements[acknowledgement_index(observation.acknowledgement)]
+        .fetch_add(1, Ordering::Relaxed);
+    counters.outcomes[adapter_write_outcome_index(observation.outcome)]
+        .fetch_add(1, Ordering::Relaxed);
+    if observation.outcome != AdapterWriteOutcome::Complete {
+        counters.error_reasons[write_error_reason_index(observation.error_code)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    counters.accepted_metadata_updates.fetch_add(
+        usize_to_u64_saturating(observation.accepted_metadata_updates),
+        Ordering::Relaxed,
+    );
+    counters.applied_metadata_updates.fetch_add(
+        usize_to_u64_saturating(observation.applied_metadata_updates),
+        Ordering::Relaxed,
+    );
+    counters.accepted_exemplars.fetch_add(
+        usize_to_u64_saturating(observation.accepted_exemplars),
+        Ordering::Relaxed,
+    );
+}
+
 pub fn status_snapshot() -> LegacyIngestStatusSnapshot {
     LegacyIngestStatusSnapshot {
         influx: InfluxLineProtocolStatusSnapshot {
             enabled: influx_line_protocol_config().enabled,
             max_lines_per_request: influx_line_protocol_config().max_lines_per_request,
             counters: snapshot_counters(LegacyAdapterKind::InfluxLineProtocol),
+            write_observability: snapshot_write_observability(
+                LegacyAdapterKind::InfluxLineProtocol,
+            ),
         },
         statsd: StatsdStatusSnapshot {
             enabled: STATSD_LISTENER_ENABLED.load(Ordering::Relaxed) > 0,
             max_packet_bytes: statsd_config().max_packet_bytes,
             max_events_per_packet: statsd_config().max_events_per_packet,
             counters: snapshot_counters(LegacyAdapterKind::Statsd),
+            write_observability: snapshot_write_observability(LegacyAdapterKind::Statsd),
         },
         graphite: GraphiteStatusSnapshot {
             enabled: GRAPHITE_LISTENER_ENABLED.load(Ordering::Relaxed) > 0,
             max_line_bytes: graphite_config().max_line_bytes,
             counters: snapshot_counters(LegacyAdapterKind::Graphite),
+            write_observability: snapshot_write_observability(LegacyAdapterKind::Graphite),
         },
     }
 }
@@ -550,6 +811,83 @@ fn counter_pair(
     }
 }
 
+fn write_observability_counters(
+    kind: LegacyAdapterKind,
+) -> &'static AdapterWriteObservabilityCounters {
+    match kind {
+        LegacyAdapterKind::InfluxLineProtocol => &INFLUX_WRITE_OBSERVABILITY,
+        LegacyAdapterKind::Statsd => &STATSD_WRITE_OBSERVABILITY,
+        LegacyAdapterKind::Graphite => &GRAPHITE_WRITE_OBSERVABILITY,
+    }
+}
+
+fn acknowledgement_index(acknowledgement: Option<WriteAcknowledgement>) -> usize {
+    match acknowledgement {
+        None => 0,
+        Some(WriteAcknowledgement::Volatile) => 1,
+        Some(WriteAcknowledgement::Appended) => 2,
+        Some(WriteAcknowledgement::Durable) => 3,
+    }
+}
+
+fn adapter_write_outcome_index(outcome: AdapterWriteOutcome) -> usize {
+    match outcome {
+        AdapterWriteOutcome::Complete => 0,
+        AdapterWriteOutcome::Rejected => 1,
+        AdapterWriteOutcome::Partial => 2,
+        AdapterWriteOutcome::Indeterminate => 3,
+    }
+}
+
+fn write_error_reason_index(error_code: Option<&str>) -> usize {
+    match error_code {
+        None => 0,
+        Some("write_overloaded") => 1,
+        Some("write_resource_limit_exceeded") => 2,
+        Some("write_invalid_metric") => 3,
+        Some("write_invalid_labels") => 4,
+        Some("write_unsupported_value") => 5,
+        Some("write_timestamp_out_of_bounds") => 6,
+        Some("write_out_of_retention") => 7,
+        Some("write_future_skew_exceeded") => 8,
+        Some("write_cardinality_limit_exceeded") => 9,
+        Some("write_cardinality_creation_rate_exceeded") => 10,
+        Some("write_memory_pressure") => 11,
+        Some("write_disk_quota_exceeded") => 12,
+        Some("write_wal_quota_exceeded") => 13,
+        Some("write_policy_rejected") => 14,
+        Some("write_timeout") => 15,
+        Some("write_storage_closed") => 16,
+        Some("write_storage_degraded") => 17,
+        Some("write_internal_io") => 18,
+        Some("write_internal") => 19,
+        Some("write_invalid_outcome") => 20,
+        Some(_) => 21,
+    }
+}
+
+fn snapshot_write_observability(kind: LegacyAdapterKind) -> AdapterWriteObservabilitySnapshot {
+    let counters = write_observability_counters(kind);
+    AdapterWriteObservabilitySnapshot {
+        acknowledgements_total: std::array::from_fn(|index| {
+            counters.acknowledgements[index].load(Ordering::Relaxed)
+        }),
+        outcomes_total: std::array::from_fn(|index| {
+            counters.outcomes[index].load(Ordering::Relaxed)
+        }),
+        error_reasons_total: std::array::from_fn(|index| {
+            counters.error_reasons[index].load(Ordering::Relaxed)
+        }),
+        accepted_metadata_updates_total: counters.accepted_metadata_updates.load(Ordering::Relaxed),
+        applied_metadata_updates_total: counters.applied_metadata_updates.load(Ordering::Relaxed),
+        accepted_exemplars_total: counters.accepted_exemplars.load(Ordering::Relaxed),
+    }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn snapshot_counters(kind: LegacyAdapterKind) -> AdapterCounterSnapshot {
     let (accepted_requests, accepted_samples) = counter_pair(kind, Outcome::Accepted);
     let (rejected_requests, rejected_samples) = counter_pair(kind, Outcome::Rejected);
@@ -604,9 +942,7 @@ fn parse_statsd_event(line: &str, line_idx: usize) -> Result<StatsdEvent, String
             }
             continue;
         }
-        return Err(format!(
-            "{context} contains unsupported segment '{segment}'"
-        ));
+        return Err(format!("{context} contains an unsupported segment"));
     }
 
     Ok(StatsdEvent {
@@ -622,34 +958,25 @@ fn normalize_statsd_gauge_value(
     metric: &str,
     labels: &[(String, String)],
     raw_value: &str,
-    state: &Mutex<BTreeMap<String, f64>>,
+    state: &mut StatsdGaugeStateCommit,
     context: &str,
 ) -> Result<f64, String> {
     let key = series_state_key(metric, labels);
     if let Some(delta) = raw_value.strip_prefix('+') {
         let delta = parse_finite_f64(delta, &format!("{context} relative gauge delta"))?;
-        let mut state = state
-            .lock()
-            .map_err(|_| "statsd gauge state lock poisoned".to_string())?;
-        let value = state.get(&key).copied().unwrap_or(0.0) + delta;
-        state.insert(key, value);
+        let value = state.value(&key).unwrap_or(0.0) + delta;
+        state.stage(key, value);
         return Ok(value);
     }
     if let Some(delta) = raw_value.strip_prefix('-') {
         let delta = parse_finite_f64(delta, &format!("{context} relative gauge delta"))?;
-        let mut state = state
-            .lock()
-            .map_err(|_| "statsd gauge state lock poisoned".to_string())?;
-        let value = state.get(&key).copied().unwrap_or(0.0) - delta;
-        state.insert(key, value);
+        let value = state.value(&key).unwrap_or(0.0) - delta;
+        state.stage(key, value);
         return Ok(value);
     }
 
     let value = parse_finite_f64(raw_value, &format!("{context} gauge value"))?;
-    let mut state = state
-        .lock()
-        .map_err(|_| "statsd gauge state lock poisoned".to_string())?;
-    state.insert(key, value);
+    state.stage(key, value);
     Ok(value)
 }
 
@@ -708,7 +1035,7 @@ fn parse_influx_series_spec(
     let mut labels = Vec::new();
     for raw_tag in parts {
         let (name, value) = split_first_unescaped_unquoted(raw_tag, b'=')
-            .ok_or_else(|| format!("{context} tag '{raw_tag}' is missing '='"))?;
+            .ok_or_else(|| format!("{context} tag is missing '='"))?;
         labels.push((
             normalize_label_name(&influx_unescape(name), &format!("{context} tag"))?,
             influx_unescape(value),
@@ -719,15 +1046,17 @@ fn parse_influx_series_spec(
 
 fn parse_influx_field_assignments(raw: &str, context: &str) -> Result<Vec<(String, f64)>, String> {
     let mut fields = Vec::new();
-    for raw_field in split_unescaped_unquoted(raw, b',') {
+    for (field_idx, raw_field) in split_unescaped_unquoted(raw, b',').enumerate() {
         let (name, value) = split_first_unescaped_unquoted(raw_field, b'=')
-            .ok_or_else(|| format!("{context} field '{raw_field}' is missing '='"))?;
+            .ok_or_else(|| format!("{context} field index {field_idx} is missing '='"))?;
         let field_name = influx_unescape(name);
         if field_name.is_empty() {
-            return Err(format!("{context} field name must not be empty"));
+            return Err(format!(
+                "{context} field index {field_idx} name must not be empty"
+            ));
         }
         let field_value =
-            parse_influx_field_value(value, &format!("{context} field '{field_name}'"))?;
+            parse_influx_field_value(value, &format!("{context} field index {field_idx}"))?;
         fields.push((field_name, field_value));
     }
     if fields.is_empty() {
@@ -746,13 +1075,13 @@ fn parse_influx_field_value(raw: &str, context: &str) -> Result<f64, String> {
     if let Some(value) = raw.strip_suffix('i') {
         let value = value
             .parse::<i64>()
-            .map_err(|_| format!("{context} has invalid integer value '{raw}'"))?;
+            .map_err(|_| format!("{context} has an invalid integer value"))?;
         return Ok(value as f64);
     }
     if let Some(value) = raw.strip_suffix('u') {
         let value = value
             .parse::<u64>()
-            .map_err(|_| format!("{context} has invalid unsigned integer value '{raw}'"))?;
+            .map_err(|_| format!("{context} has an invalid unsigned integer value"))?;
         return Ok(value as f64);
     }
     parse_finite_f64(raw, context)
@@ -766,9 +1095,7 @@ fn parse_influx_precision(raw: Option<&str>) -> Result<InfluxTimestampPrecision,
         "s" => Ok(InfluxTimestampPrecision::S),
         "m" => Ok(InfluxTimestampPrecision::M),
         "h" => Ok(InfluxTimestampPrecision::H),
-        other => Err(format!(
-            "unsupported influx line protocol precision '{other}'"
-        )),
+        _ => Err("unsupported influx line protocol precision".to_string()),
     }
 }
 
@@ -813,7 +1140,7 @@ fn parse_graphite_metric_spec(
     for raw_tag in segments {
         let (name, value) = raw_tag
             .split_once('=')
-            .ok_or_else(|| format!("{context} tag '{raw_tag}' is missing '='"))?;
+            .ok_or_else(|| format!("{context} tag is missing '='"))?;
         labels.push((
             normalize_label_name(name, &format!("{context} tag"))?,
             value.to_string(),
@@ -855,10 +1182,20 @@ fn normalize_legacy_tags(
 }
 
 fn normalize_metric_name(raw: &str, context: &str) -> Result<String, String> {
+    if raw.len() > MAX_METRIC_NAME_LEN {
+        return Err(format!(
+            "{context} exceeds the {MAX_METRIC_NAME_LEN}-byte input limit"
+        ));
+    }
     normalize_identifier(raw, true, &format!("{context} metric name"))
 }
 
 fn normalize_label_name(raw: &str, context: &str) -> Result<String, String> {
+    if raw.len() > MAX_LABEL_NAME_LEN {
+        return Err(format!(
+            "{context} exceeds the {MAX_LABEL_NAME_LEN}-byte input limit"
+        ));
+    }
     normalize_identifier(raw, false, &format!("{context} label name"))
 }
 
@@ -887,7 +1224,15 @@ fn normalize_identifier(raw: &str, allow_colon: bool, context: &str) -> Result<S
         }
     }
     if out.is_empty() {
-        return Err(format!("{context} '{raw}' could not be normalized"));
+        return Err(format!("{context} could not be normalized"));
+    }
+    let max_len = if allow_colon {
+        MAX_METRIC_NAME_LEN
+    } else {
+        MAX_LABEL_NAME_LEN
+    };
+    if out.len() > max_len {
+        return Err(format!("{context} exceeds the {max_len}-byte output limit"));
     }
     Ok(out)
 }
@@ -903,7 +1248,7 @@ fn insert_metadata_update(
     if let Some(existing) = metadata_updates.get(metric) {
         if existing != &candidate {
             return Err(format!(
-                "{context} produced conflicting metadata updates for metric '{metric}'"
+                "{context} produced conflicting metadata updates for one metric"
             ));
         }
         return Ok(());
@@ -915,7 +1260,7 @@ fn insert_metadata_update(
 fn parse_finite_f64(raw: &str, context: &str) -> Result<f64, String> {
     let value = raw
         .parse::<f64>()
-        .map_err(|_| format!("{context} has invalid numeric value '{raw}'"))?;
+        .map_err(|_| format!("{context} has an invalid numeric value"))?;
     if !value.is_finite() {
         return Err(format!("{context} must be finite"));
     }
@@ -1098,6 +1443,62 @@ mod tests {
         assert_eq!(
             second.envelope.scalar_samples[0].data_point.value_as_f64(),
             Some(3.0)
+        );
+    }
+
+    #[test]
+    fn statsd_invalid_packet_does_not_publish_earlier_gauge_updates() {
+        let adapter = StatsdAdapter::new();
+        let err = adapter
+            .normalize_packet(
+                "queue.depth:+5|g\nthis is not statsd",
+                tenant::DEFAULT_TENANT_ID,
+                1,
+                statsd_config(),
+            )
+            .expect_err("a malformed later event must reject the whole packet");
+        assert!(err.contains("event index 1"));
+
+        let next = adapter
+            .normalize_packet(
+                "queue.depth:+2|g",
+                tenant::DEFAULT_TENANT_ID,
+                2,
+                statsd_config(),
+            )
+            .expect("a subsequent packet should normalize");
+        assert_eq!(
+            next.envelope.scalar_samples[0].data_point.value_as_f64(),
+            Some(2.0),
+            "the rejected packet must not advance relative-gauge state"
+        );
+    }
+
+    #[test]
+    fn legacy_write_observability_uses_bounded_label_sets() {
+        assert_eq!(write_error_reason_index(None), 0);
+        for (index, reason) in LEGACY_WRITE_ERROR_REASON_NAMES.iter().enumerate().skip(1) {
+            if *reason == "other" {
+                continue;
+            }
+            assert_eq!(write_error_reason_index(Some(reason)), index);
+        }
+        assert_eq!(
+            write_error_reason_index(Some("attacker-controlled-unrecognized-code")),
+            LEGACY_WRITE_ERROR_REASON_NAMES.len() - 1
+        );
+        assert_eq!(acknowledgement_index(None), 0);
+        assert_eq!(
+            acknowledgement_index(Some(WriteAcknowledgement::Volatile)),
+            1
+        );
+        assert_eq!(
+            acknowledgement_index(Some(WriteAcknowledgement::Appended)),
+            2
+        );
+        assert_eq!(
+            acknowledgement_index(Some(WriteAcknowledgement::Durable)),
+            3
         );
     }
 

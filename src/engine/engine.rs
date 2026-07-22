@@ -19,12 +19,16 @@ use crate::engine::segment::{SegmentWriter, WalHighWatermark};
 use crate::engine::series::{SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily};
 use crate::engine::wal::{FramedWal, SamplesBatchFrame, SeriesDefinitionFrame};
 use crate::mmap::PlatformMmap;
-use crate::storage::{SeriesSelection, TimestampPrecision};
+use crate::storage::{
+    BatchWriteResult, RowWriteOutcome, SeriesSelection, TimestampPrecision, WriteMode,
+    WriteRejection,
+};
 use crate::validation::{validate_labels, validate_metric};
 use crate::{
-    DataPoint, DeleteSeriesResult, Label, MetricSeries, QueryOptions, RemoteSegmentCachePolicy,
-    RemoteStorageObservabilitySnapshot, Result, Row, SeriesPoints, Storage, StorageBuilder,
-    StorageObservabilitySnapshot, StorageRuntimeMode, TsinkError, Value, WriteResult,
+    DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryOptions,
+    RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot, Result, Row, SeriesPoints,
+    Storage, StorageBuilder, StorageObservabilitySnapshot, StorageRuntimeMode, TsinkError, Value,
+    WriteResult,
 };
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -181,6 +185,7 @@ struct PersistedStorageState {
     numeric_compactor: Option<Compactor>,
     blob_compactor: Option<Compactor>,
     wal: Option<FramedWal>,
+    local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     tiered_storage: Option<config::TieredStorageConfig>,
     remote_segment_cache_policy: RemoteSegmentCachePolicy,
     remote_segment_refresh_interval: Duration,
@@ -194,6 +199,7 @@ struct RuntimeConfigState {
     timestamp_precision: TimestampPrecision,
     retention_window: i64,
     future_skew_window: i64,
+    max_future_skew_window: Option<i64>,
     retention_enforced: bool,
     runtime_mode: StorageRuntimeMode,
     partition_window: i64,
@@ -217,6 +223,9 @@ struct MemoryAccountingState {
     persisted_mmap_used_bytes: AtomicU64,
     tombstone_used_bytes: AtomicU64,
     budget_bytes: AtomicU64,
+    active_backpressured_writers: AtomicU64,
+    backpressure_events_total: AtomicU64,
+    rejections_total: AtomicU64,
     backpressure_lock: Mutex<()>,
     admission_backpressure_lock: Mutex<()>,
 }
@@ -238,6 +247,7 @@ struct BackgroundWorkerSupervisorState {
     flush_thread_wakeup_requested: AtomicBool,
     persisted_refresh_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     rollup_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    compaction_interval: Duration,
     fail_fast_enabled: bool,
 }
 
@@ -334,6 +344,58 @@ impl Storage for ChunkStorage {
 
     fn insert_rows_with_result(&self, rows: &[Row]) -> Result<WriteResult> {
         self.insert_rows_impl(rows)
+    }
+
+    fn write_batch(&self, rows: &[Row], mode: WriteMode) -> Result<BatchWriteResult> {
+        // Preserve the compatibility API's lifecycle and runtime-mode checks even though an open
+        // engine treats an empty canonical batch as a no-op with no acknowledgement.
+        if rows.is_empty() {
+            self.insert_rows_impl(rows)?;
+            return Ok(BatchWriteResult::empty());
+        }
+
+        match mode {
+            WriteMode::Atomic => match self.insert_rows_impl(rows) {
+                Ok(result) => Ok(BatchWriteResult::from_outcomes(
+                    Some(result.acknowledgement),
+                    (0..rows.len()).map(RowWriteOutcome::accepted).collect(),
+                )),
+                Err(error) => {
+                    // The compatibility error does not carry an input index. Atomic rollback
+                    // makes the outcome trustworthy for every row, but the causal index remains
+                    // unknown until the ingest pipeline exposes it directly.
+                    let rejection = WriteRejection::from_error(&error, None);
+                    Ok(BatchWriteResult::from_outcomes(
+                        None,
+                        (0..rows.len())
+                            .map(|index| RowWriteOutcome::rejected(index, rejection.clone()))
+                            .collect(),
+                    ))
+                }
+            },
+            WriteMode::BestEffort => {
+                let mut acknowledgement: Option<crate::WriteAcknowledgement> = None;
+                let mut outcomes = Vec::with_capacity(rows.len());
+
+                for (index, row) in rows.iter().enumerate() {
+                    match self.insert_rows_impl(std::slice::from_ref(row)) {
+                        Ok(result) => {
+                            acknowledgement = Some(match acknowledgement {
+                                Some(current) => current.weakest(result.acknowledgement),
+                                None => result.acknowledgement,
+                            });
+                            outcomes.push(RowWriteOutcome::accepted(index));
+                        }
+                        Err(error) => outcomes.push(RowWriteOutcome::rejected(
+                            index,
+                            WriteRejection::from_error(&error, Some(index)),
+                        )),
+                    }
+                }
+
+                Ok(BatchWriteResult::from_outcomes(acknowledgement, outcomes))
+            }
+        }
     }
 
     fn select(
@@ -468,6 +530,45 @@ impl Storage for ChunkStorage {
         self.memory_budget_value()
     }
 
+    fn effective_storage_limits(&self) -> EffectiveStorageLimits {
+        let persistent =
+            self.persisted.numeric_lane_path.is_some() || self.persisted.blob_lane_path.is_some();
+        let wal_enabled = self.persisted.wal.is_some();
+        let finite_usize =
+            |value: usize| (value != usize::MAX).then(|| u64::try_from(value).unwrap_or(u64::MAX));
+        let wal_unlimited_sentinel = usize::MAX as u64;
+        let write_timeout_nanos = self.runtime.write_timeout.as_nanos().min(u64::MAX.into()) as u64;
+        let local_disk_limits = self
+            .persisted
+            .local_disk_budget
+            .as_ref()
+            .map(|budget| budget.limits());
+
+        EffectiveStorageLimits {
+            reported_by_backend: true,
+            persistent,
+            wal_enabled,
+            accounted_memory_bytes: finite_usize(self.memory_budget_value()),
+            cardinality: finite_usize(self.runtime.cardinality_limit),
+            wal_bytes: wal_enabled
+                .then_some(self.runtime.wal_size_limit_bytes)
+                .filter(|limit| *limit != wal_unlimited_sentinel),
+            local_disk_bytes: local_disk_limits.and_then(|limits| limits.max_bytes),
+            filesystem_free_headroom_bytes: local_disk_limits
+                .map(|limits| limits.filesystem_free_headroom_bytes),
+            maintenance_temp_reserve_bytes: local_disk_limits
+                .map(|limits| limits.maintenance_temp_reserve_bytes),
+            max_concurrent_writers: Some(
+                u64::try_from(self.runtime.write_limiter.capacity()).unwrap_or(u64::MAX),
+            ),
+            write_timeout_nanos: Some(write_timeout_nanos),
+            max_active_partition_heads_per_series: Some(
+                u64::try_from(self.runtime.max_active_partition_heads_per_series)
+                    .unwrap_or(u64::MAX),
+            ),
+        }
+    }
+
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
         self.observability_snapshot_impl()
     }
@@ -496,6 +597,32 @@ impl Storage for ChunkStorage {
         self.ensure_open()?;
         let _compaction_guard = self.compaction_gate();
 
+        let wal_dir = self
+            .persisted
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.path().parent().map(|path| path.to_path_buf()));
+        if self.persisted.numeric_lane_path.is_none()
+            && self.persisted.blob_lane_path.is_none()
+            && wal_dir.is_none()
+        {
+            drop(write_permits);
+            return Err(TsinkError::InvalidConfiguration(
+                "snapshot requires persistent storage (data_path with segments and/or WAL)"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(local_disk_budget) = &self.persisted.local_disk_budget {
+            if local_disk_budget.governs(destination)? {
+                drop(write_permits);
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "snapshot destination must be outside the managed data directory: {}",
+                    destination.display()
+                )));
+            }
+        }
+
         if crate::engine::fs_utils::path_exists_no_follow(destination)? {
             drop(write_permits);
             return Err(TsinkError::InvalidConfiguration(format!(
@@ -512,23 +639,6 @@ impl Storage for ChunkStorage {
             )));
         };
         std::fs::create_dir_all(destination_parent)?;
-
-        let wal_dir = self
-            .persisted
-            .wal
-            .as_ref()
-            .and_then(|wal| wal.path().parent().map(|path| path.to_path_buf()));
-
-        if self.persisted.numeric_lane_path.is_none()
-            && self.persisted.blob_lane_path.is_none()
-            && wal_dir.is_none()
-        {
-            drop(write_permits);
-            return Err(TsinkError::InvalidConfiguration(
-                "snapshot requires persistent storage (data_path with segments and/or WAL)"
-                    .to_string(),
-            ));
-        }
 
         let staging = crate::engine::fs_utils::stage_dir_path(destination, "snapshot")?;
         std::fs::create_dir_all(&staging)?;

@@ -1,5 +1,8 @@
 # Cluster Setup
 
+> [!WARNING]
+> **Experimental, non-primary capability.** Cluster mode is not tsink's primary product. This guide documents an advanced subsystem and is not a production-readiness claim. Validate correctness, failure handling, and data safety for your workload before relying on it.
+
 This guide covers running tsink as a replicated multi-node cluster. The same engine binary that runs single-node also runs in cluster mode — clustering is enabled with a flag.
 
 ---
@@ -10,7 +13,8 @@ A tsink cluster is a group of nodes that share data via consistent-hash-ring sha
 
 - **Shard routing** — series are hashed to a logical shard, and each shard is owned by one or more replica nodes.
 - **Replication** — writes fan out to all replica owners; consistency guarantees are tunable.
-- **Hinted handoff** — writes destined for a temporarily unavailable peer are durably queued and replayed when it recovers.
+- **Hinted handoff** — writes destined for a temporarily unavailable peer are placed in a bounded,
+  on-disk queue and replayed when it recovers.
 - **Anti-entropy repair** — periodic digest exchange detects and repairs diverged shards.
 - **Online rebalance** — shard ownership migrates automatically when nodes join or leave.
 - **Control-plane consensus** — membership and ring state are managed by an internal Raft-like log replicated across all storage-capable nodes.
@@ -109,7 +113,7 @@ tsink-server \
 
 Series are mapped to shards, and shards are mapped to replica owners, using a consistent hash ring:
 
-1. **Series → shard**: `shard_index = series_id % shard_count`
+1. **Series → shard**: `shard_index = stable_series_identity_hash(metric, sorted_labels) % shard_count`
 2. **Shard → owners**: virtual-node consistent hash ring (xxHash64, seed 0). Each physical node gets 128 virtual nodes on the ring. The `replication_factor` clockwise-unique physical nodes are the shard's replica set.
 
 The `--cluster-shards` value determines the total number of logical shards and **cannot be changed after the cluster is created**. The default of `128` is sufficient for most deployments. Use a higher value (e.g. `512` or `1024`) if you plan to grow to many nodes and want fine-grained shard migration.
@@ -148,7 +152,10 @@ Controls how many replica responses are required and whether all replicas are qu
 
 ### Partial response
 
-When `--cluster-read-partial-response allow` (default), a query can succeed and return data even if some shards are temporarily unavailable. The response will include a `"partial_response": true` field in the metadata.
+When `--cluster-read-partial-response allow` (default), a query can succeed and return data even if
+some shards are temporarily unavailable. The JSON response includes
+`"partialResponse": {"enabled": true, ...}` plus warnings, and the HTTP headers report the same
+partial state.
 
 Set `--cluster-read-partial-response deny` to return an error instead when any shard is unavailable.
 
@@ -156,7 +163,12 @@ Set `--cluster-read-partial-response deny` to return an error instead when any s
 
 ## Hinted handoff
 
-When a write cannot be delivered to a replica because the peer is unreachable, tsink durably queues the data in a per-peer **hinted handoff outbox**. When the peer recovers, the queued data is replayed automatically.
+When a write cannot be delivered to a replica because the peer is unreachable, tsink places the
+data in a bounded, per-peer **hinted handoff outbox** backed by an append-only log. When the peer
+recovers, the queued data is replayed automatically. The current outbox flushes records for
+process-restart recovery and calls `sync_data` before publishing Put or Ack state. Compaction syncs
+its replacement file before rename, but the replacement does not yet synchronize the parent
+directory; the platform limits in the [durability contract](durability.md) still apply.
 
 Handoff behavior is tunable via environment variables:
 
@@ -167,7 +179,7 @@ Handoff behavior is tunable via environment variables:
 | `TSINK_CLUSTER_OUTBOX_MAX_PEER_BYTES` | `268435456` (256 MiB) | Per-peer size cap. |
 | `TSINK_CLUSTER_OUTBOX_MAX_LOG_BYTES` | `2147483648` (2 GiB) | Maximum WAL size for the outbox log. |
 | `TSINK_CLUSTER_OUTBOX_REPLAY_INTERVAL_SECS` | `2` | How often to attempt replay to recovered peers (seconds). |
-| `TSINK_CLUSTER_OUTBOX_REPLAY_BATCH_SIZE` | `256` | Rows per replay batch. |
+| `TSINK_CLUSTER_OUTBOX_REPLAY_BATCH_SIZE` | `256` | Maximum queued outbox entries considered per replay pass. |
 | `TSINK_CLUSTER_OUTBOX_MAX_BACKOFF_SECS` | `30` | Maximum backoff between replay attempts. |
 | `TSINK_CLUSTER_OUTBOX_MAX_RECORD_BYTES` | `2097152` (2 MiB) | Maximum size of a single outbox record. |
 | `TSINK_CLUSTER_OUTBOX_CLEANUP_INTERVAL_SECS` | `30` | How often stale outbox records are cleaned up. |
@@ -215,7 +227,7 @@ curl http://node-1:9201/api/v1/admin/cluster/repair/status
 
 ## Rebalance
 
-When shard ownership changes (node joining, leaving, or ring update), data migrates to new owners. Rebalance runs automatically in the background and is rate-limited to avoid impacting production traffic.
+When shard ownership changes (node joining, leaving, or ring update), data migrates to new owners. Rebalance runs automatically in the background and is rate-limited to avoid impacting foreground traffic.
 
 | Environment variable | Default | Description |
 |---|---|---|
@@ -339,9 +351,9 @@ tsink-server \
   ...
 ```
 
-The token is sent on every internal RPC call via the `x-tsink-internal-auth` header. Tokens can be rotated at runtime without restart — see the [secret rotation guide](docs/secret-rotation.md).
+The token is sent on every internal RPC call via the `x-tsink-internal-auth` header. Tokens can be rotated at runtime without restart — see the [secret rotation guide](secret-rotation.md).
 
-### mTLS (recommended for production)
+### mTLS (recommended)
 
 Enable mTLS to authenticate and encrypt all peer-to-peer traffic using certificates. When mTLS is enabled, shared-secret token auth is disabled.
 
@@ -362,7 +374,7 @@ tsink-server \
 | `--cluster-internal-mtls-cert` | PEM certificate presented by this node on all outbound RPC calls. |
 | `--cluster-internal-mtls-key` | PEM private key for the certificate above. |
 
-mTLS certificates can be rotated at runtime without restart. See the [secret rotation guide](docs/secret-rotation.md).
+mTLS certificates can be rotated at runtime without restart. See the [secret rotation guide](secret-rotation.md).
 
 ---
 
@@ -388,7 +400,13 @@ The following environment variables control internal RPC behavior and resource l
 
 ## Write deduplication
 
-To prevent double-writes during retry storms, tsink tracks idempotency keys per node in a sliding time window. Duplicate writes within the window are silently dropped on the receiving node.
+To suppress duplicate internal retries, each receiving node tracks idempotency keys in a bounded
+sliding window. Current-format completions replay the original indexed result, counts, and
+acknowledgement; legacy markers that lack a stored result return
+`409 idempotency_result_unavailable` rather than inventing success. A completion-marker persistence
+failure returns `503 dedupe_persistence_failed` and discloses any already accepted components.
+This is bounded duplicate suppression, not an end-to-end exactly-once guarantee; see
+[clustering internals](clustering-internals.md#idempotency-and-deduplication).
 
 | Environment variable | Default | Description |
 |---|---|---|
@@ -421,7 +439,7 @@ curl http://node-1:9201/api/v1/admin/cluster/audit/export
 
 ## Configuration checklist
 
-Before starting a production cluster:
+Before evaluating an experimental cluster deployment:
 
 - [ ] Every node has a unique, stable `--cluster-node-id`.
 - [ ] `--cluster-bind` is reachable by all peers on the network.

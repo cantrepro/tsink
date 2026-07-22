@@ -80,6 +80,221 @@ fn rejects_mixed_numeric_insert_across_calls_when_wal_is_disabled() {
 }
 
 #[test]
+fn later_shard_codec_failure_does_not_partially_apply_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::new("partial_apply_a", DataPoint::new(1, 10_i64)),
+            Row::new("partial_apply_b", DataPoint::new(1, i64::MIN)),
+        ])
+        .unwrap();
+
+    let registry = storage.catalog.registry.read();
+    let a_id = registry
+        .resolve_existing("partial_apply_a", &[])
+        .unwrap()
+        .series_id;
+    let b_id = registry
+        .resolve_existing("partial_apply_b", &[])
+        .unwrap()
+        .series_id;
+    drop(registry);
+    assert!(
+        ChunkStorage::series_shard_idx(a_id) < ChunkStorage::series_shard_idx(b_id),
+        "the regression requires the safe series to apply before the failing series"
+    );
+
+    let err = storage
+        .insert_rows(&[
+            Row::new("partial_apply_a", DataPoint::new(2, 11_i64)),
+            Row::new("partial_apply_b", DataPoint::new(2, i64::MAX)),
+        ])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::Codec(_)));
+
+    assert_eq!(
+        storage.select("partial_apply_a", &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, 10_i64)],
+        "a later-shard apply failure must not expose earlier-shard points"
+    );
+    assert_eq!(
+        storage.select("partial_apply_b", &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, i64::MIN)],
+        "the failing series must retain only its previously committed point"
+    );
+    assert_engine_memory_usage_reconciled(&storage);
+    storage.close().unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(2)
+        .with_wal_enabled(true)
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select("partial_apply_a", &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, 10_i64)],
+        "an aborted batch must not become durable during close"
+    );
+    assert_eq!(
+        reopened.select("partial_apply_b", &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, i64::MIN)]
+    );
+}
+
+#[test]
+fn later_shard_codec_failure_without_wal_is_atomic() {
+    let storage = ChunkStorage::new(2, None);
+
+    storage
+        .insert_rows(&[
+            Row::new("volatile_partial_apply_a", DataPoint::new(1, 10_i64)),
+            Row::new("volatile_partial_apply_b", DataPoint::new(1, i64::MIN)),
+        ])
+        .unwrap();
+
+    let err = storage
+        .insert_rows(&[
+            Row::new("volatile_partial_apply_a", DataPoint::new(2, 11_i64)),
+            Row::new("volatile_partial_apply_b", DataPoint::new(2, i64::MAX)),
+        ])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::Codec(_)));
+    assert_eq!(
+        storage
+            .select("volatile_partial_apply_a", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 10_i64)]
+    );
+    assert_eq!(
+        storage
+            .select("volatile_partial_apply_b", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, i64::MIN)]
+    );
+    assert_engine_memory_usage_reconciled(&storage);
+}
+
+#[test]
+fn apply_failure_rolls_back_new_series_visibility_and_timestamp_bounds() {
+    let storage = ChunkStorage::new(2, None);
+
+    let err = storage
+        .insert_rows(&[
+            Row::new("new_partial_apply_a", DataPoint::new(100, 10_i64)),
+            Row::new("new_partial_apply_a", DataPoint::new(101, 11_i64)),
+            Row::new("new_partial_apply_b", DataPoint::new(100, i64::MIN)),
+            Row::new("new_partial_apply_b", DataPoint::new(101, i64::MAX)),
+        ])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::Codec(_)));
+
+    assert!(storage
+        .select("new_partial_apply_a", &[], 0, 200)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .select("new_partial_apply_b", &[], 0, 200)
+        .unwrap()
+        .is_empty());
+    assert!(storage.list_metrics().unwrap().is_empty());
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .retention
+            .max_observed_timestamp,
+        None,
+        "a rejected staged apply must not advance retention visibility bounds"
+    );
+    assert_engine_memory_usage_reconciled(&storage);
+}
+
+#[test]
+fn flush_codec_failure_preserves_active_points_and_memory_accounting() {
+    let storage = ChunkStorage::new(3, None);
+    let metric = "flush_codec_failure";
+
+    storage
+        .insert_rows(&[
+            Row::new(metric, DataPoint::new(1, i64::MIN)),
+            Row::new(metric, DataPoint::new(2, i64::MAX)),
+        ])
+        .unwrap();
+    let expected = vec![DataPoint::new(1, i64::MIN), DataPoint::new(2, i64::MAX)];
+    assert_eq!(storage.select(metric, &[], 0, 10).unwrap(), expected);
+
+    let err = storage.flush_all_active().unwrap_err();
+    assert!(matches!(err, TsinkError::Codec(_)));
+    assert_eq!(
+        storage.select(metric, &[], 0, 10).unwrap(),
+        expected,
+        "a failed flush must leave the active head query-visible"
+    );
+    assert_engine_memory_usage_reconciled(&storage);
+}
+
+#[test]
+fn partial_flush_error_accounts_chunks_completed_before_failure() {
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        3,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            partition_window: 10,
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let metric = "partial_flush_codec_failure";
+    let expected = vec![
+        DataPoint::new(1, 10_i64),
+        DataPoint::new(2, 11_i64),
+        DataPoint::new(11, i64::MIN),
+        DataPoint::new(12, i64::MAX),
+    ];
+
+    storage
+        .insert_rows(&[
+            Row::new(metric, expected[0].clone()),
+            Row::new(metric, expected[1].clone()),
+            Row::new(metric, expected[2].clone()),
+            Row::new(metric, expected[3].clone()),
+        ])
+        .unwrap();
+
+    let err = storage.flush_all_active().unwrap_err();
+    assert!(matches!(err, TsinkError::Codec(_)));
+    assert_eq!(storage.select(metric, &[], 0, 20).unwrap(), expected);
+    assert_engine_memory_usage_reconciled(&storage);
+
+    let flush = storage.observability_snapshot().flush;
+    assert_eq!(flush.active_flush_errors_total, 1);
+    assert_eq!(flush.active_flushed_series_total, 1);
+    assert_eq!(flush.active_flushed_chunks_total, 1);
+    assert_eq!(flush.active_flushed_points_total, 2);
+}
+
+#[test]
 fn failed_insert_rolls_back_new_series_metadata_immediately() {
     let storage = ChunkStorage::new(4, None);
     let labels = vec![Label::new("host", "a")];

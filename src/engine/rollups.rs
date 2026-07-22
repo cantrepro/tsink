@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::metrics::{QueryObservabilityCounters, RollupObservabilityCounters};
 use super::*;
-use crate::engine::fs_utils::write_file_atomically_and_sync_parent;
+use crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted;
 use crate::engine::query::TieredQueryPlan;
 use crate::engine::tombstone::{TombstoneMap, TombstoneRange};
 use crate::query_aggregation::{bucket_start_for_origin, downsample_points_with_origin};
@@ -58,6 +58,7 @@ pub(super) struct RollupRuntimeState {
     dir_path: Option<PathBuf>,
     policies_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
+    local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     policies: RwLock<Vec<RollupPolicy>>,
     checkpoints: RwLock<HashMap<String, BTreeMap<String, i64>>>,
     pending_materializations:

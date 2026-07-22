@@ -3,9 +3,10 @@
 use crate::cgroup;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
-    DataPoint, Label, MetricSeries, QueryOptions, QueryRowsPage, QueryRowsScanOptions, Result,
-    RollupObservabilitySnapshot, RollupPolicy, Row, SeriesSelection, Storage, StorageBuilder,
-    TimestampPrecision, TsinkError, WriteResult,
+    BatchWriteResult, DataPoint, EffectiveStorageLimits, Label, MetricSeries, QueryOptions,
+    QueryRowsPage, QueryRowsScanOptions, Result, RollupObservabilitySnapshot, RollupPolicy, Row,
+    RowWriteOutcome, SeriesSelection, Storage, StorageBuilder, StorageObservabilitySnapshot,
+    TimestampPrecision, TsinkError, WriteMode, WriteRejection, WriteRejectionCategory, WriteResult,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -22,9 +23,13 @@ const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// Runtime settings for the async service layer.
 #[derive(Debug, Clone, Copy)]
 pub struct AsyncRuntimeOptions {
-    /// Maximum number of in-flight requests accepted per queue.
+    /// Number of commands that may wait in each bounded read and write queue.
+    ///
+    /// Zero is normalized to one.
     pub queue_capacity: usize,
     /// Number of dedicated reader worker threads.
+    ///
+    /// Zero is normalized to one.
     pub read_workers: usize,
 }
 
@@ -56,6 +61,11 @@ enum WriteCommand {
     InsertRowsWithResult {
         rows: Vec<Row>,
         reply: Reply<WriteResult>,
+    },
+    WriteBatch {
+        rows: Vec<Row>,
+        mode: WriteMode,
+        reply: Reply<BatchWriteResult>,
     },
     Snapshot {
         path: PathBuf,
@@ -179,17 +189,26 @@ impl Drop for AsyncRuntime {
     }
 }
 
-/// Async facade for `Storage` backed by dedicated worker threads.
+/// Runtime-independent async facade over [`Storage`], backed by dedicated worker threads.
+///
+/// Clones share the same queues, workers, and lifecycle state. Closing any clone closes the
+/// shared facade for every clone. Call [`AsyncStorage::close`] explicitly to observe storage
+/// shutdown errors; dropping the facade is not a substitute for a successful close.
 #[derive(Clone)]
 pub struct AsyncStorage {
     runtime: Arc<AsyncRuntime>,
 }
 
 impl AsyncStorage {
+    /// Starts an async facade with [`AsyncRuntimeOptions::default`] around an existing backend.
     pub fn from_storage(storage: Arc<dyn Storage>) -> Result<Self> {
         Self::from_storage_with_options(storage, AsyncRuntimeOptions::default())
     }
 
+    /// Starts an async facade with explicit queue and reader-worker settings.
+    ///
+    /// Worker threads are owned by the returned facade and do not require a Tokio or async-std
+    /// runtime. Zero-valued options are normalized to one.
     pub fn from_storage_with_options(
         storage: Arc<dyn Storage>,
         options: AsyncRuntimeOptions,
@@ -199,14 +218,25 @@ impl AsyncStorage {
         })
     }
 
+    /// Clones the underlying synchronous storage handle.
+    ///
+    /// Operations made through this handle bypass the facade's queues and lifecycle guard.
     pub fn inner(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.runtime.storage)
     }
 
+    /// Consumes this facade handle and returns a clone of the synchronous storage handle.
+    ///
+    /// This does not close the storage or other [`AsyncStorage`] clones.
     pub fn into_inner(self) -> Arc<dyn Storage> {
         Arc::clone(&self.runtime.storage)
     }
 
+    /// Queues a compatibility write and waits for its success or failure.
+    ///
+    /// Use [`AsyncStorage::insert_rows_with_result`] when the durability acknowledgement matters.
+    /// Once accepted into the write queue, the write may still execute if the awaiting future is
+    /// cancelled.
     pub async fn insert_rows(&self, rows: Vec<Row>) -> Result<()> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -218,7 +248,10 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Inserts rows and returns the durability guarantee established when the call succeeds.
+    /// Queues a write and returns the durability guarantee established when it succeeds.
+    ///
+    /// Once accepted into the write queue, the write may still execute if the awaiting future is
+    /// cancelled.
     pub async fn insert_rows_with_result(&self, rows: Vec<Row>) -> Result<WriteResult> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -230,6 +263,51 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Queues [`Storage::write_batch`] with an explicit failure policy and returns its outcome.
+    ///
+    /// The whole batch runs as one command on the serialized write worker. Once accepted into the
+    /// write queue, it may still execute if the awaiting future is cancelled.
+    pub async fn write_batch(&self, rows: Vec<Row>, mode: WriteMode) -> Result<BatchWriteResult> {
+        if let Err(error) = self.ensure_open() {
+            if !rows.is_empty() && matches!(error, TsinkError::StorageClosed) {
+                let outcomes = match mode {
+                    WriteMode::Atomic => {
+                        let rejection = WriteRejection::new(
+                            WriteRejectionCategory::StorageClosed,
+                            None,
+                            error.to_string(),
+                        );
+                        (0..rows.len())
+                            .map(|index| RowWriteOutcome::rejected(index, rejection.clone()))
+                            .collect()
+                    }
+                    WriteMode::BestEffort => (0..rows.len())
+                        .map(|index| {
+                            RowWriteOutcome::rejected(
+                                index,
+                                WriteRejection::new(
+                                    WriteRejectionCategory::StorageClosed,
+                                    Some(index),
+                                    error.to_string(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                };
+                return Ok(BatchWriteResult::from_outcomes(None, outcomes));
+            }
+            return Err(error);
+        }
+        let (reply, recv) = reply_channel();
+        self.runtime
+            .write_tx
+            .send(WriteCommand::WriteBatch { rows, mode, reply })
+            .await
+            .map_err(|_| runtime_stopped_error())?;
+        recv_reply(recv).await
+    }
+
+    /// Runs [`Storage::select`] on the facade's reader worker pool.
     pub async fn select(
         &self,
         metric: impl Into<String>,
@@ -253,6 +331,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::select_with_options`] on the reader worker pool.
     pub async fn select_with_options(
         &self,
         metric: impl Into<String>,
@@ -272,6 +351,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::select_all`] on the reader worker pool.
     pub async fn select_all(
         &self,
         metric: impl Into<String>,
@@ -293,6 +373,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::scan_series_rows`] on the reader worker pool.
     pub async fn scan_series_rows(
         &self,
         series: Vec<MetricSeries>,
@@ -316,6 +397,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::scan_metric_rows`] on the reader worker pool.
     pub async fn scan_metric_rows(
         &self,
         metric: impl Into<String>,
@@ -339,6 +421,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::list_metrics`] on the reader worker pool.
     pub async fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -350,6 +433,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Runs [`Storage::select_series`] on the reader worker pool.
     pub async fn select_series(&self, selection: SeriesSelection) -> Result<Vec<MetricSeries>> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -361,14 +445,29 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Returns [`Storage::memory_used`] directly without entering a worker queue.
     pub fn memory_used(&self) -> usize {
         self.runtime.storage.memory_used()
     }
 
+    /// Returns [`Storage::memory_budget`] directly without entering a worker queue.
+    ///
+    /// `usize::MAX` means no explicit memory budget is configured.
     pub fn memory_budget(&self) -> usize {
         self.runtime.storage.memory_budget()
     }
 
+    /// Returns [`Storage::effective_storage_limits`] directly without entering a worker queue.
+    pub fn effective_storage_limits(&self) -> EffectiveStorageLimits {
+        self.runtime.storage.effective_storage_limits()
+    }
+
+    /// Returns [`Storage::observability_snapshot`] directly without entering a worker queue.
+    pub fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
+        self.runtime.storage.observability_snapshot()
+    }
+
+    /// Queues [`Storage::apply_rollup_policies`] on the serialized write worker.
     pub async fn apply_rollup_policies(
         &self,
         policies: Vec<RollupPolicy>,
@@ -383,6 +482,7 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
+    /// Queues [`Storage::trigger_rollup_run`] on the serialized write worker.
     pub async fn trigger_rollup_run(&self) -> Result<RollupObservabilitySnapshot> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -394,7 +494,9 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Writes an atomic on-disk snapshot to `path`.
+    /// Queues an atomic on-disk snapshot after earlier queued writes.
+    ///
+    /// Backend-specific requirements from [`Storage::snapshot`] still apply.
     pub async fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
         self.ensure_open()?;
         let (reply, recv) = reply_channel();
@@ -409,7 +511,10 @@ impl AsyncStorage {
         recv_reply(recv).await
     }
 
-    /// Close the storage. Additional operations return `StorageClosed`.
+    /// Closes the underlying storage through the serialized write worker.
+    ///
+    /// A successful call closes all clones of this facade. Additional facade operations, including
+    /// another close, return [`TsinkError::StorageClosed`].
     pub async fn close(&self) -> Result<()> {
         if self
             .runtime
@@ -477,7 +582,10 @@ impl Drop for ClosingStateGuard<'_> {
     }
 }
 
-/// Builder for [`AsyncStorage`].
+/// Configures both the synchronous storage backend and its [`AsyncStorage`] worker facade.
+///
+/// Storage settings use [`StorageBuilder`] defaults, including no explicit finite memory,
+/// cardinality, or WAL-size limits. Configure those limits explicitly for constrained hosts.
 pub struct AsyncStorageBuilder {
     inner: StorageBuilder,
     async_options: AsyncRuntimeOptions,
@@ -493,71 +601,96 @@ impl Default for AsyncStorageBuilder {
 }
 
 impl AsyncStorageBuilder {
+    /// Creates an async builder with default storage and runtime options.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the capacity of each bounded command queue.
+    ///
+    /// Zero is normalized to one.
     #[must_use]
     pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
         self.async_options.queue_capacity = capacity.max(1);
         self
     }
 
+    /// Sets the number of dedicated reader worker threads.
+    ///
+    /// Zero is normalized to one. Writes always use one serialized worker.
     #[must_use]
     pub fn with_read_workers(mut self, workers: usize) -> Self {
         self.async_options.read_workers = workers.max(1);
         self
     }
 
+    /// Sets the local persistence path; see [`StorageBuilder::with_data_path`].
     #[must_use]
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.inner = self.inner.with_data_path(path);
         self
     }
 
+    /// Sets and enables the retention window; see [`StorageBuilder::with_retention`].
     #[must_use]
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.inner = self.inner.with_retention(retention);
         self
     }
 
+    /// Enables or disables retention enforcement.
     #[must_use]
     pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
         self.inner = self.inner.with_retention_enforced(enforced);
         self
     }
 
+    /// Rejects samples farther than `max_future_skew` ahead of the storage clock.
+    ///
+    /// This is opt in; see [`StorageBuilder::with_max_future_skew`].
+    #[must_use]
+    pub fn with_max_future_skew(mut self, max_future_skew: Duration) -> Self {
+        self.inner = self.inner.with_max_future_skew(max_future_skew);
+        self
+    }
+
+    /// Sets the timestamp unit used by storage.
     #[must_use]
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.inner = self.inner.with_timestamp_precision(precision);
         self
     }
 
+    /// Sets the target encoded chunk size in points.
     #[must_use]
     pub fn with_chunk_points(mut self, points: usize) -> Self {
         self.inner = self.inner.with_chunk_points(points);
         self
     }
 
+    /// Sets the synchronous storage writer-concurrency limit.
     #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
         self.inner = self.inner.with_max_writers(max_writers);
         self
     }
 
+    /// Sets how long storage waits to acquire writer permits.
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.inner = self.inner.with_write_timeout(timeout);
         self
     }
 
+    /// Sets the width of active ingestion time partitions.
     #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.inner = self.inner.with_partition_duration(duration);
         self
     }
 
+    /// Sets the per-series partition-head bound.
     #[must_use]
     pub fn with_max_active_partition_heads_per_series(mut self, max_heads: usize) -> Self {
         self.inner = self
@@ -566,36 +699,69 @@ impl AsyncStorageBuilder {
         self
     }
 
+    /// Sets the storage memory budget in bytes.
+    ///
+    /// The default is `usize::MAX`, meaning no explicit budget is configured.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.inner = self.inner.with_memory_limit(bytes);
         self
     }
 
+    /// Sets the maximum number of distinct metric-and-label series.
+    ///
+    /// The default is `usize::MAX`, meaning no explicit limit is configured.
     #[must_use]
     pub fn with_cardinality_limit(mut self, series: usize) -> Self {
         self.inner = self.inner.with_cardinality_limit(series);
         self
     }
 
+    /// Enables or disables the WAL for persistent storage.
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.inner = self.inner.with_wal_enabled(enabled);
         self
     }
 
+    /// Sets the maximum on-disk WAL size in bytes.
+    ///
+    /// The default is `usize::MAX`, meaning no explicit limit is configured.
     #[must_use]
     pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
         self.inner = self.inner.with_wal_size_limit(bytes);
         self
     }
 
+    /// Sets the managed local data-directory byte limit.
+    #[must_use]
+    pub fn with_local_disk_limit(mut self, bytes: u64) -> Self {
+        self.inner = self.inner.with_local_disk_limit(bytes);
+        self
+    }
+
+    /// Sets the filesystem free-space floor for local storage.
+    #[must_use]
+    pub fn with_filesystem_free_headroom(mut self, bytes: u64) -> Self {
+        self.inner = self.inner.with_filesystem_free_headroom(bytes);
+        self
+    }
+
+    /// Reserves local-disk bytes for maintenance temporary output.
+    #[must_use]
+    pub fn with_maintenance_temp_reserve(mut self, bytes: u64) -> Self {
+        self.inner = self.inner.with_maintenance_temp_reserve(bytes);
+        self
+    }
+
+    /// Sets the userspace WAL writer-buffer capacity in bytes.
     #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
         self.inner = self.inner.with_wal_buffer_size(size);
         self
     }
 
+    /// Selects the WAL synchronization policy.
     #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.inner = self.inner.with_wal_sync_mode(mode);
@@ -620,6 +786,9 @@ impl AsyncStorageBuilder {
         self
     }
 
+    /// Builds the synchronous storage backend and starts the async worker threads.
+    ///
+    /// Call [`AsyncStorage::close`] during host shutdown to surface storage shutdown errors.
     pub fn build(self) -> Result<AsyncStorage> {
         let storage = self.inner.build()?;
         AsyncStorage::from_storage_with_options(storage, self.async_options)
@@ -641,6 +810,10 @@ fn write_worker_loop(
             }
             WriteCommand::InsertRowsWithResult { rows, reply } => {
                 let result = storage.insert_rows_with_result(&rows);
+                let _ = reply.send_blocking(result);
+            }
+            WriteCommand::WriteBatch { rows, mode, reply } => {
+                let result = storage.write_batch(&rows, mode);
                 let _ = reply.send_blocking(result);
             }
             WriteCommand::Snapshot { path, reply } => {

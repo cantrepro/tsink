@@ -1,4 +1,5 @@
 use super::*;
+use crate::{RowWriteStatus, WriteMode, WriteRejectionCategory};
 
 fn wait_for_condition<F>(timeout: Duration, poll_interval: Duration, condition: F) -> bool
 where
@@ -60,6 +61,120 @@ fn timestamp_precision_changes_retention_unit_conversion() {
 }
 
 #[test]
+fn opt_in_future_skew_limit_accepts_boundary_and_rejects_before_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_max_future_skew(Duration::from_secs(10))
+        .with_wal_sync_mode(WalSyncMode::PerAppend)
+        .with_background_threads_enabled_for_tests(false)
+        .with_current_time_override_for_tests(100)
+        .build()
+        .unwrap();
+
+    let boundary = storage
+        .write_batch(
+            &[Row::new("future_skew_boundary", DataPoint::new(110, 1.0))],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+    assert_eq!(boundary.accepted, 1);
+    assert_eq!(boundary.rejected, 0);
+
+    let metrics_before = storage.list_metrics().unwrap();
+    let wal_before = storage.observability_snapshot().wal;
+    let rejected = storage
+        .write_batch(
+            &[
+                Row::new("future_skew_atomic_safe", DataPoint::new(109, 2.0)),
+                Row::new("future_skew_atomic_too_far", DataPoint::new(111, 3.0)),
+            ],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+
+    assert_eq!(rejected.accepted, 0);
+    assert_eq!(rejected.rejected, 2);
+    assert_eq!(rejected.acknowledgement, None);
+    assert!(rejected.outcomes.iter().all(|outcome| {
+        matches!(
+            &outcome.status,
+            RowWriteStatus::Rejected(rejection)
+                if rejection.category == WriteRejectionCategory::FutureSkewExceeded
+        )
+    }));
+    assert_eq!(storage.list_metrics().unwrap(), metrics_before);
+
+    let wal_after = storage.observability_snapshot().wal;
+    assert_eq!(
+        (
+            wal_after.append_series_definitions_total,
+            wal_after.append_sample_batches_total,
+            wal_after.append_points_total,
+            wal_after.append_bytes_total,
+        ),
+        (
+            wal_before.append_series_definitions_total,
+            wal_before.append_sample_batches_total,
+            wal_before.append_points_total,
+            wal_before.append_bytes_total,
+        ),
+    );
+    assert!(storage
+        .select("future_skew_atomic_safe", &[], 0, 200)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .select("future_skew_atomic_too_far", &[], 0, 200)
+        .unwrap()
+        .is_empty());
+
+    let error = storage
+        .insert_rows(&[Row::new(
+            "future_skew_specific_error",
+            DataPoint::new(111, 4.0),
+        )])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::FutureSkewExceeded {
+            timestamp: 111,
+            cutoff: 110,
+        }
+    ));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn future_skew_limit_is_unset_by_default() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_current_time_override_for_tests(100)
+        .build()
+        .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "default_future_skew_acceptance",
+            DataPoint::new(10_000, 1.0),
+        )])
+        .unwrap();
+    assert_eq!(
+        storage
+            .select("default_future_skew_acceptance", &[], 0, 10_001)
+            .unwrap(),
+        vec![DataPoint::new(10_000, 1.0)]
+    );
+    let retention = storage.observability_snapshot().retention;
+    assert_eq!(retention.future_skew_points_total, 1);
+    assert_eq!(retention.future_skew_max_timestamp, Some(10_000));
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn write_limiter_respects_configured_timeout() {
     let storage = ChunkStorage::new_with_data_path_and_options(
         8,
@@ -71,6 +186,7 @@ fn write_limiter_respects_configured_timeout() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -106,6 +222,23 @@ fn write_limiter_respects_configured_timeout() {
             workers: 1
         }
     ));
+
+    let canonical = storage
+        .write_batch(
+            &[Row::new(
+                "canonical_write_timeout_metric",
+                DataPoint::new(1, 1.0),
+            )],
+            WriteMode::Atomic,
+        )
+        .expect("a safe timeout should be represented as a canonical rejection");
+    assert_eq!(canonical.accepted, 0);
+    assert_eq!(canonical.rejected, 1);
+    assert_eq!(canonical.acknowledgement, None);
+    let RowWriteStatus::Rejected(rejection) = &canonical.outcomes[0].status else {
+        panic!("the held writer permit must reject the canonical write");
+    };
+    assert_eq!(rejection.category, WriteRejectionCategory::WriteTimeout);
 }
 
 #[test]
@@ -122,6 +255,7 @@ fn wal_pressure_with_busy_writer_permit_returns_limit_error_not_timeout() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -171,6 +305,7 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
                 timestamp_precision: TimestampPrecision::Nanoseconds,
                 retention_window: i64::MAX,
                 future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+                max_future_skew_window: None,
                 retention_enforced: false,
                 runtime_mode: StorageRuntimeMode::ReadWrite,
                 partition_window: i64::MAX,
@@ -242,6 +377,7 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -307,6 +443,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 timestamp_precision: TimestampPrecision::Nanoseconds,
                 retention_window: i64::MAX,
                 future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+                max_future_skew_window: None,
                 retention_enforced: false,
                 runtime_mode: StorageRuntimeMode::ReadWrite,
                 partition_window: 10,
@@ -445,6 +582,15 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
             > before.flush.admission_pressure_relief_observed_total
     );
     assert!(
+        after.memory.pressure.backpressure_events_total
+            > before.memory.pressure.backpressure_events_total
+    );
+    assert_eq!(after.memory.pressure.active_backpressured_writers, 0);
+    assert_eq!(
+        after.memory.pressure.rejections_total,
+        before.memory.pressure.rejections_total
+    );
+    assert!(
         after.flush.persisted_segments_total > before.flush.persisted_segments_total,
         "background flush should persist the non-current head instead of fragmenting the live head",
     );
@@ -486,6 +632,7 @@ fn wal_admission_backpressure_rejects_without_flushing_current_head() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -618,6 +765,7 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
             future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+            max_future_skew_window: None,
             retention_enforced: false,
             runtime_mode: StorageRuntimeMode::ReadWrite,
             partition_window: i64::MAX,
@@ -676,6 +824,7 @@ fn close_blocks_until_in_flight_writer_releases_permit() {
                 timestamp_precision: TimestampPrecision::Nanoseconds,
                 retention_window: i64::MAX,
                 future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+                max_future_skew_window: None,
                 retention_enforced: false,
                 runtime_mode: StorageRuntimeMode::ReadWrite,
                 partition_window: i64::MAX,

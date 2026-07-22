@@ -12,27 +12,38 @@ use std::time::Duration;
 
 pub(crate) const DEFAULT_CHUNK_POINTS: usize = 2048;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Default number of simultaneously open time-partition heads retained for each series.
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
 
+/// Unit used to interpret timestamps and time-based storage settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimestampPrecision {
+    /// Timestamps are nanoseconds since the Unix epoch.
     Nanoseconds,
+    /// Timestamps are microseconds since the Unix epoch.
     Microseconds,
+    /// Timestamps are milliseconds since the Unix epoch.
     Milliseconds,
+    /// Timestamps are seconds since the Unix epoch.
     Seconds,
 }
 
+/// Determines whether a storage instance owns writable local state or reads remote segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageRuntimeMode {
+    /// Accept writes and maintain local persistent state when a data path is configured.
     #[default]
     ReadWrite,
+    /// Serve queries from an object-store-backed segment catalog without local writes.
     ComputeOnly,
 }
 
+/// Cache policy for segments discovered in object storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteSegmentCachePolicy {
+    /// Cache segment metadata while reading segment contents from the remote tier on demand.
     #[default]
     MetadataOnly,
 }
@@ -252,7 +263,7 @@ pub struct QueryRowsPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteAcknowledgement {
-    /// The write is visible in memory but was not protected by a crash-recovery log.
+    /// The write is visible in memory without a complete crash-recovery log guarantee.
     ///
     /// This is the conservative default for backends that do not expose stronger durability
     /// metadata at the API boundary, and for storage configured without a WAL.
@@ -262,16 +273,35 @@ pub enum WriteAcknowledgement {
     /// This is typical for [`WalSyncMode::Periodic`] before a later fsync or persistence step
     /// makes the write durable.
     Appended,
-    /// The write is known crash-safe when the call returns.
+    /// The configured core WAL synchronization contract completed before the call returned.
+    ///
+    /// This is tsink's strongest software acknowledgement. Actual crash survival still depends on
+    /// the filesystem, mount options, storage controller, and hardware honoring those operations.
     Durable,
 }
 
 impl WriteAcknowledgement {
+    /// Returns the weaker of two acknowledgement guarantees.
+    ///
+    /// This is used for batch results that combine independently acknowledged rows. The
+    /// guarantee order is [`WriteAcknowledgement::Volatile`], then
+    /// [`WriteAcknowledgement::Appended`], then [`WriteAcknowledgement::Durable`].
+    #[must_use]
+    pub const fn weakest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Volatile, _) | (_, Self::Volatile) => Self::Volatile,
+            (Self::Appended, _) | (_, Self::Appended) => Self::Appended,
+            (Self::Durable, Self::Durable) => Self::Durable,
+        }
+    }
+
+    /// Returns whether the acknowledgement records tsink's strongest software durability level.
     #[must_use]
     pub const fn is_durable(self) -> bool {
         matches!(self, Self::Durable)
     }
 
+    /// Returns the snake-case representation used by external adapters.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -282,36 +312,331 @@ impl WriteAcknowledgement {
     }
 }
 
+/// Maximum UTF-8 byte length of a diagnostic message in a [`WriteRejection`].
+///
+/// Messages longer than this limit are truncated at a character boundary. Callers should use
+/// [`WriteRejection::category`] for control flow; the bounded message is diagnostic only.
+pub const MAX_WRITE_REJECTION_MESSAGE_BYTES: usize = 512;
+
+/// Admission behavior for [`Storage::write_batch`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    /// Accept and commit every row as one unit, or reject every row.
+    Atomic,
+    /// Admit each row independently in input order and report every outcome.
+    BestEffort,
+}
+
+/// Machine-readable reason that a submitted row was not accepted.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteRejectionCategory {
+    /// The metric name is absent or invalid.
+    InvalidMetric,
+    /// One or more labels are invalid.
+    InvalidLabels,
+    /// The row's value cannot be stored for the target series.
+    UnsupportedValue,
+    /// The timestamp cannot be represented by the configured partition policy.
+    TimestampOutOfBounds,
+    /// The timestamp is older than the writable retention floor.
+    BelowRetentionFloor,
+    /// The timestamp exceeds the configured future-skew allowance.
+    FutureSkewExceeded,
+    /// Accepting the row would exceed the series-cardinality limit.
+    CardinalityLimitExceeded,
+    /// Creating the row's series would exceed a cardinality creation-rate limit.
+    CardinalityCreationRateExceeded,
+    /// The write could not be admitted within the memory budget.
+    MemoryPressure,
+    /// The write could not be admitted within the disk budget.
+    DiskQuotaExceeded,
+    /// The write could not be admitted within the WAL budget.
+    WalQuotaExceeded,
+    /// A database, tenant, or query policy rejected the write.
+    PolicyRejected,
+    /// The write could not acquire admission capacity before its deadline.
+    WriteTimeout,
+    /// The storage instance is closing or closed.
+    StorageClosed,
+    /// The storage instance is degraded or fenced against new writes.
+    StorageDegraded,
+    /// An internal persistence or I/O operation failed.
+    InternalIo,
+    /// An internal failure could not be represented more specifically.
+    Internal,
+}
+
+/// Structured rejection detail for one submitted row.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriteRejection {
+    /// Machine-readable rejection category.
+    pub category: WriteRejectionCategory,
+    /// Input index that caused a batch-wide rejection, when the engine can identify it.
+    ///
+    /// In best-effort mode this is the rejected row's own index. An atomic batch may reject all
+    /// rows without being able to identify which input caused the batch error.
+    pub cause_index: Option<usize>,
+    /// Bounded human-readable diagnostic detail.
+    pub message: String,
+}
+
+impl WriteRejection {
+    /// Creates a rejection and bounds its diagnostic message to
+    /// [`MAX_WRITE_REJECTION_MESSAGE_BYTES`] UTF-8 bytes.
+    #[must_use]
+    pub fn new(
+        category: WriteRejectionCategory,
+        cause_index: Option<usize>,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut message = message.into();
+        if message.len() > MAX_WRITE_REJECTION_MESSAGE_BYTES {
+            let mut boundary = MAX_WRITE_REJECTION_MESSAGE_BYTES;
+            while !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
+        }
+        Self {
+            category,
+            cause_index,
+            message,
+        }
+    }
+
+    pub(crate) fn from_error(error: &TsinkError, cause_index: Option<usize>) -> Self {
+        let category = match error {
+            TsinkError::MetricRequired | TsinkError::InvalidMetricName(_) => {
+                WriteRejectionCategory::InvalidMetric
+            }
+            TsinkError::InvalidLabel(_) => WriteRejectionCategory::InvalidLabels,
+            TsinkError::UnsupportedAggregation { .. } | TsinkError::ValueTypeMismatch { .. } => {
+                WriteRejectionCategory::UnsupportedValue
+            }
+            TsinkError::InvalidTimeRange { .. }
+            | TsinkError::PartitionNotFound { .. }
+            | TsinkError::InvalidPartition { .. }
+            | TsinkError::LateWritePartitionFanoutExceeded { .. } => {
+                WriteRejectionCategory::TimestampOutOfBounds
+            }
+            TsinkError::OutOfRetention { .. } => WriteRejectionCategory::BelowRetentionFloor,
+            TsinkError::FutureSkewExceeded { .. } => WriteRejectionCategory::FutureSkewExceeded,
+            TsinkError::CardinalityLimitExceeded { .. } => {
+                WriteRejectionCategory::CardinalityLimitExceeded
+            }
+            TsinkError::MemoryBudgetExceeded { .. } => WriteRejectionCategory::MemoryPressure,
+            TsinkError::InsufficientDiskSpace { .. }
+            | TsinkError::DiskQuotaExceeded { .. }
+            | TsinkError::InsufficientCompactionHeadroom { .. } => {
+                WriteRejectionCategory::DiskQuotaExceeded
+            }
+            TsinkError::WalSizeLimitExceeded { .. } => WriteRejectionCategory::WalQuotaExceeded,
+            TsinkError::WriteTimeout { .. } => WriteRejectionCategory::WriteTimeout,
+            TsinkError::StorageShuttingDown => WriteRejectionCategory::StorageDegraded,
+            TsinkError::StorageClosed => WriteRejectionCategory::StorageClosed,
+            TsinkError::ReadOnlyPartition { .. }
+            | TsinkError::InvalidConfiguration(_)
+            | TsinkError::UnsupportedOperation { .. } => WriteRejectionCategory::PolicyRejected,
+            TsinkError::DataCorruption(_)
+            | TsinkError::IoWithPath { .. }
+            | TsinkError::Io(_)
+            | TsinkError::MemoryMap { .. }
+            | TsinkError::Wal { .. }
+            | TsinkError::ChecksumMismatch { .. } => WriteRejectionCategory::InternalIo,
+            TsinkError::NoDataPoints { .. }
+            | TsinkError::LockPoisoned { .. }
+            | TsinkError::ChannelSend { .. }
+            | TsinkError::ChannelReceive { .. }
+            | TsinkError::ChannelTimeout { .. }
+            | TsinkError::Json(_)
+            | TsinkError::Bincode(_)
+            | TsinkError::Utf8(_)
+            | TsinkError::InvalidOffset { .. }
+            | TsinkError::Compression(_)
+            | TsinkError::Codec(_)
+            | TsinkError::Other(_) => WriteRejectionCategory::Internal,
+        };
+        Self::new(category, cause_index, error.to_string())
+    }
+}
+
+/// Acceptance state for one submitted row.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowWriteStatus {
+    /// The row was accepted and committed.
+    Accepted,
+    /// The row was not committed.
+    Rejected(WriteRejection),
+}
+
+/// Indexed outcome for one row submitted to [`Storage::write_batch`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowWriteOutcome {
+    /// Zero-based position of the row in the submitted slice.
+    pub index: usize,
+    /// Acceptance or structured rejection for this row.
+    pub status: RowWriteStatus,
+}
+
+impl RowWriteOutcome {
+    /// Creates an accepted outcome for `index`.
+    #[must_use]
+    pub const fn accepted(index: usize) -> Self {
+        Self {
+            index,
+            status: RowWriteStatus::Accepted,
+        }
+    }
+
+    /// Creates a rejected outcome for `index`.
+    #[must_use]
+    pub const fn rejected(index: usize, rejection: WriteRejection) -> Self {
+        Self {
+            index,
+            status: RowWriteStatus::Rejected(rejection),
+        }
+    }
+}
+
+/// Complete outcome of a canonical batch write.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchWriteResult {
+    /// Number of rows supplied by the caller.
+    pub submitted: usize,
+    /// Number of rows accepted and committed.
+    pub accepted: usize,
+    /// Number of rows rejected.
+    pub rejected: usize,
+    /// Weakest durability guarantee among accepted rows, or `None` when none were accepted.
+    pub acknowledgement: Option<WriteAcknowledgement>,
+    /// Exactly one outcome per submitted row, ordered by input index.
+    pub outcomes: Vec<RowWriteOutcome>,
+}
+
+impl BatchWriteResult {
+    /// Creates a batch result from ordered outcomes and their weakest acknowledgement.
+    ///
+    /// Counts are derived from `outcomes`. The acknowledgement is normalized to `None` when no
+    /// row was accepted.
+    #[must_use]
+    pub fn from_outcomes(
+        acknowledgement: Option<WriteAcknowledgement>,
+        outcomes: Vec<RowWriteOutcome>,
+    ) -> Self {
+        let submitted = outcomes.len();
+        let accepted = outcomes
+            .iter()
+            .filter(|outcome| matches!(&outcome.status, RowWriteStatus::Accepted))
+            .count();
+        Self {
+            submitted,
+            accepted,
+            rejected: submitted.saturating_sub(accepted),
+            acknowledgement: if accepted == 0 { None } else { acknowledgement },
+            outcomes,
+        }
+    }
+
+    /// Returns the canonical result for a successful empty no-op.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            submitted: 0,
+            accepted: 0,
+            rejected: 0,
+            acknowledgement: None,
+            outcomes: Vec::new(),
+        }
+    }
+}
+
+/// Result metadata returned by [`Storage::insert_rows_with_result`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WriteResult {
+    /// Durability established before the write call returned.
     pub acknowledgement: WriteAcknowledgement,
 }
 
 impl WriteResult {
+    /// Creates a result for an explicit acknowledgement level.
     #[must_use]
     pub const fn new(acknowledgement: WriteAcknowledgement) -> Self {
         Self { acknowledgement }
     }
 
+    /// Creates a result for a write without a complete WAL recovery guarantee.
     #[must_use]
     pub const fn volatile() -> Self {
         Self::new(WriteAcknowledgement::Volatile)
     }
 
+    /// Creates a result for a write appended to the WAL without the complete sync contract.
     #[must_use]
     pub const fn appended() -> Self {
         Self::new(WriteAcknowledgement::Appended)
     }
 
+    /// Creates a result for a write that completed the configured WAL synchronization contract.
     #[must_use]
     pub const fn durable() -> Self {
         Self::new(WriteAcknowledgement::Durable)
     }
 
+    /// Returns whether this result records tsink's strongest software durability level.
     #[must_use]
     pub const fn is_durable(self) -> bool {
         self.acknowledgement.is_durable()
     }
+}
+
+/// Effective storage-side limits reported by a built backend.
+///
+/// This snapshot is intentionally narrower than the planned resource-profile model. It reports
+/// controls that the backend currently enforces for storage writes. `None` means that no finite
+/// limit is enforced for that field when `reported_by_backend` is `true`; when it is `false`, the
+/// backend did not report its configuration and every optional value must be treated as unknown.
+///
+/// The accounted-memory limit is not a hard process-RSS cap. Inspect
+/// [`Storage::observability_snapshot`] for the categories included in and excluded from that
+/// accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveStorageLimits {
+    /// Whether the backend supplied the values in this snapshot.
+    pub reported_by_backend: bool,
+    /// Whether the backend owns local persistent storage for this instance.
+    pub persistent: bool,
+    /// Whether a local write-ahead log is active for this instance.
+    pub wal_enabled: bool,
+    /// Finite budget for the engine's accounted storage memory, in bytes.
+    pub accounted_memory_bytes: Option<u64>,
+    /// Finite total-series cardinality limit.
+    pub cardinality: Option<u64>,
+    /// Finite on-disk WAL byte limit. This is `None` when the WAL is inactive or unbounded.
+    pub wal_bytes: Option<u64>,
+    /// Finite byte limit enforced by the local data-directory coordinator.
+    ///
+    /// `None` means unbounded when this is a persistent, reporting backend, and inactive or
+    /// unknown otherwise.
+    pub local_disk_bytes: Option<u64>,
+    /// Filesystem free-space floor for the managed local data directory.
+    pub filesystem_free_headroom_bytes: Option<u64>,
+    /// Local-disk bytes reserved for maintenance temporary output.
+    pub maintenance_temp_reserve_bytes: Option<u64>,
+    /// Maximum writes admitted concurrently by the synchronous engine.
+    pub max_concurrent_writers: Option<u64>,
+    /// Maximum wait for a writer permit, in nanoseconds.
+    pub write_timeout_nanos: Option<u64>,
+    /// Maximum simultaneously active partition heads for one series.
+    pub max_active_partition_heads_per_series: Option<u64>,
 }
 
 /// Outcome metadata for a delete-series operation.
@@ -325,6 +650,10 @@ pub struct DeleteSeriesResult {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StorageObservabilitySnapshot {
+    /// Effective storage controls reported by the backend at snapshot time.
+    pub limits: EffectiveStorageLimits,
+    /// Shared local data-directory accounting, or `None` for unsupported/non-persistent backends.
+    pub local_disk: Option<crate::LocalDiskBudgetSnapshot>,
     pub memory: MemoryObservabilitySnapshot,
     pub wal: WalObservabilitySnapshot,
     pub retention: RetentionObservabilitySnapshot,
@@ -336,18 +665,69 @@ pub struct StorageObservabilitySnapshot {
     pub health: StorageHealthSnapshot,
 }
 
+/// Current pressure on the built-in engine's modeled, admitted memory scope.
+///
+/// This does not describe process RSS. [`MemoryPressureLevel::Degraded`] means the storage
+/// instance is degraded; it does not imply that memory pressure caused the degradation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPressureLevel {
+    /// Accounted usage is below the configured approaching-limit threshold, or is unlimited.
+    Normal,
+    /// Accounted usage has reached the published approaching-limit threshold.
+    ApproachingLimit,
+    /// At least one writer is currently waiting for accounted memory to be reclaimed.
+    Backpressured,
+    /// Accounted usage is at or above the finite budget, so growth must be rejected.
+    Rejecting,
+    /// The storage instance is degraded and its resource state requires operator attention.
+    Degraded,
+}
+
+/// Memory-pressure state and memory-specific admission counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryPressureSnapshot {
+    /// Current level, or `None` when the backend does not report memory pressure.
+    pub level: Option<MemoryPressureLevel>,
+    /// Approaching-limit threshold in basis points of the finite budget.
+    pub approaching_limit_basis_points: Option<u16>,
+    /// Resolved approaching-limit threshold in bytes.
+    pub approaching_limit_bytes: Option<u64>,
+    /// Writers currently delayed by an accounted-memory shortfall.
+    pub active_backpressured_writers: u64,
+    /// Writes that entered accounted-memory backpressure.
+    pub backpressure_events_total: u64,
+    /// Writes rejected with `MemoryBudgetExceeded`.
+    pub rejections_total: u64,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MemoryObservabilitySnapshot {
+    /// Modeled bytes charged to the storage memory budget.
+    pub accounted_bytes: usize,
+    /// Accounted bytes modeled from owned allocations, excluding virtual mapping lengths.
+    pub estimated_accounted_bytes: usize,
+    /// Backward-compatible alias for `accounted_bytes`.
     pub budgeted_bytes: usize,
+    /// Measured excluded bytes. Read this only when `excluded_bytes_known` is true.
     pub excluded_bytes: usize,
+    /// Whether `excluded_bytes` is a complete measurement of the named excluded categories.
+    pub excluded_bytes_known: bool,
+    /// Known categories outside the admitted storage-memory calculation.
+    pub excluded_categories: Vec<String>,
     pub active_and_sealed_bytes: usize,
     pub registry_bytes: usize,
     pub metadata_cache_bytes: usize,
     pub persisted_index_bytes: usize,
+    /// Full virtual length of persisted file mappings; this is not resident memory or RSS.
     #[serde(default)]
     pub persisted_mmap_bytes: usize,
     pub tombstone_bytes: usize,
+    /// Legacy field retained for compatibility. Persisted mappings are currently budgeted above.
     pub excluded_persisted_mmap_bytes: usize,
+    /// Current modeled-memory pressure and memory-specific admission counters.
+    pub pressure: MemoryPressureSnapshot,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -355,7 +735,7 @@ pub struct WalObservabilitySnapshot {
     pub enabled: bool,
     /// Configured WAL sync mode (`per-append`, `periodic`, or `disabled`).
     pub sync_mode: String,
-    /// Whether a successful write acknowledgement implies crash-safe durability immediately.
+    /// Whether the configured policy synchronizes every acknowledged non-empty write immediately.
     pub acknowledged_writes_durable: bool,
     pub size_bytes: u64,
     pub segment_count: u64,
@@ -572,6 +952,11 @@ pub struct RollupObservabilitySnapshot {
     pub policies: Vec<RollupPolicyStatus>,
 }
 
+/// Synchronous interface implemented by tsink storage backends.
+///
+/// Instances returned by [`StorageBuilder::build`] are shared trait objects and may be used from
+/// multiple threads. Call [`Storage::close`] explicitly when the host shuts down so persistence
+/// or worker-shutdown errors are returned to the caller.
 pub trait Storage: Send + Sync {
     /// Inserts rows into the storage.
     ///
@@ -584,13 +969,31 @@ pub trait Storage: Send + Sync {
     ///
     /// Backends that do not override this method conservatively report
     /// [`WriteAcknowledgement::Volatile`] for non-empty writes because they do not expose a
-    /// stronger crash-safety contract at the API boundary.
+    /// stronger durability metadata at the API boundary.
     fn insert_rows_with_result(&self, rows: &[Row]) -> Result<WriteResult> {
         self.insert_rows(rows)?;
         Ok(if rows.is_empty() {
             WriteResult::durable()
         } else {
             WriteResult::volatile()
+        })
+    }
+
+    /// Writes a batch with explicit atomic or best-effort admission semantics.
+    ///
+    /// Implementations return one ordered [`RowWriteOutcome`] for every submitted row. Expected
+    /// row rejections are represented in an `Ok` [`BatchWriteResult`]; the outer error is reserved
+    /// for failures for which trustworthy row outcomes cannot be reported. A successful empty
+    /// batch has no outcomes and no acknowledgement.
+    ///
+    /// Backends must opt in explicitly. The default does not delegate to the compatibility
+    /// [`Storage::insert_rows`] method because that method cannot prove indexed outcomes or atomic
+    /// rollback behavior.
+    fn write_batch(&self, _rows: &[Row], _mode: WriteMode) -> Result<BatchWriteResult> {
+        Err(TsinkError::UnsupportedOperation {
+            operation: "write_batch",
+            reason: "canonical indexed batch outcomes are not implemented by this storage backend"
+                .to_string(),
         })
     }
 
@@ -953,6 +1356,14 @@ pub trait Storage: Send + Sync {
         0
     }
 
+    /// Reports the storage-side limits enforced by this backend.
+    ///
+    /// Third-party backends receive an unreported default. They should override this method only
+    /// for limits they actually enforce, not for advisory targets.
+    fn effective_storage_limits(&self) -> EffectiveStorageLimits {
+        EffectiveStorageLimits::default()
+    }
+
     /// Returns configured in-memory byte budget for the storage engine.
     ///
     /// `usize::MAX` means "no explicit budget configured".
@@ -961,7 +1372,10 @@ pub trait Storage: Send + Sync {
     }
 
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
-        StorageObservabilitySnapshot::default()
+        StorageObservabilitySnapshot {
+            limits: self.effective_storage_limits(),
+            ..StorageObservabilitySnapshot::default()
+        }
     }
 
     fn apply_rollup_policies(
@@ -981,22 +1395,36 @@ pub trait Storage: Send + Sync {
 
     /// Writes an atomic on-disk snapshot to `destination`.
     ///
-    /// Snapshot support is backend-specific and may not be available for all storage
-    /// implementations.
+    /// The built-in persistent backend requires a destination that does not already exist and
+    /// publishes the completed snapshot as a directory. Snapshot support is backend-specific and
+    /// may not be available for all storage implementations. Restore built-in snapshots with
+    /// [`StorageBuilder::restore_from_snapshot`].
     fn snapshot(&self, _destination: &Path) -> Result<()> {
         Err(TsinkError::InvalidConfiguration(
             "snapshot is not implemented for this storage backend".to_string(),
         ))
     }
 
+    /// Flushes pending state and shuts down resources owned by this storage instance.
+    ///
+    /// A successful close ends the instance's lifecycle; subsequent operations return
+    /// [`TsinkError::StorageClosed`] for the built-in backend. Explicit close is preferred over
+    /// relying on drop because it lets the embedder handle shutdown failures.
     fn close(&self) -> Result<()>;
 }
 
+/// Configures and opens the built-in storage engine.
+///
+/// The default builder creates read-write storage and uses nanosecond timestamps. Without a
+/// [`StorageBuilder::with_data_path`], storage is in-memory and no on-disk WAL is opened. The
+/// default configuration does not impose explicit finite memory, cardinality, or WAL-size limits;
+/// constrained hosts should set those limits before calling [`StorageBuilder::build`].
 pub struct StorageBuilder {
     data_path: Option<PathBuf>,
     object_store_path: Option<PathBuf>,
     retention: Duration,
     retention_enforced: bool,
+    max_future_skew: Option<Duration>,
     hot_tier_retention: Option<Duration>,
     warm_tier_retention: Option<Duration>,
     runtime_mode: StorageRuntimeMode,
@@ -1013,6 +1441,10 @@ pub struct StorageBuilder {
     cardinality_limit: usize,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
+    local_disk_limit_bytes: Option<u64>,
+    filesystem_free_headroom_bytes: u64,
+    maintenance_temp_reserve_bytes: u64,
+    shared_local_disk_budget: Option<std::sync::Arc<crate::LocalDiskBudget>>,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
     wal_replay_mode: WalReplayMode,
@@ -1031,6 +1463,7 @@ impl Default for StorageBuilder {
             object_store_path: None,
             retention: Duration::from_secs(14 * 24 * 3600),
             retention_enforced: false,
+            max_future_skew: None,
             hot_tier_retention: None,
             warm_tier_retention: None,
             runtime_mode: StorageRuntimeMode::ReadWrite,
@@ -1047,6 +1480,10 @@ impl Default for StorageBuilder {
             cardinality_limit: usize::MAX,
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
+            local_disk_limit_bytes: None,
+            filesystem_free_headroom_bytes: 0,
+            maintenance_temp_reserve_bytes: 0,
+            shared_local_disk_budget: None,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
             wal_replay_mode: WalReplayMode::Strict,
@@ -1061,11 +1498,16 @@ impl Default for StorageBuilder {
 }
 
 impl StorageBuilder {
+    /// Creates a builder with the defaults described on [`StorageBuilder`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the directory used for local segments, metadata, and the WAL.
+    ///
+    /// Building opens or creates this directory, recovers compatible existing state, and acquires
+    /// the built-in backend's process lock for the storage lifecycle.
     #[must_use]
     pub fn with_data_path(mut self, path: impl AsRef<Path>) -> Self {
         self.data_path = Some(path.as_ref().to_path_buf());
@@ -1082,6 +1524,10 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets the retention window and enables retention enforcement.
+    ///
+    /// Use [`StorageBuilder::with_retention_enforced`] afterwards to configure a window without
+    /// enforcing it.
     #[must_use]
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
@@ -1096,6 +1542,17 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_retention_enforced(mut self, enforced: bool) -> Self {
         self.retention_enforced = enforced;
+        self
+    }
+
+    /// Rejects samples farther than `max_future_skew` ahead of the storage clock.
+    ///
+    /// This policy is opt in. By default, future timestamps remain accepted and are only tracked
+    /// by the engine's future-skew observability and bounded-recency logic. The duration is
+    /// converted using the configured [`TimestampPrecision`] when the storage is built.
+    #[must_use]
+    pub fn with_max_future_skew(mut self, max_future_skew: Duration) -> Self {
+        self.max_future_skew = Some(max_future_skew);
         self
     }
 
@@ -1119,42 +1576,55 @@ impl StorageBuilder {
         self
     }
 
+    /// Selects the read-write or compute-only runtime mode.
     #[must_use]
     pub fn with_runtime_mode(mut self, mode: StorageRuntimeMode) -> Self {
         self.runtime_mode = mode;
         self
     }
 
+    /// Selects how segments discovered in remote storage are cached locally.
     #[must_use]
     pub fn with_remote_segment_cache_policy(mut self, policy: RemoteSegmentCachePolicy) -> Self {
         self.remote_segment_cache_policy = policy;
         self
     }
 
+    /// Sets how often storage refreshes its remote segment catalog.
+    ///
+    /// Intervals below one millisecond are normalized to one millisecond.
     #[must_use]
     pub fn with_remote_segment_refresh_interval(mut self, interval: Duration) -> Self {
         self.remote_segment_refresh_interval = interval.max(Duration::from_millis(1));
         self
     }
 
+    /// Controls whether newly persisted hot segments are mirrored to object storage.
     #[must_use]
     pub fn with_mirror_hot_segments_to_object_store(mut self, enabled: bool) -> Self {
         self.mirror_hot_segments_to_object_store = enabled;
         self
     }
 
+    /// Sets the unit used for sample timestamps and duration-based engine settings.
     #[must_use]
     pub fn with_timestamp_precision(mut self, precision: TimestampPrecision) -> Self {
         self.timestamp_precision = precision;
         self
     }
 
+    /// Sets the target number of points per encoded chunk.
+    ///
+    /// The value is clamped to the range `1..=u16::MAX`.
     #[must_use]
     pub fn with_chunk_points(mut self, points: usize) -> Self {
         self.chunk_points = points.clamp(1, u16::MAX as usize);
         self
     }
 
+    /// Sets the maximum number of writes admitted concurrently.
+    ///
+    /// Passing zero selects the cgroup-aware worker default.
     #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
         self.max_writers = if max_writers == 0 {
@@ -1165,12 +1635,14 @@ impl StorageBuilder {
         self
     }
 
+    /// Sets how long writes and lifecycle operations wait to acquire writer permits.
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
     }
 
+    /// Sets the width of the active time partitions used for ingestion.
     #[must_use]
     pub fn with_partition_duration(mut self, duration: Duration) -> Self {
         self.partition_duration = duration;
@@ -1190,10 +1662,17 @@ impl StorageBuilder {
         self
     }
 
-    /// Sets a global in-memory byte budget for active + sealed chunks.
+    /// Sets the modeled storage-memory budget.
     ///
-    /// When exceeded, the engine applies backpressure by persisting sealed chunks to L0
-    /// and evicting the oldest sealed chunks from RAM before admitting new writes.
+    /// The budget charges active and sealed chunks, registry and metadata state, persisted indexes
+    /// and virtual mapping lengths, and tombstones. It excludes query working sets, write and WAL
+    /// staging, thread stacks, allocator overhead, and adapter state, so it is not a process-RSS
+    /// cap. [`Storage::observability_snapshot`] exposes the exact current category inventory and
+    /// pressure state.
+    ///
+    /// When a write would exceed the modeled budget, the engine applies backpressure by persisting
+    /// sealed chunks to L0 and evicting the oldest sealed chunks before rejecting the write.
+    /// The builder default is `usize::MAX`, meaning no explicit budget is configured.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.memory_limit_bytes = bytes;
@@ -1203,12 +1682,16 @@ impl StorageBuilder {
     /// Sets a hard upper bound for total series cardinality.
     ///
     /// New metric+label combinations are rejected once the limit is reached.
+    /// The builder default is `usize::MAX`, meaning no explicit limit is configured.
     #[must_use]
     pub fn with_cardinality_limit(mut self, series: usize) -> Self {
         self.cardinality_limit = series;
         self
     }
 
+    /// Enables or disables the WAL for persistent read-write storage.
+    ///
+    /// The WAL is enabled by default, but is only opened when a data path is configured.
     #[must_use]
     pub fn with_wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
@@ -1217,19 +1700,74 @@ impl StorageBuilder {
 
     /// Sets a hard upper bound for on-disk WAL bytes across all WAL segments.
     ///
-    /// `usize::MAX` disables the limit.
+    /// `usize::MAX`, the builder default, disables the limit.
     #[must_use]
     pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
         self.wal_size_limit_bytes = bytes;
         self
     }
 
+    /// Sets a hard upper bound for local data-directory growth admitted by tsink's coordinator.
+    ///
+    /// Existing directories above a newly configured limit may still be opened for recovery and
+    /// deletion, but new growth is rejected. The bound is enforced only for persistent read-write
+    /// storage and requires [`StorageBuilder::with_data_path`]. Object-store roots and snapshot
+    /// destinations outside the data directory are not included.
+    #[must_use]
+    pub fn with_local_disk_limit(mut self, bytes: u64) -> Self {
+        self.local_disk_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Sets filesystem free space that tsink must leave available for the host.
+    ///
+    /// This physical-space floor is enforced in addition to the logical local-disk limit. Normal
+    /// writes must also leave the maintenance temporary reserve available.
+    #[must_use]
+    pub fn with_filesystem_free_headroom(mut self, bytes: u64) -> Self {
+        self.filesystem_free_headroom_bytes = bytes;
+        self
+    }
+
+    /// Reserves local-disk bytes for compaction and other maintenance temporary output.
+    ///
+    /// Foreground growth cannot consume this reserve. Maintenance may use it while still honoring
+    /// the global local-disk limit and filesystem free-space headroom.
+    #[must_use]
+    pub fn with_maintenance_temp_reserve(mut self, bytes: u64) -> Self {
+        self.maintenance_temp_reserve_bytes = bytes;
+        self
+    }
+
+    /// Installs a pre-created local-disk coordinator for this core data path.
+    ///
+    /// This lets an adapter create and retain the coordinator used by core storage. It does not
+    /// automatically govern independent adapter files or filesystem writes that bypass the
+    /// coordinator. The coordinator root must exactly match the configured data path. Its limits
+    /// become the builder's effective disk settings.
+    #[must_use]
+    pub fn with_shared_local_disk_budget(
+        mut self,
+        budget: std::sync::Arc<crate::LocalDiskBudget>,
+    ) -> Self {
+        let limits = budget.limits();
+        self.local_disk_limit_bytes = limits.max_bytes;
+        self.filesystem_free_headroom_bytes = limits.filesystem_free_headroom_bytes;
+        self.maintenance_temp_reserve_bytes = limits.maintenance_temp_reserve_bytes;
+        self.shared_local_disk_budget = Some(budget);
+        self
+    }
+
+    /// Sets the byte capacity of the userspace WAL writer buffer.
+    ///
+    /// A zero value is normalized to a one-byte buffer when the WAL is opened.
     #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
         self.wal_buffer_size = size;
         self
     }
 
+    /// Selects when successful WAL appends are synchronized to durable storage.
     #[must_use]
     pub fn with_wal_sync_mode(mut self, mode: WalSyncMode) -> Self {
         self.wal_sync_mode = mode;
@@ -1256,6 +1794,9 @@ impl StorageBuilder {
         self
     }
 
+    /// Enables the metadata shard index used by bounded shard-scoped discovery APIs.
+    ///
+    /// A shard count of zero disables the index.
     #[must_use]
     pub fn with_metadata_shard_count(mut self, shard_count: u32) -> Self {
         self.metadata_shard_count = Some(shard_count);
@@ -1276,10 +1817,19 @@ impl StorageBuilder {
         self
     }
 
+    /// Opens the configured storage and starts any background workers it owns.
+    ///
+    /// The returned [`Arc`] may be shared between host threads. Call [`Storage::close`] once the
+    /// host has stopped submitting work and before discarding its storage handles.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
         crate::engine::build_storage(self)
     }
 
+    /// Restores a snapshot directory into `data_path`.
+    ///
+    /// Perform restoration before opening storage at the target path. If `data_path` already
+    /// exists, a successful restore replaces it; activation uses staging and attempts rollback if
+    /// the replacement fails.
     pub fn restore_from_snapshot(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,
@@ -1301,6 +1851,10 @@ impl StorageBuilder {
 
     pub(crate) fn retention_enforced(&self) -> bool {
         self.retention_enforced
+    }
+
+    pub(crate) fn max_future_skew(&self) -> Option<Duration> {
+        self.max_future_skew
     }
 
     pub(crate) fn object_store_path(&self) -> Option<&Path> {
@@ -1365,6 +1919,20 @@ impl StorageBuilder {
 
     pub(crate) fn wal_size_limit_bytes(&self) -> usize {
         self.wal_size_limit_bytes
+    }
+
+    pub(crate) fn local_disk_limits(&self) -> crate::LocalDiskLimits {
+        crate::LocalDiskLimits {
+            max_bytes: self.local_disk_limit_bytes,
+            filesystem_free_headroom_bytes: self.filesystem_free_headroom_bytes,
+            maintenance_temp_reserve_bytes: self.maintenance_temp_reserve_bytes,
+        }
+    }
+
+    pub(crate) fn shared_local_disk_budget(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::LocalDiskBudget>> {
+        self.shared_local_disk_budget.as_ref()
     }
 
     pub(crate) fn wal_buffer_size(&self) -> usize {

@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use tsink_core::Storage;
 
+use crate::enums::UWriteMode;
 use crate::error::{Result, TsinkUniFFIError};
 use crate::query::{UQueryOptions, USeriesSelection};
 use crate::types::{
-    UDataPoint, UDeleteSeriesResult, ULabel, ULabeledDataPoints, UMetadataShardScope,
-    UMetricSeries, UQueryRowsPage, UQueryRowsScanOptions, URollupObservabilitySnapshot,
-    URollupPolicy, URow, USeriesPoints, UShardWindowDigest, UShardWindowRowsPage,
-    UShardWindowScanOptions, UStorageObservabilitySnapshot, UWriteResult,
+    UBatchWriteResult, UDataPoint, UDeleteSeriesResult, UEffectiveStorageLimits, ULabel,
+    ULabeledDataPoints, UMetadataShardScope, UMetricSeries, UQueryRowsPage, UQueryRowsScanOptions,
+    URollupObservabilitySnapshot, URollupPolicy, URow, USeriesPoints, UShardWindowDigest,
+    UShardWindowRowsPage, UShardWindowScanOptions, UStorageObservabilitySnapshot, UWriteResult,
 };
 
 #[derive(uniffi::Object)]
@@ -42,6 +43,14 @@ impl TsinkDB {
         let rows: Vec<tsink_core::Row> = rows.into_iter().map(Into::into).collect();
         self.storage
             .insert_rows_with_result(&rows)
+            .map(Into::into)
+            .map_err(TsinkUniFFIError::from)
+    }
+
+    pub fn write_batch(&self, rows: Vec<URow>, mode: UWriteMode) -> Result<UBatchWriteResult> {
+        let rows: Vec<tsink_core::Row> = rows.into_iter().map(Into::into).collect();
+        self.storage
+            .write_batch(&rows, mode.into())
             .map(Into::into)
             .map_err(TsinkUniFFIError::from)
     }
@@ -210,6 +219,10 @@ impl TsinkDB {
 
     pub fn memory_budget(&self) -> u64 {
         self.storage.memory_budget() as u64
+    }
+
+    pub fn effective_storage_limits(&self) -> UEffectiveStorageLimits {
+        self.storage.effective_storage_limits().into()
     }
 
     pub fn observability_snapshot(&self) -> UStorageObservabilitySnapshot {

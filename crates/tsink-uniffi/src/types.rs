@@ -1,6 +1,7 @@
 use crate::enums::{
-    UAggregation, UHistogramCount, UHistogramResetHint, URemoteSegmentCachePolicy,
-    USeriesMatcherOp, UStorageRuntimeMode, UValue, UWriteAcknowledgement,
+    UAggregation, UDiskCategory, UHistogramCount, UHistogramResetHint, UMemoryPressureLevel,
+    URemoteSegmentCachePolicy, URowWriteStatus, USeriesMatcherOp, UStorageRuntimeMode, UValue,
+    UWriteAcknowledgement, UWriteRejectionCategory,
 };
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -132,15 +133,96 @@ pub struct UWriteResult {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct UWriteRejection {
+    pub category: UWriteRejectionCategory,
+    pub cause_index: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct URowWriteOutcome {
+    pub index: u64,
+    pub status: URowWriteStatus,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UBatchWriteResult {
+    pub submitted: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub acknowledgement: Option<UWriteAcknowledgement>,
+    pub outcomes: Vec<URowWriteOutcome>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct UDeleteSeriesResult {
     pub matched_series: u64,
     pub tombstones_applied: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct UEffectiveStorageLimits {
+    pub reported_by_backend: bool,
+    pub persistent: bool,
+    pub wal_enabled: bool,
+    pub accounted_memory_bytes: Option<u64>,
+    pub cardinality: Option<u64>,
+    pub wal_bytes: Option<u64>,
+    pub local_disk_bytes: Option<u64>,
+    pub filesystem_free_headroom_bytes: Option<u64>,
+    pub maintenance_temp_reserve_bytes: Option<u64>,
+    pub max_concurrent_writers: Option<u64>,
+    pub write_timeout_nanos: Option<u64>,
+    pub max_active_partition_heads_per_series: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ULocalDiskLimits {
+    pub max_bytes: Option<u64>,
+    pub filesystem_free_headroom_bytes: u64,
+    pub maintenance_temp_reserve_bytes: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UDiskCategoryUsage {
+    pub category: UDiskCategory,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ULocalDiskBudgetSnapshot {
+    pub limits: ULocalDiskLimits,
+    pub accounted_bytes: u64,
+    pub reserved_bytes: u64,
+    pub maintenance_reserved_bytes: u64,
+    pub unknown_bytes: u64,
+    pub filesystem_available_bytes: Option<u64>,
+    pub over_limit: bool,
+    pub active_reservations: u64,
+    pub rejections_total: u64,
+    pub reconciliations_total: u64,
+    pub reservation_overruns_total: u64,
+    pub categories: Vec<UDiskCategoryUsage>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UMemoryPressureSnapshot {
+    pub level: Option<UMemoryPressureLevel>,
+    pub approaching_limit_basis_points: Option<u16>,
+    pub approaching_limit_bytes: Option<u64>,
+    pub active_backpressured_writers: u64,
+    pub backpressure_events_total: u64,
+    pub rejections_total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct UMemoryObservabilitySnapshot {
+    pub accounted_bytes: u64,
+    pub estimated_accounted_bytes: u64,
     pub budgeted_bytes: u64,
     pub excluded_bytes: u64,
+    pub excluded_bytes_known: bool,
+    pub excluded_categories: Vec<String>,
     pub active_and_sealed_bytes: u64,
     pub registry_bytes: u64,
     pub metadata_cache_bytes: u64,
@@ -148,6 +230,7 @@ pub struct UMemoryObservabilitySnapshot {
     pub persisted_mmap_bytes: u64,
     pub tombstone_bytes: u64,
     pub excluded_persisted_mmap_bytes: u64,
+    pub pressure: UMemoryPressureSnapshot,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -339,6 +422,8 @@ pub struct URollupObservabilitySnapshot {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UStorageObservabilitySnapshot {
+    pub limits: UEffectiveStorageLimits,
+    pub local_disk: Option<ULocalDiskBudgetSnapshot>,
     pub memory: UMemoryObservabilitySnapshot,
     pub wal: UWalObservabilitySnapshot,
     pub retention: URetentionObservabilitySnapshot,

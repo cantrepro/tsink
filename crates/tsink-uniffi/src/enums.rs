@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::types::UNativeHistogram;
+use crate::types::{UNativeHistogram, UWriteRejection};
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum UValue {
@@ -58,6 +58,31 @@ pub enum UStorageRuntimeMode {
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
+pub enum UMemoryPressureLevel {
+    Normal,
+    ApproachingLimit,
+    Backpressured,
+    Rejecting,
+    Degraded,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UDiskCategory {
+    Wal,
+    Segments,
+    Registry,
+    Tombstones,
+    Rollups,
+    Metadata,
+    Exemplars,
+    Cluster,
+    EdgeSync,
+    ServerState,
+    Temporary,
+    Unknown,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum URemoteSegmentCachePolicy {
     MetadataOnly,
 }
@@ -87,4 +112,37 @@ pub enum UWriteAcknowledgement {
     Volatile,
     Appended,
     Durable,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UWriteMode {
+    Atomic,
+    BestEffort,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum UWriteRejectionCategory {
+    InvalidMetric,
+    InvalidLabels,
+    UnsupportedValue,
+    TimestampOutOfBounds,
+    BelowRetentionFloor,
+    FutureSkewExceeded,
+    CardinalityLimitExceeded,
+    CardinalityCreationRateExceeded,
+    MemoryPressure,
+    DiskQuotaExceeded,
+    WalQuotaExceeded,
+    PolicyRejected,
+    WriteTimeout,
+    StorageClosed,
+    StorageDegraded,
+    InternalIo,
+    Internal,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum URowWriteStatus {
+    Accepted,
+    Rejected { rejection: UWriteRejection },
 }

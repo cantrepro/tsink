@@ -21,6 +21,13 @@ fn startup_builder(data_path: &Path) -> StorageBuilder {
         .with_chunk_points(2)
 }
 
+fn planning_error(builder: &StorageBuilder) -> TsinkError {
+    match StartupPlanningPhase::prepare(builder) {
+        Ok(_) => panic!("expected startup planning to fail"),
+        Err(err) => err,
+    }
+}
+
 fn inventory_entry(root: impl Into<PathBuf>, segment_id: u64) -> SegmentInventoryEntry {
     SegmentInventoryEntry {
         lane: SegmentLaneFamily::Numeric,
@@ -128,6 +135,91 @@ fn build_storage_returns_structured_error_for_invalid_data_path() {
     assert!(matches!(
         err,
         TsinkError::Io(_) | TsinkError::IoWithPath { .. }
+    ));
+}
+
+#[test]
+fn planning_rejects_invalid_local_disk_limit_relationships() {
+    let temp_dir = TempDir::new().unwrap();
+    let cases = [
+        (0, 0, "local disk limit must be greater than zero"),
+        (
+            100,
+            100,
+            "maintenance temporary reserve 100 must be smaller than local disk limit 100",
+        ),
+        (
+            100,
+            101,
+            "maintenance temporary reserve 101 must be smaller than local disk limit 100",
+        ),
+    ];
+
+    for (index, (limit, reserve, expected)) in cases.into_iter().enumerate() {
+        let builder = startup_builder(&temp_dir.path().join(format!("case-{index}")))
+            .with_local_disk_limit(limit)
+            .with_maintenance_temp_reserve(reserve);
+        let err = planning_error(&builder);
+        assert!(
+            matches!(err, TsinkError::InvalidConfiguration(ref message) if message.contains(expected)),
+            "unexpected planning error: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn planning_rejects_shared_disk_budget_for_a_different_data_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let limits = crate::LocalDiskLimits {
+        max_bytes: Some(1_000),
+        ..crate::LocalDiskLimits::default()
+    };
+    let shared = crate::LocalDiskBudget::open(temp_dir.path().join("shared"), limits).unwrap();
+    let builder =
+        startup_builder(&temp_dir.path().join("different")).with_shared_local_disk_budget(shared);
+
+    let err = planning_error(&builder);
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("shared local disk budget root")
+                && message.contains("does not match data path")
+    ));
+}
+
+#[test]
+fn planning_rejects_wal_sublimit_above_normal_disk_growth_capacity() {
+    let temp_dir = TempDir::new().unwrap();
+    let valid_builder = startup_builder(&temp_dir.path().join("valid"))
+        .with_local_disk_limit(1_000)
+        .with_maintenance_temp_reserve(200)
+        .with_wal_size_limit(800);
+    StartupPlanningPhase::prepare(&valid_builder).unwrap();
+
+    let invalid_builder = startup_builder(&temp_dir.path().join("invalid"))
+        .with_local_disk_limit(1_000)
+        .with_maintenance_temp_reserve(200)
+        .with_wal_size_limit(801);
+    let err = planning_error(&invalid_builder);
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("WAL size limit 801 exceeds local disk growth capacity 800")
+    ));
+}
+
+#[test]
+fn planning_rejects_object_store_nested_under_the_managed_data_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let builder = startup_builder(&data_path).with_object_store_path(data_path.join("remote"));
+
+    let err = planning_error(&builder);
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("object store path")
+                && message.contains("must be outside managed local data path")
     ));
 }
 
