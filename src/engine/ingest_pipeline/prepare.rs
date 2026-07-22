@@ -7,7 +7,7 @@ use super::super::super::{
     Result, SeriesDefinitionFrame, SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily,
     SeriesVisibilitySummary, TsinkError, ValueLane, WriteAdmissionControlContext,
     WritePrepareContext, WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext,
-    WritePrepareWalContext,
+    WritePrepareWalContext, STORAGE_OPEN,
 };
 use super::apply::WriteApplier;
 use super::phases::{
@@ -275,6 +275,21 @@ impl<'a> WritePrepareWalContext<'a> {
 }
 
 impl<'a> WriteAdmissionControlContext<'a> {
+    fn ensure_accepting_writes(self) -> Result<()> {
+        if self
+            .observability
+            .health
+            .fail_fast_triggered
+            .load(Ordering::SeqCst)
+        {
+            return Err(TsinkError::StorageShuttingDown);
+        }
+        if self.lifecycle.load(Ordering::SeqCst) != STORAGE_OPEN {
+            return Err(TsinkError::StorageClosed);
+        }
+        Ok(())
+    }
+
     fn request_admission_pressure_relief(self) -> bool {
         let Some(_backpressure_guard) = self.admission_backpressure_lock.try_lock() else {
             return false;
@@ -311,6 +326,11 @@ impl<'a> WriteAdmissionControlContext<'a> {
         let mut relief_requested = false;
 
         loop {
+            // A writer owns a limiter permit while it waits here. Shutdown pauses the workers
+            // that could relieve pressure before draining those permits, so continuing to poll
+            // after the lifecycle transition would hold close() hostage until the write timeout.
+            self.ensure_accepting_writes()?;
+
             if let Some((budget, _required)) =
                 memory_budget.shortfall(estimated_memory_growth_bytes)
             {

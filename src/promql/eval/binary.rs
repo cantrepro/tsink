@@ -296,8 +296,10 @@ fn combine_vector_samples(
             sample.value = if matched { 1.0 } else { 0.0 };
         } else if !matched {
             return Ok(None);
-        } else if !result_on_rhs && expr.matching.as_ref().is_some_and(|m| m.on) {
-            sample.metric.clear();
+        } else {
+            // Comparison filters always propagate the left-hand value, even
+            // for group_right, where the output labels come from the RHS.
+            sample.value = lhs.value;
         }
     } else {
         sample.metric.clear();
@@ -305,10 +307,14 @@ fn combine_vector_samples(
     }
 
     if let Some(matching) = expr.matching.as_ref() {
+        if matching.cardinality == VectorMatchCardinality::OneToOne {
+            apply_one_to_one_output_matching(&mut sample, matching);
+        }
+
         if result_on_rhs {
-            include_labels_from_one_side(&mut sample.labels, lhs, &matching.include_labels);
+            include_labels_from_one_side(&mut sample, lhs, &matching.include_labels);
         } else if matching.cardinality == VectorMatchCardinality::ManyToOne {
-            include_labels_from_one_side(&mut sample.labels, rhs, &matching.include_labels);
+            include_labels_from_one_side(&mut sample, rhs, &matching.include_labels);
         }
     }
 
@@ -362,7 +368,12 @@ fn sample_key(sample: &Sample, matching: Option<&VectorMatching>) -> Vec<u8> {
                 .filter(|l| wanted.contains(l.name.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            canonical_series_identity("", &selected)
+            let metric = if wanted.contains("__name__") {
+                sample.metric.as_str()
+            } else {
+                ""
+            };
+            canonical_series_identity(metric, &selected)
         }
         Some(m) => {
             let ignored: BTreeSet<&str> = m.labels.iter().map(|s| s.as_str()).collect();
@@ -404,15 +415,41 @@ fn matching_cardinality(matching: Option<&VectorMatching>) -> VectorMatchCardina
         .unwrap_or(VectorMatchCardinality::OneToOne)
 }
 
-fn include_labels_from_one_side(base: &mut Vec<Label>, source: &Sample, labels: &[String]) {
+fn apply_one_to_one_output_matching(sample: &mut Sample, matching: &VectorMatching) {
+    let labels: BTreeSet<&str> = matching.labels.iter().map(String::as_str).collect();
+    if matching.on {
+        sample
+            .labels
+            .retain(|label| labels.contains(label.name.as_str()));
+        if !labels.contains("__name__") {
+            sample.metric.clear();
+        }
+    } else {
+        sample
+            .labels
+            .retain(|label| !labels.contains(label.name.as_str()));
+        if labels.contains("__name__") {
+            sample.metric.clear();
+        }
+    }
+}
+
+fn include_labels_from_one_side(base: &mut Sample, source: &Sample, labels: &[String]) {
     for label_name in labels {
+        if label_name == "__name__" {
+            base.metric.clone_from(&source.metric);
+            continue;
+        }
+
         if let Some(value) = source
             .labels
             .iter()
             .find(|label| label.name == *label_name)
             .map(|label| label.value.clone())
         {
-            set_label(base, label_name, &value);
+            set_label(&mut base.labels, label_name, &value);
+        } else {
+            base.labels.retain(|label| label.name != *label_name);
         }
     }
 }

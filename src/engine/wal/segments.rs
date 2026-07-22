@@ -88,13 +88,16 @@ impl FramedWal {
             operation: "open".to_string(),
             details: "missing WAL segment after initialization".to_string(),
         })?;
+        let published_highwater_path = published_highwater_path(&dir);
+        let published_highwater_tmp_path = published_highwater_tmp_path(&dir);
+        let existing_published_highwater = read_published_highwater(&published_highwater_path)?;
+        if let Some(published_highwater) = existing_published_highwater {
+            discard_unpublished_suffixes(&segments, published_highwater)?;
+        }
         let recovery = scan_segments_for_open(&segments)?;
         let mut active_last_seq = recovery.active_segment_last_seq;
         let last_highwater = recovery.last_highwater;
 
-        let published_highwater_path = published_highwater_path(&dir);
-        let published_highwater_tmp_path = published_highwater_tmp_path(&dir);
-        let existing_published_highwater = read_published_highwater(&published_highwater_path)?;
         let published_highwater = existing_published_highwater.unwrap_or(last_highwater);
         let writer_file = if recovery.quarantine_active_segment {
             let quarantined_segment = active.id;
@@ -388,6 +391,109 @@ fn read_published_highwater(path: &Path) -> Result<Option<WalHighWatermark>> {
         Ok(bytes) => decode_published_highwater(&bytes).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
+    }
+}
+
+fn discard_unpublished_suffixes(
+    segments: &[WalSegmentFile],
+    published_highwater: WalHighWatermark,
+) -> Result<()> {
+    for segment in segments {
+        let truncate_len = match segment.id.cmp(&published_highwater.segment) {
+            std::cmp::Ordering::Less => continue,
+            std::cmp::Ordering::Equal => {
+                published_prefix_len(&segment.path, published_highwater.frame)?
+            }
+            std::cmp::Ordering::Greater => Some(0),
+        };
+
+        let Some(truncate_len) = truncate_len else {
+            continue;
+        };
+        let current_len = match fs::metadata(&segment.path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if current_len <= truncate_len {
+            continue;
+        }
+
+        let file = OpenOptions::new().write(true).open(&segment.path)?;
+        file.set_len(truncate_len)?;
+        file.sync_data()?;
+        warn!(
+            segment = segment.id,
+            path = %segment.path.display(),
+            published_segment = published_highwater.segment,
+            published_frame = published_highwater.frame,
+            discarded_bytes = current_len.saturating_sub(truncate_len),
+            "WAL open discarded unpublished suffix"
+        );
+    }
+
+    Ok(())
+}
+
+/// Returns the byte length of the physical prefix ending at `published_frame`.
+///
+/// A publish marker defines a prefix, not merely the latest frame to expose. Keeping
+/// later frames around would let a future publish marker retroactively commit a write
+/// that crashed before publication. An empty file is valid because WAL reset removes
+/// checkpointed frames while retaining their monotonic high-watermark.
+fn published_prefix_len(path: &Path, published_frame: u64) -> Result<Option<u64>> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut prefix_len = 0u64;
+    let mut saw_frame_at_or_before_boundary = false;
+
+    loop {
+        let header = match read_header(&mut reader)? {
+            HeaderRead::Eof => {
+                if !saw_frame_at_or_before_boundary {
+                    return Ok(Some(0));
+                }
+                return Err(TsinkError::DataCorruption(format!(
+                    "WAL publish boundary frame {published_frame} is missing from {}",
+                    path.display()
+                )));
+            }
+            HeaderRead::Truncated => return Ok(None),
+            HeaderRead::FrameHeader(header) => header,
+        };
+
+        let Some(parsed_header) = parse_frame_header(&header)? else {
+            return Ok(None);
+        };
+        if parsed_header.frame_seq > published_frame {
+            if saw_frame_at_or_before_boundary {
+                return Err(TsinkError::DataCorruption(format!(
+                    "WAL publish boundary frame {published_frame} is missing before frame {} in {}",
+                    parsed_header.frame_seq,
+                    path.display()
+                )));
+            }
+            return Ok(Some(0));
+        }
+        if parsed_header.payload_len > MAX_FRAME_PAYLOAD_BYTES {
+            return Ok(None);
+        }
+
+        let mut payload = vec![0u8; parsed_header.payload_len];
+        if let Err(err) = reader.read_exact(&mut payload) {
+            if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(err.into());
+        }
+
+        saw_frame_at_or_before_boundary = true;
+        prefix_len = prefix_len.saturating_add(
+            (FRAME_HEADER_LEN as u64).saturating_add(parsed_header.payload_len as u64),
+        );
+        if parsed_header.frame_seq == published_frame {
+            return Ok(Some(prefix_len));
+        }
     }
 }
 

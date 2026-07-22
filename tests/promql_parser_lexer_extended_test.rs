@@ -72,6 +72,12 @@ fn lexer_07_unknown_escape_keeps_character() {
 }
 
 #[test]
+fn lexer_preserves_utf8_string_contents() {
+    let tokens = lex(r#""Bakı 東京""#);
+    assert!(matches!(&tokens[0].kind, TokenKind::String(s) if s == "Bakı 東京"));
+}
+
+#[test]
 fn lexer_08_unterminated_string_returns_parse_error() {
     let err = Lexer::new(r#""unterminated"#).tokenize().unwrap_err();
     assert!(matches!(err, PromqlError::Parse(msg) if msg.contains("unterminated string literal")));

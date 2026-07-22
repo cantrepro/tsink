@@ -1,6 +1,8 @@
 use crate::cluster::control::ShardHandoffPhase;
 use crate::cluster::membership::MembershipView;
-use crate::http::{json_response, text_response, HttpRequest, HttpResponse};
+use crate::http::{
+    json_response, text_response, HttpRequest, HttpResponse, MAX_BODY_BYTES, MAX_HEADER_BYTES,
+};
 use crate::security::ManagedStringSecret;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ pub const DEFAULT_RPC_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_RPC_MAX_RETRIES: usize = 2;
 pub const DEFAULT_INTERNAL_RING_VERSION: u64 = 1;
 const RETRYABLE_STATUS_CODES: [u16; 4] = [500, 502, 503, 504];
+const MAX_INTERNAL_RPC_RESPONSE_BYTES: usize = MAX_HEADER_BYTES + MAX_BODY_BYTES;
 static RUSTLS_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
 pub const CLUSTER_CAPABILITY_RPC_V1: &str = "cluster_rpc_v1";
@@ -867,6 +870,11 @@ pub enum RpcError {
         path: String,
         message: String,
     },
+    ResponseTooLarge {
+        endpoint: String,
+        path: String,
+        limit: usize,
+    },
     ProtocolVersionMismatch {
         endpoint: String,
         expected: String,
@@ -918,6 +926,14 @@ impl fmt::Display for RpcError {
                 path,
                 message,
             } => write!(f, "RPC transport error calling {endpoint}{path}: {message}"),
+            Self::ResponseTooLarge {
+                endpoint,
+                path,
+                limit,
+            } => write!(
+                f,
+                "RPC response from {endpoint}{path} exceeds the {limit}-byte limit"
+            ),
             Self::ProtocolVersionMismatch {
                 endpoint,
                 expected,
@@ -1439,19 +1455,56 @@ where
     let _ = tokio::time::timeout(timeout, stream.flush()).await;
     let _ = stream.shutdown().await;
 
-    let mut raw_response = Vec::new();
-    tokio::time::timeout(timeout, stream.read_to_end(&mut raw_response))
-        .await
-        .map_err(|_| RpcError::Timeout {
+    match tokio::time::timeout(
+        timeout,
+        read_response_bounded(stream, MAX_INTERNAL_RPC_RESPONSE_BYTES),
+    )
+    .await
+    {
+        Err(_) => Err(RpcError::Timeout {
             endpoint: endpoint.to_string(),
             path: path.to_string(),
-        })?
-        .map_err(|err| RpcError::Transport {
+        }),
+        Ok(Ok(raw_response)) => Ok(raw_response),
+        Ok(Err(BoundedResponseReadError::Io(err))) => Err(RpcError::Transport {
             endpoint: endpoint.to_string(),
             path: path.to_string(),
             message: err.to_string(),
-        })?;
-    Ok(raw_response)
+        }),
+        Ok(Err(BoundedResponseReadError::LimitExceeded)) => Err(RpcError::ResponseTooLarge {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            limit: MAX_INTERNAL_RPC_RESPONSE_BYTES,
+        }),
+    }
+}
+
+#[derive(Debug)]
+enum BoundedResponseReadError {
+    Io(std::io::Error),
+    LimitExceeded,
+}
+
+async fn read_response_bounded<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedResponseReadError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = reader.take(read_limit);
+    let mut response = Vec::with_capacity(max_bytes.min(8 * 1024));
+    limited
+        .read_to_end(&mut response)
+        .await
+        .map_err(BoundedResponseReadError::Io)?;
+    if response.len() > max_bytes {
+        return Err(BoundedResponseReadError::LimitExceeded);
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Clone)]
@@ -1620,6 +1673,42 @@ mod tests {
             .expect_err("unsupported version should be rejected");
 
         assert_eq!(err, "unsupported HTTP version: HTTP/2");
+    }
+
+    #[tokio::test]
+    async fn bounded_response_reader_accepts_the_limit_and_rejects_the_next_byte() {
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        writer
+            .write_all(b"12345678")
+            .await
+            .expect("test response should write");
+        drop(writer);
+        let response = read_response_bounded(&mut reader, 8)
+            .await
+            .expect("response at the limit should be accepted");
+        assert_eq!(response, b"12345678");
+
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        writer
+            .write_all(b"123456789")
+            .await
+            .expect("test response should write");
+        drop(writer);
+        let err = read_response_bounded(&mut reader, 8)
+            .await
+            .expect_err("response beyond the limit should be rejected");
+        assert!(matches!(err, BoundedResponseReadError::LimitExceeded));
+    }
+
+    #[test]
+    fn oversized_rpc_response_errors_are_not_retried() {
+        let err = RpcError::ResponseTooLarge {
+            endpoint: "node-b:9201".to_string(),
+            path: "/internal/v1/select".to_string(),
+            limit: 8,
+        };
+
+        assert!(!err.retryable());
     }
 
     fn build_test_mtls_server_acceptor(

@@ -157,6 +157,77 @@ fn wal_pressure_with_busy_writer_permit_returns_limit_error_not_timeout() {
 }
 
 #[test]
+fn close_cancels_writer_waiting_for_admission_pressure() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                timestamp_precision: TimestampPrecision::Nanoseconds,
+                retention_window: i64::MAX,
+                future_skew_window: default_future_skew_window(TimestampPrecision::Nanoseconds),
+                retention_enforced: false,
+                runtime_mode: StorageRuntimeMode::ReadWrite,
+                partition_window: i64::MAX,
+                max_active_partition_heads_per_series:
+                    crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+                max_writers: 1,
+                write_timeout: Duration::from_secs(2),
+                memory_budget_bytes: u64::MAX,
+                cardinality_limit: usize::MAX,
+                wal_size_limit_bytes: 1,
+                admission_poll_interval: Duration::from_millis(5),
+                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                background_threads_enabled: false,
+                background_fail_fast: false,
+                metadata_shard_count: None,
+                remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+                remote_segment_refresh_interval: Duration::from_secs(5),
+                tiered_storage: None,
+                #[cfg(test)]
+                current_time_override: None,
+            },
+        )
+        .unwrap(),
+    );
+
+    let writer_storage = Arc::clone(&storage);
+    let writer = std::thread::spawn(move || {
+        writer_storage.insert_rows(&[Row::new(
+            "close_admission_pressure_metric",
+            DataPoint::new(1, 1.0),
+        )])
+    });
+    assert!(wait_for_condition(
+        Duration::from_secs(1),
+        Duration::from_millis(5),
+        || {
+            storage
+                .observability_snapshot()
+                .flush
+                .admission_backpressure_delays_total
+                > 0
+        },
+    ));
+
+    let close_started = std::time::Instant::now();
+    storage.close().unwrap();
+    assert!(
+        close_started.elapsed() < Duration::from_secs(1),
+        "close should cancel admission backpressure instead of waiting for the write timeout",
+    );
+    assert!(matches!(
+        writer.join().unwrap(),
+        Err(TsinkError::StorageClosed)
+    ));
+}
+
+#[test]
 fn memory_pressure_relief_completes_with_busy_writer_permit() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);

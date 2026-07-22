@@ -19,44 +19,73 @@ impl<'a> DeleteBridgeContext<'a> {
     fn publish_tombstone_delete(
         self,
         tombstone: TombstoneRange,
-        updated_tombstones: TombstoneMap,
-    ) -> Result<()> {
-        let updated_series_ids = updated_tombstones.keys().copied().collect::<Vec<_>>();
-        let has_affected_rollups = self.storage.with_rollup_run_lock(|| -> Result<bool> {
-            let affected_policy_ids = self
-                .storage
-                .affected_rollup_policy_ids_for_series(&updated_series_ids);
-            self.storage.with_visibility_write_stage(|| {
-                if !affected_policy_ids.is_empty() {
-                    self.storage.stage_pending_rollup_delete_invalidation(
-                        tombstone,
-                        &updated_series_ids,
-                        &affected_policy_ids,
-                    )?;
-                }
-
-                self.storage
-                    .tombstone_publication_context()
-                    .publish_tombstone_updates_locked(
-                        self.storage,
-                        self.storage.tombstone_index_context(),
-                        updated_tombstones,
-                    )?;
-                if !affected_policy_ids.is_empty() {
-                    let finalize_result = self.storage.finalize_pending_rollup_delete_invalidation(
-                        tombstone,
-                        &updated_series_ids,
-                        &affected_policy_ids,
-                    );
-                    if finalize_result.is_err() {
-                        // Tombstones are already durable and the pending delete marker is durable,
-                        // so the delete has committed even if we could not immediately rewrite
-                        // rollup state.
+        matched_series_ids: &[SeriesId],
+    ) -> Result<usize> {
+        let (updated_series_ids, has_affected_rollups) =
+            self.storage.with_rollup_run_lock(|| -> Result<_> {
+                self.storage.with_visibility_write_stage(|| {
+                    // Tombstone updates are read-modify-write operations. Recompute them after
+                    // acquiring the visibility fence so concurrent deletes cannot overwrite one
+                    // another with snapshots prepared before either publication committed.
+                    let updated_tombstones =
+                        self.storage
+                            .tombstone_read_context()
+                            .with_tombstones(|current| {
+                                let mut updates =
+                                    TombstoneMap::with_capacity(matched_series_ids.len());
+                                for series_id in matched_series_ids {
+                                    let mut ranges =
+                                        current.get(series_id).cloned().unwrap_or_default();
+                                    tombstone::merge_tombstone_range(&mut ranges, tombstone);
+                                    if current.get(series_id) != Some(&ranges) {
+                                        updates.insert(*series_id, ranges);
+                                    }
+                                }
+                                updates
+                            });
+                    if updated_tombstones.is_empty() {
+                        return Ok((Vec::new(), false));
                     }
-                }
-                Ok(!affected_policy_ids.is_empty())
-            })
-        })?;
+
+                    let updated_series_ids = updated_tombstones.keys().copied().collect::<Vec<_>>();
+                    let affected_policy_ids = self
+                        .storage
+                        .affected_rollup_policy_ids_for_series(&updated_series_ids);
+                    if !affected_policy_ids.is_empty() {
+                        self.storage.stage_pending_rollup_delete_invalidation(
+                            tombstone,
+                            &updated_series_ids,
+                            &affected_policy_ids,
+                        )?;
+                    }
+
+                    self.storage
+                        .tombstone_publication_context()
+                        .publish_tombstone_updates_locked(
+                            self.storage,
+                            self.storage.tombstone_index_context(),
+                            updated_tombstones,
+                        )?;
+                    if !affected_policy_ids.is_empty() {
+                        let finalize_result =
+                            self.storage.finalize_pending_rollup_delete_invalidation(
+                                tombstone,
+                                &updated_series_ids,
+                                &affected_policy_ids,
+                            );
+                        if finalize_result.is_err() {
+                            // Tombstones are already durable and the pending delete marker is
+                            // durable, so the delete has committed even if we could not immediately
+                            // rewrite rollup state.
+                        }
+                    }
+                    Ok((updated_series_ids, !affected_policy_ids.is_empty()))
+                })
+            })?;
+        if updated_series_ids.is_empty() {
+            return Ok(0);
+        }
+
         let _ = self
             .storage
             .live_series_ids(updated_series_ids.iter().copied(), true)?;
@@ -64,7 +93,7 @@ impl<'a> DeleteBridgeContext<'a> {
         if has_affected_rollups {
             self.storage.notify_rollup_thread();
         }
-        Ok(())
+        Ok(updated_series_ids.len())
     }
 }
 
@@ -91,28 +120,13 @@ impl ChunkStorage {
             return Ok(DeleteSeriesResult::default());
         }
 
-        let updated_tombstones = self.tombstone_read_context().with_tombstones(|current| {
-            let mut updates = TombstoneMap::with_capacity(series_ids.len());
-            for series_id in &series_ids {
-                let mut ranges = current.get(series_id).cloned().unwrap_or_default();
-                tombstone::merge_tombstone_range(&mut ranges, tombstone);
-                if current.get(series_id) != Some(&ranges) {
-                    updates.insert(*series_id, ranges);
-                }
-            }
-            updates
-        });
         let matched_series = saturating_u64_from_usize(series_ids.len());
-        let tombstones_applied = saturating_u64_from_usize(updated_tombstones.len());
-        if updated_tombstones.is_empty() {
-            return Ok(DeleteSeriesResult {
-                matched_series,
-                tombstones_applied,
-            });
-        }
-
-        self.delete_bridge_context()
-            .publish_tombstone_delete(tombstone, updated_tombstones)?;
+        #[cfg(test)]
+        self.invoke_tombstone_pre_publication_hook();
+        let tombstones_applied = saturating_u64_from_usize(
+            self.delete_bridge_context()
+                .publish_tombstone_delete(tombstone, &series_ids)?,
+        );
 
         Ok(DeleteSeriesResult {
             matched_series,
@@ -135,6 +149,37 @@ impl ChunkStorage {
                 }
                 points.retain(|point| !tombstone::timestamp_is_tombstoned(point.timestamp, ranges));
             });
+    }
+
+    #[cfg(test)]
+    pub(super) fn invoke_tombstone_pre_publication_hook(&self) {
+        let hook = self
+            .persist_test_hooks
+            .tombstone_pre_publication_hook
+            .read()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_tombstone_pre_publication_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .tombstone_pre_publication_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_tombstone_pre_publication_hook(&self) {
+        self.persist_test_hooks
+            .tombstone_pre_publication_hook
+            .write()
+            .take();
     }
 
     #[cfg(test)]

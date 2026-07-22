@@ -36,6 +36,7 @@ pub(super) struct PersistTestHooks {
     pub(super) query_append_sort_in_memory_source_snapshot_hook:
         RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) query_persisted_chunk_decode_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) tombstone_pre_publication_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) tombstone_post_swap_pre_visibility_hook: RwLock<Option<Arc<IngestCommitHook>>>,
 }
 

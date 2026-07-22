@@ -311,6 +311,7 @@ impl ChunkStorage {
                 budget_bytes: &self.memory.budget_bytes,
             },
             admission: WriteAdmissionControlContext {
+                lifecycle: self.coordination.lifecycle.as_ref(),
                 budget: self.persisted_sealed_budget_context(),
                 workers: self.worker_wake_context(),
                 observability: self.observability.as_ref(),

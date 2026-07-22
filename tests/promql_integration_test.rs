@@ -69,7 +69,7 @@ fn setup_group_matching_storage() -> Arc<dyn Storage> {
             Row::with_labels(
                 "compare_left",
                 vec![Label::new("job", "api"), Label::new("region", "west")],
-                DataPoint::new(60, 3.0),
+                DataPoint::new(60, 4.0),
             ),
             Row::with_labels(
                 "compare_right",
@@ -632,6 +632,31 @@ fn selector_exact_and_regex_matchers_work() {
 }
 
 #[test]
+fn selector_matchers_preserve_utf8_label_values() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::with_labels(
+            "weather_metric",
+            vec![Label::new("city", "Bakı")],
+            DataPoint::new(60, 23.0),
+        )])
+        .unwrap();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query(r#"weather_metric{city="Bakı"}"#, 60)
+            .unwrap(),
+    );
+
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].value, 23.0);
+}
+
+#[test]
 fn negative_offset_reads_forward_in_time_for_range_queries() {
     let storage = StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -769,6 +794,29 @@ fn aggregation_by_and_without_work() {
     assert!((values[0].1 - 1.0).abs() < 1e-9);
     assert_eq!(values[1].0, "POST");
     assert!((values[1].1 - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn aggregation_by_metric_name_keeps_metrics_separate() {
+    let storage = setup_group_matching_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let mut samples = as_instant_vector(
+        engine
+            .instant_query(
+                r#"sum by (__name__) ({__name__=~"(left|right)_metric"})"#,
+                60,
+            )
+            .unwrap(),
+    );
+    samples.sort_by(|left, right| left.metric.cmp(&right.metric));
+
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].metric, "left_metric");
+    assert_eq!(samples[0].value, 15.0);
+    assert_eq!(samples[1].metric, "right_metric");
+    assert_eq!(samples[1].value, 2.0);
+    assert!(samples.iter().all(|sample| sample.labels.is_empty()));
 }
 
 #[test]
@@ -1122,6 +1170,57 @@ fn comparison_on_modifier_drops_metric_name_without_bool() {
 
     assert_eq!(samples.len(), 1);
     assert!(samples[0].metric.is_empty());
+    assert_eq!(samples[0].labels, vec![Label::new("status", "200")]);
+}
+
+#[test]
+fn one_to_one_vector_matching_shapes_output_labels() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let arithmetic = as_instant_vector(
+        engine
+            .instant_query(
+                r#"http_requests_total{method="GET"} / on(status) http_requests_total{method="POST"}"#,
+                600,
+            )
+            .unwrap(),
+    );
+    assert_eq!(arithmetic.len(), 1);
+    assert!(arithmetic[0].metric.is_empty());
+    assert_eq!(arithmetic[0].labels, vec![Label::new("status", "200")]);
+    assert_eq!(arithmetic[0].value, 2.0);
+
+    let comparison = as_instant_vector(
+        engine
+            .instant_query(
+                r#"http_requests_total{method="GET"} > ignoring(method) http_requests_total{method="POST"}"#,
+                600,
+            )
+            .unwrap(),
+    );
+    assert_eq!(comparison.len(), 1);
+    assert_eq!(comparison[0].metric, "http_requests_total");
+    assert_eq!(comparison[0].labels, vec![Label::new("status", "200")]);
+    assert_eq!(comparison[0].value, 600.0);
+}
+
+#[test]
+fn vector_matching_on_metric_name_uses_metric_names() {
+    let storage = setup_group_matching_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let samples = as_instant_vector(
+        engine
+            .instant_query(
+                r#"{__name__=~"(left|right)_metric"} and on(__name__) right_metric"#,
+                60,
+            )
+            .unwrap(),
+    );
+
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].metric, "right_metric");
 }
 
 #[test]
@@ -1165,7 +1264,7 @@ fn group_right_comparison_uses_rhs_cardinality_and_metric_name() {
     let mut samples = as_instant_vector(
         engine
             .instant_query(
-                "compare_left == on(job) group_right(region) compare_right",
+                "compare_left > on(job) group_right(region) compare_right",
                 60,
             )
             .unwrap(),
@@ -1175,7 +1274,7 @@ fn group_right_comparison_uses_rhs_cardinality_and_metric_name() {
     assert_eq!(samples.len(), 2);
     assert!(samples
         .iter()
-        .all(|sample| sample.metric == "compare_right" && sample.value == 3.0));
+        .all(|sample| sample.metric == "compare_right" && sample.value == 4.0));
     assert!(samples.iter().all(|sample| {
         sample
             .labels
@@ -1227,22 +1326,15 @@ fn vector_matching_distinguishes_delimiter_collision_group_labels() {
 
     samples.sort_by(|a, b| a.labels.cmp(&b.labels));
     assert_eq!(samples.len(), 2);
-    assert_eq!(samples[0].value, 12.0);
+    assert_eq!(samples[0].value, 24.0);
     assert_eq!(
         samples[0].labels,
-        vec![
-            Label::new("instance", "a"),
-            Label::new("job", format!("api{delimiter}zone=west")),
-        ]
+        vec![Label::new("job", "api"), Label::new("zone", "west"),]
     );
-    assert_eq!(samples[1].value, 24.0);
+    assert_eq!(samples[1].value, 12.0);
     assert_eq!(
         samples[1].labels,
-        vec![
-            Label::new("instance", "b"),
-            Label::new("job", "api"),
-            Label::new("zone", "west"),
-        ]
+        vec![Label::new("job", format!("api{delimiter}zone=west"))]
     );
 }
 

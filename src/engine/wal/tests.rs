@@ -216,7 +216,7 @@ fn committed_replay_discards_unpaired_series_definitions() {
 }
 
 #[test]
-fn committed_replay_ignores_persisted_writes_that_never_crossed_publish_boundary() {
+fn wal_reopen_discards_persisted_writes_that_never_crossed_publish_boundary() {
     let temp_dir = TempDir::new().unwrap();
     let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
     let definition = SeriesDefinitionFrame {
@@ -263,12 +263,125 @@ fn committed_replay_ignores_persisted_writes_that_never_crossed_publish_boundary
         reopened.current_published_highwater(),
         WalHighWatermark::default()
     );
-    assert_eq!(reopened.replay_frames().unwrap().len(), 2);
+    assert!(reopened.replay_frames().unwrap().is_empty());
     assert!(reopened.replay_committed_writes().unwrap().is_empty());
     assert!(reopened
         .committed_series_definitions_snapshot()
         .unwrap()
         .is_empty());
+
+    let committed_definition = SeriesDefinitionFrame {
+        series_id: 8,
+        metric: "committed_after_recovery".to_string(),
+        labels: vec![Label::new("host", "b")],
+    };
+    let committed_batch = SamplesBatchFrame::from_points(
+        8,
+        ValueLane::Numeric,
+        &[ChunkPoint {
+            ts: 20,
+            value: Value::F64(2.0),
+        }],
+    )
+    .unwrap();
+    reopened
+        .append_series_definition(&committed_definition)
+        .unwrap();
+    reopened.append_samples(&[committed_batch]).unwrap();
+    drop(reopened);
+
+    let reopened_again = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let committed_series_ids = reopened_again
+        .replay_committed_writes()
+        .unwrap()
+        .into_iter()
+        .flat_map(|write| write.sample_batches)
+        .map(|batch| batch.series_id)
+        .collect::<Vec<_>>();
+    assert_eq!(committed_series_ids, vec![8]);
+}
+
+#[test]
+fn wal_reopen_discards_unpublished_frames_from_a_later_segment() {
+    let temp_dir = TempDir::new().unwrap();
+    let baseline_definition = SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "baseline".to_string(),
+        labels: vec![],
+    };
+    let baseline_batch = SamplesBatchFrame::from_points(
+        1,
+        ValueLane::Numeric,
+        &[ChunkPoint {
+            ts: 1,
+            value: Value::F64(1.0),
+        }],
+    )
+    .unwrap();
+    let segment_max_bytes =
+        FramedWal::estimate_series_definition_frame_bytes(&baseline_definition).unwrap();
+    let wal = FramedWal::open_with_options(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        128,
+        segment_max_bytes,
+    )
+    .unwrap();
+    wal.append_series_definition(&baseline_definition).unwrap();
+    wal.append_samples(&[baseline_batch]).unwrap();
+    let published_highwater = wal.current_published_highwater();
+
+    let abandoned_definition = SeriesDefinitionFrame {
+        series_id: 2,
+        metric: "abandoned".to_string(),
+        labels: vec![],
+    };
+    let abandoned_batch = SamplesBatchFrame::from_points(
+        2,
+        ValueLane::Numeric,
+        &[ChunkPoint {
+            ts: 2,
+            value: Value::F64(2.0),
+        }],
+    )
+    .unwrap();
+    let estimated_bytes = FramedWal::estimate_series_definition_frame_bytes(&abandoned_definition)
+        .unwrap()
+        .saturating_add(
+            FramedWal::estimate_samples_frame_bytes(std::slice::from_ref(&abandoned_batch))
+                .unwrap(),
+        );
+    let definition_payload =
+        FramedWal::encode_series_definition_frame_payload(&abandoned_definition).unwrap();
+    let samples_payload =
+        FramedWal::encode_samples_frame_payload(std::slice::from_ref(&abandoned_batch)).unwrap();
+    let mut abandoned = wal.begin_logical_write(estimated_bytes).unwrap();
+    abandoned
+        .append_series_definition_payload(&definition_payload)
+        .unwrap();
+    abandoned.append_samples_payload(&samples_payload).unwrap();
+    let abandoned_highwater = abandoned.persist_pending().unwrap();
+    assert!(abandoned_highwater.segment > published_highwater.segment);
+    std::mem::forget(abandoned);
+    drop(wal);
+
+    let reopened = FramedWal::open_with_options(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        128,
+        segment_max_bytes,
+    )
+    .unwrap();
+    assert_eq!(reopened.current_published_highwater(), published_highwater);
+    let committed_series_ids = reopened
+        .replay_committed_writes()
+        .unwrap()
+        .into_iter()
+        .flat_map(|write| write.sample_batches)
+        .map(|batch| batch.series_id)
+        .collect::<Vec<_>>();
+    assert_eq!(committed_series_ids, vec![1]);
+    assert_eq!(std::fs::metadata(reopened.path()).unwrap().len(), 0);
 }
 
 #[test]

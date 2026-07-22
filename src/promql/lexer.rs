@@ -341,28 +341,34 @@ impl<'a> Lexer<'a> {
         let mut out = String::new();
 
         while !self.is_eof() {
-            let b = self.peek_byte();
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(TokenKind::String(out)),
-                b'\\' => {
+            let ch = self.input[self.pos..]
+                .chars()
+                .next()
+                .expect("non-empty UTF-8 suffix while lexing a string");
+            self.pos += ch.len_utf8();
+            match ch {
+                '"' => return Ok(TokenKind::String(out)),
+                '\\' => {
                     if self.is_eof() {
                         return Err(PromqlError::Parse(
                             "unterminated escape sequence".to_string(),
                         ));
                     }
-                    let escaped = self.peek_byte();
-                    self.pos += 1;
+                    let escaped = self.input[self.pos..]
+                        .chars()
+                        .next()
+                        .expect("non-empty UTF-8 suffix after an escape");
+                    self.pos += escaped.len_utf8();
                     match escaped {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        other => out.push(other as char),
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        other => out.push(other),
                     }
                 }
-                other => out.push(other as char),
+                other => out.push(other),
             }
         }
 

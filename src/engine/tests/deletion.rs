@@ -105,6 +105,71 @@ fn delete_series_tombstones_selected_time_range() {
 }
 
 #[test]
+fn concurrent_deletes_merge_tombstones_at_the_visibility_boundary() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let storage = Arc::new(retention_storage_at_time(None, 4, i64::MAX));
+    let labels = vec![Label::new("host", "a")];
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "concurrent_delete_metric",
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "concurrent_delete_metric",
+                labels.clone(),
+                DataPoint::new(2, 2.0),
+            ),
+            Row::with_labels(
+                "concurrent_delete_metric",
+                labels.clone(),
+                DataPoint::new(3, 3.0),
+            ),
+        ])
+        .unwrap();
+
+    let ready = Arc::new(Barrier::new(2));
+    storage.set_tombstone_pre_publication_hook({
+        let ready = Arc::clone(&ready);
+        move || {
+            ready.wait();
+        }
+    });
+
+    let first_storage = Arc::clone(&storage);
+    let first = thread::spawn(move || {
+        first_storage.delete_series(
+            &SeriesSelection::new()
+                .with_metric("concurrent_delete_metric")
+                .with_time_range(1, 2),
+        )
+    });
+    let second_storage = Arc::clone(&storage);
+    let second = thread::spawn(move || {
+        second_storage.delete_series(
+            &SeriesSelection::new()
+                .with_metric("concurrent_delete_metric")
+                .with_time_range(3, 4),
+        )
+    });
+
+    assert_eq!(first.join().unwrap().unwrap().tombstones_applied, 1);
+    assert_eq!(second.join().unwrap().unwrap().tombstones_applied, 1);
+    storage.clear_tombstone_pre_publication_hook();
+
+    assert_eq!(
+        storage
+            .select("concurrent_delete_metric", &labels, 0, 5)
+            .unwrap(),
+        vec![DataPoint::new(2, 2.0)],
+        "concurrent delete publications must preserve both disjoint tombstone ranges",
+    );
+}
+
+#[test]
 fn delete_series_without_time_range_tombstones_all_matching_series() {
     let storage = builder_at_time(1)
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
