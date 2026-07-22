@@ -4,9 +4,9 @@ Complete listing of every configuration knob in tsink — the embedded library A
 
 Sections are ordered from most commonly used to most advanced.
 
-The individual memory, cardinality, WAL, and concurrency controls below are not a complete resource
-profile. Their exact enforcement scope, effective post-build inspection API, and missing disk/query
-budgets are documented in [Resource limits and profiles](resource-limits.md).
+The individual memory, cardinality, WAL, disk, and concurrency controls below are not a complete
+resource profile. Their exact enforcement scope, effective post-build inspection API, and remaining
+gaps are documented in [Resource limits and profiles](resource-limits.md).
 
 ---
 
@@ -130,7 +130,10 @@ tsink-server --help
 | Flag | Default | Description |
 |---|---|---|
 | `--data-path <PATH>` | *(none)* | Persist data under PATH. Without this flag, storage is purely in-memory. |
-| `--object-store-path <PATH>` | *(none)* | Object-store root for tiered segment lanes (`hot/`, `warm/`, `cold/`). |
+| `--object-store-path <PATH>` | *(none)* | Object-store root for tiered segment lanes (`hot/`, `warm/`, `cold/`). Must not overlap `--data-path`. |
+| `--local-disk-limit <BYTES>` | *(unlimited)* | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
+| `--filesystem-free-headroom <BYTES>` | `0` | Filesystem free space that budget-integrated writes must leave available. |
+| `--maintenance-temp-reserve <BYTES>` | `0` | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
 | `--timestamp-precision <PRECISION>` | `ms` | Units for raw timestamps: `s`, `ms`, `us`, `ns`. |
 | `--retention <DURATION>` | `14d` | Data retention window (e.g. `7d`, `24h`, `90d`). |
 | `--hot-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which local segments move to the warm object-store tier. |
@@ -141,6 +144,22 @@ tsink-server --help
 | `--wal-enabled <BOOL>` | `true` | Enable (`true`) or disable (`false`) the WAL. |
 | `--wal-sync-mode <MODE>` | `per-append` | `per-append` (synchronize each non-empty write) or `periodic` (append-driven interval, higher throughput). |
 | `--chunk-points <N>` | `2048` | Target data points per chunk (1–65535). |
+
+The three disk values accept an integer byte count or a case-insensitive binary `K`, `M`, `G`, or
+`T` suffix (for example, `512M` or `1.5G`). Setting `--local-disk-limit`, a non-zero
+`--filesystem-free-headroom`, or a non-zero `--maintenance-temp-reserve` requires `--data-path`.
+The maintenance reserve is unavailable to normal growth; maintenance may use it while still leaving
+the configured filesystem headroom. The headroom plus reserve must fit in the supported 64-bit byte
+range.
+
+Quota-aware admission currently covers core storage, metric metadata, exemplars, rules, the usage
+ledger, and managed control-plane state. Cluster control state and log, cluster audit,
+deduplication and outbox files, and edge queues do not yet reserve against this budget. External
+snapshot destinations and external restore staging or target directories are also outside it.
+Snapshot destinations inside the managed root are rejected, as are online restore targets that
+overlap the live `--data-path`; describing external destinations as unbudgeted does not permit a
+restore over or inside the running server's data tree. Files beneath `--data-path` can still appear
+in reconciled usage, but that accounting does not make excluded writers quota-safe.
 
 ### 2.3 Memory & cardinality
 

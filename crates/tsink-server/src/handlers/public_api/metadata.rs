@@ -204,7 +204,8 @@ pub(crate) async fn handle_series_with_admission(
                 elapsed_nanos_since(started),
                 request.body.len() as u64,
             ),
-        );
+        )
+        .await;
         return cluster_json_success_response(JsonValue::Array(all_series), &read_metadata);
     }
 
@@ -265,7 +266,8 @@ pub(crate) async fn handle_series_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             json_response(200, &json!({"status": "success", "data": data}))
         }
         Ok(Err(err)) => promql_error_response("bad_data", &err),
@@ -404,7 +406,8 @@ pub(crate) async fn handle_labels_with_admission(
                 elapsed_nanos_since(started),
                 request.body.len() as u64,
             ),
-        );
+        )
+        .await;
         return cluster_json_success_response(
             json!(names.into_iter().collect::<Vec<_>>()),
             &metadata,
@@ -440,7 +443,8 @@ pub(crate) async fn handle_labels_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             json_response(200, &json!({"status": "success", "data": data}))
         }
         Ok(Err(err)) => promql_error_response("execution", &format!("label query failed: {err}")),
@@ -543,7 +547,8 @@ pub(crate) async fn handle_metadata_with_admission(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
 
     json_response(
         200,
@@ -678,7 +683,8 @@ pub(crate) async fn handle_label_values_with_admission(
                 elapsed_nanos_since(started),
                 request.body.len() as u64,
             ),
-        );
+        )
+        .await;
         return cluster_json_success_response(
             json!(values.into_iter().collect::<Vec<_>>()),
             &metadata,
@@ -719,7 +725,8 @@ pub(crate) async fn handle_label_values_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             json_response(200, &json!({"status": "success", "data": data}))
         }
         Ok(Err(err)) => {

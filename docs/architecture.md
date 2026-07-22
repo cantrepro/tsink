@@ -568,7 +568,9 @@ The `tsink-server` crate wraps the library engine in a full HTTP server.
 ### Connection handling
 
 - `MAX_CONNECTIONS = 1024` simultaneous TCP connections.
-- `KEEP_ALIVE_TIMEOUT = 30 s`, `HANDSHAKE_TIMEOUT = 10 s`, `SHUTDOWN_GRACE_PERIOD = 10 s`.
+- `KEEP_ALIVE_TIMEOUT = 30 s`, `HANDSHAKE_TIMEOUT = 10 s`, and a 10 s shutdown grace
+  threshold. Crossing the shutdown threshold logs a warning; owned connection tasks continue
+  draining before persistent storage and its process lease are released.
 - TLS via `tokio-rustls`; HTTP/1.1 framing.
 
 ### Multi-tenancy

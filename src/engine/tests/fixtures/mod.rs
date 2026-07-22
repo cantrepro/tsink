@@ -11,5 +11,6 @@ pub(in crate::engine::storage_engine::tests) use self::persisted::{
     open_raw_numeric_storage_with_registry_snapshot_from_data_path, persistent_numeric_storage,
     persistent_numeric_storage_with_metadata_shards, persistent_rollup_storage,
     reopen_persistent_numeric_storage, reopen_persistent_rollup_storage,
+    reopen_persistent_rollup_storage_with_disk_budget,
 };
 pub(in crate::engine::storage_engine::tests) use self::segments::make_persisted_numeric_chunk;

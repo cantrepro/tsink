@@ -901,6 +901,7 @@ pub enum RpcError {
         endpoint: String,
         path: String,
         status: u16,
+        error_code: Option<String>,
         message: String,
         retryable: bool,
     },
@@ -1326,7 +1327,11 @@ impl RpcClient {
             .as_ref()
             .map(|err| err.retryable)
             .unwrap_or_else(|| RETRYABLE_STATUS_CODES.contains(&parsed.status));
+        let error_code = parsed_error
+            .as_ref()
+            .and_then(|err| sanitize_rpc_error_code(&err.code));
         let message = parsed_error
+            .as_ref()
             .map(|err| sanitize_rpc_error_diagnostic(&err.error))
             .unwrap_or_else(|| "remote peer returned an unstructured error response".to_string());
 
@@ -1334,6 +1339,7 @@ impl RpcClient {
             endpoint: endpoint.to_string(),
             path: path.to_string(),
             status: parsed.status,
+            error_code,
             message,
             retryable,
         })
@@ -1557,6 +1563,16 @@ fn sanitize_rpc_error_diagnostic(message: &str) -> String {
     }
 }
 
+fn sanitize_rpc_error_code(code: &str) -> Option<String> {
+    if code
+        .chars()
+        .all(|character| character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    Some(sanitize_rpc_error_diagnostic(code))
+}
+
 fn parse_http_response(raw: &[u8]) -> Result<ParsedHttpResponse, String> {
     let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
         return Err("response is missing header terminator".to_string());
@@ -1708,6 +1724,20 @@ mod tests {
         assert!(diagnostic.len() <= MAX_RPC_ERROR_DIAGNOSTIC_BYTES);
         assert!(!diagnostic.chars().any(char::is_control));
         assert!(diagnostic.starts_with("peer error "));
+    }
+
+    #[test]
+    fn rpc_error_codes_are_optional_bounded_and_strip_control_characters() {
+        let code = sanitize_rpc_error_code(&format!(
+            "write_disk_quota_exceeded\r\n{}",
+            "x".repeat(MAX_RPC_ERROR_DIAGNOSTIC_BYTES)
+        ))
+        .expect("non-empty error code should be retained");
+
+        assert!(code.len() <= MAX_RPC_ERROR_DIAGNOSTIC_BYTES);
+        assert!(!code.chars().any(char::is_control));
+        assert!(code.starts_with("write_disk_quota_exceeded "));
+        assert_eq!(sanitize_rpc_error_code(" \r\n\0\t"), None);
     }
 
     #[test]
@@ -1941,6 +1971,70 @@ mod tests {
             .await
             .expect("RPC call should succeed");
         assert!(response.series.is_empty());
+
+        server.await.expect("server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_client_preserves_structured_disk_quota_error_code() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection expected");
+            let mut read_buffer = Vec::new();
+            let _ = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("request should parse");
+
+            let response = internal_error_response(
+                413,
+                "write_disk_quota_exceeded",
+                "local disk quota exceeded\r\nreserved bytes unavailable",
+                false,
+            );
+            write_http_response(&mut stream, &response)
+                .await
+                .expect("response write should succeed");
+        });
+
+        let client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(500),
+            max_retries: 0,
+            protocol_version: INTERNAL_RPC_PROTOCOL_VERSION.to_string(),
+            internal_auth_token: "cluster-shared-token".to_string(),
+            internal_auth_runtime: None,
+            local_node_id: "node-a".to_string(),
+            compatibility: CompatibilityProfile::default(),
+            internal_mtls: None,
+        });
+
+        let err = client
+            .list_metrics(&addr.to_string())
+            .await
+            .expect_err("structured disk quota response should fail the RPC");
+        match err {
+            RpcError::HttpStatus {
+                status,
+                error_code,
+                message,
+                retryable,
+                ..
+            } => {
+                assert_eq!(status, 413);
+                assert_eq!(error_code.as_deref(), Some("write_disk_quota_exceeded"));
+                assert_eq!(
+                    message,
+                    "local disk quota exceeded reserved bytes unavailable"
+                );
+                assert!(!retryable);
+            }
+            other => panic!("expected structured HTTP status error, got {other:?}"),
+        }
 
         server.await.expect("server task should complete");
     }

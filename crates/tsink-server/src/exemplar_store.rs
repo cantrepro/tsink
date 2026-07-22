@@ -1,11 +1,9 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tsink::{Label, SeriesMatcher, SeriesMatcherOp, SeriesSelection};
 
 const EXEMPLAR_STORE_FILE_NAME: &str = "exemplar-store.json";
@@ -141,6 +139,7 @@ struct ExemplarStoreMetrics {
 #[derive(Debug)]
 pub struct ExemplarStore {
     path: Option<PathBuf>,
+    local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
     config: ExemplarStoreConfig,
     state: RwLock<ExemplarStoreState>,
     metrics: ExemplarStoreMetrics,
@@ -156,22 +155,66 @@ impl ExemplarStore {
     pub fn in_memory_with_config(config: ExemplarStoreConfig) -> Self {
         Self {
             path: None,
+            local_disk_budget: None,
             config: config.validate().expect("valid exemplar store config"),
             state: RwLock::new(ExemplarStoreState::default()),
             metrics: ExemplarStoreMetrics::default(),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_path: Option<&Path>) -> Result<Self, String> {
-        Self::open_with_config(data_path, ExemplarStoreConfig::default())
+        Self::open_with_disk_budget(data_path, None)
     }
 
+    pub fn open_with_disk_budget(
+        data_path: Option<&Path>,
+        local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
+    ) -> Result<Self, String> {
+        Self::open_with_config_and_disk_budget(
+            data_path,
+            ExemplarStoreConfig::default(),
+            local_disk_budget,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_with_config(
         data_path: Option<&Path>,
         config: ExemplarStoreConfig,
     ) -> Result<Self, String> {
+        Self::open_with_config_and_disk_budget(data_path, config, None)
+    }
+
+    pub fn open_with_config_and_disk_budget(
+        data_path: Option<&Path>,
+        config: ExemplarStoreConfig,
+        local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         let config = config.validate()?;
         let path = data_path.map(|path| path.join(EXEMPLAR_STORE_FILE_NAME));
+        match (path.as_deref(), local_disk_budget.as_ref()) {
+            (Some(path), Some(budget)) => {
+                budget.cleanup_atomic_write_temps(path).map_err(|err| {
+                    format!(
+                        "failed to clean exemplar temporary files for {}: {err}",
+                        path.display()
+                    )
+                })?;
+                budget.validate_managed_file_path(path).map_err(|err| {
+                    format!(
+                        "failed to validate exemplar store {}: {err}",
+                        path.display()
+                    )
+                })?;
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "exemplars cannot use a local disk budget without a data path".to_string(),
+                )
+            }
+            _ => {}
+        }
         let state = if let Some(path) = path.as_ref() {
             load_state(path)?
         } else {
@@ -180,6 +223,7 @@ impl ExemplarStore {
 
         Ok(Self {
             path,
+            local_disk_budget,
             config,
             state: RwLock::new(state),
             metrics: ExemplarStoreMetrics::default(),
@@ -190,10 +234,7 @@ impl ExemplarStore {
         self.config
     }
 
-    pub fn apply_writes(
-        &self,
-        exemplars: &[ExemplarWrite],
-    ) -> Result<ExemplarApplyOutcome, String> {
+    pub fn apply_writes(&self, exemplars: &[ExemplarWrite]) -> tsink::Result<ExemplarApplyOutcome> {
         if exemplars.is_empty() {
             return Ok(ExemplarApplyOutcome {
                 accepted: 0,
@@ -201,7 +242,7 @@ impl ExemplarStore {
             });
         }
 
-        let mut state = self.write_state()?;
+        let mut state = self.write_state().map_err(tsink::TsinkError::Other)?;
         let mut staged_state = state.clone();
         let mut accepted = 0usize;
         let mut dropped = 0usize;
@@ -331,7 +372,7 @@ impl ExemplarStore {
     pub fn snapshot_into(&self, snapshot_path: &Path) -> Result<(), String> {
         let snapshot_file = snapshot_path.join(EXEMPLAR_STORE_FILE_NAME);
         let state = self.read_state()?;
-        write_store_file(&snapshot_file, &state)
+        write_store_file(&snapshot_file, &state, None).map_err(|err| err.to_string())
     }
 
     pub fn metrics_snapshot(&self) -> Result<ExemplarStoreMetricsSnapshot, String> {
@@ -360,11 +401,11 @@ impl ExemplarStore {
             .map_err(|_| "exemplar store write lock poisoned".to_string())
     }
 
-    fn persist_state(&self, state: &ExemplarStoreState) -> Result<(), String> {
+    fn persist_state(&self, state: &ExemplarStoreState) -> tsink::Result<()> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        write_store_file(path, state)
+        write_store_file(path, state, self.local_disk_budget.as_ref())
     }
 }
 
@@ -438,16 +479,11 @@ fn load_state(path: &Path) -> Result<ExemplarStoreState, String> {
     Ok(state)
 }
 
-fn write_store_file(path: &Path, state: &ExemplarStoreState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create exemplar store directory {}: {err}",
-                parent.display()
-            )
-        })?;
-    }
-
+fn write_store_file(
+    path: &Path,
+    state: &ExemplarStoreState,
+    local_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
+) -> tsink::Result<()> {
     let persisted = PersistedExemplarStore {
         magic: EXEMPLAR_STORE_MAGIC.to_string(),
         schema_version: EXEMPLAR_STORE_SCHEMA_VERSION,
@@ -465,42 +501,18 @@ fn write_store_file(path: &Path, state: &ExemplarStoreState) -> Result<(), Strin
             })
             .collect(),
     };
-    let mut encoded = serde_json::to_vec_pretty(&persisted)
-        .map_err(|err| format!("failed to serialize exemplar store: {err}"))?;
+    let mut encoded = serde_json::to_vec_pretty(&persisted)?;
     encoded.push(b'\n');
 
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary exemplar store {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(&encoded).map_err(|err| {
-        format!(
-            "failed to write temporary exemplar store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to fsync temporary exemplar store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to install exemplar store {} from {}: {err}",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
-    Ok(())
+    if let Some(local_disk_budget) = local_disk_budget {
+        return local_disk_budget.write_file_atomically_and_sync_parent(
+            path,
+            &encoded,
+            tsink::DiskCategory::Exemplars,
+        );
+    }
+
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, &encoded)
 }
 
 #[derive(Debug)]
@@ -737,12 +749,12 @@ mod tests {
             .expect("initial exemplar should persist");
         let metrics_before = store.metrics_snapshot().expect("metrics should load");
 
-        let tmp_path = store
+        let store_path = store
             .path
             .as_deref()
-            .expect("persistent store should expose file path")
-            .with_extension("tmp");
-        std::fs::create_dir(&tmp_path).expect("blocking temporary path should build");
+            .expect("persistent store should expose file path");
+        std::fs::remove_file(store_path).expect("persisted store should be removable");
+        std::fs::create_dir(store_path).expect("blocking publication path should build");
 
         let error = store
             .apply_writes(&[ExemplarWrite {
@@ -752,8 +764,8 @@ mod tests {
                 timestamp: 20,
                 value: 2.0,
             }])
-            .expect_err("temporary-path collision should fail persistence");
-        assert!(error.contains("failed to open temporary exemplar store"));
+            .expect_err("publication-path collision should fail persistence");
+        assert!(matches!(error, tsink::TsinkError::Io(_)), "{error}");
         let metrics_after_failure = store.metrics_snapshot().expect("metrics should load");
         assert_eq!(metrics_after_failure, metrics_before);
 
@@ -765,11 +777,75 @@ mod tests {
         assert_eq!(queried[0].exemplars[0].timestamp, 10);
         assert_eq!(queried[0].exemplars[0].labels[0].value, "persisted");
 
-        let reopened = ExemplarStore::open_with_config(Some(temp_dir.path()), store.config())
-            .expect("persisted exemplars should remain readable");
-        let persisted = reopened
-            .query(&[selection], 0, 30, 8)
-            .expect("reopened exemplar query should succeed");
-        assert_eq!(persisted, queried);
+        assert!(
+            std::fs::read_dir(temp_dir.path())
+                .expect("exemplar directory should remain readable")
+                .all(|entry| !entry
+                    .expect("exemplar directory entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".exemplar-store.json.tmp-")),
+            "a failed publication must clean its unique temporary file"
+        );
+    }
+
+    #[test]
+    fn exemplar_store_disk_quota_rejection_does_not_publish_writes_or_counters() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store =
+            ExemplarStore::open_with_disk_budget(Some(temp_dir.path()), Some(Arc::clone(&budget)))
+                .expect("store should open");
+        let metrics_before = store.metrics_snapshot().expect("metrics should load");
+        let selection = SeriesSelection::new()
+            .with_metric("metric_a")
+            .with_matcher(SeriesMatcher::equal("job", "api"));
+
+        let error = store
+            .apply_writes(&[ExemplarWrite {
+                metric: "metric_a".to_string(),
+                series_labels: vec![Label::new("job", "api")],
+                exemplar_labels: vec![Label::new(
+                    "trace_id",
+                    "a-deliberately-long-value-that-exceeds-the-tiny-quota",
+                )],
+                timestamp: 10,
+                value: 1.0,
+            }])
+            .expect_err("tiny disk quota should reject exemplar persistence");
+        assert!(matches!(error, tsink::TsinkError::DiskQuotaExceeded { .. }));
+        assert_eq!(
+            store.metrics_snapshot().expect("metrics should load"),
+            metrics_before,
+            "a rejected write must not publish counters or state"
+        );
+        assert!(
+            store
+                .query(&[selection], 0, 20, 10)
+                .expect("query should succeed")
+                .is_empty(),
+            "a rejected write must not become visible"
+        );
+        assert!(
+            !store
+                .path
+                .as_deref()
+                .expect("persistent store should expose file path")
+                .exists(),
+            "a rejected write must not publish a store file"
+        );
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.rejections_total, 1);
     }
 }

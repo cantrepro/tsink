@@ -90,6 +90,39 @@ fn segment_quota_preflight_rejection_leaves_no_staging_or_live_reservation() {
     assert_eq!(snapshot.rejections_total, 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn budgeted_segment_writer_rejects_a_managed_lane_that_escapes_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let data_root = tmp.path().join("data");
+    let external = tmp.path().join("external");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    let budget = crate::LocalDiskBudget::open(&data_root, crate::LocalDiskLimits::default())
+        .expect("budget should open before the namespace swap");
+    let lane_path = data_root.join("lane_numeric");
+    symlink(&external, &lane_path).unwrap();
+    let writer = SegmentWriter::new_with_disk_budget(
+        &lane_path,
+        0,
+        1,
+        Some(budget.clone()),
+        crate::DiskReservationKind::Growth,
+    )
+    .unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("an expected-local writer must not fall back to an unbudgeted external path");
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("escapes local disk root")));
+    assert!(!external.join("segments").exists());
+    assert_eq!(budget.snapshot().active_reservations, 0);
+}
+
 #[test]
 fn segment_writer_replaces_stale_root_missing_manifest() {
     let tmp = TempDir::new().unwrap();

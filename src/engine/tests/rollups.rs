@@ -1166,6 +1166,75 @@ fn policy_apply_waits_for_an_active_worker_and_persists_the_new_set() {
 }
 
 #[test]
+fn committed_policy_apply_surfaces_initial_materialization_failure_and_reopens() {
+    use std::sync::atomic::AtomicUsize;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_rollup_storage(temp_dir.path());
+    let labels = vec![Label::new("host", "a")];
+    let policy = cpu_rollup_policy("cpu_1s_avg", 1_000);
+
+    storage
+        .insert_rows(&[
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(0, 1.0)),
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(1_000, 2.0)),
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(2_000, 3.0)),
+            Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(3_000, 4.0)),
+            Row::with_labels("cpu_usage", labels, DataPoint::new(4_000, 5.0)),
+        ])
+        .unwrap();
+
+    let persist_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_rollup_state_persist_hook({
+        let persist_calls = Arc::clone(&persist_calls);
+        move || {
+            let call = persist_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                return Err(TsinkError::Other(
+                    "injected post-commit materialization state failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    });
+
+    let snapshot = storage
+        .apply_rollup_policies(vec![policy.clone()])
+        .expect("a durable policy apply must not be reported as rejected");
+    storage.clear_rollup_state_persist_hook();
+
+    assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(snapshot.policies.len(), 1);
+    assert_eq!(snapshot.policies[0].policy, policy);
+    assert!(
+        snapshot.policies[0].last_error.as_deref().is_some_and(
+            |error| error.contains("injected post-commit materialization state failure")
+        ),
+        "committed apply should expose the deferred materialization failure: {:?}",
+        snapshot.policies[0].last_error
+    );
+    assert_eq!(snapshot.worker_errors_total, 1);
+    assert_eq!(
+        read_rollup_policies_file(temp_dir.path())["policies"][0]["id"],
+        policy.id
+    );
+
+    storage.close().unwrap();
+    drop(storage);
+
+    let reopened = reopen_persistent_rollup_storage(temp_dir.path());
+    let reopened_status = reopened.observability_snapshot().rollups.policies;
+    assert_eq!(reopened_status.len(), 1);
+    assert_eq!(reopened_status[0].policy, policy);
+
+    let retry = reopened.trigger_rollup_run().unwrap();
+    assert_eq!(retry.policies.len(), 1);
+    assert_eq!(retry.policies[0].policy, policy);
+    assert_eq!(retry.policies[0].last_error, None);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn policy_remove_waits_for_an_active_worker_and_discards_stale_state() {
     use std::sync::mpsc;
     use std::thread;

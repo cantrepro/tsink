@@ -576,6 +576,18 @@ The JSON body equivalent uses `selectors` (array of strings), `start`, and `end`
 }
 ```
 
+Malformed bodies, selectors, or time ranges return `400`; a storage mode that cannot durably delete
+returns `409`. Before any selector commits, a logical quota, filesystem-headroom, or maintenance-
+reserve rejection returns structured `413 write_disk_quota_exceeded` without partial-outcome
+headers. If an earlier selector, or an earlier series expanded from the same tenant-scoped selector,
+already committed tombstones, a later quota rejection remains `413` but returns
+`X-Tsink-Write-Partial: true`, `X-Tsink-Write-Outcome: partial`, and the proven
+`X-Tsink-Delete-Matchers-Processed`, `X-Tsink-Delete-Matched-Series`, and
+`X-Tsink-Delete-Tombstones-Applied` counts; the JSON error body carries the same counts. Other
+tombstone persistence failures return an indeterminate `500` with `possible`/
+`indeterminate_backend` headers; when prior committed progress exists, the response also carries
+the proven delete counts.
+
 ---
 
 ### Rules & rollups
@@ -606,6 +618,10 @@ Apply a recording/alerting rules configuration.
 ```
 
 **Response:** `200 application/json` — rules snapshot.
+
+Invalid rule definitions return `400`. A local-disk quota, filesystem-headroom, or
+maintenance-reserve rejection returns structured `413 write_disk_quota_exceeded`; other rules-store
+persistence failures return an indeterminate `500`.
 
 ---
 
@@ -644,7 +660,15 @@ Apply rollup downsampling policies.
 }
 ```
 
-**Response:** `200 application/json` — rollup policies snapshot.
+**Response:** `200 application/json` — rollup policies snapshot. Policy persistence commits before
+the initial materialization attempt. If that first materialization fails, the apply still returns
+the committed `200` snapshot with the per-policy `lastError` and incremented `workerErrorsTotal`;
+use `/api/v1/admin/rollups/run` to retry materialization rather than treating the policy update as
+uncommitted.
+
+Invalid or unsupported policies return `400`. A local-disk quota, filesystem-headroom, or
+maintenance-reserve rejection returns structured `413 write_disk_quota_exceeded`; other rollup
+persistence failures return an indeterminate `500`.
 
 ---
 
@@ -653,6 +677,10 @@ Apply rollup downsampling policies.
 Trigger an immediate rollup materialization run.
 
 **Response:** `200 application/json` — rollup snapshot.
+
+A local-disk quota, filesystem-headroom, or maintenance-reserve rejection returns structured
+`413 write_disk_quota_exceeded`; other materialization persistence failures return an indeterminate
+`500`.
 
 ---
 
@@ -853,6 +881,11 @@ Stream raw per-request usage records as newline-delimited JSON.
 Force immediate usage ledger reconciliation against live storage.
 
 **Response:** `200 application/json` — `{journal, storageSnapshots}`.
+
+If the shared local-disk quota, filesystem headroom, or maintenance reserve rejects the
+reconciliation frame, the endpoint returns structured `413 write_disk_quota_exceeded` without
+publishing a tenant prefix. Other ledger persistence failures return an indeterminate
+`500 usage_ledger_persistence_failed` response.
 
 ---
 

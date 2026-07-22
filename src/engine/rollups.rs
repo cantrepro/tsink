@@ -40,10 +40,22 @@ type RollupPolicyStartHook = dyn Fn(&RollupPolicy) + Send + Sync + 'static;
 type RollupStatePersistHook = dyn Fn() -> Result<()> + Send + Sync + 'static;
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollupPolicyPersistHookPoint {
+    CandidatePublished,
+    RollbackStarting,
+}
+
+#[cfg(test)]
+type RollupPolicyPersistHook =
+    dyn Fn(RollupPolicyPersistHookPoint) -> Result<()> + Send + Sync + 'static;
+
+#[cfg(test)]
 #[derive(Default)]
 struct RollupTestHooks {
     policy_start_hook: RwLock<Option<Arc<RollupPolicyStartHook>>>,
     state_persist_hook: RwLock<Option<Arc<RollupStatePersistHook>>>,
+    policy_persist_hook: RwLock<Option<Arc<RollupPolicyPersistHook>>>,
 }
 
 #[cfg(test)]
@@ -59,6 +71,7 @@ pub(super) struct RollupRuntimeState {
     policies_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    snapshot_visibility: RwLock<()>,
     policies: RwLock<Vec<RollupPolicy>>,
     checkpoints: RwLock<HashMap<String, BTreeMap<String, i64>>>,
     pending_materializations:

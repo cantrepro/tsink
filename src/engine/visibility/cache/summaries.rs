@@ -278,8 +278,10 @@ impl ChunkStorage {
         self.bump_live_series_pruning_generation();
     }
 
-    pub(super) fn clear_series_visible_timestamp_cache<I>(&self, series_ids: I)
-    where
+    pub(in crate::engine::storage_engine) fn clear_series_visible_timestamp_cache<I>(
+        &self,
+        series_ids: I,
+    ) where
         I: IntoIterator<Item = SeriesId>,
     {
         let _recency_guard = self.visibility.recency_state_lock.lock();

@@ -10,8 +10,6 @@ use crate::tenant;
 use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,7 +19,9 @@ use tsink::label::{
 };
 use tsink::promql::types::{histogram_count_value, PromqlValue, Sample};
 use tsink::promql::Engine;
-use tsink::{DataPoint, Label, Row, Storage, TimestampPrecision, Value};
+use tsink::{
+    DataPoint, DiskCategory, Label, LocalDiskBudget, Row, Storage, TimestampPrecision, Value,
+};
 
 const RULES_STORE_FILE_NAME: &str = "rules-store.json";
 const RULES_STORE_MAGIC: &str = "tsink-rules-store";
@@ -33,6 +33,8 @@ const RULES_MAX_ALERT_INSTANCES_PER_RULE_ENV: &str = "TSINK_RULES_MAX_ALERT_INST
 const DEFAULT_RULES_SCHEDULER_TICK_MS: u64 = 1_000;
 const DEFAULT_MAX_RECORDING_ROWS_PER_EVAL: usize = 10_000;
 const DEFAULT_MAX_ALERT_INSTANCES_PER_RULE: usize = 10_000;
+const RECORDING_RULE_ATTEMPT_PENDING: &str =
+    "recording rule evaluation attempt checkpointed; final outcome pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RulesRuntimeConfig {
@@ -323,12 +325,38 @@ struct PersistedRulesStore {
 
 struct RulesStore {
     path: Option<PathBuf>,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: RwLock<PersistedRulesStoreState>,
 }
 
 impl RulesStore {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn open(data_path: Option<&Path>) -> Result<Self, String> {
+        Self::open_with_disk_budget(data_path, None)
+    }
+
+    fn open_with_disk_budget(
+        data_path: Option<&Path>,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         let path = data_path.map(|path| path.join(RULES_STORE_FILE_NAME));
+        match (path.as_deref(), local_disk_budget.as_ref()) {
+            (Some(path), Some(budget)) => {
+                budget.cleanup_atomic_write_temps(path).map_err(|err| {
+                    format!(
+                        "failed to clean rules temporary files for {}: {err}",
+                        path.display()
+                    )
+                })?;
+                budget.validate_managed_file_path(path).map_err(|err| {
+                    format!("failed to validate rules store {}: {err}", path.display())
+                })?;
+            }
+            (None, Some(_)) => {
+                return Err("rules cannot use a local disk budget without a data path".to_string())
+            }
+            _ => {}
+        }
         let state = if let Some(path) = path.as_ref() {
             load_rules_store_state(path)?
         } else {
@@ -336,6 +364,7 @@ impl RulesStore {
         };
         Ok(Self {
             path,
+            local_disk_budget,
             state: RwLock::new(state),
         })
     }
@@ -344,13 +373,15 @@ impl RulesStore {
         Ok(self.read_state()?.clone())
     }
 
-    fn apply_groups(&self, groups: Vec<RuleGroupSpec>) -> Result<(), String> {
-        validate_groups(&groups)?;
-        let fingerprints = configured_rule_fingerprints(&groups)?;
-        let mut state = self.write_state()?;
+    fn apply_groups(&self, groups: Vec<RuleGroupSpec>) -> Result<(), RulesApplyError> {
+        validate_groups(&groups).map_err(RulesApplyError::Rejected)?;
+        let fingerprints =
+            configured_rule_fingerprints(&groups).map_err(RulesApplyError::Rejected)?;
+        let mut state = self.write_state().map_err(RulesApplyError::Internal)?;
+        let mut candidate = state.clone();
         let mut retained = BTreeMap::new();
         for (rule_id, fingerprint) in fingerprints {
-            if let Some(existing) = state.runtime.get(&rule_id) {
+            if let Some(existing) = candidate.runtime.get(&rule_id) {
                 if existing.fingerprint == fingerprint {
                     retained.insert(rule_id, existing.clone());
                     continue;
@@ -364,21 +395,25 @@ impl RulesStore {
                 },
             );
         }
-        state.groups = groups;
-        state.runtime = retained;
-        self.persist_state(&state)
+        candidate.groups = groups;
+        candidate.runtime = retained;
+        self.persist_state(&candidate)
+            .map_err(RulesApplyError::Persistence)?;
+        *state = candidate;
+        Ok(())
     }
 
     fn apply_runtime_updates(
         &self,
         updates: Vec<(String, PersistedRuleRuntimeState)>,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         if updates.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let mut state = self.write_state()?;
         let configured = configured_rule_fingerprints(&state.groups)?;
-        let mut changed = false;
+        let mut candidate = state.clone();
+        let mut applied = 0usize;
         for (rule_id, runtime_state) in updates {
             let Some(expected_fingerprint) = configured.get(&rule_id).copied() else {
                 continue;
@@ -386,13 +421,15 @@ impl RulesStore {
             if expected_fingerprint != runtime_state.fingerprint {
                 continue;
             }
-            state.runtime.insert(rule_id, runtime_state);
-            changed = true;
+            candidate.runtime.insert(rule_id, runtime_state);
+            applied = applied.saturating_add(1);
         }
-        if changed {
-            self.persist_state(&state)?;
+        if applied > 0 {
+            self.persist_state(&candidate)
+                .map_err(|err| format!("rules state persistence failed: {err}"))?;
+            *state = candidate;
         }
-        Ok(())
+        Ok(applied)
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, PersistedRulesStoreState>, String> {
@@ -407,17 +444,22 @@ impl RulesStore {
             .map_err(|_| "rules store write lock poisoned".to_string())
     }
 
-    fn persist_state(&self, state: &PersistedRulesStoreState) -> Result<(), String> {
+    fn persist_state(&self, state: &PersistedRulesStoreState) -> tsink::Result<()> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        write_rules_store_state(path, state)
+        write_rules_store_state(path, state, self.local_disk_budget.as_ref())
     }
 
     fn snapshot_into(&self, snapshot_path: &Path) -> Result<(), String> {
         let snapshot_file = snapshot_path.join(RULES_STORE_FILE_NAME);
         let state = self.read_state()?;
-        write_rules_store_state(&snapshot_file, &state)
+        write_rules_store_state(&snapshot_file, &state, None).map_err(|err| {
+            format!(
+                "failed to write rules snapshot {}: {err}",
+                snapshot_file.display()
+            )
+        })
     }
 }
 
@@ -542,6 +584,33 @@ pub enum RulesRunTriggerError {
     Snapshot(String),
 }
 
+#[derive(Debug)]
+pub enum RulesApplyError {
+    Rejected(String),
+    Persistence(tsink::TsinkError),
+    Internal(String),
+}
+
+impl std::fmt::Display for RulesApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(detail) | Self::Internal(detail) => formatter.write_str(detail),
+            Self::Persistence(source) => {
+                write!(formatter, "rules state persistence failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RulesApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persistence(source) => Some(source),
+            Self::Rejected(_) | Self::Internal(_) => None,
+        }
+    }
+}
+
 pub struct RulesRuntime {
     store: Arc<RulesStore>,
     storage: Arc<dyn Storage>,
@@ -554,6 +623,7 @@ pub struct RulesRuntime {
 }
 
 impl RulesRuntime {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(
         data_path: Option<&Path>,
         storage: Arc<dyn Storage>,
@@ -561,8 +631,29 @@ impl RulesRuntime {
         cluster_context: Option<Arc<ClusterRequestContext>>,
         usage_accounting: Option<Arc<UsageAccounting>>,
     ) -> Result<Arc<Self>, String> {
+        Self::open_with_disk_budget(
+            data_path,
+            storage,
+            precision,
+            cluster_context,
+            usage_accounting,
+            None,
+        )
+    }
+
+    pub fn open_with_disk_budget(
+        data_path: Option<&Path>,
+        storage: Arc<dyn Storage>,
+        precision: TimestampPrecision,
+        cluster_context: Option<Arc<ClusterRequestContext>>,
+        usage_accounting: Option<Arc<UsageAccounting>>,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
-            store: Arc::new(RulesStore::open(data_path)?),
+            store: Arc::new(RulesStore::open_with_disk_budget(
+                data_path,
+                local_disk_budget,
+            )?),
             storage,
             precision,
             cluster_context,
@@ -584,9 +675,12 @@ impl RulesRuntime {
         })
     }
 
-    pub fn apply_groups(&self, groups: Vec<RuleGroupSpec>) -> Result<RulesStatusSnapshot, String> {
+    pub fn apply_groups(
+        &self,
+        groups: Vec<RuleGroupSpec>,
+    ) -> Result<RulesStatusSnapshot, RulesApplyError> {
         self.store.apply_groups(groups)?;
-        self.snapshot()
+        self.snapshot().map_err(RulesApplyError::Internal)
     }
 
     pub fn snapshot(&self) -> Result<RulesStatusSnapshot, String> {
@@ -739,10 +833,45 @@ impl RulesRuntime {
                     continue;
                 }
 
+                // Recording evaluation has externally visible row and usage side effects. Claim
+                // the aligned interval durably before either can occur. If the final outcome
+                // checkpoint later fails, this conservative marker survives restart and prevents
+                // replaying the interval (at the cost of at-most-once behavior after a crash).
+                let evaluation_previous = if matches!(rule, RuleSpec::Recording(_)) {
+                    let attempt = recording_rule_attempt_state(
+                        previous.clone(),
+                        fingerprint,
+                        aligned_eval_ts,
+                        now_unix_ms,
+                    );
+                    match self
+                        .store
+                        .apply_runtime_updates(vec![(rule_id.clone(), attempt.clone())])
+                    {
+                        Ok(1) => attempt,
+                        Ok(_) => {
+                            evaluation_failures = evaluation_failures.saturating_add(1);
+                            last_error = Some(format!(
+                                "recording rule attempt checkpoint skipped for '{rule_id}' because its configuration changed"
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            evaluation_failures = evaluation_failures.saturating_add(1);
+                            last_error = Some(format!(
+                                "recording rule attempt checkpoint failed for '{rule_id}': {err}"
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    previous.clone()
+                };
+
                 evaluated_rules = evaluated_rules.saturating_add(1);
                 let started = Instant::now();
                 let result = self
-                    .evaluate_rule(group, rule, aligned_eval_ts, previous.clone())
+                    .evaluate_rule(group, rule, aligned_eval_ts, evaluation_previous.clone())
                     .await;
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let operation = match rule {
@@ -766,12 +895,12 @@ impl RulesRuntime {
                             record.result_units = state.last_sample_count;
                             record.rows = state.last_recorded_rows;
                             record.duration_nanos = duration_ms.saturating_mul(1_000_000);
-                            let _ = accounting.record(record);
+                            accounting.record_best_effort(record).await;
                         }
                         updates.push((rule_id, state));
                     }
                     Err(err) => {
-                        let mut state = previous;
+                        let mut state = evaluation_previous;
                         state.fingerprint = fingerprint;
                         state.last_eval_timestamp = Some(aligned_eval_ts);
                         state.last_eval_unix_ms = Some(now_unix_ms);
@@ -781,27 +910,29 @@ impl RulesRuntime {
                         updates.push((rule_id, state));
                         evaluation_failures = evaluation_failures.saturating_add(1);
                         if let Some(accounting) = self.usage_accounting.as_ref() {
-                            let _ = accounting.record(UsageRecordInput {
-                                tenant_id: &group.tenant_id,
-                                category: UsageCategory::Background,
-                                operation,
-                                source: "rules",
-                                status: "error",
-                                request_units: 1,
-                                result_units: 0,
-                                rows: 0,
-                                metadata_updates: 0,
-                                exemplars_accepted: 0,
-                                exemplars_dropped: 0,
-                                histogram_series: 0,
-                                matched_series: 0,
-                                tombstones_applied: 0,
-                                duration_nanos: duration_ms.saturating_mul(1_000_000),
-                                request_bytes: 0,
-                                logical_storage_series: 0,
-                                logical_storage_samples: 0,
-                                logical_storage_bytes: 0,
-                            });
+                            accounting
+                                .record_best_effort(UsageRecordInput {
+                                    tenant_id: &group.tenant_id,
+                                    category: UsageCategory::Background,
+                                    operation,
+                                    source: "rules",
+                                    status: "error",
+                                    request_units: 1,
+                                    result_units: 0,
+                                    rows: 0,
+                                    metadata_updates: 0,
+                                    exemplars_accepted: 0,
+                                    exemplars_dropped: 0,
+                                    histogram_series: 0,
+                                    matched_series: 0,
+                                    tombstones_applied: 0,
+                                    duration_nanos: duration_ms.saturating_mul(1_000_000),
+                                    request_bytes: 0,
+                                    logical_storage_series: 0,
+                                    logical_storage_samples: 0,
+                                    logical_storage_bytes: 0,
+                                })
+                                .await;
                         }
                         last_error = Some(err);
                     }
@@ -1108,6 +1239,24 @@ fn summarize_rule_state(rule: &RuleSpec, state: &PersistedRuleRuntimeState) -> S
             }
         }
     }
+}
+
+fn recording_rule_attempt_state(
+    mut previous: PersistedRuleRuntimeState,
+    fingerprint: u64,
+    aligned_eval_timestamp: i64,
+    attempt_unix_ms: u64,
+) -> PersistedRuleRuntimeState {
+    previous.fingerprint = fingerprint;
+    previous.last_eval_timestamp = Some(aligned_eval_timestamp);
+    previous.last_eval_unix_ms = Some(attempt_unix_ms);
+    previous.last_duration_ms = 0;
+    previous.last_error = Some(RECORDING_RULE_ATTEMPT_PENDING.to_string());
+    previous.last_sample_count = 0;
+    previous.last_recorded_rows = 0;
+    previous.last_outcome = Some(RuleEvaluationOutcome::Error);
+    previous.alert_instances.clear();
+    previous
 }
 
 fn validate_groups(groups: &[RuleGroupSpec]) -> Result<(), String> {
@@ -1643,54 +1792,26 @@ fn load_rules_store_state(path: &Path) -> Result<PersistedRulesStoreState, Strin
     Ok(persisted.state)
 }
 
-fn write_rules_store_state(path: &Path, state: &PersistedRulesStoreState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create rules store directory {}: {err}",
-                parent.display()
-            )
-        })?;
-    }
+fn write_rules_store_state(
+    path: &Path,
+    state: &PersistedRulesStoreState,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+) -> tsink::Result<()> {
     let persisted = PersistedRulesStore {
         magic: RULES_STORE_MAGIC.to_string(),
         schema_version: RULES_STORE_SCHEMA_VERSION,
         state: state.clone(),
     };
-    let mut encoded = serde_json::to_vec_pretty(&persisted)
-        .map_err(|err| format!("failed to serialize rules store: {err}"))?;
+    let mut encoded = serde_json::to_vec_pretty(&persisted)?;
     encoded.push(b'\n');
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary rules store {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(&encoded).map_err(|err| {
-        format!(
-            "failed to write temporary rules store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to sync temporary rules store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace rules store {} from {}: {err}",
-            path.display(),
-            tmp_path.display()
-        )
-    })
+    if let Some(local_disk_budget) = local_disk_budget {
+        return local_disk_budget.write_file_atomically_and_sync_parent(
+            path,
+            &encoded,
+            DiskCategory::ServerState,
+        );
+    }
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, &encoded)
 }
 
 pub fn empty_rules_snapshot() -> RulesStatusSnapshot {
@@ -1724,8 +1845,83 @@ mod tests {
     use super::*;
     use crate::cluster::config::{ClusterConfig, DEFAULT_CLUSTER_SHARDS};
     use crate::cluster::{ClusterRequestContext, ClusterRuntime};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::tempdir;
     use tsink::StorageBuilder;
+
+    struct CountingInsertStorage {
+        inner: Arc<dyn Storage>,
+        inserted_rows: Arc<AtomicU64>,
+    }
+
+    impl Storage for CountingInsertStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)?;
+            self.inserted_rows.fetch_add(
+                u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            Ok(())
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<tsink::MetricSeries>> {
+            self.inner.list_metrics()
+        }
+
+        fn list_metrics_with_wal(&self) -> tsink::Result<Vec<tsink::MetricSeries>> {
+            self.inner.list_metrics_with_wal()
+        }
+
+        fn select_series(
+            &self,
+            selection: &tsink::SeriesSelection,
+        ) -> tsink::Result<Vec<tsink::MetricSeries>> {
+            self.inner.select_series(selection)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    fn encoded_rules_store_len(state: &PersistedRulesStoreState) -> u64 {
+        let persisted = PersistedRulesStore {
+            magic: RULES_STORE_MAGIC.to_string(),
+            schema_version: RULES_STORE_SCHEMA_VERSION,
+            state: state.clone(),
+        };
+        let mut encoded =
+            serde_json::to_vec_pretty(&persisted).expect("rules state should serialize");
+        encoded.push(b'\n');
+        u64::try_from(encoded.len()).expect("encoded rules state length should fit u64")
+    }
 
     fn make_storage_with_path(path: &Path) -> Arc<dyn Storage> {
         StorageBuilder::new()
@@ -1759,6 +1955,152 @@ mod tests {
         Arc::new(
             ClusterRequestContext::from_runtime(runtime).expect("cluster context should build"),
         )
+    }
+
+    fn sample_recording_group(name: &str, record: &str) -> RuleGroupSpec {
+        RuleGroupSpec {
+            name: name.to_string(),
+            tenant_id: "team-a".to_string(),
+            interval_secs: 60,
+            labels: BTreeMap::new(),
+            rules: vec![RuleSpec::Recording(RecordingRuleSpec {
+                record: record.to_string(),
+                expr: "source_metric".to_string(),
+                interval_secs: None,
+                labels: BTreeMap::new(),
+            })],
+        }
+    }
+
+    #[test]
+    fn disk_quota_failure_does_not_publish_candidate_rules() {
+        let temp_dir = tempdir().expect("temp dir should build");
+        let initial_group = sample_recording_group("initial", "initial_recording");
+        let store = RulesStore::open(Some(temp_dir.path())).expect("rules store should open");
+        store
+            .apply_groups(vec![initial_group.clone()])
+            .expect("initial rules should persist");
+        drop(store);
+
+        let store_path = temp_dir.path().join(RULES_STORE_FILE_NAME);
+        let initial_bytes = std::fs::read(&store_path).expect("initial rules should exist");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(initial_bytes.len() as u64 + 1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let runtime = RulesRuntime::open_with_disk_budget(
+            Some(temp_dir.path()),
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            Some(Arc::clone(&budget)),
+        )
+        .expect("runtime should open");
+
+        let err = runtime
+            .apply_groups(vec![sample_recording_group(
+                "replacement",
+                "replacement_recording",
+            )])
+            .expect_err("replacement should exceed the atomic-write peak quota");
+        assert!(matches!(
+            err,
+            RulesApplyError::Persistence(tsink::TsinkError::DiskQuotaExceeded { .. })
+        ));
+
+        let snapshot = runtime
+            .snapshot()
+            .expect("live state should remain readable");
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].name, initial_group.name);
+        assert_eq!(
+            std::fs::read(&store_path).expect("persisted rules should remain readable"),
+            initial_bytes
+        );
+        let disk = budget.snapshot();
+        assert_eq!(disk.active_reservations, 0);
+        assert_eq!(disk.reserved_bytes, 0);
+        assert_eq!(disk.rejections_total, 1);
+    }
+
+    #[test]
+    fn budgeted_rules_are_accounted_exactly_and_reopen() {
+        let temp_dir = tempdir().expect("temp dir should build");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(128 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let expected_group = sample_recording_group("persisted", "persisted_recording");
+        let runtime = RulesRuntime::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Arc::clone(&storage),
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            Some(Arc::clone(&budget)),
+        )
+        .expect("runtime should open");
+        runtime
+            .apply_groups(vec![expected_group.clone()])
+            .expect("rules should persist");
+
+        let store_path = temp_dir.path().join(RULES_STORE_FILE_NAME);
+        let store_bytes = std::fs::metadata(&store_path)
+            .expect("rules store should exist")
+            .len();
+        let disk = budget.snapshot();
+        assert_eq!(disk.accounted_bytes, store_bytes);
+        assert_eq!(
+            disk.categories
+                .iter()
+                .find(|usage| usage.category == DiskCategory::ServerState)
+                .map(|usage| usage.bytes),
+            Some(store_bytes)
+        );
+
+        let snapshot_dir = tempdir().expect("snapshot dir should build");
+        runtime
+            .snapshot_into(snapshot_dir.path())
+            .expect("external snapshot should succeed");
+        assert!(snapshot_dir.path().join(RULES_STORE_FILE_NAME).exists());
+        assert_eq!(budget.snapshot().accounted_bytes, store_bytes);
+
+        drop(runtime);
+        drop(budget);
+        let reopened_budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(128 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should reopen");
+        let reopened = RulesRuntime::open_with_disk_budget(
+            Some(temp_dir.path()),
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            Some(Arc::clone(&reopened_budget)),
+        )
+        .expect("rules runtime should reopen");
+        let snapshot = reopened.snapshot().expect("reopened state should load");
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].name, expected_group.name);
+        assert_eq!(reopened_budget.snapshot().accounted_bytes, store_bytes);
     }
 
     #[tokio::test]
@@ -1825,6 +2167,173 @@ mod tests {
             .select("recorded_metric", &[Label::new("host", "a")], 0, 120_000)
             .expect("recorded points should still exist");
         assert_eq!(points.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recording_rule_final_checkpoint_quota_failure_does_not_replay_rows_or_usage_after_reopen(
+    ) {
+        let rules_dir = tempdir().expect("rules temp dir should build");
+        let group = sample_recording_group("recording", "recorded_metric");
+        let bootstrap_store =
+            RulesStore::open(Some(rules_dir.path())).expect("rules store should open");
+        bootstrap_store
+            .apply_groups(vec![group.clone()])
+            .expect("initial rules should persist");
+        let initial_state = bootstrap_store
+            .snapshot()
+            .expect("initial rules state should be readable");
+        let rule = &group.rules[0];
+        let rule_id = rule_id(&group, rule);
+        let fingerprint = rule_fingerprint(&group, rule).expect("rule should fingerprint");
+        let initial_runtime = initial_state
+            .runtime
+            .get(&rule_id)
+            .cloned()
+            .expect("initial runtime state should exist");
+        let attempt = recording_rule_attempt_state(
+            initial_runtime,
+            fingerprint,
+            60_000,
+            unix_timestamp_millis(),
+        );
+        let mut attempt_candidate = initial_state.clone();
+        attempt_candidate
+            .runtime
+            .insert(rule_id.clone(), attempt.clone());
+        let initial_len = encoded_rules_store_len(&initial_state);
+        let attempt_len = encoded_rules_store_len(&attempt_candidate);
+
+        let mut successful_candidate = attempt_candidate;
+        let successful_runtime = successful_candidate
+            .runtime
+            .get_mut(&rule_id)
+            .expect("candidate runtime should exist");
+        successful_runtime.last_success_unix_ms = Some(unix_timestamp_millis());
+        successful_runtime.last_error = None;
+        successful_runtime.last_sample_count = 1;
+        successful_runtime.last_recorded_rows = 1;
+        successful_runtime.last_outcome = Some(RuleEvaluationOutcome::Success);
+        assert!(
+            encoded_rules_store_len(&successful_candidate) > initial_len,
+            "the final checkpoint must require more than the post-attempt quota headroom"
+        );
+        drop(bootstrap_store);
+
+        let budget_limit = initial_len
+            .checked_add(attempt_len)
+            .expect("rules quota should fit u64");
+        let budget = LocalDiskBudget::open(
+            rules_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(budget_limit),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+
+        let inner_storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        inner_storage
+            .insert_rows(&[Row::with_labels(
+                "source_metric",
+                vec![
+                    Label::new("host", "a"),
+                    Label::new(tenant::TENANT_LABEL, "team-a"),
+                ],
+                DataPoint::new(60_000, 7.0),
+            )])
+            .expect("seed write should succeed");
+        let inserted_rows = Arc::new(AtomicU64::new(0));
+        let storage: Arc<dyn Storage> = Arc::new(CountingInsertStorage {
+            inner: inner_storage,
+            inserted_rows: Arc::clone(&inserted_rows),
+        });
+        let usage_accounting = UsageAccounting::open(None).expect("usage store should open");
+        let runtime = RulesRuntime::open_with_disk_budget(
+            Some(rules_dir.path()),
+            Arc::clone(&storage),
+            TimestampPrecision::Milliseconds,
+            None,
+            Some(Arc::clone(&usage_accounting)),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("runtime should open");
+
+        runtime.run_due_at(60_000).await;
+
+        assert_eq!(inserted_rows.load(Ordering::SeqCst), 1);
+        let usage = usage_accounting.tenant_summary("team-a");
+        assert_eq!(usage.background.events_total, 1);
+        assert_eq!(usage.background.rows, 1);
+        let live = runtime.snapshot().expect("live status should be readable");
+        assert_eq!(live.metrics.evaluated_rules_total, 1);
+        assert_eq!(live.metrics.evaluation_failures_total, 1);
+        assert_eq!(live.metrics.recording_rows_written_total, 1);
+        assert!(
+            live.metrics
+                .last_error
+                .as_deref()
+                .is_some_and(|err| err.contains("rules state persist failed")),
+            "final checkpoint failure should be visible in runtime status: {:?}",
+            live.metrics.last_error
+        );
+        let live_rule = &live.groups[0].rules[0];
+        assert_eq!(live_rule.last_eval_timestamp, Some(60_000));
+        assert_eq!(live_rule.state, "error");
+        assert_eq!(
+            live_rule.last_error.as_deref(),
+            Some(RECORDING_RULE_ATTEMPT_PENDING)
+        );
+
+        let persisted = load_rules_store_state(&rules_dir.path().join(RULES_STORE_FILE_NAME))
+            .expect("attempt checkpoint should remain readable");
+        let persisted_attempt = persisted
+            .runtime
+            .get(&rule_id)
+            .expect("attempt checkpoint should remain persisted");
+        assert_eq!(persisted_attempt.last_eval_timestamp, Some(60_000));
+        assert_eq!(
+            persisted_attempt.last_error.as_deref(),
+            Some(RECORDING_RULE_ATTEMPT_PENDING)
+        );
+        assert_eq!(budget.snapshot().rejections_total, 1);
+
+        drop(runtime);
+        drop(budget);
+        let reopened_budget = LocalDiskBudget::open(
+            rules_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(budget_limit),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should reopen");
+        let reopened = RulesRuntime::open_with_disk_budget(
+            Some(rules_dir.path()),
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            Some(Arc::clone(&usage_accounting)),
+            Some(reopened_budget),
+        )
+        .expect("rules runtime should reopen");
+
+        reopened.run_due_at(60_500).await;
+
+        assert_eq!(inserted_rows.load(Ordering::SeqCst), 1);
+        let usage = usage_accounting.tenant_summary("team-a");
+        assert_eq!(usage.background.events_total, 1);
+        assert_eq!(usage.background.rows, 1);
+        let reopened_status = reopened
+            .snapshot()
+            .expect("reopened status should be readable");
+        let reopened_rule = &reopened_status.groups[0].rules[0];
+        assert_eq!(reopened_rule.last_eval_timestamp, Some(60_000));
+        assert_eq!(reopened_rule.state, "error");
+        assert_eq!(
+            reopened_rule.last_error.as_deref(),
+            Some(RECORDING_RULE_ATTEMPT_PENDING)
+        );
     }
 
     #[tokio::test]

@@ -1160,7 +1160,8 @@ fn option_atomic_millis(value: &AtomicU64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::cluster::rpc::InternalIngestRowsResponse;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::http::read_http_request;
+    use tokio::io::AsyncWriteExt;
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("tempdir")
@@ -1307,8 +1308,10 @@ mod tests {
         let endpoint = listener.local_addr().expect("local addr").to_string();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request).await.expect("read");
+            let mut request_buffer = Vec::new();
+            let _ = read_http_request(&mut stream, &mut request_buffer)
+                .await
+                .expect("request should parse");
             let response = serde_json::to_vec(&InternalIngestRowsResponse {
                 inserted_rows: 2,
                 write_result: Some(tsink::BatchWriteResult::from_outcomes(
@@ -1339,8 +1342,10 @@ mod tests {
         let endpoint = listener.local_addr().expect("local addr").to_string();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request).await.expect("read");
+            let mut request_buffer = Vec::new();
+            let _ = read_http_request(&mut stream, &mut request_buffer)
+                .await
+                .expect("request should parse");
             let response = serde_json::to_vec(&InternalIngestRowsResponse {
                 inserted_rows: 2,
                 write_result: None,

@@ -9,6 +9,7 @@ mod snapshot;
 
 type PersistPostPublishHook = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 pub(super) type IngestCommitHook = dyn Fn() + Send + Sync + 'static;
+pub(super) type FallibleCommitHook = dyn Fn() -> Result<()> + Send + Sync + 'static;
 
 #[derive(Default)]
 pub(super) struct PersistTestHooks {
@@ -38,6 +39,7 @@ pub(super) struct PersistTestHooks {
     pub(super) query_persisted_chunk_decode_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) tombstone_pre_publication_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) tombstone_post_swap_pre_visibility_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) tombstone_post_commit_error_hook: RwLock<Option<Arc<FallibleCommitHook>>>,
 }
 
 impl std::fmt::Debug for PersistTestHooks {

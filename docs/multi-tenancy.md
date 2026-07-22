@@ -263,6 +263,23 @@ tsink records per-tenant resource consumption to an append-only NDJSON ledger. E
 
 Records are aggregated into per-tenant summaries broken down by category. A storage snapshot is periodically reconciled against live index state and attached to the summary.
 
+Usage metering does not participate in the primary data/query response classification: a ledger
+failure does not turn already-completed primary work into a retryable data failure. The handler
+does await metering before returning, however, so ledger I/O can add response latency. Ordinary
+appends run on one bounded blocking lane, independently of the bounded storage-reconciliation scan,
+and every failure immediately updates the journal's `recordFailuresTotal`/
+`lastRecordErrorCode` fields and `tsink_usage_ledger_record_failures_total`. Stderr diagnostics are
+rate-limited to power-of-two failure counts. Alert on an increase or rate in the counter rather than
+on a permanently nonzero total; any increase means the usage history may have a gap or an
+indeterminate tail. Multi-tenant storage reconciliations are committed as one physical ledger frame,
+so restart cannot accept only a tenant prefix and duplicate it on retry. The loader remains
+backward-compatible with legacy single-record lines and sequence gaps, but rejects an unterminated
+tail, an empty batch, or a zero or duplicate sequence.
+
+The journal's in-memory record history is currently unbounded. Status, report, support-bundle, and
+export operations scan it synchronously, and export does not yet provide a bounded pagination or
+streaming cursor.
+
 ### Retrieving usage data
 
 ```bash

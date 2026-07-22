@@ -19,6 +19,7 @@ pub(super) fn render_metrics(
     rbac_registry: Option<&RbacRegistry>,
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let mut collection_errors = Vec::new();
     let memory_used = storage.memory_used();
@@ -36,6 +37,9 @@ pub(super) fn render_metrics(
     let series_count = metrics_list.len();
     let uptime = server_start.elapsed().as_secs();
     let obs = storage.observability_snapshot();
+    let local_disk = local_disk_budget
+        .map(tsink::LocalDiskBudget::snapshot)
+        .or_else(|| obs.local_disk.clone());
     let memory_obs = &obs.memory;
     let memory_pressure_normal = u8::from(matches!(
         memory_obs.pressure.level,
@@ -662,7 +666,7 @@ pub(super) fn render_metrics(
         cluster_dedupe_log_bytes = cluster_dedupe_metrics.log_bytes,
     );
 
-    append_local_disk_metrics(&mut body, obs.local_disk.as_ref());
+    append_local_disk_metrics(&mut body, local_disk.as_ref());
     cluster::append_metrics(
         &mut body,
         ClusterMetrics {
@@ -710,7 +714,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
     };
 
     body.push_str(
-        "# HELP tsink_local_disk_accounted_bytes Bytes accounted beneath the core managed data directory\n\
+        "# HELP tsink_local_disk_accounted_bytes Bytes accounted beneath the shared managed data directory\n\
          # TYPE tsink_local_disk_accounted_bytes gauge\n",
     );
     body.push_str(&format!(
@@ -718,7 +722,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         snapshot.accounted_bytes
     ));
     body.push_str(
-        "# HELP tsink_local_disk_reserved_bytes Bytes held by live core local-disk reservations\n\
+        "# HELP tsink_local_disk_reserved_bytes Bytes held by live managed local-disk reservations\n\
          # TYPE tsink_local_disk_reserved_bytes gauge\n",
     );
     body.push_str(&format!(
@@ -726,7 +730,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         snapshot.reserved_bytes
     ));
     body.push_str(
-        "# HELP tsink_local_disk_maintenance_reserved_bytes Live reservation bytes held by core maintenance work\n\
+        "# HELP tsink_local_disk_maintenance_reserved_bytes Live reservation bytes held by managed maintenance work\n\
          # TYPE tsink_local_disk_maintenance_reserved_bytes gauge\n",
     );
     body.push_str(&format!(
@@ -752,13 +756,13 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
     }
     if let Some(limit) = snapshot.limits.max_bytes {
         body.push_str(
-            "# HELP tsink_local_disk_limit_bytes Configured logical byte limit for the core managed data directory\n\
+            "# HELP tsink_local_disk_limit_bytes Configured logical byte limit for the shared managed data directory\n\
              # TYPE tsink_local_disk_limit_bytes gauge\n",
         );
         body.push_str(&format!("tsink_local_disk_limit_bytes {limit}\n"));
     }
     body.push_str(
-        "# HELP tsink_local_disk_filesystem_headroom_bytes Configured filesystem free-space floor for core local storage\n\
+        "# HELP tsink_local_disk_filesystem_headroom_bytes Configured filesystem free-space floor for managed local storage\n\
          # TYPE tsink_local_disk_filesystem_headroom_bytes gauge\n",
     );
     body.push_str(&format!(
@@ -766,7 +770,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         snapshot.limits.filesystem_free_headroom_bytes
     ));
     body.push_str(
-        "# HELP tsink_local_disk_maintenance_reserve_bytes Configured logical bytes reserved for core maintenance output\n\
+        "# HELP tsink_local_disk_maintenance_reserve_bytes Configured logical bytes reserved for managed maintenance output\n\
          # TYPE tsink_local_disk_maintenance_reserve_bytes gauge\n",
     );
     body.push_str(&format!(
@@ -774,7 +778,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         snapshot.limits.maintenance_temp_reserve_bytes
     ));
     body.push_str(
-        "# HELP tsink_local_disk_over_limit Whether reconciled core usage exceeds its logical limit\n\
+        "# HELP tsink_local_disk_over_limit Whether reconciled managed usage exceeds its logical limit\n\
          # TYPE tsink_local_disk_over_limit gauge\n",
     );
     body.push_str(&format!(
@@ -782,7 +786,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         u8::from(snapshot.over_limit)
     ));
     body.push_str(
-        "# HELP tsink_local_disk_active_reservations Live core local-disk reservations\n\
+        "# HELP tsink_local_disk_active_reservations Live managed local-disk reservations\n\
          # TYPE tsink_local_disk_active_reservations gauge\n",
     );
     body.push_str(&format!(
@@ -792,17 +796,17 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
     for (name, help, value) in [
         (
             "tsink_local_disk_rejections_total",
-            "Core local-disk reservations rejected by logical or physical limits",
+            "Managed local-disk reservations rejected by logical or physical limits",
             snapshot.rejections_total,
         ),
         (
             "tsink_local_disk_reconciliations_total",
-            "Successful full scans of the core managed data directory",
+            "Successful full scans of the shared managed data directory",
             snapshot.reconciliations_total,
         ),
         (
             "tsink_local_disk_reservation_overruns_total",
-            "Core disk commits whose surviving growth exceeded their reservation",
+            "Managed disk commits whose surviving growth exceeded their reservation",
             snapshot.reservation_overruns_total,
         ),
     ] {
@@ -811,7 +815,7 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         ));
     }
     body.push_str(
-        "# HELP tsink_local_disk_category_bytes Accounted bytes beneath the core managed data directory by category\n\
+        "# HELP tsink_local_disk_category_bytes Accounted bytes beneath the shared managed data directory by category\n\
          # TYPE tsink_local_disk_category_bytes gauge\n",
     );
     for usage in &snapshot.categories {
@@ -982,6 +986,14 @@ fn append_usage_metrics(body: &mut String, snapshot: &crate::usage::UsageLedgerS
     body.push_str(&format!(
         "tsink_usage_ledger_storage_reconciliations_total {}\n",
         snapshot.storage_reconciliations_total
+    ));
+    body.push_str(
+        "# HELP tsink_usage_ledger_record_failures_total Usage ledger append attempts that did not complete successfully\n\
+         # TYPE tsink_usage_ledger_record_failures_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_record_failures_total {}\n",
+        snapshot.record_failures_total
     ));
     body.push_str(
         "# HELP tsink_usage_ledger_durable Whether usage accounting is backed by a durable on-disk ledger\n\
@@ -1986,6 +1998,20 @@ fn prometheus_escape_label_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_metrics_render_failed_durable_publications() {
+        let mut body = String::new();
+        append_usage_metrics(
+            &mut body,
+            &crate::usage::UsageLedgerStatus {
+                record_failures_total: 7,
+                ..crate::usage::UsageLedgerStatus::default()
+            },
+        );
+
+        assert!(body.contains("tsink_usage_ledger_record_failures_total 7\n"));
+    }
 
     #[test]
     fn legacy_write_observability_renders_fixed_cardinality_labels() {

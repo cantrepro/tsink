@@ -710,6 +710,43 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates an unmanaged directory tree and makes every parent link crash-durable.
+///
+/// Unlike the local-disk-budget directory helper, this deliberately performs no quota accounting.
+/// It is used for filesystem-backed tier roots outside the managed local data path. Every ancestor
+/// is synchronized on every call so a retry after a prior sync failure cannot mistake
+/// merely-visible directory entries for durable ones.
+pub(crate) fn create_dir_all_and_sync_parents(directory: &Path) -> Result<()> {
+    let directory = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(TsinkError::Io)?
+            .join(directory)
+    };
+    std::fs::create_dir_all(&directory).map_err(|source| TsinkError::IoWithPath {
+        path: directory.clone(),
+        source,
+    })?;
+
+    let mut ancestors = directory.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let metadata = std::fs::metadata(ancestor).map_err(|source| TsinkError::IoWithPath {
+            path: ancestor.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "directory path contains a non-directory entry: {}",
+                ancestor.display()
+            )));
+        }
+        sync_parent_dir(ancestor)?;
+    }
+    Ok(())
+}
+
 pub fn write_file_atomically_and_sync_parent(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp_path = write_tmp_and_sync(path, bytes)?;
     if let Err(err) = rename_tmp(&tmp_path, path) {
@@ -803,6 +840,36 @@ mod tests {
         assert_eq!(
             std::fs::read(&path).expect("payload should exist"),
             b"payload"
+        );
+    }
+
+    #[test]
+    fn write_file_atomically_reports_parent_sync_failure_after_publication() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("state.bin");
+        let _sync_failure = fail_directory_sync_once(
+            temp_dir.path().to_path_buf(),
+            "injected atomic publication parent sync failure",
+        );
+
+        let err = write_file_atomically_and_sync_parent(&path, b"payload")
+            .expect_err("the injected parent sync failure should be reported");
+
+        assert!(
+            err.to_string()
+                .contains("injected atomic publication parent sync failure"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("published payload should remain inspectable"),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp_dir.path())
+                .expect("temporary directory should remain readable")
+                .count(),
+            1,
+            "the failed publication must not leave an orphan temporary file"
         );
     }
 

@@ -61,35 +61,30 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
         .collect::<Result<Vec<_>>>()
 }
 
-pub(super) fn persist_rollup_policies_budgeted(
-    path: Option<&Path>,
-    policies: &[RollupPolicy],
-    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-) -> Result<()> {
-    let Some(path) = path else {
-        if policies.is_empty() {
-            return Ok(());
-        }
-        return Err(TsinkError::InvalidConfiguration(
-            "rollup policies require persistent storage".to_string(),
-        ));
-    };
-
+pub(super) fn encode_rollup_policies(policies: &[RollupPolicy]) -> Result<Vec<u8>> {
     let payload = PersistedRollupPoliciesFile {
         magic: ROLLUP_POLICIES_MAGIC.to_string(),
         version: ROLLUP_SCHEMA_VERSION,
         policies: policies.to_vec(),
     };
-    let encoded = serde_json::to_vec_pretty(&payload)?;
+    Ok(serde_json::to_vec_pretty(&payload)?)
+}
+
+pub(super) fn persist_encoded_rollup_policies_budgeted(
+    path: &Path,
+    encoded: &[u8],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     write_file_atomically_and_sync_parent_budgeted(
         path,
-        &encoded,
+        encoded,
         local_disk_budget,
         crate::DiskCategory::Rollups,
-        crate::DiskReservationKind::Growth,
+        reservation_kind,
     )
 }
 
@@ -103,6 +98,7 @@ impl RollupQuerySelectionContext<'_> {
         start: i64,
         end: i64,
     ) -> Option<RollupQueryCandidate> {
+        let _snapshot_visibility = self.store.state.snapshot_visibility.read();
         if is_internal_rollup_metric(metric) || aggregation == Aggregation::None || interval <= 0 {
             return None;
         }
@@ -291,7 +287,13 @@ impl ChunkStorage {
         let snapshot = state_store.next_snapshot_for_policies(normalized);
         state_store.persist_snapshot(&snapshot)?;
         state_store.install_snapshot(snapshot);
-        self.run_rollup_pipeline_once_locked()?;
+        if let Err(err) = self.run_rollup_pipeline_once_locked() {
+            // The policy/state snapshot is already durable and visible. Returning Err here would
+            // tell callers the apply was rejected even though retrying or reopening observes the
+            // new policy set. Keep the committed result authoritative and expose initial
+            // materialization degradation through per-policy status instead.
+            state_store.record_rollup_pipeline_error(&err);
+        }
         Ok(self.rollup_observability_snapshot())
     }
 

@@ -222,6 +222,29 @@ struct ServerCliArgs {
         help = "Memory budget (for example 1G or 1073741824)"
     )]
     memory_limit: Option<usize>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        help = "Shared byte limit for integrated local writers (core storage, metadata, exemplars, rules, usage ledger, and managed state)"
+    )]
+    local_disk_limit: Option<u64>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        default_value = "0",
+        help = "Filesystem free space that local writes must leave available"
+    )]
+    filesystem_free_headroom: u64,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        default_value = "0",
+        help = "Local-disk capacity reserved for maintenance temporary output"
+    )]
+    maintenance_temp_reserve: u64,
     #[arg(long, value_name = "N", help = "Max unique series")]
     cardinality_limit: Option<usize>,
     #[arg(long, value_name = "N", help = "Target points per chunk")]
@@ -445,6 +468,9 @@ impl ServerCliArgs {
             remote_segment_refresh_interval: self.remote_segment_refresh_interval,
             mirror_hot_segments_to_object_store: self.mirror_hot_segments_to_object_store,
             memory_limit: self.memory_limit,
+            local_disk_limit: self.local_disk_limit,
+            filesystem_free_headroom: self.filesystem_free_headroom,
+            maintenance_temp_reserve: self.maintenance_temp_reserve,
             cardinality_limit: self.cardinality_limit,
             chunk_points: self.chunk_points,
             max_writers: self.max_writers,
@@ -595,18 +621,18 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration: '{value}'"))
 }
 
-fn parse_byte_size(value: &str) -> Result<usize, String> {
+fn parse_byte_size_u64(value: &str) -> Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("empty byte size value".to_string());
     }
-    if let Ok(bytes) = value.parse::<usize>() {
+    if let Ok(bytes) = value.parse::<u64>() {
         return Ok(bytes);
     }
 
     let last = value.as_bytes()[value.len() - 1];
     let (num_str, multiplier) = match last {
-        b'K' | b'k' => (&value[..value.len() - 1], 1_024_usize),
+        b'K' | b'k' => (&value[..value.len() - 1], 1_024_u64),
         b'M' | b'm' => (&value[..value.len() - 1], 1_024 * 1_024),
         b'G' | b'g' => (&value[..value.len() - 1], 1_024 * 1_024 * 1_024),
         b'T' | b't' => (&value[..value.len() - 1], 1_024 * 1_024 * 1_024 * 1_024),
@@ -625,11 +651,17 @@ fn parse_byte_size(value: &str) -> Result<usize, String> {
     }
 
     let bytes = num * multiplier as f64;
-    if !bytes.is_finite() || bytes > usize::MAX as f64 {
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
         return Err(format!("invalid byte size: '{value}'"));
     }
 
-    Ok(bytes as usize)
+    Ok(bytes as u64)
+}
+
+fn parse_byte_size(value: &str) -> Result<usize, String> {
+    let bytes = parse_byte_size_u64(value)?;
+    usize::try_from(bytes)
+        .map_err(|_| format!("byte size exceeds this platform's range: '{value}'"))
 }
 
 fn parse_storage_mode(value: &str) -> Result<StorageRuntimeMode, String> {
@@ -706,6 +738,85 @@ mod tests {
     #[test]
     fn parse_byte_size_rejects_negative_values() {
         assert!(parse_byte_size("-1K").is_err());
+    }
+
+    #[test]
+    fn parses_shared_local_disk_limit_flags() {
+        let config = parse_server_args(
+            [
+                "--data-path",
+                "/tmp/tsink-disk-budget",
+                "--local-disk-limit",
+                "2G",
+                "--filesystem-free-headroom",
+                "64M",
+                "--maintenance-temp-reserve",
+                "128M",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("local disk flags should parse");
+
+        assert_eq!(config.local_disk_limit, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(config.filesystem_free_headroom, 64 * 1024 * 1024);
+        assert_eq!(config.maintenance_temp_reserve, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn local_disk_limits_require_a_data_path() {
+        let err = parse_server_args(["--local-disk-limit", "1M"].into_iter().map(str::to_string))
+            .expect_err("a finite server disk limit without a root should fail");
+        assert!(
+            err.contains("local disk limits require --data-path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_disk_limit_relationships_are_validated() {
+        let zero = parse_server_args(
+            [
+                "--data-path",
+                "/tmp/tsink-disk-budget",
+                "--local-disk-limit",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("zero disk limit should fail");
+        assert!(zero.contains("local disk limit must be greater than zero"));
+
+        let no_growth_capacity = parse_server_args(
+            [
+                "--data-path",
+                "/tmp/tsink-disk-budget",
+                "--local-disk-limit",
+                "1M",
+                "--maintenance-temp-reserve",
+                "1M",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("maintenance reserve equal to the limit should fail");
+        assert!(no_growth_capacity.contains("must be smaller than local disk limit"));
+
+        let overflow = parse_server_args(
+            [
+                "--data-path",
+                "/tmp/tsink-disk-budget",
+                "--filesystem-free-headroom",
+                "18446744073709551615",
+                "--maintenance-temp-reserve",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("combined physical reserves that overflow should fail");
+        assert!(overflow.contains("exceeds the supported byte range"));
     }
 
     #[test]

@@ -59,13 +59,44 @@ impl<'a> DeleteBridgeContext<'a> {
                         )?;
                     }
 
-                    self.storage
+                    let tombstone_persist_result = self
+                        .storage
                         .tombstone_publication_context()
                         .publish_tombstone_updates_locked(
                             self.storage,
                             self.storage.tombstone_index_context(),
                             updated_tombstones,
-                        )?;
+                        );
+                    if let Err(tombstone_failure) = tombstone_persist_result {
+                        let definitively_clean = tombstone_failure.is_definitively_clean();
+                        let tombstone_error = tombstone_failure.into_tsink_error();
+                        if !definitively_clean {
+                            // A failed rollback or accounting reconciliation means some durable
+                            // manifests may still expose the candidate tombstones. Retain the
+                            // pending marker so same-process queries avoid stale rollups and
+                            // startup can repair rollup state from the durable tombstone outcome.
+                            tracing::warn!(
+                                error = %tombstone_error,
+                                "Delete retained pending rollup invalidation after indeterminate tombstone persistence failure"
+                            );
+                            return Err(tombstone_error);
+                        }
+                        let cancel_result = if affected_policy_ids.is_empty() {
+                            Ok(())
+                        } else {
+                            self.storage.cancel_pending_rollup_delete_invalidation(
+                                tombstone,
+                                &updated_series_ids,
+                                &affected_policy_ids,
+                            )
+                        };
+                        return match cancel_result {
+                            Ok(()) => Err(tombstone_error),
+                            Err(cancel_error) => Err(TsinkError::Other(format!(
+                                "delete tombstone persistence failed: {tombstone_error}; pending rollup invalidation rollback failed: {cancel_error}"
+                            ))),
+                        };
+                    }
                     if !affected_policy_ids.is_empty() {
                         let finalize_result =
                             self.storage.finalize_pending_rollup_delete_invalidation(
@@ -86,9 +117,26 @@ impl<'a> DeleteBridgeContext<'a> {
             return Ok(0);
         }
 
-        let _ = self
+        #[cfg(test)]
+        let live_series_result = self
             .storage
-            .live_series_ids(updated_series_ids.iter().copied(), true)?;
+            .invoke_tombstone_post_commit_error_hook()
+            .and_then(|()| {
+                self.storage
+                    .live_series_ids(updated_series_ids.iter().copied(), true)
+            });
+        #[cfg(not(test))]
+        let live_series_result = self
+            .storage
+            .live_series_ids(updated_series_ids.iter().copied(), true);
+        if let Err(err) = live_series_result {
+            // Tombstones and query visibility have already committed. Metadata pruning is
+            // repairable cleanup, so never turn its failure into a definitive delete rejection.
+            tracing::warn!(
+                error = %err,
+                "Committed delete deferred live-series metadata pruning"
+            );
+        }
         self.storage.notify_compaction_thread();
         if has_affected_rollups {
             self.storage.notify_rollup_thread();
@@ -211,5 +259,37 @@ impl ChunkStorage {
             .persist_test_hooks
             .tombstone_post_swap_pre_visibility_hook
             .write() = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn invoke_tombstone_post_commit_error_hook(&self) -> Result<()> {
+        let hook = self
+            .persist_test_hooks
+            .tombstone_post_commit_error_hook
+            .read()
+            .clone();
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_tombstone_post_commit_error_hook<F>(&self, hook: F)
+    where
+        F: Fn() -> Result<()> + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .tombstone_post_commit_error_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_tombstone_post_commit_error_hook(&self) {
+        self.persist_test_hooks
+            .tombstone_post_commit_error_hook
+            .write()
+            .take();
     }
 }

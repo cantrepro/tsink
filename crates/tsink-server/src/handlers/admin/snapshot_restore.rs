@@ -1,5 +1,160 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AdminDeleteSeriesProgress {
+    matchers_processed: u64,
+    matched_series: u64,
+    tombstones_applied: u64,
+}
+
+impl AdminDeleteSeriesProgress {
+    fn add_outcome(&mut self, matched_series: u64, tombstones_applied: u64) {
+        self.matched_series = self.matched_series.saturating_add(matched_series);
+        self.tombstones_applied = self.tombstones_applied.saturating_add(tombstones_applied);
+    }
+
+    fn has_committed_tombstones(self) -> bool {
+        self.tombstones_applied > 0
+    }
+}
+
+#[derive(Debug)]
+enum AdminDeleteSeriesExecutionError {
+    Storage(tsink::TsinkError),
+    Partial {
+        source: tsink::TsinkError,
+        progress: AdminDeleteSeriesProgress,
+    },
+}
+
+impl AdminDeleteSeriesExecutionError {
+    fn retention_usage_status(&self) -> RetentionUsageStatus {
+        match self {
+            Self::Partial { source, .. }
+                if server_persistence_error_category(source)
+                    == WriteRejectionCategory::DiskQuotaExceeded =>
+            {
+                RetentionUsageStatus::Partial
+            }
+            Self::Partial { .. } => RetentionUsageStatus::Indeterminate,
+            Self::Storage(_) => RetentionUsageStatus::Indeterminate,
+        }
+    }
+}
+
+fn partial_delete_series_error_response(
+    source: &tsink::TsinkError,
+    matchers_processed: u64,
+    matched_series: u64,
+    tombstones_applied: u64,
+) -> HttpResponse {
+    let category = server_persistence_error_category(source);
+    let (status, error_code, retry_after) = write_rejection_http_mapping(category);
+    let outcome = if category == WriteRejectionCategory::DiskQuotaExceeded {
+        "partial"
+    } else {
+        "indeterminate_backend"
+    };
+    let diagnostic = if category == WriteRejectionCategory::DiskQuotaExceeded {
+        format!("delete_series stopped after committed partial progress: {source}")
+    } else {
+        "delete_series failed after committed partial progress; the remaining durable outcome is indeterminate"
+            .to_string()
+    };
+    let diagnostic = bounded_write_rejection_diagnostic(&diagnostic).to_string();
+    let mut response = json_response(
+        status,
+        &json!({
+            "status": "error",
+            "errorType": "partial_delete",
+            "code": error_code,
+            "error": diagnostic,
+            "data": {
+                "outcome": outcome,
+                "matchersProcessed": matchers_processed,
+                "matchedSeries": matched_series,
+                "tombstonesApplied": tombstones_applied,
+            }
+        }),
+    )
+    .with_header(WRITE_ERROR_CODE_HEADER, error_code)
+    .with_header(
+        DELETE_MATCHERS_PROCESSED_HEADER,
+        matchers_processed.to_string(),
+    )
+    .with_header(DELETE_MATCHED_SERIES_HEADER, matched_series.to_string())
+    .with_header(
+        DELETE_TOMBSTONES_APPLIED_HEADER,
+        tombstones_applied.to_string(),
+    );
+    if category == WriteRejectionCategory::DiskQuotaExceeded {
+        response = response
+            .with_header(WRITE_PARTIAL_HEADER, "true")
+            .with_header(WRITE_OUTCOME_HEADER, "partial");
+    } else {
+        response = with_indeterminate_backend_headers(response);
+    }
+    if let Some(retry_after) = retry_after {
+        response = response.with_header("Retry-After", retry_after);
+    }
+    response
+}
+
+fn admin_delete_series_execution_error_response(
+    err: &AdminDeleteSeriesExecutionError,
+) -> HttpResponse {
+    match err {
+        AdminDeleteSeriesExecutionError::Storage(source) => delete_series_error_response(source),
+        AdminDeleteSeriesExecutionError::Partial { source, progress } => {
+            partial_delete_series_error_response(
+                source,
+                progress.matchers_processed,
+                progress.matched_series,
+                progress.tombstones_applied,
+            )
+        }
+    }
+}
+
+fn admin_delete_series_task_failure_response(progress: AdminDeleteSeriesProgress) -> HttpResponse {
+    const DIAGNOSTIC: &str =
+        "delete_series task did not complete; the durable outcome is indeterminate";
+    if !progress.has_committed_tombstones() {
+        return indeterminate_backend_write_error_response(500, "write_internal", DIAGNOSTIC);
+    }
+
+    with_indeterminate_backend_headers(
+        json_response(
+            500,
+            &json!({
+                "status": "error",
+                "errorType": "partial_delete",
+                "code": "write_internal",
+                "error": DIAGNOSTIC,
+                "data": {
+                    "outcome": "indeterminate_backend",
+                    "matchersProcessed": progress.matchers_processed,
+                    "matchedSeries": progress.matched_series,
+                    "tombstonesApplied": progress.tombstones_applied,
+                }
+            }),
+        )
+        .with_header(WRITE_ERROR_CODE_HEADER, "write_internal")
+        .with_header(
+            DELETE_MATCHERS_PROCESSED_HEADER,
+            progress.matchers_processed.to_string(),
+        )
+        .with_header(
+            DELETE_MATCHED_SERIES_HEADER,
+            progress.matched_series.to_string(),
+        )
+        .with_header(
+            DELETE_TOMBSTONES_APPLIED_HEADER,
+            progress.tombstones_applied.to_string(),
+        ),
+    )
+}
+
 pub(crate) async fn handle_admin_snapshot(
     storage: &Arc<dyn Storage>,
     metadata_store: &Arc<MetricMetadataStore>,
@@ -60,6 +215,7 @@ pub(crate) async fn handle_admin_snapshot(
 pub(crate) async fn handle_admin_restore(
     request: &HttpRequest,
     admin_path_prefix: Option<&Path>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let payload = match parse_optional_json_body::<RestoreAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
@@ -101,6 +257,9 @@ pub(crate) async fn handle_admin_restore(
         Ok(path_buf) => path_buf,
         Err(err) => return text_response(400, &err),
     };
+    if let Err(err) = validate_restore_target_outside_live_root(&data_path_buf, local_disk_budget) {
+        return text_response(409, &err);
+    }
 
     let response_snapshot_path = snapshot_path_buf.display().to_string();
     let response_data_path = data_path_buf.display().to_string();
@@ -223,30 +382,80 @@ pub(crate) async fn handle_admin_delete_series(
         Err(err) => return err.to_http_response(),
     };
 
-    let storage = tenant::scoped_storage(Arc::clone(storage), tenant_id.clone());
+    let storage = Arc::clone(storage);
+    let delete_tenant_id = tenant_id.clone();
     let matcher_count = matcher_count.min(u64::MAX as usize) as u64;
+    let known_progress = Arc::new(std::sync::Mutex::new(AdminDeleteSeriesProgress::default()));
+    let task_progress = Arc::clone(&known_progress);
     let result = tokio::task::spawn_blocking(move || {
-        let mut matched_series = 0u64;
-        let mut tombstones_applied = 0u64;
+        let mut progress = AdminDeleteSeriesProgress::default();
         for selection in selections {
-            let outcome = storage.delete_series(&selection)?;
-            matched_series = matched_series.saturating_add(outcome.matched_series);
-            tombstones_applied = tombstones_applied.saturating_add(outcome.tombstones_applied);
+            let completed_progress = progress;
+            let mut selector_progress = AdminDeleteSeriesProgress::default();
+            let mut observe_inner_delete = |outcome: tsink::DeleteSeriesResult| {
+                selector_progress.add_outcome(outcome.matched_series, outcome.tombstones_applied);
+                let mut observed_progress = completed_progress;
+                observed_progress.matchers_processed =
+                    observed_progress.matchers_processed.saturating_add(1);
+                observed_progress.add_outcome(
+                    selector_progress.matched_series,
+                    selector_progress.tombstones_applied,
+                );
+                *task_progress
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = observed_progress;
+            };
+            match tenant::delete_series_with_progress(
+                &storage,
+                &delete_tenant_id,
+                &selection,
+                &mut observe_inner_delete,
+            ) {
+                Ok(outcome) => {
+                    progress.matchers_processed = progress.matchers_processed.saturating_add(1);
+                    progress.add_outcome(outcome.matched_series, outcome.tombstones_applied);
+                    *task_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = progress;
+                }
+                Err(tenant::TenantDeleteSeriesError::Partial {
+                    source,
+                    matched_series,
+                    tombstones_applied,
+                }) => {
+                    progress.matchers_processed = progress.matchers_processed.saturating_add(1);
+                    progress.add_outcome(matched_series, tombstones_applied);
+                    *task_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = progress;
+                    return Err(AdminDeleteSeriesExecutionError::Partial { source, progress });
+                }
+                Err(tenant::TenantDeleteSeriesError::Storage(source))
+                    if progress.has_committed_tombstones() =>
+                {
+                    return Err(AdminDeleteSeriesExecutionError::Partial { source, progress });
+                }
+                Err(tenant::TenantDeleteSeriesError::Storage(source)) => {
+                    return Err(AdminDeleteSeriesExecutionError::Storage(source));
+                }
+            }
         }
-        Ok::<_, tsink::TsinkError>((matched_series, tombstones_applied))
+        Ok::<_, AdminDeleteSeriesExecutionError>(progress)
     })
     .await;
 
     match result {
-        Ok(Ok((matched_series, tombstones_applied))) => {
+        Ok(Ok(progress)) => {
             record_retention_usage(
                 usage_accounting,
                 &tenant_id,
-                matched_series,
-                tombstones_applied,
+                progress.matched_series,
+                progress.tombstones_applied,
                 matcher_count,
                 elapsed_nanos_since(started),
-            );
+                RetentionUsageStatus::Success,
+            )
+            .await;
             json_response(
                 200,
                 &json!({
@@ -254,16 +463,45 @@ pub(crate) async fn handle_admin_delete_series(
                     "data": {
                         "tenantId": tenant_id,
                         "matchersProcessed": matcher_count,
-                        "matchedSeries": matched_series,
-                        "tombstonesApplied": tombstones_applied,
+                        "matchedSeries": progress.matched_series,
+                        "tombstonesApplied": progress.tombstones_applied,
                         "start": start,
                         "end": end
                     }
                 }),
             )
         }
-        Ok(Err(err)) => delete_series_error_response(&err),
-        Err(err) => text_response(500, &format!("delete_series task failed: {err}")),
+        Ok(Err(err @ AdminDeleteSeriesExecutionError::Partial { progress, .. })) => {
+            let usage_status = err.retention_usage_status();
+            record_retention_usage(
+                usage_accounting,
+                &tenant_id,
+                progress.matched_series,
+                progress.tombstones_applied,
+                progress.matchers_processed,
+                elapsed_nanos_since(started),
+                usage_status,
+            )
+            .await;
+            admin_delete_series_execution_error_response(&err)
+        }
+        Ok(Err(err)) => admin_delete_series_execution_error_response(&err),
+        Err(_) => {
+            let progress = *known_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            record_retention_usage(
+                usage_accounting,
+                &tenant_id,
+                progress.matched_series,
+                progress.tombstones_applied,
+                progress.matchers_processed,
+                elapsed_nanos_since(started),
+                RetentionUsageStatus::Indeterminate,
+            )
+            .await;
+            admin_delete_series_task_failure_response(progress)
+        }
     }
 }
 
@@ -763,6 +1001,7 @@ pub(crate) async fn handle_admin_cluster_restore(
     request: &HttpRequest,
     admin_path_prefix: Option<&Path>,
     cluster_context: Option<&ClusterRequestContext>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let payload = match parse_optional_json_body::<ClusterRestoreAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
@@ -874,9 +1113,9 @@ pub(crate) async fn handle_admin_cluster_restore(
         }
     };
 
-    let restored_state = match consensus.restore_recovery_snapshot(
+    let preflight_control_state = match consensus.preflight_recovery_snapshot(
         manifest.control_snapshot.control_state.clone(),
-        manifest.control_snapshot.control_log.clone(),
+        &manifest.control_snapshot.control_log,
         force_local_leader,
     ) {
         Ok(state) => state,
@@ -889,9 +1128,25 @@ pub(crate) async fn handle_admin_cluster_restore(
         }
     };
 
+    enum RestoreTarget {
+        Local {
+            snapshot_path: PathBuf,
+            data_path: PathBuf,
+        },
+        Remote {
+            snapshot_path: String,
+            data_path: String,
+        },
+    }
+
+    struct RestorePlan {
+        node_id: String,
+        endpoint: String,
+        target: RestoreTarget,
+    }
+
     let local_node_id = cluster_context.runtime.membership.local_node_id.as_str();
-    let restore_started = Instant::now();
-    let mut cluster_nodes = Vec::with_capacity(manifest.cluster_nodes.len());
+    let mut restore_plan = Vec::with_capacity(manifest.cluster_nodes.len());
     for node in &manifest.cluster_nodes {
         let requested_data_path = data_path_overrides
             .get(node.node_id.as_str())
@@ -904,8 +1159,8 @@ pub(crate) async fn handle_admin_cluster_restore(
                     .display()
                     .to_string()
             });
-        let restored = if node.node_id == local_node_id {
-            let resolved =
+        let target = if node.node_id == local_node_id {
+            let data_path =
                 match resolve_admin_path(Path::new(&requested_data_path), admin_path_prefix, false)
                 {
                     Ok(path) => path,
@@ -913,6 +1168,15 @@ pub(crate) async fn handle_admin_cluster_restore(
                         return admin_cluster_snapshot_error_response(400, "invalid_path", err);
                     }
                 };
+            if let Err(err) =
+                validate_restore_target_outside_live_root(&data_path, local_disk_budget)
+            {
+                return admin_cluster_snapshot_error_response(
+                    409,
+                    "live_data_path_restore_rejected",
+                    err,
+                );
+            }
             let snapshot_path = match resolve_admin_path(
                 Path::new(node.snapshot_path.as_str()),
                 admin_path_prefix,
@@ -923,27 +1187,74 @@ pub(crate) async fn handle_admin_cluster_restore(
                     return admin_cluster_snapshot_error_response(400, "invalid_path", err);
                 }
             };
-            match perform_local_data_restore(&snapshot_path, &resolved, Some(cluster_context)).await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    return admin_cluster_snapshot_error_response(503, "restore_failed", err);
-                }
+            RestoreTarget::Local {
+                snapshot_path,
+                data_path,
             }
         } else {
-            match cluster_context
+            RestoreTarget::Remote {
+                snapshot_path: node.snapshot_path.clone(),
+                data_path: requested_data_path,
+            }
+        };
+        restore_plan.push(RestorePlan {
+            node_id: node.node_id.clone(),
+            endpoint: node.endpoint.clone(),
+            target,
+        });
+    }
+
+    let restore_started = Instant::now();
+    let mut cluster_nodes = Vec::with_capacity(restore_plan.len());
+    for node in restore_plan {
+        let restored = match node.target {
+            RestoreTarget::Local {
+                snapshot_path,
+                data_path,
+            } => {
+                match perform_local_data_restore(&snapshot_path, &data_path, Some(cluster_context))
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        return admin_cluster_snapshot_error_response(503, "restore_failed", err);
+                    }
+                }
+            }
+            RestoreTarget::Remote {
+                snapshot_path,
+                data_path,
+            } => match cluster_context
                 .rpc_client
                 .data_restore(
                     node.endpoint.as_str(),
                     &InternalDataRestoreRequest {
-                        snapshot_path: node.snapshot_path.clone(),
-                        data_path: requested_data_path,
+                        snapshot_path,
+                        data_path,
                     },
                 )
                 .await
             {
                 Ok(response) => response,
                 Err(err) => {
+                    if let RpcError::HttpStatus {
+                        status,
+                        error_code,
+                        message,
+                        ..
+                    } = &err
+                    {
+                        if (400..500).contains(status) {
+                            return admin_cluster_snapshot_error_response(
+                                *status,
+                                error_code.as_deref().unwrap_or("remote_restore_rejected"),
+                                format!(
+                                    "remote restore rejected for node '{}' via {}: {message}",
+                                    node.node_id, node.endpoint
+                                ),
+                            );
+                        }
+                    }
                     return admin_cluster_snapshot_error_response(
                         503,
                         "restore_failed",
@@ -953,17 +1264,33 @@ pub(crate) async fn handle_admin_cluster_restore(
                         ),
                     );
                 }
-            }
+            },
         };
         cluster_nodes.push(ClusterRestoreNodeArtifactV1 {
-            node_id: node.node_id.clone(),
-            endpoint: node.endpoint.clone(),
+            node_id: node.node_id,
+            endpoint: node.endpoint,
             snapshot_path: restored.snapshot_path,
             data_path: restored.data_path,
             restored_unix_ms: restored.restored_unix_ms,
             restore_duration_ms: restored.duration_ms,
         });
     }
+
+    let restored_state = match consensus.restore_recovery_snapshot(
+        preflight_control_state,
+        manifest.control_snapshot.control_log.clone(),
+        false,
+    ) {
+        Ok(state) => state,
+        Err(err) => {
+            return admin_cluster_snapshot_error_response(
+                409,
+                "control_restore_rejected",
+                format!("cluster control restore rejected after data restore: {err}"),
+            );
+        }
+    };
+
     cluster_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     let rto_ms = u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let report = ClusterRestoreReportFileV1 {

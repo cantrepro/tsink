@@ -12,6 +12,7 @@ pub(crate) async fn handle_admin_support_bundle(
     rbac_registry: Option<&RbacRegistry>,
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let tenant_id = match support_bundle_tenant_id(request) {
         Ok(tenant_id) => tenant_id,
@@ -49,6 +50,7 @@ pub(crate) async fn handle_admin_support_bundle(
                     security_manager,
                     usage_accounting,
                     None,
+                    local_disk_budget,
                 )
                 .await
             ),
@@ -101,7 +103,7 @@ pub(crate) async fn handle_admin_support_bundle(
     }
 }
 
-pub(crate) fn handle_admin_usage_report(
+pub(crate) async fn handle_admin_usage_report(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
     usage_accounting: Option<&UsageAccounting>,
@@ -115,10 +117,13 @@ pub(crate) fn handle_admin_usage_report(
             Err(response) => return response,
         };
     let reconciled_storage_snapshots = if reconcile {
-        match usage_accounting.reconcile_storage(storage) {
+        match usage_accounting
+            .reconcile_storage_async(Arc::clone(storage))
+            .await
+        {
             Ok(snapshots) => snapshots,
             Err(err) => {
-                return text_response(500, &format!("usage storage reconciliation failed: {err}"))
+                return usage_accounting_error_response("usage storage reconciliation", &err)
             }
         }
     } else {
@@ -177,7 +182,10 @@ pub(crate) async fn handle_admin_usage_reconcile(
     let Some(usage_accounting) = usage_accounting else {
         return text_response(503, "usage accounting is unavailable");
     };
-    match usage_accounting.reconcile_storage(storage) {
+    match usage_accounting
+        .reconcile_storage_async(Arc::clone(storage))
+        .await
+    {
         Ok(snapshots) => json_response(
             200,
             &json!({
@@ -188,6 +196,54 @@ pub(crate) async fn handle_admin_usage_reconcile(
                 }
             }),
         ),
-        Err(err) => text_response(500, &format!("usage storage reconciliation failed: {err}")),
+        Err(err) => usage_accounting_error_response("usage storage reconciliation", &err),
+    }
+}
+
+fn usage_accounting_error_response(
+    action: &str,
+    err: &crate::usage::UsageAccountingError,
+) -> HttpResponse {
+    if let Some(
+        disk_error @ (tsink::TsinkError::DiskQuotaExceeded { .. }
+        | tsink::TsinkError::InsufficientDiskSpace { .. }
+        | tsink::TsinkError::InsufficientCompactionHeadroom { .. }),
+    ) = err.disk_error()
+    {
+        return server_persistence_error_response(action, disk_error);
+    }
+    if err.is_persistence_failure() {
+        return indeterminate_backend_write_error_response(
+            500,
+            "usage_ledger_persistence_failed",
+            "usage ledger persistence failed; the durable outcome is indeterminate",
+        );
+    }
+    text_response(500, &format!("{action} failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_quota_budget_failure_uses_usage_specific_indeterminate_response() {
+        let err = crate::usage::UsageAccountingError::Disk(tsink::TsinkError::Io(
+            std::io::Error::other("injected usage ledger failure"),
+        ));
+
+        let response = usage_accounting_error_response("usage reconciliation", &err);
+
+        assert_eq!(response.status, 500);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER)
+                && value == "usage_ledger_persistence_failed"
+        }));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_PARTIAL_HEADER) && value == "possible"
+        }));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_OUTCOME_HEADER) && value == "indeterminate_backend"
+        }));
     }
 }

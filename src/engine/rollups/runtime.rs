@@ -1,4 +1,6 @@
-use super::policy::{load_rollup_policies, persist_rollup_policies_budgeted};
+use super::policy::{
+    encode_rollup_policies, load_rollup_policies, persist_encoded_rollup_policies_budgeted,
+};
 use super::*;
 use crate::engine::series::SeriesKey;
 
@@ -19,6 +21,7 @@ impl RollupRuntimeState {
             policies_path,
             state_path,
             local_disk_budget,
+            snapshot_visibility: RwLock::new(()),
             policies: RwLock::new(Vec::new()),
             checkpoints: RwLock::new(HashMap::new()),
             pending_materializations: RwLock::new(HashMap::new()),
@@ -83,6 +86,28 @@ impl RollupRuntimeState {
     #[cfg(test)]
     pub(super) fn clear_state_persist_hook(&self) {
         *self.test_hooks.state_persist_hook.write() = None;
+    }
+
+    #[cfg(test)]
+    fn invoke_policy_persist_hook(&self, point: RollupPolicyPersistHookPoint) -> Result<()> {
+        let hook = self.test_hooks.policy_persist_hook.read().clone();
+        if let Some(hook) = hook {
+            hook(point)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_policy_persist_hook<F>(&self, hook: F)
+    where
+        F: Fn(RollupPolicyPersistHookPoint) -> Result<()> + Send + Sync + 'static,
+    {
+        *self.test_hooks.policy_persist_hook.write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_policy_persist_hook(&self) {
+        *self.test_hooks.policy_persist_hook.write() = None;
     }
 }
 
@@ -196,6 +221,26 @@ fn persist_rollup_state_budgeted(
         ));
     };
 
+    let encoded = encode_rollup_state(
+        checkpoints,
+        generations,
+        pending_materializations,
+        pending_delete_invalidations,
+    )?;
+    persist_encoded_rollup_state_budgeted(
+        path,
+        &encoded,
+        local_disk_budget,
+        crate::DiskReservationKind::Growth,
+    )
+}
+
+pub(super) fn encode_rollup_state(
+    checkpoints: &HashMap<String, BTreeMap<String, i64>>,
+    generations: &HashMap<String, u64>,
+    pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
+    pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+) -> Result<Vec<u8>> {
     let mut flattened = Vec::new();
     let mut policy_ids = checkpoints.keys().cloned().collect::<Vec<_>>();
     policy_ids.sort();
@@ -258,17 +303,93 @@ fn persist_rollup_state_budgeted(
         pending_delete_invalidations: persisted_pending_delete_invalidations,
         generations: persisted_generations,
     };
-    let encoded = serde_json::to_vec_pretty(&payload)?;
+    Ok(serde_json::to_vec_pretty(&payload)?)
+}
+
+fn persist_encoded_rollup_state_budgeted(
+    path: &Path,
+    encoded: &[u8],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     write_file_atomically_and_sync_parent_budgeted(
         path,
-        &encoded,
+        encoded,
         local_disk_budget,
         crate::DiskCategory::Rollups,
-        crate::DiskReservationKind::Growth,
+        reservation_kind,
     )
+}
+
+fn read_rollup_file_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn restore_rollup_file(
+    path: &Path,
+    previous: Option<&[u8]>,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    if read_rollup_file_if_present(path)?.as_deref() == previous {
+        return Ok(());
+    }
+
+    match previous {
+        Some(previous) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_file_atomically_and_sync_parent_budgeted(
+                path,
+                previous,
+                local_disk_budget,
+                crate::DiskCategory::Rollups,
+                crate::DiskReservationKind::Recovery,
+            )
+        }
+        None => crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            path,
+            local_disk_budget,
+            crate::DiskCategory::Rollups,
+        ),
+    }
+}
+
+fn snapshot_persistence_error_after_rollback(
+    persist_error: TsinkError,
+    policies_rollback: Result<()>,
+    state_rollback: Option<Result<()>>,
+) -> TsinkError {
+    let mut rollback_errors = Vec::new();
+    if let Err(err) = policies_rollback {
+        rollback_errors.push(format!("policies rollback failed: {err}"));
+    }
+    match state_rollback {
+        Some(Err(err)) => rollback_errors.push(format!("state rollback failed: {err}")),
+        None => rollback_errors.push(
+            "state rollback skipped after indeterminate policies rollback; candidate invalidating state retained"
+                .to_string(),
+        ),
+        Some(Ok(())) => {}
+    }
+    if rollback_errors.is_empty() {
+        persist_error
+    } else {
+        TsinkError::Other(format!(
+            "rollup snapshot persistence failed: {persist_error}; {}",
+            rollback_errors.join("; ")
+        ))
+    }
 }
 
 pub(super) fn normalize_pending_delete_invalidations(
@@ -504,6 +625,7 @@ impl<'a> RollupStateStoreContext<'a> {
     }
 
     pub(super) fn capture_snapshot(self) -> RollupRuntimeSnapshot {
+        let _visibility = self.state.snapshot_visibility.read();
         RollupRuntimeSnapshot {
             policies: self.policies_snapshot(),
             checkpoints: self.checkpoints_snapshot(),
@@ -515,30 +637,125 @@ impl<'a> RollupStateStoreContext<'a> {
     }
 
     pub(super) fn persist_snapshot(self, snapshot: &RollupRuntimeSnapshot) -> Result<()> {
-        persist_rollup_policies_budgeted(
-            self.state.policies_path(),
-            &snapshot.policies,
-            self.state.local_disk_budget.as_ref(),
-        )?;
-        #[cfg(test)]
-        self.state.invoke_state_persist_hook()?;
-        persist_rollup_state_budgeted(
-            self.state.state_path(),
+        self.persist_snapshot_with_kind(snapshot, crate::DiskReservationKind::Growth)
+    }
+
+    fn persist_snapshot_with_kind(
+        self,
+        snapshot: &RollupRuntimeSnapshot,
+        reservation_kind: crate::DiskReservationKind,
+    ) -> Result<()> {
+        let encoded_policies = encode_rollup_policies(&snapshot.policies)?;
+        let encoded_state = encode_rollup_state(
             &snapshot.checkpoints,
             &snapshot.generations,
             &snapshot.pending_materializations,
             &snapshot.pending_delete_invalidations,
-            self.state.local_disk_budget.as_ref(),
-        )
+        )?;
+
+        let Some(policies_path) = self.state.policies_path() else {
+            if snapshot.policies.is_empty()
+                && snapshot.checkpoints.is_empty()
+                && snapshot.generations.is_empty()
+                && snapshot.pending_materializations.is_empty()
+                && snapshot.pending_delete_invalidations.is_empty()
+            {
+                return Ok(());
+            }
+            return Err(TsinkError::InvalidConfiguration(
+                "rollup snapshots require persistent storage".to_string(),
+            ));
+        };
+        let Some(state_path) = self.state.state_path() else {
+            return Err(TsinkError::InvalidConfiguration(
+                "rollup snapshots require persistent storage".to_string(),
+            ));
+        };
+
+        // These two files form one logical snapshot. Capture both before publishing either file,
+        // then use recovery admission to put both entries back before returning any error. This
+        // keeps a typed quota rejection deterministic for callers while preventing a failed apply
+        // from becoming a policy-only durable update after restart.
+        let previous_policies = read_rollup_file_if_present(policies_path)?;
+        let previous_state = read_rollup_file_if_present(state_path)?;
+        let persist_result = (|| {
+            // Publish the invalidating state first. If the process stops before policies are
+            // replaced, the old policy definition has no reusable checkpoint and queries fall
+            // back to raw data. Publishing policies first could pair a changed definition with a
+            // checkpoint and generation produced by its predecessor.
+            persist_encoded_rollup_state_budgeted(
+                state_path,
+                &encoded_state,
+                self.state.local_disk_budget.as_ref(),
+                reservation_kind,
+            )?;
+            #[cfg(test)]
+            self.state.invoke_state_persist_hook()?;
+            persist_encoded_rollup_policies_budgeted(
+                policies_path,
+                &encoded_policies,
+                self.state.local_disk_budget.as_ref(),
+                reservation_kind,
+            )?;
+            #[cfg(test)]
+            self.state
+                .invoke_policy_persist_hook(RollupPolicyPersistHookPoint::CandidatePublished)?;
+            Ok(())
+        })();
+
+        match persist_result {
+            Ok(()) => Ok(()),
+            Err(persist_error) => {
+                // Restore policies before state. If recovery itself is interrupted, the old
+                // policies remain paired with the invalidating candidate state, which is a safe
+                // raw-data fallback. Restoring state first could briefly pair new policies with
+                // checkpoints produced by their predecessors.
+                let policies_rollback = {
+                    #[cfg(test)]
+                    let hook_result = self
+                        .state
+                        .invoke_policy_persist_hook(RollupPolicyPersistHookPoint::RollbackStarting);
+                    #[cfg(not(test))]
+                    let hook_result = Ok(());
+                    hook_result.and_then(|()| {
+                        restore_rollup_file(
+                            policies_path,
+                            previous_policies.as_deref(),
+                            self.state.local_disk_budget.as_ref(),
+                        )
+                    })
+                };
+                // Candidate state invalidates predecessor checkpoints and is safe with either
+                // policy version. Restore predecessor state only after predecessor policies are
+                // definitively back; otherwise a failed policy rollback could leave candidate
+                // policies paired with stale predecessor checkpoints.
+                let state_rollback = policies_rollback.is_ok().then(|| {
+                    restore_rollup_file(
+                        state_path,
+                        previous_state.as_deref(),
+                        self.state.local_disk_budget.as_ref(),
+                    )
+                });
+                Err(snapshot_persistence_error_after_rollback(
+                    persist_error,
+                    policies_rollback,
+                    state_rollback,
+                ))
+            }
+        }
     }
 
     pub(super) fn install_snapshot(self, snapshot: RollupRuntimeSnapshot) {
-        *self.state.policies.write() = snapshot.policies;
+        // Query selection holds the matching read guard while it reads the component locks. Keep
+        // the whole in-memory replacement invisible until every component is installed, and put
+        // policies last so even non-query readers see the conservative invalidating state first.
+        let _visibility = self.state.snapshot_visibility.write();
         *self.state.checkpoints.write() = snapshot.checkpoints;
         *self.state.pending_materializations.write() = snapshot.pending_materializations;
         *self.state.pending_delete_invalidations.write() = snapshot.pending_delete_invalidations;
         *self.state.generations.write() = snapshot.generations;
         *self.state.policy_stats.write() = snapshot.policy_stats;
+        *self.state.policies.write() = snapshot.policies;
     }
 
     pub(super) fn next_snapshot_for_policies(
@@ -807,6 +1024,36 @@ impl<'a> RollupInvalidationContext<'a> {
         persist_result
     }
 
+    fn cancel_pending_rollup_delete_invalidation(
+        self,
+        tombstone: TombstoneRange,
+        series_ids: &[SeriesId],
+        affected_policy_ids: &BTreeSet<String>,
+    ) -> Result<()> {
+        let Some(pending_delete) =
+            build_pending_delete_invalidation(tombstone, series_ids, affected_policy_ids)
+        else {
+            return Ok(());
+        };
+
+        let mut snapshot = self.store.capture_snapshot();
+        let previous_len = snapshot.pending_delete_invalidations.len();
+        snapshot
+            .pending_delete_invalidations
+            .retain(|entry| entry != &pending_delete);
+        if snapshot.pending_delete_invalidations.len() == previous_len {
+            return Ok(());
+        }
+
+        // Cancellation restores the pre-delete state after tombstone persistence rejected the
+        // operation. It is recovery work, so it must remain possible while the logical data root
+        // is at or above its normal-growth limit.
+        self.store
+            .persist_snapshot_with_kind(&snapshot, crate::DiskReservationKind::Recovery)?;
+        self.store.install_snapshot(snapshot);
+        Ok(())
+    }
+
     fn invalidate_rollup_policy_ids(self, affected_policy_ids: &BTreeSet<String>) -> Result<bool> {
         if affected_policy_ids.is_empty() {
             return Ok(false);
@@ -865,6 +1112,16 @@ impl ChunkStorage {
     ) -> Result<()> {
         self.rollup_invalidation_context()
             .finalize_pending_rollup_delete_invalidation(tombstone, series_ids, affected_policy_ids)
+    }
+
+    pub(in crate::engine) fn cancel_pending_rollup_delete_invalidation(
+        &self,
+        tombstone: TombstoneRange,
+        series_ids: &[SeriesId],
+        affected_policy_ids: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.rollup_invalidation_context()
+            .cancel_pending_rollup_delete_invalidation(tombstone, series_ids, affected_policy_ids)
     }
 
     pub(in crate::engine) fn invalidate_rollup_policy_ids(

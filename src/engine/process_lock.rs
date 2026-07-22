@@ -15,6 +15,23 @@ impl DataPathProcessLock {
     pub(super) fn acquire(data_path: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_path)?;
         let lock_path = data_path.join(DATA_PATH_LOCK_FILE_NAME);
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(metadata) => {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "data path lock must be a regular file, found {:?}: {}",
+                    metadata.file_type(),
+                    lock_path.display()
+                )))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: lock_path,
+                    source,
+                })
+            }
+        }
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

@@ -63,18 +63,15 @@ impl<'a> TombstoneIndexContext<'a> {
     pub(in crate::engine::storage_engine) fn persist_tombstones_index_updates(
         self,
         updates: &TombstoneMap,
-    ) -> Result<()> {
+    ) -> tombstone::TombstonePersistenceResult<()> {
         if updates.is_empty() {
             return Ok(());
         }
-        for path in self.tombstone_index_persist_paths() {
-            tombstone::persist_tombstone_updates_with_disk_budget(
-                &path,
-                updates,
-                self.local_disk_budget,
-            )?;
-        }
-        Ok(())
+        tombstone::persist_tombstone_updates_across_paths_with_disk_budget_outcome(
+            &self.tombstone_index_persist_paths(),
+            updates,
+            self.local_disk_budget,
+        )
     }
 
     pub(in crate::engine::storage_engine) fn persist_tombstones_index_snapshot_for_recovery(
@@ -223,9 +220,15 @@ impl<'a> TombstonePublicationContext<'a> {
         storage: &ChunkStorage,
         index: TombstoneIndexContext<'a>,
         updates: TombstoneMap,
-    ) -> Result<()> {
+    ) -> tombstone::TombstonePersistenceResult<()> {
+        // Reserve the registry high-water mark before the durable commit boundary. The only
+        // possible failure is series-id exhaustion; reporting that after manifest publication
+        // would incorrectly present an effective delete as rejected.
+        self.reserve_series_ids_referenced_by_tombstones(&updates)
+            .map_err(tombstone::TombstonePersistenceError::definitively_clean)?;
         index.persist_tombstones_index_updates(&updates)?;
         self.apply_tombstone_updates_locked(storage, updates)
+            .map_err(tombstone::TombstonePersistenceError::indeterminate)
     }
 
     fn apply_tombstone_updates_locked(
@@ -233,8 +236,6 @@ impl<'a> TombstonePublicationContext<'a> {
         storage: &ChunkStorage,
         updates: TombstoneMap,
     ) -> Result<()> {
-        self.reserve_series_ids_referenced_by_tombstones(&updates)?;
-
         let changed_series_ids = updates.keys().copied().collect::<BTreeSet<_>>();
         let mut tombstones = self.tombstones.write();
         storage.with_included_memory_delta(
@@ -254,7 +255,27 @@ impl<'a> TombstonePublicationContext<'a> {
         drop(tombstones);
         #[cfg(test)]
         storage.invoke_tombstone_post_swap_pre_visibility_hook();
-        storage.refresh_series_visible_timestamp_cache_locked(changed_series_ids)?;
+        #[cfg(test)]
+        let refresh_result = storage
+            .invoke_tombstone_post_commit_error_hook()
+            .and_then(|()| {
+                storage.refresh_series_visible_timestamp_cache_locked(
+                    changed_series_ids.iter().copied(),
+                )
+            });
+        #[cfg(not(test))]
+        let refresh_result = storage
+            .refresh_series_visible_timestamp_cache_locked(changed_series_ids.iter().copied());
+        if let Err(err) = refresh_result {
+            // The disk manifests and tombstone map have committed. Drop stale summaries so later
+            // readers either rebuild them or surface the underlying storage error, while this
+            // delete retains honest committed-success semantics.
+            storage.clear_series_visible_timestamp_cache(changed_series_ids.iter().copied());
+            tracing::warn!(
+                error = %err,
+                "Committed delete deferred series visibility summary rebuild"
+            );
+        }
         storage.bump_visibility_state_generation();
         Ok(())
     }

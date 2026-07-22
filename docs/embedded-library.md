@@ -131,9 +131,12 @@ Persistent storage always creates the accounting coordinator; the logical quota 
 until configured. It accounts WAL, segments and indexes, registry/catalog state, tombstones, rollup
 state, recognized temporary output, and unknown files beneath the configured data path. Unknown
 files are counted but never deleted. The WAL limit remains an additional WAL-only sublimit.
-Object-store roots and snapshot destinations outside the data directory are excluded; while a disk
-coordinator is active, snapshot destinations that resolve inside the managed tree are rejected.
-Separate server-side stores are not automatically included in this core envelope.
+Object-store roots and external snapshot destinations outside the data directory are excluded;
+while a disk coordinator is active, snapshot destinations that resolve inside the managed tree are
+rejected. These `StorageBuilder` controls describe the embedded core envelope: they do not discover
+arbitrary files written by an embedder or automatically include separate server-side stores. The
+built-in `tsink-server` instead creates one shared coordinator and explicitly supplies it to the
+core, metric metadata, exemplars, rules, usage ledger, and managed control-plane state.
 
 ### Remote segments
 
@@ -618,9 +621,12 @@ if snap.health.degraded {
 The snapshot covers effective storage limits, memory, WAL, retention, flush pipeline, compaction,
 queries, rollups, remote storage, and overall health. An optional effective limit is `None` when the
 built-in backend has no finite limit for that field. The memory value is modeled engine accounting,
-not a hard process-RSS cap. Local-disk values describe the persistent core data-directory scope,
-not every file written by the optional server. See [Resource limits and profiles](resource-limits.md)
-for the exact accounted scopes and the query/server limits that remain unfinished.
+not a hard process-RSS cap. For an embedded `StorageBuilder`, local-disk values describe the
+persistent core data-directory scope. The built-in server reports its explicitly shared coordinator,
+which also covers its integrated metadata, exemplar, rules, usage, and managed-state stores, but not
+every experimental cluster or edge writer. See
+[Resource limits and profiles](resource-limits.md) for the exact accounted scopes and the
+query/server limits that remain unfinished.
 
 ---
 

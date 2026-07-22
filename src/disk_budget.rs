@@ -10,7 +10,8 @@ use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -311,9 +312,11 @@ impl DiskAccountingState {
 
 /// Shared owner for one local data-directory disk envelope.
 pub struct LocalDiskBudget {
+    configured_root: PathBuf,
     root: PathBuf,
     limits: LocalDiskLimits,
     state: Mutex<DiskAccountingState>,
+    managed_file_mutation_lock: Mutex<()>,
     reservations_released: Condvar,
     space_probe: Arc<dyn SpaceProbe>,
 }
@@ -322,6 +325,7 @@ impl fmt::Debug for LocalDiskBudget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalDiskBudget")
+            .field("configured_root", &self.configured_root)
             .field("root", &self.root)
             .field("limits", &self.limits)
             .field("state", &self.state)
@@ -341,6 +345,7 @@ impl LocalDiskBudget {
         space_probe: Arc<dyn SpaceProbe>,
     ) -> Result<Arc<Self>> {
         let limits = limits.validate()?;
+        let configured_root = absolute_path_lexically_normalized(root)?;
         fs::create_dir_all(root).map_err(|source| TsinkError::IoWithPath {
             path: root.to_path_buf(),
             source,
@@ -349,10 +354,13 @@ impl LocalDiskBudget {
             path: root.to_path_buf(),
             source,
         })?;
+        sync_directory_ancestry(&root)?;
         let budget = Arc::new(Self {
+            configured_root,
             root,
             limits,
             state: Mutex::new(DiskAccountingState::default()),
+            managed_file_mutation_lock: Mutex::new(()),
             reservations_released: Condvar::new(),
             space_probe,
         });
@@ -378,19 +386,535 @@ impl LocalDiskBudget {
         Ok(resolve_path_allow_missing(path)?.starts_with(&self.root))
     }
 
+    /// Returns whether `path` overlaps the managed root in either direction.
+    ///
+    /// This is useful for independent persistence roots, such as an object store, that must be
+    /// neither inside the quota tree nor an ancestor of it. Both lexical configured paths and
+    /// resolved paths are checked so an in-tree symlink to an external directory is still rejected
+    /// as an overlapping persistence namespace.
+    pub fn overlaps(&self, path: &Path) -> Result<bool> {
+        let lexical = absolute_path_lexically_normalized(path)?;
+        if lexical.starts_with(&self.configured_root)
+            || self.configured_root.starts_with(&lexical)
+            || lexical.starts_with(&self.root)
+            || self.root.starts_with(&lexical)
+        {
+            return Ok(true);
+        }
+        let resolved = resolve_path_allow_missing(path)?;
+        Ok(resolved.starts_with(&self.root) || self.root.starts_with(resolved))
+    }
+
     /// Returns whether the directory entry at `path` belongs to the managed tree.
     ///
     /// Unlike [`LocalDiskBudget::governs`], this resolves the parent but deliberately does not
     /// follow the final component. Filesystem mutators use this because replacing or removing an
-    /// in-tree symlink mutates the managed directory entry even when its target is outside.
+    /// in-tree symlink mutates the managed directory entry even when its target is outside. A path
+    /// lexically beneath the configured or canonical root that escapes through an intermediate
+    /// symlink is rejected instead of being mistaken for an intentionally external path.
     pub(crate) fn governs_entry(&self, path: &Path) -> Result<bool> {
         let Some(file_name) = path.file_name() else {
             return self.matches_root(path);
         };
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        Ok(resolve_path_allow_missing(parent)?
+        let governed = resolve_path_allow_missing(parent)?
             .join(file_name)
-            .starts_with(&self.root))
+            .starts_with(&self.root);
+        if !governed {
+            let lexical = absolute_path_lexically_normalized(path)?;
+            if lexical.starts_with(&self.configured_root) || lexical.starts_with(&self.root) {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "managed path escapes local disk root {} through an existing filesystem entry: {}",
+                    self.root.display(),
+                    path.display()
+                )));
+            }
+        }
+        Ok(governed)
+    }
+
+    /// Validates an owned regular-file path without following its final component.
+    ///
+    /// Missing files are allowed. Existing symlinks and non-file entries are rejected so a
+    /// sidecar cannot load or append through an entry that reconciliation deliberately does not
+    /// follow.
+    pub fn validate_managed_file_path(&self, path: &Path) -> Result<()> {
+        if !self.governs_entry(path)? {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed file is outside local disk root {}: {}",
+                self.root.display(),
+                path.display()
+            )));
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+            Ok(metadata) => Err(TsinkError::InvalidConfiguration(format!(
+                "managed file must be a regular file, found {:?}: {}",
+                metadata.file_type(),
+                path.display()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Validates an owned directory path without following its final component.
+    ///
+    /// Missing directories are allowed. Existing symlinks and non-directory entries are rejected
+    /// so startup cannot follow an owned namespace outside the process-locked data tree.
+    pub(crate) fn validate_managed_directory_path(&self, path: &Path) -> Result<()> {
+        if !self.governs_entry(path)? {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed directory is outside local disk root {}: {}",
+                self.root.display(),
+                path.display()
+            )));
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+            Ok(metadata) => Err(TsinkError::InvalidConfiguration(format!(
+                "managed directory must be a directory, found {:?}: {}",
+                metadata.file_type(),
+                path.display()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Creates a managed directory tree and synchronizes every newly-created parent entry.
+    pub fn create_dir_all_and_sync_parents(&self, directory: &Path) -> Result<()> {
+        let directory = resolve_path_allow_missing(directory)?;
+        if !directory.starts_with(&self.root) {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed directory is outside local disk root {}: {}",
+                self.root.display(),
+                directory.display()
+            )));
+        }
+
+        fs::create_dir_all(&directory).map_err(|source| TsinkError::IoWithPath {
+            path: directory.clone(),
+            source,
+        })?;
+
+        // Retry every ancestor sync even when a previous attempt created the directories before
+        // failing. Otherwise the next startup could observe the entries, skip all syncs, and
+        // report success while their parent links still are not crash-durable.
+        crate::engine::fs_utils::sync_parent_dir(&self.root)?;
+        let relative = directory.strip_prefix(&self.root).map_err(|_| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed directory is outside local disk root {}: {}",
+                self.root.display(),
+                directory.display()
+            ))
+        })?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            let metadata =
+                fs::symlink_metadata(&current).map_err(|source| TsinkError::IoWithPath {
+                    path: current.clone(),
+                    source,
+                })?;
+            if !metadata.file_type().is_dir() {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "managed directory path contains a non-directory entry: {}",
+                    current.display()
+                )));
+            }
+            crate::engine::fs_utils::sync_parent_dir(&current)?;
+        }
+        Ok(())
+    }
+
+    /// Removes orphan temporary files created by atomic replacement of `target`.
+    ///
+    /// Call this while holding the data-path process lease, before opening the owned store. Only
+    /// regular files or symlinks with the exact generated `.<target>.tmp-<pid>-<nonce>` shape are
+    /// removed; directories or other entry types cause startup to fail rather than deleting
+    /// ambiguous host data.
+    pub fn cleanup_atomic_write_temps(self: &Arc<Self>, target: &Path) -> Result<u64> {
+        let parent = target.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed file has no parent directory: {}",
+                target.display()
+            ))
+        })?;
+        if !self.governs_entry(target)? {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed file is outside local disk root {}: {}",
+                self.root.display(),
+                target.display()
+            )));
+        }
+        let file_name = target.file_name().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed file has no final component: {}",
+                target.display()
+            ))
+        })?;
+        let target_name = file_name.to_str().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed file name is not valid UTF-8: {}",
+                target.display()
+            ))
+        })?;
+        self.cleanup_owned_temporary_entries_matching(
+            parent,
+            true,
+            false,
+            |candidate| atomic_write_temp_target_name(candidate) == Some(target_name),
+            "atomic-write temporary cleanup",
+        )
+    }
+
+    /// Removes generated atomic-write temporaries whose final target name is explicitly owned by
+    /// the caller. The directory is not created when absent.
+    pub(crate) fn cleanup_atomic_write_temps_matching_targets<F>(
+        self: &Arc<Self>,
+        directory: &Path,
+        owns_target: F,
+    ) -> Result<u64>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.cleanup_owned_temporary_entries_matching(
+            directory,
+            false,
+            false,
+            |candidate| atomic_write_temp_target_name(candidate).is_some_and(&owns_target),
+            "owned atomic-write temporary cleanup",
+        )
+    }
+
+    /// Removes explicitly-owned temporary directory entries. Regular files and symlinks with an
+    /// owned name are also safe to unlink; special file types are rejected.
+    pub(crate) fn cleanup_temporary_directories_matching_names<F>(
+        self: &Arc<Self>,
+        directory: &Path,
+        owns_name: F,
+    ) -> Result<u64>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.cleanup_owned_temporary_entries_matching(
+            directory,
+            false,
+            true,
+            owns_name,
+            "owned temporary-directory cleanup",
+        )
+    }
+
+    fn cleanup_owned_temporary_entries_matching<F>(
+        self: &Arc<Self>,
+        directory: &Path,
+        create_directory: bool,
+        allow_directories: bool,
+        owns_name: F,
+        operation: &str,
+    ) -> Result<u64>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        self.validate_managed_directory_path(directory)?;
+        if create_directory {
+            self.create_dir_all_and_sync_parents(directory)?;
+        } else if !crate::engine::fs_utils::path_exists_no_follow(directory)? {
+            return Ok(0);
+        }
+
+        let mut owned_entries = Vec::new();
+        for entry in fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| TsinkError::IoWithPath {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+            let entry_name = entry.file_name();
+            let Some(entry_name) = entry_name.to_str() else {
+                continue;
+            };
+            if !owns_name(entry_name) {
+                continue;
+            }
+            let entry_path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&entry_path).map_err(|source| TsinkError::IoWithPath {
+                    path: entry_path.clone(),
+                    source,
+                })?;
+            let file_type = metadata.file_type();
+            if !(file_type.is_file()
+                || file_type.is_symlink()
+                || (file_type.is_dir() && allow_directories))
+            {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "refusing to remove ambiguous owned temporary entry: {}",
+                    entry_path.display()
+                )));
+            }
+            owned_entries.push(entry_path);
+        }
+        if owned_entries.is_empty() {
+            return Ok(0);
+        }
+
+        let reservation =
+            self.reserve(DiskCategory::Temporary, 0, DiskReservationKind::Recovery)?;
+        let mut removed = 0u64;
+        let mut cleanup_error = None;
+        for entry_path in owned_entries {
+            if let Err(err) = crate::engine::fs_utils::remove_path_if_exists(&entry_path) {
+                cleanup_error = Some(err);
+                break;
+            }
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            if let Err(err) = crate::engine::fs_utils::sync_dir(directory) {
+                cleanup_error.get_or_insert(err);
+            }
+        }
+        let settlement_result = reservation.commit(0, 0);
+        let reconciliation_result = self.reconcile_when_idle().map(|_| ());
+        match (cleanup_error, settlement_result, reconciliation_result) {
+            (None, Ok(()), Ok(())) => Ok(removed),
+            (cleanup_error, settlement, reconciliation) => {
+                let mut errors = Vec::new();
+                if let Some(err) = cleanup_error {
+                    errors.push(format!("cleanup failed: {err}"));
+                }
+                if let Err(err) = settlement {
+                    errors.push(format!("disk settlement failed: {err}"));
+                }
+                if let Err(err) = reconciliation {
+                    errors.push(format!("disk reconciliation failed: {err}"));
+                }
+                Err(TsinkError::Other(format!(
+                    "{operation} for {} failed: {}",
+                    directory.display(),
+                    errors.join("; ")
+                )))
+            }
+        }
+    }
+
+    /// Atomically replaces one managed file using normal-growth admission.
+    ///
+    /// The complete encoded replacement is reserved as peak additional space, newly-created
+    /// directory entries plus the file are synchronized, and overwrite accounting is reconciled
+    /// exactly before return. If publication or settlement reports an error after rename, the
+    /// previous file is restored with recovery admission before the error is returned.
+    pub fn write_file_atomically_and_sync_parent(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+    ) -> Result<()> {
+        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let parent = path.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed file has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        self.create_dir_all_and_sync_parents(parent)?;
+        self.validate_managed_file_path(path)?;
+        let previous = match fs::symlink_metadata(path) {
+            Ok(_) => Some(fs::read(path).map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        };
+
+        let write_result = crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted(
+            path,
+            bytes,
+            Some(self),
+            category,
+            DiskReservationKind::Growth,
+        );
+        let Err(write_err) = write_result else {
+            return Ok(());
+        };
+
+        let unchanged = match previous.as_deref() {
+            Some(previous) => fs::read(path)
+                .map(|current| current == previous)
+                .unwrap_or(false),
+            None => matches!(
+                fs::symlink_metadata(path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound
+            ),
+        };
+        if unchanged {
+            return Err(write_err);
+        }
+
+        let rollback_result = match previous {
+            Some(previous) => {
+                crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted(
+                    path,
+                    &previous,
+                    Some(self),
+                    category,
+                    DiskReservationKind::Recovery,
+                )
+            }
+            None => crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+                path,
+                Some(self),
+                category,
+            ),
+        };
+        match rollback_result {
+            Ok(()) => Err(write_err),
+            Err(rollback_err) => Err(TsinkError::Other(format!(
+                "atomic write to {} failed: {write_err}; rollback failed: {rollback_err}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Appends bytes to a managed regular file with normal-growth admission.
+    ///
+    /// Appends are serialized by the coordinator and the file is opened internally, binding the
+    /// charged path to the mutated entry. On a write or sync failure this method first attempts to
+    /// restore the original length or remove a newly-created file. If rollback fails, surviving
+    /// growth is conservatively charged and the managed tree is reconciled before return.
+    pub fn append_file_and_sync_parent(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+    ) -> Result<()> {
+        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let parent = path.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed append file has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        self.create_dir_all_and_sync_parents(parent)?;
+        self.validate_managed_file_path(path)?;
+        let existed = fs::symlink_metadata(path).is_ok();
+        let initial_len = if existed {
+            fs::metadata(path)?.len()
+        } else {
+            0
+        };
+        let requested = u64::try_from(bytes.len()).map_err(|_| {
+            TsinkError::Other("append byte count exceeds the supported byte range".to_string())
+        })?;
+        let reservation = self.reserve(category, requested, DiskReservationKind::Growth)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        self.validate_managed_file_path(path)?;
+        let append_result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            crate::engine::fs_utils::sync_parent_dir(path)?;
+            Ok(())
+        })();
+
+        match append_result {
+            Ok(()) => {
+                let measured_growth = file
+                    .metadata()
+                    .map(|metadata| metadata.len().saturating_sub(initial_len))
+                    .unwrap_or(requested);
+                let settlement_result = reservation.commit(requested.max(measured_growth), 0);
+                if let Err(settlement_err) = settlement_result {
+                    let rollback_result = if existed {
+                        file.set_len(initial_len)
+                            .and_then(|()| file.sync_all())
+                            .map_err(TsinkError::from)
+                    } else {
+                        drop(file);
+                        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)
+                    };
+                    let reconciliation_result = self.reconcile_when_idle().map(|_| ());
+                    return match (rollback_result, reconciliation_result) {
+                        (Ok(()), Ok(())) => Err(settlement_err),
+                        (rollback, reconciliation) => {
+                            let mut errors =
+                                vec![format!("disk settlement failed: {settlement_err}")];
+                            if let Err(err) = rollback {
+                                errors.push(format!("rollback failed: {err}"));
+                            }
+                            if let Err(err) = reconciliation {
+                                errors.push(format!("disk reconciliation failed: {err}"));
+                            }
+                            Err(TsinkError::Other(format!(
+                                "budgeted append to {} failed: {}",
+                                path.display(),
+                                errors.join("; ")
+                            )))
+                        }
+                    };
+                }
+                Ok(())
+            }
+            Err(append_err) => {
+                let rollback_result = if existed {
+                    file.set_len(initial_len)
+                        .and_then(|()| file.sync_all())
+                        .map_err(TsinkError::from)
+                } else {
+                    drop(file);
+                    crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)
+                };
+                if rollback_result.is_ok() {
+                    return Err(append_err);
+                }
+
+                let measured_growth = fs::metadata(path)
+                    .map(|metadata| metadata.len().saturating_sub(initial_len))
+                    .unwrap_or(requested);
+                let settlement_result = reservation.commit(requested.max(measured_growth), 0);
+                let reconciliation_result = self.reconcile_when_idle().map(|_| ());
+                let mut errors = vec![format!("append failed: {append_err}")];
+                if let Err(err) = rollback_result {
+                    errors.push(format!("rollback failed: {err}"));
+                }
+                if let Err(err) = settlement_result {
+                    errors.push(format!("disk settlement failed: {err}"));
+                }
+                if let Err(err) = reconciliation_result {
+                    errors.push(format!("disk reconciliation failed: {err}"));
+                }
+                Err(TsinkError::Other(format!(
+                    "budgeted append to {} failed: {}",
+                    path.display(),
+                    errors.join("; ")
+                )))
+            }
+        }
     }
 
     pub(crate) fn matches_root(&self, path: &Path) -> Result<bool> {
@@ -518,7 +1042,7 @@ impl LocalDiskBudget {
     /// Cleanup paths use this after filesystem shrinkage. Waiting rather than subtracting a
     /// measured category total prevents an externally-added file from causing an undercount of
     /// unrelated surviving data.
-    pub(crate) fn reconcile_when_idle(&self) -> Result<LocalDiskBudgetSnapshot> {
+    pub fn reconcile_when_idle(&self) -> Result<LocalDiskBudgetSnapshot> {
         let mut state = self.state.lock();
         state.reconciliation_waiters =
             state.reconciliation_waiters.checked_add(1).ok_or_else(|| {
@@ -724,6 +1248,7 @@ impl fmt::Debug for DiskReservation {
 }
 
 impl DiskReservation {
+    /// Atomically expands this reservation before additional filesystem growth.
     pub(crate) fn grow_by(&mut self, bytes: u64) -> Result<()> {
         let reserved_bytes = self.reserved_bytes.checked_add(bytes).ok_or_else(|| {
             TsinkError::Other(format!(
@@ -800,6 +1325,27 @@ fn logical_quota_error(
     }
 }
 
+fn absolute_path_lexically_normalized(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(TsinkError::Io)?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn resolve_path_allow_missing(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -835,6 +1381,28 @@ fn resolve_path_allow_missing(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+fn sync_directory_ancestry(directory: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in directory.components() {
+        current.push(component.as_os_str());
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|source| TsinkError::IoWithPath {
+            path: current.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed directory path contains a non-directory entry: {}",
+                current.display()
+            )));
+        }
+        crate::engine::fs_utils::sync_parent_dir(&current)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn measured_path_bytes(path: &Path) -> Result<u64> {
@@ -936,6 +1504,30 @@ fn checked_category_total(categories: &BTreeMap<DiskCategory, u64>) -> Result<u6
             )
         })
     })
+}
+
+fn atomic_write_temp_target_name(file_name: &str) -> Option<&str> {
+    let generated = file_name.strip_prefix('.')?;
+    let (target, suffix) = generated.rsplit_once(".tmp-")?;
+    if target.is_empty() {
+        return None;
+    }
+    let (pid, nonce) = suffix.split_once('-')?;
+    let canonical_pid = pid
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|value| value.to_string() == pid);
+    if !canonical_pid || !is_exact_lower_hex(nonce, 16) {
+        return None;
+    }
+    Some(target)
+}
+
+fn is_exact_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn classify_path(root: &Path, path: &Path) -> DiskCategory {
@@ -1106,8 +1698,9 @@ fn system_available_space(_path: &Path) -> std::io::Result<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -1417,6 +2010,9 @@ mod tests {
         assert!(budget.governs(&root).unwrap());
         assert!(budget.governs(&root.join("missing/child")).unwrap());
         assert!(!budget.governs(&root.join("../outside")).unwrap());
+        assert!(budget.overlaps(&root.join("missing/child")).unwrap());
+        assert!(budget.overlaps(temp.path()).unwrap());
+        assert!(!budget.overlaps(&temp.path().join("sibling")).unwrap());
 
         #[cfg(unix)]
         {
@@ -1430,6 +2026,301 @@ mod tests {
                 .unwrap());
             assert!(!budget.governs(&root.join("outside-alias/missing")).unwrap());
         }
+    }
+
+    #[test]
+    fn budget_open_retries_sync_for_every_configured_root_ancestor() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let base = fs::canonicalize(temp_dir.path()).expect("temp root should canonicalize");
+        let first_missing_ancestor = base.join("nested-root");
+        let root = first_missing_ancestor.join("deeper/data");
+
+        {
+            let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+                first_missing_ancestor.clone(),
+                "injected configured-root ancestor sync failure",
+            );
+            LocalDiskBudget::open(&root, LocalDiskLimits::default())
+                .expect_err("opening should fail when a configured-root ancestor cannot sync");
+        }
+        assert!(root.is_dir());
+
+        {
+            let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+                first_missing_ancestor,
+                "injected configured-root retry sync failure",
+            );
+            LocalDiskBudget::open(&root, LocalDiskLimits::default()).expect_err(
+                "retry must resynchronize every ancestor even after all entries already exist",
+            );
+        }
+        LocalDiskBudget::open(&root, LocalDiskLimits::default())
+            .expect("opening should succeed after the full configured-root ancestry syncs");
+    }
+
+    #[test]
+    fn durable_directory_creation_retries_ancestor_syncs_after_entries_exist() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let root = temp_dir.path().join("data");
+        let budget = LocalDiskBudget::open(&root, LocalDiskLimits::default())
+            .expect("disk budget should open");
+        let nested = root.join("usage/ledger");
+        let synchronized_root = budget.root().to_path_buf();
+
+        {
+            let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+                synchronized_root.clone(),
+                "injected ancestor sync failure",
+            );
+            budget
+                .create_dir_all_and_sync_parents(&nested)
+                .expect_err("first ancestor sync should fail after creating the directories");
+        }
+        assert!(nested.is_dir());
+
+        {
+            let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+                synchronized_root,
+                "injected retry sync failure",
+            );
+            budget
+                .create_dir_all_and_sync_parents(&nested)
+                .expect_err("retry must resynchronize an already-existing ancestor entry");
+        }
+        budget
+            .create_dir_all_and_sync_parents(&nested)
+            .expect("a later complete sync should make the directory chain durable");
+    }
+
+    #[test]
+    fn failed_atomic_rollback_cannot_clobber_a_concurrent_successful_replacement() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let target = temp_dir.path().join("managed-state.json");
+        fs::write(&target, b"old-state").expect("old state should write");
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        let first_sync = Arc::new(AtomicBool::new(true));
+        let failed_writer_entered = Arc::new(Barrier::new(2));
+        let release_failed_writer = Arc::new(Barrier::new(2));
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+            {
+                let root = temp_dir.path().to_path_buf();
+                let first_sync = Arc::clone(&first_sync);
+                let failed_writer_entered = Arc::clone(&failed_writer_entered);
+                let release_failed_writer = Arc::clone(&release_failed_writer);
+                move |candidate| {
+                    if candidate == root.as_path() && first_sync.swap(false, Ordering::SeqCst) {
+                        failed_writer_entered.wait();
+                        release_failed_writer.wait();
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
+            "injected post-rename sync failure",
+        );
+
+        let failed_budget = Arc::clone(&budget);
+        let failed_target = target.clone();
+        let failed_writer = std::thread::spawn(move || {
+            failed_budget.write_file_atomically_and_sync_parent(
+                &failed_target,
+                b"failed-state",
+                DiskCategory::Metadata,
+            )
+        });
+        failed_writer_entered.wait();
+
+        let successful_budget = Arc::clone(&budget);
+        let successful_target = target.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (successful_tx, successful_rx) = std::sync::mpsc::sync_channel(1);
+        let successful_writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = successful_budget.write_file_atomically_and_sync_parent(
+                &successful_target,
+                b"successful-state",
+                DiskCategory::Metadata,
+            );
+            successful_tx.send(result).unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second writer should reach the managed mutation call");
+        let mutation_lock_was_held = budget.managed_file_mutation_lock.try_lock().is_none();
+        let early_result = successful_rx.recv_timeout(Duration::from_millis(250));
+
+        release_failed_writer.wait();
+        failed_writer
+            .join()
+            .expect("failed writer should not panic")
+            .expect_err("the injected sync failure should be returned after rollback");
+        let second_writer_timed_out = matches!(
+            &early_result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let successful_result = match early_result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                successful_rx.recv_timeout(Duration::from_secs(1)).expect(
+                    "successful writer should finish after rollback releases the mutation lock",
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("successful writer disconnected before reporting its result")
+            }
+        };
+        successful_writer
+            .join()
+            .expect("successful writer should not panic");
+        assert!(
+            mutation_lock_was_held,
+            "failed writer must hold the shared mutation lock through rollback"
+        );
+        assert!(
+            second_writer_timed_out,
+            "second writer completed before the failed writer released rollback serialization"
+        );
+        successful_result.expect("second replacement should succeed");
+        assert_eq!(
+            fs::read(&target).expect("final managed state should remain readable"),
+            b"successful-state"
+        );
+    }
+
+    #[test]
+    fn managed_atomic_write_rolls_back_after_post_rename_sync_failure() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let target = temp_dir.path().join("metric-metadata-store.json");
+        fs::write(&target, b"old-state").expect("old state should write");
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            temp_dir.path().to_path_buf(),
+            "injected sidecar parent sync failure",
+        );
+
+        let err = budget
+            .write_file_atomically_and_sync_parent(&target, b"new-state", DiskCategory::Metadata)
+            .expect_err("post-rename sync failure should be reported");
+
+        assert!(err
+            .to_string()
+            .contains("injected sidecar parent sync failure"));
+        assert_eq!(fs::read(&target).unwrap(), b"old-state");
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 9);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn atomic_temp_cleanup_removes_only_the_owned_exact_prefix() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let target = temp_dir.path().join("rules-store.json");
+        let orphan = temp_dir
+            .path()
+            .join(".rules-store.json.tmp-123-0000000000000001");
+        let unrelated = temp_dir.path().join(".other.json.tmp-123-1");
+        let malformed_owned_prefix = temp_dir.path().join(".rules-store.json.tmp-manual");
+        let uppercase_nonce = temp_dir
+            .path()
+            .join(".rules-store.json.tmp-123-000000000000000A");
+        let leading_zero_pid = temp_dir
+            .path()
+            .join(".rules-store.json.tmp-0123-0000000000000002");
+        let overflowing_pid = temp_dir
+            .path()
+            .join(".rules-store.json.tmp-4294967296-0000000000000003");
+        fs::write(&orphan, b"orphan").expect("orphan should write");
+        fs::write(&unrelated, b"host-owned").expect("unrelated file should write");
+        fs::write(&malformed_owned_prefix, b"operator-owned").expect("lookalike should write");
+        fs::write(&uppercase_nonce, b"uppercase").expect("uppercase lookalike should write");
+        fs::write(&leading_zero_pid, b"leading-zero").expect("PID lookalike should write");
+        fs::write(&overflowing_pid, b"overflowing-pid")
+            .expect("out-of-range PID lookalike should write");
+        let expected_remaining = [
+            &unrelated,
+            &malformed_owned_prefix,
+            &uppercase_nonce,
+            &leading_zero_pid,
+            &overflowing_pid,
+        ]
+        .into_iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum::<u64>();
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+
+        assert_eq!(budget.cleanup_atomic_write_temps(&target).unwrap(), 1);
+        assert!(!orphan.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"host-owned");
+        assert_eq!(
+            fs::read(&malformed_owned_prefix).unwrap(),
+            b"operator-owned"
+        );
+        assert!(uppercase_nonce.is_file());
+        assert!(leading_zero_pid.is_file());
+        assert!(overflowing_pid.is_file());
+        assert_eq!(budget.snapshot().accounted_bytes, expected_remaining);
+    }
+
+    #[test]
+    fn atomic_temp_cleanup_noop_does_not_rescan_the_managed_tree() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let target = temp_dir.path().join("rules-store.json");
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        assert_eq!(budget.snapshot().reconciliations_total, 1);
+
+        assert_eq!(budget.cleanup_atomic_write_temps(&target).unwrap(), 0);
+        assert_eq!(budget.snapshot().reconciliations_total, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_managed_entry_cannot_escape_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let data_root = temp_dir.path().join("data");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&data_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, data_root.join("lane_numeric")).unwrap();
+        let budget = LocalDiskBudget::open(&data_root, LocalDiskLimits::default())
+            .expect("disk budget should open");
+
+        let escaped = data_root.join("lane_numeric/segments/L0/seg-0000000000000001");
+        let err = budget
+            .governs_entry(&escaped)
+            .expect_err("a lexically managed entry must not silently escape the budget root");
+        assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+            if message.contains("escapes local disk root")));
+        assert!(!budget.governs_entry(&outside.join("remote-file")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_append_rejects_a_dangling_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let data_root = temp_dir.path().join("data");
+        let outside = temp_dir.path().join("outside-ledger.ndjson");
+        fs::create_dir_all(data_root.join("usage-accounting")).unwrap();
+        let ledger = data_root.join("usage-accounting/ledger.ndjson");
+        symlink(&outside, &ledger).expect("dangling symlink should build");
+        let budget = LocalDiskBudget::open(&data_root, LocalDiskLimits::default())
+            .expect("disk budget should open");
+
+        let err = budget
+            .append_file_and_sync_parent(&ledger, b"record\n", DiskCategory::ServerState)
+            .expect_err("managed append must reject the final symlink");
+        assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+        assert!(!outside.exists());
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
     }
 
     #[test]

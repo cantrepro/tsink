@@ -1448,6 +1448,34 @@ pub fn scoped_storage(inner: Arc<dyn Storage>, tenant_id: impl Into<String>) -> 
     Arc::new(TenantScopedStorage::new(inner, tenant_id.into()))
 }
 
+#[derive(Debug)]
+pub(crate) enum TenantDeleteSeriesError {
+    Storage(TsinkError),
+    Partial {
+        source: TsinkError,
+        matched_series: u64,
+        tombstones_applied: u64,
+    },
+}
+
+impl TenantDeleteSeriesError {
+    fn into_source(self) -> TsinkError {
+        match self {
+            Self::Storage(source) | Self::Partial { source, .. } => source,
+        }
+    }
+}
+
+pub(crate) fn delete_series_with_progress(
+    inner: &Arc<dyn Storage>,
+    tenant_id: &str,
+    selection: &SeriesSelection,
+    observer: &mut dyn FnMut(DeleteSeriesResult),
+) -> Result<DeleteSeriesResult, TenantDeleteSeriesError> {
+    TenantScopedStorage::new(Arc::clone(inner), tenant_id.to_string())
+        .delete_series_with_progress(selection, observer)
+}
+
 fn exact_selection_for_series(
     series: &MetricSeries,
     time_range: Option<(i64, i64)>,
@@ -1682,6 +1710,58 @@ impl TenantScopedStorage {
             })
             .collect()
     }
+
+    fn delete_series_with_progress(
+        &self,
+        selection: &SeriesSelection,
+        observer: &mut dyn FnMut(DeleteSeriesResult),
+    ) -> Result<DeleteSeriesResult, TenantDeleteSeriesError> {
+        if self.is_default_tenant() {
+            let time_range = match (selection.start, selection.end) {
+                (Some(start), Some(end)) => Some((start, end)),
+                _ => None,
+            };
+            let series = self
+                .read_series(selection)
+                .map_err(TenantDeleteSeriesError::Storage)?;
+            let mut matched_series = 0u64;
+            let mut tombstones_applied = 0u64;
+            for series in series {
+                match self
+                    .inner
+                    .delete_series(&exact_selection_for_series(&series, time_range))
+                {
+                    Ok(outcome) => {
+                        matched_series = matched_series.saturating_add(outcome.matched_series);
+                        tombstones_applied =
+                            tombstones_applied.saturating_add(outcome.tombstones_applied);
+                        observer(outcome);
+                    }
+                    Err(source) if tombstones_applied > 0 => {
+                        return Err(TenantDeleteSeriesError::Partial {
+                            source,
+                            matched_series,
+                            tombstones_applied,
+                        });
+                    }
+                    Err(source) => return Err(TenantDeleteSeriesError::Storage(source)),
+                }
+            }
+            return Ok(DeleteSeriesResult {
+                matched_series,
+                tombstones_applied,
+            });
+        }
+        let scoped = self
+            .scoped_selection(selection)
+            .map_err(TenantDeleteSeriesError::Storage)?;
+        let outcome = self
+            .inner
+            .delete_series(&scoped)
+            .map_err(TenantDeleteSeriesError::Storage)?;
+        observer(outcome);
+        Ok(outcome)
+    }
 }
 
 impl Storage for TenantScopedStorage {
@@ -1886,28 +1966,8 @@ impl Storage for TenantScopedStorage {
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> TsinkResult<DeleteSeriesResult> {
-        if self.is_default_tenant() {
-            let time_range = match (selection.start, selection.end) {
-                (Some(start), Some(end)) => Some((start, end)),
-                _ => None,
-            };
-            let series = self.read_series(selection)?;
-            let mut matched_series = 0u64;
-            let mut tombstones_applied = 0u64;
-            for series in series {
-                let outcome = self
-                    .inner
-                    .delete_series(&exact_selection_for_series(&series, time_range))?;
-                matched_series = matched_series.saturating_add(outcome.matched_series);
-                tombstones_applied = tombstones_applied.saturating_add(outcome.tombstones_applied);
-            }
-            return Ok(DeleteSeriesResult {
-                matched_series,
-                tombstones_applied,
-            });
-        }
-        let scoped = self.scoped_selection(selection)?;
-        self.inner.delete_series(&scoped)
+        self.delete_series_with_progress(selection, &mut |_| {})
+            .map_err(TenantDeleteSeriesError::into_source)
     }
 
     fn memory_used(&self) -> usize {
@@ -2066,6 +2126,7 @@ mod tests {
                 },
             )
             .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 
     struct RecordingMetadataStorage {

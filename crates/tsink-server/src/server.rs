@@ -22,9 +22,12 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tsink::promql::Engine;
-use tsink::{Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision, WalSyncMode};
+use tsink::{
+    LocalDiskBudget, LocalDiskLimits, Storage, StorageBuilder, StorageRuntimeMode,
+    TimestampPrecision, WalSyncMode,
+};
 
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_GRAPHITE_CONNECTIONS: usize = 1024;
@@ -63,6 +66,9 @@ pub struct ServerConfig {
     pub remote_segment_refresh_interval: Option<Duration>,
     pub mirror_hot_segments_to_object_store: bool,
     pub memory_limit: Option<usize>,
+    pub local_disk_limit: Option<u64>,
+    pub filesystem_free_headroom: u64,
+    pub maintenance_temp_reserve: u64,
     pub cardinality_limit: Option<usize>,
     pub chunk_points: Option<usize>,
     pub max_writers: Option<usize>,
@@ -103,6 +109,9 @@ impl Default for ServerConfig {
             remote_segment_refresh_interval: None,
             mirror_hot_segments_to_object_store: false,
             memory_limit: None,
+            local_disk_limit: None,
+            filesystem_free_headroom: 0,
+            maintenance_temp_reserve: 0,
             cardinality_limit: None,
             chunk_points: None,
             max_writers: None,
@@ -173,6 +182,7 @@ impl ServerConfig {
         self.validate_admin_config()?;
         self.validate_edge_sync_config()?;
         self.validate_storage_mode_config()?;
+        self.validate_local_disk_config()?;
         let _ = self.resolved_listener_tls_paths()?;
         self.cluster.validate()?;
         Ok(())
@@ -309,6 +319,26 @@ impl ServerConfig {
         Ok(())
     }
 
+    fn validate_local_disk_config(&self) -> Result<(), String> {
+        let requested = self.local_disk_limit.is_some()
+            || self.filesystem_free_headroom > 0
+            || self.maintenance_temp_reserve > 0;
+        if requested && self.data_path.is_none() {
+            return Err(
+                "local disk limits require --data-path so all managed files share one root"
+                    .to_string(),
+            );
+        }
+        LocalDiskLimits {
+            max_bytes: self.local_disk_limit,
+            filesystem_free_headroom_bytes: self.filesystem_free_headroom,
+            maintenance_temp_reserve_bytes: self.maintenance_temp_reserve,
+        }
+        .validate()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
     fn has_public_auth(&self) -> bool {
         self.auth_token
             .as_deref()
@@ -379,6 +409,7 @@ struct ServerContext {
     edge_sync_context: Option<Arc<edge_sync::EdgeSyncRuntimeContext>>,
     usage_accounting: Arc<UsageAccounting>,
     managed_control_plane: Arc<ManagedControlPlane>,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 }
 
 impl ServerContext {
@@ -396,6 +427,7 @@ impl ServerContext {
             security_manager: Some(self.security_manager.as_ref()),
             usage_accounting: Some(self.usage_accounting.as_ref()),
             managed_control_plane: Some(self.managed_control_plane.as_ref()),
+            local_disk_budget: self.local_disk_budget.as_deref(),
         }
     }
 
@@ -483,6 +515,130 @@ struct ListenerBootstrap {
     graphite_task: Option<JoinHandle<()>>,
 }
 
+struct BoundStatsdListener {
+    socket: UdpSocket,
+    bound: std::net::SocketAddr,
+}
+
+struct BoundGraphiteListener {
+    listener: TcpListener,
+    bound: std::net::SocketAddr,
+}
+
+struct ServerPersistenceRoot {
+    budget: Arc<LocalDiskBudget>,
+    _non_core_process_lease: Option<ServerDataPathProcessLease>,
+}
+
+impl ServerPersistenceRoot {
+    fn open(config: &ServerConfig) -> Result<Option<Self>, String> {
+        let limits = server_local_disk_limits(config);
+        let Some(data_path) = config.data_path.as_deref() else {
+            if limits.max_bytes.is_some()
+                || limits.filesystem_free_headroom_bytes > 0
+                || limits.maintenance_temp_reserve_bytes > 0
+            {
+                return Err(
+                    "local disk limits require --data-path so all managed files share one root"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        };
+
+        // Read-write core storage owns the canonical `.tsink.lock`. Other server modes still
+        // persist sidecars under data_path, so the server must hold that same lease itself.
+        let non_core_process_lease = (config.storage_mode != StorageRuntimeMode::ReadWrite)
+            .then(|| ServerDataPathProcessLease::acquire(data_path))
+            .transpose()?;
+        let budget = LocalDiskBudget::open(data_path, limits)
+            .map_err(|err| format!("failed to open shared local disk budget: {err}"))?;
+        if let Some(object_store_path) = config.object_store_path.as_deref() {
+            if budget.overlaps(object_store_path).map_err(|err| {
+                format!(
+                    "failed to validate object store path {} against managed data path {}: {err}",
+                    object_store_path.display(),
+                    data_path.display()
+                )
+            })? {
+                return Err(format!(
+                    "object store path {} must be outside managed local data path {}",
+                    object_store_path.display(),
+                    data_path.display()
+                ));
+            }
+        }
+        Ok(Some(Self {
+            budget,
+            _non_core_process_lease: non_core_process_lease,
+        }))
+    }
+
+    fn budget(&self) -> Arc<LocalDiskBudget> {
+        Arc::clone(&self.budget)
+    }
+}
+
+struct ServerDataPathProcessLease {
+    lock_file: std::fs::File,
+}
+
+impl ServerDataPathProcessLease {
+    fn acquire(data_path: &Path) -> Result<Self, String> {
+        const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+        const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+        std::fs::create_dir_all(data_path).map_err(|err| {
+            format!(
+                "failed to create server data path {} before locking: {err}",
+                data_path.display()
+            )
+        })?;
+        let lock_path = data_path.join(".tsink.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|err| {
+                format!(
+                    "failed to open server data-path lock {}: {err}",
+                    lock_path.display()
+                )
+            })?;
+        let deadline = Instant::now() + RETRY_TIMEOUT;
+        loop {
+            match lock_file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "data path {} is already locked by another tsink process ({})",
+                        data_path.display(),
+                        lock_path.display()
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(format!(
+                        "failed to acquire server data-path lock {}: {err}",
+                        lock_path.display()
+                    ));
+                }
+            }
+        }
+        Ok(Self { lock_file })
+    }
+}
+
+impl Drop for ServerDataPathProcessLease {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
 struct ServerRuntime {
     listen_addr: String,
     app_context: ServerContext,
@@ -491,6 +647,7 @@ struct ServerRuntime {
     shutdown_rx: watch::Receiver<bool>,
     storage: Arc<dyn Storage>,
     background_workers: BackgroundWorkers,
+    persistence_root: Option<ServerPersistenceRoot>,
 }
 
 impl ServerRuntime {
@@ -501,11 +658,26 @@ impl ServerRuntime {
         admission::global_public_write_admission()?;
         admission::global_public_read_admission()?;
 
+        let persistence_root = ServerPersistenceRoot::open(&config)?;
+        let local_disk_budget = persistence_root.as_ref().map(ServerPersistenceRoot::budget);
         let access_control = load_access_control(&config)?;
-        let mut cluster = bootstrap_cluster_runtime(&config).await?;
+        // Acquire the core data-path lock before any cluster or sidecar writer can publish files
+        // beneath the same root.
+        let core_storage = build_core_storage_runtime(&config, local_disk_budget.clone())?;
+        let mut cluster = bootstrap_cluster_runtime(&config, local_disk_budget.clone()).await?;
         let security = build_security_runtime(&config, &mut cluster)?;
         let admin_path_prefix = resolve_admin_path_prefix(config.admin_path_prefix.as_deref())?;
-        let storage = build_storage_runtime(&config, cluster.clone_cluster_context())?;
+        let storage = build_storage_runtime(
+            &config,
+            core_storage,
+            cluster.clone_cluster_context(),
+            local_disk_budget.clone(),
+        )?;
+        if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+            local_disk_budget
+                .reconcile_when_idle()
+                .map_err(|err| format!("failed to reconcile shared local disk usage: {err}"))?;
+        }
         let app_context = build_server_context(
             &config,
             admin_path_prefix,
@@ -513,6 +685,7 @@ impl ServerRuntime {
             &security,
             &storage,
             &cluster,
+            local_disk_budget,
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listeners = bind_listeners(&config, &app_context, &shutdown_rx).await?;
@@ -530,6 +703,7 @@ impl ServerRuntime {
             shutdown_rx,
             storage: Arc::clone(&storage.storage),
             background_workers,
+            persistence_root,
         })
     }
 
@@ -542,6 +716,7 @@ impl ServerRuntime {
             shutdown_rx,
             storage,
             background_workers,
+            persistence_root,
         } = self;
         let ListenerBootstrap {
             listener,
@@ -555,7 +730,9 @@ impl ServerRuntime {
         await_listener_task(statsd_task).await;
         await_listener_task(graphite_task).await;
         background_workers.shutdown().await;
-        close_storage_runtime(storage).await
+        let close_result = close_storage_runtime(storage).await;
+        drop(persistence_root);
+        close_result
     }
 }
 
@@ -583,7 +760,10 @@ fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, 
     })
 }
 
-async fn bootstrap_cluster_runtime(config: &ServerConfig) -> Result<ClusterBootstrap, String> {
+async fn bootstrap_cluster_runtime(
+    config: &ServerConfig,
+    _local_disk_budget: Option<Arc<LocalDiskBudget>>,
+) -> Result<ClusterBootstrap, String> {
     let mut cluster_context = None;
     let mut internal_api = None;
     let mut auto_join_runtime = None;
@@ -783,32 +963,46 @@ fn build_security_runtime(
 
 fn build_storage_runtime(
     config: &ServerConfig,
+    storage: Arc<dyn Storage>,
     cluster_context: Option<Arc<cluster::ClusterRequestContext>>,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<StorageBootstrap, String> {
-    let storage = build_storage(config).map_err(|err| format!("failed to build storage: {err}"))?;
     let metadata_store = Arc::new(
-        MetricMetadataStore::open(config.data_path.as_deref())
-            .map_err(|err| format!("failed to open metric metadata store: {err}"))?,
+        MetricMetadataStore::open_with_disk_budget(
+            config.data_path.as_deref(),
+            local_disk_budget.clone(),
+        )
+        .map_err(|err| format!("failed to open metric metadata store: {err}"))?,
     );
     let exemplar_store = Arc::new(
-        ExemplarStore::open(config.data_path.as_deref())
-            .map_err(|err| format!("failed to open exemplar store: {err}"))?,
+        ExemplarStore::open_with_disk_budget(
+            config.data_path.as_deref(),
+            local_disk_budget.clone(),
+        )
+        .map_err(|err| format!("failed to open exemplar store: {err}"))?,
     );
-    let usage_accounting = UsageAccounting::open(config.data_path.as_deref())
-        .map_err(|err| format!("failed to open usage accounting store: {err}"))?;
+    let usage_accounting = UsageAccounting::open_with_disk_budget(
+        config.data_path.as_deref(),
+        local_disk_budget.clone(),
+    )
+    .map_err(|err| format!("failed to open usage accounting store: {err}"))?;
     if let Err(err) = usage_accounting.reconcile_storage(&storage) {
         eprintln!("usage storage reconciliation at startup failed: {err}");
     }
     let managed_control_plane = Arc::new(
-        ManagedControlPlane::open(config.data_path.as_deref())
-            .map_err(|err| format!("failed to open managed control-plane store: {err}"))?,
+        ManagedControlPlane::open_with_disk_budget(
+            config.data_path.as_deref(),
+            local_disk_budget.clone(),
+        )
+        .map_err(|err| format!("failed to open managed control-plane store: {err}"))?,
     );
-    let rules_runtime = RulesRuntime::open(
+    let rules_runtime = RulesRuntime::open_with_disk_budget(
         config.data_path.as_deref(),
         Arc::clone(&storage),
         config.timestamp_precision,
         cluster_context,
         Some(Arc::clone(&usage_accounting)),
+        local_disk_budget,
     )
     .map_err(|err| format!("failed to open rules runtime: {err}"))?;
 
@@ -829,6 +1023,7 @@ fn build_server_context(
     security: &SecurityBootstrap,
     storage: &StorageBootstrap,
     cluster: &ClusterBootstrap,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> ServerContext {
     ServerContext {
         storage: Arc::clone(&storage.storage),
@@ -853,6 +1048,7 @@ fn build_server_context(
         edge_sync_context: cluster.edge_sync_context.clone(),
         usage_accounting: Arc::clone(&storage.usage_accounting),
         managed_control_plane: Arc::clone(&storage.managed_control_plane),
+        local_disk_budget,
     }
 }
 
@@ -904,8 +1100,13 @@ async fn bind_listeners(
     let listener = TcpListener::bind(&config.listen)
         .await
         .map_err(|err| format!("bind {} failed: {err}", config.listen))?;
-    let statsd_task = bind_statsd_listener(config, app_context, shutdown_rx).await?;
-    let graphite_task = bind_graphite_listener(config, app_context, shutdown_rx).await?;
+    // Complete every fallible bind before spawning a listener task. Otherwise a later bind
+    // failure can detach an earlier task while bootstrap unwinds and releases persistence locks.
+    let statsd_listener = bind_statsd_socket(config).await?;
+    let graphite_listener = bind_graphite_socket(config).await?;
+    let statsd_task = start_statsd_listener(config, app_context, shutdown_rx, statsd_listener);
+    let graphite_task =
+        start_graphite_listener(config, app_context, shutdown_rx, graphite_listener);
 
     Ok(ListenerBootstrap {
         listener,
@@ -914,11 +1115,7 @@ async fn bind_listeners(
     })
 }
 
-async fn bind_statsd_listener(
-    config: &ServerConfig,
-    app_context: &ServerContext,
-    shutdown_rx: &watch::Receiver<bool>,
-) -> Result<Option<JoinHandle<()>>, String> {
+async fn bind_statsd_socket(config: &ServerConfig) -> Result<Option<BoundStatsdListener>, String> {
     legacy_ingest::set_listener_enabled(legacy_ingest::LegacyAdapterKind::Statsd, false);
 
     let Some(addr) = config.statsd_listen.clone() else {
@@ -931,6 +1128,17 @@ async fn bind_statsd_listener(
     let bound = socket
         .local_addr()
         .map_err(|err| format!("statsd listener local_addr failed: {err}"))?;
+
+    Ok(Some(BoundStatsdListener { socket, bound }))
+}
+
+fn start_statsd_listener(
+    config: &ServerConfig,
+    app_context: &ServerContext,
+    shutdown_rx: &watch::Receiver<bool>,
+    listener: Option<BoundStatsdListener>,
+) -> Option<JoinHandle<()>> {
+    let BoundStatsdListener { socket, bound } = listener?;
     eprintln!(
         "statsd listener listening on {} for tenant '{}'",
         bound, config.statsd_tenant_id
@@ -940,21 +1148,19 @@ async fn bind_statsd_listener(
     let statsd_tenant_id = config.statsd_tenant_id.clone();
     let app_context = app_context.clone();
     let mut shutdown_rx = shutdown_rx.clone();
-    Ok(Some(tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Err(err) =
             run_statsd_listener(socket, &app_context, &statsd_tenant_id, &mut shutdown_rx).await
         {
             eprintln!("statsd listener error: {err}");
         }
         legacy_ingest::set_listener_enabled(legacy_ingest::LegacyAdapterKind::Statsd, false);
-    })))
+    }))
 }
 
-async fn bind_graphite_listener(
+async fn bind_graphite_socket(
     config: &ServerConfig,
-    app_context: &ServerContext,
-    shutdown_rx: &watch::Receiver<bool>,
-) -> Result<Option<JoinHandle<()>>, String> {
+) -> Result<Option<BoundGraphiteListener>, String> {
     legacy_ingest::set_listener_enabled(legacy_ingest::LegacyAdapterKind::Graphite, false);
 
     let Some(addr) = config.graphite_listen.clone() else {
@@ -967,6 +1173,17 @@ async fn bind_graphite_listener(
     let bound = listener
         .local_addr()
         .map_err(|err| format!("graphite listener local_addr failed: {err}"))?;
+
+    Ok(Some(BoundGraphiteListener { listener, bound }))
+}
+
+fn start_graphite_listener(
+    config: &ServerConfig,
+    app_context: &ServerContext,
+    shutdown_rx: &watch::Receiver<bool>,
+    binding: Option<BoundGraphiteListener>,
+) -> Option<JoinHandle<()>> {
+    let BoundGraphiteListener { listener, bound } = binding?;
     eprintln!(
         "graphite listener listening on {} for tenant '{}'",
         bound, config.graphite_tenant_id
@@ -976,7 +1193,7 @@ async fn bind_graphite_listener(
     let graphite_tenant_id = config.graphite_tenant_id.clone();
     let app_context = app_context.clone();
     let mut shutdown_rx = shutdown_rx.clone();
-    Ok(Some(tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Err(err) = run_graphite_listener(
             listener,
             &app_context,
@@ -988,7 +1205,7 @@ async fn bind_graphite_listener(
             eprintln!("graphite listener error: {err}");
         }
         legacy_ingest::set_listener_enabled(legacy_ingest::LegacyAdapterKind::Graphite, false);
-    })))
+    }))
 }
 
 fn start_shutdown_signal_task(shutdown_tx: watch::Sender<bool>) -> JoinHandle<()> {
@@ -1010,10 +1227,12 @@ async fn run_accept_loop(
 ) {
     println!("tsink server listening on {}", listen_addr);
 
-    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut connection_tasks = JoinSet::new();
     let shutdown_rx = shutdown_rx;
 
     loop {
+        reap_finished_connection_tasks(&mut connection_tasks, "HTTP");
+
         let permit = tokio::select! {
             permit = semaphore.clone().acquire_owned() => {
                 match permit {
@@ -1043,28 +1262,56 @@ async fn run_accept_loop(
         };
 
         let app_context = app_context.clone();
-        let active = Arc::clone(&active_connections);
-
-        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        connection_tasks.spawn(async move {
             let _permit = permit;
             let result = handle_connection(stream, &app_context, None, &mut shutdown_rx).await;
             if let Err(err) = result {
                 eprintln!("connection error: {err}");
             }
-            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
-    let drain_start = Instant::now();
-    while active_connections.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-        if drain_start.elapsed() > SHUTDOWN_GRACE_PERIOD {
-            eprintln!("shutdown grace period expired, closing with active connections");
-            break;
+    drain_connection_tasks(&mut connection_tasks, "HTTP", SHUTDOWN_GRACE_PERIOD).await;
+}
+
+fn reap_finished_connection_tasks(connection_tasks: &mut JoinSet<()>, listener_name: &str) {
+    while let Some(result) = connection_tasks.try_join_next() {
+        if let Err(err) = result {
+            eprintln!("{listener_name} connection task failed: {err}");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn drain_connection_tasks(
+    connection_tasks: &mut JoinSet<()>,
+    listener_name: &str,
+    grace_period: Duration,
+) {
+    let grace_deadline = tokio::time::Instant::now() + grace_period;
+    let mut grace_expired = false;
+
+    while !connection_tasks.is_empty() {
+        let result = if grace_expired {
+            connection_tasks.join_next().await
+        } else {
+            match tokio::time::timeout_at(grace_deadline, connection_tasks.join_next()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    grace_expired = true;
+                    eprintln!(
+                        "shutdown grace period expired with {} active {listener_name} connection(s); waiting for request work to finish before releasing persistence resources",
+                        connection_tasks.len()
+                    );
+                    continue;
+                }
+            }
+        };
+
+        if let Some(Err(err)) = result {
+            eprintln!("{listener_name} connection task failed during shutdown: {err}");
+        }
     }
 }
 
@@ -1264,13 +1511,27 @@ async fn run_graphite_listener(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     let connection_limit = Arc::new(Semaphore::new(MAX_GRAPHITE_CONNECTIONS));
+    let mut connection_tasks = JoinSet::new();
+    let mut listener_error = None;
+
     loop {
-        let stream = tokio::select! {
+        reap_finished_connection_tasks(&mut connection_tasks, "Graphite");
+
+        let accepted = tokio::select! {
             result = listener.accept() => {
-                let (stream, _) = result.map_err(|err| format!("graphite accept failed: {err}"))?;
-                stream
+                Some(result)
             }
-            _ = shutdown_rx.changed() => return Ok(()),
+            _ = shutdown_rx.changed() => None,
+        };
+        let Some(accepted) = accepted else {
+            break;
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                listener_error = Some(format!("graphite accept failed: {err}"));
+                break;
+            }
         };
 
         let connection_permit = match Arc::clone(&connection_limit).try_acquire_owned() {
@@ -1286,7 +1547,7 @@ async fn run_graphite_listener(
         let app_context = app_context.clone();
         let tenant_id = tenant_id.to_string();
         let mut connection_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        connection_tasks.spawn(async move {
             let _connection_permit = connection_permit;
             if let Err(err) = handle_graphite_connection(
                 stream,
@@ -1299,6 +1560,13 @@ async fn run_graphite_listener(
                 eprintln!("graphite connection error: {err}");
             }
         });
+    }
+
+    drain_connection_tasks(&mut connection_tasks, "Graphite", SHUTDOWN_GRACE_PERIOD).await;
+
+    match listener_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -1492,7 +1760,46 @@ fn legacy_ingest_error_is_throttled(err: &str) -> bool {
         || err.contains("limit exceeded")
 }
 
-fn build_storage(config: &ServerConfig) -> tsink::Result<Arc<dyn Storage>> {
+fn server_local_disk_limits(config: &ServerConfig) -> LocalDiskLimits {
+    LocalDiskLimits {
+        max_bytes: config.local_disk_limit,
+        filesystem_free_headroom_bytes: config.filesystem_free_headroom,
+        maintenance_temp_reserve_bytes: config.maintenance_temp_reserve,
+    }
+}
+
+#[cfg(test)]
+fn build_server_disk_budget(config: &ServerConfig) -> Result<Option<Arc<LocalDiskBudget>>, String> {
+    let limits = server_local_disk_limits(config);
+    let Some(data_path) = config.data_path.as_deref() else {
+        if limits.max_bytes.is_some()
+            || limits.filesystem_free_headroom_bytes > 0
+            || limits.maintenance_temp_reserve_bytes > 0
+        {
+            return Err(
+                "local disk limits require --data-path so all managed files share one root"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    };
+    LocalDiskBudget::open(data_path, limits)
+        .map(Some)
+        .map_err(|err| format!("failed to open shared local disk budget: {err}"))
+}
+
+fn build_core_storage_runtime(
+    config: &ServerConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
+) -> Result<Arc<dyn Storage>, String> {
+    build_storage_with_disk_budget(config, local_disk_budget)
+        .map_err(|err| format!("failed to build storage: {err}"))
+}
+
+fn build_storage_with_disk_budget(
+    config: &ServerConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
+) -> tsink::Result<Arc<dyn Storage>> {
     let mut builder = StorageBuilder::new()
         .with_wal_enabled(
             config.wal_enabled && config.storage_mode != StorageRuntimeMode::ComputeOnly,
@@ -1525,6 +1832,9 @@ fn build_storage(config: &ServerConfig) -> tsink::Result<Arc<dyn Storage>> {
     if let Some(path) = &config.data_path {
         if config.storage_mode == StorageRuntimeMode::ReadWrite {
             builder = builder.with_data_path(path);
+            if let Some(local_disk_budget) = local_disk_budget {
+                builder = builder.with_shared_local_disk_budget(local_disk_budget);
+            }
         }
     }
     builder = builder.with_retention(config.retention.unwrap_or(DEFAULT_STORAGE_RETENTION));
@@ -1723,6 +2033,7 @@ mod tests {
                 ManagedControlPlane::open(None)
                     .expect("managed control plane should open in memory"),
             ),
+            local_disk_budget: None,
         }
     }
 
@@ -1958,6 +2269,79 @@ mod tests {
             .expect("aborted worker future should be dropped");
     }
 
+    #[tokio::test]
+    async fn listener_bootstrap_does_not_spawn_statsd_before_graphite_bind_succeeds() {
+        let occupied_graphite = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("graphite blocker should bind");
+        let graphite_addr = occupied_graphite
+            .local_addr()
+            .expect("graphite blocker should expose its address");
+        let statsd_reservation = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("statsd port reservation should bind");
+        let statsd_addr = statsd_reservation
+            .local_addr()
+            .expect("statsd reservation should expose its address");
+        drop(statsd_reservation);
+
+        let app_context = make_legacy_listener_context(
+            make_storage(),
+            Arc::new(MetricMetadataStore::in_memory()),
+            Arc::new(ExemplarStore::in_memory()),
+        );
+        let config = ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            statsd_listen: Some(statsd_addr.to_string()),
+            graphite_listen: Some(graphite_addr.to_string()),
+            ..ServerConfig::default()
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let err = match bind_listeners(&config, &app_context, &shutdown_rx).await {
+            Ok(_) => panic!("occupied graphite port should reject listener bootstrap"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bind graphite listener"));
+
+        let rebound_statsd = UdpSocket::bind(statsd_addr)
+            .await
+            .expect("failed bootstrap must release the bound StatsD socket without spawning it");
+        drop(rebound_statsd);
+    }
+
+    #[tokio::test]
+    async fn connection_drain_waits_past_grace_period_until_request_work_finishes() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut connection_tasks = JoinSet::new();
+        connection_tasks.spawn(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        });
+        started_rx
+            .await
+            .expect("connection task should start before draining");
+
+        let drain_task = tokio::spawn(async move {
+            drain_connection_tasks(&mut connection_tasks, "test", Duration::from_millis(10)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain_task.is_finished(),
+            "grace expiry must not detach active request work"
+        );
+
+        release_tx
+            .send(())
+            .expect("connection task should remain alive past grace expiry");
+        tokio::time::timeout(Duration::from_secs(1), drain_task)
+            .await
+            .expect("connection drain should finish after request work completes")
+            .expect("connection drain task should not panic");
+    }
+
     fn malformed_disabled_cluster_config() -> ClusterConfig {
         ClusterConfig {
             enabled: false,
@@ -2118,6 +2502,7 @@ mod tests {
             edge_sync_context: None,
             usage_accounting,
             managed_control_plane,
+            local_disk_budget: None,
         };
 
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -2210,6 +2595,7 @@ mod tests {
             edge_sync_context: None,
             usage_accounting,
             managed_control_plane,
+            local_disk_budget: None,
         };
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_handle = tokio::spawn(async move {
@@ -2504,7 +2890,12 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let storage = build_storage_runtime(&config, None).expect("storage runtime should build");
+        let local_disk_budget =
+            build_server_disk_budget(&config).expect("shared disk budget should open");
+        let core_storage = build_core_storage_runtime(&config, local_disk_budget.clone())
+            .expect("core storage should build");
+        let storage = build_storage_runtime(&config, core_storage, None, local_disk_budget)
+            .expect("storage runtime should build");
 
         assert!(storage.usage_accounting.ledger_status().durable);
         assert!(storage.managed_control_plane.status_snapshot().durable);
@@ -2521,6 +2912,73 @@ mod tests {
             .storage
             .close()
             .expect("storage runtime should close cleanly");
+    }
+
+    #[test]
+    fn non_read_write_server_root_holds_the_canonical_process_lease() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config = ServerConfig {
+            data_path: Some(temp_dir.path().join("data")),
+            storage_mode: StorageRuntimeMode::ComputeOnly,
+            ..ServerConfig::default()
+        };
+        let first = ServerPersistenceRoot::open(&config)
+            .expect("first root acquisition should not fail")
+            .expect("data path should create a persistence root");
+
+        let error = match ServerPersistenceRoot::open(&config) {
+            Ok(_) => panic!("a second server root must not share the same data path"),
+            Err(error) => error,
+        };
+        assert!(error.contains("already locked by another tsink process"));
+        drop(first);
+
+        let reopened = ServerPersistenceRoot::open(&config)
+            .expect("released process lease should allow reopening")
+            .expect("data path should create a persistence root");
+        assert_eq!(
+            reopened.budget.root(),
+            std::fs::canonicalize(config.data_path.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_only_server_rejects_object_store_inside_managed_data_root() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let data_path = temp_dir.path().join("data");
+        let config = ServerConfig {
+            data_path: Some(data_path.clone()),
+            object_store_path: Some(data_path.join("object-store")),
+            storage_mode: StorageRuntimeMode::ComputeOnly,
+            ..ServerConfig::default()
+        };
+
+        let error = match ServerPersistenceRoot::open(&config) {
+            Ok(_) => panic!("an object store beneath the managed root must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("object store path")
+                && error.contains("must be outside managed local data path"),
+            "unexpected error: {error}"
+        );
+
+        let ancestor_config = ServerConfig {
+            object_store_path: Some(temp_dir.path().to_path_buf()),
+            ..config.clone()
+        };
+        assert!(
+            ServerPersistenceRoot::open(&ancestor_config).is_err(),
+            "an object store containing the managed root must also be rejected"
+        );
+
+        let outside_config = ServerConfig {
+            object_store_path: Some(temp_dir.path().join("object-store")),
+            ..config
+        };
+        assert!(ServerPersistenceRoot::open(&outside_config)
+            .expect("rejection must release the process lease")
+            .is_some());
     }
 
     #[test]
@@ -2568,8 +3026,12 @@ mod tests {
         };
         let security =
             build_security_runtime(&config, &mut cluster).expect("security bootstrap should build");
-        let storage =
-            build_storage_runtime(&config, None).expect("storage bootstrap should succeed");
+        let local_disk_budget =
+            build_server_disk_budget(&config).expect("shared disk budget should open");
+        let core_storage = build_core_storage_runtime(&config, local_disk_budget.clone())
+            .expect("core storage should build");
+        let storage = build_storage_runtime(&config, core_storage, None, local_disk_budget.clone())
+            .expect("storage bootstrap should succeed");
         let admin_path_prefix = Some(temp_dir.path().to_path_buf());
 
         let context = build_server_context(
@@ -2579,6 +3041,7 @@ mod tests {
             &security,
             &storage,
             &cluster,
+            local_disk_budget,
         );
 
         assert_eq!(context.auth_token.as_deref(), Some("public-token"));
@@ -2738,12 +3201,11 @@ mod tests {
             MetricMetadataStore::open(Some(temp_dir.path()))
                 .expect("persistent metadata store should open"),
         );
-        let metadata_tmp_path = metadata_store
+        let metadata_path = metadata_store
             .file_path()
-            .expect("persistent metadata store should expose its path")
-            .with_extension("tmp");
-        std::fs::create_dir(&metadata_tmp_path)
-            .expect("blocking metadata temporary path should build");
+            .expect("persistent metadata store should expose its path");
+        std::fs::create_dir(metadata_path)
+            .expect("blocking metadata publication path should build");
         let (listen_addr, shutdown_tx, listener_task) =
             spawn_statsd_test_listener(Arc::clone(&storage), Arc::clone(&metadata_store)).await;
 

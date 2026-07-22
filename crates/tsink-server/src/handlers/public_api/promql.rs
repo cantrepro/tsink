@@ -95,7 +95,8 @@ pub(crate) async fn handle_instant_query_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             let mut response = promql_success_response(&value, precision);
             if let Some(distributed_storage) = distributed_storage.as_ref() {
                 let metadata = distributed_storage.read_metadata_snapshot();
@@ -225,7 +226,8 @@ pub(crate) async fn handle_range_query_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             let mut response = promql_success_response(&value, precision);
             if let Some(distributed_storage) = distributed_storage.as_ref() {
                 let metadata = distributed_storage.read_metadata_snapshot();
@@ -591,7 +593,8 @@ pub(crate) async fn handle_query_exemplars_with_admission(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
 
     let data = JsonValue::Array(
         series

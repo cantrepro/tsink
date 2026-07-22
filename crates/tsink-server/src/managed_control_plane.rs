@@ -19,8 +19,50 @@ const MANAGED_TENANT_INGEST_WINDOW_MS: u64 = 1_000;
 #[derive(Debug)]
 pub struct ManagedControlPlane {
     state_path: Option<PathBuf>,
+    local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
     state: Mutex<ManagedControlPlaneStateFile>,
     request_runtimes: Mutex<BTreeMap<String, Arc<ManagedTenantRequestRuntime>>>,
+}
+
+#[derive(Debug)]
+pub enum ManagedControlPlaneMutationError {
+    Rejected(String),
+    Persistence(tsink::TsinkError),
+}
+
+impl std::fmt::Display for ManagedControlPlaneMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(detail) => formatter.write_str(detail),
+            Self::Persistence(source) => {
+                write!(
+                    formatter,
+                    "managed control-plane state persistence failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManagedControlPlaneMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected(_) => None,
+            Self::Persistence(source) => Some(source),
+        }
+    }
+}
+
+impl From<String> for ManagedControlPlaneMutationError {
+    fn from(detail: String) -> Self {
+        Self::Rejected(detail)
+    }
+}
+
+impl From<tsink::TsinkError> for ManagedControlPlaneMutationError {
+    fn from(source: tsink::TsinkError) -> Self {
+        Self::Persistence(source)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -474,17 +516,57 @@ impl ManagedControlPlaneAuditFilter {
 }
 
 impl ManagedControlPlane {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_path: Option<&Path>) -> Result<Self, String> {
+        Self::open_with_disk_budget(data_path, None)
+    }
+
+    pub fn open_with_disk_budget(
+        data_path: Option<&Path>,
+        local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         let state_path = match data_path {
             Some(data_path) => {
                 let directory = data_path.join(MANAGED_CONTROL_PLANE_DIR);
-                fs::create_dir_all(&directory).map_err(|err| {
-                    format!(
-                        "failed to create managed control-plane directory {}: {err}",
-                        directory.display()
-                    )
-                })?;
-                Some(directory.join(MANAGED_CONTROL_PLANE_STATE_FILE))
+                if let Some(budget) = local_disk_budget.as_ref() {
+                    budget
+                        .create_dir_all_and_sync_parents(&directory)
+                        .map_err(|err| {
+                            format!(
+                                "failed to durably create managed control-plane directory {}: {err}",
+                                directory.display()
+                            )
+                        })?;
+                } else {
+                    fs::create_dir_all(&directory).map_err(|err| {
+                        format!(
+                            "failed to create managed control-plane directory {}: {err}",
+                            directory.display()
+                        )
+                    })?;
+                }
+                let path = directory.join(MANAGED_CONTROL_PLANE_STATE_FILE);
+                if let Some(budget) = local_disk_budget.as_ref() {
+                    budget.cleanup_atomic_write_temps(&path).map_err(|err| {
+                        format!(
+                            "failed to clean managed control-plane temporary files for {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                    budget.validate_managed_file_path(&path).map_err(|err| {
+                        format!(
+                            "failed to validate managed control-plane state {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                }
+                Some(path)
+            }
+            None if local_disk_budget.is_some() => {
+                return Err(
+                    "managed control plane cannot use a local disk budget without a data path"
+                        .to_string(),
+                )
             }
             None => None,
         };
@@ -494,7 +576,12 @@ impl ManagedControlPlane {
                 load_state_file(path)?
             } else {
                 let state = ManagedControlPlaneStateFile::default();
-                persist_state_file(path, &state)?;
+                persist_state_file(path, &state, local_disk_budget.as_ref()).map_err(|err| {
+                    format!(
+                        "failed to initialize managed control-plane state {}: {err}",
+                        path.display()
+                    )
+                })?;
                 state
             }
         } else {
@@ -503,6 +590,7 @@ impl ManagedControlPlane {
 
         Ok(Self {
             state_path,
+            local_disk_budget,
             state: Mutex::new(state),
             request_runtimes: Mutex::new(BTreeMap::new()),
         })
@@ -603,7 +691,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedDeploymentProvisionRequest,
-    ) -> Result<ManagedDeployment, String> {
+    ) -> Result<ManagedDeployment, ManagedControlPlaneMutationError> {
         let deployment_id = validate_resource_id("deploymentId", &request.deployment_id)?;
         self.mutate(
             actor,
@@ -694,7 +782,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedBackupPolicyApplyRequest,
-    ) -> Result<ManagedDeployment, String> {
+    ) -> Result<ManagedDeployment, ManagedControlPlaneMutationError> {
         let deployment_id = validate_resource_id("deploymentId", &request.deployment_id)?;
         self.mutate(actor, "apply_backup_policy", "deployment", &deployment_id, |state, now| {
             let deployment = state
@@ -744,7 +832,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedBackupRunRecordRequest,
-    ) -> Result<ManagedDeployment, String> {
+    ) -> Result<ManagedDeployment, ManagedControlPlaneMutationError> {
         let deployment_id = validate_resource_id("deploymentId", &request.deployment_id)?;
         self.mutate(
             actor,
@@ -796,7 +884,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedMaintenanceApplyRequest,
-    ) -> Result<ManagedDeployment, String> {
+    ) -> Result<ManagedDeployment, ManagedControlPlaneMutationError> {
         let deployment_id = validate_resource_id("deploymentId", &request.deployment_id)?;
         self.mutate(
             actor,
@@ -836,7 +924,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedUpgradeApplyRequest,
-    ) -> Result<ManagedDeployment, String> {
+    ) -> Result<ManagedDeployment, ManagedControlPlaneMutationError> {
         let deployment_id = validate_resource_id("deploymentId", &request.deployment_id)?;
         self.mutate(
             actor,
@@ -923,7 +1011,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedTenantApplyRequest,
-    ) -> Result<ManagedTenant, String> {
+    ) -> Result<ManagedTenant, ManagedControlPlaneMutationError> {
         let tenant_id = validate_resource_id("tenantId", &request.tenant_id)?;
         self.mutate(actor, "apply_tenant", "tenant", &tenant_id, |state, now| {
             let existing = state.tenants.get(&tenant_id).cloned();
@@ -1003,7 +1091,7 @@ impl ManagedControlPlane {
         &self,
         actor: ManagedControlPlaneActor,
         request: ManagedTenantLifecycleRequest,
-    ) -> Result<ManagedTenant, String> {
+    ) -> Result<ManagedTenant, ManagedControlPlaneMutationError> {
         let tenant_id = validate_resource_id("tenantId", &request.tenant_id)?;
         self.mutate(actor, "apply_tenant_lifecycle", "tenant", &tenant_id, |state, now| {
             let deployment_id = state
@@ -1042,7 +1130,7 @@ impl ManagedControlPlane {
         target_kind: &str,
         target_id: &str,
         f: F,
-    ) -> Result<T, String>
+    ) -> Result<T, ManagedControlPlaneMutationError>
     where
         F: FnOnce(&mut ManagedControlPlaneStateFile, u64) -> Result<T, String>,
     {
@@ -1069,7 +1157,7 @@ impl ManagedControlPlane {
                     },
                 );
                 if let Some(path) = self.state_path.as_deref() {
-                    persist_state_file(path, &candidate)?;
+                    persist_state_file(path, &candidate, self.local_disk_budget.as_ref())?;
                 }
                 *state = candidate;
                 Ok(value)
@@ -1090,10 +1178,10 @@ impl ManagedControlPlane {
                     },
                 );
                 if let Some(path) = self.state_path.as_deref() {
-                    persist_state_file(path, &audited)?;
+                    persist_state_file(path, &audited, self.local_disk_budget.as_ref())?;
                 }
                 *state = audited;
-                Err(err)
+                Err(ManagedControlPlaneMutationError::Rejected(err))
             }
         }
     }
@@ -1403,21 +1491,29 @@ fn load_state_file(path: &Path) -> Result<ManagedControlPlaneStateFile, String> 
     Ok(state)
 }
 
-fn persist_state_file(path: &Path, state: &ManagedControlPlaneStateFile) -> Result<(), String> {
-    let encoded = serde_json::to_vec_pretty(state)
-        .map_err(|err| format!("failed to encode managed control-plane state: {err}"))?;
+fn persist_state_file(
+    path: &Path,
+    state: &ManagedControlPlaneStateFile,
+    local_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
+) -> tsink::Result<()> {
+    let encoded = serde_json::to_vec_pretty(state)?;
+
+    if let Some(local_disk_budget) = local_disk_budget {
+        return local_disk_budget.write_file_atomically_and_sync_parent(
+            path,
+            &encoded,
+            tsink::DiskCategory::ServerState,
+        );
+    }
+
     let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, encoded).map_err(|err| {
-        format!(
-            "failed to write managed control-plane state {}: {err}",
-            temp_path.display()
-        )
+    fs::write(&temp_path, encoded).map_err(|source| tsink::TsinkError::IoWithPath {
+        path: temp_path.clone(),
+        source,
     })?;
-    fs::rename(&temp_path, path).map_err(|err| {
-        format!(
-            "failed to publish managed control-plane state {}: {err}",
-            path.display()
-        )
+    fs::rename(&temp_path, path).map_err(|source| tsink::TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -1500,6 +1596,17 @@ mod tests {
         ManagedControlPlaneActor {
             id: "test-admin".to_string(),
             scope: "test".to_string(),
+        }
+    }
+
+    fn deployment_request(deployment_id: &str) -> ManagedDeploymentProvisionRequest {
+        ManagedDeploymentProvisionRequest {
+            deployment_id: deployment_id.to_string(),
+            display_name: Some(format!("Deployment {deployment_id}")),
+            region: Some("us-east-1".to_string()),
+            plan: Some("ha".to_string()),
+            lifecycle: Some(DeploymentLifecycleState::Ready),
+            ..ManagedDeploymentProvisionRequest::default()
         }
     }
 
@@ -1652,12 +1759,132 @@ mod tests {
                 },
             )
             .expect_err("missing deployment should fail");
-        assert!(err.contains("unknown deployment"));
+        assert!(matches!(
+            &err,
+            ManagedControlPlaneMutationError::Rejected(detail)
+                if detail.contains("unknown deployment")
+        ));
 
         let snapshot = store.state_snapshot();
         assert!(snapshot.deployments.is_empty());
         assert_eq!(snapshot.status.audit_records_total, 1);
         let audit = store.query_audit(ManagedControlPlaneAuditFilter::default());
         assert_eq!(audit[0].outcome, "error");
+    }
+
+    #[test]
+    fn managed_control_plane_disk_quota_rejection_does_not_publish_candidate_state() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let initial_file_bytes = u64::try_from(
+            serde_json::to_vec_pretty(&ManagedControlPlaneStateFile::default())
+                .expect("default state should encode")
+                .len(),
+        )
+        .expect("encoded state length should fit u64");
+        let budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(initial_file_bytes),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = ManagedControlPlane::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("initial state should fit the exact quota");
+        let state_path = temp_dir
+            .path()
+            .join(MANAGED_CONTROL_PLANE_DIR)
+            .join(MANAGED_CONTROL_PLANE_STATE_FILE);
+        let initial_contents = fs::read(&state_path).expect("initial state should exist");
+
+        let err = store
+            .provision_deployment(actor(), deployment_request("quota-rejected"))
+            .expect_err("growing the state file should exceed the quota");
+        assert!(
+            matches!(
+                &err,
+                ManagedControlPlaneMutationError::Persistence(
+                    tsink::TsinkError::DiskQuotaExceeded { .. }
+                )
+            ),
+            "{err}"
+        );
+
+        let state = store.state_snapshot();
+        assert!(state.deployments.is_empty());
+        assert_eq!(state.status.audit_records_total, 0);
+        assert_eq!(
+            fs::read(&state_path).expect("published state should remain readable"),
+            initial_contents
+        );
+        let disk = budget.snapshot();
+        assert_eq!(disk.accounted_bytes, initial_file_bytes);
+        assert_eq!(disk.reserved_bytes, 0);
+        assert_eq!(disk.active_reservations, 0);
+        assert_eq!(disk.rejections_total, 1);
+    }
+
+    #[test]
+    fn managed_control_plane_disk_accounting_is_exact_across_restart() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let budget =
+            tsink::LocalDiskBudget::open(temp_dir.path(), tsink::LocalDiskLimits::default())
+                .expect("disk budget should open");
+        let store = ManagedControlPlane::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("managed state should open");
+        store
+            .provision_deployment(actor(), deployment_request("restart-safe"))
+            .expect("deployment should persist");
+
+        let state_path = temp_dir
+            .path()
+            .join(MANAGED_CONTROL_PLANE_DIR)
+            .join(MANAGED_CONTROL_PLANE_STATE_FILE);
+        let state_bytes = fs::metadata(&state_path)
+            .expect("managed state should exist")
+            .len();
+        let disk = budget.snapshot();
+        assert_eq!(disk.accounted_bytes, state_bytes);
+        assert_eq!(disk.reserved_bytes, 0);
+        assert_eq!(disk.active_reservations, 0);
+        assert_eq!(
+            disk.categories
+                .iter()
+                .find(|usage| usage.category == tsink::DiskCategory::ServerState)
+                .map(|usage| usage.bytes),
+            Some(state_bytes)
+        );
+
+        drop(store);
+        drop(budget);
+
+        let restarted_budget =
+            tsink::LocalDiskBudget::open(temp_dir.path(), tsink::LocalDiskLimits::default())
+                .expect("disk budget should reconcile after restart");
+        let reopened = ManagedControlPlane::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&restarted_budget)),
+        )
+        .expect("managed state should reopen");
+        assert!(reopened
+            .state_snapshot()
+            .deployments
+            .iter()
+            .any(|deployment| deployment.id == "restart-safe"));
+        let disk = restarted_budget.snapshot();
+        assert_eq!(disk.accounted_bytes, state_bytes);
+        assert_eq!(
+            disk.categories
+                .iter()
+                .find(|usage| usage.category == tsink::DiskCategory::ServerState)
+                .map(|usage| usage.bytes),
+            Some(state_bytes)
+        );
     }
 }

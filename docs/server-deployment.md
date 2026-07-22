@@ -70,7 +70,10 @@ Use `--help` to print the full listing with types and defaults.
 | Flag | Default | Description |
 |---|---|---|
 | `--data-path PATH` | *none* | Directory for WAL, segments, metadata, and rules. Required for persistent storage. |
-| `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. |
+| `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. Must not overlap `--data-path`. |
+| `--local-disk-limit BYTES` | *unlimited* | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
+| `--filesystem-free-headroom BYTES` | `0` | Filesystem free space that budget-integrated writes must leave available. |
+| `--maintenance-temp-reserve BYTES` | `0` | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
 | `--wal-enabled BOOL` | `true` | Enable or disable the write-ahead log. |
 | `--wal-sync-mode MODE` | `per-append` | WAL durability policy: `per-append` synchronizes each non-empty write; `periodic` uses an append-driven interval for higher throughput. |
 | `--timestamp-precision PRECISION` | `ms` | Interpret ingested timestamps as `s`, `ms`, `us`, or `ns`. |
@@ -80,6 +83,21 @@ Use `--help` to print the full listing with types and defaults.
 | `--storage-mode MODE` | `read-write` | `read-write` for full local persistence, `compute-only` for query-only nodes backed by object store. |
 | `--remote-segment-refresh-interval DURATION` | *default* | Metadata refresh TTL for `compute-only` nodes. |
 | `--mirror-hot-segments-to-object-store BOOL` | `false` | Copy hot-tier segments to the object store for DR. Requires `--object-store-path`. |
+
+Disk-size flags accept integer bytes or a case-insensitive binary `K`, `M`, `G`, or `T` suffix
+(for example, `512M` or `1.5G`). Setting `--local-disk-limit`, a non-zero
+`--filesystem-free-headroom`, or a non-zero `--maintenance-temp-reserve` requires `--data-path`.
+The reserve remains unavailable to normal growth but may be consumed by maintenance temporary
+output; maintenance must still leave the filesystem headroom. The headroom plus reserve must fit in
+the supported 64-bit byte range.
+
+The shared budget's quota-aware writers are core storage, metric metadata, exemplars, rules, the
+usage ledger, and managed control-plane state. It does not yet govern cluster control state and log,
+cluster audit, deduplication and outbox files, or edge queues. External snapshot destinations and
+external restore staging or target directories are also outside the budget. Snapshot destinations
+inside the managed root are rejected, and an online restore target may not overlap the live
+`--data-path`. Files beneath `--data-path` can still be included when usage is reconciled, but that
+does not provide admission guarantees for excluded writers.
 
 ### Memory and performance
 
@@ -276,8 +294,8 @@ Admin endpoints are only served when `--enable-admin-api` is set and require the
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/admin/snapshot` | Create an atomic snapshot of the data directory. |
-| `POST` | `/api/v1/admin/restore` | Restore a snapshot to the data path. |
+| `POST` | `/api/v1/admin/snapshot` | Create an atomic snapshot at an external destination; managed-root destinations are rejected. |
+| `POST` | `/api/v1/admin/restore` | Restore a snapshot to an external recovery target; targets overlapping the live data path are rejected. |
 | `POST` | `/api/v1/admin/rollups/apply` | Replace persisted rollup policies. |
 | `POST` | `/api/v1/admin/rollups/run` | Run one synchronous rollup materialization pass. |
 | `GET` | `/api/v1/admin/rollups/status` | Rollup policy freshness and coverage. |
@@ -398,7 +416,19 @@ cluster dedupe marker store initialized at /var/lib/tsink/dedupe
 cluster hinted-handoff outbox initialized at /var/lib/tsink/outbox
 ```
 
-The TCP listener binds last. Once bound, the server is ready to accept connections.
+Before any listener binds, the server holds the canonical data-path process lease. Its
+budget-integrated stores durably link newly created nested directories into their parents and reject
+owned file paths whose final entry is a symlink or another non-regular file. These static checks do
+not close a hostile concurrent namespace-swap race. The metadata, exemplar, rules, and managed-state
+stores remove orphan atomic-replacement files only when they match that
+store's generated `.<target>.tmp-<pid>-<nonce>` shape, using a canonical decimal `u32` PID and
+exactly 16 lowercase hexadecimal nonce digits; an ambiguous matching directory makes startup fail
+instead of being deleted. A successful removal is synchronized and followed by accounting
+reconciliation, while a no-op orphan pass skips that rescan.
+
+The server performs one final idle-coordinator reconciliation after all persistent stores open. The
+TCP listener binds last. Once bound, status and metrics include files created during bootstrap and
+the server is ready to accept connections.
 
 ---
 
@@ -406,9 +436,13 @@ The TCP listener binds last. Once bound, the server is ready to accept connectio
 
 The server handles `SIGTERM` and `SIGINT` (Ctrl-C).
 On receipt, it:
+
 1. Stops accepting new connections.
-2. Waits up to **10 seconds** for in-flight requests to complete.
-3. Flushes and closes the storage runtime.
+2. Signals idle HTTP and Graphite connections to close and waits for in-flight request work.
+3. Logs a warning after **10 seconds** if connections remain, but continues draining them instead of
+   detaching work that may still mutate persistent state.
+4. Stops owned background workers, flushes and closes the storage runtime, and only then releases
+   the data-path process lease.
 
 ---
 
@@ -564,6 +598,6 @@ tsink-server \
 | TCP keep-alive interval | 60 s |
 | Keep-alive idle timeout | 30 s |
 | TLS handshake timeout | 10 s |
-| Graceful shutdown window | 10 s |
+| Graceful shutdown warning threshold | 10 s; active request work continues draining before persistence teardown |
 
 Admission control for concurrent write and read requests is tunable via environment variables — see [Write admission](#write-admission) and [Read admission](#read-admission) above.

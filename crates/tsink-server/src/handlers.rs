@@ -58,7 +58,7 @@ use crate::cluster::rpc::{
     InternalQueryExemplarsRequest, InternalQueryExemplarsResponse, InternalRepairBackfillRequest,
     InternalRepairBackfillResponse, InternalRow, InternalSelectBatchRequest,
     InternalSelectBatchResponse, InternalSelectRequest, InternalSelectResponse,
-    InternalSelectSeriesRequest, InternalSelectSeriesResponse, InternalWriteExemplar,
+    InternalSelectSeriesRequest, InternalSelectSeriesResponse, InternalWriteExemplar, RpcError,
     CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1, CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1,
     CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1, CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1,
     CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1, CLUSTER_CAPABILITY_METADATA_INGEST_V1,
@@ -103,7 +103,7 @@ use crate::prom_write::{
     NormalizedMetricMetadataUpdate, NormalizedSeriesIdentity, NormalizedWriteEnvelope,
 };
 use crate::rbac::{self, RbacRegistry};
-use crate::rules::{self, RulesApplyRequest, RulesRunTriggerError, RulesRuntime};
+use crate::rules::{self, RulesApplyError, RulesApplyRequest, RulesRunTriggerError, RulesRuntime};
 use crate::security::{
     SecretRotationMode, SecretRotationTarget, SecurityManager, SecurityRotateResult,
 };
@@ -173,6 +173,9 @@ const WRITE_ACKNOWLEDGEMENT_HEADER: &str = "X-Tsink-Write-Acknowledgement";
 const WRITE_PARTIAL_HEADER: &str = "X-Tsink-Write-Partial";
 const WRITE_ROWS_ACCEPTED_HEADER: &str = "X-Tsink-Rows-Accepted";
 const WRITE_OUTCOME_HEADER: &str = "X-Tsink-Write-Outcome";
+const DELETE_MATCHERS_PROCESSED_HEADER: &str = "X-Tsink-Delete-Matchers-Processed";
+const DELETE_MATCHED_SERIES_HEADER: &str = "X-Tsink-Delete-Matched-Series";
+const DELETE_TOMBSTONES_APPLIED_HEADER: &str = "X-Tsink-Delete-Tombstones-Applied";
 const AUDIT_ACTOR_ID_HEADER: &str = "x-tsink-actor-id";
 const AUDIT_FORWARDED_USER_HEADER: &str = "x-forwarded-user";
 const METADATA_API_DEFAULT_LIMIT: usize = 1_000;
@@ -365,6 +368,7 @@ pub(crate) struct AppContext<'a> {
     pub security_manager: Option<&'a SecurityManager>,
     pub usage_accounting: Option<&'a UsageAccounting>,
     pub managed_control_plane: Option<&'a ManagedControlPlane>,
+    pub local_disk_budget: Option<&'a tsink::LocalDiskBudget>,
 }
 
 #[derive(Clone, Copy)]
@@ -573,9 +577,12 @@ fn record_query_pressure(tenant_id: &str, requests: usize, units: usize) {
     );
 }
 
-fn maybe_record_usage(usage_accounting: Option<&UsageAccounting>, record: UsageRecordInput<'_>) {
+async fn maybe_record_usage(
+    usage_accounting: Option<&UsageAccounting>,
+    record: UsageRecordInput<'_>,
+) {
     if let Some(accounting) = usage_accounting {
-        let _ = accounting.record(record);
+        accounting.record_best_effort(record).await;
     }
 }
 
@@ -607,7 +614,7 @@ impl QueryUsageMetrics {
     }
 }
 
-fn record_query_usage(
+async fn record_query_usage(
     usage_accounting: Option<&UsageAccounting>,
     tenant_id: &str,
     operation: &str,
@@ -619,7 +626,7 @@ fn record_query_usage(
     record.result_units = metrics.result_units;
     record.duration_nanos = metrics.duration_nanos;
     record.request_bytes = metrics.request_bytes;
-    maybe_record_usage(usage_accounting, record);
+    maybe_record_usage(usage_accounting, record).await;
 }
 
 #[derive(Clone, Copy)]
@@ -655,7 +662,7 @@ impl IngestUsageMetrics {
     }
 }
 
-fn record_ingest_usage(
+async fn record_ingest_usage(
     usage_accounting: Option<&UsageAccounting>,
     tenant_id: &str,
     operation: &str,
@@ -671,16 +678,34 @@ fn record_ingest_usage(
     record.histogram_series = metrics.histogram_series;
     record.duration_nanos = metrics.duration_nanos;
     record.request_bytes = metrics.request_bytes;
-    maybe_record_usage(usage_accounting, record);
+    maybe_record_usage(usage_accounting, record).await;
 }
 
-fn record_retention_usage(
+#[derive(Clone, Copy)]
+enum RetentionUsageStatus {
+    Success,
+    Partial,
+    Indeterminate,
+}
+
+impl RetentionUsageStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Partial => "partial",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+async fn record_retention_usage(
     usage_accounting: Option<&UsageAccounting>,
     tenant_id: &str,
     matched_series: u64,
     tombstones_applied: u64,
     request_units: u64,
     duration_nanos: u64,
+    status: RetentionUsageStatus,
 ) {
     let mut record = UsageRecordInput::success(
         tenant_id,
@@ -688,11 +713,12 @@ fn record_retention_usage(
         "delete_series",
         "/api/v1/admin/delete_series",
     );
+    record.status = status.as_str();
     record.request_units = request_units;
     record.matched_series = matched_series;
     record.tombstones_applied = tombstones_applied;
     record.duration_nanos = duration_nanos;
-    maybe_record_usage(usage_accounting, record);
+    maybe_record_usage(usage_accounting, record).await;
 }
 
 fn promql_value_units(value: &PromqlValue) -> usize {
@@ -998,6 +1024,7 @@ pub struct TestRequestOptions<'a> {
     pub security_manager: Option<&'a SecurityManager>,
     pub usage_accounting: Option<&'a UsageAccounting>,
     pub managed_control_plane: Option<&'a ManagedControlPlane>,
+    pub local_disk_budget: Option<&'a tsink::LocalDiskBudget>,
 }
 
 #[cfg(test)]
@@ -1019,6 +1046,7 @@ impl<'a> Default for TestRequestOptions<'a> {
             security_manager: None,
             usage_accounting: None,
             managed_control_plane: None,
+            local_disk_budget: None,
         }
     }
 }
@@ -1046,6 +1074,7 @@ pub async fn handle_test_request(
             security_manager: options.security_manager,
             usage_accounting: options.usage_accounting,
             managed_control_plane: options.managed_control_plane,
+            local_disk_budget: options.local_disk_budget,
         },
         RequestContext {
             request,
@@ -1359,6 +1388,7 @@ pub async fn handle_request_with_admin_and_cluster_and_tenant_and_metadata_and_s
             security_manager,
             usage_accounting,
             managed_control_plane,
+            local_disk_budget: None,
         },
     )
     .await
@@ -2000,6 +2030,7 @@ fn handle_metrics(
     rbac_registry: Option<&RbacRegistry>,
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     metrics::render_metrics(
         storage,
@@ -2011,6 +2042,7 @@ fn handle_metrics(
         rbac_registry,
         security_manager,
         usage_accounting,
+        local_disk_budget,
     )
 }
 
@@ -2146,6 +2178,7 @@ async fn handle_tsdb_status(
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
     managed_control_plane: Option<&ManagedControlPlane>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let tenant_id = match tenant_id_for_text_request(request) {
         Ok(tenant_id) => tenant_id,
@@ -2173,6 +2206,8 @@ async fn handle_tsdb_status(
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
     let effective_storage_limits = storage.effective_storage_limits();
+    let local_disk = local_disk_budget.map(tsink::LocalDiskBudget::snapshot);
+    let server_disk_limits = local_disk_budget.map(tsink::LocalDiskBudget::limits);
     let storage = Arc::clone(&storage);
     let result = tokio::task::spawn_blocking(move || {
         let metrics = storage.list_metrics().unwrap_or_default();
@@ -2190,6 +2225,7 @@ async fn handle_tsdb_status(
         Ok(values) => values,
         Err(err) => return text_response(500, &format!("status task failed: {err}")),
     };
+    let local_disk = local_disk.or_else(|| observability.local_disk.clone());
     let cluster_write_metrics = write_routing_metrics_snapshot();
     let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
     let cluster_fanout_metrics = read_fanout_metrics_snapshot();
@@ -2340,14 +2376,14 @@ async fn handle_tsdb_status(
                     "accountedMemoryBytes": effective_storage_limits.accounted_memory_bytes,
                     "cardinality": effective_storage_limits.cardinality,
                     "walBytes": effective_storage_limits.wal_bytes,
-                    "localDiskBytes": effective_storage_limits.local_disk_bytes,
-                    "filesystemFreeHeadroomBytes": effective_storage_limits.filesystem_free_headroom_bytes,
-                    "maintenanceTempReserveBytes": effective_storage_limits.maintenance_temp_reserve_bytes,
+                    "localDiskBytes": server_disk_limits.and_then(|limits| limits.max_bytes).or(effective_storage_limits.local_disk_bytes),
+                    "filesystemFreeHeadroomBytes": server_disk_limits.map(|limits| limits.filesystem_free_headroom_bytes).or(effective_storage_limits.filesystem_free_headroom_bytes),
+                    "maintenanceTempReserveBytes": server_disk_limits.map(|limits| limits.maintenance_temp_reserve_bytes).or(effective_storage_limits.maintenance_temp_reserve_bytes),
                     "maxConcurrentWriters": effective_storage_limits.max_concurrent_writers,
                     "writeTimeoutNanos": effective_storage_limits.write_timeout_nanos,
                     "maxActivePartitionHeadsPerSeries": effective_storage_limits.max_active_partition_heads_per_series
                 },
-                "localDisk": local_disk_status_json(observability.local_disk.as_ref()),
+                "localDisk": local_disk_status_json(local_disk.as_ref()),
                 "memory": {
                     "accountedBytes": observability.memory.accounted_bytes,
                     "estimatedAccountedBytes": observability.memory.estimated_accounted_bytes,
@@ -3412,7 +3448,7 @@ fn delete_series_error_response(err: &tsink::TsinkError) -> HttpResponse {
         {
             text_response(409, &format!("delete_series rejected: {err}"))
         }
-        _ => text_response(500, &format!("delete_series failed: {err}")),
+        _ => server_persistence_error_response("delete_series", err),
     }
 }
 
@@ -4608,12 +4644,13 @@ async fn perform_local_data_snapshot(
     match result {
         Ok(Ok(())) => {
             if let Some(rules_runtime) = rules_runtime {
-                rules_runtime.snapshot_into(&snapshot_path).map_err(|err| {
-                    format!(
+                if let Err(err) = rules_runtime.snapshot_into(&snapshot_path) {
+                    let _ = std::fs::remove_dir_all(&snapshot_path);
+                    return Err(format!(
                         "rules snapshot failed for {}: {err}",
                         snapshot_path.display()
-                    )
-                })?;
+                    ));
+                }
             }
             let size_path = snapshot_path.clone();
             let size_bytes =
@@ -4836,6 +4873,27 @@ fn resolve_admin_path(
         }
     }
     Ok(resolved)
+}
+
+fn validate_restore_target_outside_live_root(
+    target: &Path,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
+) -> Result<(), String> {
+    let Some(local_disk_budget) = local_disk_budget else {
+        return Ok(());
+    };
+    let target_is_live_or_descendant = local_disk_budget
+        .governs(target)
+        .map_err(|err| format!("failed to validate restore target: {err}"))?;
+    let target_is_live_ancestor = local_disk_budget.root().starts_with(target);
+    if target_is_live_or_descendant || target_is_live_ancestor {
+        return Err(format!(
+            "online restore target '{}' overlaps the active data path '{}'; restore into a separate offline path",
+            target.display(),
+            local_disk_budget.root().display()
+        ));
+    }
+    Ok(())
 }
 
 fn canonicalize_requested_path(path: &Path, must_exist: bool) -> Result<PathBuf, String> {
@@ -5157,13 +5215,112 @@ async fn preflight_histogram_rows_with_cluster(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterSidecarWriteFailure {
+    message: String,
+    disk_quota: bool,
+}
+
+impl ClusterSidecarWriteFailure {
+    fn generic(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            disk_quota: false,
+        }
+    }
+
+    fn from_storage(message: impl Into<String>, err: &tsink::TsinkError) -> Self {
+        Self {
+            message: message.into(),
+            disk_quota: server_persistence_error_category(err)
+                == WriteRejectionCategory::DiskQuotaExceeded,
+        }
+    }
+
+    fn from_rpc(message: impl Into<String>, err: &RpcError) -> Self {
+        let disk_quota = matches!(
+            err,
+            RpcError::HttpStatus {
+                status: 413,
+                error_code: Some(error_code),
+                ..
+            } if error_code == "write_disk_quota_exceeded"
+        );
+        Self {
+            message: message.into(),
+            disk_quota,
+        }
+    }
+
+    fn retain_preferred(slot: &mut Option<Self>, candidate: Self) {
+        if slot
+            .as_ref()
+            .is_none_or(|current| !current.disk_quota && candidate.disk_quota)
+        {
+            *slot = Some(candidate);
+        }
+    }
+
+    fn with_context(self, context: impl AsRef<str>) -> Self {
+        Self {
+            message: format!("{}: {}", context.as_ref(), self.message),
+            disk_quota: self.disk_quota,
+        }
+    }
+}
+
+impl From<String> for ClusterSidecarWriteFailure {
+    fn from(message: String) -> Self {
+        Self::generic(message)
+    }
+}
+
+impl std::fmt::Display for ClusterSidecarWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn retain_preferred_exemplar_failure_for_shards(
+    failures: &mut BTreeMap<u32, ClusterSidecarWriteFailure>,
+    shards: &BTreeSet<u32>,
+    candidate: ClusterSidecarWriteFailure,
+) {
+    for shard in shards {
+        let mut preferred = failures.remove(shard);
+        ClusterSidecarWriteFailure::retain_preferred(&mut preferred, candidate.clone());
+        if let Some(preferred) = preferred {
+            failures.insert(*shard, preferred);
+        }
+    }
+}
+
+fn exemplar_quorum_failure(
+    shard_state: &BTreeMap<u32, ExemplarShardAckState>,
+    failures: &BTreeMap<u32, ClusterSidecarWriteFailure>,
+    mode: ClusterWriteConsistency,
+) -> Option<ClusterSidecarWriteFailure> {
+    let (shard, state) = shard_state
+        .iter()
+        .find(|(_, state)| state.acknowledged_acks < state.required_acks)?;
+    let failure = failures.get(shard).cloned().unwrap_or_else(|| {
+        ClusterSidecarWriteFailure::generic(
+            "no replica returned an explicit failure detail".to_string(),
+        )
+    });
+    Some(failure.with_context(format!(
+        "exemplar replication failed for shard {shard} in {mode} mode: required {} acks, got {}",
+        state.required_acks, state.acknowledged_acks
+    )))
+}
+
 async fn replicate_metadata_updates_with_cluster(
     metadata_store: &Arc<MetricMetadataStore>,
     cluster_context: &ClusterRequestContext,
     tenant_id: &str,
     updates: &[NormalizedMetricMetadataUpdate],
     ring_version: u64,
-) -> Result<usize, String> {
+) -> Result<usize, ClusterSidecarWriteFailure> {
     if updates.is_empty() {
         return Ok(0);
     }
@@ -5186,10 +5343,10 @@ async fn replicate_metadata_updates_with_cluster(
         )
         .await
         .map_err(|err| {
-            format!(
+            ClusterSidecarWriteFailure::generic(format!(
                 "metadata peer capability preflight failed for {}: {err}",
                 node.endpoint
-            )
+            ))
         })?;
     }
 
@@ -5219,22 +5376,32 @@ async fn replicate_metadata_updates_with_cluster(
             )
             .await
             .map_err(|err| {
-                format!(
-                    "remote metadata write to node '{}' ({}) failed: {err}",
-                    node.id, node.endpoint
+                ClusterSidecarWriteFailure::from_rpc(
+                    format!(
+                        "remote metadata write to node '{}' ({}) failed: {err}",
+                        node.id, node.endpoint
+                    ),
+                    &err,
                 )
             })?;
         validate_internal_ingest_write_response(&response, 0, internal_updates.len(), 0).map_err(
             |err| {
-                format!(
+                ClusterSidecarWriteFailure::generic(format!(
                     "remote metadata write to node '{}' ({}) returned an invalid result: {err}",
                     node.id, node.endpoint
-                )
+                ))
             },
         )?;
     }
 
-    metadata_store.apply_updates(tenant_id, updates)
+    metadata_store
+        .apply_updates(tenant_id, updates)
+        .map_err(|err| {
+            ClusterSidecarWriteFailure::from_storage(
+                format!("local metadata write failed: {err}"),
+                &err,
+            )
+        })
 }
 
 fn stable_fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -5359,7 +5526,7 @@ async fn route_exemplars_with_consistency_and_ring_version(
     exemplars: Vec<NormalizedExemplar>,
     mode: ClusterWriteConsistency,
     ring_version: u64,
-) -> Result<ExemplarClusterWriteStats, String> {
+) -> Result<ExemplarClusterWriteStats, ClusterSidecarWriteFailure> {
     if exemplars.is_empty() {
         return Ok(ExemplarClusterWriteStats::default());
     }
@@ -5418,7 +5585,7 @@ async fn route_exemplars_with_consistency_and_ring_version(
     let exemplar_required_capabilities =
         payload_required_capabilities(PrometheusPayloadKind::Exemplar);
     let mut dropped_exemplars_per_replica_max = 0usize;
-    let mut first_replica_failure = None::<String>;
+    let mut replica_failures_by_shard = BTreeMap::<u32, ClusterSidecarWriteFailure>::new();
 
     if !local_exemplars.is_empty() {
         let local_exemplar_count = local_exemplars.len();
@@ -5438,13 +5605,24 @@ async fn route_exemplars_with_consistency_and_ring_version(
                 }
             }
             Ok(outcome) => {
-                first_replica_failure = Some(format!(
-                    "local exemplar store reported {} accepted for {local_exemplar_count} writes",
-                    outcome.accepted
-                ));
+                retain_preferred_exemplar_failure_for_shards(
+                    &mut replica_failures_by_shard,
+                    &local_shards,
+                    ClusterSidecarWriteFailure::generic(format!(
+                        "local exemplar store reported {} accepted for {local_exemplar_count} writes",
+                        outcome.accepted
+                    )),
+                );
             }
             Err(err) => {
-                first_replica_failure = Some(format!("local exemplar write failed: {err}"));
+                retain_preferred_exemplar_failure_for_shards(
+                    &mut replica_failures_by_shard,
+                    &local_shards,
+                    ClusterSidecarWriteFailure::from_storage(
+                        format!("local exemplar write failed: {err}"),
+                        &err,
+                    ),
+                );
             }
         }
     }
@@ -5452,11 +5630,15 @@ async fn route_exemplars_with_consistency_and_ring_version(
     let remote_exemplar_limit = exemplar_store.config().max_exemplars_per_request;
     for (_, mut batch) in remote_batches {
         if batch.exemplars.len() > remote_exemplar_limit {
-            first_replica_failure.get_or_insert_with(|| format!(
-                "exemplar routing failed for node '{}': remote batch exceeds exemplar limit {} > {remote_exemplar_limit}",
-                batch.owner_node_id,
-                batch.exemplars.len(),
-            ));
+            retain_preferred_exemplar_failure_for_shards(
+                &mut replica_failures_by_shard,
+                &batch.shards,
+                ClusterSidecarWriteFailure::generic(format!(
+                    "exemplar routing failed for node '{}': remote batch exceeds exemplar limit {} > {remote_exemplar_limit}",
+                    batch.owner_node_id,
+                    batch.exemplars.len(),
+                )),
+            );
             continue;
         }
 
@@ -5468,12 +5650,14 @@ async fn route_exemplars_with_consistency_and_ring_version(
         )
         .await
         {
-            first_replica_failure.get_or_insert_with(|| {
-                format!(
+            retain_preferred_exemplar_failure_for_shards(
+                &mut replica_failures_by_shard,
+                &batch.shards,
+                ClusterSidecarWriteFailure::generic(format!(
                     "exemplar peer capability preflight failed for {}: {err}",
                     batch.endpoint
-                )
-            });
+                )),
+            );
             continue;
         }
 
@@ -5500,12 +5684,17 @@ async fn route_exemplars_with_consistency_and_ring_version(
         {
             Ok(response) => response,
             Err(err) => {
-                first_replica_failure.get_or_insert_with(|| {
-                    format!(
-                        "remote exemplar write to node '{}' ({}) failed: {err}",
-                        batch.owner_node_id, batch.endpoint
-                    )
-                });
+                retain_preferred_exemplar_failure_for_shards(
+                    &mut replica_failures_by_shard,
+                    &batch.shards,
+                    ClusterSidecarWriteFailure::from_rpc(
+                        format!(
+                            "remote exemplar write to node '{}' ({}) failed: {err}",
+                            batch.owner_node_id, batch.endpoint
+                        ),
+                        &err,
+                    ),
+                );
                 continue;
             }
         };
@@ -5513,12 +5702,14 @@ async fn route_exemplars_with_consistency_and_ring_version(
         if let Err(err) =
             validate_internal_ingest_write_response(&response, 0, 0, remote_exemplar_count)
         {
-            first_replica_failure.get_or_insert_with(|| {
-                format!(
+            retain_preferred_exemplar_failure_for_shards(
+                &mut replica_failures_by_shard,
+                &batch.shards,
+                ClusterSidecarWriteFailure::generic(format!(
                     "remote exemplar write to node '{}' ({}) returned an invalid result: {err}",
                     batch.owner_node_id, batch.endpoint
-                )
-            });
+                )),
+            );
             continue;
         }
         dropped_exemplars_per_replica_max =
@@ -5530,17 +5721,8 @@ async fn route_exemplars_with_consistency_and_ring_version(
         }
     }
 
-    if let Some((shard, state)) = shard_state
-        .iter()
-        .find(|(_, state)| state.acknowledged_acks < state.required_acks)
-    {
-        let failure_context = first_replica_failure
-            .as_deref()
-            .unwrap_or("no replica returned an explicit failure detail");
-        return Err(format!(
-            "exemplar replication failed for shard {shard} in {mode} mode: required {} acks, got {}; first failure: {failure_context}",
-            state.required_acks, state.acknowledged_acks
-        ));
+    if let Some(failure) = exemplar_quorum_failure(&shard_state, &replica_failures_by_shard, mode) {
+        return Err(failure);
     }
 
     Ok(ExemplarClusterWriteStats {
@@ -5751,9 +5933,17 @@ fn partial_write_error_response(
         return response;
     }
 
+    // A sidecar persistence error can leave that sidecar's durable outcome unknown even when
+    // other envelope components are proven committed. Preserve that stronger uncertainty signal
+    // while still disclosing the components whose progress is known.
+    let mut response = response;
+    if response_header_value(&response, WRITE_PARTIAL_HEADER).is_none() {
+        response = response.with_header(WRITE_PARTIAL_HEADER, "true");
+    }
+    if response_header_value(&response, WRITE_OUTCOME_HEADER).is_none() {
+        response = response.with_header(WRITE_OUTCOME_HEADER, "partial");
+    }
     let mut response = response
-        .with_header(WRITE_PARTIAL_HEADER, "true")
-        .with_header(WRITE_OUTCOME_HEADER, "partial")
         .with_header(WRITE_ROWS_ACCEPTED_HEADER, accepted_rows.to_string())
         .with_header(
             "X-Tsink-Metadata-Accepted",
@@ -5910,7 +6100,10 @@ async fn apply_normalized_write_envelope(
                 Err(err) => {
                     return Err(indeterminate_cluster_write_response(
                         partial_write_error_response(
-                            text_response(409, &format!("cluster metadata write rejected: {err}")),
+                            cluster_sidecar_write_error_response(
+                                "cluster metadata write rejected",
+                                &err,
+                            ),
                             row_count,
                             acknowledgement,
                             0,
@@ -5942,7 +6135,10 @@ async fn apply_normalized_write_envelope(
                 Err(err) => {
                     return Err(indeterminate_cluster_write_response(
                         partial_write_error_response(
-                            text_response(409, &err),
+                            cluster_sidecar_write_error_response(
+                                "cluster exemplar write rejected",
+                                &err,
+                            ),
                             row_count,
                             acknowledgement,
                             metadata_updates.len(),
@@ -5964,8 +6160,8 @@ async fn apply_normalized_write_envelope(
                 exemplar_stats.as_ref().and_then(|stats| stats.consistency),
             ),
             // Row routing reports the weakest acknowledgement returned by the replicas that
-            // satisfied the requested consistency. Server sidecars remain outside that WAL
-            // boundary and therefore weaken the complete envelope to Volatile.
+            // satisfied the requested consistency. Sidecars are separate transactions and the
+            // cluster protocol does not report their durability, so remain conservative here.
             acknowledgement,
             accepted_metadata_updates: metadata_updates.len(),
             applied_metadata_updates,
@@ -6014,7 +6210,7 @@ async fn apply_normalized_write_envelope(
             Ok(applied) => applied,
             Err(err) => {
                 return Err(partial_write_error_response(
-                    text_response(500, &format!("metadata update failed: {err}")),
+                    server_persistence_error_response("metadata update", &err),
                     row_count,
                     acknowledgement,
                     0,
@@ -6026,8 +6222,8 @@ async fn apply_normalized_write_envelope(
     };
 
     if !metadata_updates.is_empty() {
-        // The sidecar store fsyncs its replacement file but does not yet fsync the parent
-        // directory, so do not let it inherit a stronger core-WAL acknowledgement.
+        // The persistent sidecar synchronizes its replacement and parent directory, but the
+        // in-memory variant and the envelope do not expose a separate durability result.
         acknowledgement =
             weakest_write_acknowledgement(acknowledgement, WriteAcknowledgement::Volatile);
     }
@@ -6061,7 +6257,7 @@ async fn apply_normalized_write_envelope(
             dropped_exemplars: outcome.dropped,
         }),
         Err(err) => Err(partial_write_error_response(
-            text_response(500, &format!("exemplar insert failed: {err}")),
+            server_persistence_error_response("exemplar insert", &err),
             row_count,
             acknowledgement,
             metadata_updates.len(),
@@ -6133,7 +6329,7 @@ pub(crate) async fn ingest_adapter_write_envelope(
         headers: Default::default(),
         body: Vec::new(),
     };
-    apply_normalized_write_envelope(
+    let result = apply_normalized_write_envelope(
         storage,
         metadata_store,
         exemplar_store,
@@ -6148,24 +6344,24 @@ pub(crate) async fn ingest_adapter_write_envelope(
         false,
     )
     .await
-    .inspect(|result| {
-        record_ingest_usage(
-            usage_accounting,
-            tenant_id,
-            "legacy_ingest",
-            source,
-            IngestUsageMetrics::new(
-                ingest_units as u64,
-                result.applied_metadata_updates as u64,
-                result.accepted_exemplars as u64,
-                result.dropped_exemplars as u64,
-                histogram_count,
-                elapsed_nanos_since(started),
-                0,
-            ),
-        );
-    })
-    .map_err(AdapterWriteError::from_response)
+    .map_err(AdapterWriteError::from_response)?;
+    record_ingest_usage(
+        usage_accounting,
+        tenant_id,
+        "legacy_ingest",
+        source,
+        IngestUsageMetrics::new(
+            ingest_units as u64,
+            result.applied_metadata_updates as u64,
+            result.accepted_exemplars as u64,
+            result.dropped_exemplars as u64,
+            histogram_count,
+            elapsed_nanos_since(started),
+            0,
+        ),
+    )
+    .await;
+    Ok(result)
 }
 
 fn maybe_enqueue_edge_sync_rows(
@@ -6401,7 +6597,8 @@ async fn handle_influx_line_protocol(
                         elapsed_nanos_since(started),
                         request.body.len() as u64,
                     ),
-                );
+                )
+                .await;
             }
             return response;
         }
@@ -6420,7 +6617,8 @@ async fn handle_influx_line_protocol(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
 
     let mut response = HttpResponse::new(204, Vec::<u8>::new())
         .with_header(
@@ -6735,6 +6933,11 @@ fn write_admission_error_response(err: WriteAdmissionError) -> HttpResponse {
 fn classify_storage_write_error(err: &tsink::TsinkError) -> Option<(u16, &'static str)> {
     match err {
         tsink::TsinkError::OutOfRetention { .. } => Some((422, "write_out_of_retention")),
+        tsink::TsinkError::InsufficientDiskSpace { .. }
+        | tsink::TsinkError::DiskQuotaExceeded { .. }
+        | tsink::TsinkError::InsufficientCompactionHeadroom { .. } => {
+            Some((413, "write_disk_quota_exceeded"))
+        }
         _ => None,
     }
 }
@@ -6751,6 +6954,74 @@ fn storage_write_error_response(action: &str, err: &tsink::TsinkError) -> HttpRe
     indeterminate_backend_write_error_response(status, error_code, &message)
 }
 
+fn server_persistence_error_category(err: &tsink::TsinkError) -> WriteRejectionCategory {
+    match err {
+        tsink::TsinkError::InsufficientDiskSpace { .. }
+        | tsink::TsinkError::DiskQuotaExceeded { .. }
+        | tsink::TsinkError::InsufficientCompactionHeadroom { .. } => {
+            WriteRejectionCategory::DiskQuotaExceeded
+        }
+        tsink::TsinkError::IoWithPath { .. }
+        | tsink::TsinkError::Io(_)
+        | tsink::TsinkError::Json(_)
+        | tsink::TsinkError::DataCorruption(_) => WriteRejectionCategory::InternalIo,
+        _ => WriteRejectionCategory::Internal,
+    }
+}
+
+fn server_persistence_error_response(action: &str, err: &tsink::TsinkError) -> HttpResponse {
+    let category = server_persistence_error_category(err);
+    let (status, error_code, retry_after) = write_rejection_http_mapping(category);
+    let message = format!("{action} failed: {err}");
+    if category != WriteRejectionCategory::DiskQuotaExceeded {
+        let mut response = indeterminate_backend_write_error_response(
+            status,
+            error_code,
+            bounded_write_rejection_diagnostic(&message),
+        );
+        if let Some(retry_after) = retry_after {
+            response = response.with_header("Retry-After", retry_after);
+        }
+        return response;
+    }
+
+    let mut response = text_response(status, bounded_write_rejection_diagnostic(&message))
+        .with_header(WRITE_ERROR_CODE_HEADER, error_code);
+    if let Some(retry_after) = retry_after {
+        response = response.with_header("Retry-After", retry_after);
+    }
+    response
+}
+
+fn cluster_sidecar_write_error_response(
+    action: &str,
+    failure: &ClusterSidecarWriteFailure,
+) -> HttpResponse {
+    let message = format!("{action}: {}", failure.message);
+    let status = if failure.disk_quota { 413 } else { 409 };
+    let response = text_response(status, bounded_write_rejection_diagnostic(&message));
+    if failure.disk_quota {
+        response.with_header(WRITE_ERROR_CODE_HEADER, "write_disk_quota_exceeded")
+    } else {
+        response
+    }
+}
+
+fn internal_server_persistence_error_response(
+    action: &str,
+    err: &tsink::TsinkError,
+) -> HttpResponse {
+    let category = server_persistence_error_category(err);
+    let (status, error_code, _) = write_rejection_http_mapping(category);
+    let response =
+        internal_error_response(status, error_code, format!("{action} failed: {err}"), false);
+    if category == WriteRejectionCategory::DiskQuotaExceeded {
+        response
+    } else {
+        with_indeterminate_backend_headers(response)
+    }
+}
+
 fn backend_write_task_failure_response(action: &str) -> HttpResponse {
     indeterminate_backend_write_error_response(
         500,
@@ -6764,9 +7035,15 @@ fn indeterminate_backend_write_error_response(
     error_code: &'static str,
     message: &str,
 ) -> HttpResponse {
+    with_indeterminate_backend_headers(
+        text_response(status, bounded_write_rejection_diagnostic(message))
+            .with_header(WRITE_ERROR_CODE_HEADER, error_code),
+    )
+}
+
+fn with_indeterminate_backend_headers(response: HttpResponse) -> HttpResponse {
     WRITE_INDETERMINATE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    text_response(status, bounded_write_rejection_diagnostic(message))
-        .with_header(WRITE_ERROR_CODE_HEADER, error_code)
+    response
         .with_header(WRITE_PARTIAL_HEADER, "possible")
         .with_header(WRITE_OUTCOME_HEADER, "indeterminate_backend")
 }
@@ -7452,6 +7729,173 @@ mod tests {
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
             self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct RulesSnapshotCollisionStorage {
+        inner: Arc<dyn Storage>,
+    }
+
+    impl Storage for RulesSnapshotCollisionStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.list_metrics()
+        }
+
+        fn snapshot(&self, destination: &Path) -> tsink::Result<()> {
+            self.inner.snapshot(destination)?;
+            std::fs::create_dir(destination.join("rules-store.json"))?;
+            Ok(())
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeleteInjectedFailure {
+        Quota,
+        Internal,
+        Panic,
+    }
+
+    struct DeleteFailureInjectingStorage {
+        inner: Arc<dyn Storage>,
+        reject_call: usize,
+        failure: DeleteInjectedFailure,
+        delete_calls: AtomicUsize,
+    }
+
+    impl DeleteFailureInjectingStorage {
+        fn quota(inner: Arc<dyn Storage>, reject_call: usize) -> Self {
+            Self {
+                inner,
+                reject_call,
+                failure: DeleteInjectedFailure::Quota,
+                delete_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn panic(inner: Arc<dyn Storage>, reject_call: usize) -> Self {
+            Self {
+                inner,
+                reject_call,
+                failure: DeleteInjectedFailure::Panic,
+                delete_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn internal(inner: Arc<dyn Storage>, reject_call: usize) -> Self {
+            Self {
+                inner,
+                reject_call,
+                failure: DeleteInjectedFailure::Internal,
+                delete_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Storage for DeleteFailureInjectingStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.list_metrics()
+        }
+
+        fn select_series(&self, selection: &SeriesSelection) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.select_series(selection)
+        }
+
+        fn delete_series(
+            &self,
+            selection: &SeriesSelection,
+        ) -> tsink::Result<tsink::DeleteSeriesResult> {
+            let call = self.delete_calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if call == self.reject_call {
+                match self.failure {
+                    DeleteInjectedFailure::Quota => {
+                        return Err(TsinkError::DiskQuotaExceeded {
+                            limit: 1,
+                            used: 1,
+                            reserved: 0,
+                            requested: 1,
+                        });
+                    }
+                    DeleteInjectedFailure::Internal => {
+                        return Err(TsinkError::Other(
+                            "private delete backend detail must not reach the response".to_string(),
+                        ));
+                    }
+                    DeleteInjectedFailure::Panic => {
+                        panic!("private delete panic detail must not reach the response");
+                    }
+                }
+            }
+            self.inner.delete_series(selection)
         }
 
         fn close(&self) -> tsink::Result<()> {
@@ -11522,14 +11966,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_write_discloses_rows_committed_before_metadata_failure() {
+    async fn remote_write_maps_metadata_disk_quota_after_rows_commit() {
         let temp_dir = TempDir::new().expect("temp dir should build");
         let storage = make_storage();
-        let metadata_store = make_metadata_store(Some(temp_dir.path()));
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let metadata_store = Arc::new(
+            MetricMetadataStore::open_with_disk_budget(
+                Some(temp_dir.path()),
+                Some(local_disk_budget),
+            )
+            .expect("metric metadata store should build"),
+        );
         let exemplar_store = make_exemplar_store(None);
         let engine = make_engine(&storage);
-        std::fs::create_dir(temp_dir.path().join("metric-metadata-store.tmp"))
-            .expect("temporary-path collision should build");
         let write = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![PromLabel {
@@ -11576,7 +12032,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status, 500);
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
         assert_eq!(
             response_header(&response, WRITE_PARTIAL_HEADER),
             Some("true")
@@ -11613,14 +12073,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_write_discloses_rows_committed_before_exemplar_failure() {
+    async fn remote_write_maps_exemplar_disk_quota_after_rows_commit() {
         let temp_dir = TempDir::new().expect("temp dir should build");
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
-        let exemplar_store = make_exemplar_store(Some(temp_dir.path()));
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let exemplar_store = Arc::new(
+            ExemplarStore::open_with_disk_budget(Some(temp_dir.path()), Some(local_disk_budget))
+                .expect("exemplar store should build"),
+        );
         let engine = make_engine(&storage);
-        std::fs::create_dir(temp_dir.path().join("exemplar-store.tmp"))
-            .expect("temporary-path collision should build");
         let write = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![PromLabel {
@@ -11670,7 +12139,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status, 500);
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
         assert_eq!(
             response_header(&response, WRITE_PARTIAL_HEADER),
             Some("true")
@@ -11697,6 +12170,313 @@ mod tests {
             .expect("exemplar metrics should remain readable");
         assert_eq!(exemplar_metrics.accepted_total, 0);
         assert_eq!(exemplar_metrics.stored_exemplars, 0);
+    }
+
+    #[tokio::test]
+    async fn remote_write_maps_metadata_only_and_exemplar_only_disk_quota() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let storage = make_storage();
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let metadata_store = Arc::new(
+            MetricMetadataStore::open_with_disk_budget(
+                Some(temp_dir.path()),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("metric metadata store should build"),
+        );
+        let exemplar_store = Arc::new(
+            ExemplarStore::open_with_disk_budget(
+                Some(temp_dir.path()),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("exemplar store should build"),
+        );
+        let engine = make_engine(&storage);
+
+        let metadata_write = WriteRequest {
+            timeseries: Vec::new(),
+            metadata: vec![MetricMetadata {
+                r#type: MetricType::Gauge as i32,
+                metric_family_name: "metadata_only_metric".to_string(),
+                help: "must exceed the tiny shared local-disk quota".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let mut metadata_encoded = Vec::new();
+        metadata_write
+            .encode(&mut metadata_encoded)
+            .expect("protobuf encoding should work");
+        let metadata_response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&metadata_encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(metadata_response.status, 413);
+        assert_eq!(
+            response_header(&metadata_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&metadata_response, WRITE_PARTIAL_HEADER),
+            None
+        );
+
+        let exemplar_write = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![PromLabel {
+                    name: "__name__".to_string(),
+                    value: "exemplar_only_metric".to_string(),
+                }],
+                samples: Vec::new(),
+                exemplars: vec![Exemplar {
+                    labels: vec![PromLabel {
+                        name: "trace_id".to_string(),
+                        value: "must-exceed-the-tiny-shared-local-disk-quota".to_string(),
+                    }],
+                    value: 2.0,
+                    timestamp: 1_700_000_000_000,
+                }],
+                ..Default::default()
+            }],
+            metadata: Vec::new(),
+        };
+        let mut exemplar_encoded = Vec::new();
+        exemplar_write
+            .encode(&mut exemplar_encoded)
+            .expect("protobuf encoding should work");
+        let exemplar_response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&exemplar_encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(exemplar_response.status, 413);
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_PARTIAL_HEADER),
+            None
+        );
+
+        let snapshot = local_disk_budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.rejections_total, 2);
+    }
+
+    #[tokio::test]
+    async fn clustered_local_sidecar_disk_quota_preserves_413_and_no_publication() {
+        let cluster_dir = TempDir::new().expect("cluster temp dir should build");
+        let data_path = cluster_dir.path().join("budgeted-data");
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            &data_path,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let metadata_store = Arc::new(
+            MetricMetadataStore::open_with_disk_budget(
+                Some(&data_path),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("metadata store should build"),
+        );
+        let exemplar_store = Arc::new(
+            ExemplarStore::open_with_disk_budget(
+                Some(&data_path),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("exemplar store should build"),
+        );
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let cluster_context = cluster_context_with_single_node_control(&cluster_dir);
+
+        let metadata_write = WriteRequest {
+            timeseries: Vec::new(),
+            metadata: vec![MetricMetadata {
+                r#type: MetricType::Gauge as i32,
+                metric_family_name: "clustered_metadata_quota".to_string(),
+                help: "must exceed the tiny local disk quota".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let mut metadata_encoded = Vec::new();
+        metadata_write
+            .encode(&mut metadata_encoded)
+            .expect("metadata protobuf should encode");
+        let metadata_response = handle_request_with_admin_and_cluster_and_tenant_and_metadata(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            None,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&metadata_encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            false,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(metadata_response.status, 413);
+        assert_eq!(
+            response_header(&metadata_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&metadata_response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&metadata_response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_cluster")
+        );
+        assert!(metadata_store
+            .query(
+                tenant::DEFAULT_TENANT_ID,
+                Some("clustered_metadata_quota"),
+                10,
+            )
+            .expect("metadata query should succeed")
+            .is_empty());
+
+        let exemplar_write = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![PromLabel {
+                    name: "__name__".to_string(),
+                    value: "clustered_exemplar_quota".to_string(),
+                }],
+                samples: Vec::new(),
+                exemplars: vec![Exemplar {
+                    labels: vec![PromLabel {
+                        name: "trace_id".to_string(),
+                        value: "must-exceed-the-tiny-local-disk-quota".to_string(),
+                    }],
+                    value: 1.0,
+                    timestamp: 1_700_000_000_000,
+                }],
+                ..Default::default()
+            }],
+            metadata: Vec::new(),
+        };
+        let mut exemplar_encoded = Vec::new();
+        exemplar_write
+            .encode(&mut exemplar_encoded)
+            .expect("exemplar protobuf should encode");
+        let exemplar_response = handle_request_with_admin_and_cluster_and_tenant_and_metadata(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            None,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/write".to_string(),
+                headers: HashMap::from([
+                    ("content-encoding".to_string(), "snappy".to_string()),
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                ]),
+                body: snappy_encode(&exemplar_encoded),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            false,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(exemplar_response.status, 413);
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&exemplar_response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_cluster")
+        );
+        let exemplar_metrics = exemplar_store
+            .metrics_snapshot()
+            .expect("exemplar metrics should remain readable");
+        assert_eq!(exemplar_metrics.accepted_total, 0);
+        assert_eq!(exemplar_metrics.stored_exemplars, 0);
+
+        let snapshot = local_disk_budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.rejections_total, 2);
     }
 
     #[tokio::test]
@@ -12225,8 +13005,8 @@ mod tests {
         let metadata_store = make_metadata_store(Some(temp_dir.path()));
         let exemplar_store = make_exemplar_store(None);
         let engine = make_engine(&storage);
-        std::fs::create_dir(temp_dir.path().join("metric-metadata-store.tmp"))
-            .expect("temporary-path collision should build");
+        std::fs::create_dir(temp_dir.path().join("metric-metadata-store.json"))
+            .expect("publication-path collision should build");
         let before = legacy_ingest::status_snapshot().influx;
 
         let response = handle_request_with_metadata_and_exemplar_store(
@@ -12248,7 +13028,11 @@ mod tests {
         assert_eq!(response.status, 500);
         assert_eq!(
             response_header(&response, WRITE_OUTCOME_HEADER),
-            Some("partial")
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
         );
         assert_eq!(
             response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
@@ -12260,8 +13044,8 @@ mod tests {
                 >= before.counters.accepted_samples_total.saturating_add(2)
         );
         assert!(
-            after.write_observability.outcomes_total[2]
-                >= before.write_observability.outcomes_total[2].saturating_add(1)
+            after.write_observability.outcomes_total[3]
+                >= before.write_observability.outcomes_total[3].saturating_add(1)
         );
     }
 
@@ -15534,6 +16318,212 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_io_failure_stays_indeterminate_through_partial_progress_wrapping() {
+        let io_failure = TsinkError::Io(std::io::Error::other("replacement sync failed"));
+        let response = partial_write_error_response(
+            server_persistence_error_response("metadata update", &io_failure),
+            3,
+            Some(WriteAcknowledgement::Durable),
+            0,
+            0,
+            0,
+        );
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_internal_io")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("3")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some("durable")
+        );
+
+        let internal_response = partial_write_error_response(
+            internal_server_persistence_error_response("internal exemplar ingest", &io_failure),
+            2,
+            Some(WriteAcknowledgement::Appended),
+            1,
+            1,
+            0,
+        );
+        assert_eq!(internal_response.status, 500);
+        assert_eq!(
+            response_header(&internal_response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&internal_response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&internal_response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("2")
+        );
+        assert_eq!(
+            response_header(&internal_response, "X-Tsink-Metadata-Applied"),
+            Some("1")
+        );
+
+        let disk_quota = TsinkError::DiskQuotaExceeded {
+            limit: 10,
+            used: 9,
+            reserved: 0,
+            requested: 2,
+        };
+        let quota_response = server_persistence_error_response("metadata update", &disk_quota);
+        assert_eq!(quota_response.status, 413);
+        assert_eq!(
+            response_header(&quota_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(response_header(&quota_response, WRITE_PARTIAL_HEADER), None);
+        assert_eq!(response_header(&quota_response, WRITE_OUTCOME_HEADER), None);
+    }
+
+    #[test]
+    fn delete_series_preserves_structured_disk_quota_rejection() {
+        let response = delete_series_error_response(&TsinkError::DiskQuotaExceeded {
+            limit: 10,
+            used: 9,
+            reserved: 0,
+            requested: 2,
+        });
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(response_header(&response, WRITE_PARTIAL_HEADER), None);
+        assert_eq!(response_header(&response, WRITE_OUTCOME_HEADER), None);
+    }
+
+    #[test]
+    fn exemplar_quorum_failure_uses_the_unsatisfied_shards_own_failure() {
+        let mut failures = BTreeMap::new();
+        retain_preferred_exemplar_failure_for_shards(
+            &mut failures,
+            &BTreeSet::from([1]),
+            ClusterSidecarWriteFailure::generic("shard-one transport failure"),
+        );
+        retain_preferred_exemplar_failure_for_shards(
+            &mut failures,
+            &BTreeSet::from([2]),
+            ClusterSidecarWriteFailure {
+                message: "shard-two disk quota".to_string(),
+                disk_quota: true,
+            },
+        );
+
+        let mut shard_state = BTreeMap::from([
+            (
+                1,
+                ExemplarShardAckState {
+                    required_acks: 2,
+                    acknowledged_acks: 1,
+                },
+            ),
+            (
+                2,
+                ExemplarShardAckState {
+                    required_acks: 2,
+                    acknowledged_acks: 1,
+                },
+            ),
+        ]);
+        let shard_one_failure =
+            exemplar_quorum_failure(&shard_state, &failures, ClusterWriteConsistency::Quorum)
+                .expect("shard one should fail quorum first");
+        assert!(!shard_one_failure.disk_quota);
+        assert!(shard_one_failure.message.contains("shard 1"));
+        assert!(shard_one_failure
+            .message
+            .contains("shard-one transport failure"));
+        assert!(!shard_one_failure.message.contains("shard-two disk quota"));
+
+        shard_state
+            .get_mut(&1)
+            .expect("shard one state should exist")
+            .acknowledged_acks = 2;
+        let shard_two_failure =
+            exemplar_quorum_failure(&shard_state, &failures, ClusterWriteConsistency::Quorum)
+                .expect("shard two should remain below quorum");
+        assert!(shard_two_failure.disk_quota);
+        assert!(shard_two_failure.message.contains("shard 2"));
+        assert!(shard_two_failure.message.contains("shard-two disk quota"));
+    }
+
+    #[test]
+    fn cluster_sidecar_failure_classification_requires_a_typed_disk_error() {
+        let storage_errors = [
+            TsinkError::DiskQuotaExceeded {
+                limit: 10,
+                used: 9,
+                reserved: 0,
+                requested: 2,
+            },
+            TsinkError::InsufficientDiskSpace {
+                required: 2,
+                available: 1,
+            },
+            TsinkError::InsufficientCompactionHeadroom {
+                limit: 10,
+                used: 8,
+                reserved: 1,
+                requested: 2,
+            },
+        ];
+        for err in &storage_errors {
+            let failure = ClusterSidecarWriteFailure::from_storage(err.to_string(), err);
+            let response =
+                cluster_sidecar_write_error_response("cluster sidecar rejected", &failure);
+            assert_eq!(response.status, 413);
+            assert_eq!(
+                response_header(&response, WRITE_ERROR_CODE_HEADER),
+                Some("write_disk_quota_exceeded")
+            );
+        }
+
+        let typed_remote = RpcError::HttpStatus {
+            endpoint: "127.0.0.1:9302".to_string(),
+            path: "/internal/v1/ingest/write".to_string(),
+            status: 413,
+            error_code: Some("write_disk_quota_exceeded".to_string()),
+            message: "peer rejected disk growth".to_string(),
+            retryable: false,
+        };
+        let failure = ClusterSidecarWriteFailure::from_rpc(typed_remote.to_string(), &typed_remote);
+        assert!(failure.disk_quota);
+
+        let untyped_remote = RpcError::HttpStatus {
+            endpoint: "127.0.0.1:9302".to_string(),
+            path: "/internal/v1/ingest/write".to_string(),
+            status: 413,
+            error_code: None,
+            message: "unrelated content limit".to_string(),
+            retryable: false,
+        };
+        let failure =
+            ClusterSidecarWriteFailure::from_rpc(untyped_remote.to_string(), &untyped_remote);
+        let response = cluster_sidecar_write_error_response("cluster sidecar rejected", &failure);
+        assert_eq!(response.status, 409);
+        assert_eq!(response_header(&response, WRITE_ERROR_CODE_HEADER), None);
+    }
+
+    #[test]
     fn edge_sync_enqueue_failure_discloses_local_commit_and_queue_progress() {
         let response = edge_sync_enqueue_error_response(
             "insert",
@@ -16566,6 +17556,114 @@ mod tests {
                 .as_deref(),
             Some("node-a")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_data_restore_failure_leaves_control_state_unchanged() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source-local");
+        let snapshot_root = temp_dir.path().join("cluster-snapshot");
+        let restore_root = temp_dir.path().join("cluster-restored");
+        let blocked_data_path = temp_dir.path().join("blocked-data-path");
+        std::fs::write(&blocked_data_path, b"not a directory")
+            .expect("blocked data path should exist as a file");
+
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("local source storage should build");
+        let engine = make_engine(&storage);
+        let cluster_context = cluster_context_with_single_node_control_state(&temp_dir, |state| {
+            state.leader_node_id = Some("node-a".to_string());
+        });
+
+        let snapshot_response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/snapshot".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "path": snapshot_root.to_string_lossy()
+                }))
+                .expect("json should encode"),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(snapshot_response.status, 200);
+        let snapshot_body: JsonValue =
+            serde_json::from_slice(&snapshot_response.body).expect("valid JSON");
+        let manifest_path = PathBuf::from(
+            snapshot_body["data"]["manifestPath"]
+                .as_str()
+                .expect("manifestPath should be present"),
+        );
+
+        let consensus = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should be present");
+        let state_before_restore = consensus.current_state();
+        let mut manifest =
+            load_cluster_snapshot_manifest_file(&manifest_path).expect("manifest should load");
+        manifest.control_snapshot.control_state.updated_unix_ms = manifest
+            .control_snapshot
+            .control_state
+            .updated_unix_ms
+            .saturating_add(1);
+        assert_ne!(
+            manifest.control_snapshot.control_state, state_before_restore,
+            "the embedded state must differ so an early control commit is observable"
+        );
+        write_cluster_snapshot_manifest_file(&manifest_path, &manifest)
+            .expect("modified manifest should persist");
+
+        let restore_response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": manifest_path.to_string_lossy(),
+                    "restoreRoot": restore_root.to_string_lossy(),
+                    "dataPaths": {
+                        "node-a": blocked_data_path.join("child").to_string_lossy()
+                    }
+                }))
+                .expect("json should encode"),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(restore_response.status, 503);
+        let restore_body: JsonValue =
+            serde_json::from_slice(&restore_response.body).expect("valid JSON");
+        assert_eq!(restore_body["errorType"], "restore_failed");
+        assert_eq!(consensus.current_state(), state_before_restore);
+
+        storage.close().expect("storage should close");
     }
 
     #[tokio::test]
@@ -18299,6 +19397,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_and_metrics_report_server_disk_budget_for_compute_only_storage() {
+        let dir = TempDir::new().unwrap();
+        let object_store_path = dir.path().join("object-store");
+        let server_data_path = dir.path().join("server-data");
+        std::fs::create_dir_all(&server_data_path).unwrap();
+        std::fs::write(
+            server_data_path.join("owned-server-state.bin"),
+            b"server-state",
+        )
+        .unwrap();
+        let storage = StorageBuilder::new()
+            .with_runtime_mode(tsink::StorageRuntimeMode::ComputeOnly)
+            .with_object_store_path(object_store_path)
+            .build()
+            .unwrap();
+        let engine = make_engine(&storage);
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            &server_data_path,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(123_456),
+                filesystem_free_headroom_bytes: 7,
+                maintenance_temp_reserve_bytes: 11,
+            },
+        )
+        .unwrap();
+
+        let status = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                local_disk_budget: Some(local_disk_budget.as_ref()),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(status.status, 200);
+        let status_body: JsonValue = serde_json::from_slice(&status.body).unwrap();
+        let limits = &status_body["data"]["effectiveStorageLimits"];
+        assert_eq!(limits["localDiskBytes"], 123_456);
+        assert_eq!(limits["filesystemFreeHeadroomBytes"], 7);
+        assert_eq!(limits["maintenanceTempReserveBytes"], 11);
+        assert_eq!(
+            status_body["data"]["localDisk"]["accountedBytes"],
+            b"server-state".len()
+        );
+
+        let metrics = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                local_disk_budget: Some(local_disk_budget.as_ref()),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(metrics.status, 200);
+        let metrics_body = std::str::from_utf8(&metrics.body).unwrap();
+        assert!(metrics_body.contains("tsink_local_disk_accounted_bytes 12"));
+        assert!(metrics_body.contains("tsink_local_disk_limit_bytes 123456"));
+
+        storage.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn status_tsdb_includes_current_tenant_admission_snapshot_when_registry_is_configured() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -18586,6 +19760,15 @@ mod tests {
         let exemplar_store = make_exemplar_store(None);
         let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
         let engine = make_engine(&storage);
+        let disk_root = TempDir::new().expect("disk root should build");
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            disk_root.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(4_096),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("server disk budget should open");
         let tenant_registry = tenant::TenantRegistry::from_json_str(
             r#"{
                 "tenants": {
@@ -18604,11 +19787,8 @@ mod tests {
         )
         .expect("tenant registry should parse");
 
-        let response = handle_request_with_admin_and_cluster_and_tenant_and_metadata_and_security(
+        let response = handle_test_request(
             &storage,
-            &metadata_store,
-            &exemplar_store,
-            None,
             &engine,
             HttpRequest {
                 method: "GET".to_string(),
@@ -18616,17 +19796,17 @@ mod tests {
                 headers: HashMap::new(),
                 body: Vec::new(),
             },
-            start_time(),
-            TimestampPrecision::Milliseconds,
-            true,
-            None,
-            None,
-            None,
-            Some(&tenant_registry),
-            None,
-            None,
-            None,
-            Some(&usage_accounting),
+            TestRequestOptions {
+                metadata_store: Some(&metadata_store),
+                exemplar_store: Some(&exemplar_store),
+                server_start: start_time(),
+                timestamp_precision: TimestampPrecision::Milliseconds,
+                admin_api_enabled: true,
+                tenant_registry: Some(&tenant_registry),
+                usage_accounting: Some(&usage_accounting),
+                local_disk_budget: Some(local_disk_budget.as_ref()),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -18647,6 +19827,10 @@ mod tests {
             "team-a"
         );
         assert_eq!(body["sections"]["usage"]["httpStatus"], 200);
+        assert_eq!(
+            body["sections"]["statusTsdb"]["body"]["data"]["localDisk"]["limits"]["maxBytes"],
+            4_096
+        );
     }
 
     #[tokio::test]
@@ -18973,6 +20157,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_snapshot_failure_removes_the_composite_snapshot_destination() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let storage: Arc<dyn Storage> = Arc::new(RulesSnapshotCollisionStorage { inner });
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let rules_runtime = make_rules_runtime(&storage);
+
+        let err = perform_local_data_snapshot(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            Some(rules_runtime.as_ref()),
+            &snapshot_path,
+            None,
+        )
+        .await
+        .expect_err("the injected rules publication collision should fail the snapshot");
+
+        assert!(err.contains("rules snapshot failed"), "{err}");
+        assert!(
+            !snapshot_path.exists(),
+            "a failed rules snapshot must remove the already-published composite destination"
+        );
+        storage.close().expect("close should succeed");
+    }
+
+    #[tokio::test]
     async fn admin_restore_endpoint_restores_snapshot() {
         let temp_dir = TempDir::new().expect("tempdir");
         let source_path = temp_dir.path().join("source");
@@ -19027,6 +20245,58 @@ mod tests {
             .expect("select should succeed");
         assert_eq!(points, vec![DataPoint::new(1, 9.0)]);
         restored_storage.close().expect("close should succeed");
+    }
+
+    #[tokio::test]
+    async fn admin_restore_rejects_targets_overlapping_the_live_data_root() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        let live_data_path = temp_dir.path().join("live-data");
+        std::fs::create_dir_all(&snapshot_path).expect("snapshot path should exist");
+        std::fs::create_dir_all(&live_data_path).expect("live data path should exist");
+        let sentinel = live_data_path.join("sentinel.bin");
+        std::fs::write(&sentinel, b"must-survive").expect("sentinel should be written");
+        let local_disk_budget =
+            tsink::LocalDiskBudget::open(&live_data_path, tsink::LocalDiskLimits::default())
+                .expect("live disk budget should open");
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+
+        for target in [
+            live_data_path.clone(),
+            live_data_path.join("nested-restore"),
+        ] {
+            let response = handle_test_request(
+                &storage,
+                &engine,
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/api/v1/admin/restore".to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                    body: serde_json::to_vec(&json!({
+                        "snapshotPath": snapshot_path,
+                        "dataPath": target,
+                    }))
+                    .unwrap(),
+                },
+                TestRequestOptions {
+                    admin_api_enabled: true,
+                    local_disk_budget: Some(local_disk_budget.as_ref()),
+                    ..TestRequestOptions::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status, 409);
+            assert!(String::from_utf8(response.body)
+                .unwrap()
+                .contains("overlaps the active data path"));
+        }
+
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"must-survive");
+        storage.close().unwrap();
     }
 
     #[tokio::test]
@@ -19508,6 +20778,523 @@ test_metric{job="test2"} 99 1700000000000
             )
             .expect("select should succeed");
         assert_eq!(points, vec![DataPoint::new(1_700_000_000_005, 99.0)]);
+    }
+
+    #[tokio::test]
+    async fn multi_selector_delete_reports_committed_progress_before_later_quota_rejection() {
+        let inner = make_storage();
+        let first_point = DataPoint::new(1_000, 1.0);
+        let second_point = DataPoint::new(1_000, 2.0);
+        inner
+            .insert_rows(&[
+                Row::new("delete_first", first_point.clone()),
+                Row::new("delete_second", second_point.clone()),
+            ])
+            .expect("rows should insert");
+        let storage: Arc<dyn Storage> =
+            Arc::new(DeleteFailureInjectingStorage::quota(Arc::clone(&inner), 2));
+        let engine = make_engine(&storage);
+
+        let response = handle_request_with_admin(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_first&match[]=delete_second&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("partial")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            Some("1")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("partial response should be JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "partial_delete");
+        assert_eq!(body["code"], "write_disk_quota_exceeded");
+        assert_eq!(body["data"]["outcome"], "partial");
+        assert_eq!(body["data"]["matchersProcessed"], 1);
+        assert_eq!(body["data"]["matchedSeries"], 1);
+        assert_eq!(body["data"]["tombstonesApplied"], 1);
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|message| message.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES));
+
+        assert!(inner
+            .select("delete_first", &[], 0, 2_000)
+            .expect("first metric should remain readable")
+            .is_empty());
+        assert_eq!(
+            inner
+                .select("delete_second", &[], 0, 2_000)
+                .expect("second metric should remain readable"),
+            vec![second_point]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_selector_delete_without_prior_progress_preserves_ordinary_quota_rejection() {
+        let inner = make_storage();
+        let point = DataPoint::new(1_000, 1.0);
+        inner
+            .insert_rows(&[Row::new("delete_first", point.clone())])
+            .expect("row should insert");
+        let storage: Arc<dyn Storage> =
+            Arc::new(DeleteFailureInjectingStorage::quota(Arc::clone(&inner), 1));
+        let engine = make_engine(&storage);
+
+        let response = handle_request_with_admin(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_first&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(response_header(&response, WRITE_PARTIAL_HEADER), None);
+        assert_eq!(response_header(&response, WRITE_OUTCOME_HEADER), None);
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            None
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            None
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            None
+        );
+        let body = String::from_utf8(response.body).expect("quota response should decode");
+        assert!(body.contains("delete_series failed"));
+        assert!(body.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES);
+        assert_eq!(
+            inner
+                .select("delete_first", &[], 0, 2_000)
+                .expect("rejected delete should not change data"),
+            vec![point]
+        );
+    }
+
+    #[tokio::test]
+    async fn single_selector_delete_reports_partial_tenant_expansion_and_usage() {
+        let inner = make_storage();
+        let first_labels = vec![Label::new("host", "a")];
+        let second_labels = vec![Label::new("host", "b")];
+        let first_point = DataPoint::new(1_000, 1.0);
+        let second_point = DataPoint::new(1_000, 2.0);
+        inner
+            .insert_rows(&[
+                Row::with_labels("delete_many", first_labels.clone(), first_point.clone()),
+                Row::with_labels("delete_many", second_labels.clone(), second_point.clone()),
+            ])
+            .expect("rows should insert");
+        let storage: Arc<dyn Storage> =
+            Arc::new(DeleteFailureInjectingStorage::quota(Arc::clone(&inner), 2));
+        let engine = make_engine(&storage);
+        let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_many&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                usage_accounting: Some(usage_accounting.as_ref()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("partial")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            Some("1")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("partial response should be JSON");
+        assert_eq!(body["data"]["matchersProcessed"], 1);
+        assert_eq!(body["data"]["matchedSeries"], 1);
+        assert_eq!(body["data"]["tombstonesApplied"], 1);
+
+        assert!(inner
+            .select("delete_many", &first_labels, 0, 2_000)
+            .expect("first series should remain readable")
+            .is_empty());
+        assert_eq!(
+            inner
+                .select("delete_many", &second_labels, 0, 2_000)
+                .expect("second series should remain readable"),
+            vec![second_point]
+        );
+
+        let records = usage_accounting.export_records(Some(tenant::DEFAULT_TENANT_ID), None, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "partial");
+        assert_eq!(records[0].request_units, 1);
+        assert_eq!(records[0].matched_series, 1);
+        assert_eq!(records[0].tombstones_applied, 1);
+        let summary = usage_accounting.tenant_summary(tenant::DEFAULT_TENANT_ID);
+        assert_eq!(summary.retention.events_total, 1);
+        assert_eq!(summary.retention.errors_total, 1);
+        assert_eq!(summary.retention.matched_series, 1);
+        assert_eq!(summary.retention.tombstones_applied, 1);
+    }
+
+    #[tokio::test]
+    async fn single_selector_delete_panic_preserves_observed_inner_progress_and_usage() {
+        let inner = make_storage();
+        let first_labels = vec![Label::new("host", "a")];
+        let second_labels = vec![Label::new("host", "b")];
+        let second_point = DataPoint::new(1_000, 2.0);
+        inner
+            .insert_rows(&[
+                Row::with_labels(
+                    "delete_many_panic",
+                    first_labels.clone(),
+                    DataPoint::new(1_000, 1.0),
+                ),
+                Row::with_labels(
+                    "delete_many_panic",
+                    second_labels.clone(),
+                    second_point.clone(),
+                ),
+            ])
+            .expect("rows should insert");
+        let storage: Arc<dyn Storage> =
+            Arc::new(DeleteFailureInjectingStorage::panic(Arc::clone(&inner), 2));
+        let engine = make_engine(&storage);
+        let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_many_panic&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                usage_accounting: Some(usage_accounting.as_ref()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_internal")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            Some("1")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("indeterminate response should be JSON");
+        assert_eq!(body["data"]["outcome"], "indeterminate_backend");
+        assert_eq!(body["data"]["matchersProcessed"], 1);
+        assert_eq!(body["data"]["matchedSeries"], 1);
+        assert_eq!(body["data"]["tombstonesApplied"], 1);
+        assert!(!String::from_utf8_lossy(&response.body).contains("private delete panic"));
+
+        assert!(inner
+            .select("delete_many_panic", &first_labels, 0, 2_000)
+            .expect("first series should remain readable")
+            .is_empty());
+        assert_eq!(
+            inner
+                .select("delete_many_panic", &second_labels, 0, 2_000)
+                .expect("second series should remain readable"),
+            vec![second_point]
+        );
+        let records = usage_accounting.export_records(Some(tenant::DEFAULT_TENANT_ID), None, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "indeterminate");
+        assert_eq!(records[0].request_units, 1);
+        assert_eq!(records[0].matched_series, 1);
+        assert_eq!(records[0].tombstones_applied, 1);
+        let summary = usage_accounting.tenant_summary(tenant::DEFAULT_TENANT_ID);
+        assert_eq!(summary.retention.errors_total, 1);
+    }
+
+    #[tokio::test]
+    async fn single_selector_delete_nonquota_failure_is_indeterminate_and_redacted() {
+        let inner = make_storage();
+        let first_labels = vec![Label::new("host", "a")];
+        let second_labels = vec![Label::new("host", "b")];
+        let second_point = DataPoint::new(1_000, 2.0);
+        inner
+            .insert_rows(&[
+                Row::with_labels(
+                    "delete_many_error",
+                    first_labels.clone(),
+                    DataPoint::new(1_000, 1.0),
+                ),
+                Row::with_labels(
+                    "delete_many_error",
+                    second_labels.clone(),
+                    second_point.clone(),
+                ),
+            ])
+            .expect("rows should insert");
+        let storage: Arc<dyn Storage> = Arc::new(DeleteFailureInjectingStorage::internal(
+            Arc::clone(&inner),
+            2,
+        ));
+        let engine = make_engine(&storage);
+        let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_many_error&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                usage_accounting: Some(usage_accounting.as_ref()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_internal")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            Some("1")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("indeterminate response should be JSON");
+        assert_eq!(body["data"]["outcome"], "indeterminate_backend");
+        assert_eq!(body["data"]["matchersProcessed"], 1);
+        assert_eq!(body["data"]["matchedSeries"], 1);
+        assert_eq!(body["data"]["tombstonesApplied"], 1);
+        assert!(!String::from_utf8_lossy(&response.body).contains("private delete backend"));
+
+        assert!(inner
+            .select("delete_many_error", &first_labels, 0, 2_000)
+            .expect("first series should remain readable")
+            .is_empty());
+        assert_eq!(
+            inner
+                .select("delete_many_error", &second_labels, 0, 2_000)
+                .expect("second series should remain readable"),
+            vec![second_point]
+        );
+        let records = usage_accounting.export_records(Some(tenant::DEFAULT_TENANT_ID), None, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "indeterminate");
+        assert_eq!(records[0].request_units, 1);
+        assert_eq!(records[0].matched_series, 1);
+        assert_eq!(records[0].tombstones_applied, 1);
+        let summary = usage_accounting.tenant_summary(tenant::DEFAULT_TENANT_ID);
+        assert_eq!(summary.retention.errors_total, 1);
+    }
+
+    #[tokio::test]
+    async fn multi_selector_delete_join_failure_is_redacted_and_preserves_known_usage() {
+        let inner = make_storage();
+        let first_point = DataPoint::new(1_000, 1.0);
+        let second_point = DataPoint::new(1_000, 2.0);
+        inner
+            .insert_rows(&[
+                Row::new("delete_before_panic", first_point),
+                Row::new("delete_during_panic", second_point.clone()),
+            ])
+            .expect("rows should insert");
+        let storage: Arc<dyn Storage> =
+            Arc::new(DeleteFailureInjectingStorage::panic(Arc::clone(&inner), 2));
+        let engine = make_engine(&storage);
+        let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/delete_series?match[]=delete_before_panic&match[]=delete_during_panic&start=0&end=2000"
+                    .to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                usage_accounting: Some(usage_accounting.as_ref()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_internal")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_PARTIAL_HEADER),
+            Some("possible")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_OUTCOME_HEADER),
+            Some("indeterminate_backend")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHERS_PROCESSED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_MATCHED_SERIES_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header(&response, DELETE_TOMBSTONES_APPLIED_HEADER),
+            Some("1")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("indeterminate response should be JSON");
+        assert_eq!(body["code"], "write_internal");
+        assert_eq!(body["data"]["outcome"], "indeterminate_backend");
+        assert_eq!(body["data"]["matchersProcessed"], 1);
+        assert_eq!(body["data"]["matchedSeries"], 1);
+        assert_eq!(body["data"]["tombstonesApplied"], 1);
+        assert!(!String::from_utf8_lossy(&response.body).contains("private delete panic"));
+
+        assert!(inner
+            .select("delete_before_panic", &[], 0, 2_000)
+            .expect("committed delete should remain visible")
+            .is_empty());
+        assert_eq!(
+            inner
+                .select("delete_during_panic", &[], 0, 2_000)
+                .expect("panicked delete should not mutate the wrapped backend"),
+            vec![second_point]
+        );
+
+        let records = usage_accounting.export_records(Some(tenant::DEFAULT_TENANT_ID), None, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "indeterminate");
+        assert_eq!(records[0].request_units, 1);
+        assert_eq!(records[0].matched_series, 1);
+        assert_eq!(records[0].tombstones_applied, 1);
+        let summary = usage_accounting.tenant_summary(tenant::DEFAULT_TENANT_ID);
+        assert_eq!(summary.retention.events_total, 1);
+        assert_eq!(summary.retention.errors_total, 1);
+        assert_eq!(summary.retention.matched_series, 1);
+        assert_eq!(summary.retention.tombstones_applied, 1);
     }
 
     #[tokio::test]

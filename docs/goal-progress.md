@@ -67,7 +67,7 @@ the changes made since that snapshot.
   [`ADR 0001`](adr/0001-write-contract.md) documentation.
 - `DONE` Declare Rust 1.89 as the MSRV, add CI coverage, and pass the locked all-target workspace
   check on that toolchain.
-- `DONE` Verify crate contents and the package dry run. The package contains 246 files and excludes
+- `DONE` Verify crate contents and the package dry run. The current package contains 249 files and excludes
   `GOAL.md`, `docs/goal-progress.md`, `.github`, and `scripts`.
 - `DONE` Improve documentation of the primary embedded lifecycle and canonical write APIs.
 - `DONE` Pass the complete post-change formatting, lint, test, documentation, no-default-feature,
@@ -151,8 +151,35 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   reconciliation, category accounting, over-limit recovery admission, structured failures, and
   observability across sync, async, UniFFI/Python, and server status/metrics surfaces. Core WAL,
   segment/compaction, registry/catalog, tombstone, rollup, retention, and temporary publication
-  paths are integrated. Optional server metadata, exemplar, cluster, control, and edge-sync writers
-  remain outside the atomic reservation boundary, so the complete disk item is not `DONE`.
+  paths are integrated. The built-in server now opens the coordinator before its persistent stores,
+  shares it with metadata, exemplars, rules, usage accounting, and managed control-plane state,
+  holds the canonical data-path lease in non-read-write modes, reconciles again before serving, and
+  drains listener work before releasing storage or that lease. Managed sidecars clean owned orphan
+  temporaries at startup, reject final symlinks, durably create nested directories, and roll back
+  post-publication replacement failures. Core startup also rejects symlinked owned namespaces and
+  removes only exact current-format atomic-write and segment-staging orphans before enforcing future
+  growth; lookalikes, unknown operator files, and pending compaction markers are preserved. Snapshot
+  sidecars use collision-safe temporary files and parent-directory synchronization. Rules persist a
+  recording-evaluation attempt before external row/usage effects. Usage accounting runs ordinary
+  durable appends on one bounded blocking lane and storage reconciliation on a distinct one-permit
+  scan lane, exposes failed appends, frames multi-tenant reconciliation atomically, and treats an
+  append-task join failure as indeterminate persistence. Tombstone publication returns a definitive
+  pre-commit failure only after a clean rollback; an indeterminate manifest rollback retains the
+  pending repair marker and any candidate shard that might still be referenced. Rollup policy/state
+  publication uses a conservative invalidating-state order and retains that state when policy
+  rollback cannot be proven. Their admin endpoints preserve typed quota rejection, including proven
+  counts when an earlier selector or an earlier series within one tenant-scoped selector already
+  committed. A failed initial
+  rollup materialization remains a committed success whose snapshot exposes the degradation;
+  repairable post-commit tombstone cache cleanup logs a warning and likewise does not fabricate a
+  mutation rejection. Tiny-limit, rollback, restart,
+  interruption-point, concurrent append, compute-only observability, typed direct/internal and
+  clustered HTTP error, support-bundle status, live-root restore rejection, and data-before-control
+  cluster restore tests cover that slice.
+  Experimental cluster control/consensus/audit/dedupe/outbox writers, edge-sync queues, and
+  external restore staging remain outside the complete boundary. Cleanup-before-growth-rejection,
+  whole-operation compaction preflight, and a crash-durable coordinator for multi-file tombstone and
+  rollup publication also remain incomplete, so the disk item is not `DONE`.
 - `DEFERRED` Add shared query work/memory/concurrency budgets and cooperative cancellation across
   direct, async, PromQL, and HTTP entry points.
 - `DEFERRED` Complete byte reservations for transient and non-write memory growth, cardinality
@@ -160,8 +187,11 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   precedence tests.
 
 Phase 2 remains incomplete. Current memory totals are modeled estimates rather than RSS, several
-important allocation classes are named but unaccounted, the local-disk boundary is core-only rather
-than server-wide, and no shared query budget is enforced yet.
+important allocation classes are named but unaccounted, the local-disk boundary does not yet cover
+cluster and edge persistence or external restore staging, static path validation does not protect
+against a hostile concurrent namespace swap, and no shared query budget is enforced yet. Usage
+metering is awaited and may add response latency, while status, report, support-bundle, and export
+reads still scan an unbounded in-memory ledger.
 
 ### Phase 3 — durability, format upgrades, and crash recovery: `DEFERRED`
 
@@ -249,14 +279,15 @@ Phase 2 targeted verification completed since that full matrix:
 - Server default/configured status and Prometheus memory-metric tests — `PASS`.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `PASS` after the
-  core local-disk slice.
-- `cargo +1.89.0 check --workspace --all-targets --locked` — `PASS` for the declared MSRV.
-- `cargo test -p tsink --all-features` — `PASS`: 554 core unit, 17 async, 4 concurrency, 59
+  shared core/server local-disk slice.
+- `cargo +1.89.0 check --workspace --all-targets --locked` — `PASS` for the declared MSRV after
+  the shared core/server local-disk slice.
+- `cargo test -p tsink --all-features` — `PASS`: 586 core unit, 17 async, 4 concurrency, 59
   integration, and all remaining core suites; 0 failures.
 - `cargo test -p tsink-uniffi` — `PASS`: 19 unit, 13 integration, and 1 configuration test.
 - `cargo test -p tsink-server status_and_metrics_report_core_local_disk_scope_when_persistent` —
-  `PASS`; `cargo doc --workspace --all-features --no-deps` — `PASS`.
-- `disk_budget::tests` — `PASS` (16 tests), including concurrent final-byte admission, logical and
+  `PASS`; `cargo doc --workspace --all-features --no-deps` — `PASS` after the shared server slice.
+- `disk_budget::tests` — `PASS` (24 tests), including concurrent final-byte admission, logical and
   physical headroom, Recovery admission, exclusive reconciliation, category/total overflow and
   underflow invariants, unknown files, and symlink-safe containment.
 - `engine::fs_utils::tests` plus focused segment tests — `PASS`, including exact over-limit cleanup,
@@ -268,6 +299,27 @@ Phase 2 targeted verification completed since that full matrix:
   wrong-version, symlink, missing, and already-over-limit registry-catalog repair.
 - `canonical_atomic_batch_reports_disk_quota_after_over_limit_reopen` and
   `persistent_reopen_reconciles_disk_categories_and_unknown_files` — `PASS`.
+- Server metadata, exemplar, rules, usage-ledger, and managed-control-plane tiny-quota,
+  persist-before-publish, exact-accounting, restart, concurrent-ordering, and torn-tail tests —
+  `PASS`.
+- Direct and internal sidecar disk-quota response tests — `PASS`, including metadata-only,
+  exemplar-only, and rows-committed partial-progress cases; overlapping live-root admin restore is
+  rejected without replacing the live tree.
+- Clustered local sidecar quota tests — `PASS` for metadata and exemplars with no publication,
+  preserved HTTP 413/error code, and existing indeterminate-cluster headers; RPC tests — `PASS`
+  (22 tests), including bounded propagation of a peer's structured disk-quota code.
+- Cluster recovery regression tests — `PASS`: node data restores finish before control consensus is
+  committed, and a failed data restore leaves the existing control state unchanged. HTTP and
+  Graphite shutdown tests also prove active request work is drained beyond the warning threshold.
+- `cargo test -p tsink-server edge_sync::tests` — `PASS` (20 tests) after the mock HTTP fixtures
+  were changed to consume complete bounded requests; the previously timing-sensitive source-runtime
+  replay regression also passed 50 consecutive focused runs.
+- `cargo test --workspace --no-default-features` — `PASS` after that edge-sync fixture hardening.
+- `cargo test -p tsink-server --bin tsink-server --all-features` — `PASS` with loopback permission:
+  599 passed, 1 ignored; the initial sandboxed run was unable to bind its TCP/UDP fixtures.
+- `cargo package -p tsink --list --allow-dirty` and `cargo package -p tsink --allow-dirty` —
+  `PASS`: 249 files, 3.9 MiB unpacked, 702.9 KiB compressed; `GOAL.md`, this progress ledger,
+  `.github`, and `scripts` remain excluded.
 
 The complete matrix will be rerun after the remaining Phase 2 implementation slices. These targeted
 results do not make the phase complete.
@@ -284,6 +336,9 @@ assigned to later roadmap phases.
 - The experimental cluster dedupe log gained optional canonical completion data. Current code reads
   legacy markers, but a duplicate whose legacy marker lacks the original result returns
   `409 idempotency_result_unavailable` rather than fabricating success.
+- The server usage ledger gained an additive batch-line format for atomic multi-tenant
+  reconciliation. It still reads legacy single-record lines and accepts legacy sequence gaps, while
+  unterminated lines, empty batches, and zero or duplicate record sequences fail closed.
 - Canonical Rust and UniFFI/Python write APIs are additive. Existing compatibility write methods
   retain their signatures and all-or-error behavior.
 
@@ -292,28 +347,34 @@ assigned to later roadmap phases.
 - Atomic results identify every rejected row, but the compatibility ingest pipeline cannot always
   identify one causal input; `WriteRejection::cause_index` can therefore be `None`.
 - Standard profiles still default several limits to effectively unlimited values. The effective
-  limits are now inspectable, and persistent core disk accounting/free-space headroom are
-  enforceable, but optional server writers, query budgets, atomic transient-memory reservations,
-  and complete memory accounting are not implemented.
+  limits are now inspectable, and shared core plus integrated server-side disk accounting/free-space
+  headroom are enforceable, but cluster/edge writers, query budgets, atomic transient-memory
+  reservations, and complete memory accounting are not implemented.
 - Memory pressure is pressure on estimated accounted storage state, not process RSS. Excluded byte
   totals remain honestly unknown; query working sets, pending/staged writes, WAL buffers and replay,
   rollup work, remote refresh staging, thread stacks, allocator/runtime overhead, and adapter/server
   state are named but not yet charged.
 - Atomic active-state staging and metadata/exemplar replacement can temporarily clone state; that
   transient memory amplification is not yet measured or governed by a complete resource profile.
-- Exact disk cleanup currently performs a full-tree reconciliation and relies on an internal
-  no-nested-reservation invariant. This is correctness-first but can make repeated cleanup
-  expensive; batching or safe deferred reconciliation is still needed before claiming high
-  cleanup throughput.
-- The core disk coordinator counts arbitrary external files at reconciliation and never deletes
-  them, but it cannot atomically govern concurrent writes by another process. Separate server-side
-  stores also do not yet share its reservations.
+- Exact disk cleanup that removes an owned entry performs a full-tree reconciliation and relies on
+  an internal no-nested-reservation invariant; a no-op orphan pass skips that rescan. This is
+  correctness-first but can make repeated effective cleanup expensive, so batching or safe deferred
+  reconciliation is still needed before claiming high cleanup throughput.
+- Usage metering does not change the response classification of already-completed primary work,
+  but handlers await its bounded blocking append and can therefore add ledger-I/O latency. Usage
+  status, reporting, support-bundle, and export reads still scan the unbounded in-memory ledger; an
+  incremental aggregate plus bounded pagination/streaming remains necessary.
+- The disk coordinator counts arbitrary external files at reconciliation and never deletes them,
+  but it cannot atomically govern concurrent writes by another process. Cluster control,
+  consensus, audit, dedupe, outbox, and edge-queue writers do not yet share its reservations, and
+  their runtime growth can temporarily make accounting stale until reconciliation.
 - There is no data-directory manifest, previous-release golden fixture, or process-kill crash
   harness. `Durable` currently describes the documented synchronization operations, not a
   cross-platform hardware guarantee.
-- Rows, metadata, and exemplars are separate transactions. Sidecar persistence does not yet sync
-  the parent directory, so envelopes containing sidecars are conservatively limited to a
-  `Volatile` acknowledgement.
+- Rows, metadata, and exemplars remain separate transactions, so a later sidecar failure can report
+  partial progress after rows commit. Sidecar replacement now synchronizes the file and parent
+  directory, but response acknowledgements remain conservatively `Volatile` because the envelope
+  and clustered sidecar protocols do not encode an atomic cross-component durability result.
 - Experimental cluster writes are not cross-node transactions. Dedupe keys are not bound to a
   receiver-verified payload fingerprint, and bounded expiry/eviction means dedupe is not
   exactly-once delivery.
@@ -330,10 +391,9 @@ assigned to later roadmap phases.
 
 ## Recommended next three tasks
 
-1. Extend the local-disk coordinator from the core data directory to explicitly scoped optional
-   server stores (metadata/exemplars, control/audit state, cluster logs/outbox, and edge queues),
-   then add restart/failure tests and batch exact cleanup reconciliation without weakening the
-   no-undercount invariant.
+1. Extend the shared local-disk coordinator through experimental cluster control/consensus/audit,
+   dedupe and hinted-handoff outbox writers plus edge queues; add restart/concurrency/failure tests,
+   and batch exact cleanup reconciliation without weakening the no-undercount invariant.
 2. Add a shared query-budget and cancellation abstraction for matched
    series, scanned/returned samples and bytes, intermediate memory, concurrency, regex expansion,
    steps, and wall time. Prove that cancellation and failure release permits and reservations, and

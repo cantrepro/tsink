@@ -88,6 +88,24 @@ impl RollupStateStoreContext<'_> {
         state.last_run_duration_nanos = duration_nanos;
         state.last_error = error;
     }
+
+    pub(super) fn record_rollup_pipeline_error(self, error: &TsinkError) {
+        let policy_ids = self
+            .state
+            .policies
+            .read()
+            .iter()
+            .map(|policy| policy.id.clone())
+            .collect::<Vec<_>>();
+        let message = format!("policy set committed; initial materialization failed: {error}");
+        let mut stats = self.state.policy_stats.write();
+        for policy_id in policy_ids {
+            let state = stats.entry(policy_id).or_default();
+            if state.last_error.is_none() {
+                state.last_error = Some(message.clone());
+            }
+        }
+    }
 }
 
 impl RollupSourceReadContext<'_> {

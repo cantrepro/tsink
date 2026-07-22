@@ -1698,39 +1698,39 @@ fn startup_self_heals_wrong_version_registry_catalog_sidecar() {
 
 #[cfg(unix)]
 #[test]
-fn startup_replaces_registry_catalog_symlink_without_mutating_its_target() {
+fn startup_rejects_registry_catalog_symlink_without_mutating_its_target() {
     use std::os::unix::fs::symlink;
 
     let temp_dir = TempDir::new().unwrap();
     let external_dir = TempDir::new().unwrap();
     let metric = "startup_symlink_registry_catalog";
-    let (checkpoint_path, catalog_path, labels, expected_points) =
-        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    let (_, catalog_path, _, _) = seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
     let original_catalog = std::fs::read(&catalog_path).unwrap();
     let external_catalog = external_dir.path().join("external-catalog.json");
     std::fs::write(&external_catalog, &original_catalog).unwrap();
     std::fs::remove_file(&catalog_path).unwrap();
     symlink(&external_catalog, &catalog_path).unwrap();
 
-    let reopened = open_registry_catalog_restart_fixture(temp_dir.path());
-
-    assert_registry_catalog_restart_fixture_is_healthy(
-        &reopened,
-        temp_dir.path(),
-        &checkpoint_path,
-        metric,
-        &labels,
-        &expected_points,
-    );
+    let err = match StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+    {
+        Ok(_) => panic!("startup must reject a symlinked registry catalog"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("managed file must be a regular file")));
     assert!(
-        !std::fs::symlink_metadata(&catalog_path)
+        std::fs::symlink_metadata(&catalog_path)
             .unwrap()
             .file_type()
             .is_symlink(),
-        "startup repair must replace the in-tree symlink entry"
+        "startup validation must leave the rejected in-tree entry unchanged"
     );
     assert_eq!(std::fs::read(&external_catalog).unwrap(), original_catalog);
-    reopened.close().unwrap();
 }
 
 #[test]

@@ -1493,12 +1493,7 @@ pub(super) async fn handle_internal_ingest_write(
             Ok(applied) => applied,
             Err(err) => {
                 return partial_write_error_response(
-                    internal_error_response(
-                        500,
-                        "metadata_store_failed",
-                        format!("internal metadata ingest failed: {err}"),
-                        true,
-                    ),
+                    internal_server_persistence_error_response("internal metadata ingest", &err),
                     inserted_rows,
                     row_acknowledgement,
                     0,
@@ -1524,12 +1519,7 @@ pub(super) async fn handle_internal_ingest_write(
                 row_acknowledgement
             };
             return partial_write_error_response(
-                internal_error_response(
-                    500,
-                    "exemplar_store_failed",
-                    format!("internal exemplar ingest failed: {err}"),
-                    true,
-                ),
+                internal_server_persistence_error_response("internal exemplar ingest", &err),
                 inserted_rows,
                 acknowledgement,
                 accepted_metadata_updates,
@@ -2621,6 +2611,7 @@ pub(super) async fn handle_internal_restore_data(
     internal_api: Option<&InternalApiConfig>,
     cluster_context: Option<&ClusterRequestContext>,
     admin_path_prefix: Option<&Path>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     if let Err(response) =
         authorize_internal_cluster_request(request, internal_api, cluster_context, false, &[])
@@ -2661,6 +2652,9 @@ pub(super) async fn handle_internal_restore_data(
             return internal_error_response(422, "invalid_data_path", err, false);
         }
     };
+    if let Err(err) = validate_restore_target_outside_live_root(&data_path, local_disk_budget) {
+        return internal_error_response(409, "live_data_path_restore_rejected", err, false);
+    }
 
     match perform_local_data_restore(&snapshot_path, &data_path, cluster_context).await {
         Ok(response) => json_response(200, &response),
@@ -3653,6 +3647,128 @@ mod tests {
             DedupeBeginOutcome::Accepted(reservation) => drop(reservation),
             other => panic!("failed write left an unexpected dedupe state: {other:?}"),
         };
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_write_preserves_sidecar_disk_quota_errors_and_partial_progress() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let metadata_store = Arc::new(
+            MetricMetadataStore::open_with_disk_budget(
+                Some(temp_dir.path()),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("metadata store should open"),
+        );
+        let exemplar_store = Arc::new(
+            ExemplarStore::open_with_disk_budget(
+                Some(temp_dir.path()),
+                Some(Arc::clone(&local_disk_budget)),
+            )
+            .expect("exemplar store should open"),
+        );
+
+        let make_request = |payload: InternalIngestWriteRequest| HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_write".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&payload).expect("payload should serialize"),
+        };
+        let metadata_response = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &make_request(InternalIngestWriteRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: None,
+                tenant_id: Some("team-a".to_string()),
+                required_capabilities: Vec::new(),
+                rows: Vec::new(),
+                metadata_updates: vec![InternalMetricMetadataUpdate {
+                    metric_family_name: "internal_metadata".to_string(),
+                    metric_type: MetricType::Gauge as i32,
+                    help: "must exceed the tiny shared disk quota".to_string(),
+                    unit: String::new(),
+                }],
+                exemplars: Vec::new(),
+            }),
+            Some(&internal_api),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(metadata_response.status, 413);
+        let metadata_error: InternalErrorResponse =
+            serde_json::from_slice(&metadata_response.body).expect("error should decode");
+        assert_eq!(metadata_error.code, "write_disk_quota_exceeded");
+        assert!(!metadata_error.retryable);
+        assert_eq!(
+            response_header_value(&metadata_response, WRITE_PARTIAL_HEADER),
+            None
+        );
+
+        let exemplar_response = handle_internal_ingest_write(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &make_request(InternalIngestWriteRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: None,
+                tenant_id: None,
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: "internal_exemplar".to_string(),
+                    labels: Vec::new(),
+                    data_point: DataPoint::new(1_700_000_000_000, 2.0),
+                }],
+                metadata_updates: Vec::new(),
+                exemplars: vec![InternalWriteExemplar {
+                    metric: "internal_exemplar".to_string(),
+                    series_labels: Vec::new(),
+                    exemplar_labels: vec![Label::new(
+                        "trace_id",
+                        "must-exceed-the-tiny-shared-disk-quota",
+                    )],
+                    timestamp: 1_700_000_000_000,
+                    value: 2.0,
+                }],
+            }),
+            Some(&internal_api),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(exemplar_response.status, 413);
+        let exemplar_error: InternalErrorResponse =
+            serde_json::from_slice(&exemplar_response.body).expect("error should decode");
+        assert_eq!(exemplar_error.code, "write_disk_quota_exceeded");
+        assert!(!exemplar_error.retryable);
+        assert_eq!(
+            response_header_value(&exemplar_response, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header_value(&exemplar_response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("1")
+        );
+
+        let snapshot = local_disk_budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.rejections_total, 2);
     }
 
     #[tokio::test]

@@ -104,51 +104,113 @@ assert_eq!(disk.limits.max_bytes, limits.local_disk_bytes);
 ```
 
 The coordinator scans the root without following symlinks, includes unknown entries in the total,
-and exposes WAL, segments, registry/catalog, tombstone, rollup, temporary, and unknown categories.
-It uses atomic peak-byte reservations so concurrent managed writers cannot collectively admit the
-same remaining capacity. Compaction and retention reserve temporary output before starting.
-Required startup, cleanup, and shutdown recovery work may proceed while the logical cap is already
-exceeded, but still honors the physical free-space floor. Cleanup is followed by an exclusive scan
-so category credits cannot undercount surviving files.
+and exposes WAL, segments, registry/catalog, tombstone, rollup, metadata, exemplar, server-state,
+temporary, and unknown categories. It uses atomic peak-byte reservations so concurrent managed
+writers cannot collectively admit the same remaining capacity. Compaction and retention reserve
+each temporary output before publication; a whole-operation compaction estimate is still pending.
+Required startup, cleanup, and shutdown recovery work may
+proceed while the logical cap is already exceeded, but still honors the physical free-space floor.
+Cleanup that removes an entry is followed by an exclusive scan so category credits cannot
+undercount surviving files; a no-op orphan pass does not rescan the tree.
+Managed file writers validate the final directory entry without following it and reject symlinks or
+other non-regular files, including dangling symlinks. This is static path validation: descriptor-
+relative traversal that remains safe across a hostile concurrent namespace swap is not yet
+implemented. Writers also synchronize every newly created nested-directory entry.
+Budget-integrated atomic server stores clean up only the generated
+`.<target>.tmp-<pid>-<nonce>` shape, where `pid` is a canonical decimal `u32` and `nonce` is exactly
+16 lowercase hexadecimal digits. Matching regular-file or symlink entries can be removed;
+ambiguous matching directories fail startup instead. Core startup additionally rejects symlinked
+owned directory namespaces and removes only exact current-format atomic-write temporaries for
+registry, rollup, tombstone, and compaction-replacement-marker targets, plus
+`.tmp-seg-<16-lowercase-hex>` staging directories. Variable target names are also strict: registry
+deltas use `delta-<16-lowercase-hex>.bin`, tombstone shards use
+`shard-<three-decimal-digits-000-through-255>-<16-lowercase-hex>.bin`, and compaction replacement
+markers use `replace-<16-lowercase-hex>-<16-lowercase-hex>.json`. Pending final compaction markers,
+unknown files, and lookalikes are preserved. Tombstone shard cleanup first validates the complete
+current or legacy manifest and fails closed on unrecognized bytes; it removes only exact canonical
+shard names that the valid manifest does not reference. Filesystem-backed tier tombstone
+directories receive the same durable ancestry linking even though they are intentionally outside
+the local quota.
 
 Opening an existing over-limit directory is supported: existing reads remain available,
 `over_limit` is reported, and new normal growth is rejected. Unknown or host-created entries are
 counted and retained. A snapshot destination resolving inside the managed tree is rejected; an
-outside destination is outside this quota and reports its own I/O failure. Object-store roots are
-outside the quota, and configuring one beneath the managed root is rejected.
+external snapshot destination is outside this quota and reports its own I/O failure. Online restore
+targets that overlap the live managed root are rejected; external restore staging and target
+directories remain unbudgeted. Object-store roots are outside the quota, and any configuration that
+overlaps one with the managed root is rejected.
 
-This is currently a **core data-directory** contract. Optional server metadata, exemplar, cluster,
-control, and edge-sync files stored elsewhere do not share these reservations. If such files happen
-to be beneath the root, a reconciliation classifies/counts them, but their independent writers are
-not yet atomically admitted. Concurrent arbitrary host mutations also cannot be prevented; the
-coordinator tolerates and counts them when reconciled but must not be described as a quota on other
-processes.
+The built-in server opens this coordinator before constructing persistent stores and shares it with
+the core, metric metadata, exemplars, rules, the usage ledger, and managed control-plane state.
+Those writers reserve exact growth, synchronize successful publication, and publish in-memory
+state only after persistence. Read-write storage holds the core data-path lease; server modes that
+do not open a read-write core hold the same canonical process lease themselves. A final startup
+reconciliation waits for outstanding reservations and makes status and metrics reflect every file
+created during bootstrap. On shutdown, HTTP and Graphite request tasks remain owned and are drained
+before storage closes or the process lease is released; the ten-second grace period is a warning
+threshold, not permission to detach a still-running write.
+
+The server flags are `--local-disk-limit`, `--filesystem-free-headroom`, and
+`--maintenance-temp-reserve`; any of them requires `--data-path`. The shared snapshot is reported
+even for compute-only server storage. Direct and internal metadata/exemplar quota failures retain
+their structured resource category and map to HTTP 413, disclosing partial row progress when rows
+already committed.
+
+This is not yet a complete **server data-directory** contract. Experimental cluster control,
+consensus, audit, dedupe and outbox files, plus edge-sync queues, are counted if they live beneath
+the root and startup reconciliation sees them, but their runtime writers do not reserve capacity.
+Clustered metadata/exemplar routing preserves a local or peer's structured disk-quota failure as
+HTTP 413 when the requested acknowledgement count is not met. Online restore targets that overlap
+the live root are rejected; external restore staging or targets and external snapshot destinations
+remain outside this quota. Concurrent arbitrary host mutations cannot be prevented: the coordinator
+tolerates and counts them when reconciled but is not a quota on other processes.
 
 ## Remaining hard-budget work
 
 ### Server-wide local disk
 
 The core now coordinates WAL, segments and indexes, compaction and retention staging,
-registry/catalog files, tombstones, and rollup state. The optional server still writes metadata and
-exemplar stores, usage/control/audit logs, cluster outbox and dedupe logs, edge queues, and restore
-staging through separate persistence paths. A complete server profile needs one explicitly scoped
-root/coordinator (or documented sub-budgets) shared by those writers without weakening tenant
-isolation.
+registry/catalog files, tombstones, and rollup state. The server additionally coordinates metadata,
+exemplars, rules, usage, and managed state through the same root. Experimental cluster and edge
+subsystems still write control/consensus/audit logs, dedupe and outbox logs, and edge queues through
+separate persistence paths. Restore staging outside the live root is also unbudgeted. A complete
+server profile needs reservations or explicitly documented sub-budgets for those remaining paths
+without weakening tenant isolation.
 
 A complete server-wide model still needs:
 
-- atomic reservations in every optional server-side writer;
-- startup and failure-path tests for those additional categories;
+- atomic reservations in the remaining cluster and edge writers;
+- startup, concurrent-admission, and failure-path tests for those additional categories;
 - explicit restore-staging accounting;
+- cleanup of eligible expired data before rejecting normal growth;
+- whole-operation compaction headroom estimation and rollback coverage;
+- a crash-durable coordinator for logically atomic multi-file tombstone and rollup publication;
 - a measured policy for batching exclusive cleanup reconciliation, which currently favors exactness
   over cleanup throughput.
 
 Core tests now cover over-limit recovery, restart reconciliation, unknown files, concurrent
-reservations, compaction preflight, WAL reset, catalog repair, symlink-safe entry replacement,
+reservations, per-output compaction preflight, WAL reset, catalog repair, symlink-safe entry replacement,
 publication rollback after directory-sync failure, and injected partial filesystem-full writes.
+Server tests cover tiny-limit no-publication behavior, exact category accounting, concurrent usage
+append ordering, torn-tail rejection, restart reconciliation across sidecars, compute-only process
+leasing and observability, structured 413 responses with partial progress, and rejection of online
+restore targets that overlap the live root.
 The internal exact-reconciliation helper assumes its caller does not hold a second reservation on
 the same coordinator; batching or a deferred-reconciliation protocol should replace that
 correctness-first constraint before advertising high cleanup throughput.
+
+### Usage accounting
+
+Ordinary durable usage appends run through one bounded blocking lane. Storage reconciliation scans
+on a separate one-permit lane, so a long scan does not occupy the ordinary append lane; its final
+multi-tenant result is appended as one physical batch frame. Handlers await metering, so ledger I/O
+can add response latency, but a ledger failure does not reclassify already-completed primary work as
+a retryable data failure.
+
+The in-memory record history is not bounded. Status, report, support-bundle, and export paths scan
+that history synchronously, and export has no bounded pagination or streaming cursor. An incremental
+aggregate plus bounded read/export APIs is still required before a finite server profile can cover
+usage accounting.
 
 ### Embedded queries
 

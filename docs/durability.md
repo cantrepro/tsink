@@ -70,10 +70,23 @@ provide trustworthy indexed outcomes.
 ## Server sidecars and experimental cluster mode
 
 Metric metadata and exemplars are maintained by server-side stores outside the core row/WAL
-transaction. They stage a full replacement, synchronize the replacement file, rename it, and only
-then publish the staged in-memory state. Their install path does not yet synchronize the parent
-directory, so an HTTP envelope containing either sidecar is conservatively reported as `Volatile`,
-even when its core rows received a stronger WAL acknowledgement.
+transaction. They stage a full replacement, synchronize the replacement file, rename it,
+synchronize the parent directory, and only then publish the staged in-memory state. A failure
+reported after rename restores the preceding file before returning when rollback succeeds. An HTTP
+envelope containing either sidecar is still conservatively reported as `Volatile`, even when its
+core rows received a stronger WAL acknowledgement, because the sidecars do not participate in the
+core WAL transaction or have a WAL-backed acknowledgement contract of their own.
+
+At startup, the budget-integrated metadata, exemplar, rules, and managed-state stores remove only
+temporary entries matching the generated `.<target>.tmp-<pid>-<nonce>` shape while the server holds
+the data-path process lease; `pid` is canonical decimal `u32` text and `nonce` is exactly 16
+lowercase hexadecimal digits. A matching directory is ambiguous and fails startup instead of being
+deleted. A successful removal is synchronized and followed by accounting reconciliation; a no-op
+orphan pass does not rescan the tree. The server independently performs one final reconciliation
+after all persistent stores open. Managed stores durably link newly created nested directories into
+their parents and reject an owned file whose final directory entry is a symlink or another
+non-regular file, including a dangling symlink. These checks are not descriptor-relative and do not
+close the remaining hostile concurrent namespace-swap race.
 
 Rows, metadata, and exemplars do not yet share one cross-component transaction. If a later sidecar
 fails after earlier components commit, HTTP returns a non-success response with

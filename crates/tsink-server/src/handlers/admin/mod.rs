@@ -128,7 +128,8 @@ mod tests {
                 body: Vec::new(),
             },
             Some(usage_accounting.as_ref()),
-        );
+        )
+        .await;
         assert_eq!(response.status, 200);
 
         let body: JsonValue =
@@ -144,5 +145,40 @@ mod tests {
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );
+    }
+
+    #[tokio::test]
+    async fn admin_usage_reconcile_preserves_structured_disk_quota_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should build");
+        let budget = tsink::LocalDiskBudget::open(
+            dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let usage_accounting =
+            UsageAccounting::open_with_disk_budget(Some(dir.path()), Some(Arc::clone(&budget)))
+                .expect("usage accounting should open");
+        let storage = make_storage();
+        tenant::scoped_storage(Arc::clone(&storage), "team-a")
+            .insert_rows(&[Row::with_labels(
+                "usage_metric",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1_700_000_000_000, 7.0),
+            )])
+            .expect("seed write should succeed");
+
+        let response =
+            handle_admin_usage_reconcile(&storage, Some(usage_accounting.as_ref())).await;
+
+        assert_eq!(response.status, 413);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER)
+                && value == "write_disk_quota_exceeded"
+        }));
+        assert!(usage_accounting.export_records(None, None, None).is_empty());
+        assert_eq!(usage_accounting.ledger_status().record_failures_total, 1);
     }
 }

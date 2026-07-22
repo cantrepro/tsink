@@ -442,10 +442,10 @@ impl ControlConsensusRuntime {
             .collect();
     }
 
-    pub fn restore_recovery_snapshot(
+    pub fn preflight_recovery_snapshot(
         &self,
         mut control_state: ControlState,
-        log_snapshot: ControlLogRecoverySnapshot,
+        log_snapshot: &ControlLogRecoverySnapshot,
         force_local_leader: bool,
     ) -> Result<ControlState, String> {
         if force_local_leader {
@@ -463,7 +463,7 @@ impl ControlConsensusRuntime {
                 self.local_node_id
             ));
         }
-        validate_recovery_log_snapshot(&log_snapshot)?;
+        validate_recovery_log_snapshot(log_snapshot)?;
         if control_state.applied_log_index < log_snapshot.snapshot_last_index {
             return Err(format!(
                 "control recovery state applied_log_index {} is older than log snapshot index {}",
@@ -476,6 +476,38 @@ impl ControlConsensusRuntime {
                 control_state.applied_log_index, log_snapshot.commit_index
             ));
         }
+
+        while control_state.applied_log_index < log_snapshot.commit_index {
+            let next_index = control_state.applied_log_index.saturating_add(1);
+            if next_index <= log_snapshot.snapshot_last_index {
+                return Err(format!(
+                    "cannot replay compacted control-log index {} (snapshot index {})",
+                    next_index, log_snapshot.snapshot_last_index
+                ));
+            }
+            let offset = usize::try_from(
+                next_index
+                    .saturating_sub(log_snapshot.snapshot_last_index)
+                    .saturating_sub(1),
+            )
+            .map_err(|_| format!("control-log entry index {next_index} exceeds platform limits"))?;
+            let entry = log_snapshot.entries.get(offset).ok_or_else(|| {
+                format!("missing committed control-log entry at index {next_index}")
+            })?;
+            self.apply_command_locked(&mut control_state, &entry.command, entry.index, entry.term)?;
+        }
+
+        Ok(control_state)
+    }
+
+    pub fn restore_recovery_snapshot(
+        &self,
+        control_state: ControlState,
+        log_snapshot: ControlLogRecoverySnapshot,
+        force_local_leader: bool,
+    ) -> Result<ControlState, String> {
+        let control_state =
+            self.preflight_recovery_snapshot(control_state, &log_snapshot, force_local_leader)?;
 
         let last_log_index = log_snapshot
             .entries

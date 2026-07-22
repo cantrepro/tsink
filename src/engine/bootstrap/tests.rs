@@ -187,6 +187,301 @@ fn planning_rejects_shared_disk_budget_for_a_different_data_root() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn planning_rejects_symlinked_owned_directory_namespaces() {
+    use std::os::unix::fs::symlink;
+
+    type OwnedDirectoryPath = fn(&Path) -> PathBuf;
+    let cases: [(&str, OwnedDirectoryPath); 4] = [
+        ("numeric lane", |data_path| {
+            data_path.join(NUMERIC_LANE_ROOT)
+        }),
+        ("WAL", |data_path| data_path.join(WAL_DIR_NAME)),
+        ("rollups", |data_path| {
+            data_path.join(rollups::ROLLUP_DIR_NAME)
+        }),
+        ("tombstones", |data_path| {
+            data_path.join(NUMERIC_LANE_ROOT).join(format!(
+                "{}.store",
+                crate::engine::tombstone::TOMBSTONES_FILE_NAME
+            ))
+        }),
+    ];
+
+    for (case_name, owned_path) in cases {
+        let temp_dir = TempDir::new().unwrap();
+        let data_path = temp_dir.path().join("data");
+        let external_path = temp_dir.path().join("external");
+        std::fs::create_dir_all(&external_path).unwrap();
+        std::fs::write(external_path.join("sentinel"), b"outside").unwrap();
+
+        let symlink_path = owned_path(&data_path);
+        std::fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+        symlink(&external_path, &symlink_path).unwrap();
+
+        let err = planning_error(&startup_builder(&data_path));
+        assert!(
+            matches!(err, TsinkError::InvalidConfiguration(ref message)
+                if message.contains("managed directory") && message.contains("directory")),
+            "unexpected {case_name} planning error: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(external_path.join("sentinel")).unwrap(),
+            b"outside",
+            "{case_name} validation must not mutate the symlink target"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_rejects_symlinked_owned_files_before_loading_them() {
+    use std::os::unix::fs::symlink;
+
+    type OwnedFilePath = fn(&Path) -> PathBuf;
+    let cases: [(&str, OwnedFilePath); 8] = [
+        ("series snapshot", |data_path| {
+            data_path.join(SERIES_INDEX_FILE_NAME)
+        }),
+        ("legacy series delta", |data_path| {
+            SeriesRegistry::incremental_path(&data_path.join(SERIES_INDEX_FILE_NAME))
+        }),
+        ("registry catalog", |data_path| {
+            registry_catalog::catalog_path(&data_path.join(SERIES_INDEX_FILE_NAME))
+        }),
+        ("segment catalog", |data_path| {
+            data_path.join(tiering::SEGMENT_CATALOG_FILE_NAME)
+        }),
+        ("rollup policies", |data_path| {
+            data_path
+                .join(rollups::ROLLUP_DIR_NAME)
+                .join("policies.json")
+        }),
+        ("rollup state", |data_path| {
+            data_path.join(rollups::ROLLUP_DIR_NAME).join("state.json")
+        }),
+        ("tombstone manifest", |data_path| {
+            data_path
+                .join(NUMERIC_LANE_ROOT)
+                .join(crate::engine::tombstone::TOMBSTONES_FILE_NAME)
+        }),
+        ("WAL publication marker", |data_path| {
+            data_path.join(WAL_DIR_NAME).join("wal.published")
+        }),
+    ];
+
+    for (case_name, owned_path) in cases {
+        let temp_dir = TempDir::new().unwrap();
+        let data_path = temp_dir.path().join("data");
+        let external_file = temp_dir.path().join("external-file");
+        std::fs::write(&external_file, b"outside").unwrap();
+
+        let symlink_path = owned_path(&data_path);
+        std::fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+        symlink(&external_file, &symlink_path).unwrap();
+
+        let err = planning_error(&startup_builder(&data_path));
+        assert!(
+            matches!(err, TsinkError::InvalidConfiguration(ref message)
+                if message.contains("managed file") && message.contains(&symlink_path.display().to_string())),
+            "unexpected {case_name} planning error: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&external_file).unwrap(),
+            b"outside",
+            "{case_name} validation must not read-modify-write the symlink target"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_rejects_a_symlinked_data_path_lock_file() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let external_file = temp_dir.path().join("external-lock-target");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::write(&external_file, b"outside").unwrap();
+    symlink(&external_file, data_path.join(".tsink.lock")).unwrap();
+
+    let err = planning_error(&startup_builder(&data_path));
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("data path lock must be a regular file")));
+    assert_eq!(std::fs::read(&external_file).unwrap(), b"outside");
+}
+
+#[test]
+fn planning_without_orphans_keeps_the_initial_single_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+
+    let plan = StartupPlanningPhase::prepare(&startup_builder(&data_path)).unwrap();
+    assert_eq!(
+        plan.local_disk_budget()
+            .expect("persistent startup should own a disk budget")
+            .snapshot()
+            .reconciliations_total,
+        1
+    );
+}
+
+#[test]
+fn planning_cleans_exact_owned_orphans_before_enforcing_future_growth() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let delta_dir = data_path.join("series_index.delta.d");
+    let rollup_dir = data_path.join(rollups::ROLLUP_DIR_NAME);
+    let tombstone_shards = lane_path.join("tombstones.json.store").join("shards");
+    let replacement_dir = lane_path.join(".compaction-replacements");
+    let segment_level = lane_path.join("segments").join("L0");
+    for directory in [
+        &data_path,
+        &delta_dir,
+        &rollup_dir,
+        &tombstone_shards,
+        &replacement_dir,
+        &segment_level,
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+
+    let owned_files = [
+        data_path.join(".series_index.bin.tmp-123-0000000000000001"),
+        data_path.join(".series_index.catalog.json.tmp-123-0000000000000002"),
+        data_path.join(".segment_catalog.json.tmp-123-0000000000000003"),
+        rollup_dir.join(".policies.json.tmp-123-0000000000000004"),
+        rollup_dir.join(".state.json.tmp-123-0000000000000005"),
+        lane_path.join(".tombstones.json.tmp-123-0000000000000006"),
+        delta_dir.join(".delta-0000000000000007.bin.tmp-123-0000000000000008"),
+        tombstone_shards.join(".shard-007-0000000000000009.bin.tmp-123-000000000000000a"),
+        tombstone_shards.join("shard-007-000000000000000f.bin"),
+        replacement_dir
+            .join(".replace-000000000000000b-000000000000000c.json.tmp-123-000000000000000d"),
+    ];
+    for path in &owned_files {
+        std::fs::write(path, b"stale-owned-bytes").unwrap();
+    }
+    let stale_segment = segment_level.join(".tmp-seg-000000000000000e");
+    std::fs::create_dir_all(&stale_segment).unwrap();
+    std::fs::write(stale_segment.join("chunks.bin"), b"stale-segment-bytes").unwrap();
+
+    let unknown = data_path.join("operator-note.bin");
+    let atomic_lookalike = data_path.join(".series_index.bin.tmp-manual");
+    let marker_lookalike =
+        replacement_dir.join(".replace-not-a-marker.json.tmp-123-000000000000000f");
+    let pending_marker = replacement_dir.join("replace-0000000000000010-0000000000000011.json");
+    let segment_lookalike = segment_level.join(".tmp-seg-not-a-segment-id");
+    let uppercase_atomic_nonce = data_path.join(".series_index.bin.tmp-123-000000000000000A");
+    let uppercase_registry_target =
+        delta_dir.join(".delta-000000000000000A.bin.tmp-123-0000000000000012");
+    let out_of_range_shard =
+        tombstone_shards.join(".shard-256-0000000000000013.bin.tmp-123-0000000000000014");
+    let uppercase_segment_staging = segment_level.join(".tmp-seg-000000000000000A");
+    std::fs::write(&unknown, b"unknown").unwrap();
+    std::fs::write(&atomic_lookalike, b"keep-atomic-lookalike").unwrap();
+    std::fs::write(&marker_lookalike, b"keep-marker-lookalike").unwrap();
+    std::fs::write(&pending_marker, b"pending-recovery-marker").unwrap();
+    std::fs::write(&uppercase_atomic_nonce, b"keep-uppercase-nonce").unwrap();
+    std::fs::write(&uppercase_registry_target, b"keep-uppercase-target").unwrap();
+    std::fs::write(&out_of_range_shard, b"keep-shard-256").unwrap();
+    std::fs::create_dir_all(&segment_lookalike).unwrap();
+    std::fs::write(segment_lookalike.join("note"), b"keep-segment-lookalike").unwrap();
+    std::fs::create_dir_all(&uppercase_segment_staging).unwrap();
+    std::fs::write(
+        uppercase_segment_staging.join("note"),
+        b"keep-uppercase-segment",
+    )
+    .unwrap();
+    let expected_remaining = [
+        std::fs::metadata(&unknown).unwrap().len(),
+        std::fs::metadata(&atomic_lookalike).unwrap().len(),
+        std::fs::metadata(&marker_lookalike).unwrap().len(),
+        std::fs::metadata(&pending_marker).unwrap().len(),
+        std::fs::metadata(&uppercase_atomic_nonce).unwrap().len(),
+        std::fs::metadata(&uppercase_registry_target).unwrap().len(),
+        std::fs::metadata(&out_of_range_shard).unwrap().len(),
+        std::fs::metadata(segment_lookalike.join("note"))
+            .unwrap()
+            .len(),
+        std::fs::metadata(uppercase_segment_staging.join("note"))
+            .unwrap()
+            .len(),
+    ]
+    .into_iter()
+    .sum::<u64>();
+
+    let builder = startup_builder(&data_path).with_local_disk_limit(expected_remaining);
+    let plan = StartupPlanningPhase::prepare(&builder)
+        .expect("recovery cleanup must run even when stale bytes initially exceed the quota");
+
+    for path in &owned_files {
+        assert!(!path.exists(), "owned orphan survived: {}", path.display());
+    }
+    assert!(!stale_segment.exists());
+    assert!(unknown.is_file());
+    assert!(atomic_lookalike.is_file());
+    assert!(marker_lookalike.is_file());
+    assert!(pending_marker.is_file());
+    assert!(uppercase_atomic_nonce.is_file());
+    assert!(uppercase_registry_target.is_file());
+    assert!(out_of_range_shard.is_file());
+    assert!(segment_lookalike.is_dir());
+    assert!(uppercase_segment_staging.is_dir());
+
+    let snapshot = plan.local_disk_budget().unwrap().snapshot();
+    assert_eq!(snapshot.accounted_bytes, expected_remaining);
+    assert_eq!(snapshot.limits.max_bytes, Some(expected_remaining));
+    assert!(!snapshot.over_limit);
+}
+
+#[test]
+fn planning_removes_only_unreferenced_owned_tombstone_shards() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let tombstones_path = lane_path.join(crate::engine::tombstone::TOMBSTONES_FILE_NAME);
+    let expected = HashMap::from([(
+        1,
+        vec![crate::engine::tombstone::TombstoneRange { start: 10, end: 20 }],
+    )]);
+    crate::engine::tombstone::persist_tombstone_updates(&tombstones_path, &expected).unwrap();
+    let referenced = crate::engine::tombstone::referenced_tombstone_shard_files(&tombstones_path)
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(referenced.len(), 1);
+
+    let shards_dir =
+        crate::engine::tombstone::tombstone_store_sidecar_path(&tombstones_path).join("shards");
+    let orphan = shards_dir.join("shard-007-ffffffffffffffff.bin");
+    let reserved_lookalike = shards_dir.join("shard-007-operator-note.bin");
+    std::fs::write(&orphan, b"fully-published-but-unreferenced").unwrap();
+    std::fs::write(&reserved_lookalike, b"not-an-owned-shard-name").unwrap();
+
+    let plan = StartupPlanningPhase::prepare(&startup_builder(&data_path))
+        .expect("startup should safely reclaim only exact unreferenced shard generations");
+    assert!(!orphan.exists());
+    assert_eq!(
+        std::fs::read(&reserved_lookalike).unwrap(),
+        b"not-an-owned-shard-name"
+    );
+    for file_name in referenced {
+        assert!(shards_dir.join(file_name).is_file());
+    }
+    assert_eq!(
+        crate::engine::tombstone::load_tombstones(&tombstones_path).unwrap(),
+        expected
+    );
+    let snapshot = plan.local_disk_budget().unwrap().snapshot();
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.active_reservations, 0);
+}
+
 #[test]
 fn planning_rejects_wal_sublimit_above_normal_disk_growth_capacity() {
     let temp_dir = TempDir::new().unwrap();
@@ -221,6 +516,34 @@ fn planning_rejects_object_store_nested_under_the_managed_data_root() {
             if message.contains("object store path")
                 && message.contains("must be outside managed local data path")
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_rejects_lexically_nested_object_store_symlink_even_when_target_is_external() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let external_path = temp_dir.path().join("external-object-store");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::create_dir_all(&external_path).unwrap();
+    std::fs::write(external_path.join("sentinel"), b"outside").unwrap();
+    let nested_alias = data_path.join("remote");
+    symlink(&external_path, &nested_alias).unwrap();
+
+    let builder = startup_builder(&data_path).with_object_store_path(&nested_alias);
+    let err = planning_error(&builder);
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("object store path")
+                && message.contains("must be outside managed local data path")
+    ));
+    assert_eq!(
+        std::fs::read(external_path.join("sentinel")).unwrap(),
+        b"outside"
+    );
 }
 
 #[test]

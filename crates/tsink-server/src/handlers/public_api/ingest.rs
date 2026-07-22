@@ -211,7 +211,8 @@ pub(crate) async fn handle_remote_write_with_admission(
                         elapsed_nanos_since(started),
                         request.body.len() as u64,
                     ),
-                );
+                )
+                .await;
             }
             return response;
         }
@@ -246,7 +247,8 @@ pub(crate) async fn handle_remote_write_with_admission(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
 
     let mut response = HttpResponse::new(200, Vec::<u8>::new());
     if let Some(consistency) = apply_result.consistency {
@@ -520,7 +522,8 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
                         elapsed_nanos_since(started),
                         request.body.len() as u64,
                     ),
-                );
+                )
+                .await;
             }
             return response;
         }
@@ -550,7 +553,8 @@ pub(crate) async fn handle_otlp_metrics_with_admission(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
 
     let mut encoded = Vec::new();
     if let Err(err) = (ExportMetricsServiceResponse {
@@ -811,7 +815,10 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                 }
                 Err(err) => {
                     return indeterminate_cluster_write_response(partial_write_error_response(
-                        text_response(409, &err),
+                        cluster_sidecar_write_error_response(
+                            "cluster exemplar write rejected",
+                            &err,
+                        ),
                         row_count,
                         (row_count > 0).then_some(WriteAcknowledgement::Volatile),
                         0,
@@ -843,7 +850,8 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                 elapsed_nanos_since(started),
                 request.body.len() as u64,
             ),
-        );
+        )
+        .await;
 
         let mut response = HttpResponse::new(200, Vec::<u8>::new());
         if let Some(consistency) = weakest_write_consistency(
@@ -930,7 +938,8 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                 elapsed_nanos_since(started),
                 request.body.len() as u64,
             ),
-        );
+        )
+        .await;
         let mut response = HttpResponse::new(200, Vec::<u8>::new());
         if let Some(acknowledgement) = acknowledgement {
             response = response.with_header(WRITE_ACKNOWLEDGEMENT_HEADER, acknowledgement.as_str());
@@ -961,7 +970,8 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                     elapsed_nanos_since(started),
                     request.body.len() as u64,
                 ),
-            );
+            )
+            .await;
             let mut response = HttpResponse::new(200, Vec::<u8>::new())
                 .with_header("X-Tsink-Exemplars-Accepted", outcome.accepted.to_string())
                 .with_header("X-Tsink-Exemplars-Dropped", outcome.dropped.to_string());
@@ -988,10 +998,11 @@ pub(crate) async fn handle_prometheus_import_with_admission(
                         elapsed_nanos_since(started),
                         request.body.len() as u64,
                     ),
-                );
+                )
+                .await;
             }
             partial_write_error_response(
-                text_response(500, &format!("exemplar import failed: {err}")),
+                server_persistence_error_response("exemplar import", &err),
                 row_count,
                 acknowledgement,
                 0,

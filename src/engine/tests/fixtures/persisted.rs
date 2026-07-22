@@ -116,6 +116,31 @@ pub(in crate::engine::storage_engine::tests) fn reopen_persistent_rollup_storage
     root: &Path,
 ) -> Arc<ChunkStorage> {
     let storage = persistent_rollup_storage(root);
+    hydrate_reopened_rollup_storage(root, storage)
+}
+
+pub(in crate::engine::storage_engine::tests) fn reopen_persistent_rollup_storage_with_disk_budget(
+    root: &Path,
+    local_disk_budget: Arc<crate::LocalDiskBudget>,
+) -> Arc<ChunkStorage> {
+    let mut options = base_storage_test_options(TimestampPrecision::Milliseconds, None);
+    options.retention_enforced = false;
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+            8,
+            None,
+            Some(root.join(NUMERIC_LANE_ROOT)),
+            Some(root.join(BLOB_LANE_ROOT)),
+            1,
+            options,
+            Some(local_disk_budget),
+        )
+        .unwrap(),
+    );
+    hydrate_reopened_rollup_storage(root, storage)
+}
+
+fn hydrate_reopened_rollup_storage(root: &Path, storage: Arc<ChunkStorage>) -> Arc<ChunkStorage> {
     storage.load_tombstones_index().unwrap();
 
     let snapshot_path = root.join(SERIES_INDEX_FILE_NAME);

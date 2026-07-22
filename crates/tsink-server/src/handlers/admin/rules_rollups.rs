@@ -24,7 +24,21 @@ pub(crate) async fn handle_admin_rules_apply(
                 "data": snapshot,
             }),
         ),
-        Err(err) => text_response(400, &err),
+        Err(err) => rules_apply_error_response(err),
+    }
+}
+
+fn rules_apply_error_response(err: RulesApplyError) -> HttpResponse {
+    match err {
+        RulesApplyError::Rejected(detail) => text_response(400, &detail),
+        RulesApplyError::Persistence(source) => {
+            server_persistence_error_response("rules apply", &source)
+        }
+        RulesApplyError::Internal(detail) => indeterminate_backend_write_error_response(
+            500,
+            "write_internal",
+            &format!("rules apply failed: {detail}"),
+        ),
     }
 }
 
@@ -87,7 +101,7 @@ pub(crate) async fn handle_admin_rollups_apply(
                 "data": snapshot,
             }),
         ),
-        Err(err) => text_response(400, &format!("rollup apply failed: {err}")),
+        Err(err) => rollup_error_response("rollup apply", &err),
     }
 }
 
@@ -100,7 +114,7 @@ pub(crate) async fn handle_admin_rollups_run(storage: &Arc<dyn Storage>) -> Http
                 "data": snapshot,
             }),
         ),
-        Err(err) => text_response(400, &format!("rollup run failed: {err}")),
+        Err(err) => rollup_error_response("rollup run", &err),
     }
 }
 
@@ -112,4 +126,83 @@ pub(crate) async fn handle_admin_rollups_status(storage: &Arc<dyn Storage>) -> H
             "data": storage.observability_snapshot().rollups,
         }),
     )
+}
+
+fn rollup_error_response(action: &str, err: &tsink::TsinkError) -> HttpResponse {
+    match err {
+        tsink::TsinkError::InvalidConfiguration(_)
+        | tsink::TsinkError::UnsupportedOperation { .. } => {
+            text_response(400, &format!("{action} rejected: {err}"))
+        }
+        _ => server_persistence_error_response(action, err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollup_quota_failure_is_a_structured_413() {
+        let response = rollup_error_response(
+            "rollup apply",
+            &tsink::TsinkError::DiskQuotaExceeded {
+                limit: 10,
+                used: 9,
+                reserved: 0,
+                requested: 2,
+            },
+        );
+
+        assert_eq!(response.status, 413);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER)
+                && value == "write_disk_quota_exceeded"
+        }));
+    }
+
+    #[test]
+    fn rollup_validation_failure_remains_a_400() {
+        let response = rollup_error_response(
+            "rollup apply",
+            &tsink::TsinkError::InvalidConfiguration("bad policy".to_string()),
+        );
+
+        assert_eq!(response.status, 400);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(name, _)| { !name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER) }));
+    }
+
+    #[test]
+    fn rules_quota_failure_is_a_structured_413() {
+        let response = rules_apply_error_response(RulesApplyError::Persistence(
+            tsink::TsinkError::DiskQuotaExceeded {
+                limit: 10,
+                used: 9,
+                reserved: 0,
+                requested: 2,
+            },
+        ));
+
+        assert_eq!(response.status, 413);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER)
+                && value == "write_disk_quota_exceeded"
+        }));
+    }
+
+    #[test]
+    fn rules_validation_failure_remains_a_400() {
+        let response = rules_apply_error_response(RulesApplyError::Rejected(
+            "invalid rules configuration".to_string(),
+        ));
+
+        assert_eq!(response.status, 400);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(name, _)| { !name.eq_ignore_ascii_case(WRITE_ERROR_CODE_HEADER) }));
+    }
 }

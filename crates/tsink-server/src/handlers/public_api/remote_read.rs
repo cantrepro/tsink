@@ -196,7 +196,8 @@ pub(crate) async fn handle_remote_read_with_admission(
             elapsed_nanos_since(started),
             request.body.len() as u64,
         ),
-    );
+    )
+    .await;
     let mut raw = Vec::new();
     if let Err(err) = response.encode(&mut raw) {
         return text_response(500, &format!("failed to encode response: {err}"));

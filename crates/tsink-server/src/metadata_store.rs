@@ -2,10 +2,8 @@ use crate::prom_remote::MetricType;
 use crate::prom_write::NormalizedMetricMetadataUpdate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const METADATA_STORE_FILE_NAME: &str = "metric-metadata-store.json";
@@ -37,6 +35,7 @@ struct PersistedMetricMetadataStore {
 #[derive(Debug)]
 pub struct MetricMetadataStore {
     path: Option<PathBuf>,
+    local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
     entries: RwLock<MetricMetadataEntries>,
 }
 
@@ -45,12 +44,44 @@ impl MetricMetadataStore {
     pub fn in_memory() -> Self {
         Self {
             path: None,
+            local_disk_budget: None,
             entries: RwLock::new(BTreeMap::new()),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_path: Option<&Path>) -> Result<Self, String> {
+        Self::open_with_disk_budget(data_path, None)
+    }
+
+    pub fn open_with_disk_budget(
+        data_path: Option<&Path>,
+        local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         let path = data_path.map(|path| path.join(METADATA_STORE_FILE_NAME));
+        match (path.as_deref(), local_disk_budget.as_ref()) {
+            (Some(path), Some(budget)) => {
+                budget.cleanup_atomic_write_temps(path).map_err(|err| {
+                    format!(
+                        "failed to clean metric metadata temporary files for {}: {err}",
+                        path.display()
+                    )
+                })?;
+                budget.validate_managed_file_path(path).map_err(|err| {
+                    format!(
+                        "failed to validate metric metadata store {}: {err}",
+                        path.display()
+                    )
+                })?;
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "metric metadata cannot use a local disk budget without a data path"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
         let entries = if let Some(path) = path.as_ref() {
             load_entries(path)?
         } else {
@@ -59,6 +90,7 @@ impl MetricMetadataStore {
 
         Ok(Self {
             path,
+            local_disk_budget,
             entries: RwLock::new(entries),
         })
     }
@@ -67,12 +99,12 @@ impl MetricMetadataStore {
         &self,
         tenant_id: &str,
         updates: &[NormalizedMetricMetadataUpdate],
-    ) -> Result<usize, String> {
+    ) -> tsink::Result<usize> {
         if updates.is_empty() {
             return Ok(0);
         }
 
-        let mut entries = self.write_entries()?;
+        let mut entries = self.write_entries().map_err(tsink::TsinkError::Other)?;
         let mut staged_entries = entries.clone();
         let mut changed = 0usize;
         let mut updated_unix_ms = unix_timestamp_millis();
@@ -134,7 +166,7 @@ impl MetricMetadataStore {
     pub fn snapshot_into(&self, snapshot_path: &Path) -> Result<(), String> {
         let snapshot_file = snapshot_path.join(METADATA_STORE_FILE_NAME);
         let entries = self.read_entries()?;
-        write_store_file(&snapshot_file, &entries)
+        write_store_file(&snapshot_file, &entries, None).map_err(|err| err.to_string())
     }
 
     #[cfg(test)]
@@ -154,11 +186,11 @@ impl MetricMetadataStore {
             .map_err(|_| "metric metadata store write lock poisoned".to_string())
     }
 
-    fn persist_entries(&self, entries: &MetricMetadataEntries) -> Result<(), String> {
+    fn persist_entries(&self, entries: &MetricMetadataEntries) -> tsink::Result<()> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        write_store_file(path, entries)
+        write_store_file(path, entries, self.local_disk_budget.as_ref())
     }
 }
 
@@ -221,56 +253,25 @@ fn load_entries(path: &Path) -> Result<BTreeMap<(String, String), MetricMetadata
 fn write_store_file(
     path: &Path,
     entries: &BTreeMap<(String, String), MetricMetadataRecord>,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create metric metadata directory {}: {err}",
-                parent.display()
-            )
-        })?;
-    }
-
+    local_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
+) -> tsink::Result<()> {
     let persisted = PersistedMetricMetadataStore {
         magic: METADATA_STORE_MAGIC.to_string(),
         schema_version: METADATA_STORE_SCHEMA_VERSION,
         entries: entries.values().cloned().collect(),
     };
-    let mut encoded = serde_json::to_vec_pretty(&persisted)
-        .map_err(|err| format!("failed to serialize metric metadata store: {err}"))?;
+    let mut encoded = serde_json::to_vec_pretty(&persisted)?;
     encoded.push(b'\n');
 
-    let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open temporary metric metadata store {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    file.write_all(&encoded).map_err(|err| {
-        format!(
-            "failed to write temporary metric metadata store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|err| {
-        format!(
-            "failed to fsync temporary metric metadata store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace metric metadata store {} with {}: {err}",
-            path.display(),
-            tmp_path.display()
-        )
-    })
+    if let Some(local_disk_budget) = local_disk_budget {
+        return local_disk_budget.write_file_atomically_and_sync_parent(
+            path,
+            &encoded,
+            tsink::DiskCategory::Metadata,
+        );
+    }
+
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, &encoded)
 }
 
 fn unix_timestamp_millis() -> u64 {
@@ -440,11 +441,11 @@ mod tests {
             )
             .expect("initial metadata update should persist");
 
-        let tmp_path = store
+        let store_path = store
             .file_path()
-            .expect("persistent store should expose file path")
-            .with_extension("tmp");
-        std::fs::create_dir(&tmp_path).expect("blocking temporary path should build");
+            .expect("persistent store should expose file path");
+        std::fs::remove_file(store_path).expect("persisted store should be removable");
+        std::fs::create_dir(store_path).expect("blocking publication path should build");
 
         let error = store
             .apply_updates(
@@ -464,8 +465,8 @@ mod tests {
                     },
                 ],
             )
-            .expect_err("temporary-path collision should fail persistence");
-        assert!(error.contains("failed to open temporary metric metadata store"));
+            .expect_err("publication-path collision should fail persistence");
+        assert!(matches!(error, tsink::TsinkError::Io(_)), "{error}");
 
         let records = store
             .query("tenant-a", None, 10)
@@ -474,11 +475,259 @@ mod tests {
         assert_eq!(records[0].metric_family_name, "http_requests_total");
         assert_eq!(records[0].help, "original");
 
-        let reopened = MetricMetadataStore::open(Some(temp_dir.path()))
-            .expect("persisted metadata should remain readable");
-        let persisted_records = reopened
-            .query("tenant-a", None, 10)
-            .expect("reopened metadata query should succeed");
-        assert_eq!(persisted_records, records);
+        assert!(
+            std::fs::read_dir(temp_dir.path())
+                .expect("metadata directory should remain readable")
+                .all(|entry| !entry
+                    .expect("metadata directory entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".metric-metadata-store.json.tmp-")),
+            "a failed publication must clean its unique temporary file"
+        );
+    }
+
+    #[test]
+    fn metadata_store_disk_quota_rejection_does_not_publish_updates() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = MetricMetadataStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("persistent metadata store should open");
+
+        let error = store
+            .apply_updates(
+                "tenant-a",
+                &[NormalizedMetricMetadataUpdate {
+                    metric_family_name: "http_requests_total".to_string(),
+                    metric_type: MetricType::Counter,
+                    help: "a deliberately long help string that exceeds the tiny quota".to_string(),
+                    unit: "requests".to_string(),
+                }],
+            )
+            .expect_err("tiny disk quota should reject metadata persistence");
+        assert!(matches!(error, tsink::TsinkError::DiskQuotaExceeded { .. }));
+        assert!(
+            store
+                .query("tenant-a", None, 10)
+                .expect("metadata query should succeed")
+                .is_empty(),
+            "a rejected update must not become visible"
+        );
+        assert!(
+            !store
+                .file_path()
+                .expect("persistent store should expose file path")
+                .exists(),
+            "a rejected update must not publish a store file"
+        );
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.rejections_total, 1);
+    }
+
+    #[test]
+    fn metadata_store_observes_shared_root_usage_and_exact_category_accounting() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let shared_file = temp_dir.path().join("unrecognized-owner.bin");
+        std::fs::write(&shared_file, vec![0_u8; 1_000]).expect("shared file should be written");
+        let budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1_024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = MetricMetadataStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("persistent metadata store should open");
+        let update = NormalizedMetricMetadataUpdate {
+            metric_family_name: "cpu_usage".to_string(),
+            metric_type: MetricType::Gauge,
+            help: "CPU usage".to_string(),
+            unit: "percent".to_string(),
+        };
+
+        let error = store
+            .apply_updates("tenant-a", std::slice::from_ref(&update))
+            .expect_err("other usage beneath the shared root should reject the rewrite");
+        assert!(matches!(error, tsink::TsinkError::DiskQuotaExceeded { .. }));
+        std::fs::remove_file(shared_file).expect("shared file should be removed");
+        budget
+            .reconcile()
+            .expect("shared budget should reconcile after removal");
+        store
+            .apply_updates("tenant-a", &[update])
+            .expect("metadata should persist after releasing shared capacity");
+
+        let file_bytes = std::fs::metadata(
+            store
+                .file_path()
+                .expect("persistent store should expose file path"),
+        )
+        .expect("metadata file should exist")
+        .len();
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, file_bytes);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|usage| usage.category == tsink::DiskCategory::Metadata)
+                .map(|usage| usage.bytes),
+            Some(file_bytes)
+        );
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn shared_budget_restart_recounts_sidecars_and_preserves_reads_at_limit() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let initial_budget =
+            tsink::LocalDiskBudget::open(temp_dir.path(), tsink::LocalDiskLimits::default())
+                .expect("initial disk budget should open");
+        let metadata_store = MetricMetadataStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&initial_budget)),
+        )
+        .expect("metadata store should open");
+        let exemplar_store = crate::exemplar_store::ExemplarStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&initial_budget)),
+        )
+        .expect("exemplar store should open");
+        metadata_store
+            .apply_updates(
+                "tenant-a",
+                &[NormalizedMetricMetadataUpdate {
+                    metric_family_name: "restart_metric".to_string(),
+                    metric_type: MetricType::Gauge,
+                    help: "persisted before restart".to_string(),
+                    unit: "widgets".to_string(),
+                }],
+            )
+            .expect("metadata should persist");
+        exemplar_store
+            .apply_writes(&[crate::exemplar_store::ExemplarWrite {
+                metric: "restart_metric".to_string(),
+                series_labels: vec![tsink::Label::new("job", "restart")],
+                exemplar_labels: vec![tsink::Label::new("trace_id", "persisted")],
+                timestamp: 10,
+                value: 1.0,
+            }])
+            .expect("exemplar should persist");
+        let used_bytes = initial_budget.snapshot().accounted_bytes;
+        assert!(used_bytes > 0);
+        drop(metadata_store);
+        drop(exemplar_store);
+        drop(initial_budget);
+
+        let restarted_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(used_bytes),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("restarted disk budget should recount existing files");
+        let metadata_store = MetricMetadataStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&restarted_budget)),
+        )
+        .expect("metadata store should reopen");
+        let exemplar_store = crate::exemplar_store::ExemplarStore::open_with_disk_budget(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&restarted_budget)),
+        )
+        .expect("exemplar store should reopen");
+
+        let metadata = metadata_store
+            .query("tenant-a", Some("restart_metric"), 10)
+            .expect("metadata should remain readable");
+        assert_eq!(metadata.len(), 1);
+        let exemplars = exemplar_store
+            .query(
+                &[tsink::SeriesSelection::new()
+                    .with_metric("restart_metric")
+                    .with_matcher(tsink::SeriesMatcher::equal("job", "restart"))],
+                0,
+                20,
+                10,
+            )
+            .expect("exemplars should remain readable");
+        assert_eq!(exemplars.len(), 1);
+        assert_eq!(exemplars[0].exemplars.len(), 1);
+
+        let metadata_error = metadata_store
+            .apply_updates(
+                "tenant-a",
+                &[NormalizedMetricMetadataUpdate {
+                    metric_family_name: "restart_metric".to_string(),
+                    metric_type: MetricType::Gauge,
+                    help: "must not replace persisted state at the limit".to_string(),
+                    unit: "widgets".to_string(),
+                }],
+            )
+            .expect_err("metadata growth at the recounted limit should fail");
+        assert!(matches!(
+            metadata_error,
+            tsink::TsinkError::DiskQuotaExceeded { .. }
+        ));
+        let exemplar_error = exemplar_store
+            .apply_writes(&[crate::exemplar_store::ExemplarWrite {
+                metric: "restart_metric".to_string(),
+                series_labels: vec![tsink::Label::new("job", "restart")],
+                exemplar_labels: vec![tsink::Label::new("trace_id", "rejected")],
+                timestamp: 20,
+                value: 2.0,
+            }])
+            .expect_err("exemplar growth at the recounted limit should fail");
+        assert!(matches!(
+            exemplar_error,
+            tsink::TsinkError::DiskQuotaExceeded { .. }
+        ));
+
+        let snapshot = restarted_budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, used_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.rejections_total, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budgeted_store_rejects_a_symlinked_owned_file() {
+        let temp_dir = TempDir::new().expect("temp dir should build");
+        let outside = temp_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside-state").expect("outside file should write");
+        std::os::unix::fs::symlink(&outside, temp_dir.path().join(METADATA_STORE_FILE_NAME))
+            .expect("managed-file symlink should build");
+        let budget =
+            tsink::LocalDiskBudget::open(temp_dir.path(), tsink::LocalDiskLimits::default())
+                .expect("disk budget should open");
+
+        let error = MetricMetadataStore::open_with_disk_budget(Some(temp_dir.path()), Some(budget))
+            .expect_err("the owned store path must not be followed through a symlink");
+        assert!(error.contains("must be a regular file"), "{error}");
+        assert_eq!(
+            std::fs::read(&outside).expect("outside file should remain readable"),
+            b"outside-state"
+        );
     }
 }

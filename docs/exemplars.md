@@ -182,10 +182,15 @@ The exemplar store is persisted to a single JSON file named `exemplar-store.json
 }
 ```
 
-Each store update writes complete replacement content to `exemplar-store.tmp`, syncs that file,
-renames it over `exemplar-store.json`, and only then publishes the corresponding in-memory state.
-The parent directory is not yet synchronized, so this is not reported as a crash-durable
-acknowledgement; see the [durability contract](durability.md).
+Each store update writes complete replacement content to a unique hidden
+`.exemplar-store.json.tmp-<pid>-<nonce>` file, syncs that file, renames it over
+`exemplar-store.json`, synchronizes the parent directory, and only then publishes the corresponding
+in-memory state. The PID uses canonical decimal `u32` text and the nonce is exactly 16 lowercase
+hexadecimal digits. A reported post-rename failure restores the prior file when rollback succeeds.
+The server still reports the complete HTTP envelope conservatively as `volatile` because this
+sidecar is outside the core row WAL transaction; see the [durability contract](durability.md). On
+startup, only orphan replacements matching that generated shape are removed while the data-path
+process lease is held.
 
 On startup the file is loaded back in full and reconstructed into the in-memory BTree index. If the file does not exist the store starts empty. A magic-string or schema-version mismatch causes the server to refuse to start with an error.
 
