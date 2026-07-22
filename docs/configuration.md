@@ -153,9 +153,10 @@ the configured filesystem headroom. The headroom plus reserve must fit in the su
 range.
 
 Quota-aware admission currently covers core storage, metric metadata, exemplars, rules, the usage
-ledger, and managed control-plane state. Cluster control state and log, cluster audit,
-deduplication and outbox files, and edge queues do not yet reserve against this budget. External
-snapshot destinations and external restore staging or target directories are also outside it.
+ledger, managed control-plane state, and the experimental hinted-handoff outbox. Cluster control
+state and log, cluster audit, deduplication files, and edge queues do not yet reserve against this
+budget. External snapshot destinations and external restore staging or target directories are also
+outside it.
 Snapshot destinations inside the managed root are rejected, as are online restore targets that
 overlap the live `--data-path`; describing external destinations as unbudgeted does not permit a
 restore over or inside the running server's data tree. Files beneath `--data-path` can still appear
@@ -293,6 +294,12 @@ These variables configure the experimental cluster subsystem. They are all read 
 ### 6.3 Hinted handoff outbox
 
 When a replica is temporarily unreachable, writes are queued in an on-disk outbox (backed by a WAL) and replayed once the replica recovers.
+
+When a shared local-disk coordinator is configured, each Put reserves growth in the `Cluster`
+category before publishing queue state. A rejected reservation is reported as a disk resource limit
+and maps to HTTP 413. The Ack append can use Recovery admission at the logical quota and then
+attempts bounded, parent-synchronized cleanup compaction. A compaction failure remains observable
+cleanup debt for the background worker to retry; it does not undo a durable Ack or reschedule.
 
 | Variable | Default | Description |
 |---|---|---|

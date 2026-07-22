@@ -240,8 +240,13 @@ When a remote write fails for a replica that is only temporarily unavailable,
 `HintedHandoffOutbox` stores the rows in a bounded per-peer queue backed by an append-only log so
 they can be replayed once the peer recovers. The log is flushed for process-restart recovery, but
 each Put or Ack record is also synchronized with `sync_data` before the corresponding in-memory
-state change. Compaction synchronizes its replacement file before rename but does not yet sync the
-parent directory afterward.
+state change. Compaction synchronizes its replacement file, atomically renames it, and synchronizes
+the parent directory. When the server has a shared local-disk coordinator, Put appends reserve
+`Cluster` growth before publication. An Ack append can use Recovery admission when the logical
+quota is exhausted and then triggers a bounded cleanup attempt. Current-format replacements shrink
+under Recovery admission; legacy default-field normalization uses normal Growth admission if its
+replacement is larger. A failed post-record compaction remains observable cleanup debt for the
+background worker; it does not change the durable Ack or reschedule outcome.
 
 The outbox maintains:
 - An in-memory queue per destination node, bounded by `TSINK_CLUSTER_OUTBOX_MAX_PEER_BYTES` (default 256 MiB).

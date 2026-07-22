@@ -575,6 +575,49 @@ impl LocalDiskBudget {
         )
     }
 
+    /// Removes one explicitly owned managed file and synchronizes its parent directory.
+    ///
+    /// Missing paths are accepted as a no-op without rescanning the tree. Regular files and
+    /// symlinks are unlinked without following the final component; directories and special file
+    /// types are rejected. After an actual removal, accounting is reconciled exactly before return.
+    pub fn remove_managed_file_if_exists_and_sync_parent(
+        self: &Arc<Self>,
+        path: &Path,
+        category: DiskCategory,
+    ) -> Result<()> {
+        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        if !self.governs_entry(path)? {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "managed file is outside local disk root {}: {}",
+                self.root.display(),
+                path.display()
+            )));
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            }
+            Ok(metadata) => {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "managed file cleanup found unsupported entry type {:?}: {}",
+                    metadata.file_type(),
+                    path.display()
+                )))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        }
+        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+            path,
+            Some(self),
+            category,
+        )
+    }
+
     /// Removes generated atomic-write temporaries whose final target name is explicitly owned by
     /// the caller. The directory is not created when absent.
     pub(crate) fn cleanup_atomic_write_temps_matching_targets<F>(
@@ -722,6 +765,131 @@ impl LocalDiskBudget {
         bytes: &[u8],
         category: DiskCategory,
     ) -> Result<()> {
+        self.write_file_atomically_and_sync_parent_with_kind(
+            path,
+            bytes,
+            category,
+            DiskReservationKind::Growth,
+            false,
+        )
+    }
+
+    /// Atomically rewrites one managed file during recovery or cleanup.
+    ///
+    /// The replacement must not be larger than the existing file. This allows required cleanup to
+    /// proceed while reconciled usage is already above the logical quota, while still reserving the
+    /// temporary replacement against the physical free-space floor.
+    pub fn rewrite_file_atomically_and_sync_parent_for_recovery(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+    ) -> Result<()> {
+        self.write_file_atomically_and_sync_parent_with_kind(
+            path,
+            bytes,
+            category,
+            DiskReservationKind::Recovery,
+            true,
+        )
+    }
+
+    /// Streams an exact-length atomic replacement for logically equivalent cleanup state.
+    ///
+    /// A non-growing replacement uses Recovery admission, so it can release space while the root
+    /// is already above its logical quota. A replacement that grows because legacy records gain
+    /// explicit fields uses normal Growth admission. The callback is bounded to `new_bytes` and
+    /// can therefore encode a large replacement one record at a time.
+    ///
+    /// This is for compaction-like rewrites where both the old and new file represent the same
+    /// logical state. If parent synchronization fails after rename, the replacement can remain
+    /// visible and the method returns an error after reconciling exact on-disk accounting.
+    pub fn rewrite_file_atomically_and_sync_parent_for_cleanup_with<F>(
+        self: &Arc<Self>,
+        path: &Path,
+        new_bytes: u64,
+        category: DiskCategory,
+        write_replacement: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut dyn Write) -> Result<()>,
+    {
+        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let parent = path.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "managed cleanup file has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        self.create_dir_all_and_sync_parents(parent)?;
+        self.validate_managed_file_path(path)?;
+        let previous_bytes = fs::metadata(path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        let kind = if new_bytes <= previous_bytes {
+            DiskReservationKind::Recovery
+        } else {
+            DiskReservationKind::Growth
+        };
+        let reservation = self.reserve(category, new_bytes, kind)?;
+        let write_result = crate::engine::fs_utils::write_file_atomically_and_sync_parent_with(
+            path,
+            new_bytes,
+            write_replacement,
+        );
+
+        match write_result {
+            Ok(()) => {
+                let settlement_result = reservation.commit(new_bytes, 0);
+                let reconciliation_result = self.reconcile_when_idle().map(|_| ());
+                match (settlement_result, reconciliation_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+                    (Err(settlement_err), Err(reconciliation_err)) => {
+                        Err(TsinkError::Other(format!(
+                            "streamed cleanup settlement failed: {settlement_err}; reconciliation failed: {reconciliation_err}"
+                        )))
+                    }
+                }
+            }
+            Err(write_err) => {
+                // The unique temporary or the published target may survive an error. Charge the
+                // admitted peak conservatively, then replace it with an exact tree scan.
+                let settlement_result =
+                    reservation.commit_as(DiskCategory::Temporary, new_bytes, 0);
+                let reconciliation_result = self.reconcile_when_idle().map(|_| ());
+                match (settlement_result, reconciliation_result) {
+                    (Ok(()), Ok(())) => Err(write_err),
+                    (settlement, reconciliation) => {
+                        let mut errors = vec![format!("rewrite failed: {write_err}")];
+                        if let Err(err) = settlement {
+                            errors.push(format!("disk settlement failed: {err}"));
+                        }
+                        if let Err(err) = reconciliation {
+                            errors.push(format!("disk reconciliation failed: {err}"));
+                        }
+                        Err(TsinkError::Other(format!(
+                            "streamed cleanup rewrite of {} failed: {}",
+                            path.display(),
+                            errors.join("; ")
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_file_atomically_and_sync_parent_with_kind(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+        kind: DiskReservationKind,
+        require_non_growing: bool,
+    ) -> Result<()> {
         let _mutation_guard = self.managed_file_mutation_lock.lock();
         let parent = path.parent().ok_or_else(|| {
             TsinkError::InvalidConfiguration(format!(
@@ -744,13 +912,24 @@ impl LocalDiskBudget {
                 })
             }
         };
+        if require_non_growing {
+            let previous_bytes = previous.as_ref().map_or(0, Vec::len);
+            if bytes.len() > previous_bytes {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "recovery rewrite for {} would grow managed state from {} to {} bytes",
+                    path.display(),
+                    previous_bytes,
+                    bytes.len()
+                )));
+            }
+        }
 
         let write_result = crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted(
             path,
             bytes,
             Some(self),
             category,
-            DiskReservationKind::Growth,
+            kind,
         );
         let Err(write_err) = write_result else {
             return Ok(());
@@ -806,6 +985,40 @@ impl LocalDiskBudget {
         bytes: &[u8],
         category: DiskCategory,
     ) -> Result<()> {
+        self.append_file_and_sync_parent_with_kind(
+            path,
+            bytes,
+            category,
+            DiskReservationKind::Growth,
+        )
+    }
+
+    /// Appends a cleanup or acknowledgement record with recovery admission.
+    ///
+    /// Recovery admission may proceed while reconciled usage is already above the logical quota,
+    /// but it still enforces the configured physical free-space floor. Callers must pair temporary
+    /// recovery growth with bounded cleanup that can reclaim the superseded state.
+    pub fn append_file_and_sync_parent_for_recovery(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+    ) -> Result<()> {
+        self.append_file_and_sync_parent_with_kind(
+            path,
+            bytes,
+            category,
+            DiskReservationKind::Recovery,
+        )
+    }
+
+    fn append_file_and_sync_parent_with_kind(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: &[u8],
+        category: DiskCategory,
+        kind: DiskReservationKind,
+    ) -> Result<()> {
         let _mutation_guard = self.managed_file_mutation_lock.lock();
         let parent = path.parent().ok_or_else(|| {
             TsinkError::InvalidConfiguration(format!(
@@ -824,7 +1037,7 @@ impl LocalDiskBudget {
         let requested = u64::try_from(bytes.len()).map_err(|_| {
             TsinkError::Other("append byte count exceeds the supported byte range".to_string())
         })?;
-        let reservation = self.reserve(category, requested, DiskReservationKind::Growth)?;
+        let reservation = self.reserve(category, requested, kind)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1968,6 +2181,191 @@ mod tests {
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.maintenance_reserved_bytes, 0);
         assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn recovery_append_and_shrinking_rewrite_restore_exact_accounting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cluster/outbox.log");
+        let budget = budget_with_space(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(4),
+                ..LocalDiskLimits::default()
+            },
+            1_000,
+        );
+
+        budget
+            .append_file_and_sync_parent(&path, b"1234", DiskCategory::Cluster)
+            .unwrap();
+        assert_eq!(budget.snapshot().accounted_bytes, 4);
+        budget
+            .append_file_and_sync_parent_for_recovery(&path, b"5", DiskCategory::Cluster)
+            .unwrap();
+        let over_limit = budget.snapshot();
+        assert_eq!(over_limit.accounted_bytes, 5);
+        assert!(over_limit.over_limit);
+
+        budget
+            .rewrite_file_atomically_and_sync_parent_for_recovery(
+                &path,
+                b"12",
+                DiskCategory::Cluster,
+            )
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"12");
+        let recovered = budget.snapshot();
+        assert_eq!(recovered.accounted_bytes, 2);
+        assert!(!recovered.over_limit);
+        assert_eq!(recovered.reserved_bytes, 0);
+        assert_eq!(recovered.active_reservations, 0);
+        assert_eq!(
+            recovered
+                .categories
+                .iter()
+                .find(|usage| usage.category == DiskCategory::Cluster)
+                .map(|usage| usage.bytes),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn recovery_rewrite_rejects_growth_without_mutating_file_or_accounting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cluster/outbox.log");
+        let budget = budget_with_space(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8),
+                ..LocalDiskLimits::default()
+            },
+            1_000,
+        );
+        budget
+            .append_file_and_sync_parent(&path, b"1234", DiskCategory::Cluster)
+            .unwrap();
+        let before = budget.snapshot();
+
+        let err = budget
+            .rewrite_file_atomically_and_sync_parent_for_recovery(
+                &path,
+                b"12345",
+                DiskCategory::Cluster,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+        assert_eq!(fs::read(&path).unwrap(), b"1234");
+        let after = budget.snapshot();
+        assert_eq!(after.accounted_bytes, before.accounted_bytes);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.categories, before.categories);
+    }
+
+    #[test]
+    fn streamed_cleanup_rewrite_supports_bounded_chunks_and_exact_accounting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cluster/outbox.log");
+        let budget = budget_with_space(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(64),
+                ..LocalDiskLimits::default()
+            },
+            1_000,
+        );
+        budget
+            .append_file_and_sync_parent(&path, b"0123456789", DiskCategory::Cluster)
+            .unwrap();
+
+        budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                &path,
+                6,
+                DiskCategory::Cluster,
+                |writer| {
+                    writer.write_all(b"ab")?;
+                    writer.write_all(b"cd")?;
+                    writer.write_all(b"ef")?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"abcdef");
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 6);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|usage| usage.category == DiskCategory::Cluster)
+                .map(|usage| usage.bytes),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn streamed_cleanup_rewrite_rejects_declared_length_overrun_without_publication() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cluster/outbox.log");
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        budget
+            .append_file_and_sync_parent(&path, b"old-state", DiskCategory::Cluster)
+            .unwrap();
+        let before = budget.snapshot();
+
+        let err = budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                &path,
+                3,
+                DiskCategory::Cluster,
+                |writer| {
+                    writer.write_all(b"four")?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("exceeded its declared length"));
+        assert_eq!(fs::read(&path).unwrap(), b"old-state");
+        let after = budget.snapshot();
+        assert_eq!(after.accounted_bytes, before.accounted_bytes);
+        assert_eq!(after.categories, before.categories);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
+    }
+
+    #[test]
+    fn recovery_append_can_consume_physical_maintenance_reserve() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cluster/outbox.log");
+        let budget = budget_with_space(
+            temp.path(),
+            LocalDiskLimits {
+                filesystem_free_headroom_bytes: 100,
+                maintenance_temp_reserve_bytes: 50,
+                ..LocalDiskLimits::default()
+            },
+            200,
+        );
+
+        assert!(matches!(
+            budget.append_file_and_sync_parent(&path, &[0; 60], DiskCategory::Cluster),
+            Err(TsinkError::InsufficientDiskSpace {
+                required: 60,
+                available: 50
+            })
+        ));
+        budget
+            .append_file_and_sync_parent_for_recovery(&path, &[0; 60], DiskCategory::Cluster)
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 60);
+        assert_eq!(budget.snapshot().accounted_bytes, 60);
     }
 
     #[test]

@@ -6,13 +6,15 @@ use crate::cluster::rpc::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::Row;
+use tsink::{DiskCategory, LocalDiskBudget, Row, TsinkError};
 
 pub const CLUSTER_OUTBOX_MAX_ENTRIES_ENV: &str = "TSINK_CLUSTER_OUTBOX_MAX_ENTRIES";
 pub const CLUSTER_OUTBOX_MAX_BYTES_ENV: &str = "TSINK_CLUSTER_OUTBOX_MAX_BYTES";
@@ -65,6 +67,46 @@ static CLUSTER_OUTBOX_CLEANUP_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_OUTBOX_STALLED_ALERTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_OUTBOX_STALLED_PEERS: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_OUTBOX_STALLED_OLDEST_AGE_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn injected_compaction_failure_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<Mutex<BTreeSet<PathBuf>>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+struct InjectedCompactionFailureGuard {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for InjectedCompactionFailureGuard {
+    fn drop(&mut self) {
+        injected_compaction_failure_paths()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn fail_compaction_for_test(path: &Path) -> InjectedCompactionFailureGuard {
+    injected_compaction_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    InjectedCompactionFailureGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+fn compaction_failure_injected(path: &Path) -> bool {
+    injected_compaction_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxConfig {
@@ -255,6 +297,7 @@ pub struct OutboxStalledPeerSnapshot {
 pub struct HintedHandoffOutbox {
     path: PathBuf,
     config: OutboxConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: Arc<Mutex<OutboxState>>,
 }
 
@@ -262,7 +305,6 @@ pub struct HintedHandoffOutbox {
 struct OutboxState {
     pending: BTreeMap<u64, OutboxEntry>,
     peer_queued_bytes: BTreeMap<String, u64>,
-    file: File,
     queued_bytes: u64,
     log_bytes: u64,
     log_records: u64,
@@ -318,6 +360,16 @@ pub enum OutboxEnqueueError {
         peer_queued_bytes: u64,
         record_bytes: u64,
     },
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    InsufficientDiskSpace {
+        required: u64,
+        available: u64,
+    },
     Persistence {
         message: String,
     },
@@ -326,6 +378,13 @@ pub enum OutboxEnqueueError {
 impl OutboxEnqueueError {
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Persistence { .. })
+    }
+
+    pub fn is_disk_resource_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::DiskQuotaExceeded { .. } | Self::InsufficientDiskSpace { .. }
+        )
     }
 }
 
@@ -365,6 +424,26 @@ impl std::fmt::Display for OutboxEnqueueError {
                     "outbox peer byte limit reached for node '{node_id}': queued {peer_queued_bytes} + record {record_bytes} > max {max_peer_bytes}"
                 )
             }
+            Self::DiskQuotaExceeded {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "outbox local disk quota exceeded: limit {limit} bytes, used {used} bytes, reserved {reserved} bytes, requested {requested} bytes"
+                )
+            }
+            Self::InsufficientDiskSpace {
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "outbox local disk headroom exhausted: required {required} bytes, available {available} bytes"
+                )
+            }
             Self::Persistence { message } => {
                 write!(f, "outbox persistence failure: {message}")
             }
@@ -376,6 +455,14 @@ impl std::error::Error for OutboxEnqueueError {}
 
 impl HintedHandoffOutbox {
     pub fn open(path: PathBuf, config: OutboxConfig) -> Result<Self, String> {
+        Self::open_with_disk_budget(path, config, None)
+    }
+
+    pub fn open_with_disk_budget(
+        path: PathBuf,
+        config: OutboxConfig,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         if config.max_entries == 0 {
             return Err("cluster outbox max entries must be greater than zero".to_string());
         }
@@ -420,12 +507,71 @@ impl HintedHandoffOutbox {
         }
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed to create cluster outbox directory {}: {err}",
-                    parent.display()
-                )
-            })?;
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .create_dir_all_and_sync_parents(parent)
+                    .map_err(|err| {
+                        format!(
+                            "failed to create managed cluster outbox directory {}: {err}",
+                            parent.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .cleanup_atomic_write_temps(&path)
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean managed cluster outbox temporaries for {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                let legacy_compaction_temp = path.with_extension("compact.tmp");
+                local_disk_budget
+                    .remove_managed_file_if_exists_and_sync_parent(
+                        &legacy_compaction_temp,
+                        DiskCategory::Temporary,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean legacy cluster outbox compaction file {}: {err}",
+                            legacy_compaction_temp.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .validate_managed_file_path(&path)
+                    .map_err(|err| {
+                        format!(
+                            "invalid managed cluster outbox path {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create cluster outbox directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        if !path.exists() {
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .append_file_and_sync_parent(&path, &[], DiskCategory::Cluster)
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize managed cluster outbox log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                tsink::engine::fs_utils::write_file_atomically_and_sync_parent(&path, &[])
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize cluster outbox log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            }
         }
 
         let mut pending = BTreeMap::new();
@@ -436,7 +582,6 @@ impl HintedHandoffOutbox {
         }
 
         let file = OpenOptions::new()
-            .create(true)
             .append(true)
             .read(true)
             .open(&path)
@@ -464,14 +609,15 @@ impl HintedHandoffOutbox {
             .metadata()
             .map(|metadata| metadata.len())
             .unwrap_or_default();
+        drop(file);
 
         let outbox = Self {
             path,
             config,
+            local_disk_budget,
             state: Arc::new(Mutex::new(OutboxState {
                 pending,
                 peer_queued_bytes,
-                file,
                 queued_bytes,
                 log_bytes,
                 log_records,
@@ -486,7 +632,9 @@ impl HintedHandoffOutbox {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.log_bytes > outbox.config.max_log_bytes {
-                if let Err(err) = compact_locked(&outbox.path, &mut state) {
+                if let Err(err) =
+                    compact_locked(&outbox.path, outbox.local_disk_budget.as_ref(), &mut state)
+                {
                     CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
                     eprintln!("cluster outbox compaction failed during open: {err}");
                 }
@@ -613,16 +761,25 @@ impl HintedHandoffOutbox {
         }
 
         entry.id = state.next_id;
+        // Advance before persistence. A failed append can be indeterminate if rollback also fails;
+        // reusing that id could overwrite a surviving record after restart, while a gap is safe.
         state.next_id = state.next_id.saturating_add(1);
 
         if let Err(err) = append_log_record_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
             &mut state,
             &OutboxLogRecord::Put {
                 entry: entry.clone(),
             },
         ) {
-            CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return Err(OutboxEnqueueError::Persistence { message: err });
+            let enqueue_error = outbox_enqueue_persistence_error(err);
+            if enqueue_error.is_disk_resource_limit() {
+                CLUSTER_OUTBOX_ENQUEUE_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            } else {
+                CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(enqueue_error);
         }
 
         state.queued_bytes = state.queued_bytes.saturating_add(entry.queue_bytes);
@@ -634,10 +791,12 @@ impl HintedHandoffOutbox {
         state.pending.insert(entry.id, entry);
 
         if state.log_bytes > self.config.max_log_bytes {
-            if let Err(err) = compact_locked(&self.path, &mut state) {
-                CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                eprintln!("cluster outbox compaction failed after enqueue: {err}");
-            }
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "enqueue",
+            );
         }
 
         CLUSTER_OUTBOX_ENQUEUED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -793,12 +952,19 @@ impl HintedHandoffOutbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let stale_records = stale_record_count(&state);
+        let disk_growth_capacity_exhausted = self
+            .local_disk_budget
+            .as_deref()
+            .is_some_and(local_disk_growth_capacity_exhausted);
         let should_compact = stale_records > 0
             && (stale_records >= self.config.cleanup_min_stale_records as u64
-                || state.log_bytes > self.config.max_log_bytes);
+                || state.log_bytes > self.config.max_log_bytes
+                || disk_growth_capacity_exhausted);
         if should_compact {
             let previous_log_bytes = state.log_bytes;
-            if let Err(err) = compact_locked(&self.path, &mut state) {
+            if let Err(err) =
+                compact_locked(&self.path, self.local_disk_budget.as_ref(), &mut state)
+            {
                 CLUSTER_OUTBOX_CLEANUP_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 refresh_observability_locked(&mut state, &self.config, now);
@@ -845,7 +1011,13 @@ impl HintedHandoffOutbox {
             return Ok(());
         }
 
-        append_log_record_locked(&mut state, &OutboxLogRecord::Ack { id: entry_id })?;
+        let used_recovery_admission = append_log_record_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
+            &mut state,
+            &OutboxLogRecord::Ack { id: entry_id },
+        )
+        .map_err(|err| err.to_string())?;
         let entry = state.pending.remove(&entry_id);
         if let Some(entry) = entry {
             state.queued_bytes = state.queued_bytes.saturating_sub(entry.queue_bytes);
@@ -857,8 +1029,20 @@ impl HintedHandoffOutbox {
             }
         }
 
-        if state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+        let disk_growth_capacity_exhausted = self
+            .local_disk_budget
+            .as_deref()
+            .is_some_and(local_disk_growth_capacity_exhausted);
+        if state.log_bytes > self.config.max_log_bytes
+            || used_recovery_admission
+            || disk_growth_capacity_exhausted
+        {
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "acknowledgement",
+            );
         }
 
         refresh_observability_locked(&mut state, &self.config, unix_timestamp_millis());
@@ -885,15 +1069,23 @@ impl HintedHandoffOutbox {
         }
 
         append_log_record_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
             &mut state,
             &OutboxLogRecord::Put {
                 entry: entry.clone(),
             },
-        )?;
+        )
+        .map_err(|err| err.to_string())?;
         state.pending.insert(entry.id, entry);
 
         if state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "reschedule",
+            );
         }
 
         refresh_observability_locked(&mut state, &self.config, now);
@@ -954,92 +1146,205 @@ fn load_existing_records(
 }
 
 fn append_log_record_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
     state: &mut OutboxState,
     record: &OutboxLogRecord,
-) -> Result<(), String> {
-    let mut encoded = serde_json::to_vec(record)
-        .map_err(|err| format!("failed to encode outbox log record: {err}"))?;
-    encoded.push(b'\n');
+) -> Result<bool, TsinkError> {
+    let encoded = encode_log_record(record).map_err(TsinkError::Other)?;
 
-    state
-        .file
-        .write_all(&encoded)
-        .map_err(|err| format!("failed to append outbox log record: {err}"))?;
-    state
-        .file
-        .flush()
-        .map_err(|err| format!("failed to flush outbox log record: {err}"))?;
-    state
-        .file
-        .sync_data()
-        .map_err(|err| format!("failed to sync outbox log record: {err}"))?;
+    let used_recovery_admission = if let Some(local_disk_budget) = local_disk_budget {
+        match record {
+            OutboxLogRecord::Put { .. } => {
+                local_disk_budget.append_file_and_sync_parent(
+                    path,
+                    &encoded,
+                    DiskCategory::Cluster,
+                )?;
+                false
+            }
+            OutboxLogRecord::Ack { .. } => {
+                match local_disk_budget.append_file_and_sync_parent(
+                    path,
+                    &encoded,
+                    DiskCategory::Cluster,
+                ) {
+                    Ok(()) => false,
+                    Err(
+                        TsinkError::DiskQuotaExceeded { .. }
+                        | TsinkError::InsufficientDiskSpace { .. },
+                    ) => {
+                        local_disk_budget.append_file_and_sync_parent_for_recovery(
+                            path,
+                            &encoded,
+                            DiskCategory::Cluster,
+                        )?;
+                        true
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    } else {
+        let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+            TsinkError::Other(format!(
+                "failed to open cluster outbox log for append: {err}"
+            ))
+        })?;
+        file.write_all(&encoded).map_err(|err| {
+            TsinkError::Other(format!("failed to append outbox log record: {err}"))
+        })?;
+        file.flush().map_err(|err| {
+            TsinkError::Other(format!("failed to flush outbox log record: {err}"))
+        })?;
+        file.sync_data()
+            .map_err(|err| TsinkError::Other(format!("failed to sync outbox log record: {err}")))?;
+        false
+    };
 
     state.log_bytes = state.log_bytes.saturating_add(encoded.len() as u64);
     state.log_records = state.log_records.saturating_add(1);
-    Ok(())
+    Ok(used_recovery_admission)
 }
 
-fn compact_locked(path: &Path, state: &mut OutboxState) -> Result<(), String> {
-    let temp_path = path.with_extension("compact.tmp");
-    let mut temp_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            format!(
-                "failed to open cluster outbox compaction file {}: {err}",
-                temp_path.display()
-            )
-        })?;
+fn try_compact_after_durable_record_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut OutboxState,
+    operation: &str,
+) {
+    let previous_log_bytes = state.log_bytes;
+    match compact_locked(path, local_disk_budget, state) {
+        Ok(()) => {
+            CLUSTER_OUTBOX_CLEANUP_COMPACTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let reclaimed = previous_log_bytes.saturating_sub(state.log_bytes);
+            if reclaimed > 0 {
+                CLUSTER_OUTBOX_CLEANUP_RECLAIMED_BYTES_TOTAL
+                    .fetch_add(reclaimed, Ordering::Relaxed);
+            }
+        }
+        Err(err) => {
+            // The Put or Ack preceding this best-effort compaction is already durable. Preserve
+            // its successful outcome and leave the stale log records as cleanup debt for retry.
+            CLUSTER_OUTBOX_CLEANUP_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            CLUSTER_OUTBOX_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            eprintln!("cluster outbox compaction deferred after durable {operation} record: {err}");
+        }
+    }
+}
 
-    for entry in state.pending.values() {
-        let mut encoded = serde_json::to_vec(&OutboxLogRecord::Put {
-            entry: entry.clone(),
-        })
-        .map_err(|err| format!("failed to encode outbox entry during compaction: {err}"))?;
-        encoded.push(b'\n');
-        temp_file
-            .write_all(&encoded)
-            .map_err(|err| format!("failed to write outbox compaction record: {err}"))?;
+fn compact_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut OutboxState,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if compaction_failure_injected(path) {
+        return Err("injected cluster outbox compaction failure".to_string());
     }
 
-    temp_file
-        .flush()
-        .map_err(|err| format!("failed to flush outbox compaction file: {err}"))?;
-    temp_file
-        .sync_data()
-        .map_err(|err| format!("failed to sync outbox compaction file: {err}"))?;
-    drop(temp_file);
+    let compacted_bytes = compacted_log_len(&state.pending)?;
 
-    std::fs::rename(&temp_path, path).map_err(|err| {
-        format!(
-            "failed to replace outbox log {} from {}: {err}",
-            path.display(),
-            temp_path.display()
+    if let Some(local_disk_budget) = local_disk_budget {
+        local_disk_budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                path,
+                compacted_bytes,
+                DiskCategory::Cluster,
+                |writer| write_compacted_log(&state.pending, writer).map_err(TsinkError::Other),
+            )
+            .map_err(|err| {
+                format!(
+                    "failed to compact managed cluster outbox log {}: {err}",
+                    path.display()
+                )
+            })?;
+    } else {
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent_with(
+            path,
+            compacted_bytes,
+            |writer| write_compacted_log(&state.pending, writer).map_err(TsinkError::Other),
         )
-    })?;
-
-    let reopened = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)
         .map_err(|err| {
             format!(
-                "failed to reopen compacted outbox log {}: {err}",
+                "failed to compact cluster outbox log {}: {err}",
                 path.display()
             )
         })?;
+    }
 
-    state.log_bytes = reopened
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
+    state.log_bytes = std::fs::metadata(path)
+        .map_err(|err| {
+            format!(
+                "failed to inspect compacted outbox log {}: {err}",
+                path.display()
+            )
+        })?
+        .len();
     state.log_records = state.pending.len() as u64;
-    state.file = reopened;
 
     Ok(())
+}
+
+fn compacted_log_len(pending: &BTreeMap<u64, OutboxEntry>) -> Result<u64, String> {
+    pending.values().try_fold(0u64, |total, entry| {
+        let encoded = encode_log_record(&OutboxLogRecord::Put {
+            entry: entry.clone(),
+        })?;
+        let record_bytes = u64::try_from(encoded.len())
+            .map_err(|_| "encoded outbox record exceeds the supported byte range".to_string())?;
+        total
+            .checked_add(record_bytes)
+            .ok_or_else(|| "compacted outbox log exceeds the supported byte range".to_string())
+    })
+}
+
+fn write_compacted_log(
+    pending: &BTreeMap<u64, OutboxEntry>,
+    writer: &mut dyn Write,
+) -> Result<(), String> {
+    for entry in pending.values() {
+        let encoded = encode_log_record(&OutboxLogRecord::Put {
+            entry: entry.clone(),
+        })?;
+        writer
+            .write_all(&encoded)
+            .map_err(|err| format!("failed to write outbox compaction record: {err}"))?;
+    }
+    Ok(())
+}
+
+fn encode_log_record(record: &OutboxLogRecord) -> Result<Vec<u8>, String> {
+    let mut encoded = serde_json::to_vec(record)
+        .map_err(|err| format!("failed to encode outbox log record: {err}"))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn outbox_enqueue_persistence_error(err: TsinkError) -> OutboxEnqueueError {
+    match err {
+        TsinkError::DiskQuotaExceeded {
+            limit,
+            used,
+            reserved,
+            requested,
+        } => OutboxEnqueueError::DiskQuotaExceeded {
+            limit,
+            used,
+            reserved,
+            requested,
+        },
+        TsinkError::InsufficientDiskSpace {
+            required,
+            available,
+        } => OutboxEnqueueError::InsufficientDiskSpace {
+            required,
+            available,
+        },
+        other => OutboxEnqueueError::Persistence {
+            message: other.to_string(),
+        },
+    }
 }
 
 fn estimate_queue_bytes(entry: &OutboxEntry) -> u64 {
@@ -1057,6 +1362,18 @@ fn update_outbox_gauges(state: &OutboxState) {
 
 fn stale_record_count(state: &OutboxState) -> u64 {
     state.log_records.saturating_sub(state.pending.len() as u64)
+}
+
+fn local_disk_growth_capacity_exhausted(budget: &LocalDiskBudget) -> bool {
+    let snapshot = budget.snapshot();
+    let Some(max_bytes) = snapshot.limits.max_bytes else {
+        return false;
+    };
+    let growth_limit = max_bytes.saturating_sub(snapshot.limits.maintenance_temp_reserve_bytes);
+    snapshot
+        .accounted_bytes
+        .saturating_add(snapshot.reserved_bytes)
+        >= growth_limit
 }
 
 fn refresh_observability_locked(
@@ -1195,10 +1512,12 @@ mod tests {
     use super::*;
     use crate::http::{read_http_request, write_http_response, HttpResponse};
     use crate::{cluster::rpc::InternalIngestRowsResponse, cluster::rpc::RpcClientConfig};
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use tsink::{DataPoint, Label, Row};
+    use tsink::{DataPoint, Label, LocalDiskLimits, Row};
 
     fn sample_rows() -> Vec<Row> {
         vec![
@@ -1215,26 +1534,53 @@ mod tests {
         ]
     }
 
+    fn test_outbox_config() -> OutboxConfig {
+        OutboxConfig {
+            max_entries: 8,
+            max_bytes: 8 * 1024 * 1024,
+            max_peer_bytes: 8 * 1024 * 1024,
+            max_log_bytes: 8 * 1024 * 1024,
+            replay_interval_secs: 1,
+            replay_batch_size: 8,
+            max_backoff_secs: 1,
+            max_record_bytes: 1024 * 1024,
+            cleanup_interval_secs: 1,
+            cleanup_min_stale_records: 1,
+            stalled_peer_age_secs: 1,
+            stalled_peer_min_entries: 1,
+            stalled_peer_min_bytes: 1,
+        }
+    }
+
     fn open_outbox(path: PathBuf) -> HintedHandoffOutbox {
-        HintedHandoffOutbox::open(
-            path,
-            OutboxConfig {
-                max_entries: 8,
-                max_bytes: 8 * 1024 * 1024,
-                max_peer_bytes: 8 * 1024 * 1024,
-                max_log_bytes: 8 * 1024 * 1024,
-                replay_interval_secs: 1,
-                replay_batch_size: 8,
-                max_backoff_secs: 1,
-                max_record_bytes: 1024 * 1024,
-                cleanup_interval_secs: 1,
-                cleanup_min_stale_records: 1,
-                stalled_peer_age_secs: 1,
-                stalled_peer_min_entries: 1,
-                stalled_peer_min_bytes: 1,
-            },
-        )
-        .expect("outbox should open")
+        HintedHandoffOutbox::open(path, test_outbox_config()).expect("outbox should open")
+    }
+
+    fn open_budgeted_outbox(path: PathBuf, budget: Arc<LocalDiskBudget>) -> HintedHandoffOutbox {
+        HintedHandoffOutbox::open_with_disk_budget(path, test_outbox_config(), Some(budget))
+            .expect("budgeted outbox should open")
+    }
+
+    fn encoded_test_enqueue_bytes(idempotency_key: &str) -> u64 {
+        let timestamp = 1_700_000_000_000;
+        let mut entry = OutboxEntry {
+            id: 0,
+            peer_node_id: "node-b".to_string(),
+            endpoint: "127.0.0.1:9302".to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            required_capabilities: Vec::new(),
+            rows: sample_rows().iter().map(InternalRow::from).collect(),
+            queue_bytes: 0,
+            enqueued_unix_ms: timestamp,
+            next_attempt_unix_ms: timestamp,
+            attempts: 0,
+        };
+        entry.queue_bytes = estimate_queue_bytes(&entry);
+        entry.id = 1;
+        encode_log_record(&OutboxLogRecord::Put { entry })
+            .expect("test outbox record should encode")
+            .len() as u64
     }
 
     fn local_stale_record_count(outbox: &HintedHandoffOutbox) -> u64 {
@@ -1243,6 +1589,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         stale_record_count(&state)
+    }
+
+    fn category_bytes(snapshot: &tsink::LocalDiskBudgetSnapshot, category: DiskCategory) -> u64 {
+        snapshot
+            .categories
+            .iter()
+            .find(|usage| usage.category == category)
+            .map_or(0, |usage| usage.bytes)
     }
 
     async fn spawn_success_ingest_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -1345,6 +1699,400 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].node_id, "node-b");
         assert_eq!(peers[0].queued_entries, 1);
+    }
+
+    #[test]
+    fn budgeted_open_compacts_legacy_defaulted_records_with_growth_admission() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("cluster/outbox/node-a.log");
+        std::fs::create_dir_all(path.parent().expect("outbox parent"))
+            .expect("outbox parent should build");
+        let timestamp = 1_700_000_000_000;
+        let entry = OutboxEntry {
+            id: 1,
+            peer_node_id: "node-b".to_string(),
+            endpoint: "127.0.0.1:9302".to_string(),
+            idempotency_key: "tsink:test:budget:legacy-defaults".to_string(),
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            required_capabilities: Vec::new(),
+            rows: sample_rows().iter().map(InternalRow::from).collect(),
+            queue_bytes: 0,
+            enqueued_unix_ms: timestamp,
+            next_attempt_unix_ms: timestamp,
+            attempts: 0,
+        };
+        let mut legacy_value = serde_json::to_value(OutboxLogRecord::Put { entry })
+            .expect("legacy record should encode");
+        let legacy_entry = legacy_value
+            .get_mut("entry")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("encoded Put should contain an entry object");
+        legacy_entry.remove("queue_bytes");
+        legacy_entry.remove("ring_version");
+        let mut legacy_bytes =
+            serde_json::to_vec(&legacy_value).expect("legacy record should serialize");
+        legacy_bytes.push(b'\n');
+        std::fs::write(&path, &legacy_bytes).expect("legacy log should write");
+
+        let budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let mut config = test_outbox_config();
+        config.max_log_bytes = 1;
+        let outbox = HintedHandoffOutbox::open_with_disk_budget(
+            path.clone(),
+            config,
+            Some(Arc::clone(&budget)),
+        )
+        .expect("legacy outbox should open");
+
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 1);
+        let compacted = std::fs::read(&path).expect("compacted log should read");
+        assert!(compacted.len() > legacy_bytes.len());
+        let compacted_value: serde_json::Value =
+            serde_json::from_slice(&compacted).expect("compacted record should decode");
+        assert!(compacted_value["entry"]["queue_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+        assert_eq!(
+            budget.snapshot().accounted_bytes,
+            u64::try_from(compacted.len()).expect("compacted length should fit u64")
+        );
+        assert_eq!(
+            category_bytes(&budget.snapshot(), DiskCategory::Cluster),
+            u64::try_from(compacted.len()).expect("compacted length should fit u64")
+        );
+    }
+
+    #[test]
+    fn budgeted_enqueue_rejects_quota_without_publishing_queue_state() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("cluster/outbox/node-a.log");
+        let budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(1),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let outbox = open_budgeted_outbox(path.clone(), Arc::clone(&budget));
+        let metrics_before = outbox_metrics_snapshot();
+
+        let err = outbox
+            .enqueue_replica_write(
+                "node-b",
+                "127.0.0.1:9302",
+                "tsink:test:budget:reject",
+                &sample_rows(),
+            )
+            .expect_err("enqueue should exceed the shared disk quota");
+
+        assert!(matches!(
+            err,
+            OutboxEnqueueError::DiskQuotaExceeded {
+                limit: 1,
+                used: 0,
+                reserved: 0,
+                requested
+            } if requested > 1
+        ));
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 0);
+        assert_eq!(outbox.backlog_snapshot().log_bytes, 0);
+        assert_eq!(std::fs::metadata(&path).expect("outbox metadata").len(), 0);
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(category_bytes(&snapshot, DiskCategory::Cluster), 0);
+        let metrics_after = outbox_metrics_snapshot();
+        assert!(metrics_after.enqueue_rejected_total > metrics_before.enqueue_rejected_total);
+    }
+
+    #[test]
+    fn budgeted_enqueue_reconciles_cluster_bytes_across_restart() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("cluster/outbox/node-a.log");
+        let budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let outbox = open_budgeted_outbox(path.clone(), Arc::clone(&budget));
+        outbox
+            .enqueue_replica_write(
+                "node-b",
+                "127.0.0.1:9302",
+                "tsink:test:budget:restart",
+                &sample_rows(),
+            )
+            .expect("enqueue should succeed");
+
+        let physical_bytes = std::fs::metadata(&path).expect("outbox metadata").len();
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            physical_bytes
+        );
+        drop(outbox);
+        drop(budget);
+
+        let restarted_budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("restarted disk budget should open");
+        let restarted_snapshot = restarted_budget.snapshot();
+        assert_eq!(restarted_snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(
+            category_bytes(&restarted_snapshot, DiskCategory::Cluster),
+            physical_bytes
+        );
+
+        let reopened = open_budgeted_outbox(path, Arc::clone(&restarted_budget));
+        assert_eq!(reopened.backlog_snapshot().queued_entries, 1);
+        let after_reopen = restarted_budget.snapshot();
+        assert_eq!(after_reopen.accounted_bytes, physical_bytes);
+        assert_eq!(after_reopen.reserved_bytes, 0);
+        assert_eq!(
+            category_bytes(&after_reopen, DiskCategory::Cluster),
+            physical_bytes
+        );
+    }
+
+    #[test]
+    fn concurrent_budgeted_outboxes_cannot_share_the_final_bytes() {
+        let temp = TempDir::new().expect("temp dir");
+        let key_a = "tsink:test:budget:concurrent:a";
+        let key_b = "tsink:test:budget:concurrent:b";
+        let record_bytes = encoded_test_enqueue_bytes(key_a);
+        assert_eq!(record_bytes, encoded_test_enqueue_bytes(key_b));
+        let budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(record_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let outbox_a = Arc::new(open_budgeted_outbox(
+            temp.path().join("cluster/outbox/node-a.log"),
+            Arc::clone(&budget),
+        ));
+        let outbox_b = Arc::new(open_budgeted_outbox(
+            temp.path().join("cluster/outbox/node-b.log"),
+            Arc::clone(&budget),
+        ));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let handles = [(outbox_a, key_a), (outbox_b, key_b)]
+            .into_iter()
+            .map(|(outbox, key)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    outbox.enqueue_replica_write("node-b", "127.0.0.1:9302", key, &sample_rows())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("enqueue thread should finish"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(OutboxEnqueueError::DiskQuotaExceeded { .. })
+                ))
+                .count(),
+            1
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, record_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            record_bytes
+        );
+    }
+
+    #[test]
+    fn budgeted_ack_forces_cleanup_and_drains_at_the_logical_quota() {
+        let temp = TempDir::new().expect("temp dir");
+        let key = "tsink:test:budget:drain";
+        let record_bytes = encoded_test_enqueue_bytes(key);
+        let path = temp.path().join("cluster/outbox/node-a.log");
+        let budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(record_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let mut config = test_outbox_config();
+        config.cleanup_min_stale_records = usize::MAX;
+        let outbox = HintedHandoffOutbox::open_with_disk_budget(
+            path.clone(),
+            config,
+            Some(Arc::clone(&budget)),
+        )
+        .expect("budgeted outbox should open");
+        outbox
+            .enqueue_replica_write("node-b", "127.0.0.1:9302", key, &sample_rows())
+            .expect("enqueue should consume the logical quota");
+        assert_eq!(budget.snapshot().accounted_bytes, record_bytes);
+
+        outbox
+            .ack_entry(1)
+            .expect("recovery acknowledgement should persist at the quota");
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 0);
+        assert_eq!(std::fs::metadata(&path).expect("outbox metadata").len(), 0);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert!(!snapshot.over_limit);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(category_bytes(&snapshot, DiskCategory::Cluster), 0);
+        drop(outbox);
+        drop(budget);
+
+        let restarted_budget = LocalDiskBudget::open(
+            temp.path(),
+            LocalDiskLimits {
+                max_bytes: Some(record_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("restarted disk budget should open");
+        let reopened = open_budgeted_outbox(path, Arc::clone(&restarted_budget));
+        assert_eq!(reopened.backlog_snapshot().queued_entries, 0);
+        assert_eq!(restarted_budget.snapshot().accounted_bytes, 0);
+    }
+
+    #[test]
+    fn durable_ack_succeeds_when_forced_compaction_becomes_cleanup_debt() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("outbox.log");
+        let mut config = test_outbox_config();
+        config.max_log_bytes = 1;
+        let outbox = HintedHandoffOutbox::open(path.clone(), config).expect("outbox should open");
+        outbox
+            .enqueue_replica_write(
+                "node-b",
+                "127.0.0.1:9302",
+                "tsink:test:outbox:ack-cleanup-debt",
+                &sample_rows(),
+            )
+            .expect("enqueue should succeed");
+        let metrics_before = outbox_metrics_snapshot();
+
+        {
+            let _compaction_failure = fail_compaction_for_test(&path);
+            outbox
+                .ack_entry(1)
+                .expect("durable Ack must remain successful when cleanup fails");
+        }
+
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 0);
+        assert!(local_stale_record_count(&outbox) > 0);
+        let metrics_after = outbox_metrics_snapshot();
+        assert!(metrics_after.cleanup_failures_total > metrics_before.cleanup_failures_total);
+        outbox
+            .cleanup_once()
+            .expect("a later cleanup pass should retire the debt");
+        assert_eq!(local_stale_record_count(&outbox), 0);
+        drop(outbox);
+        assert_eq!(open_outbox(path).backlog_snapshot().queued_entries, 0);
+    }
+
+    #[test]
+    fn durable_reschedule_succeeds_when_compaction_becomes_cleanup_debt() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("outbox.log");
+        let mut config = test_outbox_config();
+        config.max_log_bytes = 1;
+        let outbox = HintedHandoffOutbox::open(path.clone(), config).expect("outbox should open");
+        outbox
+            .enqueue_replica_write(
+                "node-b",
+                "127.0.0.1:9302",
+                "tsink:test:outbox:reschedule-cleanup-debt",
+                &sample_rows(),
+            )
+            .expect("enqueue should succeed");
+        let entry = outbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .get(&1)
+            .cloned()
+            .expect("pending entry should exist");
+        let metrics_before = outbox_metrics_snapshot();
+
+        {
+            let _compaction_failure = fail_compaction_for_test(&path);
+            outbox
+                .reschedule_entry(entry, "injected replay failure")
+                .expect("durable reschedule must remain successful when cleanup fails");
+        }
+
+        let state = outbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.pending.get(&1).map(|entry| entry.attempts), Some(1));
+        assert!(stale_record_count(&state) > 0);
+        drop(state);
+        let metrics_after = outbox_metrics_snapshot();
+        assert!(metrics_after.cleanup_failures_total > metrics_before.cleanup_failures_total);
+        outbox
+            .cleanup_once()
+            .expect("a later cleanup pass should retire the debt");
+        assert_eq!(local_stale_record_count(&outbox), 0);
+    }
+
+    #[test]
+    fn budgeted_open_removes_the_exact_legacy_compaction_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("cluster/outbox/node-a.log");
+        let legacy_compaction_temp = path.with_extension("compact.tmp");
+        std::fs::create_dir_all(
+            legacy_compaction_temp
+                .parent()
+                .expect("legacy temp should have a parent"),
+        )
+        .expect("outbox directory should build");
+        std::fs::write(&legacy_compaction_temp, b"stale-compaction")
+            .expect("legacy compaction file should write");
+        let budget = LocalDiskBudget::open(temp.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        assert!(budget.snapshot().accounted_bytes > 0);
+
+        let outbox = open_budgeted_outbox(path, Arc::clone(&budget));
+
+        assert!(!legacy_compaction_temp.exists());
+        assert_eq!(outbox.backlog_snapshot().queued_entries, 0);
+        assert_eq!(budget.snapshot().accounted_bytes, 0);
     }
 
     #[test]

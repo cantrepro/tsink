@@ -762,7 +762,7 @@ fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, 
 
 async fn bootstrap_cluster_runtime(
     config: &ServerConfig,
-    _local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<ClusterBootstrap, String> {
     let mut cluster_context = None;
     let mut internal_api = None;
@@ -833,7 +833,11 @@ async fn bootstrap_cluster_runtime(
         );
         context.dedupe_store = Some(dedupe_store);
 
-        let outbox = Arc::new(build_cluster_outbox_store(config, &context.runtime)?);
+        let outbox = Arc::new(build_cluster_outbox_store(
+            config,
+            &context.runtime,
+            local_disk_budget.clone(),
+        )?);
         eprintln!(
             "cluster hinted-handoff outbox initialized at {}",
             outbox.outbox_path().display()
@@ -1910,6 +1914,7 @@ fn build_cluster_control_store(
 fn build_cluster_outbox_store(
     config: &ServerConfig,
     runtime: &cluster::ClusterRuntime,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<HintedHandoffOutbox, String> {
     let outbox_config = cluster::outbox::OutboxConfig::from_env()?;
     let base_path = config
@@ -1920,7 +1925,14 @@ fn build_cluster_outbox_store(
         "{}.outbox.log",
         sanitize_path_component(&runtime.membership.local_node_id)
     ));
-    HintedHandoffOutbox::open(outbox_path, outbox_config)
+    match local_disk_budget {
+        Some(local_disk_budget) => HintedHandoffOutbox::open_with_disk_budget(
+            outbox_path,
+            outbox_config,
+            Some(local_disk_budget),
+        ),
+        None => HintedHandoffOutbox::open(outbox_path, outbox_config),
+    }
 }
 
 fn build_cluster_control_consensus(

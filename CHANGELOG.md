@@ -21,6 +21,8 @@ compatibility and is not yet covered by a stable support promise.
   acknowledgements, and platform limits.
 - Structured write-rejection, acknowledgement, partial-effect, and indeterminate-outcome metrics
   and HTTP response headers across the principal ingest adapters.
+- Shared local-disk quota admission and exact restart/category accounting for the experimental
+  hinted-handoff outbox, including structured HTTP 413 responses when enqueue growth is rejected.
 
 ### Changed
 
@@ -46,6 +48,9 @@ compatibility and is not yet covered by a stable support promise.
   sidecar effects instead of inventing success. Edge-sync and hinted-handoff replay retain entries
   until a complete canonical atomic result is validated, and edge-sync appends and flushes its
   queue acknowledgement record before removing an entry from memory.
+- Hinted-handoff acknowledgements can append with Recovery admission when the shared disk quota is
+  exhausted, then attempt bounded streaming compaction. A failed post-record compaction remains
+  retryable cleanup debt without changing the already-durable Ack or reschedule outcome.
 
 ### Compatibility
 
@@ -59,6 +64,8 @@ compatibility and is not yet covered by a stable support promise.
 - The cluster dedupe log stores optional completion data for exact retry replay and remains able to
   read older markers without that field; retries of legacy markers now return an explicit conflict
   because their original result cannot be reconstructed.
+- The hinted-handoff log record format is unchanged. Startup additionally removes only the exact
+  legacy compaction temporary path and generated current-format atomic-write temporaries.
 - No core segment or WAL wire-format version changed in this work.
 - Rust versions older than 1.89 are not supported beginning with the next release.
 

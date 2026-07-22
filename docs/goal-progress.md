@@ -175,11 +175,16 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   mutation rejection. Tiny-limit, rollback, restart,
   interruption-point, concurrent append, compute-only observability, typed direct/internal and
   clustered HTTP error, support-bundle status, live-root restore rejection, and data-before-control
-  cluster restore tests cover that slice.
-  Experimental cluster control/consensus/audit/dedupe/outbox writers, edge-sync queues, and
-  external restore staging remain outside the complete boundary. Cleanup-before-growth-rejection,
-  whole-operation compaction preflight, and a crash-durable coordinator for multi-file tombstone and
-  rollup publication also remain incomplete, so the disk item is not `DONE`.
+  cluster restore tests cover that slice. The experimental hinted-handoff outbox now reserves Put
+  growth in the shared `Cluster` category, reports structured quota/headroom failures through HTTP
+  413, reconciles exact restart bytes, and uses Recovery admission for Ack appends plus durable,
+  bounded cleanup attempts at a quota-full log. Post-record compaction failure remains retryable
+  cleanup debt without changing a durable Ack or reschedule. Experimental cluster
+  control/consensus/audit/dedupe writers,
+  edge-sync queues, and external restore staging remain outside the complete boundary.
+  Cleanup-before-growth-rejection, whole-operation compaction preflight, and a crash-durable
+  coordinator for multi-file tombstone and rollup publication also remain incomplete, so the disk
+  item is not `DONE`.
 - `DEFERRED` Add shared query work/memory/concurrency budgets and cooperative cancellation across
   direct, async, PromQL, and HTTP entry points.
 - `DEFERRED` Complete byte reservations for transient and non-write memory growth, cardinality
@@ -188,8 +193,9 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
 
 Phase 2 remains incomplete. Current memory totals are modeled estimates rather than RSS, several
 important allocation classes are named but unaccounted, the local-disk boundary does not yet cover
-cluster and edge persistence or external restore staging, static path validation does not protect
-against a hostile concurrent namespace swap, and no shared query budget is enforced yet. Usage
+cluster control/consensus/audit/dedupe persistence, edge persistence, or external restore staging;
+static path validation does not protect against a hostile concurrent namespace swap, and no shared
+query budget is enforced yet. Usage
 metering is awaited and may add response latency, while status, report, support-bundle, and export
 reads still scan an unbounded in-memory ledger.
 
@@ -320,6 +326,23 @@ Phase 2 targeted verification completed since that full matrix:
 - `cargo package -p tsink --list --allow-dirty` and `cargo package -p tsink --allow-dirty` —
   `PASS`: 249 files, 3.9 MiB unpacked, 702.9 KiB compressed; `GOAL.md`, this progress ledger,
   `.github`, and `scripts` remain excluded.
+- `cargo test -p tsink disk_budget::tests` — `PASS` (29 tests), including Recovery append/rewrite
+  accounting, exact-length bounded streaming, physical maintenance-reserve use, and rejection of a
+  streamed replacement that exceeds its declared length.
+- `cargo test -p tsink-server cluster::outbox::tests` — `PASS` (14 tests) with loopback permission;
+  the initial sandboxed run could not bind the two replay fixtures. New coverage proves tiny-quota
+  no-publication, exact restart reconciliation, concurrent final-byte admission, legacy temporary
+  cleanup, legacy default-field growth admission, quota-full Ack recovery, and nonfatal cleanup debt
+  after durable Ack and reschedule records.
+- `cargo test -p tsink-server budgeted_` — `PASS` (8 tests), and
+  `write_routing_error_response_preserves_outbox_disk_quota_category` — `PASS`.
+- `cargo test --workspace --all-features` — `PASS` with loopback permission after the
+  hinted-handoff slice: 591 core unit tests, 608 server tests with 1 ignored fixture, and all core
+  integration, UniFFI, migration, and documentation suites passed. The first final run hit an
+  unrelated temporary data-path lock in one core retention test; that exact test passed in isolation
+  and the complete rerun passed.
+- `cargo test --workspace --no-default-features` — `PASS` after the hinted-handoff slice with the
+  same core/server counts and all remaining suites green.
 
 The complete matrix will be rerun after the remaining Phase 2 implementation slices. These targeted
 results do not make the phase complete.
@@ -336,6 +359,9 @@ assigned to later roadmap phases.
 - The experimental cluster dedupe log gained optional canonical completion data. Current code reads
   legacy markers, but a duplicate whose legacy marker lacks the original result returns
   `409 idempotency_result_unavailable` rather than fabricating success.
+- The hinted-handoff record format did not change. Its compaction replacement now synchronizes the
+  parent directory, and startup removes only the exact legacy `.compact.tmp` path plus generated
+  current-format atomic-write temporaries.
 - The server usage ledger gained an additive batch-line format for atomic multi-tenant
   reconciliation. It still reads legacy single-record lines and accepts legacy sequence gaps, while
   unterminated lines, empty batches, and zero or duplicate record sequences fail closed.
@@ -366,8 +392,9 @@ assigned to later roadmap phases.
   incremental aggregate plus bounded pagination/streaming remains necessary.
 - The disk coordinator counts arbitrary external files at reconciliation and never deletes them,
   but it cannot atomically govern concurrent writes by another process. Cluster control,
-  consensus, audit, dedupe, outbox, and edge-queue writers do not yet share its reservations, and
-  their runtime growth can temporarily make accounting stale until reconciliation.
+  consensus, audit, dedupe, and edge-queue writers do not yet share its reservations, and their
+  runtime growth can temporarily make accounting stale until reconciliation. The hinted-handoff
+  outbox now does share reservations and exact cleanup reconciliation.
 - There is no data-directory manifest, previous-release golden fixture, or process-kill crash
   harness. `Durable` currently describes the documented synchronization operations, not a
   cross-platform hardware guarantee.
@@ -382,8 +409,6 @@ assigned to later roadmap phases.
   complete. There is no configurable source-side minimum acknowledgement.
 - Edge queue records are flushed but not synchronized with `sync_data`/`sync_all`, so a reported
   queue acceptance is not a crash-durable upload guarantee.
-- The hinted-handoff outbox synchronizes Put and Ack records, but compaction replacement does not
-  yet sync the parent directory after rename.
 - Cluster functionality is not yet isolated behind an explicit experimental Cargo feature or crate
   boundary.
 - `HUMAN GATE`: external design partners, real cross-release upgrades, constrained edge validation,
@@ -391,9 +416,9 @@ assigned to later roadmap phases.
 
 ## Recommended next three tasks
 
-1. Extend the shared local-disk coordinator through experimental cluster control/consensus/audit,
-   dedupe and hinted-handoff outbox writers plus edge queues; add restart/concurrency/failure tests,
-   and batch exact cleanup reconciliation without weakening the no-undercount invariant.
+1. Extend the shared local-disk coordinator through experimental cluster control/consensus/audit
+   and dedupe writers plus edge queues; add restart/concurrency/failure tests, and batch exact
+   cleanup reconciliation without weakening the no-undercount invariant.
 2. Add a shared query-budget and cancellation abstraction for matched
    series, scanned/returned samples and bytes, intermediate memory, concurrency, regex expansion,
    steps, and wall time. Prove that cancellation and failure release permits and reservations, and

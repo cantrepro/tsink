@@ -6713,6 +6713,14 @@ fn write_routing_error_response(err: WriteRoutingError) -> HttpResponse {
         return response;
     }
 
+    if matches!(
+        &err,
+        WriteRoutingError::OutboxEnqueue { source, .. } if source.is_disk_resource_limit()
+    ) {
+        return text_response(413, &err.to_string())
+            .with_header(WRITE_ERROR_CODE_HEADER, "write_disk_quota_exceeded");
+    }
+
     let status = match &err {
         WriteRoutingError::InvalidConsistencyOverride { .. } => 400,
         WriteRoutingError::ConsistencyTimeout { .. } => 504,
@@ -14690,6 +14698,25 @@ mod tests {
         assert!(
             WRITE_REJECTION_REASON_TOTALS[reason_index].load(Ordering::Relaxed)
                 >= before.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn write_routing_error_response_preserves_outbox_disk_quota_category() {
+        let response = write_routing_error_response(WriteRoutingError::OutboxEnqueue {
+            node_id: "node-b".to_string(),
+            source: crate::cluster::outbox::OutboxEnqueueError::DiskQuotaExceeded {
+                limit: 10,
+                used: 9,
+                reserved: 0,
+                requested: 2,
+            },
+        });
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
         );
     }
 

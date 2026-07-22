@@ -92,9 +92,10 @@ output; maintenance must still leave the filesystem headroom. The headroom plus 
 the supported 64-bit byte range.
 
 The shared budget's quota-aware writers are core storage, metric metadata, exemplars, rules, the
-usage ledger, and managed control-plane state. It does not yet govern cluster control state and log,
-cluster audit, deduplication and outbox files, or edge queues. External snapshot destinations and
-external restore staging or target directories are also outside the budget. Snapshot destinations
+usage ledger, managed control-plane state, and the experimental hinted-handoff outbox. It does not
+yet govern cluster control state and log, cluster audit, deduplication files, or edge queues.
+External snapshot destinations and external restore staging or target directories are also outside
+the budget. Snapshot destinations
 inside the managed root are rejected, and an online restore target may not overlap the live
 `--data-path`. Files beneath `--data-path` can still be included when usage is reconciled, but that
 does not provide admission guarantees for excluded writers.
@@ -424,7 +425,9 @@ stores remove orphan atomic-replacement files only when they match that
 store's generated `.<target>.tmp-<pid>-<nonce>` shape, using a canonical decimal `u32` PID and
 exactly 16 lowercase hexadecimal nonce digits; an ambiguous matching directory makes startup fail
 instead of being deleted. A successful removal is synchronized and followed by accounting
-reconciliation, while a no-op orphan pass skips that rescan.
+reconciliation, while a no-op orphan pass skips that rescan. The hinted-handoff outbox applies the
+same generated-temporary rule and also recognizes its one exact legacy `<outbox>.compact.tmp` path;
+it never treats lookalike operator files as owned cleanup candidates.
 
 The server performs one final idle-coordinator reconciliation after all persistent stores open. The
 TCP listener binds last. Once bound, status and metrics include files created during bootstrap and

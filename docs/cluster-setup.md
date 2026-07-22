@@ -167,8 +167,11 @@ When a write cannot be delivered to a replica because the peer is unreachable, t
 data in a bounded, per-peer **hinted handoff outbox** backed by an append-only log. When the peer
 recovers, the queued data is replayed automatically. The current outbox flushes records for
 process-restart recovery and calls `sync_data` before publishing Put or Ack state. Compaction syncs
-its replacement file before rename, but the replacement does not yet synchronize the parent
-directory; the platform limits in the [durability contract](durability.md) still apply.
+its replacement file before rename and then synchronizes the parent directory. With a shared local
+disk budget, Put records reserve `Cluster` growth, while an Ack append using Recovery admission can
+trigger an immediate cleanup attempt at the logical quota. A failed post-record compaction remains
+cleanup debt for retry without changing the durable Ack or reschedule outcome. The platform limits
+in the [durability contract](durability.md) still apply.
 
 Handoff behavior is tunable via environment variables:
 

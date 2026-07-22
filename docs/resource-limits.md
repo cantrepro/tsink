@@ -141,7 +141,8 @@ directories remain unbudgeted. Object-store roots are outside the quota, and any
 overlaps one with the managed root is rejected.
 
 The built-in server opens this coordinator before constructing persistent stores and shares it with
-the core, metric metadata, exemplars, rules, the usage ledger, and managed control-plane state.
+the core, metric metadata, exemplars, rules, the usage ledger, managed control-plane state, and the
+experimental hinted-handoff outbox.
 Those writers reserve exact growth, synchronize successful publication, and publish in-memory
 state only after persistence. Read-write storage holds the core data-path lease; server modes that
 do not open a read-write core hold the same canonical process lease themselves. A final startup
@@ -154,11 +155,18 @@ The server flags are `--local-disk-limit`, `--filesystem-free-headroom`, and
 `--maintenance-temp-reserve`; any of them requires `--data-path`. The shared snapshot is reported
 even for compute-only server storage. Direct and internal metadata/exemplar quota failures retain
 their structured resource category and map to HTTP 413, disclosing partial row progress when rows
-already committed.
+already committed. A hinted-handoff Put that cannot reserve shared local-disk growth likewise
+returns a structured disk resource failure; the cluster write surface maps it to HTTP 413.
 
 This is not yet a complete **server data-directory** contract. Experimental cluster control,
-consensus, audit, dedupe and outbox files, plus edge-sync queues, are counted if they live beneath
-the root and startup reconciliation sees them, but their runtime writers do not reserve capacity.
+consensus, audit, and dedupe files, plus edge-sync queues, are counted if they live beneath the root
+and startup reconciliation sees them, but their runtime writers do not reserve capacity. The
+hinted-handoff outbox now reserves Put growth in the `Cluster` category, reconciles exact bytes on
+restart, and uses Recovery admission for the Ack append plus an immediate cleanup attempt when the
+logical quota is exhausted. Current-format logs shrink through Recovery compaction; a legacy record
+whose explicit defaults make the replacement grow requires normal Growth admission. A failed
+post-record compaction is recorded as cleanup debt and retried without changing the durable Ack or
+reschedule outcome.
 Clustered metadata/exemplar routing preserves a local or peer's structured disk-quota failure as
 HTTP 413 when the requested acknowledgement count is not met. Online restore targets that overlap
 the live root are rejected; external restore staging or targets and external snapshot destinations
@@ -171,11 +179,11 @@ tolerates and counts them when reconciled but is not a quota on other processes.
 
 The core now coordinates WAL, segments and indexes, compaction and retention staging,
 registry/catalog files, tombstones, and rollup state. The server additionally coordinates metadata,
-exemplars, rules, usage, and managed state through the same root. Experimental cluster and edge
-subsystems still write control/consensus/audit logs, dedupe and outbox logs, and edge queues through
-separate persistence paths. Restore staging outside the live root is also unbudgeted. A complete
-server profile needs reservations or explicitly documented sub-budgets for those remaining paths
-without weakening tenant isolation.
+exemplars, rules, usage, managed state, and the hinted-handoff outbox through the same root.
+Experimental cluster and edge subsystems still write control/consensus/audit logs, dedupe logs, and
+edge queues through separate persistence paths. Restore staging outside the live root is also
+unbudgeted. A complete server profile needs reservations or explicitly documented sub-budgets for
+those remaining paths without weakening tenant isolation.
 
 A complete server-wide model still needs:
 
@@ -194,7 +202,9 @@ publication rollback after directory-sync failure, and injected partial filesyst
 Server tests cover tiny-limit no-publication behavior, exact category accounting, concurrent usage
 append ordering, torn-tail rejection, restart reconciliation across sidecars, compute-only process
 leasing and observability, structured 413 responses with partial progress, and rejection of online
-restore targets that overlap the live root.
+restore targets that overlap the live root. Hinted-handoff tests additionally cover tiny-quota
+enqueue rejection without queue publication, exact restart reconciliation, competing outboxes for
+the final bytes, and Ack recovery that compacts a quota-full log to an empty restart state.
 The internal exact-reconciliation helper assumes its caller does not hold a second reservation on
 the same coordinator; batching or a deferred-reconciliation protocol should replace that
 correctness-first constraint before advertising high cleanup throughput.

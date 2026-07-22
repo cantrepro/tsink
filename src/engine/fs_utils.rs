@@ -462,6 +462,40 @@ fn cleanup_failed_tmp_write(tmp_path: &Path, write_err: TsinkError) -> TsinkErro
     }
 }
 
+struct ExactLengthWriter<'a, W> {
+    inner: &'a mut W,
+    remaining: u64,
+}
+
+impl<W: Write> Write for ExactLengthWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamed atomic-write chunk exceeds the supported byte range",
+            )
+        })?;
+        if requested > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "streamed atomic write exceeded its declared length by {} bytes",
+                    requested - self.remaining
+                ),
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining = self.remaining.checked_sub(written as u64).ok_or_else(|| {
+            std::io::Error::other("streamed atomic-write length accounting underflow")
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
@@ -509,6 +543,84 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         "failed to reserve unique temporary file for {}",
         path.display()
     )))
+}
+
+/// Atomically replaces a file from an exact-length bounded stream and synchronizes its parent.
+///
+/// The callback cannot write more than `expected_bytes`, and writing fewer bytes is rejected. This
+/// keeps large cleanup rewrites bounded by the callback's own per-record buffer rather than the
+/// complete replacement size. As with [`write_file_atomically_and_sync_parent`], an error from the
+/// final parent-directory synchronization can be returned after the replacement became visible.
+pub fn write_file_atomically_and_sync_parent_with<F>(
+    path: &Path,
+    expected_bytes: u64,
+    write_replacement: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut dyn Write) -> Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        TsinkError::InvalidConfiguration(format!(
+            "streamed atomic-write target has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let (tmp_path, file) = {
+        let mut created = None;
+        for _ in 0..256 {
+            let tmp_path = tmp_path_for(path)?;
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => {
+                    created = Some((tmp_path, file));
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        created.ok_or_else(|| {
+            TsinkError::Other(format!(
+                "failed to reserve unique streamed replacement for {}",
+                path.display()
+            ))
+        })?
+    };
+
+    let mut writer = BufWriter::new(file);
+    let write_result = (|| -> Result<()> {
+        {
+            let mut exact_writer = ExactLengthWriter {
+                inner: &mut writer,
+                remaining: expected_bytes,
+            };
+            write_replacement(&mut exact_writer)?;
+            if exact_writer.remaining != 0 {
+                return Err(TsinkError::Other(format!(
+                    "streamed atomic write for {} produced {} fewer bytes than declared",
+                    path.display(),
+                    exact_writer.remaining
+                )));
+            }
+            exact_writer.flush()?;
+        }
+        writer.get_ref().sync_all()?;
+        Ok(())
+    })();
+    drop(writer);
+    if let Err(write_err) = write_result {
+        return Err(cleanup_failed_tmp_write(&tmp_path, write_err));
+    }
+
+    if let Err(rename_err) = rename_tmp(&tmp_path, path) {
+        return Err(cleanup_failed_tmp_write(&tmp_path, rename_err));
+    }
+    sync_parent_dir(path)
 }
 
 pub(crate) fn rename_tmp(tmp_path: &Path, path: &Path) -> Result<()> {

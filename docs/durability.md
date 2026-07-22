@@ -105,8 +105,11 @@ whether rows committed and returns `X-Tsink-Write-Outcome: indeterminate_backend
 
 Hinted-handoff and edge-sync queues are asynchronous delivery mechanisms, not stronger core row
 acknowledgements. Hinted-handoff Put and Ack records are flushed and synchronized before their
-in-memory state changes, although compaction does not yet synchronize the parent directory after
-rename. Edge-sync queue records are flushed but are not currently synchronized with
+in-memory state changes. Compaction synchronizes its replacement file, atomically renames it, and
+synchronizes the parent directory; when a shared logical disk quota is full, the Ack append can use
+Recovery admission and is followed by a shrinking-compaction attempt. Compaction failure leaves
+retryable cleanup debt without changing an already-durable Ack. Edge-sync queue records are flushed
+but are not currently synchronized with
 `sync_data`/`sync_all`; queue acceptance therefore is not a crash-durable upload guarantee. A
 successfully replayed edge entry is removed after any valid upstream acknowledgement, including
 `Volatile`, and a still-pending entry can also expire under the configured pre-ack retention.
