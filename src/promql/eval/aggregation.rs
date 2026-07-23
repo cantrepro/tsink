@@ -15,6 +15,9 @@ pub(crate) fn eval_aggregation(
     params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
     let input = engine.eval(&expr.expr, params)?;
+    // Grouping retains canonical keys, grouped samples, and output alongside the input. Reserve
+    // that modeled peak before any of those collections are materialized.
+    params.reserve_transform_upper(&[&input], 3)?;
     let PromqlValue::InstantVector(samples) = input else {
         return Err(PromqlError::Type(
             "aggregation expects an instant vector".to_string(),
@@ -27,6 +30,7 @@ pub(crate) fn eval_aggregation(
 
     let mut groups: BTreeMap<Vec<u8>, (String, Vec<Label>, Vec<Sample>)> = BTreeMap::new();
     for sample in samples {
+        params.checkpoint()?;
         let (metric, labels) = grouped_metric_and_labels(&sample, expr.grouping.as_ref());
         let key = canonical_series_identity(&metric, &labels);
         let entry = groups
@@ -46,6 +50,7 @@ pub(crate) fn eval_aggregation(
         | AggregationOp::Stddev
         | AggregationOp::Stdvar => {
             for (_, (metric, labels, group_samples)) in groups {
+                params.checkpoint()?;
                 let timestamp = max_timestamp(&group_samples, params.eval_time);
                 match aggregate_group(expr.op, &group_samples)? {
                     AggregationValue::Float(value) => {
@@ -60,6 +65,7 @@ pub(crate) fn eval_aggregation(
         AggregationOp::Quantile => {
             let phi = aggregation_quantile(engine, expr, params)?;
             for (_, (metric, labels, group_samples)) in groups {
+                params.checkpoint()?;
                 if group_samples
                     .iter()
                     .any(|sample| sample.histogram.is_some())
@@ -80,6 +86,7 @@ pub(crate) fn eval_aggregation(
         AggregationOp::CountValues => {
             let label_name = aggregation_label_name(engine, expr, params)?;
             for (_, (metric, labels, group_samples)) in groups {
+                params.checkpoint()?;
                 if group_samples
                     .iter()
                     .any(|sample| sample.histogram.is_some())
@@ -110,6 +117,7 @@ pub(crate) fn eval_aggregation(
         AggregationOp::TopK | AggregationOp::BottomK => {
             let k = aggregation_k(engine, expr, params)?;
             for (_, (_, _, mut group_samples)) in groups {
+                params.checkpoint()?;
                 if group_samples
                     .iter()
                     .any(|sample| sample.histogram.is_some())
@@ -135,6 +143,7 @@ pub(crate) fn eval_aggregation(
         }
         AggregationOp::LimitK | AggregationOp::LimitRatio => {
             for (_, (_, _, mut group_samples)) in groups {
+                params.checkpoint()?;
                 group_samples.sort_by_key(sample_hash);
                 let selected = match expr.op {
                     AggregationOp::LimitK => {

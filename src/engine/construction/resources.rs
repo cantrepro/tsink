@@ -62,6 +62,8 @@ impl ChunkStorage {
         blob_lane_path: Option<&PathBuf>,
         next_segment_id: u64,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        maintenance_max_items_per_pass: usize,
+        maintenance_max_bytes_per_pass: u64,
     ) -> Result<StorageAssemblyResources> {
         let series_index_path = Self::series_index_path_for_lanes(
             numeric_lane_path.map(|path| path.as_path()),
@@ -75,6 +77,10 @@ impl ChunkStorage {
                 Arc::clone(&next_segment_id),
                 local_disk_budget.clone(),
             )
+            .with_maintenance_work_limits(
+                maintenance_max_items_per_pass,
+                maintenance_max_bytes_per_pass,
+            )
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_segment_id_allocator_and_disk_budget(
@@ -82,6 +88,10 @@ impl ChunkStorage {
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
                 local_disk_budget.clone(),
+            )
+            .with_maintenance_work_limits(
+                maintenance_max_items_per_pass,
+                maintenance_max_bytes_per_pass,
             )
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));

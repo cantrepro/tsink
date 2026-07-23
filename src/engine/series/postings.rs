@@ -4,6 +4,17 @@ use std::sync::atomic::Ordering;
 use super::*;
 
 impl SeriesRegistry {
+    pub(crate) fn has_series_for_metric(&self, metric: &str) -> bool {
+        let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
+            return false;
+        };
+        self.metric_postings_shards[Self::metric_postings_shard_idx(metric_id)]
+            .read()
+            .metric_postings
+            .get(&metric_id)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
     pub fn series_ids_for_metric(&self, metric: &str) -> Vec<SeriesId> {
         let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
             return Vec::new();
@@ -14,6 +25,44 @@ impl SeriesRegistry {
             .get(&metric_id)
             .map(|ids| ids.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Returns the next bounded, ascending page of series ids for one metric.
+    ///
+    /// `after` is exclusive. The Roaring iterator seeks directly to the requested id, so a
+    /// background cursor does not rescan every preceding posting on each maintenance pass. A
+    /// full page reports `has_more` conservatively without inspecting a posting beyond `limit`;
+    /// an exact-multiple traversal therefore ends with one empty terminal page.
+    pub(crate) fn series_ids_for_metric_after(
+        &self,
+        metric: &str,
+        after: Option<SeriesId>,
+        limit: usize,
+    ) -> (Vec<SeriesId>, bool) {
+        if limit == 0 {
+            return (Vec::new(), false);
+        }
+        let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
+            return (Vec::new(), false);
+        };
+        let shard = self.metric_postings_shards[Self::metric_postings_shard_idx(metric_id)].read();
+        let Some(ids) = shard.metric_postings.get(&metric_id) else {
+            return (Vec::new(), false);
+        };
+
+        let mut iterator = ids.iter();
+        if let Some(after) = after {
+            let Some(first_allowed) = after.checked_add(1) else {
+                return (Vec::new(), false);
+            };
+            iterator.advance_to(first_allowed);
+        }
+
+        let available = usize::try_from(ids.len()).unwrap_or(usize::MAX);
+        let mut page = Vec::with_capacity(limit.min(available));
+        page.extend(iterator.take(limit));
+        let has_more = page.len() == limit;
+        (page, has_more)
     }
 
     pub fn series_id_postings_for_metric(&self, metric: &str) -> Option<RoaringTreemap> {

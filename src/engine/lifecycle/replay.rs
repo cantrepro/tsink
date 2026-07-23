@@ -53,12 +53,26 @@ impl<'a> LifecycleReplayContext<'a> {
         Ok(())
     }
 
-    fn record_committed_series_definitions(
+    fn record_replayed_series_definition(
         self,
-        definitions: Vec<crate::engine::wal::SeriesDefinitionFrame>,
+        definition: crate::engine::wal::SeriesDefinitionFrame,
     ) {
         if let Some(wal) = self.wal {
-            wal.record_committed_series_definitions_if_initialized(definitions);
+            wal.record_replayed_series_definition_if_initialized(definition);
+            // Replay processes one admitted frame at a time. Publish its retained cache charge
+            // while that frame's transient lease is still alive so the next frame sees it.
+            self.publication
+                .sync_wal_series_definition_cache_memory_usage(Some(wal));
+        }
+    }
+
+    fn record_replayed_samples(self, sample_batches: &[crate::engine::wal::SamplesBatchFrame]) {
+        if let Some(wal) = self.wal {
+            wal.record_replayed_samples_if_initialized(
+                sample_batches.iter().map(|batch| batch.series_id),
+            );
+            self.publication
+                .sync_wal_series_definition_cache_memory_usage(Some(wal));
         }
     }
 
@@ -130,23 +144,35 @@ impl ChunkStorage {
 
         let replay_result = (|| -> Result<()> {
             let mut stream =
-                wal.replay_committed_write_stream_after_with_mode(replay_highwater, replay_mode)?;
-            while let Some(write) = stream.next_write()? {
-                replay_stats.frames = replay_stats.frames.saturating_add(
-                    saturating_u64_from_usize(write.series_definitions.len()).saturating_add(1),
-                );
-                replay_stats.series_definitions = replay_stats
-                    .series_definitions
-                    .saturating_add(saturating_u64_from_usize(write.series_definitions.len()));
-                let replayed_series_definitions = write.series_definitions.clone();
-                replay.register_series_definitions(&write.series_definitions)?;
-                replay_stats.sample_batches = replay_stats
-                    .sample_batches
-                    .saturating_add(saturating_u64_from_usize(write.sample_batches.len()));
-                replay_stats.points = replay_stats.points.saturating_add(
-                    self.replay_wal_sample_batches(write.sample_batches, write.highwater)?,
-                );
-                replay.record_committed_series_definitions(replayed_series_definitions);
+                wal.replay_committed_frame_stream_after_with_mode(replay_highwater, replay_mode)?;
+            while let Some(admitted) = stream
+                .next_frame_with_admission(|bytes| self.reserve_write_transient_memory(bytes))?
+            {
+                replay_stats.frames = replay_stats.frames.saturating_add(1);
+                let highwater = admitted.highwater;
+                let transient_memory = admitted.reservation;
+                match admitted.frame {
+                    crate::engine::wal::ReplayFrame::SeriesDefinition(definition) => {
+                        replay_stats.series_definitions =
+                            replay_stats.series_definitions.saturating_add(1);
+                        replay.register_series_definitions(std::slice::from_ref(&definition))?;
+                        replay.record_replayed_series_definition(definition);
+                    }
+                    crate::engine::wal::ReplayFrame::Samples(sample_batches) => {
+                        replay_stats.sample_batches = replay_stats
+                            .sample_batches
+                            .saturating_add(saturating_u64_from_usize(sample_batches.len()));
+                        replay.record_replayed_samples(&sample_batches);
+                        replay_stats.points =
+                            replay_stats
+                                .points
+                                .saturating_add(self.replay_wal_sample_batches(
+                                    sample_batches,
+                                    highwater,
+                                    &transient_memory,
+                                )?);
+                    }
+                }
             }
 
             Ok(())

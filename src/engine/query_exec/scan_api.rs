@@ -3,12 +3,13 @@ use crate::validation::{validate_labels, validate_metric};
 use crate::{MetricSeries, Result, Row, TsinkError};
 
 use super::{
-    shard_window_fnv1a_update, shard_window_hash_data_point, shard_window_series_identity_key,
+    modeled_points_retained_bytes, modeled_vec_capacity_bytes, shard_window_fnv1a_update,
+    shard_window_hash_data_point, shard_window_series_identity_key,
     sort_data_points_for_shard_window, validate_query_rows_scan_options,
     validate_shard_window_request, validate_shard_window_scan_options, ChunkStorage,
-    MetadataShardScope, PersistedTierFetchStats, QueryRowsPage, QueryRowsScanOptions,
-    RawSeriesScanPage, SeriesId, ShardWindowDigest, ShardWindowRowsPage, ShardWindowScanOptions,
-    SHARD_WINDOW_FNV_OFFSET_BASIS,
+    MetadataShardScope, PersistedTierFetchStats, QueryExecution, QueryRowsPage,
+    QueryRowsScanOptions, RawSeriesScanPage, SeriesId, ShardWindowDigest, ShardWindowRowsPage,
+    ShardWindowScanOptions, SHARD_WINDOW_FNV_OFFSET_BASIS,
 };
 
 impl ChunkStorage {
@@ -17,14 +18,29 @@ impl ChunkStorage {
         shard: u32,
         shard_count: u32,
         operation: &'static str,
-    ) -> Result<Vec<ShardScanSeriesEntry>> {
+        execution: &QueryExecution,
+    ) -> Result<(Vec<ShardScanSeriesEntry>, crate::QueryMemoryReservation)> {
+        let candidate_reservation = self.reserve_metadata_candidate_working_set(execution)?;
         let metadata = self.metadata_shard_scope_context();
         let series_query = self.series_query_context();
         let scope = MetadataShardScope::new(shard_count, vec![shard]);
+        execution.ensure_pattern_expansion(
+            u64::try_from(self.catalog.registry.read().series_count()).unwrap_or(u64::MAX),
+        )?;
         let candidate_series_ids = metadata.live_series_ids_for_scope(&scope, operation)?;
+        execution.checkpoint()?;
+        execution.charge_pattern_expansion(
+            u64::try_from(candidate_series_ids.len()).unwrap_or(u64::MAX),
+        )?;
+        execution
+            .charge_series_matched(u64::try_from(candidate_series_ids.len()).unwrap_or(u64::MAX))?;
+        execution.observe_intermediate_vector_size(
+            u64::try_from(candidate_series_ids.len()).unwrap_or(u64::MAX),
+        )?;
 
         let mut entries = Vec::with_capacity(candidate_series_ids.len());
         for series_id in candidate_series_ids {
+            execution.checkpoint()?;
             let Some(series) = series_query.metric_series(series_id) else {
                 continue;
             };
@@ -37,7 +53,7 @@ impl ChunkStorage {
             });
         }
         entries.sort_by(|left, right| left.identity_key.cmp(&right.identity_key));
-        Ok(entries)
+        Ok((entries, candidate_reservation))
     }
 
     fn scan_resolved_series_rows_with_plan(
@@ -47,6 +63,7 @@ impl ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
         options: QueryRowsScanOptions,
+        execution: &QueryExecution,
     ) -> Result<QueryRowsPage> {
         let context = self.series_query_context();
         let max_rows = options.max_rows;
@@ -60,8 +77,10 @@ impl ChunkStorage {
         };
         let mut stream_row_offset = 0u64;
         let mut persisted_stats = PersistedTierFetchStats::default();
+        let mut row_reservations = Vec::new();
 
         for (index, (series, series_id)) in resolved.iter().enumerate() {
+            execution.checkpoint()?;
             let page = match series_id {
                 Some(series_id) => context.collect_raw_series_page(
                     *series_id,
@@ -70,6 +89,8 @@ impl ChunkStorage {
                     plan,
                     row_offset.saturating_sub(stream_row_offset),
                     max_rows.and_then(|max| max.checked_sub(response.rows.len())),
+                    Some(execution),
+                    false,
                 )?,
                 None => RawSeriesScanPage::default(),
             };
@@ -77,12 +98,28 @@ impl ChunkStorage {
             stream_row_offset = stream_row_offset.saturating_add(page.final_rows_seen);
 
             if !page.points.is_empty() {
+                row_reservations.push(self.reserve_rows_materialization(
+                    execution,
+                    &series.name,
+                    &series.labels,
+                    &page.points,
+                )?);
                 response.rows_scanned = response
                     .rows_scanned
                     .saturating_add(u64::try_from(page.points.len()).unwrap_or(u64::MAX));
-                response.rows.extend(page.points.into_iter().map(|point| {
-                    Row::with_labels(series.name.clone(), series.labels.clone(), point)
-                }));
+                for point in page.points {
+                    self.charge_row_before_materialization(
+                        execution,
+                        &series.name,
+                        &series.labels,
+                        &point,
+                    )?;
+                    response.rows.push(Row::with_labels(
+                        series.name.clone(),
+                        series.labels.clone(),
+                        point,
+                    ));
+                }
             }
 
             if !page.reached_end {
@@ -111,37 +148,61 @@ impl ChunkStorage {
         shard_count: u32,
         window_start: i64,
         window_end: i64,
+        execution: &QueryExecution,
     ) -> Result<ShardWindowDigest> {
         let context = self.series_query_context();
+        execution.checkpoint()?;
         self.ensure_open()?;
         validate_shard_window_request(shard, shard_count, window_start, window_end)?;
         self.request_background_persisted_refresh_if_needed();
 
         let mut points = Vec::new();
+        let mut points_reservation = execution.reserve_memory(0)?;
         let mut point_hashes = Vec::new();
+        let mut point_hash_reservation = execution.reserve_memory(0)?;
         let mut fingerprint = SHARD_WINDOW_FNV_OFFSET_BASIS;
         let mut series_count = 0u64;
         let mut point_count = 0u64;
         let plan = context.query_tier_plan(window_start, window_end);
         let mut persisted_stats = PersistedTierFetchStats::default();
 
-        for entry in
-            self.shard_scan_series_entries(shard, shard_count, "compute_shard_window_digest")?
-        {
+        let (entries, _candidate_reservation) = self.shard_scan_series_entries(
+            shard,
+            shard_count,
+            "compute_shard_window_digest",
+            execution,
+        )?;
+        for entry in entries {
+            execution.checkpoint()?;
             let stats = context.collect_points_for_series_into(
                 entry.series_id,
                 window_start,
                 window_end,
                 plan,
                 &mut points,
+                Some(execution),
+                false,
             )?;
             persisted_stats.accumulate(stats);
+            points_reservation.resize(modeled_points_retained_bytes(&points))?;
             if points.is_empty() {
                 continue;
             }
 
             point_hashes.clear();
+            execution.observe_intermediate_vector_size(
+                u64::try_from(points.len()).unwrap_or(u64::MAX),
+            )?;
+            let requested_hash_capacity = points
+                .len()
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+                .max(4);
+            point_hash_reservation
+                .resize(modeled_vec_capacity_bytes::<u64>(requested_hash_capacity))?;
             point_hashes.extend(points.iter().map(shard_window_hash_data_point));
+            point_hash_reservation
+                .resize(modeled_vec_capacity_bytes::<u64>(point_hashes.capacity()))?;
             point_hashes.sort_unstable();
 
             shard_window_fnv1a_update(&mut fingerprint, entry.identity_key.as_bytes());
@@ -180,8 +241,10 @@ impl ChunkStorage {
         window_start: i64,
         window_end: i64,
         options: ShardWindowScanOptions,
+        execution: &QueryExecution,
     ) -> Result<ShardWindowRowsPage> {
         let context = self.series_query_context();
+        execution.checkpoint()?;
         self.ensure_open()?;
         validate_shard_window_request(shard, shard_count, window_start, window_end)?;
         validate_shard_window_scan_options(options)?;
@@ -209,15 +272,23 @@ impl ChunkStorage {
         let mut remaining_series_budget = max_series;
         let plan = context.query_tier_plan(window_start, window_end);
         let mut persisted_stats = PersistedTierFetchStats::default();
-        'series_scan: for entry in
-            self.shard_scan_series_entries(shard, shard_count, "scan_shard_window_rows")?
-        {
+        let mut row_reservations = Vec::new();
+        let (entries, _candidate_reservation) = self.shard_scan_series_entries(
+            shard,
+            shard_count,
+            "scan_shard_window_rows",
+            execution,
+        )?;
+        'series_scan: for entry in entries {
+            execution.checkpoint()?;
             let stats = context.collect_points_for_series_into(
                 entry.series_id,
                 window_start,
                 window_end,
                 plan,
                 &mut points,
+                Some(execution),
+                false,
             )?;
             persisted_stats.accumulate(stats);
             if points.is_empty() {
@@ -225,6 +296,12 @@ impl ChunkStorage {
             }
 
             sort_data_points_for_shard_window(&mut points);
+            row_reservations.push(self.reserve_rows_materialization(
+                execution,
+                &entry.series.name,
+                &entry.series.labels,
+                &points,
+            )?);
 
             let mut counted_series_for_budget = false;
             for point in points.iter() {
@@ -251,6 +328,12 @@ impl ChunkStorage {
                 }
 
                 response.rows_scanned = response.rows_scanned.saturating_add(1);
+                self.charge_row_before_materialization(
+                    execution,
+                    &entry.series.name,
+                    &entry.series.labels,
+                    point,
+                )?;
                 response.rows.push(Row::with_labels(
                     entry.series.name.clone(),
                     entry.series.labels.clone(),
@@ -271,6 +354,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
+        execution: &QueryExecution,
     ) -> Result<QueryRowsPage> {
         let context = self.series_query_context();
         self.ensure_open()?;
@@ -286,7 +370,7 @@ impl ChunkStorage {
         }
         let resolved = context.resolve_series_batch(series);
         let plan = context.query_tier_plan(start, end);
-        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options)
+        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
     }
 
     pub(in crate::engine::storage_engine) fn scan_metric_rows_api(
@@ -295,6 +379,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
+        execution: &QueryExecution,
     ) -> Result<QueryRowsPage> {
         let context = self.series_query_context();
         self.ensure_open()?;
@@ -321,7 +406,7 @@ impl ChunkStorage {
         resolved.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
 
         let plan = context.query_tier_plan(start, end);
-        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options)
+        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
     }
 }
 

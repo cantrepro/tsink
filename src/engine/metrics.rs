@@ -67,6 +67,37 @@ impl StorageObservabilityCounters {
             saturating_u64_from_usize(stats.output_points),
             Ordering::Relaxed,
         );
+        self.compaction
+            .planning_directory_entries_inspected_total
+            .fetch_add(
+                saturating_u64_from_usize(stats.planning_directory_entries_inspected),
+                Ordering::Relaxed,
+            );
+        self.compaction
+            .planning_manifests_inspected_total
+            .fetch_add(
+                saturating_u64_from_usize(stats.planning_manifests_inspected),
+                Ordering::Relaxed,
+            );
+        self.compaction
+            .planning_candidates_observed_total
+            .fetch_add(
+                saturating_u64_from_usize(stats.planning_candidates_observed),
+                Ordering::Relaxed,
+            );
+        self.compaction
+            .planning_source_bytes_total
+            .fetch_add(stats.planning_source_bytes, Ordering::Relaxed);
+        if stats.planning_backlog_observed {
+            self.compaction
+                .planning_backlog_observed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if stats.planning_budget_exhausted {
+            self.compaction
+                .planning_budget_exhaustions_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if stats.compacted {
             self.compaction
                 .success_total
@@ -199,6 +230,10 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) admission_pressure_relief_observed_total: AtomicU64,
     pub(super) active_flush_runs_total: AtomicU64,
     pub(super) active_flush_errors_total: AtomicU64,
+    pub(super) active_flush_inspected_series_total: AtomicU64,
+    pub(super) active_flush_selected_input_bytes_total: AtomicU64,
+    pub(super) active_flush_item_limit_hits_total: AtomicU64,
+    pub(super) active_flush_byte_limit_skips_total: AtomicU64,
     pub(super) active_flushed_series_total: AtomicU64,
     pub(super) active_flushed_chunks_total: AtomicU64,
     pub(super) active_flushed_points_total: AtomicU64,
@@ -206,6 +241,10 @@ pub(super) struct FlushObservabilityCounters {
     pub(super) persist_success_total: AtomicU64,
     pub(super) persist_noop_total: AtomicU64,
     pub(super) persist_errors_total: AtomicU64,
+    pub(super) persist_inspected_chunks_total: AtomicU64,
+    pub(super) persist_selected_input_bytes_total: AtomicU64,
+    pub(super) persist_item_limit_hits_total: AtomicU64,
+    pub(super) persist_byte_limit_hits_total: AtomicU64,
     pub(super) persisted_series_total: AtomicU64,
     pub(super) persisted_chunks_total: AtomicU64,
     pub(super) persisted_points_total: AtomicU64,
@@ -232,6 +271,12 @@ pub(super) struct CompactionObservabilityCounters {
     pub(super) output_chunks_total: AtomicU64,
     pub(super) source_points_total: AtomicU64,
     pub(super) output_points_total: AtomicU64,
+    pub(super) planning_directory_entries_inspected_total: AtomicU64,
+    pub(super) planning_manifests_inspected_total: AtomicU64,
+    pub(super) planning_candidates_observed_total: AtomicU64,
+    pub(super) planning_source_bytes_total: AtomicU64,
+    pub(super) planning_backlog_observed_total: AtomicU64,
+    pub(super) planning_budget_exhaustions_total: AtomicU64,
     pub(super) duration_nanos_total: AtomicU64,
 }
 
@@ -316,6 +361,71 @@ impl Default for RemoteStorageObservabilityState {
             next_refresh_retry_unix_ms: AtomicU64::new(0),
             last_refresh_error: RwLock::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_planning_tests {
+    use super::*;
+
+    #[test]
+    fn compaction_result_records_bounded_planner_work() {
+        let counters = StorageObservabilityCounters::default();
+        counters.record_compaction_result(
+            CompactionRunStats {
+                planning_directory_entries_inspected: 7,
+                planning_manifests_inspected: 5,
+                planning_candidates_observed: 4,
+                planning_source_bytes: 123,
+                planning_backlog_observed: true,
+                planning_budget_exhausted: true,
+                ..CompactionRunStats::default()
+            },
+            11,
+        );
+
+        assert_eq!(
+            counters
+                .compaction
+                .planning_directory_entries_inspected_total
+                .load(Ordering::Relaxed),
+            7
+        );
+        assert_eq!(
+            counters
+                .compaction
+                .planning_manifests_inspected_total
+                .load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            counters
+                .compaction
+                .planning_candidates_observed_total
+                .load(Ordering::Relaxed),
+            4
+        );
+        assert_eq!(
+            counters
+                .compaction
+                .planning_source_bytes_total
+                .load(Ordering::Relaxed),
+            123
+        );
+        assert_eq!(
+            counters
+                .compaction
+                .planning_backlog_observed_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .compaction
+                .planning_budget_exhaustions_total
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }
 

@@ -13,6 +13,7 @@ pub(crate) async fn handle_admin_support_bundle(
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let tenant_id = match support_bundle_tenant_id(request) {
         Ok(tenant_id) => tenant_id,
@@ -51,6 +52,7 @@ pub(crate) async fn handle_admin_support_bundle(
                     usage_accounting,
                     None,
                     local_disk_budget,
+                    offline_restore_disk_budget,
                 )
                 .await
             ),
@@ -116,6 +118,11 @@ pub(crate) async fn handle_admin_usage_report(
             Ok(filter) => filter,
             Err(response) => return response,
         };
+    let (read_options, max_response_bytes) =
+        match parse_usage_read_page(request, usage_accounting, UsageReadKind::Report) {
+            Ok(options) => options,
+            Err(response) => return response,
+        };
     let reconciled_storage_snapshots = if reconcile {
         match usage_accounting
             .reconcile_storage_async(Arc::clone(storage))
@@ -129,23 +136,51 @@ pub(crate) async fn handle_admin_usage_report(
     } else {
         Vec::new()
     };
-    let report = usage_accounting.report(
+    let report = match usage_accounting.report_page(
         tenant_id.as_deref(),
         start_unix_ms,
         end_unix_ms,
         bucket_width,
-    );
-    json_response(
+        read_options,
+    ) {
+        Ok(report) => report,
+        Err(err) => return usage_read_error_response(&err),
+    };
+    let reconciliation = usage_reconciliation_json(&report, &storage.observability_snapshot());
+    let payload = AdminUsageReportResponse {
+        status: "success",
+        data: AdminUsageReportResponseData {
+            report: &report,
+            reconciliation: &reconciliation,
+            reconciled_storage_snapshots: &reconciled_storage_snapshots,
+        },
+    };
+    let response = bounded_usage_json_response(
         200,
-        &json!({
-            "status": "success",
-            "data": {
-                "report": report,
-                "reconciliation": usage_reconciliation_json(&report, &storage.observability_snapshot()),
-                "reconciledStorageSnapshots": reconciled_storage_snapshots,
-            }
-        }),
-    )
+        &payload,
+        max_response_bytes,
+        "usage_report_response_too_large",
+    );
+    if reconcile {
+        response.with_header("X-Tsink-Usage-Reconciliation", "completed")
+    } else {
+        response
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUsageReportResponse<'a> {
+    status: &'static str,
+    data: AdminUsageReportResponseData<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUsageReportResponseData<'a> {
+    report: &'a crate::usage::UsageReport,
+    reconciliation: &'a JsonValue,
+    reconciled_storage_snapshots: &'a [crate::usage::UsageStorageSnapshot],
 }
 
 pub(crate) fn handle_admin_usage_export(
@@ -159,20 +194,274 @@ pub(crate) fn handle_admin_usage_export(
         Ok(filter) => filter,
         Err(response) => return response,
     };
-    let records = usage_accounting.export_records(tenant_id.as_deref(), start_unix_ms, end_unix_ms);
-    let mut body = String::new();
-    for record in records {
-        match serde_json::to_string(&record) {
-            Ok(line) => {
-                body.push_str(&line);
-                body.push('\n');
-            }
-            Err(err) => {
-                return text_response(500, &format!("failed to encode usage export: {err}"))
-            }
+    let (read_options, max_response_bytes) =
+        match parse_usage_read_page(request, usage_accounting, UsageReadKind::Export) {
+            Ok(options) => options,
+            Err(response) => return response,
+        };
+    let page = match usage_accounting.export_page(
+        tenant_id.as_deref(),
+        start_unix_ms,
+        end_unix_ms,
+        read_options,
+        max_response_bytes,
+    ) {
+        Ok(page) => page,
+        Err(err) => return usage_read_error_response(&err),
+    };
+    let mut body = Vec::with_capacity(page.response_bytes);
+    for record in &page.records {
+        if let Err(err) = serde_json::to_writer(&mut body, record) {
+            return usage_read_error_response(&crate::usage::UsageReadError::Encoding(format!(
+                "failed to encode usage export: {err}"
+            )));
         }
+        body.push(b'\n');
     }
-    HttpResponse::new(200, body).with_header("Content-Type", "application/x-ndjson")
+    debug_assert_eq!(body.len(), page.response_bytes);
+    let mut response = HttpResponse::new(200, body)
+        .with_header("Content-Type", "application/x-ndjson")
+        .with_header("Cache-Control", "no-store")
+        .with_header(
+            "X-Tsink-Usage-Snapshot-Sequence",
+            page.snapshot_sequence.to_string(),
+        )
+        .with_header(
+            "X-Tsink-Usage-Records-Returned",
+            page.records_returned.to_string(),
+        )
+        .with_header(
+            "X-Tsink-Usage-Response-Bytes",
+            page.response_bytes.to_string(),
+        )
+        .with_header(
+            "X-Tsink-Usage-Raw-History-Complete",
+            page.raw_history_complete.to_string(),
+        )
+        .with_header("X-Tsink-Usage-Has-More", page.has_more.to_string());
+    if let Some(sequence) = page.earliest_available_sequence {
+        response = response.with_header(
+            "X-Tsink-Usage-Earliest-Available-Sequence",
+            sequence.to_string(),
+        );
+    }
+    if let Some(sequence) = page.next_after_sequence {
+        response = response.with_header("X-Tsink-Usage-Next-After-Sequence", sequence.to_string());
+    }
+    response
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UsageReadKind {
+    Report,
+    Export,
+}
+
+fn parse_usage_read_page(
+    request: &HttpRequest,
+    accounting: &UsageAccounting,
+    kind: UsageReadKind,
+) -> Result<(crate::usage::UsageReadOptions, usize), HttpResponse> {
+    let limits = accounting.limits();
+    let (default_records, maximum_records, maximum_response_bytes) = match kind {
+        UsageReadKind::Report => (
+            limits.report_default_records,
+            limits.report_max_records,
+            limits.report_max_response_bytes,
+        ),
+        UsageReadKind::Export => (
+            limits.export_default_records,
+            limits.export_max_records,
+            limits.export_max_response_bytes,
+        ),
+    };
+    let limit = match request.param("limit") {
+        Some(value) => parse_usage_usize(&value, "limit")?,
+        None => default_records,
+    };
+    if limit == 0 || limit > maximum_records {
+        return Err(usage_read_error_response(
+            &crate::usage::UsageReadError::InvalidLimit {
+                requested: limit,
+                maximum: maximum_records,
+            },
+        ));
+    }
+    let max_response_bytes = match request
+        .param("maxBytes")
+        .or_else(|| request.param("maxResponseBytes"))
+    {
+        Some(value) => parse_usage_usize(&value, "maxBytes")?,
+        None => maximum_response_bytes,
+    };
+    if max_response_bytes == 0 || max_response_bytes > maximum_response_bytes {
+        return Err(usage_read_error_response(
+            &crate::usage::UsageReadError::InvalidResponseBytes {
+                requested: max_response_bytes,
+                maximum: maximum_response_bytes,
+            },
+        ));
+    }
+    let after_sequence = parse_optional_usage_u64(
+        request
+            .param("afterSequence")
+            .or_else(|| request.param("after_sequence")),
+        "afterSequence",
+    )?;
+    let snapshot_sequence = parse_optional_usage_u64(
+        request
+            .param("snapshotSequence")
+            .or_else(|| request.param("snapshot_sequence")),
+        "snapshotSequence",
+    )?;
+    Ok((
+        crate::usage::UsageReadOptions {
+            after_sequence,
+            snapshot_sequence,
+            limit,
+        },
+        max_response_bytes,
+    ))
+}
+
+fn parse_usage_usize(value: &str, name: &str) -> Result<usize, HttpResponse> {
+    let value =
+        parse_admin_u64(value, name).map_err(|err| usage_parameter_error(name, value, &err))?;
+    usize::try_from(value).map_err(|_| {
+        usage_parameter_error(
+            name,
+            &value.to_string(),
+            &format!("invalid '{name}': value exceeds this platform's range"),
+        )
+    })
+}
+
+fn parse_optional_usage_u64(
+    value: Option<String>,
+    name: &str,
+) -> Result<Option<u64>, HttpResponse> {
+    value
+        .map(|value| {
+            parse_admin_u64(&value, name).map_err(|err| usage_parameter_error(name, &value, &err))
+        })
+        .transpose()
+}
+
+fn usage_parameter_error(name: &str, value: &str, message: &str) -> HttpResponse {
+    json_response(
+        400,
+        &json!({
+            "status": "error",
+            "error": {
+                "code": "usage_page_parameter_invalid",
+                "message": message,
+                "details": {
+                    "parameter": name,
+                    "value": value,
+                }
+            }
+        }),
+    )
+}
+
+fn usage_read_error_response(err: &crate::usage::UsageReadError) -> HttpResponse {
+    let details = match err {
+        crate::usage::UsageReadError::InvalidLimit { requested, maximum } => json!({
+            "requested": requested,
+            "maximum": maximum,
+        }),
+        crate::usage::UsageReadError::InvalidResponseBytes { requested, maximum } => json!({
+            "requestedBytes": requested,
+            "maximumBytes": maximum,
+        }),
+        crate::usage::UsageReadError::InvalidSnapshot { requested, latest } => json!({
+            "requestedSnapshotSequence": requested,
+            "latestSequence": latest,
+        }),
+        crate::usage::UsageReadError::CursorExpired {
+            requested_after,
+            earliest_available,
+        } => json!({
+            "requestedAfterSequence": requested_after,
+            "earliestAvailableSequence": earliest_available,
+        }),
+        crate::usage::UsageReadError::RecordExceedsResponseLimit {
+            sequence,
+            required_bytes,
+            maximum_bytes,
+        } => json!({
+            "sequence": sequence,
+            "requiredBytes": required_bytes,
+            "maximumBytes": maximum_bytes,
+        }),
+        crate::usage::UsageReadError::Encoding(_) => JsonValue::Null,
+    };
+    json_response(
+        err.http_status(),
+        &json!({
+            "status": "error",
+            "error": {
+                "code": err.code(),
+                "message": err.to_string(),
+                "details": details,
+            }
+        }),
+    )
+}
+
+#[derive(Debug)]
+struct BoundedUsageResponseWriter {
+    body: Vec<u8>,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedUsageResponseWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.maximum.saturating_sub(self.body.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "usage response exceeds configured byte limit",
+            ));
+        }
+        self.body.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_usage_json_response(
+    status: u16,
+    value: &impl Serialize,
+    maximum: usize,
+    error_code: &str,
+) -> HttpResponse {
+    let mut writer = BoundedUsageResponseWriter {
+        body: Vec::with_capacity(maximum.min(8 * 1024)),
+        maximum,
+        exceeded: false,
+    };
+    if let Err(err) = serde_json::to_writer(&mut writer, value) {
+        if writer.exceeded {
+            return json_response(
+                413,
+                &json!({
+                    "status": "error",
+                    "error": {
+                        "code": error_code,
+                        "message": format!("usage response exceeds the configured maximum {maximum} bytes"),
+                        "maximumBytes": maximum,
+                    }
+                }),
+            );
+        }
+        return text_response(500, &format!("failed to encode usage response: {err}"));
+    }
+    HttpResponse::new(status, writer.body).with_header("Content-Type", "application/json")
 }
 
 pub(crate) async fn handle_admin_usage_reconcile(
@@ -204,6 +493,18 @@ fn usage_accounting_error_response(
     action: &str,
     err: &crate::usage::UsageAccountingError,
 ) -> HttpResponse {
+    if matches!(err, crate::usage::UsageAccountingError::Limit(_)) {
+        return json_response(
+            413,
+            &json!({
+                "status": "error",
+                "error": {
+                    "code": "usage_ledger_limit_exceeded",
+                    "message": format!("{action} failed: {err}"),
+                }
+            }),
+        );
+    }
     if let Some(
         disk_error @ (tsink::TsinkError::DiskQuotaExceeded { .. }
         | tsink::TsinkError::InsufficientDiskSpace { .. }
@@ -226,6 +527,23 @@ fn usage_accounting_error_response(
 mod tests {
     use super::*;
 
+    fn usage_request(path: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
     fn non_quota_budget_failure_uses_usage_specific_indeterminate_response() {
         let err = crate::usage::UsageAccountingError::Disk(tsink::TsinkError::Io(
@@ -245,5 +563,96 @@ mod tests {
         assert!(response.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case(WRITE_OUTCOME_HEADER) && value == "indeterminate_backend"
         }));
+    }
+
+    #[test]
+    fn export_handler_returns_stable_continuation_headers() {
+        let accounting = UsageAccounting::open(None).expect("usage accounting should open");
+        for _ in 0..3 {
+            accounting
+                .record(UsageRecordInput::success(
+                    "team-a",
+                    UsageCategory::Query,
+                    "query",
+                    "test",
+                ))
+                .expect("usage record should append");
+        }
+
+        let first = handle_admin_usage_export(
+            &usage_request("/api/v1/admin/usage/export?tenant=team-a&limit=2"),
+            Some(&accounting),
+        );
+        assert_eq!(first.status, 200);
+        assert_eq!(header(&first, "X-Tsink-Usage-Records-Returned"), Some("2"));
+        assert_eq!(header(&first, "X-Tsink-Usage-Has-More"), Some("true"));
+        assert_eq!(
+            header(&first, "X-Tsink-Usage-Raw-History-Complete"),
+            Some("true")
+        );
+        assert_eq!(
+            header(&first, "X-Tsink-Usage-Next-After-Sequence"),
+            Some("2")
+        );
+        assert_eq!(header(&first, "X-Tsink-Usage-Snapshot-Sequence"), Some("3"));
+
+        let second = handle_admin_usage_export(
+            &usage_request(
+                "/api/v1/admin/usage/export?tenant=team-a&limit=2&afterSequence=2&snapshotSequence=3",
+            ),
+            Some(&accounting),
+        );
+        assert_eq!(second.status, 200);
+        assert_eq!(header(&second, "X-Tsink-Usage-Records-Returned"), Some("1"));
+        assert_eq!(header(&second, "X-Tsink-Usage-Has-More"), Some("false"));
+        let records = String::from_utf8(second.body)
+            .expect("export must be utf-8")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::usage::UsageLedgerRecord>(line)
+                    .expect("export line should decode")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn export_handler_rejects_invalid_limit_structurally() {
+        let accounting = UsageAccounting::open(None).expect("usage accounting should open");
+        let response = handle_admin_usage_export(
+            &usage_request("/api/v1/admin/usage/export?limit=0"),
+            Some(&accounting),
+        );
+        assert_eq!(response.status, 400);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("error should be JSON");
+        assert_eq!(body["error"]["code"], "usage_page_limit_invalid");
+    }
+
+    #[tokio::test]
+    async fn report_handler_enforces_encoded_response_bytes() {
+        let accounting = UsageAccounting::open(None).expect("usage accounting should open");
+        accounting
+            .record(UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Query,
+                "query",
+                "test",
+            ))
+            .expect("usage record should append");
+        let storage: Arc<dyn Storage> = tsink::StorageBuilder::new()
+            .build()
+            .expect("storage should build");
+        let response = handle_admin_usage_report(
+            &storage,
+            &usage_request("/api/v1/admin/usage/report?bucket=none&maxBytes=1"),
+            Some(&accounting),
+        )
+        .await;
+        assert_eq!(response.status, 413);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("error should be JSON");
+        assert_eq!(body["error"]["code"], "usage_report_response_too_large");
     }
 }

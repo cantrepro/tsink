@@ -124,7 +124,7 @@ fn budgeted_segment_writer_rejects_a_managed_lane_that_escapes_through_a_symlink
 }
 
 #[test]
-fn segment_writer_replaces_stale_root_missing_manifest() {
+fn segment_writer_rejects_unknown_root_missing_manifest() {
     let tmp = TempDir::new().unwrap();
     let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
     fs::create_dir_all(&writer.layout().root).unwrap();
@@ -133,12 +133,98 @@ fn segment_writer_replaces_stale_root_missing_manifest() {
     assert!(!writer.layout().manifest_path.exists());
 
     let (registry, chunks_by_series) = sample_segment_input();
-    writer.write_segment(&registry, &chunks_by_series).unwrap();
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("an unknown final segment root must fail closed");
 
-    assert!(!stale_file.exists());
-    assert!(writer.layout().manifest_path.exists());
-    let loaded = load_segments(tmp.path()).unwrap();
-    assert_eq!(loaded.next_segment_id, 2);
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("segment publish target already exists")));
+    assert_eq!(fs::read(stale_file).unwrap(), b"partial");
+    assert!(!writer.layout().manifest_path.exists());
+    assert!(load_segments(tmp.path()).unwrap().series.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn segment_writer_rejects_dangling_final_target_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    fs::create_dir_all(writer.layout().root.parent().unwrap()).unwrap();
+    symlink("missing-external-target", &writer.layout().root).unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("a dangling final-target symlink must fail closed");
+
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("segment publish target already exists")));
+    assert!(fs::symlink_metadata(&writer.layout().root)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn segment_writer_preserves_preexisting_staging_file_and_directory() {
+    for collision_is_directory in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+        let staging = writer
+            .layout()
+            .root
+            .with_file_name(".tmp-seg-0000000000000001");
+        fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        if collision_is_directory {
+            fs::create_dir(&staging).unwrap();
+            fs::write(staging.join("operator-note"), b"preserve-dir").unwrap();
+        } else {
+            fs::write(&staging, b"preserve-file").unwrap();
+        }
+        let (registry, chunks_by_series) = sample_segment_input();
+
+        writer
+            .write_segment(&registry, &chunks_by_series)
+            .expect_err("preexisting staging state must fail closed");
+
+        if collision_is_directory {
+            assert_eq!(
+                fs::read(staging.join("operator-note")).unwrap(),
+                b"preserve-dir"
+            );
+        } else {
+            assert_eq!(fs::read(staging).unwrap(), b"preserve-file");
+        }
+        assert!(!writer.layout().root.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn segment_writer_preserves_preexisting_dangling_staging_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let staging = writer
+        .layout()
+        .root
+        .with_file_name(".tmp-seg-0000000000000001");
+    fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    symlink("missing-staging-target", &staging).unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("a dangling staging symlink must fail closed");
+
+    assert!(fs::symlink_metadata(staging)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!writer.layout().root.exists());
 }
 
 #[test]
@@ -260,6 +346,7 @@ fn segment_writer_compresses_chunk_payloads_with_zstd() {
         },
         points: Vec::new(),
         encoded_payload: original_payload.clone(),
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     };
 
@@ -538,6 +625,7 @@ fn sample_segment_input() -> (SeriesRegistry, HashMap<u64, Vec<Chunk>>) {
         },
         points,
         encoded_payload: encoded.payload,
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     };
 
@@ -569,6 +657,7 @@ fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
         },
         points,
         encoded_payload: encoded.payload,
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     }
 }

@@ -1,5 +1,37 @@
 use super::*;
 
+struct VisibilityRefreshQueryBudget<'a> {
+    execution: &'a QueryExecution,
+    retained_staging_bytes: u64,
+    reservation: &'a mut crate::QueryMemoryReservation,
+}
+
+impl VisibilityRefreshQueryBudget<'_> {
+    fn checkpoint(&self) -> Result<()> {
+        self.execution.checkpoint().map_err(Into::into)
+    }
+
+    fn admit_actual_range_rebuild(&mut self, raw_ranges: usize) -> Result<()> {
+        self.execution
+            .observe_intermediate_vector_size(u64::try_from(raw_ranges).unwrap_or(u64::MAX))?;
+        // The raw source vector and normalization output coexist. A fixed allowance also covers
+        // the bounded retained-range compaction vector and allocator slack.
+        let scratch_bytes = u64::try_from(raw_ranges)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(std::mem::size_of::<SeriesVisibilityRangeSummary>())
+                    .unwrap_or(u64::MAX),
+            )
+            .saturating_mul(2)
+            .saturating_add(4096);
+        let required = self.retained_staging_bytes.saturating_add(scratch_bytes);
+        if required > self.reservation.bytes() {
+            self.reservation.resize(required)?;
+        }
+        Ok(())
+    }
+}
+
 impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn missing_visibility_summary_series_ids<I>(
         &self,
@@ -149,7 +181,11 @@ impl ChunkStorage {
         persisted_index: &PersistedIndexState,
         tombstone_ranges: Option<&[tombstone::TombstoneRange]>,
         bounded_cutoff: i64,
+        mut query_budget: Option<&mut VisibilityRefreshQueryBudget<'_>>,
     ) -> Result<SeriesVisibilitySummary> {
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
         let latest_visible = self.latest_visible_timestamp_for_series_locked(
             series_id,
             persisted_index,
@@ -165,61 +201,111 @@ impl ChunkStorage {
             )?,
             None => None,
         };
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
 
-        let mut ranges = Vec::new();
-        {
-            let active = self.active_shard(series_id).read();
-            if let Some(state) = active.get(&series_id) {
-                ranges.extend(state.points_in_partition_order().filter_map(|point| {
+        // Ingest does not take the visibility fence. Hold both per-series shard guards while
+        // recounting, admitting, allocating, and traversing so a post-preflight write cannot
+        // make the actual range vector larger than its query reservation.
+        let active = self.active_shard(series_id).read();
+        let sealed = self.sealed_shard(series_id).read();
+        let active_ranges = if let Some(state) = active.get(&series_id) {
+            let mut count = 0usize;
+            for _ in state.points_in_partition_order() {
+                if let Some(query_budget) = query_budget.as_deref() {
+                    query_budget.checkpoint()?;
+                }
+                count = count.saturating_add(1);
+            }
+            count
+        } else {
+            0
+        };
+        let sealed_ranges = sealed.get(&series_id).map_or(0, BTreeMap::len);
+        let persisted_ranges = persisted_index
+            .chunk_refs
+            .get(&series_id)
+            .map_or(0, Vec::len);
+        let raw_ranges = active_ranges
+            .saturating_add(sealed_ranges)
+            .saturating_add(persisted_ranges);
+        if let Some(query_budget) = query_budget.as_deref_mut() {
+            query_budget.admit_actual_range_rebuild(raw_ranges)?;
+        }
+
+        let mut ranges = Vec::with_capacity(raw_ranges);
+        if let Some(state) = active.get(&series_id) {
+            for point in state.points_in_partition_order() {
+                if let Some(query_budget) = query_budget.as_deref() {
+                    query_budget.checkpoint()?;
+                }
+                if let Some(range) =
                     Self::single_timestamp_visibility_range(point.ts, tombstone_ranges)
-                }));
+                {
+                    ranges.push(range);
+                }
             }
         }
-        {
-            let sealed = self.sealed_shard(series_id).read();
-            if let Some(chunks) = sealed.get(&series_id) {
-                ranges.extend(chunks.values().filter_map(|chunk| {
-                    Self::chunk_bounds_visibility_range(
-                        chunk.header.min_ts,
-                        chunk.header.max_ts,
-                        chunk.header.point_count,
-                        tombstone_ranges,
-                    )
-                }));
+        if let Some(chunks) = sealed.get(&series_id) {
+            for chunk in chunks.values() {
+                if let Some(query_budget) = query_budget.as_deref() {
+                    query_budget.checkpoint()?;
+                }
+                if let Some(range) = Self::chunk_bounds_visibility_range(
+                    chunk.header.min_ts,
+                    chunk.header.max_ts,
+                    chunk.header.point_count,
+                    tombstone_ranges,
+                ) {
+                    ranges.push(range);
+                }
             }
         }
         if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
-            ranges.extend(chunks.iter().filter_map(|chunk_ref| {
-                Self::chunk_bounds_visibility_range(
+            for chunk_ref in chunks {
+                if let Some(query_budget) = query_budget.as_deref() {
+                    query_budget.checkpoint()?;
+                }
+                if let Some(range) = Self::chunk_bounds_visibility_range(
                     chunk_ref.min_ts,
                     chunk_ref.max_ts,
                     chunk_ref.point_count,
                     tombstone_ranges,
-                )
-            }));
+                ) {
+                    ranges.push(range);
+                }
+            }
         }
+        drop(sealed);
+        drop(active);
 
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
         Self::normalize_series_visibility_ranges(&mut ranges);
-        if ranges.len() > SERIES_VISIBILITY_SUMMARY_MAX_RANGES {
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
+        let truncated_before_floor = ranges.len() > SERIES_VISIBILITY_SUMMARY_MAX_RANGES;
+        if truncated_before_floor {
             let drop_count = ranges
                 .len()
                 .saturating_sub(SERIES_VISIBILITY_SUMMARY_MAX_RANGES);
             ranges.drain(..drop_count);
-            return Ok(SeriesVisibilitySummary {
-                latest_visible_timestamp: latest_visible,
-                latest_bounded_visible_timestamp: latest_bounded_visible,
-                exhaustive_floor_inclusive: ranges.first().map(|range| range.min_ts),
-                truncated_before_floor: true,
-                ranges,
-            });
         }
 
+        // Normalization deliberately allocates a full-size merge buffer. Compact the retained
+        // summary afterward so every update/map entry is bounded by the documented range cap
+        // rather than retaining capacity proportional to the raw source history.
+        let mut retained_ranges = Vec::with_capacity(ranges.len());
+        retained_ranges.extend(ranges);
         Ok(SeriesVisibilitySummary {
             latest_visible_timestamp: latest_visible,
             latest_bounded_visible_timestamp: latest_bounded_visible,
-            exhaustive_floor_inclusive: ranges.first().map(|range| range.min_ts),
-            truncated_before_floor: false,
-            ranges,
+            exhaustive_floor_inclusive: retained_ranges.first().map(|range| range.min_ts),
+            truncated_before_floor,
+            ranges: retained_ranges,
         })
     }
 
@@ -227,7 +313,9 @@ impl ChunkStorage {
         &self,
         updates: Vec<(SeriesId, SeriesVisibilitySummary)>,
     ) {
-        let _recency_guard = self.visibility.recency_state_lock.lock();
+        // The caller holds recency_state_lock from before it snapshots active/sealed state. Ingest
+        // publishes points before taking that lock to merge timestamps, so it either precedes
+        // this rebuild and is included or follows this replacement and merges afterward.
         let current_bounded = self
             .visibility
             .max_bounded_observed_timestamp
@@ -331,6 +419,146 @@ impl ChunkStorage {
         self.refresh_series_visible_timestamp_cache_locked(series_ids)
     }
 
+    pub(in crate::engine::storage_engine) fn series_visibility_refresh_staging_upper_bound<'a>(
+        &self,
+        series_ids: impl IntoIterator<Item = &'a SeriesId>,
+    ) -> usize {
+        self.series_visibility_refresh_staging_upper_bound_impl(series_ids, None, true)
+            .expect("visibility refresh staging without a query execution cannot fail")
+            .0
+    }
+
+    fn series_visibility_refresh_staging_upper_bound_impl<'a>(
+        &self,
+        series_ids: impl IntoIterator<Item = &'a SeriesId>,
+        execution: Option<&QueryExecution>,
+        include_id_vectors: bool,
+    ) -> Result<(usize, usize, usize)> {
+        let persisted_index = self.persisted.persisted_index.read();
+        let mut changed_count = 0usize;
+        let mut retained_updates = 0usize;
+        let mut largest_series_rebuild = 0usize;
+        let mut largest_intermediate_vector = 0usize;
+        for &series_id in series_ids {
+            if let Some(execution) = execution {
+                execution.checkpoint()?;
+            }
+            changed_count = changed_count.saturating_add(1);
+            let active_ranges = {
+                let active = self.active_shard(series_id).read();
+                if let Some(state) = active.get(&series_id) {
+                    let mut count = 0usize;
+                    for _ in state.points_in_partition_order() {
+                        if let Some(execution) = execution {
+                            execution.checkpoint()?;
+                        }
+                        count = count.saturating_add(1);
+                    }
+                    count
+                } else {
+                    0
+                }
+            };
+            let sealed_ranges = {
+                let sealed = self.sealed_shard(series_id).read();
+                if let Some(chunks) = sealed.get(&series_id) {
+                    let mut count = 0usize;
+                    for _ in chunks {
+                        if let Some(execution) = execution {
+                            execution.checkpoint()?;
+                        }
+                        count = count.saturating_add(1);
+                    }
+                    count
+                } else {
+                    0
+                }
+            };
+            let persisted_ranges = if let Some(chunks) = persisted_index.chunk_refs.get(&series_id)
+            {
+                let mut count = 0usize;
+                for _ in chunks {
+                    if let Some(execution) = execution {
+                        execution.checkpoint()?;
+                    }
+                    count = count.saturating_add(1);
+                }
+                count
+            } else {
+                0
+            };
+            let raw_ranges = active_ranges
+                .saturating_add(sealed_ranges)
+                .saturating_add(persisted_ranges);
+            largest_intermediate_vector = largest_intermediate_vector.max(raw_ranges);
+            // Normalization can hold the source and merged vectors together. The retained
+            // summary is capped, but the source scan is not, so charge its exact item count.
+            largest_series_rebuild = largest_series_rebuild.max(
+                raw_ranges
+                    .saturating_mul(std::mem::size_of::<SeriesVisibilityRangeSummary>())
+                    .saturating_mul(2)
+                    .saturating_add(4096),
+            );
+            retained_updates = retained_updates.saturating_add(
+                std::mem::size_of::<(SeriesId, SeriesVisibilitySummary)>().saturating_add(
+                    SERIES_VISIBILITY_SUMMARY_MAX_RANGES
+                        .saturating_mul(std::mem::size_of::<SeriesVisibilityRangeSummary>()),
+                ),
+            );
+        }
+
+        let id_vector = changed_count.saturating_mul(std::mem::size_of::<SeriesId>());
+        largest_intermediate_vector = largest_intermediate_vector.max(changed_count);
+        // Cache hash-map growth can retain predecessor allocations while the update vector and
+        // one per-series rebuild remain live. Four retained-update copies conservatively cover
+        // the three cache maps and allocator growth.
+        let retained_staging_bytes = usize::from(include_id_vectors)
+            .saturating_mul(id_vector.saturating_mul(2))
+            .saturating_add(retained_updates.saturating_mul(4))
+            .saturating_add(4096);
+        let bytes = retained_staging_bytes.saturating_add(largest_series_rebuild);
+        Ok((bytes, retained_staging_bytes, largest_intermediate_vector))
+    }
+
+    pub(in crate::engine::storage_engine) fn refresh_series_visible_timestamp_cache_for_query(
+        &self,
+        series_ids: Vec<SeriesId>,
+        execution: &QueryExecution,
+    ) -> Result<()> {
+        if series_ids.is_empty() {
+            return Ok(());
+        }
+
+        let _visibility_guard = self.visibility_read_fence();
+        // list_metrics has already reserved its source, missing-ID, and retention-partition
+        // vectors. Admit only the additional update/range/cache staging here so the same IDs are
+        // not charged twice.
+        let (staging_bytes, retained_staging_bytes, largest_intermediate_vector) = self
+            .series_visibility_refresh_staging_upper_bound_impl(
+                series_ids.iter(),
+                Some(execution),
+                false,
+            )?;
+        execution.observe_intermediate_vector_size(
+            u64::try_from(largest_intermediate_vector).unwrap_or(u64::MAX),
+        )?;
+        let mut reservation =
+            execution.reserve_memory(u64::try_from(staging_bytes).unwrap_or(u64::MAX))?;
+        execution.checkpoint()?;
+
+        #[cfg(test)]
+        self.invoke_metadata_visibility_refresh_post_preflight_hook();
+
+        self.refresh_series_visible_timestamp_cache_locked_impl(
+            series_ids,
+            Some(&mut VisibilityRefreshQueryBudget {
+                execution,
+                retained_staging_bytes: u64::try_from(retained_staging_bytes).unwrap_or(u64::MAX),
+                reservation: &mut reservation,
+            }),
+        )
+    }
+
     pub(in crate::engine::storage_engine) fn refresh_series_visible_timestamp_cache_locked<I>(
         &self,
         series_ids: I,
@@ -338,24 +566,46 @@ impl ChunkStorage {
     where
         I: IntoIterator<Item = SeriesId>,
     {
+        self.refresh_series_visible_timestamp_cache_locked_impl(series_ids, None)
+    }
+
+    fn refresh_series_visible_timestamp_cache_locked_impl<I>(
+        &self,
+        series_ids: I,
+        mut query_budget: Option<&mut VisibilityRefreshQueryBudget<'_>>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = SeriesId>,
+    {
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
         let mut series_ids = series_ids.into_iter().collect::<Vec<_>>();
         if series_ids.is_empty() {
             return Ok(());
         }
         series_ids.sort_unstable();
         series_ids.dedup();
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
 
+        let _recency_guard = self.visibility.recency_state_lock.lock();
         let tombstones = self.visibility.tombstones.read();
         let persisted_index = self.persisted.persisted_index.read();
         let bounded_cutoff = self.current_future_skew_cutoff();
         let mut updates = Vec::with_capacity(series_ids.len());
 
         for series_id in series_ids {
+            if let Some(query_budget) = query_budget.as_deref() {
+                query_budget.checkpoint()?;
+            }
             let summary = self.rebuild_series_visibility_summary_locked(
                 series_id,
                 &persisted_index,
                 tombstones.get(&series_id).map(Vec::as_slice),
                 bounded_cutoff,
+                query_budget.as_deref_mut(),
             )?;
             updates.push((series_id, summary));
         }
@@ -363,6 +613,9 @@ impl ChunkStorage {
         drop(persisted_index);
         drop(tombstones);
 
+        if let Some(query_budget) = query_budget.as_deref() {
+            query_budget.checkpoint()?;
+        }
         self.replace_series_visible_timestamp_cache_entries(updates);
         Ok(())
     }

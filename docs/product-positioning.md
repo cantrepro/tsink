@@ -130,10 +130,11 @@ compatibility gates.
 
 - tsink is pre-1.0; public APIs and on-disk upgrade guarantees are still being
   hardened.
-- The builder has individual memory, cardinality, WAL, retention, and
-  concurrency controls. Finite named resource profiles and a comprehensive
-  tested resource envelope are not shipped, and several important quotas
-  default to no explicit limit.
+- Finite named resource profiles and deterministic low-level overrides are
+  shipped, with `Embedded` as the core default and `Server` as the server
+  default. Their initial constants remain provisional pending the complete
+  clean measurement matrix, and the modeled accounting is not a comprehensive
+  process-RSS envelope.
 - `write_batch` reports indexed structured outcomes with explicit atomic or
   best-effort policy, and the principal ingest adapters preserve durability and
   partial/indeterminate effects. Cross-component and cross-node atomicity are

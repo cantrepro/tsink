@@ -52,8 +52,39 @@ pub struct WalReplayStream {
 pub struct CommittedWalReplayStream {
     raw: WalReplayStream,
     pending_series_definitions: Vec<SeriesDefinitionFrame>,
+    pending_series_definition_bytes: usize,
     published_highwater: WalHighWatermark,
     finished: bool,
+}
+
+pub(in crate::engine) struct CommittedWalFrameReplayStream {
+    raw: WalReplayStream,
+    published_highwater: WalHighWatermark,
+    finished: bool,
+}
+
+pub(in crate::engine) struct AdmittedReplayFrame<R> {
+    pub(in crate::engine) frame: ReplayFrame,
+    pub(in crate::engine) reservation: R,
+    pub(in crate::engine) highwater: WalHighWatermark,
+}
+
+fn modeled_replay_frame_scratch_bytes(frame_type: u8, payload_len: usize) -> Result<usize> {
+    let copied_payloads = payload_len
+        .checked_mul(2)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+    let decoded_structures = match frame_type {
+        FRAME_TYPE_SERIES_DEF => std::mem::size_of::<SeriesDefinitionFrame>()
+            .checked_add(payload_len)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+        FRAME_TYPE_SAMPLES => (u16::MAX as usize)
+            .checked_mul(std::mem::size_of::<SamplesBatchFrame>())
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+        _ => 0,
+    };
+    copied_payloads
+        .checked_add(decoded_structures)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
 }
 
 impl WalReplayStream {
@@ -155,6 +186,15 @@ impl WalReplayStream {
     }
 
     pub fn next_frame(&mut self) -> Result<Option<ReplayFrame>> {
+        Ok(self
+            .next_frame_with_admission(|_| Ok(()))?
+            .map(|admitted| admitted.frame))
+    }
+
+    pub(in crate::engine) fn next_frame_with_admission<R>(
+        &mut self,
+        mut reserve: impl FnMut(usize) -> Result<R>,
+    ) -> Result<Option<AdmittedReplayFrame<R>>> {
         loop {
             if self.current_reader.is_none() && !self.open_next_segment()? {
                 return Ok(None);
@@ -203,6 +243,9 @@ impl WalReplayStream {
                 )?;
                 continue;
             }
+
+            let reservation =
+                reserve(modeled_replay_frame_scratch_bytes(frame_type, payload_len)?)?;
 
             let mut payload = vec![0u8; payload_len];
             if let Err(e) = reader.read_exact(&mut payload) {
@@ -273,7 +316,11 @@ impl WalReplayStream {
             };
 
             self.last_frame_highwater = frame_pos;
-            return Ok(Some(frame));
+            return Ok(Some(AdmittedReplayFrame {
+                frame,
+                reservation,
+                highwater: frame_pos,
+            }));
         }
     }
 
@@ -305,6 +352,7 @@ impl CommittedWalReplayStream {
         Self {
             raw,
             pending_series_definitions: Vec::new(),
+            pending_series_definition_bytes: 0,
             published_highwater,
             finished: false,
         }
@@ -325,6 +373,33 @@ impl CommittedWalReplayStream {
 
             match next_frame {
                 Some(ReplayFrame::SeriesDefinition(definition)) => {
+                    let definition_bytes = std::mem::size_of::<SeriesDefinitionFrame>()
+                        .checked_add(definition.metric.len())
+                        .and_then(|bytes| {
+                            definition
+                                .labels
+                                .len()
+                                .checked_mul(std::mem::size_of::<Label>())
+                                .and_then(|labels| bytes.checked_add(labels))
+                        })
+                        .and_then(|bytes| {
+                            definition.labels.iter().try_fold(bytes, |bytes, label| {
+                                bytes
+                                    .checked_add(label.name.len())
+                                    .and_then(|bytes| bytes.checked_add(label.value.len()))
+                            })
+                        })
+                        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+                    let pending_bytes = self
+                        .pending_series_definition_bytes
+                        .checked_add(definition_bytes)
+                        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+                    if pending_bytes > MAX_FRAME_PAYLOAD_BYTES {
+                        return Err(TsinkError::DataCorruption(format!(
+                            "committed WAL write has more than {MAX_FRAME_PAYLOAD_BYTES} bytes of pending series definitions"
+                        )));
+                    }
+                    self.pending_series_definition_bytes = pending_bytes;
                     self.pending_series_definitions.push(definition);
                 }
                 Some(ReplayFrame::Samples(sample_batches)) => {
@@ -336,6 +411,7 @@ impl CommittedWalReplayStream {
                         .into_iter()
                         .filter(|definition| committed_series_ids.contains(&definition.series_id))
                         .collect();
+                    self.pending_series_definition_bytes = 0;
                     return Ok(Some(CommittedWalWriteFrame {
                         series_definitions,
                         sample_batches,
@@ -349,6 +425,34 @@ impl CommittedWalReplayStream {
                 }
             }
         }
+    }
+}
+
+impl CommittedWalFrameReplayStream {
+    fn new(raw: WalReplayStream, published_highwater: WalHighWatermark) -> Self {
+        Self {
+            raw,
+            published_highwater,
+            finished: false,
+        }
+    }
+
+    pub(in crate::engine) fn next_frame_with_admission<R>(
+        &mut self,
+        mut reserve: impl FnMut(usize) -> Result<R>,
+    ) -> Result<Option<AdmittedReplayFrame<R>>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let Some(frame) = self.raw.next_frame_with_admission(&mut reserve)? else {
+            self.finished = true;
+            return Ok(None);
+        };
+        if frame.highwater > self.published_highwater {
+            self.finished = true;
+            return Ok(None);
+        }
+        Ok(Some(frame))
     }
 }
 
@@ -550,6 +654,21 @@ impl FramedWal {
     ) -> Result<CommittedWalReplayStream> {
         Ok(CommittedWalReplayStream::new(
             self.replay_stream_after_with_context(replay_highwater, replay_mode, context)?,
+            self.current_published_highwater(),
+        ))
+    }
+
+    pub(in crate::engine) fn replay_committed_frame_stream_after_with_mode(
+        &self,
+        replay_highwater: WalHighWatermark,
+        replay_mode: WalReplayMode,
+    ) -> Result<CommittedWalFrameReplayStream> {
+        Ok(CommittedWalFrameReplayStream::new(
+            self.replay_stream_after_with_context(
+                replay_highwater,
+                replay_mode,
+                WalReplayContext::General,
+            )?,
             self.current_published_highwater(),
         ))
     }

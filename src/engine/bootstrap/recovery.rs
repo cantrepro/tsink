@@ -83,7 +83,12 @@ fn validate_startup_registry_catalog(
     let index_path = series_index_path.expect("persisted registry requires a snapshot path");
     let catalog_sources = registry_catalog::inventory_sources(&inventory.segment_inventory);
     match registry_catalog::validate_registry_catalog(index_path, &catalog_sources) {
-        Ok(Some(validated_catalog)) => Some(validated_catalog),
+        Ok(Some(validated_catalog)) => {
+            if !validated_catalog.incremental_store || !validated_catalog.legacy_snapshot {
+                registry.force_registry_checkpoint();
+            }
+            Some(validated_catalog)
+        }
         Ok(None) => {
             registry.force_registry_checkpoint();
             None
@@ -113,17 +118,24 @@ fn load_startup_segment_state(
         load_segment_series,
         numeric_lane_enabled,
         blob_lane_enabled,
+        plan.startup_memory_budget(),
     )?;
 
     if inventory.apply_quarantines(load_quarantined) {
         registry.force_registry_checkpoint();
         if registry.reconcile_registry_with_persisted || !load_segment_series {
             registry.discard_persisted_registry();
+            // Do not retain a complete first set of indexes and mappings while rebuilding the
+            // same valid segments with series metadata. Startup admission charges each physical
+            // segment once, so release that recoverable intermediate before materializing its
+            // replacement.
+            drop(std::mem::take(&mut loaded_segments));
             let (reloaded_segments, reloaded_quarantined) = load_startup_segments_with_recovery(
                 &inventory.segment_inventory,
                 true,
                 numeric_lane_enabled,
                 blob_lane_enabled,
+                plan.startup_memory_budget(),
             )?;
             loaded_segments = reloaded_segments;
             if inventory.apply_quarantines(reloaded_quarantined) {
@@ -147,6 +159,7 @@ fn reconcile_startup_registry_snapshot(
         Some(loaded_registry),
         Some(registry_catalog::ValidatedRegistryCatalog {
             series_fingerprint: Some(series_fingerprint),
+            ..
         }),
     ) = (registry.persisted_registry.as_ref(), validated_catalog)
     else {
@@ -168,11 +181,15 @@ fn reconcile_startup_registry_snapshot(
         registry.discard_persisted_registry();
 
         let (numeric_lane_enabled, blob_lane_enabled) = plan.lane_flags();
+        // The fallback rebuild replaces this entire index set. Releasing it first keeps mapping
+        // and decoded-index retention within the one-copy startup admission model.
+        drop(std::mem::take(loaded_segments));
         let (reloaded_segments, reloaded_quarantined) = load_startup_segments_with_recovery(
             &inventory.segment_inventory,
             true,
             numeric_lane_enabled,
             blob_lane_enabled,
+            plan.startup_memory_budget(),
         )?;
         *loaded_segments = reloaded_segments;
         if inventory.apply_quarantines(reloaded_quarantined) {
@@ -190,6 +207,7 @@ fn should_load_segment_series(
         validated_catalog,
         Some(registry_catalog::ValidatedRegistryCatalog {
             series_fingerprint: Some(_),
+            ..
         })
     )
 }
@@ -199,14 +217,17 @@ fn load_startup_segments_with_recovery(
     load_series: bool,
     numeric_lane_enabled: bool,
     blob_lane_enabled: bool,
+    metadata_decode_limit_bytes: usize,
 ) -> Result<(LoadedSegmentIndexes, Vec<StartupQuarantinedSegment>)> {
     let loaded_numeric = load_segment_indexes_from_dirs_startup_recoverable_with_series(
         inventory.roots_for_lane(SegmentLaneFamily::Numeric),
         load_series,
+        metadata_decode_limit_bytes,
     )?;
     let loaded_blob = load_segment_indexes_from_dirs_startup_recoverable_with_series(
         inventory.roots_for_lane(SegmentLaneFamily::Blob),
         load_series,
+        metadata_decode_limit_bytes,
     )?;
     let mut quarantined = loaded_numeric.quarantined;
     quarantined.extend(loaded_blob.quarantined);

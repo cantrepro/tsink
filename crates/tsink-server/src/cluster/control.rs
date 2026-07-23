@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
+#[cfg(test)]
+use tsink::disk_budget::DiskCategory;
+use tsink::disk_budget::LocalDiskBudget;
 
 pub const CONTROL_STATE_SCHEMA_VERSION: u16 = 1;
 const CONTROL_STATE_MAGIC: &str = "tsink-control-state";
@@ -1071,6 +1073,7 @@ pub struct ControlStateStore {
 #[derive(Debug)]
 struct ControlStateStoreInner {
     path: PathBuf,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     write_state: Mutex<ControlStateStoreWriteState>,
 }
 
@@ -1100,12 +1103,6 @@ impl From<&ControlState> for ControlStatePersistenceVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlStatePersistMode {
-    Monotonic,
-    ReplaceCurrent,
-}
-
 #[derive(Debug, Clone)]
 struct LoadedControlState {
     state: ControlState,
@@ -1120,8 +1117,43 @@ struct ControlStateEnvelopeV1 {
 }
 
 impl ControlStateStore {
+    #[allow(dead_code)]
     pub fn open(path: PathBuf) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
+        Self::open_with_disk_budget(path, None)
+    }
+
+    pub fn open_with_disk_budget(
+        path: PathBuf,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
+        let parent = path.parent().ok_or_else(|| {
+            format!(
+                "control-state path has no parent directory: {}",
+                path.display()
+            )
+        })?;
+        if let Some(budget) = local_disk_budget.as_ref() {
+            budget
+                .create_dir_all_and_sync_parents(parent)
+                .map_err(|err| {
+                    format!(
+                        "failed to create control-state directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            budget.validate_managed_file_path(&path).map_err(|err| {
+                format!(
+                    "failed to validate control-state path {}: {err}",
+                    path.display()
+                )
+            })?;
+            budget.cleanup_atomic_write_temps(&path).map_err(|err| {
+                format!(
+                    "failed to clean control-state temporary files for {}: {err}",
+                    path.display()
+                )
+            })?;
+        } else {
             std::fs::create_dir_all(parent).map_err(|err| {
                 format!(
                     "failed to create control-state directory {}: {err}",
@@ -1132,6 +1164,7 @@ impl ControlStateStore {
         Ok(Self {
             inner: Arc::new(ControlStateStoreInner {
                 path,
+                local_disk_budget,
                 write_state: Mutex::new(ControlStateStoreWriteState::default()),
             }),
         })
@@ -1141,11 +1174,16 @@ impl ControlStateStore {
         &self.inner.path
     }
 
+    pub(crate) fn local_disk_budget(&self) -> Option<&Arc<LocalDiskBudget>> {
+        self.inner.local_disk_budget.as_ref()
+    }
+
     #[allow(dead_code)]
     pub fn load(&self) -> Result<Option<ControlState>, String> {
         Ok(self.load_internal()?.map(|loaded| loaded.state))
     }
 
+    #[cfg(test)]
     pub fn load_or_bootstrap(&self, bootstrap_state: ControlState) -> Result<ControlState, String> {
         bootstrap_state.validate()?;
 
@@ -1157,12 +1195,9 @@ impl ControlStateStore {
         Ok(bootstrap_state)
     }
 
+    #[cfg(test)]
     pub fn persist(&self, state: &ControlState) -> Result<(), String> {
-        self.persist_internal(state, ControlStatePersistMode::Monotonic)
-    }
-
-    pub fn replace(&self, state: &ControlState) -> Result<(), String> {
-        self.persist_internal(state, ControlStatePersistMode::ReplaceCurrent)
+        self.persist_internal(state)
     }
 
     fn load_internal(&self) -> Result<Option<LoadedControlState>, String> {
@@ -1248,21 +1283,9 @@ impl ControlStateStore {
         Ok(Some(LoadedControlState { state }))
     }
 
-    fn persist_internal(
-        &self,
-        state: &ControlState,
-        mode: ControlStatePersistMode,
-    ) -> Result<(), String> {
-        state.validate()?;
-
-        let envelope = ControlStateEnvelopeV1 {
-            magic: CONTROL_STATE_MAGIC.to_string(),
-            schema_version: CONTROL_STATE_SCHEMA_VERSION,
-            state: state.clone(),
-        };
-        let mut encoded = serde_json::to_vec_pretty(&envelope)
-            .map_err(|err| format!("failed to serialize control state: {err}"))?;
-        encoded.push(b'\n');
+    #[cfg(test)]
+    fn persist_internal(&self, state: &ControlState) -> Result<(), String> {
+        let encoded = encode_control_state_file(state)?;
         let candidate_version = ControlStatePersistenceVersion::from(state);
 
         let mut write_state = self
@@ -1275,22 +1298,59 @@ impl ControlStateStore {
                 .load_internal()?
                 .map(|loaded| ControlStatePersistenceVersion::from(&loaded.state));
         }
-        if mode == ControlStatePersistMode::Monotonic
-            && write_state
-                .latest_persisted_version
-                .is_some_and(|current| candidate_version < current)
+        if write_state
+            .latest_persisted_version
+            .is_some_and(|current| candidate_version < current)
         {
             return Ok(());
         }
 
-        write_atomically(&self.inner.path, &encoded)?;
+        if let Some(budget) = self.inner.local_disk_budget.as_ref() {
+            budget
+                .write_file_atomically_and_sync_parent(
+                    &self.inner.path,
+                    &encoded,
+                    DiskCategory::Cluster,
+                )
+                .map_err(|err| {
+                    format!(
+                        "failed to persist control-state file {}: {err}",
+                        self.inner.path.display()
+                    )
+                })?;
+        } else {
+            write_atomically(&self.inner.path, &encoded)?;
+        }
         write_state.latest_persisted_version = Some(candidate_version);
         Ok(())
     }
+
+    pub(crate) fn record_persisted_checkpoint(&self, state: &ControlState) {
+        let mut write_state = self
+            .inner
+            .write_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_state.latest_persisted_version = Some(ControlStatePersistenceVersion::from(state));
+    }
 }
 
+pub(crate) fn encode_control_state_file(state: &ControlState) -> Result<Vec<u8>, String> {
+    state.validate()?;
+    let envelope = ControlStateEnvelopeV1 {
+        magic: CONTROL_STATE_MAGIC.to_string(),
+        schema_version: CONTROL_STATE_SCHEMA_VERSION,
+        state: state.clone(),
+    };
+    let mut encoded = serde_json::to_vec_pretty(&envelope)
+        .map_err(|err| format!("failed to serialize control state: {err}"))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+#[cfg(test)]
 fn write_atomically(path: &Path, encoded: &[u8]) -> Result<(), String> {
-    write_file_atomically_and_sync_parent(path, encoded).map_err(|err| {
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, encoded).map_err(|err| {
         format!(
             "failed to persist control-state file {}: {err}",
             path.display()

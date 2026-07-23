@@ -641,6 +641,7 @@ pub(crate) fn downsample_points_with_custom(
     aggregation: &dyn BytesAggregation,
     start: i64,
     end: i64,
+    mut admit: impl FnMut(&DataPoint) -> Result<()>,
 ) -> Result<Vec<DataPoint>> {
     if points.is_empty() || interval <= 0 || start >= end {
         return Ok(Vec::new());
@@ -671,6 +672,7 @@ pub(crate) fn downsample_points_with_custom(
         }
 
         if let Some(dp) = aggregation.aggregate_bucket(&points[bucket_begin..idx], bucket_start)? {
+            admit(&dp)?;
             result.push(dp);
         }
     }

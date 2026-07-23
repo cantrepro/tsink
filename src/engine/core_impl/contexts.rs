@@ -11,8 +11,11 @@ pub(in crate::engine::storage_engine) struct CatalogContext<'a> {
 pub(in crate::engine::storage_engine) struct ChunkContext<'a> {
     pub(in crate::engine::storage_engine) active_builders:
         &'a [ActiveBuilderShard; IN_MEMORY_SHARD_COUNT],
+    pub(in crate::engine::storage_engine) active_wal_index: &'a Mutex<ActiveWalIndex>,
     pub(in crate::engine::storage_engine) sealed_chunks:
         &'a [SealedChunkShard; IN_MEMORY_SHARD_COUNT],
+    pub(in crate::engine::storage_engine) pending_sealed_chunks:
+        &'a RwLock<PendingSealedChunkIndex>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +43,15 @@ pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) clock: ClockContext<'a>,
     pub(in crate::engine::storage_engine) max_future_skew_window: Option<i64>,
     pub(in crate::engine::storage_engine) cardinality_limit: usize,
+    pub(in crate::engine::storage_engine) max_labels_per_series: usize,
+    pub(in crate::engine::storage_engine) max_series_identity_bytes: usize,
+    pub(in crate::engine::storage_engine) write_batch_limits: crate::WriteBatchLimits,
+    pub(in crate::engine::storage_engine) wal_enabled: bool,
+    pub(in crate::engine::storage_engine) write_transient: &'a Arc<WriteTransientMemoryAccounting>,
+    pub(in crate::engine::storage_engine) series_creation_rate_limiter:
+        &'a Arc<SeriesCreationRateLimiter>,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) tombstone_staged_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
 }
@@ -83,7 +94,9 @@ impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn chunk_context(&self) -> ChunkContext<'_> {
         ChunkContext {
             active_builders: &self.chunks.active_builders,
+            active_wal_index: &self.chunks.active_wal_index,
             sealed_chunks: &self.chunks.sealed_chunks,
+            pending_sealed_chunks: &self.chunks.pending_sealed_chunks,
         }
     }
 
@@ -197,6 +210,10 @@ impl ChunkStorage {
             persisted_index: &self.persisted.persisted_index,
             sealed_chunks: &self.chunks.sealed_chunks,
             flush_metrics: &self.observability.flush,
+            #[cfg(test)]
+            exact_eviction_inspect_hook: &self
+                .persist_test_hooks
+                .exact_sealed_eviction_inspect_hook,
         }
     }
 
@@ -241,6 +258,7 @@ impl ChunkStorage {
     ) -> SealedChunkPublishContext<'_> {
         SealedChunkPublishContext {
             sealed_chunks: &self.chunks.sealed_chunks,
+            pending_sealed_chunks: &self.chunks.pending_sealed_chunks,
             next_chunk_sequence: &self.chunks.next_chunk_sequence,
             memory: self.shard_memory_accounting_context(),
             #[cfg(test)]
@@ -279,7 +297,14 @@ impl ChunkStorage {
             clock: self.clock_context(),
             max_future_skew_window: self.runtime.max_future_skew_window,
             cardinality_limit: self.runtime.cardinality_limit,
+            max_labels_per_series: self.runtime.max_labels_per_series,
+            max_series_identity_bytes: self.runtime.max_series_identity_bytes,
+            write_batch_limits: self.runtime.write_batch_limits,
+            wal_enabled: self.persisted.wal.is_some(),
+            write_transient: &self.memory.write_transient,
+            series_creation_rate_limiter: &self.catalog.series_creation_rate_limiter,
             used_bytes: &self.memory.used_bytes,
+            tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
             budget_bytes: &self.memory.budget_bytes,
             memory_rejections_total: &self.memory.rejections_total,
         }
@@ -314,7 +339,10 @@ impl ChunkStorage {
             },
             memory_budget: WritePrepareMemoryBudgetContext {
                 used_bytes: &self.memory.used_bytes,
+                tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
                 budget_bytes: &self.memory.budget_bytes,
+                write_transient: &self.memory.write_transient,
+                memory_rejections_total: &self.memory.rejections_total,
             },
             admission: WriteAdmissionControlContext {
                 lifecycle: self.coordination.lifecycle.as_ref(),
@@ -385,6 +413,12 @@ impl ChunkStorage {
                 observability: self.observability.as_ref(),
                 wal: self.persisted.wal.as_ref(),
                 wal_metrics: self.wal_metrics_context(),
+                accounting_enabled: self.memory.accounting_enabled,
+                wal_series_definition_cache_used_bytes: &self
+                    .memory
+                    .wal_series_definition_cache_used_bytes,
+                shared_used_bytes: &self.memory.shared_used_bytes,
+                used_bytes: &self.memory.used_bytes,
                 #[cfg(test)]
                 crash_before_publish_persisted: &self
                     .persist_test_hooks
@@ -403,12 +437,19 @@ impl ChunkStorage {
             registry_used_bytes: &self.memory.registry_used_bytes,
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,
             persisted_mmap_used_bytes: &self.memory.persisted_mmap_used_bytes,
+            wal_series_definition_cache_used_bytes: &self
+                .memory
+                .wal_series_definition_cache_used_bytes,
             shared_used_bytes: &self.memory.shared_used_bytes,
             used_bytes: &self.memory.used_bytes,
             registry_bookkeeping: self.registry_bookkeeping_context(),
             materialized_series: self.materialized_series_write_context(),
             runtime_metadata_delta: self.runtime_metadata_delta_write_context(),
             metadata_shards: self.metadata_shard_publication_context(),
+            #[cfg(test)]
+            persisted_index_accounting_inspect_hook: &self
+                .persist_test_hooks
+                .persisted_index_accounting_inspect_hook,
         }
     }
 }

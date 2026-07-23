@@ -33,6 +33,74 @@ fn internal_storage_write_error_response(
     internal_error_response(fallback_status, fallback_code, message, fallback_retryable)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InternalControlErrorContract<'a> {
+    status: u16,
+    code: &'a str,
+    retryable: bool,
+    write_error_header: bool,
+}
+
+fn internal_control_error_contract<'a>(
+    resource_limited: bool,
+    persistence_fenced: bool,
+    indeterminate: bool,
+    committed_checkpoint_pending: bool,
+    fallback_code: &'a str,
+) -> InternalControlErrorContract<'a> {
+    if persistence_fenced || indeterminate {
+        return InternalControlErrorContract {
+            status: 503,
+            code: CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+            retryable: false,
+            write_error_header: true,
+        };
+    }
+    if resource_limited {
+        return InternalControlErrorContract {
+            status: 413,
+            code: "write_disk_quota_exceeded",
+            retryable: false,
+            write_error_header: true,
+        };
+    }
+    InternalControlErrorContract {
+        status: 503,
+        code: fallback_code,
+        retryable: !committed_checkpoint_pending,
+        write_error_header: false,
+    }
+}
+
+fn internal_control_consensus_error_response(
+    err: &ControlConsensusError,
+    persistence_fenced: bool,
+    fallback_code: &str,
+    message: String,
+) -> HttpResponse {
+    let contract = internal_control_error_contract(
+        err.resource_limit().is_some(),
+        persistence_fenced,
+        err.is_indeterminate(),
+        err.is_committed_checkpoint_pending(),
+        fallback_code,
+    );
+    internal_control_error_response_from_contract(contract, message)
+}
+
+fn internal_control_error_response_from_contract(
+    contract: InternalControlErrorContract<'_>,
+    message: String,
+) -> HttpResponse {
+    let response =
+        internal_error_response(contract.status, contract.code, message, contract.retryable);
+    if contract.write_error_header {
+        response.with_header(WRITE_ERROR_CODE_HEADER, contract.code)
+    } else {
+        response
+    }
+}
+
 #[derive(Debug, Clone)]
 enum InternalAtomicWriteDisposition {
     Accepted(WriteAcknowledgement),
@@ -206,14 +274,44 @@ fn dedupe_persistence_failure_response(
     applied_metadata_updates: usize,
     accepted_exemplars: usize,
 ) -> HttpResponse {
+    let (status, code, retryable) = if err.resource_limit().is_some() {
+        (413, "write_disk_quota_exceeded", false)
+    } else {
+        (503, "dedupe_persistence_failed", true)
+    };
     partial_write_error_response(
-        internal_error_response(503, "dedupe_persistence_failed", err.to_string(), true),
+        internal_error_response(status, code, err.to_string(), retryable)
+            .with_header(WRITE_ERROR_CODE_HEADER, code),
         accepted_rows,
         acknowledgement,
         accepted_metadata_updates,
         applied_metadata_updates,
         accepted_exemplars,
     )
+}
+
+fn dedupe_begin_failure_response(
+    err: &DedupeBeginError,
+    fallback_code: &'static str,
+    context: &'static str,
+) -> HttpResponse {
+    match err {
+        DedupeBeginError::InvalidIdempotencyKey { .. } => {
+            internal_error_response(400, "invalid_idempotency_key", err.to_string(), false)
+        }
+        DedupeBeginError::Persistence(persistence) if persistence.resource_limit().is_some() => {
+            internal_error_response(
+                413,
+                "write_disk_quota_exceeded",
+                persistence.to_string(),
+                false,
+            )
+            .with_header(WRITE_ERROR_CODE_HEADER, "write_disk_quota_exceeded")
+        }
+        DedupeBeginError::Persistence(_) => {
+            internal_error_response(503, fallback_code, format!("{context}: {err}"), true)
+        }
+    }
 }
 
 pub(super) fn membership_from_control_state(
@@ -1440,7 +1538,11 @@ pub(super) async fn handle_internal_ingest_write(
                 dedupe_reservation = Some(reservation);
             }
             Err(err) => {
-                return internal_error_response(503, "dedupe_unavailable", err.to_string(), true);
+                return dedupe_begin_failure_response(
+                    &err,
+                    "dedupe_unavailable",
+                    "internal dedupe is unavailable",
+                );
             }
         }
     }
@@ -1817,11 +1919,10 @@ pub(super) async fn handle_internal_ingest_rows(
                 dedupe_reservation = Some(reservation);
             }
             Err(err) => {
-                return internal_error_response(
-                    503,
+                return dedupe_begin_failure_response(
+                    &err,
                     "dedupe_lookup_failed",
-                    format!("internal dedupe lookup failed: {err}"),
-                    true,
+                    "internal dedupe lookup failed",
                 );
             }
         }
@@ -2564,6 +2665,7 @@ pub(super) async fn handle_internal_snapshot_data(
     internal_api: Option<&InternalApiConfig>,
     cluster_context: Option<&ClusterRequestContext>,
     admin_path_prefix: Option<&Path>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
 ) -> HttpResponse {
     if let Err(response) =
         authorize_internal_cluster_request(request, internal_api, cluster_context, false, &[])
@@ -2590,6 +2692,12 @@ pub(super) async fn handle_internal_snapshot_data(
                 return internal_error_response(422, "invalid_snapshot_path", err, false);
             }
         };
+    if let Err(err) = validate_snapshot_destination_outside_offline_root(
+        &snapshot_path,
+        offline_restore_disk_budget.map(Arc::as_ref),
+    ) {
+        return internal_error_response(422, "invalid_snapshot_path", err, false);
+    }
 
     match perform_local_data_snapshot(
         storage,
@@ -2612,12 +2720,67 @@ pub(super) async fn handle_internal_restore_data(
     cluster_context: Option<&ClusterRequestContext>,
     admin_path_prefix: Option<&Path>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
 ) -> HttpResponse {
-    if let Err(response) =
-        authorize_internal_cluster_request(request, internal_api, cluster_context, false, &[])
-    {
+    handle_internal_restore_data_impl(
+        request,
+        internal_api,
+        cluster_context,
+        admin_path_prefix,
+        local_disk_budget,
+        offline_restore_disk_budget,
+        &[],
+    )
+    .await
+}
+
+pub(super) async fn handle_internal_restore_data_budgeted(
+    request: &HttpRequest,
+    internal_api: Option<&InternalApiConfig>,
+    cluster_context: Option<&ClusterRequestContext>,
+    admin_path_prefix: Option<&Path>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
+) -> HttpResponse {
+    handle_internal_restore_data_impl(
+        request,
+        internal_api,
+        cluster_context,
+        admin_path_prefix,
+        local_disk_budget,
+        offline_restore_disk_budget,
+        &[CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_internal_restore_data_impl(
+    request: &HttpRequest,
+    internal_api: Option<&InternalApiConfig>,
+    cluster_context: Option<&ClusterRequestContext>,
+    admin_path_prefix: Option<&Path>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
+    required_capabilities: &[&str],
+) -> HttpResponse {
+    if let Err(response) = authorize_internal_cluster_request(
+        request,
+        internal_api,
+        cluster_context,
+        false,
+        required_capabilities,
+    ) {
         return response;
     }
+    let Some(offline_restore_disk_budget) = offline_restore_disk_budget else {
+        return internal_error_response(
+            503,
+            "offline_restore_unconfigured",
+            "offline restore is unavailable because no dedicated restore root and finite disk limit are configured",
+            false,
+        );
+    };
 
     let payload: InternalDataRestoreRequest = match parse_internal_json_body(request) {
         Ok(payload) => payload,
@@ -2643,22 +2806,34 @@ pub(super) async fn handle_internal_restore_data(
     {
         Ok(path) => path,
         Err(err) => {
-            return internal_error_response(422, "invalid_snapshot_path", err, false);
+            return internal_error_response(422, "invalid_restore_path", err, false);
         }
     };
     let data_path = match resolve_admin_path(Path::new(&data_path), admin_path_prefix, false) {
         Ok(path) => path,
         Err(err) => {
-            return internal_error_response(422, "invalid_data_path", err, false);
+            return internal_error_response(422, "invalid_restore_path", err, false);
         }
     };
     if let Err(err) = validate_restore_target_outside_live_root(&data_path, local_disk_budget) {
-        return internal_error_response(409, "live_data_path_restore_rejected", err, false);
+        return internal_error_response(422, "invalid_restore_path", err, false);
+    }
+    if let Err(err) =
+        validate_restore_target_within_offline_root(&data_path, offline_restore_disk_budget)
+    {
+        return internal_error_response(422, "invalid_restore_path", err, false);
     }
 
-    match perform_local_data_restore(&snapshot_path, &data_path, cluster_context).await {
+    match perform_local_data_restore(
+        &snapshot_path,
+        &data_path,
+        cluster_context,
+        Arc::clone(offline_restore_disk_budget),
+    )
+    .await
+    {
         Ok(response) => json_response(200, &response),
-        Err(err) => internal_error_response(503, "restore_failed", err, true),
+        Err(err) => admin_restore_error_response(&err),
     }
 }
 
@@ -2871,11 +3046,11 @@ pub(super) async fn handle_internal_control_append(
 
     match consensus.handle_append_request(payload) {
         Ok(response) => json_response(200, &response),
-        Err(err) => internal_error_response(
-            503,
+        Err(err) => internal_control_consensus_error_response(
+            &err,
+            consensus.persistence_status().fenced,
             "control_append_failed",
             format!("control append failed: {err}"),
-            true,
         ),
     }
 }
@@ -2915,11 +3090,11 @@ pub(super) async fn handle_internal_control_install_snapshot(
 
     match consensus.handle_install_snapshot_request(payload) {
         Ok(response) => json_response(200, &response),
-        Err(err) => internal_error_response(
-            503,
+        Err(err) => internal_control_consensus_error_response(
+            &err,
+            consensus.persistence_status().fenced,
             "control_install_snapshot_failed",
             format!("control install_snapshot failed: {err}"),
-            true,
         ),
     }
 }
@@ -2966,11 +3141,34 @@ pub(super) async fn handle_internal_control_auto_join(
     };
 
     if !consensus.is_local_control_leader() {
-        let _ = consensus
+        if let Err(err) = consensus
             .ensure_leader_established(&cluster_context.rpc_client)
-            .await;
+            .await
+        {
+            return internal_control_consensus_error_response(
+                &err,
+                consensus.persistence_status().fenced,
+                "control_leader_establish_failed",
+                format!("failed to establish control leader before auto_join: {err}"),
+            );
+        }
     }
     if !consensus.is_local_control_leader() {
+        let persistence = consensus.persistence_status();
+        if persistence.fenced {
+            return internal_control_error_response_from_contract(
+                internal_control_error_contract(
+                    false,
+                    true,
+                    false,
+                    false,
+                    "control_leader_establish_failed",
+                ),
+                persistence.detail.unwrap_or_else(|| {
+                    "control persistence remains fenced after leader establishment".to_string()
+                }),
+            );
+        }
         return internal_error_response(
             409,
             "not_control_leader",
@@ -3027,6 +3225,57 @@ pub(super) async fn handle_internal_control_auto_join(
                 },
             )
         }
+        Ok(ProposeOutcome::CommittedCheckpointPending { .. }) => {
+            let state = consensus.current_state();
+            let node_status = state
+                .node_record(&payload.node_id)
+                .map(|node| node.status.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            json_response(
+                200,
+                &InternalControlAutoJoinResponse {
+                    result: "accepted_checkpoint_pending".to_string(),
+                    membership_epoch: state.membership_epoch,
+                    node_status,
+                    leader_node_id: state.leader_node_id,
+                },
+            )
+        }
+        Ok(ProposeOutcome::CommittedCleanupPending { .. }) => {
+            let state = consensus.current_state();
+            let node_status = state
+                .node_record(&payload.node_id)
+                .map(|node| node.status.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            json_response(
+                200,
+                &InternalControlAutoJoinResponse {
+                    result: "accepted_cleanup_pending".to_string(),
+                    membership_epoch: state.membership_epoch,
+                    node_status,
+                    leader_node_id: state.leader_node_id,
+                },
+            )
+        }
+        Ok(ProposeOutcome::CommittedPersistencePending { .. }) => {
+            let state = consensus.current_state();
+            let node_status = state
+                .node_record(&payload.node_id)
+                .map(|node| node.status.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            json_response(
+                200,
+                &InternalControlAutoJoinResponse {
+                    result: "accepted_persistence_pending".to_string(),
+                    membership_epoch: state.membership_epoch,
+                    node_status,
+                    leader_node_id: state.leader_node_id,
+                },
+            )
+        }
         Ok(ProposeOutcome::Pending { .. }) => {
             let state = consensus.current_state();
             let node_status = state
@@ -3044,11 +3293,11 @@ pub(super) async fn handle_internal_control_auto_join(
                 },
             )
         }
-        Err(err) => internal_error_response(
-            503,
+        Err(err) => internal_control_consensus_error_response(
+            &err,
+            consensus.persistence_status().fenced,
             "control_mutation_failed",
             format!("control auto_join failed: {err}"),
-            true,
         ),
     }
 }
@@ -3098,6 +3347,270 @@ mod tests {
             headers.insert((*name).to_string(), (*value).to_string());
         }
         headers
+    }
+
+    fn internal_restore_request(
+        internal_api: &InternalApiConfig,
+        path: &str,
+        snapshot_path: &Path,
+        data_path: &Path,
+    ) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalDataRestoreRequest {
+                snapshot_path: snapshot_path.display().to_string(),
+                data_path: data_path.display().to_string(),
+            })
+            .expect("restore request should encode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_restore_alias_and_budgeted_endpoint_fail_closed_with_stable_contracts() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source");
+        let snapshot_path = temp_dir.path().join("source.snapshot");
+        let source: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("source storage should build");
+        source
+            .insert_rows(&[Row::new(
+                "restore_budget_metric",
+                DataPoint::new(1_700_000_000_000, 1.0),
+            )])
+            .expect("source row should insert");
+        source
+            .snapshot(&snapshot_path)
+            .expect("source snapshot should build");
+
+        let internal_api = internal_api();
+        let offline_root = temp_dir.path().join("offline-restores");
+        let quota_budget = tsink::LocalDiskBudget::open(
+            &offline_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("quota budget should open");
+        for (path, budgeted) in [
+            ("/internal/v1/restore_data", false),
+            ("/internal/v1/restore_data_budgeted", true),
+        ] {
+            let destination = offline_root.join(if budgeted { "new" } else { "legacy" });
+            let mut request =
+                internal_restore_request(&internal_api, path, &snapshot_path, &destination);
+            if !budgeted {
+                request.headers.insert(
+                    INTERNAL_RPC_CAPABILITIES_HEADER.to_string(),
+                    CLUSTER_CAPABILITY_RPC_V1.to_string(),
+                );
+            }
+            let response = if budgeted {
+                handle_internal_restore_data_budgeted(
+                    &request,
+                    Some(&internal_api),
+                    None,
+                    None,
+                    None,
+                    Some(&quota_budget),
+                )
+                .await
+            } else {
+                handle_internal_restore_data(
+                    &request,
+                    Some(&internal_api),
+                    None,
+                    None,
+                    None,
+                    Some(&quota_budget),
+                )
+                .await
+            };
+            assert_eq!(response.status, 413, "endpoint {path}");
+            let body: InternalErrorResponse =
+                serde_json::from_slice(&response.body).expect("quota response should decode");
+            assert_eq!(body.code, "write_disk_quota_exceeded");
+            assert!(!body.retryable);
+            assert_eq!(
+                response_header_value(&response, WRITE_ERROR_CODE_HEADER),
+                Some("write_disk_quota_exceeded")
+            );
+        }
+
+        let unconfigured_request = internal_restore_request(
+            &internal_api,
+            "/internal/v1/restore_data",
+            &snapshot_path,
+            &offline_root.join("unconfigured"),
+        );
+        let unconfigured = handle_internal_restore_data(
+            &unconfigured_request,
+            Some(&internal_api),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(unconfigured.status, 503);
+        let body: InternalErrorResponse = serde_json::from_slice(&unconfigured.body)
+            .expect("unconfigured response should decode");
+        assert_eq!(body.code, "offline_restore_unconfigured");
+        assert!(!body.retryable);
+
+        let roomy_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path().join("roomy-offline-restores"),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("roomy budget should open");
+        let outside_request = internal_restore_request(
+            &internal_api,
+            "/internal/v1/restore_data_budgeted",
+            &snapshot_path,
+            &temp_dir.path().join("outside-offline-root"),
+        );
+        let outside = handle_internal_restore_data_budgeted(
+            &outside_request,
+            Some(&internal_api),
+            None,
+            None,
+            None,
+            Some(&roomy_budget),
+        )
+        .await;
+        assert_eq!(outside.status, 422);
+        let body: InternalErrorResponse =
+            serde_json::from_slice(&outside.body).expect("path response should decode");
+        assert_eq!(body.code, "invalid_restore_path");
+        assert!(!body.retryable);
+
+        let mut missing_capability_request = internal_restore_request(
+            &internal_api,
+            "/internal/v1/restore_data_budgeted",
+            &snapshot_path,
+            &roomy_budget.root().join("missing-capability"),
+        );
+        missing_capability_request.headers.insert(
+            INTERNAL_RPC_CAPABILITIES_HEADER.to_string(),
+            CLUSTER_CAPABILITY_RPC_V1.to_string(),
+        );
+        let missing_capability = handle_internal_restore_data_budgeted(
+            &missing_capability_request,
+            Some(&internal_api),
+            None,
+            None,
+            None,
+            Some(&roomy_budget),
+        )
+        .await;
+        assert_eq!(missing_capability.status, 409);
+        let body: InternalErrorResponse = serde_json::from_slice(&missing_capability.body)
+            .expect("capability response should decode");
+        assert_eq!(body.code, "peer_capability_missing");
+        assert_eq!(
+            body.missing_capabilities,
+            vec![CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1.to_string()]
+        );
+
+        source.close().expect("source storage should close");
+    }
+
+    #[tokio::test]
+    async fn internal_snapshot_rejects_destinations_inside_offline_restore_root() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path().join("offline-restores"),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore budget should open");
+        let destination = offline_restore_disk_budget
+            .root()
+            .join("forbidden-snapshot");
+        let internal_api = internal_api();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/snapshot_data".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalDataSnapshotRequest {
+                path: destination.display().to_string(),
+            })
+            .expect("snapshot request should encode"),
+        };
+        let response = handle_internal_snapshot_data(
+            &make_storage(),
+            &Arc::new(MetricMetadataStore::in_memory()),
+            &Arc::new(ExemplarStore::in_memory()),
+            None,
+            &request,
+            Some(&internal_api),
+            None,
+            None,
+            Some(&offline_restore_disk_budget),
+        )
+        .await;
+        assert_eq!(response.status, 422);
+        let body: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("snapshot response should decode");
+        assert_eq!(body.code, "invalid_snapshot_path");
+        assert!(!body.retryable);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn control_persistence_resource_and_fence_contracts_are_nonretryable() {
+        let quota = internal_control_error_response_from_contract(
+            internal_control_error_contract(true, false, false, false, "fallback"),
+            "cluster quota rejected the control publication".to_string(),
+        );
+        assert_eq!(quota.status, 413);
+        let quota_body: InternalErrorResponse =
+            serde_json::from_slice(&quota.body).expect("quota body should decode");
+        assert_eq!(quota_body.code, "write_disk_quota_exceeded");
+        assert!(!quota_body.retryable);
+        assert_eq!(
+            response_header_value(&quota, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+
+        for contract in [
+            internal_control_error_contract(false, true, false, false, "fallback"),
+            internal_control_error_contract(false, false, true, false, "fallback"),
+            internal_control_error_contract(true, true, false, false, "fallback"),
+        ] {
+            let response = internal_control_error_response_from_contract(
+                contract,
+                "control persistence requires authoritative repair".to_string(),
+            );
+            assert_eq!(response.status, 503);
+            let body: InternalErrorResponse =
+                serde_json::from_slice(&response.body).expect("fenced body should decode");
+            assert_eq!(body.code, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE);
+            assert!(!body.retryable);
+            assert_eq!(
+                response_header_value(&response, WRITE_ERROR_CODE_HEADER),
+                Some(CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            );
+        }
     }
 
     fn metric_series(metric: &str, labels: &[(&str, &str)]) -> MetricSeries {
@@ -3469,6 +3982,149 @@ mod tests {
             )
             .expect("stored point should be readable");
         assert_eq!(points.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_ingest_rows_maps_dedupe_disk_quota_after_row_commit() {
+        let storage = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let local_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let dedupe_config = crate::cluster::dedupe::DedupeConfig {
+            window_secs: 60,
+            max_entries: 32,
+            max_log_bytes: 8 * 1024,
+            cleanup_interval_secs: 30,
+        };
+        let dedupe_store = Arc::new(
+            DedupeWindowStore::open_with_disk_budget(
+                temp_dir.path().join("edge_sync/dedupe.log"),
+                dedupe_config,
+                Some(Arc::clone(&local_disk_budget)),
+                tsink::DiskCategory::EdgeSync,
+            )
+            .expect("dedupe store should open"),
+        );
+        let edge_sync_context = edge_sync::EdgeSyncRuntimeContext {
+            source: None,
+            accept_dedupe_store: Some(Arc::clone(&dedupe_store)),
+            accept_dedupe_config: Some(dedupe_config),
+        };
+        let make_request = |key: &str, metric: &str| HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/ingest_rows".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalIngestRowsRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                idempotency_key: Some(key.to_string()),
+                required_capabilities: Vec::new(),
+                rows: vec![InternalRow {
+                    metric: metric.to_string(),
+                    labels: vec![Label::new("node", "a")],
+                    data_point: DataPoint::new(1_700_000_000_000, 9.0),
+                }],
+            })
+            .expect("payload should serialize"),
+        };
+        let request = make_request("tsink:test:dedupe-disk-quota", "dedupe_disk_quota_metric");
+
+        let first = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+
+        assert_eq!(first.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&first.body).expect("error response should decode");
+        assert_eq!(error.code, "write_disk_quota_exceeded");
+        assert!(!error.retryable);
+        assert_eq!(
+            response_header_value(&first, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header_value(&first, WRITE_PARTIAL_HEADER),
+            Some("true")
+        );
+        assert_eq!(
+            response_header_value(&first, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("1")
+        );
+        assert_eq!(
+            response_header_value(&first, WRITE_ACKNOWLEDGEMENT_HEADER),
+            Some(WriteAcknowledgement::Volatile.as_str())
+        );
+        assert_eq!(
+            storage
+                .select(
+                    "dedupe_disk_quota_metric",
+                    &[Label::new("node", "a")],
+                    1_700_000_000_000,
+                    1_700_000_000_001,
+                )
+                .expect("committed point should be readable")
+                .len(),
+            1
+        );
+
+        let replay = handle_internal_ingest_rows(
+            &storage,
+            &request,
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(replay.status, 200);
+        assert!(replay.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-Tsink-Idempotency-Replayed") && value == "true"
+        }));
+
+        let fenced = handle_internal_ingest_rows(
+            &storage,
+            &make_request(
+                "tsink:test:dedupe-disk-quota:new",
+                "dedupe_disk_quota_fenced_metric",
+            ),
+            Some(&internal_api),
+            None,
+            Some(&edge_sync_context),
+        )
+        .await;
+        assert_eq!(fenced.status, 413);
+        let fenced_error: InternalErrorResponse =
+            serde_json::from_slice(&fenced.body).expect("fenced error should decode");
+        assert_eq!(fenced_error.code, "write_disk_quota_exceeded");
+        assert!(!fenced_error.retryable);
+        assert!(storage
+            .select(
+                "dedupe_disk_quota_fenced_metric",
+                &[Label::new("node", "a")],
+                1_700_000_000_000,
+                1_700_000_000_001,
+            )
+            .expect("fenced metric query should succeed")
+            .is_empty());
+
+        let snapshot = local_disk_budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
     }
 
     #[tokio::test]

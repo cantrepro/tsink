@@ -4,8 +4,10 @@ use crate::validation::validate_metric;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
-    Result, Row, TsinkError,
+    QueryBudget, QueryBudgetLimits, QueryBudgetSnapshot, QueryCancellationToken, QueryExecution,
+    QueryWorkLimits, Result, Row, TsinkError,
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,22 @@ pub(crate) const DEFAULT_CHUNK_POINTS: usize = 2048;
 pub(crate) const DEFAULT_REMOTE_SEGMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Default number of simultaneously open time-partition heads retained for each series.
 pub const DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES: usize = 8;
+/// Maximum regular-file and directory entries accepted from one snapshot restore tree.
+///
+/// The root snapshot directory counts as one entry. This bounds traversal work before staging.
+pub const MAX_SNAPSHOT_RESTORE_ENTRIES: u64 = 100_000;
+/// Maximum descendant-directory depth accepted from a snapshot restore tree.
+///
+/// The snapshot root has depth zero, so a path may contain at most this many directory components
+/// beneath it. This bounds both measurement traversal and recursive copy stack use.
+pub const MAX_SNAPSHOT_RESTORE_DEPTH: u32 = 128;
+/// Policy floor for the temporary-admission allowance charged per snapshot restore entry.
+///
+/// The effective allowance is the greater of this value and the destination filesystem's reported
+/// allocation unit. Restore staging adds that effective allowance for every entry to the regular
+/// files' logical lengths. This is conservative admission policy, not an exact physical-byte
+/// claim.
+pub const SNAPSHOT_RESTORE_ENTRY_STAGING_ALLOWANCE_FLOOR_BYTES: u64 = 4 * 1024;
 
 /// Unit used to interpret timestamps and time-based storage settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -318,6 +336,91 @@ impl WriteAcknowledgement {
 /// [`WriteRejection::category`] for control flow; the bounded message is diagnostic only.
 pub const MAX_WRITE_REJECTION_MESSAGE_BYTES: usize = 512;
 
+/// Optional limits applied to one foreground write submission before the engine clones any row
+/// identity or value payload.
+///
+/// `None` preserves the legacy unbounded behavior for that dimension. `max_modeled_input_bytes`
+/// counts the logical UTF-8/byte/histogram payload plus the modeled row, label, and value storage
+/// that write preparation must duplicate; it is an admission model, not serialized wire size or
+/// allocator RSS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriteBatchLimits {
+    /// Maximum rows accepted in one top-level submission. Besides bounding input traversal, this
+    /// also bounds the indexed outcome vector returned by best-effort writes.
+    pub max_rows: Option<usize>,
+    /// Maximum modeled input bytes accepted in one top-level submission.
+    pub max_modeled_input_bytes: Option<usize>,
+}
+
+fn checked_write_size_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
+}
+
+fn checked_write_size_mul(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
+}
+
+fn modeled_histogram_payload_bytes(histogram: &crate::NativeHistogram) -> Result<usize> {
+    let mut bytes = std::mem::size_of::<crate::NativeHistogram>();
+    for (len, element_bytes) in [
+        (
+            histogram.negative_spans.len(),
+            std::mem::size_of::<crate::HistogramBucketSpan>(),
+        ),
+        (histogram.negative_deltas.len(), std::mem::size_of::<i64>()),
+        (histogram.negative_counts.len(), std::mem::size_of::<f64>()),
+        (
+            histogram.positive_spans.len(),
+            std::mem::size_of::<crate::HistogramBucketSpan>(),
+        ),
+        (histogram.positive_deltas.len(), std::mem::size_of::<i64>()),
+        (histogram.positive_counts.len(), std::mem::size_of::<f64>()),
+        (histogram.custom_values.len(), std::mem::size_of::<f64>()),
+    ] {
+        bytes = checked_write_size_add(bytes, checked_write_size_mul(len, element_bytes)?)?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_value_payload_bytes(value: &crate::Value) -> Result<usize> {
+    match value {
+        crate::Value::Bytes(bytes) => Ok(bytes.len()),
+        crate::Value::String(text) => Ok(text.len()),
+        crate::Value::Histogram(histogram) => modeled_histogram_payload_bytes(histogram),
+        crate::Value::F64(_)
+        | crate::Value::I64(_)
+        | crate::Value::U64(_)
+        | crate::Value::Bool(_) => Ok(0),
+    }
+}
+
+/// Returns the checked logical-memory model used by write-batch byte admission.
+///
+/// The model includes each row's owned `Row` representation, metric UTF-8 bytes, label objects
+/// and text, and the full logical payload of bytes, strings, and native histograms. It deliberately
+/// uses lengths rather than spare allocator capacity and does not count caller-owned input twice.
+/// Write preparation separately reserves every tsink-owned clone, index, response outcome, and
+/// WAL encoding that can coexist with this input model.
+pub fn modeled_write_batch_input_bytes(rows: &[Row]) -> Result<usize> {
+    let mut total = checked_write_size_mul(rows.len(), std::mem::size_of::<Row>())?;
+    for row in rows {
+        total = checked_write_size_add(total, row.metric().len())?;
+        total = checked_write_size_add(
+            total,
+            checked_write_size_mul(row.labels().len(), std::mem::size_of::<Label>())?,
+        )?;
+        for label in row.labels() {
+            total = checked_write_size_add(total, label.name.len())?;
+            total = checked_write_size_add(total, label.value.len())?;
+        }
+        total =
+            checked_write_size_add(total, modeled_value_payload_bytes(&row.data_point().value)?)?;
+    }
+    Ok(total)
+}
+
 /// Admission behavior for [`Storage::write_batch`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -350,6 +453,8 @@ pub enum WriteRejectionCategory {
     CardinalityLimitExceeded,
     /// Creating the row's series would exceed a cardinality creation-rate limit.
     CardinalityCreationRateExceeded,
+    /// The submitted batch exceeded a configured row-count or modeled-input-byte limit.
+    WriteBatchLimitExceeded,
     /// The write could not be admitted within the memory budget.
     MemoryPressure,
     /// The write could not be admitted within the disk budget.
@@ -429,17 +534,31 @@ impl WriteRejection {
             TsinkError::CardinalityLimitExceeded { .. } => {
                 WriteRejectionCategory::CardinalityLimitExceeded
             }
-            TsinkError::MemoryBudgetExceeded { .. } => WriteRejectionCategory::MemoryPressure,
+            TsinkError::CardinalityCreationRateExceeded { .. } => {
+                WriteRejectionCategory::CardinalityCreationRateExceeded
+            }
+            TsinkError::WriteBatchRowLimitExceeded { .. }
+            | TsinkError::WriteBatchInputLimitExceeded { .. }
+            | TsinkError::WriteBatchSizeOverflow => WriteRejectionCategory::WriteBatchLimitExceeded,
+            TsinkError::MemoryBudgetExceeded { .. }
+            | TsinkError::AsyncQueueByteLimitExceeded { .. } => {
+                WriteRejectionCategory::MemoryPressure
+            }
             TsinkError::InsufficientDiskSpace { .. }
             | TsinkError::DiskQuotaExceeded { .. }
             | TsinkError::InsufficientCompactionHeadroom { .. } => {
                 WriteRejectionCategory::DiskQuotaExceeded
             }
             TsinkError::WalSizeLimitExceeded { .. } => WriteRejectionCategory::WalQuotaExceeded,
-            TsinkError::WriteTimeout { .. } => WriteRejectionCategory::WriteTimeout,
+            TsinkError::WriteTimeout { .. } | TsinkError::LifecycleTimeout { .. } => {
+                WriteRejectionCategory::WriteTimeout
+            }
             TsinkError::StorageShuttingDown => WriteRejectionCategory::StorageDegraded,
             TsinkError::StorageClosed => WriteRejectionCategory::StorageClosed,
             TsinkError::ReadOnlyPartition { .. }
+            | TsinkError::MaintenanceWorkItemTooLarge { .. }
+            | TsinkError::MaintenanceDependencyWindowExceeded { .. }
+            | TsinkError::MaintenanceNamespaceLimitExceeded { .. }
             | TsinkError::InvalidConfiguration(_)
             | TsinkError::UnsupportedOperation { .. } => WriteRejectionCategory::PolicyRejected,
             TsinkError::DataCorruption(_)
@@ -448,7 +567,9 @@ impl WriteRejection {
             | TsinkError::MemoryMap { .. }
             | TsinkError::Wal { .. }
             | TsinkError::ChecksumMismatch { .. } => WriteRejectionCategory::InternalIo,
-            TsinkError::NoDataPoints { .. }
+            TsinkError::QueryBudget(_)
+            | TsinkError::AsyncQueuePayloadSizeOverflow { .. }
+            | TsinkError::NoDataPoints { .. }
             | TsinkError::LockPoisoned { .. }
             | TsinkError::ChannelSend { .. }
             | TsinkError::ChannelReceive { .. }
@@ -609,6 +730,7 @@ impl WriteResult {
 /// [`Storage::observability_snapshot`] for the categories included in and excluded from that
 /// accounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EffectiveStorageLimits {
     /// Whether the backend supplied the values in this snapshot.
     pub reported_by_backend: bool,
@@ -620,8 +742,23 @@ pub struct EffectiveStorageLimits {
     pub accounted_memory_bytes: Option<u64>,
     /// Finite total-series cardinality limit.
     pub cardinality: Option<u64>,
+    /// Maximum labels accepted in a submitted series identity.
+    pub max_labels_per_series: Option<u64>,
+    /// Maximum cumulative metric and label UTF-8 bytes in a submitted series identity.
+    pub max_series_identity_bytes: Option<u64>,
+    /// Maximum new series that may commit during one creation-rate window.
+    pub max_new_series_per_window: Option<u64>,
+    /// Effective creation-rate window in nanoseconds after timestamp-precision rounding.
+    pub new_series_window_nanos: Option<u64>,
+    /// Maximum rows accepted in one foreground write submission.
+    pub max_write_batch_rows: Option<u64>,
+    /// Maximum modeled logical input bytes accepted in one foreground write submission.
+    pub max_write_batch_input_bytes: Option<u64>,
     /// Finite on-disk WAL byte limit. This is `None` when the WAL is inactive or unbounded.
     pub wal_bytes: Option<u64>,
+    /// Finite userspace WAL writer-buffer capacity. The buffer is inspected and reported but is
+    /// not charged to `accounted_memory_bytes`.
+    pub wal_write_buffer_bytes: Option<u64>,
     /// Finite byte limit enforced by the local data-directory coordinator.
     ///
     /// `None` means unbounded when this is a persistent, reporting backend, and inactive or
@@ -633,10 +770,656 @@ pub struct EffectiveStorageLimits {
     pub maintenance_temp_reserve_bytes: Option<u64>,
     /// Maximum writes admitted concurrently by the synchronous engine.
     pub max_concurrent_writers: Option<u64>,
-    /// Maximum wait for a writer permit, in nanoseconds.
+    /// Maximum wait for a writer permit or one close-coordination acquisition, in nanoseconds.
     pub write_timeout_nanos: Option<u64>,
+    /// Maximum named background worker threads owned by this storage instance.
+    ///
+    /// The built-in backend has one fixed slot each for flush, compaction,
+    /// persisted refresh (including retention/tiering), and rollups. Inactive
+    /// capabilities contribute zero to this per-instance value.
+    pub max_background_threads: Option<u64>,
+    /// Maximum concurrent background flush passes.
+    pub max_flush_concurrency: Option<u64>,
+    /// Maximum concurrent compaction passes.
+    pub max_compaction_concurrency: Option<u64>,
+    /// Maximum concurrent retention/tiering maintenance passes.
+    pub max_retention_tiering_concurrency: Option<u64>,
+    /// Maximum concurrent remote catalog refresh passes.
+    pub max_remote_catalog_refresh_concurrency: Option<u64>,
+    /// Maximum concurrent remote-tier payload fetches.
+    ///
+    /// Remote payload reads are synchronous within a query, so the built-in
+    /// backend derives this from the shared concurrent-query limit. `None`
+    /// therefore honestly reports an unbounded query/fetch configuration.
+    pub max_remote_tier_fetch_concurrency: Option<u64>,
+    /// Maximum concurrent rollup passes.
+    pub max_rollup_concurrency: Option<u64>,
+    /// Effective periodic flush cadence, in nanoseconds.
+    pub flush_interval_nanos: Option<u64>,
+    /// Effective periodic compaction cadence, in nanoseconds.
+    pub compaction_interval_nanos: Option<u64>,
+    /// Effective persisted-catalog worker poll cadence, in nanoseconds.
+    ///
+    /// Explicit pending-work notifications may wake this worker sooner. The
+    /// same serialized worker owns retention/tiering and remote catalog refresh.
+    pub persisted_refresh_poll_interval_nanos: Option<u64>,
+    /// Effective periodic rollup cadence, in nanoseconds.
+    pub rollup_interval_nanos: Option<u64>,
     /// Maximum simultaneously active partition heads for one series.
     pub max_active_partition_heads_per_series: Option<u64>,
+}
+
+/// Schema version of [`ResourceConfigurationSnapshot`].
+pub const RESOURCE_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
+
+/// Finite resource settings for the runtime-independent async facade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsyncResourceLimits {
+    /// Maximum commands waiting in each read or write queue.
+    pub queue_command_capacity: usize,
+    /// Maximum modeled bytes owned by commands in the write queue.
+    pub write_queue_byte_capacity: usize,
+    /// Maximum modeled bytes owned by commands in the read queue.
+    pub read_queue_byte_capacity: usize,
+    /// Dedicated synchronous reader threads owned by an async facade.
+    pub read_workers: usize,
+}
+
+/// Fixed worker topology, cadence, and per-pass maintenance bounds.
+///
+/// The current engine owns at most one worker of each named kind. Custom profiles must retain
+/// that topology; the limits are nevertheless explicit so hosts can inspect the full thread
+/// contract rather than infer it from implementation details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundResourceLimits {
+    pub max_threads: usize,
+    pub flush_concurrency: usize,
+    pub compaction_concurrency: usize,
+    pub persisted_refresh_concurrency: usize,
+    pub remote_fetch_concurrency: usize,
+    pub rollup_concurrency: usize,
+    pub flush_interval: Duration,
+    pub compaction_interval: Duration,
+    pub persisted_refresh_interval: Duration,
+    pub rollup_interval: Duration,
+    /// Maximum logical items selected by one bounded maintenance pass.
+    pub maintenance_max_items_per_pass: usize,
+    /// Maximum modeled input bytes selected by one bounded maintenance pass.
+    pub maintenance_max_bytes_per_pass: u64,
+}
+
+/// Complete finite limits used by a named or custom resource profile.
+///
+/// Standard profile constants are deliberately conservative and provisional until the complete
+/// measurement matrix in `docs/resource-profile-measurements.md` is rerun on release hardware.
+/// `Custom` profiles are validated at build time: every optional field nested in
+/// [`WriteBatchLimits`] and [`QueryBudgetLimits`] must be finite and non-zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceLimits {
+    pub accounted_memory_bytes: u64,
+    pub local_disk_bytes: u64,
+    pub filesystem_free_headroom_bytes: u64,
+    pub maintenance_temp_reserve_bytes: u64,
+    pub wal_bytes: u64,
+    pub wal_write_buffer_bytes: u64,
+    pub cardinality: u64,
+    pub max_labels_per_series: u64,
+    pub max_series_identity_bytes: u64,
+    pub max_new_series_per_window: u64,
+    pub new_series_window: Duration,
+    pub write_batch: WriteBatchLimits,
+    pub max_concurrent_writers: u64,
+    pub write_timeout: Duration,
+    pub max_active_partition_heads_per_series: u64,
+    pub query: QueryBudgetLimits,
+    pub async_runtime: AsyncResourceLimits,
+    pub background: BackgroundResourceLimits,
+}
+
+/// Named base profile selected for a storage builder.
+///
+/// `ExpertUnlimited` preserves the legacy unbounded storage/query defaults for migrations. Hard
+/// storage-format limits, bounded async channel mechanics, and the fixed worker topology still
+/// apply. It should be selected deliberately, not used as a constrained-host default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "name", content = "limits")]
+#[allow(clippy::large_enum_variant)]
+pub enum ResourceProfile {
+    Test,
+    Embedded,
+    Edge,
+    Server,
+    Custom(ResourceLimits),
+    ExpertUnlimited,
+}
+
+/// Stable profile label included in configuration snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProfileName {
+    #[default]
+    Unreported,
+    Test,
+    Embedded,
+    Edge,
+    Server,
+    Custom,
+    ExpertUnlimited,
+}
+
+impl ResourceProfile {
+    #[must_use]
+    pub const fn name(self) -> ResourceProfileName {
+        match self {
+            Self::Test => ResourceProfileName::Test,
+            Self::Embedded => ResourceProfileName::Embedded,
+            Self::Edge => ResourceProfileName::Edge,
+            Self::Server => ResourceProfileName::Server,
+            Self::Custom(_) => ResourceProfileName::Custom,
+            Self::ExpertUnlimited => ResourceProfileName::ExpertUnlimited,
+        }
+    }
+
+    /// Returns finite limits for a standard or custom profile.
+    ///
+    /// `None` is returned only for [`ResourceProfile::ExpertUnlimited`].
+    #[must_use]
+    pub const fn finite_limits(self) -> Option<ResourceLimits> {
+        match self {
+            Self::Test => Some(ResourceLimits::test()),
+            Self::Embedded => Some(ResourceLimits::embedded()),
+            Self::Edge => Some(ResourceLimits::edge()),
+            Self::Server => Some(ResourceLimits::server()),
+            Self::Custom(limits) => Some(limits),
+            Self::ExpertUnlimited => None,
+        }
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+const fn finite_write_batch(rows: usize, bytes: usize) -> WriteBatchLimits {
+    WriteBatchLimits {
+        max_rows: Some(rows),
+        max_modeled_input_bytes: Some(bytes),
+    }
+}
+
+const fn finite_query_limits(
+    concurrent: u64,
+    shared_memory: u64,
+    per_query_memory: u64,
+    series: u64,
+    scanned: u64,
+    returned: u64,
+    returned_bytes: u64,
+) -> QueryBudgetLimits {
+    QueryBudgetLimits {
+        max_concurrent_queries: Some(concurrent),
+        max_shared_memory_bytes: Some(shared_memory),
+        per_query: QueryWorkLimits {
+            max_series_matched: Some(series),
+            max_samples_scanned: Some(scanned),
+            max_samples_returned: Some(returned),
+            max_returned_bytes: Some(returned_bytes),
+            max_pattern_expansion: Some(series.saturating_mul(4)),
+            max_steps: Some(1_000_000),
+            max_intermediate_vector_size: Some(series),
+            max_memory_bytes: Some(per_query_memory),
+            max_wall_time: Some(Duration::from_secs(30)),
+        },
+    }
+}
+
+const fn background_limits(
+    remote_fetch_concurrency: usize,
+    maintenance_max_items_per_pass: usize,
+    maintenance_max_bytes_per_pass: u64,
+) -> BackgroundResourceLimits {
+    BackgroundResourceLimits {
+        max_threads: 4,
+        flush_concurrency: 1,
+        compaction_concurrency: 1,
+        persisted_refresh_concurrency: 1,
+        remote_fetch_concurrency,
+        rollup_concurrency: 1,
+        flush_interval: Duration::from_millis(250),
+        compaction_interval: Duration::from_secs(5),
+        persisted_refresh_interval: Duration::from_millis(250),
+        rollup_interval: Duration::from_secs(5),
+        maintenance_max_items_per_pass,
+        maintenance_max_bytes_per_pass,
+    }
+}
+
+impl ResourceLimits {
+    #[must_use]
+    pub const fn test() -> Self {
+        Self {
+            accounted_memory_bytes: 64 * MIB,
+            local_disk_bytes: 256 * MIB,
+            filesystem_free_headroom_bytes: 16 * MIB,
+            maintenance_temp_reserve_bytes: 32 * MIB,
+            wal_bytes: 32 * MIB,
+            wal_write_buffer_bytes: 4 * 1024,
+            cardinality: 10_000,
+            max_labels_per_series: 128,
+            max_series_identity_bytes: 64 * 1024,
+            max_new_series_per_window: 5_000,
+            new_series_window: Duration::from_secs(60),
+            write_batch: finite_write_batch(10_000, 8 * MIB as usize),
+            max_concurrent_writers: 2,
+            write_timeout: Duration::from_secs(30),
+            max_active_partition_heads_per_series: 4,
+            query: finite_query_limits(2, 16 * MIB, 8 * MIB, 10_000, 1_000_000, 250_000, 16 * MIB),
+            async_runtime: AsyncResourceLimits {
+                queue_command_capacity: 256,
+                write_queue_byte_capacity: 8 * MIB as usize,
+                read_queue_byte_capacity: 4 * MIB as usize,
+                read_workers: 2,
+            },
+            // One active chunk can conservatively grow to the complete accounted-memory ceiling
+            // across repeated writes. The maintenance byte cap must therefore admit that chunk.
+            background: background_limits(2, 10_000, 64 * MIB),
+        }
+    }
+
+    #[must_use]
+    pub const fn embedded() -> Self {
+        Self {
+            accounted_memory_bytes: 512 * MIB,
+            local_disk_bytes: 16 * GIB,
+            filesystem_free_headroom_bytes: 256 * MIB,
+            maintenance_temp_reserve_bytes: GIB,
+            wal_bytes: 512 * MIB,
+            wal_write_buffer_bytes: 4 * 1024,
+            cardinality: 1_000_000,
+            max_labels_per_series: 128,
+            max_series_identity_bytes: 64 * 1024,
+            max_new_series_per_window: 100_000,
+            new_series_window: Duration::from_secs(60),
+            write_batch: finite_write_batch(100_000, 64 * MIB as usize),
+            max_concurrent_writers: 4,
+            write_timeout: Duration::from_secs(30),
+            max_active_partition_heads_per_series: 8,
+            query: finite_query_limits(
+                8,
+                128 * MIB,
+                32 * MIB,
+                250_000,
+                10_000_000,
+                2_000_000,
+                64 * MIB,
+            ),
+            async_runtime: AsyncResourceLimits {
+                queue_command_capacity: 1_024,
+                write_queue_byte_capacity: 64 * MIB as usize,
+                read_queue_byte_capacity: 16 * MIB as usize,
+                read_workers: 4,
+            },
+            background: background_limits(8, 100_000, 512 * MIB),
+        }
+    }
+
+    #[must_use]
+    pub const fn edge() -> Self {
+        Self {
+            accounted_memory_bytes: 256 * MIB,
+            local_disk_bytes: 4 * GIB,
+            filesystem_free_headroom_bytes: 128 * MIB,
+            maintenance_temp_reserve_bytes: 512 * MIB,
+            wal_bytes: 256 * MIB,
+            wal_write_buffer_bytes: 4 * 1024,
+            cardinality: 250_000,
+            max_labels_per_series: 128,
+            max_series_identity_bytes: 64 * 1024,
+            max_new_series_per_window: 25_000,
+            new_series_window: Duration::from_secs(60),
+            write_batch: finite_write_batch(50_000, 32 * MIB as usize),
+            max_concurrent_writers: 4,
+            write_timeout: Duration::from_secs(30),
+            max_active_partition_heads_per_series: 8,
+            query: finite_query_limits(
+                4,
+                64 * MIB,
+                16 * MIB,
+                100_000,
+                5_000_000,
+                1_000_000,
+                32 * MIB,
+            ),
+            async_runtime: AsyncResourceLimits {
+                queue_command_capacity: 512,
+                write_queue_byte_capacity: 32 * MIB as usize,
+                read_queue_byte_capacity: 8 * MIB as usize,
+                read_workers: 2,
+            },
+            background: background_limits(4, 50_000, 256 * MIB),
+        }
+    }
+
+    #[must_use]
+    pub const fn server() -> Self {
+        Self {
+            accounted_memory_bytes: 2 * GIB,
+            local_disk_bytes: 256 * GIB,
+            filesystem_free_headroom_bytes: 2 * GIB,
+            maintenance_temp_reserve_bytes: 16 * GIB,
+            wal_bytes: 8 * GIB,
+            wal_write_buffer_bytes: 64 * 1024,
+            cardinality: 10_000_000,
+            max_labels_per_series: 128,
+            max_series_identity_bytes: 64 * 1024,
+            max_new_series_per_window: 1_000_000,
+            new_series_window: Duration::from_secs(60),
+            write_batch: finite_write_batch(500_000, 256 * MIB as usize),
+            max_concurrent_writers: 16,
+            write_timeout: Duration::from_secs(30),
+            max_active_partition_heads_per_series: 16,
+            query: finite_query_limits(
+                32,
+                512 * MIB,
+                128 * MIB,
+                1_000_000,
+                50_000_000,
+                10_000_000,
+                256 * MIB,
+            ),
+            async_runtime: AsyncResourceLimits {
+                queue_command_capacity: 4_096,
+                write_queue_byte_capacity: 256 * MIB as usize,
+                read_queue_byte_capacity: 64 * MIB as usize,
+                read_workers: 16,
+            },
+            background: background_limits(32, 500_000, 2 * GIB),
+        }
+    }
+
+    /// Validates finite values and relationships required by the current engine topology.
+    pub fn validate(self) -> Result<()> {
+        fn positive(name: &str, value: u64) -> Result<()> {
+            if value == 0 {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "resource limit '{name}' must be greater than zero"
+                )));
+            }
+            Ok(())
+        }
+
+        for (name, value) in [
+            ("accounted_memory_bytes", self.accounted_memory_bytes),
+            ("local_disk_bytes", self.local_disk_bytes),
+            (
+                "filesystem_free_headroom_bytes",
+                self.filesystem_free_headroom_bytes,
+            ),
+            (
+                "maintenance_temp_reserve_bytes",
+                self.maintenance_temp_reserve_bytes,
+            ),
+            ("wal_bytes", self.wal_bytes),
+            ("wal_write_buffer_bytes", self.wal_write_buffer_bytes),
+            ("cardinality", self.cardinality),
+            ("max_labels_per_series", self.max_labels_per_series),
+            ("max_series_identity_bytes", self.max_series_identity_bytes),
+            ("max_new_series_per_window", self.max_new_series_per_window),
+            ("max_concurrent_writers", self.max_concurrent_writers),
+            (
+                "max_active_partition_heads_per_series",
+                self.max_active_partition_heads_per_series,
+            ),
+            (
+                "background.maintenance_max_bytes_per_pass",
+                self.background.maintenance_max_bytes_per_pass,
+            ),
+        ] {
+            positive(name, value)?;
+        }
+        for (name, value) in [
+            (
+                "async.queue_command_capacity",
+                self.async_runtime.queue_command_capacity,
+            ),
+            (
+                "async.write_queue_byte_capacity",
+                self.async_runtime.write_queue_byte_capacity,
+            ),
+            (
+                "async.read_queue_byte_capacity",
+                self.async_runtime.read_queue_byte_capacity,
+            ),
+            ("async.read_workers", self.async_runtime.read_workers),
+            ("background.max_threads", self.background.max_threads),
+            (
+                "background.flush_concurrency",
+                self.background.flush_concurrency,
+            ),
+            (
+                "background.compaction_concurrency",
+                self.background.compaction_concurrency,
+            ),
+            (
+                "background.persisted_refresh_concurrency",
+                self.background.persisted_refresh_concurrency,
+            ),
+            (
+                "background.remote_fetch_concurrency",
+                self.background.remote_fetch_concurrency,
+            ),
+            (
+                "background.rollup_concurrency",
+                self.background.rollup_concurrency,
+            ),
+            (
+                "background.maintenance_max_items_per_pass",
+                self.background.maintenance_max_items_per_pass,
+            ),
+        ] {
+            positive(name, u64::try_from(value).unwrap_or(u64::MAX))?;
+        }
+        for (name, duration) in [
+            ("new_series_window", self.new_series_window),
+            ("write_timeout", self.write_timeout),
+            ("background.flush_interval", self.background.flush_interval),
+            (
+                "background.compaction_interval",
+                self.background.compaction_interval,
+            ),
+            (
+                "background.persisted_refresh_interval",
+                self.background.persisted_refresh_interval,
+            ),
+            (
+                "background.rollup_interval",
+                self.background.rollup_interval,
+            ),
+        ] {
+            if duration.is_zero() {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "resource limit '{name}' must be greater than zero"
+                )));
+            }
+        }
+        let Some(max_rows) = self.write_batch.max_rows else {
+            return Err(TsinkError::InvalidConfiguration(
+                "finite resource profiles require write_batch.max_rows".to_string(),
+            ));
+        };
+        let Some(max_input_bytes) = self.write_batch.max_modeled_input_bytes else {
+            return Err(TsinkError::InvalidConfiguration(
+                "finite resource profiles require write_batch.max_modeled_input_bytes".to_string(),
+            ));
+        };
+        if max_rows == 0 || max_input_bytes == 0 {
+            return Err(TsinkError::InvalidConfiguration(
+                "finite write-batch limits must be greater than zero".to_string(),
+            ));
+        }
+        if self.background.maintenance_max_items_per_pass < max_rows {
+            return Err(TsinkError::InvalidConfiguration(
+                "maintenance items per pass must be at least write_batch.max_rows so one admitted batch cannot exceed the pass cap"
+                    .to_string(),
+            ));
+        }
+        self.query
+            .validate()
+            .map_err(crate::QueryBudgetError::from)?;
+        let query_fields_are_finite = self.query.max_concurrent_queries.is_some()
+            && self.query.max_shared_memory_bytes.is_some()
+            && self.query.per_query.max_series_matched.is_some()
+            && self.query.per_query.max_samples_scanned.is_some()
+            && self.query.per_query.max_samples_returned.is_some()
+            && self.query.per_query.max_returned_bytes.is_some()
+            && self.query.per_query.max_pattern_expansion.is_some()
+            && self.query.per_query.max_steps.is_some()
+            && self.query.per_query.max_intermediate_vector_size.is_some()
+            && self.query.per_query.max_memory_bytes.is_some()
+            && self.query.per_query.max_wall_time.is_some();
+        if !query_fields_are_finite {
+            return Err(TsinkError::InvalidConfiguration(
+                "finite resource profiles require every query-budget field".to_string(),
+            ));
+        }
+        if self.background.maintenance_max_bytes_per_pass < self.accounted_memory_bytes {
+            return Err(TsinkError::InvalidConfiguration(
+                "maintenance bytes per pass must be at least accounted profile memory so one admitted sealed chunk cannot exceed the pass cap"
+                    .to_string(),
+            ));
+        }
+        if self.maintenance_temp_reserve_bytes >= self.local_disk_bytes {
+            return Err(TsinkError::InvalidConfiguration(
+                "maintenance temporary reserve must be smaller than local disk bytes".to_string(),
+            ));
+        }
+        if self.wal_bytes
+            > self
+                .local_disk_bytes
+                .saturating_sub(self.maintenance_temp_reserve_bytes)
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "WAL bytes exceed local disk growth capacity after maintenance reserve".to_string(),
+            ));
+        }
+        if self.max_labels_per_series > crate::label::MAX_SUPPORTED_LABELS_PER_SERIES as u64 {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "max_labels_per_series {} exceeds the storage-format limit {}",
+                self.max_labels_per_series,
+                crate::label::MAX_SUPPORTED_LABELS_PER_SERIES
+            )));
+        }
+        let fixed_worker_count = self
+            .background
+            .flush_concurrency
+            .saturating_add(self.background.compaction_concurrency)
+            .saturating_add(self.background.persisted_refresh_concurrency)
+            .saturating_add(self.background.rollup_concurrency);
+        if self.background.flush_concurrency != 1
+            || self.background.compaction_concurrency != 1
+            || self.background.persisted_refresh_concurrency != 1
+            || self.background.rollup_concurrency != 1
+            || self.background.max_threads != fixed_worker_count
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "the current engine requires one flush, compaction, persisted-refresh, and rollup slot"
+                    .to_string(),
+            ));
+        }
+        let query_concurrency = self.query.max_concurrent_queries.unwrap_or(0);
+        if u64::try_from(self.background.remote_fetch_concurrency).unwrap_or(u64::MAX)
+            != query_concurrency
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "remote fetch concurrency must equal shared query concurrency".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Low-level builder settings that differ from the selected base profile.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceLimitOverride {
+    AccountedMemory,
+    LocalDisk,
+    FilesystemFreeHeadroom,
+    MaintenanceTempReserve,
+    WalBytes,
+    WalWriteBuffer,
+    Cardinality,
+    MaxLabelsPerSeries,
+    MaxSeriesIdentityBytes,
+    SeriesCreationRate,
+    WriteBatch,
+    ConcurrentWriters,
+    WriteTimeout,
+    PartitionHeads,
+    QueryBudget,
+    AsyncQueueCommands,
+    AsyncWriteQueueBytes,
+    AsyncReadQueueBytes,
+    AsyncReadWorkers,
+    MaintenanceWork,
+}
+
+/// Fully resolved limits reported by a storage or async facade.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ResolvedResourceLimits {
+    pub storage: EffectiveStorageLimits,
+    pub query: QueryBudgetLimits,
+    /// Present only when an async facade is active.
+    pub async_runtime: Option<AsyncResourceLimits>,
+    pub maintenance_max_items_per_pass: Option<u64>,
+    pub maintenance_max_bytes_per_pass: Option<u64>,
+}
+
+/// Versioned, serializable resource configuration and override provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ResourceConfigurationSnapshot {
+    pub schema_version: u32,
+    pub reported_by_backend: bool,
+    pub selected_profile: ResourceProfileName,
+    pub resolved_limits: ResolvedResourceLimits,
+    pub overrides: Vec<ResourceLimitOverride>,
+}
+
+impl Default for ResourceConfigurationSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: RESOURCE_CONFIGURATION_SCHEMA_VERSION,
+            reported_by_backend: false,
+            selected_profile: ResourceProfileName::Unreported,
+            resolved_limits: ResolvedResourceLimits::default(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+/// Cardinality and new-series admission state for the built-in backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardinalityObservabilitySnapshot {
+    /// Current number of registered series.
+    pub series_count: u64,
+    /// New-series reservations currently awaiting write publication.
+    pub pending_new_series: u64,
+    /// New series committed in the current fixed window.
+    pub committed_in_window: u64,
+    /// Start of the current fixed window in the storage timestamp precision.
+    pub current_window_start: Option<i64>,
+    /// New-series reservations admitted since this storage instance opened.
+    pub admitted_new_series_total: u64,
+    /// New series committed since this storage instance opened.
+    pub committed_new_series_total: u64,
+    /// Creation-rate admission rejections since this storage instance opened.
+    pub creation_rate_rejections_total: u64,
 }
 
 /// Outcome metadata for a delete-series operation.
@@ -652,17 +1435,100 @@ pub struct DeleteSeriesResult {
 pub struct StorageObservabilitySnapshot {
     /// Effective storage controls reported by the backend at snapshot time.
     pub limits: EffectiveStorageLimits,
+    /// Versioned selected profile, resolved limits, and low-level override provenance.
+    pub resource_configuration: ResourceConfigurationSnapshot,
     /// Shared local data-directory accounting, or `None` for unsupported/non-persistent backends.
     pub local_disk: Option<crate::LocalDiskBudgetSnapshot>,
     pub memory: MemoryObservabilitySnapshot,
+    /// Current total and creation-rate cardinality state.
+    pub cardinality: CardinalityObservabilitySnapshot,
     pub wal: WalObservabilitySnapshot,
     pub retention: RetentionObservabilitySnapshot,
     pub flush: FlushObservabilitySnapshot,
     pub compaction: CompactionObservabilitySnapshot,
     pub query: QueryObservabilitySnapshot,
+    /// Shared admission, work-limit, cancellation, and query-memory accounting.
+    pub query_budget: QueryBudgetSnapshot,
     pub rollups: RollupObservabilitySnapshot,
     pub remote: RemoteStorageObservabilitySnapshot,
+    /// Instance-owned background worker lifecycle, wakeup, wait, and pass state.
+    pub background: BackgroundWorkObservabilitySnapshot,
     pub health: StorageHealthSnapshot,
+}
+
+/// Lifecycle and bounded-work counters for one named background worker slot.
+///
+/// `installed` describes whether the instance still owns a join handle;
+/// `running` describes whether that thread is currently alive. They differ
+/// briefly during startup and after a worker exits but before it is joined.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackgroundWorkerObservabilitySnapshot {
+    /// Whether a join handle is installed in this instance's worker slot.
+    pub installed: bool,
+    /// Whether the worker thread is currently alive.
+    pub running: bool,
+    /// The worker's periodic/poll cadence, in nanoseconds, when configured.
+    pub interval_nanos: Option<u64>,
+    /// Fixed maximum number of passes that this slot may execute concurrently.
+    pub max_concurrency: u64,
+    /// Successful thread starts since this instance opened.
+    pub starts_total: u64,
+    /// Thread exits since this instance opened.
+    pub exits_total: u64,
+    /// Coalescible explicit wakeup notifications delivered to an installed thread.
+    pub notifications_total: u64,
+    /// Efficient park operations entered while waiting for cadence or new work.
+    pub idle_waits_total: u64,
+    /// Maintenance passes that acquired their outer lifecycle gate.
+    pub passes_started_total: u64,
+    /// Started maintenance passes that returned or unwound.
+    pub passes_completed_total: u64,
+    /// Join handles successfully reaped during shutdown.
+    pub shutdown_joins_total: u64,
+}
+
+/// Observability for all background worker slots owned by one storage instance.
+///
+/// Retention/tiering and remote catalog refresh do not create hidden threads:
+/// both are serialized through `persisted_refresh`. Remote tier payload reads
+/// happen on query callers and are bounded by the query-concurrency setting
+/// reported in [`EffectiveStorageLimits`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackgroundWorkObservabilitySnapshot {
+    /// Per-instance upper bound on installed background threads.
+    pub max_threads: u64,
+    /// Join handles currently installed across all worker slots.
+    pub installed_threads: u64,
+    /// Worker threads currently alive across all worker slots.
+    pub running_threads: u64,
+    /// Close-pipeline attempts since this instance opened, including best-effort drop.
+    pub close_attempts_total: u64,
+    /// Close attempts that completed the durability pipeline and joined every owned worker.
+    pub close_success_total: u64,
+    /// Close attempts that returned an error, including coordination timeouts and filesystem
+    /// failures.
+    pub close_errors_total: u64,
+    /// Time spent waiting for close-critical gates and the complete writer-permit drain.
+    pub close_coordination_wait_nanos_total: u64,
+    /// Close coordination acquisitions that reached the configured write/lifecycle timeout.
+    pub close_coordination_timeouts_total: u64,
+    /// Compaction passes attempted by close across all attempts, including no-op/error passes.
+    pub close_compaction_passes_total: u64,
+    /// Fixed maximum compaction passes attempted by one close.
+    pub close_compaction_pass_limit: u64,
+    /// Wall-clock duration of all close-pipeline attempts, including durability filesystem calls.
+    pub close_duration_nanos_total: u64,
+    /// Wall-clock time spent joining owned worker handles across close, abrupt-test shutdown, and
+    /// best-effort drop.
+    pub shutdown_join_wait_nanos_total: u64,
+    /// Periodic and explicitly woken flush worker.
+    pub flush: BackgroundWorkerObservabilitySnapshot,
+    /// Periodic and explicitly woken compaction worker.
+    pub compaction: BackgroundWorkerObservabilitySnapshot,
+    /// Serialized persisted refresh, retention/tiering, and remote-catalog worker.
+    pub persisted_refresh: BackgroundWorkerObservabilitySnapshot,
+    /// Periodic and explicitly woken rollup worker.
+    pub rollup: BackgroundWorkerObservabilitySnapshot,
 }
 
 /// Current pressure on the built-in engine's modeled, admitted memory scope.
@@ -703,6 +1569,7 @@ pub struct MemoryPressureSnapshot {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MemoryObservabilitySnapshot {
     /// Modeled bytes charged to the storage memory budget.
     pub accounted_bytes: usize,
@@ -724,6 +1591,19 @@ pub struct MemoryObservabilitySnapshot {
     #[serde(default)]
     pub persisted_mmap_bytes: usize,
     pub tombstone_bytes: usize,
+    /// Conservative modeled bytes retained by the WAL's committed series-definition cache.
+    pub wal_series_definition_cache_bytes: usize,
+    /// Current conservative reservation for tsink-owned foreground-write and startup-WAL scratch.
+    /// This is included in `accounted_bytes` and `estimated_accounted_bytes`.
+    pub write_transient_bytes: usize,
+    /// Highest concurrent write/replay scratch reservation since this instance opened.
+    pub peak_write_transient_bytes: usize,
+    /// Scratch leases admitted since this instance opened.
+    pub write_transient_reservations_total: u64,
+    /// Scratch leases rejected by the shared storage memory budget.
+    pub write_transient_rejections_total: u64,
+    /// True because transient bytes are conservative modeled reservations, not allocator samples.
+    pub write_transient_bytes_estimated: bool,
     /// Legacy field retained for compatibility. Persisted mappings are currently budgeted above.
     pub excluded_persisted_mmap_bytes: usize,
     /// Current modeled-memory pressure and memory-specific admission counters.
@@ -737,6 +1617,8 @@ pub struct WalObservabilitySnapshot {
     pub sync_mode: String,
     /// Whether the configured policy synchronizes every acknowledged non-empty write immediately.
     pub acknowledged_writes_durable: bool,
+    /// Finite capacity of the userspace `BufWriter`; inspected but not storage-budget-accounted.
+    pub write_buffer_capacity_bytes: u64,
     pub size_bytes: u64,
     pub segment_count: u64,
     pub active_segment: u64,
@@ -788,6 +1670,18 @@ pub struct FlushObservabilitySnapshot {
     pub admission_pressure_relief_observed_total: u64,
     pub active_flush_runs_total: u64,
     pub active_flush_errors_total: u64,
+    /// Active series inspected by cursor-bounded background flush passes.
+    #[serde(default)]
+    pub active_flush_inspected_series_total: u64,
+    /// Modeled input bytes selected by cursor-bounded background flush passes.
+    #[serde(default)]
+    pub active_flush_selected_input_bytes_total: u64,
+    /// Background passes that consumed their complete series-inspection allowance.
+    #[serde(default)]
+    pub active_flush_item_limit_hits_total: u64,
+    /// Candidate active heads skipped because they did not fit the pass byte allowance.
+    #[serde(default)]
+    pub active_flush_byte_limit_skips_total: u64,
     pub active_flushed_series_total: u64,
     pub active_flushed_chunks_total: u64,
     pub active_flushed_points_total: u64,
@@ -795,6 +1689,18 @@ pub struct FlushObservabilitySnapshot {
     pub persist_success_total: u64,
     pub persist_noop_total: u64,
     pub persist_errors_total: u64,
+    /// Sealed chunks inspected by bounded background persistence windows.
+    #[serde(default)]
+    pub persist_inspected_chunks_total: u64,
+    /// Modeled sealed-chunk input bytes selected by bounded persistence windows.
+    #[serde(default)]
+    pub persist_selected_input_bytes_total: u64,
+    /// Bounded persistence windows that exhausted their item allowance.
+    #[serde(default)]
+    pub persist_item_limit_hits_total: u64,
+    /// Bounded persistence windows stopped by their byte allowance.
+    #[serde(default)]
+    pub persist_byte_limit_hits_total: u64,
     pub persisted_series_total: u64,
     pub persisted_chunks_total: u64,
     pub persisted_points_total: u64,
@@ -821,6 +1727,12 @@ pub struct CompactionObservabilitySnapshot {
     pub output_chunks_total: u64,
     pub source_points_total: u64,
     pub output_points_total: u64,
+    pub planning_directory_entries_inspected_total: u64,
+    pub planning_manifests_inspected_total: u64,
+    pub planning_candidates_observed_total: u64,
+    pub planning_source_bytes_total: u64,
+    pub planning_backlog_observed_total: u64,
+    pub planning_budget_exhaustions_total: u64,
     pub duration_nanos_total: u64,
 }
 
@@ -928,10 +1840,16 @@ pub struct RollupPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct RollupPolicyStatus {
     pub policy: RollupPolicy,
+    /// Matching sources visited in the current or most recently completed bounded traversal.
     pub matched_series: u64,
+    /// Visited matching sources that currently have a checkpoint.
     pub materialized_series: u64,
+    /// Minimum checkpoint after a complete traversal; `None` while coverage is partial.
     pub materialized_through: Option<i64>,
     pub lag: Option<i64>,
+    /// Whether the latest bounded traversal has visited every source posting for this policy.
+    #[serde(default)]
+    pub source_traversal_complete: bool,
     pub last_run_started_at_ms: Option<u64>,
     pub last_run_completed_at_ms: Option<u64>,
     pub last_run_duration_nanos: u64,
@@ -948,6 +1866,15 @@ pub struct RollupObservabilitySnapshot {
     pub buckets_materialized_total: u64,
     pub points_materialized_total: u64,
     pub last_run_duration_nanos: u64,
+    /// Whether the bounded traversal reached the end of every active policy.
+    #[serde(default)]
+    pub source_traversal_complete: bool,
+    /// Policy whose source postings will be visited by the next bounded pass.
+    #[serde(default)]
+    pub continuation_policy_id: Option<String>,
+    /// Exclusive source-series cursor for the next bounded pass.
+    #[serde(default)]
+    pub continuation_after_series_id: Option<u64>,
     #[serde(default)]
     pub policies: Vec<RollupPolicyStatus>,
 }
@@ -958,6 +1885,35 @@ pub struct RollupObservabilitySnapshot {
 /// multiple threads. Call [`Storage::close`] explicitly when the host shuts down so persistence
 /// or worker-shutdown errors are returned to the caller.
 pub trait Storage: Send + Sync {
+    /// Returns the shared query budget when this backend implements core query admission.
+    ///
+    /// Third-party backends retain their previous behavior through the `None` default.
+    fn query_budget(&self) -> Option<QueryBudget> {
+        None
+    }
+
+    /// Admits one execution that nested query operations can share without acquiring more slots.
+    fn begin_query_execution(
+        &self,
+        request_limits: QueryWorkLimits,
+        cancellation: QueryCancellationToken,
+    ) -> Result<Option<QueryExecution>> {
+        self.query_budget()
+            .map(|budget| {
+                budget
+                    .begin_query_with(request_limits, cancellation)
+                    .map_err(Into::into)
+            })
+            .transpose()
+    }
+
+    /// Returns the backend's shared query-budget snapshot, or an unreported/unbounded default.
+    fn query_budget_snapshot(&self) -> QueryBudgetSnapshot {
+        self.query_budget()
+            .map(|budget| budget.snapshot())
+            .unwrap_or_default()
+    }
+
     /// Inserts rows into the storage.
     ///
     /// This compatibility method only reports success or failure. Use
@@ -1005,6 +1961,19 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<DataPoint>>;
 
+    /// Selects under an already-admitted execution. Built-in nested callers use this to share one
+    /// concurrency slot; compatibility backends safely fall back to their existing method.
+    fn select_with_execution(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<DataPoint>> {
+        self.select(metric, labels, start, end)
+    }
+
     fn select_into(
         &self,
         metric: &str,
@@ -1014,6 +1983,19 @@ pub trait Storage: Send + Sync {
         out: &mut Vec<DataPoint>,
     ) -> Result<()> {
         *out = self.select(metric, labels, start, end)?;
+        Ok(())
+    }
+
+    fn select_into_with_execution(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        out: &mut Vec<DataPoint>,
+        execution: &QueryExecution,
+    ) -> Result<()> {
+        *out = self.select_with_execution(metric, labels, start, end, execution)?;
         Ok(())
     }
 
@@ -1042,7 +2024,42 @@ pub trait Storage: Send + Sync {
         Ok(out)
     }
 
+    fn select_many_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> Result<Vec<SeriesPoints>> {
+        if start >= end {
+            return Err(TsinkError::InvalidTimeRange { start, end });
+        }
+        let mut out = Vec::with_capacity(series.len());
+        for item in series {
+            let points =
+                match self.select_with_execution(&item.name, &item.labels, start, end, execution) {
+                    Ok(points) => points,
+                    Err(TsinkError::NoDataPoints { .. }) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+            out.push(SeriesPoints {
+                series: item.clone(),
+                points,
+            });
+        }
+        Ok(out)
+    }
+
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
+
+    fn select_with_options_with_execution(
+        &self,
+        metric: &str,
+        opts: QueryOptions,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<DataPoint>> {
+        self.select_with_options(metric, opts)
+    }
 
     fn select_all(
         &self,
@@ -1051,10 +2068,32 @@ pub trait Storage: Send + Sync {
         end: i64,
     ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>>;
 
+    fn select_all_with_execution(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        self.select_all(metric, start, end)
+    }
+
     fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
         Err(TsinkError::Other(
             "list_metrics is not implemented for this storage backend".to_string(),
         ))
+    }
+
+    /// Lists known series while sharing an already-admitted query execution.
+    ///
+    /// Built-in and forwarding backends override this so async and nested metadata reads do not
+    /// acquire a second concurrency slot. Third-party backends retain compatibility by delegating
+    /// to [`Storage::list_metrics`].
+    fn list_metrics_with_execution(
+        &self,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
+        self.list_metrics()
     }
 
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
@@ -1080,6 +2119,14 @@ pub trait Storage: Send + Sync {
         crate::query_selection::select_series_by_scan(self, selection)
     }
 
+    fn select_series_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
+        self.select_series(selection)
+    }
+
     #[cfg(test)]
     fn sync_persisted_segments_from_disk_if_dirty_for_tests(&self) -> Result<()> {
         Ok(())
@@ -1103,6 +2150,15 @@ pub trait Storage: Send + Sync {
             reason: "bounded shard-scoped metadata is not implemented by this storage backend"
                 .to_string(),
         })
+    }
+
+    fn select_series_in_shards_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
+        self.select_series_in_shards(selection, scope)
     }
 
     fn compute_shard_window_digest(
@@ -1170,6 +2226,17 @@ pub trait Storage: Send + Sync {
             point_count,
             fingerprint,
         })
+    }
+
+    fn compute_shard_window_digest_with_execution(
+        &self,
+        shard: u32,
+        shard_count: u32,
+        window_start: i64,
+        window_end: i64,
+        _execution: &QueryExecution,
+    ) -> Result<ShardWindowDigest> {
+        self.compute_shard_window_digest(shard, shard_count, window_start, window_end)
     }
 
     fn scan_shard_window_rows(
@@ -1260,6 +2327,18 @@ pub trait Storage: Send + Sync {
         Ok(response)
     }
 
+    fn scan_shard_window_rows_with_execution(
+        &self,
+        shard: u32,
+        shard_count: u32,
+        window_start: i64,
+        window_end: i64,
+        options: ShardWindowScanOptions,
+        _execution: &QueryExecution,
+    ) -> Result<ShardWindowRowsPage> {
+        self.scan_shard_window_rows(shard, shard_count, window_start, window_end, options)
+    }
+
     fn scan_series_rows(
         &self,
         series: &[MetricSeries],
@@ -1321,6 +2400,17 @@ pub trait Storage: Send + Sync {
         Ok(response)
     }
 
+    fn scan_series_rows_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        _execution: &QueryExecution,
+    ) -> Result<QueryRowsPage> {
+        self.scan_series_rows(series, start, end, options)
+    }
+
     fn scan_metric_rows(
         &self,
         metric: &str,
@@ -1340,6 +2430,17 @@ pub trait Storage: Send + Sync {
             .filter(|entry| entry.name == metric)
             .collect::<Vec<_>>();
         self.scan_series_rows(&series, start, end, options)
+    }
+
+    fn scan_metric_rows_with_execution(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        _execution: &QueryExecution,
+    ) -> Result<QueryRowsPage> {
+        self.scan_metric_rows(metric, start, end, options)
     }
 
     /// Adds deletion tombstones for series selected by matchers and optional time range.
@@ -1364,6 +2465,16 @@ pub trait Storage: Send + Sync {
         EffectiveStorageLimits::default()
     }
 
+    /// Reports the selected resource profile, resolved limits, and override provenance.
+    ///
+    /// Third-party backends receive an unreported versioned default until they opt in.
+    fn resource_configuration_snapshot(&self) -> ResourceConfigurationSnapshot {
+        ResourceConfigurationSnapshot {
+            schema_version: RESOURCE_CONFIGURATION_SCHEMA_VERSION,
+            ..ResourceConfigurationSnapshot::default()
+        }
+    }
+
     /// Returns configured in-memory byte budget for the storage engine.
     ///
     /// `usize::MAX` means "no explicit budget configured".
@@ -1374,6 +2485,7 @@ pub trait Storage: Send + Sync {
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {
         StorageObservabilitySnapshot {
             limits: self.effective_storage_limits(),
+            resource_configuration: self.resource_configuration_snapshot(),
             ..StorageObservabilitySnapshot::default()
         }
     }
@@ -1387,6 +2499,12 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Advances synchronous rollup materialization and returns bounded traversal progress.
+    ///
+    /// Finite built-in profiles process at most one configured item/byte page. Callers that need a
+    /// complete traversal repeat this method until
+    /// [`RollupObservabilitySnapshot::source_traversal_complete`] is true. The explicit
+    /// [`ResourceProfile::ExpertUnlimited`] profile drains one complete cycle per call.
     fn trigger_rollup_run(&self) -> Result<RollupObservabilitySnapshot> {
         Err(TsinkError::InvalidConfiguration(
             "rollup runtime is not implemented for this storage backend".to_string(),
@@ -1409,17 +2527,36 @@ pub trait Storage: Send + Sync {
     ///
     /// A successful close ends the instance's lifecycle; subsequent operations return
     /// [`TsinkError::StorageClosed`] for the built-in backend. Explicit close is preferred over
-    /// relying on drop because it lets the embedder handle shutdown failures.
+    /// relying on drop because it lets the embedder handle shutdown failures. The built-in
+    /// backend applies the configured write timeout to each outer maintenance, writer-drain, and
+    /// compaction coordination acquisition. Once durability filesystem I/O begins, portable
+    /// blocking file APIs cannot be safely preempted; close waits for that call and reports its
+    /// actual result.
     fn close(&self) -> Result<()>;
+
+    /// Test-only abrupt-shutdown simulation. Implementations that support it must stop workers
+    /// and release leases without flushing or recovering durable state.
+    #[cfg(test)]
+    fn abandon_without_close_for_tests(&self) -> Result<()> {
+        Err(TsinkError::UnsupportedOperation {
+            operation: "abandon_without_close_for_tests",
+            reason: "abrupt-shutdown simulation is not implemented by this storage backend"
+                .to_string(),
+        })
+    }
 }
 
 /// Configures and opens the built-in storage engine.
 ///
 /// The default builder creates read-write storage and uses nanosecond timestamps. Without a
 /// [`StorageBuilder::with_data_path`], storage is in-memory and no on-disk WAL is opened. The
-/// default configuration does not impose explicit finite memory, cardinality, or WAL-size limits;
-/// constrained hosts should set those limits before calling [`StorageBuilder::build`].
+/// default base profile is [`ResourceProfile::Embedded`], which supplies finite memory,
+/// cardinality, write, query, WAL, and persistent-disk limits. Profile disk controls are dormant
+/// for in-memory storage. Select [`ResourceProfile::ExpertUnlimited`] explicitly to preserve the
+/// legacy unbounded storage/query behavior during migration.
 pub struct StorageBuilder {
+    resource_profile: ResourceProfile,
+    resource_overrides: BTreeSet<ResourceLimitOverride>,
     data_path: Option<PathBuf>,
     object_store_path: Option<PathBuf>,
     retention: Duration,
@@ -1439,17 +2576,25 @@ pub struct StorageBuilder {
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
     cardinality_limit: usize,
+    max_labels_per_series: usize,
+    max_series_identity_bytes: usize,
+    max_new_series_per_window: Option<usize>,
+    new_series_window: Duration,
+    write_batch_limits: WriteBatchLimits,
     wal_enabled: bool,
     wal_size_limit_bytes: usize,
     local_disk_limit_bytes: Option<u64>,
     filesystem_free_headroom_bytes: u64,
     maintenance_temp_reserve_bytes: u64,
+    maintenance_max_items_per_pass: usize,
+    maintenance_max_bytes_per_pass: u64,
     shared_local_disk_budget: Option<std::sync::Arc<crate::LocalDiskBudget>>,
     wal_buffer_size: usize,
     wal_sync_mode: WalSyncMode,
     wal_replay_mode: WalReplayMode,
     background_fail_fast: bool,
     metadata_shard_count: Option<u32>,
+    query_budget_limits: QueryBudgetLimits,
     #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
     #[cfg(test)]
@@ -1458,7 +2603,9 @@ pub struct StorageBuilder {
 
 impl Default for StorageBuilder {
     fn default() -> Self {
-        Self {
+        let mut builder = Self {
+            resource_profile: ResourceProfile::Embedded,
+            resource_overrides: BTreeSet::new(),
             data_path: None,
             object_store_path: None,
             retention: Duration::from_secs(14 * 24 * 3600),
@@ -1478,26 +2625,342 @@ impl Default for StorageBuilder {
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window: Duration::from_secs(60),
+            write_batch_limits: WriteBatchLimits::default(),
             wal_enabled: true,
             wal_size_limit_bytes: usize::MAX,
             local_disk_limit_bytes: None,
             filesystem_free_headroom_bytes: 0,
             maintenance_temp_reserve_bytes: 0,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             shared_local_disk_budget: None,
             wal_buffer_size: 4096,
             wal_sync_mode: WalSyncMode::default(),
             wal_replay_mode: WalReplayMode::Strict,
             background_fail_fast: true,
             metadata_shard_count: None,
+            query_budget_limits: QueryBudgetLimits::default(),
             #[cfg(test)]
             background_threads_enabled_override: None,
             #[cfg(test)]
             current_time_override: None,
-        }
+        };
+        builder.apply_selected_resource_profile();
+        builder
     }
 }
 
 impl StorageBuilder {
+    fn has_resource_override(&self, field: ResourceLimitOverride) -> bool {
+        self.resource_overrides.contains(&field)
+    }
+
+    fn apply_selected_resource_profile(&mut self) {
+        let finite = self.resource_profile.finite_limits();
+        let as_usize = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+
+        if !self.has_resource_override(ResourceLimitOverride::AccountedMemory) {
+            self.memory_limit_bytes = finite
+                .map(|limits| as_usize(limits.accounted_memory_bytes))
+                .unwrap_or(usize::MAX);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::LocalDisk) {
+            self.local_disk_limit_bytes = finite.map(|limits| limits.local_disk_bytes);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::FilesystemFreeHeadroom) {
+            self.filesystem_free_headroom_bytes = finite
+                .map(|limits| limits.filesystem_free_headroom_bytes)
+                .unwrap_or(0);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::MaintenanceTempReserve) {
+            self.maintenance_temp_reserve_bytes = finite
+                .map(|limits| limits.maintenance_temp_reserve_bytes)
+                .unwrap_or(0);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::WalBytes) {
+            self.wal_size_limit_bytes = finite
+                .map(|limits| as_usize(limits.wal_bytes))
+                .unwrap_or(usize::MAX);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::WalWriteBuffer) {
+            self.wal_buffer_size = finite
+                .map(|limits| as_usize(limits.wal_write_buffer_bytes))
+                .unwrap_or(4096);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::Cardinality) {
+            self.cardinality_limit = finite
+                .map(|limits| as_usize(limits.cardinality))
+                .unwrap_or(usize::MAX);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::MaxLabelsPerSeries) {
+            self.max_labels_per_series = finite
+                .map(|limits| as_usize(limits.max_labels_per_series))
+                .unwrap_or(crate::label::DEFAULT_MAX_LABELS_PER_SERIES);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::MaxSeriesIdentityBytes) {
+            self.max_series_identity_bytes = finite
+                .map(|limits| as_usize(limits.max_series_identity_bytes))
+                .unwrap_or(crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::SeriesCreationRate) {
+            self.max_new_series_per_window =
+                finite.map(|limits| as_usize(limits.max_new_series_per_window));
+            self.new_series_window = finite
+                .map(|limits| limits.new_series_window)
+                .unwrap_or(Duration::from_secs(60));
+        }
+        if !self.has_resource_override(ResourceLimitOverride::WriteBatch) {
+            self.write_batch_limits = finite.map(|limits| limits.write_batch).unwrap_or_default();
+        }
+        if !self.has_resource_override(ResourceLimitOverride::ConcurrentWriters) {
+            self.max_writers = finite
+                .map(|limits| as_usize(limits.max_concurrent_writers))
+                .unwrap_or_else(crate::cgroup::default_workers_limit)
+                .max(1);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::WriteTimeout) {
+            self.write_timeout = finite
+                .map(|limits| limits.write_timeout)
+                .unwrap_or(Duration::from_secs(30));
+        }
+        if !self.has_resource_override(ResourceLimitOverride::PartitionHeads) {
+            self.max_active_partition_heads_per_series = finite
+                .map(|limits| as_usize(limits.max_active_partition_heads_per_series))
+                .unwrap_or(DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES)
+                .max(1);
+        }
+        if !self.has_resource_override(ResourceLimitOverride::QueryBudget) {
+            self.query_budget_limits = finite.map(|limits| limits.query).unwrap_or_default();
+        }
+        if !self.has_resource_override(ResourceLimitOverride::MaintenanceWork) {
+            self.maintenance_max_items_per_pass = finite
+                .map(|limits| limits.background.maintenance_max_items_per_pass)
+                .unwrap_or(usize::MAX);
+            self.maintenance_max_bytes_per_pass = finite
+                .map(|limits| limits.background.maintenance_max_bytes_per_pass)
+                .unwrap_or(u64::MAX);
+        }
+    }
+
+    /// Selects a named or custom base profile.
+    ///
+    /// Low-level settings already applied to this builder remain overrides. This rule is
+    /// deliberately independent of call order: selecting another profile never erases them.
+    #[must_use]
+    pub fn with_resource_profile(mut self, profile: ResourceProfile) -> Self {
+        self.resource_profile = profile;
+        self.apply_selected_resource_profile();
+        self
+    }
+
+    /// Clears one low-level override and restores that field from the selected base profile.
+    #[must_use]
+    pub fn clear_resource_limit_override(mut self, field: ResourceLimitOverride) -> Self {
+        self.resource_overrides.remove(&field);
+        self.apply_selected_resource_profile();
+        self
+    }
+
+    /// Clears every low-level override and restores the complete selected base profile.
+    #[must_use]
+    pub fn clear_resource_limit_overrides(mut self) -> Self {
+        self.resource_overrides.clear();
+        self.shared_local_disk_budget = None;
+        self.apply_selected_resource_profile();
+        self
+    }
+
+    /// Returns the selected base profile, including custom finite limits when applicable.
+    #[must_use]
+    pub const fn resource_profile(&self) -> ResourceProfile {
+        self.resource_profile
+    }
+
+    /// Returns the currently resolved, versioned resource configuration without opening storage.
+    #[must_use]
+    pub fn resource_configuration_snapshot(&self) -> ResourceConfigurationSnapshot {
+        let persistent =
+            self.runtime_mode == StorageRuntimeMode::ReadWrite && self.data_path.is_some();
+        let wal_enabled = persistent && self.wal_enabled;
+        let finite_usize =
+            |value: usize| (value != usize::MAX).then(|| u64::try_from(value).unwrap_or(u64::MAX));
+        let duration_nanos =
+            |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let has_tiered_storage = self.object_store_path.is_some();
+        let flush_concurrency = u64::from(persistent);
+        let compaction_concurrency = u64::from(persistent);
+        let persisted_refresh_concurrency = u64::from(
+            persistent
+                || (self.runtime_mode == StorageRuntimeMode::ComputeOnly && has_tiered_storage),
+        );
+        let rollup_concurrency = u64::from(persistent);
+        ResourceConfigurationSnapshot {
+            schema_version: RESOURCE_CONFIGURATION_SCHEMA_VERSION,
+            reported_by_backend: true,
+            selected_profile: self.resource_profile.name(),
+            resolved_limits: ResolvedResourceLimits {
+                storage: EffectiveStorageLimits {
+                    reported_by_backend: true,
+                    persistent,
+                    wal_enabled,
+                    accounted_memory_bytes: finite_usize(self.memory_limit_bytes),
+                    cardinality: finite_usize(self.cardinality_limit),
+                    max_labels_per_series: finite_usize(self.max_labels_per_series),
+                    max_series_identity_bytes: finite_usize(self.max_series_identity_bytes),
+                    max_new_series_per_window: self
+                        .max_new_series_per_window
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                    new_series_window_nanos: self
+                        .max_new_series_per_window
+                        .map(|_| duration_nanos(self.new_series_window)),
+                    max_write_batch_rows: self
+                        .write_batch_limits
+                        .max_rows
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                    max_write_batch_input_bytes: self
+                        .write_batch_limits
+                        .max_modeled_input_bytes
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                    wal_bytes: wal_enabled
+                        .then(|| finite_usize(self.wal_size_limit_bytes))
+                        .flatten(),
+                    wal_write_buffer_bytes: wal_enabled
+                        .then(|| u64::try_from(self.wal_buffer_size.max(1)).unwrap_or(u64::MAX)),
+                    local_disk_bytes: persistent.then_some(self.local_disk_limit_bytes).flatten(),
+                    filesystem_free_headroom_bytes: persistent
+                        .then_some(self.filesystem_free_headroom_bytes),
+                    maintenance_temp_reserve_bytes: persistent
+                        .then_some(self.maintenance_temp_reserve_bytes),
+                    max_concurrent_writers: Some(
+                        u64::try_from(self.max_writers.max(1)).unwrap_or(u64::MAX),
+                    ),
+                    write_timeout_nanos: Some(duration_nanos(self.write_timeout)),
+                    max_background_threads: Some(
+                        flush_concurrency
+                            .saturating_add(compaction_concurrency)
+                            .saturating_add(persisted_refresh_concurrency)
+                            .saturating_add(rollup_concurrency),
+                    ),
+                    max_flush_concurrency: Some(flush_concurrency),
+                    max_compaction_concurrency: Some(compaction_concurrency),
+                    max_retention_tiering_concurrency: Some(u64::from(
+                        persistent && self.retention_enforced,
+                    )),
+                    max_remote_catalog_refresh_concurrency: Some(u64::from(
+                        self.runtime_mode == StorageRuntimeMode::ComputeOnly && has_tiered_storage,
+                    )),
+                    max_remote_tier_fetch_concurrency: if has_tiered_storage {
+                        self.query_budget_limits.max_concurrent_queries
+                    } else {
+                        Some(0)
+                    },
+                    max_rollup_concurrency: Some(rollup_concurrency),
+                    flush_interval_nanos: (flush_concurrency > 0)
+                        .then(|| duration_nanos(Duration::from_millis(250))),
+                    compaction_interval_nanos: (compaction_concurrency > 0)
+                        .then(|| duration_nanos(Duration::from_secs(5))),
+                    persisted_refresh_poll_interval_nanos: (persisted_refresh_concurrency > 0)
+                        .then(|| duration_nanos(Duration::from_millis(250))),
+                    rollup_interval_nanos: (rollup_concurrency > 0)
+                        .then(|| duration_nanos(Duration::from_secs(5))),
+                    max_active_partition_heads_per_series: Some(
+                        u64::try_from(self.max_active_partition_heads_per_series)
+                            .unwrap_or(u64::MAX),
+                    ),
+                },
+                query: self.query_budget_limits,
+                async_runtime: None,
+                maintenance_max_items_per_pass: (self.maintenance_max_items_per_pass != usize::MAX)
+                    .then(|| {
+                        u64::try_from(self.maintenance_max_items_per_pass).unwrap_or(u64::MAX)
+                    }),
+                maintenance_max_bytes_per_pass: (self.maintenance_max_bytes_per_pass != u64::MAX)
+                    .then_some(self.maintenance_max_bytes_per_pass),
+            },
+            overrides: self.resource_overrides.iter().copied().collect(),
+        }
+    }
+
+    fn validate_resource_configuration(&self) -> Result<()> {
+        if let Some(limits) = self.resource_profile.finite_limits() {
+            limits.validate()?;
+        }
+        if self
+            .write_batch_limits
+            .max_rows
+            .is_some_and(|value| value == 0)
+            || self
+                .write_batch_limits
+                .max_modeled_input_bytes
+                .is_some_and(|value| value == 0)
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "configured write-batch limits must be greater than zero".to_string(),
+            ));
+        }
+        if self.maintenance_max_items_per_pass == 0 || self.maintenance_max_bytes_per_pass == 0 {
+            return Err(TsinkError::InvalidConfiguration(
+                "maintenance per-pass limits must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(max_rows) = self.write_batch_limits.max_rows {
+            if self.maintenance_max_items_per_pass != usize::MAX
+                && self.maintenance_max_items_per_pass < max_rows
+            {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "maintenance item cap {} is smaller than write-batch row limit {}; increase the maintenance cap or lower the row limit so one admitted batch cannot be stranded",
+                    self.maintenance_max_items_per_pass, max_rows
+                )));
+            }
+        }
+        if self.maintenance_max_bytes_per_pass != u64::MAX {
+            if self.memory_limit_bytes == usize::MAX {
+                return Err(TsinkError::InvalidConfiguration(
+                    "a finite maintenance byte cap requires a finite accounted-memory limit so one admitted sealed chunk cannot exceed the pass cap"
+                        .to_string(),
+                ));
+            }
+            let memory_limit_bytes = u64::try_from(self.memory_limit_bytes).unwrap_or(u64::MAX);
+            if self.maintenance_max_bytes_per_pass < memory_limit_bytes {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "maintenance byte cap {} is smaller than accounted-memory limit {}; increase the maintenance cap or lower the memory limit so one admitted sealed chunk cannot be stranded",
+                    self.maintenance_max_bytes_per_pass, memory_limit_bytes
+                )));
+            }
+        }
+        self.query_budget_limits
+            .validate()
+            .map_err(crate::QueryBudgetError::from)?;
+        if let Some(local_disk_bytes) = self.local_disk_limit_bytes {
+            if local_disk_bytes == 0 {
+                return Err(TsinkError::InvalidConfiguration(
+                    "local disk limit must be greater than zero".to_string(),
+                ));
+            }
+            if self.maintenance_temp_reserve_bytes >= local_disk_bytes {
+                return Err(TsinkError::InvalidConfiguration(
+                    "maintenance temporary reserve must be smaller than local disk limit"
+                        .to_string(),
+                ));
+            }
+            if self.wal_enabled && self.wal_size_limit_bytes != usize::MAX {
+                let wal_bytes = u64::try_from(self.wal_size_limit_bytes).unwrap_or(u64::MAX);
+                if wal_bytes > local_disk_bytes.saturating_sub(self.maintenance_temp_reserve_bytes)
+                {
+                    return Err(TsinkError::InvalidConfiguration(
+                        "WAL limit exceeds local disk growth capacity after maintenance reserve"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a builder with the defaults described on [`StorageBuilder`].
     #[must_use]
     pub fn new() -> Self {
@@ -1627,6 +3090,8 @@ impl StorageBuilder {
     /// Passing zero selects the cgroup-aware worker default.
     #[must_use]
     pub fn with_max_writers(mut self, max_writers: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::ConcurrentWriters);
         self.max_writers = if max_writers == 0 {
             crate::cgroup::default_workers_limit().max(1)
         } else {
@@ -1635,9 +3100,11 @@ impl StorageBuilder {
         self
     }
 
-    /// Sets how long writes and lifecycle operations wait to acquire writer permits.
+    /// Sets the per-acquisition wait for writer permits and close maintenance/compaction gates.
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::WriteTimeout);
         self.write_timeout = timeout;
         self
     }
@@ -1658,6 +3125,8 @@ impl StorageBuilder {
     /// active head.
     #[must_use]
     pub fn with_max_active_partition_heads_per_series(mut self, max_heads: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::PartitionHeads);
         self.max_active_partition_heads_per_series = max_heads.max(1);
         self
     }
@@ -1665,16 +3134,22 @@ impl StorageBuilder {
     /// Sets the modeled storage-memory budget.
     ///
     /// The budget charges active and sealed chunks, registry and metadata state, persisted indexes
-    /// and virtual mapping lengths, and tombstones. It excludes query working sets, write and WAL
-    /// staging, thread stacks, allocator overhead, and adapter state, so it is not a process-RSS
-    /// cap. [`Storage::observability_snapshot`] exposes the exact current category inventory and
-    /// pressure state.
+    /// and virtual mapping lengths, tombstones, and conservative transient reservations for
+    /// foreground write preparation, startup WAL replay, and pre-live registry, segment-inventory,
+    /// and persisted-index hydration. It excludes caller-owned input, query working sets, the
+    /// finite WAL `BufWriter`, thread stacks, allocator overhead, and adapter state, so it is not a
+    /// process-RSS cap. [`Storage::observability_snapshot`] exposes the exact current category
+    /// inventory and pressure state; conservative startup hydration admission is released before
+    /// the built instance becomes live.
     ///
     /// When a write would exceed the modeled budget, the engine applies backpressure by persisting
     /// sealed chunks to L0 and evicting the oldest sealed chunks before rejecting the write.
-    /// The builder default is `usize::MAX`, meaning no explicit budget is configured.
+    /// The `Embedded` builder default is 512 MiB. `usize::MAX` remains an explicit low-level
+    /// opt-out and is also selected by `ExpertUnlimited`.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::AccountedMemory);
         self.memory_limit_bytes = bytes;
         self
     }
@@ -1682,10 +3157,68 @@ impl StorageBuilder {
     /// Sets a hard upper bound for total series cardinality.
     ///
     /// New metric+label combinations are rejected once the limit is reached.
-    /// The builder default is `usize::MAX`, meaning no explicit limit is configured.
+    /// The `Embedded` builder default is 1,000,000 series. `usize::MAX` remains an explicit
+    /// low-level opt-out and is also selected by `ExpertUnlimited`.
     #[must_use]
     pub fn with_cardinality_limit(mut self, series: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::Cardinality);
         self.cardinality_limit = series;
+        self
+    }
+
+    /// Sets the maximum label count accepted in a submitted series identity.
+    ///
+    /// The default is [`crate::DEFAULT_MAX_LABELS_PER_SERIES`]. Values above
+    /// [`crate::MAX_SUPPORTED_LABELS_PER_SERIES`] are rejected during build because the current
+    /// WAL and segment formats cannot represent them.
+    #[must_use]
+    pub fn with_max_labels_per_series(mut self, labels: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaxLabelsPerSeries);
+        self.max_labels_per_series = labels;
+        self
+    }
+
+    /// Sets the maximum cumulative UTF-8 bytes in a submitted series identity.
+    ///
+    /// The calculation includes the metric name and every label name and value. The default is
+    /// [`crate::DEFAULT_MAX_SERIES_IDENTITY_BYTES`]. `usize::MAX` is an explicit expert opt-out.
+    #[must_use]
+    pub fn with_max_series_identity_bytes(mut self, bytes: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaxSeriesIdentityBytes);
+        self.max_series_identity_bytes = bytes;
+        self
+    }
+
+    /// Limits successful creation of new series during a fixed storage-clock window.
+    ///
+    /// Admission includes concurrent in-flight writes. A failed write releases its reservation;
+    /// only a published write counts as committed. The window is rounded up to one configured
+    /// timestamp unit when it is finer than [`StorageBuilder::with_timestamp_precision`].
+    #[must_use]
+    pub fn with_series_creation_rate_limit(
+        mut self,
+        max_new_series: usize,
+        window: Duration,
+    ) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::SeriesCreationRate);
+        self.max_new_series_per_window = Some(max_new_series);
+        self.new_series_window = window;
+        self
+    }
+
+    /// Configures pre-allocation row-count and modeled-input-byte admission for writes.
+    ///
+    /// Each `None` field preserves legacy unbounded behavior. Finite limits apply to atomic,
+    /// best-effort, async, internal rollup, and WAL-replay ingestion paths.
+    #[must_use]
+    pub fn with_write_batch_limits(mut self, limits: WriteBatchLimits) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::WriteBatch);
+        self.write_batch_limits = limits;
         self
     }
 
@@ -1700,9 +3233,12 @@ impl StorageBuilder {
 
     /// Sets a hard upper bound for on-disk WAL bytes across all WAL segments.
     ///
-    /// `usize::MAX`, the builder default, disables the limit.
+    /// The `Embedded` builder default is 512 MiB. `usize::MAX` disables the limit and is selected
+    /// by `ExpertUnlimited`.
     #[must_use]
     pub fn with_wal_size_limit(mut self, bytes: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::WalBytes);
         self.wal_size_limit_bytes = bytes;
         self
     }
@@ -1715,6 +3251,8 @@ impl StorageBuilder {
     /// destinations outside the data directory are not included.
     #[must_use]
     pub fn with_local_disk_limit(mut self, bytes: u64) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::LocalDisk);
         self.local_disk_limit_bytes = Some(bytes);
         self
     }
@@ -1725,6 +3263,8 @@ impl StorageBuilder {
     /// writes must also leave the maintenance temporary reserve available.
     #[must_use]
     pub fn with_filesystem_free_headroom(mut self, bytes: u64) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::FilesystemFreeHeadroom);
         self.filesystem_free_headroom_bytes = bytes;
         self
     }
@@ -1735,7 +3275,27 @@ impl StorageBuilder {
     /// the global local-disk limit and filesystem free-space headroom.
     #[must_use]
     pub fn with_maintenance_temp_reserve(mut self, bytes: u64) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaintenanceTempReserve);
         self.maintenance_temp_reserve_bytes = bytes;
+        self
+    }
+
+    /// Sets the maximum logical items selected by one background maintenance pass.
+    #[must_use]
+    pub fn with_maintenance_max_items_per_pass(mut self, max_items: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaintenanceWork);
+        self.maintenance_max_items_per_pass = max_items;
+        self
+    }
+
+    /// Sets the maximum modeled input bytes selected by one background maintenance pass.
+    #[must_use]
+    pub fn with_maintenance_max_bytes_per_pass(mut self, max_bytes: u64) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaintenanceWork);
+        self.maintenance_max_bytes_per_pass = max_bytes;
         self
     }
 
@@ -1750,6 +3310,12 @@ impl StorageBuilder {
         mut self,
         budget: std::sync::Arc<crate::LocalDiskBudget>,
     ) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::LocalDisk);
+        self.resource_overrides
+            .insert(ResourceLimitOverride::FilesystemFreeHeadroom);
+        self.resource_overrides
+            .insert(ResourceLimitOverride::MaintenanceTempReserve);
         let limits = budget.limits();
         self.local_disk_limit_bytes = limits.max_bytes;
         self.filesystem_free_headroom_bytes = limits.filesystem_free_headroom_bytes;
@@ -1763,6 +3329,8 @@ impl StorageBuilder {
     /// A zero value is normalized to a one-byte buffer when the WAL is opened.
     #[must_use]
     pub fn with_wal_buffer_size(mut self, size: usize) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::WalWriteBuffer);
         self.wal_buffer_size = size;
         self
     }
@@ -1803,6 +3371,18 @@ impl StorageBuilder {
         self
     }
 
+    /// Configures shared query concurrency/memory admission and per-query work limits.
+    ///
+    /// Every `None` field remains unbounded for backward compatibility. Finite values are
+    /// validated when [`StorageBuilder::build`] constructs the storage instance.
+    #[must_use]
+    pub fn with_query_budget_limits(mut self, limits: QueryBudgetLimits) -> Self {
+        self.resource_overrides
+            .insert(ResourceLimitOverride::QueryBudget);
+        self.query_budget_limits = limits;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_current_time_override_for_tests(mut self, timestamp: i64) -> Self {
@@ -1822,6 +3402,19 @@ impl StorageBuilder {
     /// The returned [`Arc`] may be shared between host threads. Call [`Storage::close`] once the
     /// host has stopped submitting work and before discarding its storage handles.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
+        self.validate_resource_configuration()?;
+        if self.max_labels_per_series > crate::label::MAX_SUPPORTED_LABELS_PER_SERIES {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "max_labels_per_series {} exceeds the storage-format limit {}",
+                self.max_labels_per_series,
+                crate::label::MAX_SUPPORTED_LABELS_PER_SERIES
+            )));
+        }
+        if self.max_new_series_per_window.is_some() && self.new_series_window.is_zero() {
+            return Err(TsinkError::InvalidConfiguration(
+                "new-series creation-rate window must be greater than zero".to_string(),
+            ));
+        }
         crate::engine::build_storage(self)
     }
 
@@ -1829,12 +3422,47 @@ impl StorageBuilder {
     ///
     /// Perform restoration before opening storage at the target path. If `data_path` already
     /// exists, a successful restore replaces it; activation uses staging and attempts rollback if
-    /// the replacement fails.
+    /// the replacement fails. The snapshot must be trusted and immutable for the duration of the
+    /// call. Static link checks reject unsafe entries, but portable filesystem APIs cannot make
+    /// traversal race-free against a process concurrently replacing snapshot paths.
     pub fn restore_from_snapshot(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,
     ) -> Result<()> {
         crate::engine::restore_storage_from_snapshot(snapshot_path.as_ref(), data_path.as_ref())
+    }
+
+    /// Restores an external snapshot under a caller-owned local disk budget.
+    ///
+    /// The destination must be a strict descendant of `disk_budget.root()`, while the snapshot
+    /// must not overlap that root. Restoration statically rejects link-like entries and measures
+    /// logical file bytes plus a finite entry count before mutation. It accepts at most
+    /// [`MAX_SNAPSHOT_RESTORE_ENTRIES`] entries and depth
+    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`]. Before creating destination state it reserves:
+    /// `logical_file_bytes + (snapshot_entry_count + missing_target_parent_directories) *
+    /// max(policy_floor, filesystem_allocation_unit)`, where the floor is
+    /// [`SNAPSHOT_RESTORE_ENTRY_STAGING_ALLOWANCE_FLOOR_BYTES`]. This admission is deliberately
+    /// conservative and is not presented as an exact physical filesystem footprint. Activation is
+    /// serialized with other managed budget mutations. A successful post-operation scan installs
+    /// exact logical accounting before release; if that scan fails, the API returns an explicit
+    /// committed-but-accounting error and conservatively charges the full reservation.
+    ///
+    /// Perform restoration before opening storage at the target path. The supplied budget is an
+    /// offline restore envelope rooted above the target; it must not concurrently coordinate an
+    /// open storage instance. After restore, open storage with its normal data-path budget rooted
+    /// at the restored target. The snapshot must be trusted and immutable throughout the call:
+    /// cross-platform path traversal cannot eliminate namespace-swap races between a static entry
+    /// check and opening that entry.
+    pub fn restore_from_snapshot_with_disk_budget(
+        snapshot_path: impl AsRef<Path>,
+        data_path: impl AsRef<Path>,
+        disk_budget: Arc<crate::LocalDiskBudget>,
+    ) -> Result<()> {
+        crate::engine::restore_storage_from_snapshot_with_disk_budget(
+            snapshot_path.as_ref(),
+            data_path.as_ref(),
+            disk_budget,
+        )
     }
 
     pub(crate) fn chunk_points(&self) -> usize {
@@ -1913,6 +3541,26 @@ impl StorageBuilder {
         self.cardinality_limit
     }
 
+    pub(crate) fn max_labels_per_series(&self) -> usize {
+        self.max_labels_per_series
+    }
+
+    pub(crate) fn max_series_identity_bytes(&self) -> usize {
+        self.max_series_identity_bytes
+    }
+
+    pub(crate) fn max_new_series_per_window(&self) -> Option<usize> {
+        self.max_new_series_per_window
+    }
+
+    pub(crate) fn new_series_window(&self) -> Duration {
+        self.new_series_window
+    }
+
+    pub(crate) fn write_batch_limits(&self) -> WriteBatchLimits {
+        self.write_batch_limits
+    }
+
     pub(crate) fn wal_enabled(&self) -> bool {
         self.wal_enabled
     }
@@ -1929,10 +3577,25 @@ impl StorageBuilder {
         }
     }
 
+    pub(crate) fn has_explicit_local_disk_settings(&self) -> bool {
+        self.has_resource_override(ResourceLimitOverride::LocalDisk)
+            || self.has_resource_override(ResourceLimitOverride::FilesystemFreeHeadroom)
+            || self.has_resource_override(ResourceLimitOverride::MaintenanceTempReserve)
+            || self.shared_local_disk_budget.is_some()
+    }
+
     pub(crate) fn shared_local_disk_budget(
         &self,
     ) -> Option<&std::sync::Arc<crate::LocalDiskBudget>> {
         self.shared_local_disk_budget.as_ref()
+    }
+
+    pub(crate) fn maintenance_max_items_per_pass(&self) -> usize {
+        self.maintenance_max_items_per_pass
+    }
+
+    pub(crate) fn maintenance_max_bytes_per_pass(&self) -> u64 {
+        self.maintenance_max_bytes_per_pass
     }
 
     pub(crate) fn wal_buffer_size(&self) -> usize {
@@ -1953,6 +3616,10 @@ impl StorageBuilder {
 
     pub(crate) fn metadata_shard_count(&self) -> Option<u32> {
         self.metadata_shard_count
+    }
+
+    pub(crate) fn query_budget_limits(&self) -> QueryBudgetLimits {
+        self.query_budget_limits
     }
 
     #[cfg(test)]

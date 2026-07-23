@@ -1,5 +1,6 @@
 use super::*;
 use crate::{RowWriteStatus, WriteMode, WriteRejectionCategory};
+use std::sync::atomic::Ordering;
 
 fn wait_for_condition<F>(timeout: Duration, poll_interval: Duration, condition: F) -> bool
 where
@@ -196,9 +197,17 @@ fn write_limiter_respects_configured_timeout() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -265,9 +274,17 @@ fn wal_pressure_with_busy_writer_permit_returns_limit_error_not_timeout() {
             write_timeout: Duration::from_millis(100),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: 1,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -315,9 +332,17 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: 1,
                 admission_poll_interval: Duration::from_millis(5),
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -387,9 +412,17 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
             write_timeout: Duration::from_millis(100),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -426,7 +459,6 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
 #[test]
 fn memory_admission_backpressure_uses_background_flush_without_sealing_current_head() {
     let temp_dir = TempDir::new().unwrap();
-    let lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
     let first_blob = "a".repeat(4096);
     let second_blob = "b".repeat(4096);
     let third_blob = "c".repeat(4096);
@@ -434,7 +466,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     let build_storage = |root: &TempDir, write_timeout: Duration| {
         let wal = FramedWal::open(root.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
         ChunkStorage::new_with_data_path_and_options(
-            8,
+            64,
             Some(wal),
             None,
             Some(root.path().join(BLOB_LANE_ROOT)),
@@ -453,9 +485,17 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 write_timeout,
                 memory_budget_bytes: 1_000_000,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: Duration::from_millis(5),
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -468,14 +508,16 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         )
         .unwrap()
     };
-    let calibration_dir = TempDir::new().unwrap();
-    let calibration = build_storage(&calibration_dir, Duration::ZERO);
-    calibration
-        .insert_rows(&[
-            Row::new(
-                "memory_backpressure_head_guard",
-                DataPoint::new(1, first_blob.clone()),
-            ),
+    let initial_rows = || {
+        let mut rows = (1..=8)
+            .map(|timestamp| {
+                Row::new(
+                    "memory_backpressure_head_guard",
+                    DataPoint::new(timestamp, first_blob.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.extend([
             Row::new(
                 "memory_backpressure_head_guard",
                 DataPoint::new(11, second_blob.clone()),
@@ -484,8 +526,12 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 "memory_backpressure_head_guard",
                 DataPoint::new(21, third_blob.clone()),
             ),
-        ])
-        .unwrap();
+        ]);
+        rows
+    };
+    let calibration_dir = TempDir::new().unwrap();
+    let calibration = build_storage(&calibration_dir, Duration::ZERO);
+    calibration.insert_rows(&initial_rows()).unwrap();
     let fourth_row = Row::new(
         "memory_backpressure_head_guard",
         DataPoint::new(22, fourth_blob.clone()),
@@ -512,22 +558,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
 
     let storage = std::sync::Arc::new(build_storage(&temp_dir, Duration::from_secs(1)));
 
-    storage
-        .insert_rows(&[
-            Row::new(
-                "memory_backpressure_head_guard",
-                DataPoint::new(1, first_blob.clone()),
-            ),
-            Row::new(
-                "memory_backpressure_head_guard",
-                DataPoint::new(11, second_blob.clone()),
-            ),
-            Row::new(
-                "memory_backpressure_head_guard",
-                DataPoint::new(21, third_blob.clone()),
-            ),
-        ])
-        .unwrap();
+    storage.insert_rows(&initial_rows()).unwrap();
 
     let series_id = storage
         .catalog
@@ -541,7 +572,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         let active = storage.active_shard(series_id).read();
         let state = active.get(&series_id).unwrap();
         assert_eq!(state.partition_head_count(), 3);
-        assert_eq!(state.point_count(), 3);
+        assert_eq!(state.point_count(), 10);
     }
 
     storage
@@ -558,14 +589,13 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
 
     assert!(
         wait_for_condition(Duration::from_secs(1), Duration::from_millis(10), || {
-            !load_segments_for_level(&lane_path, 0).unwrap().is_empty()
-                && storage
-                    .observability_snapshot()
-                    .flush
-                    .persisted_segments_total
-                    > before.flush.persisted_segments_total
+            storage
+                .observability_snapshot()
+                .flush
+                .active_flushed_chunks_total
+                > before.flush.active_flushed_chunks_total
         }),
-        "background flush should publish a persisted segment while relieving admission pressure",
+        "background flush should finalize an older head while relieving admission pressure",
     );
 
     let after = storage.observability_snapshot();
@@ -591,15 +621,16 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         before.memory.pressure.rejections_total
     );
     assert!(
-        after.flush.persisted_segments_total > before.flush.persisted_segments_total,
-        "background flush should persist the non-current head instead of fragmenting the live head",
+        after.flush.active_flushed_chunks_total > before.flush.active_flushed_chunks_total,
+        "background flush should finalize a non-current head instead of fragmenting the live head",
     );
     {
         let active = storage.active_shard(series_id).read();
         let state = active.get(&series_id).unwrap();
-        assert_eq!(state.partition_head_count(), 1);
+        assert!(state.partition_head_count() < 3);
+        let current_partition_id = state.current_partition_id.unwrap();
         assert_eq!(
-            state.point_count(),
+            state.partition_heads[&current_partition_id].builder.len(),
             2,
             "admission pressure must keep the current partial head intact while appending the new point",
         );
@@ -608,13 +639,145 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         storage
             .select("memory_backpressure_head_guard", &[], 0, 30)
             .unwrap(),
-        vec![
-            DataPoint::new(1, first_blob),
-            DataPoint::new(11, second_blob),
-            DataPoint::new(21, third_blob),
-            DataPoint::new(22, fourth_blob),
-        ]
+        (1..=8)
+            .map(|timestamp| DataPoint::new(timestamp, first_blob.clone()))
+            .chain([
+                DataPoint::new(11, second_blob),
+                DataPoint::new(21, third_blob),
+                DataPoint::new(22, fourth_blob),
+            ])
+            .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn memory_admission_evicts_persisted_sealed_overlap_to_exact_residual_budget() {
+    const STAGED_BYTES: usize = 113;
+    const TRANSIENT_BYTES: usize = 127;
+    const ESTIMATED_GROWTH_BYTES: usize = 139;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        2,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            write_timeout: Duration::ZERO,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "admission_residual_eviction",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("admission_residual_eviction", &[])
+        .unwrap()
+        .series_id;
+    let (sealed_key, sealed_chunk) = storage.chunks.sealed_chunks
+        [ChunkStorage::series_shard_idx(series_id)]
+    .read()
+    .get(&series_id)
+    .unwrap()
+    .first_key_value()
+    .map(|(key, chunk)| (*key, Arc::clone(chunk)))
+    .unwrap();
+    let overlap_bytes = ChunkStorage::chunk_memory_usage_bytes(&sealed_chunk);
+
+    let writer = SegmentWriter::new(&lane_path, 0, 1).unwrap();
+    writer
+        .write_segment(
+            &storage.catalog.registry.read(),
+            &HashMap::from([(series_id, vec![Arc::clone(&sealed_chunk)])]),
+        )
+        .unwrap();
+    storage
+        .add_persisted_segments_from_loaded(
+            vec![load_segment_index(&writer.layout().root).unwrap()],
+        )
+        .unwrap();
+    storage.mark_persisted_chunk_watermarks(&HashMap::from([(series_id, sealed_key.sequence)]));
+
+    let used_before = storage.memory.used_bytes.load(Ordering::Acquire) as usize;
+    storage
+        .memory
+        .tombstone_staged_bytes
+        .store(STAGED_BYTES as u64, Ordering::Release);
+    let transient = storage
+        .reserve_write_transient_memory(TRANSIENT_BYTES)
+        .unwrap();
+    let exact_residual_budget = used_before
+        .saturating_sub(overlap_bytes)
+        .saturating_add(STAGED_BYTES)
+        .saturating_add(TRANSIENT_BYTES)
+        .saturating_add(ESTIMATED_GROWTH_BYTES);
+    storage
+        .memory
+        .budget_bytes
+        .store(exact_residual_budget as u64, Ordering::Release);
+
+    let prepare = storage.write_prepare_context();
+    prepare
+        .admission
+        .enforce_admission_controls(
+            prepare.memory_budget,
+            prepare.wal,
+            ESTIMATED_GROWTH_BYTES,
+            0,
+        )
+        .expect("one persisted sealed overlap should make the exact residual boundary fit");
+    let used_after = storage.memory.used_bytes.load(Ordering::Acquire) as usize;
+    assert_eq!(used_after, used_before - overlap_bytes);
+    assert!(
+        storage.chunks.sealed_chunks[ChunkStorage::series_shard_idx(series_id)]
+            .read()
+            .get(&series_id)
+            .is_none()
+    );
+
+    storage
+        .memory
+        .budget_bytes
+        .store((exact_residual_budget - 1) as u64, Ordering::Release);
+    let error = prepare
+        .admission
+        .enforce_admission_controls(
+            prepare.memory_budget,
+            prepare.wal,
+            ESTIMATED_GROWTH_BYTES,
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == exact_residual_budget - 1 && required == exact_residual_budget
+    ));
+
+    storage
+        .memory
+        .tombstone_staged_bytes
+        .store(0, Ordering::Release);
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    drop(transient);
+    storage.close().unwrap();
 }
 
 #[test]
@@ -642,9 +805,17 @@ fn wal_admission_backpressure_rejects_without_flushing_current_head() {
             write_timeout: Duration::from_millis(25),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: Duration::from_millis(5),
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -775,9 +946,17 @@ fn wal_size_limit_rejects_writes_against_many_segment_wals() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: wal_size_limit,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -834,9 +1013,17 @@ fn close_blocks_until_in_flight_writer_releases_permit() {
                 write_timeout: Duration::from_secs(2),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: true,
                 background_fail_fast: false,
                 metadata_shard_count: None,

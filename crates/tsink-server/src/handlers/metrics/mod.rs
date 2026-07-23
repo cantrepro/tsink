@@ -20,6 +20,7 @@ pub(super) fn render_metrics(
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let mut collection_errors = Vec::new();
     let memory_used = storage.memory_used();
@@ -34,12 +35,13 @@ pub(super) fn render_metrics(
             Vec::new()
         }
     };
-    let series_count = metrics_list.len();
     let uptime = server_start.elapsed().as_secs();
     let obs = storage.observability_snapshot();
+    let series_count = obs.cardinality.series_count;
     let local_disk = local_disk_budget
         .map(tsink::LocalDiskBudget::snapshot)
         .or_else(|| obs.local_disk.clone());
+    let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let memory_obs = &obs.memory;
     let memory_pressure_normal = u8::from(matches!(
         memory_obs.pressure.level,
@@ -101,6 +103,10 @@ pub(super) fn render_metrics(
     let edge_sync_accept_status = edge_sync_context
         .map(|context| context.accept_status_snapshot())
         .unwrap_or_default();
+    let cluster_audit_health = cluster_context
+        .and_then(|context| context.audit_log.as_ref())
+        .map(|audit_log| audit_log.health_snapshot())
+        .unwrap_or_default();
     let cluster_outbox_peers = cluster_context
         .and_then(|context| context.outbox.as_ref())
         .map(|outbox| outbox.peer_backlog_snapshot())
@@ -110,6 +116,7 @@ pub(super) fn render_metrics(
         .map(|outbox| outbox.stalled_peer_snapshot())
         .unwrap_or_default();
     let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
+    let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
     let cluster_handoff = cluster_handoff_snapshot(cluster_context);
     let cluster_digest = cluster_digest_snapshot(cluster_context);
     let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
@@ -157,6 +164,21 @@ pub(super) fn render_metrics(
          # HELP tsink_memory_tombstone_bytes Estimated budgeted bytes used by tombstone state\n\
          # TYPE tsink_memory_tombstone_bytes gauge\n\
          tsink_memory_tombstone_bytes {memory_tombstones}\n\
+         # HELP tsink_memory_wal_series_definition_cache_bytes Modeled budgeted bytes retained by the WAL series-definition cache\n\
+         # TYPE tsink_memory_wal_series_definition_cache_bytes gauge\n\
+         tsink_memory_wal_series_definition_cache_bytes {memory_wal_series_definition_cache}\n\
+         # HELP tsink_memory_write_transient_bytes Current modeled budgeted bytes reserved for foreground write and startup replay scratch\n\
+         # TYPE tsink_memory_write_transient_bytes gauge\n\
+         tsink_memory_write_transient_bytes {memory_write_transient}\n\
+         # HELP tsink_memory_write_transient_peak_bytes Peak concurrent modeled write and replay scratch reservation\n\
+         # TYPE tsink_memory_write_transient_peak_bytes gauge\n\
+         tsink_memory_write_transient_peak_bytes {memory_write_transient_peak}\n\
+         # HELP tsink_memory_write_transient_reservations_total Write and replay scratch leases admitted by the shared memory budget\n\
+         # TYPE tsink_memory_write_transient_reservations_total counter\n\
+         tsink_memory_write_transient_reservations_total {memory_write_transient_reservations_total}\n\
+         # HELP tsink_memory_write_transient_rejections_total Write and replay scratch leases rejected by the shared memory budget\n\
+         # TYPE tsink_memory_write_transient_rejections_total counter\n\
+         tsink_memory_write_transient_rejections_total {memory_write_transient_rejections_total}\n\
          # HELP tsink_memory_excluded_bytes_known Whether excluded memory bytes are completely measured\n\
          # TYPE tsink_memory_excluded_bytes_known gauge\n\
          tsink_memory_excluded_bytes_known {memory_excluded_known}\n\
@@ -272,6 +294,18 @@ pub(super) fn render_metrics(
          # HELP tsink_flush_active_errors_total Active chunk flush errors\n\
          # TYPE tsink_flush_active_errors_total counter\n\
          tsink_flush_active_errors_total {active_flush_errors_total}\n\
+         # HELP tsink_flush_active_inspected_series_total Active series inspected by bounded background flushes\n\
+         # TYPE tsink_flush_active_inspected_series_total counter\n\
+         tsink_flush_active_inspected_series_total {active_flush_inspected_series_total}\n\
+         # HELP tsink_flush_active_selected_input_bytes_total Modeled active-head input bytes selected by bounded background flushes\n\
+         # TYPE tsink_flush_active_selected_input_bytes_total counter\n\
+         tsink_flush_active_selected_input_bytes_total {active_flush_selected_input_bytes_total}\n\
+         # HELP tsink_flush_active_item_limit_hits_total Bounded background flush passes that consumed the series inspection allowance\n\
+         # TYPE tsink_flush_active_item_limit_hits_total counter\n\
+         tsink_flush_active_item_limit_hits_total {active_flush_item_limit_hits_total}\n\
+         # HELP tsink_flush_active_byte_limit_skips_total Active heads skipped because they did not fit the bounded background flush byte allowance\n\
+         # TYPE tsink_flush_active_byte_limit_skips_total counter\n\
+         tsink_flush_active_byte_limit_skips_total {active_flush_byte_limit_skips_total}\n\
          # HELP tsink_flush_active_series_total Active series flushed into sealed chunks\n\
          # TYPE tsink_flush_active_series_total counter\n\
          tsink_flush_active_series_total {active_flushed_series_total}\n\
@@ -293,6 +327,18 @@ pub(super) fn render_metrics(
          # HELP tsink_flush_persist_errors_total Persist errors\n\
          # TYPE tsink_flush_persist_errors_total counter\n\
          tsink_flush_persist_errors_total {persist_errors_total}\n\
+         # HELP tsink_flush_persist_inspected_chunks_total Sealed chunks inspected by bounded background persistence windows\n\
+         # TYPE tsink_flush_persist_inspected_chunks_total counter\n\
+         tsink_flush_persist_inspected_chunks_total {persist_inspected_chunks_total}\n\
+         # HELP tsink_flush_persist_selected_input_bytes_total Modeled sealed-chunk input bytes selected by bounded background persistence windows\n\
+         # TYPE tsink_flush_persist_selected_input_bytes_total counter\n\
+         tsink_flush_persist_selected_input_bytes_total {persist_selected_input_bytes_total}\n\
+         # HELP tsink_flush_persist_item_limit_hits_total Bounded background persistence windows that exhausted their item allowance\n\
+         # TYPE tsink_flush_persist_item_limit_hits_total counter\n\
+         tsink_flush_persist_item_limit_hits_total {persist_item_limit_hits_total}\n\
+         # HELP tsink_flush_persist_byte_limit_hits_total Bounded background persistence windows stopped by their byte allowance\n\
+         # TYPE tsink_flush_persist_byte_limit_hits_total counter\n\
+         tsink_flush_persist_byte_limit_hits_total {persist_byte_limit_hits_total}\n\
          # HELP tsink_flush_persisted_series_total Series persisted\n\
          # TYPE tsink_flush_persisted_series_total counter\n\
          tsink_flush_persisted_series_total {persisted_series_total}\n\
@@ -533,6 +579,11 @@ pub(super) fn render_metrics(
         memory_persisted_index = memory_obs.persisted_index_bytes,
         memory_persisted_mmap = memory_obs.persisted_mmap_bytes,
         memory_tombstones = memory_obs.tombstone_bytes,
+        memory_wal_series_definition_cache = memory_obs.wal_series_definition_cache_bytes,
+        memory_write_transient = memory_obs.write_transient_bytes,
+        memory_write_transient_peak = memory_obs.peak_write_transient_bytes,
+        memory_write_transient_reservations_total = memory_obs.write_transient_reservations_total,
+        memory_write_transient_rejections_total = memory_obs.write_transient_rejections_total,
         memory_excluded_known = u8::from(memory_obs.excluded_bytes_known),
         memory_active_backpressured_writers = memory_obs.pressure.active_backpressured_writers,
         memory_backpressure_events_total = memory_obs.pressure.backpressure_events_total,
@@ -566,6 +617,12 @@ pub(super) fn render_metrics(
         flush_pipeline_duration_nanos_total = obs.flush.pipeline_duration_nanos_total,
         active_flush_runs_total = obs.flush.active_flush_runs_total,
         active_flush_errors_total = obs.flush.active_flush_errors_total,
+        active_flush_inspected_series_total = obs.flush.active_flush_inspected_series_total,
+        active_flush_selected_input_bytes_total = obs
+            .flush
+            .active_flush_selected_input_bytes_total,
+        active_flush_item_limit_hits_total = obs.flush.active_flush_item_limit_hits_total,
+        active_flush_byte_limit_skips_total = obs.flush.active_flush_byte_limit_skips_total,
         active_flushed_series_total = obs.flush.active_flushed_series_total,
         active_flushed_chunks_total = obs.flush.active_flushed_chunks_total,
         active_flushed_points_total = obs.flush.active_flushed_points_total,
@@ -573,6 +630,10 @@ pub(super) fn render_metrics(
         persist_success_total = obs.flush.persist_success_total,
         persist_noop_total = obs.flush.persist_noop_total,
         persist_errors_total = obs.flush.persist_errors_total,
+        persist_inspected_chunks_total = obs.flush.persist_inspected_chunks_total,
+        persist_selected_input_bytes_total = obs.flush.persist_selected_input_bytes_total,
+        persist_item_limit_hits_total = obs.flush.persist_item_limit_hits_total,
+        persist_byte_limit_hits_total = obs.flush.persist_byte_limit_hits_total,
         persisted_series_total = obs.flush.persisted_series_total,
         persisted_chunks_total = obs.flush.persisted_chunks_total,
         persisted_points_total = obs.flush.persisted_points_total,
@@ -667,6 +728,7 @@ pub(super) fn render_metrics(
     );
 
     append_local_disk_metrics(&mut body, local_disk.as_ref());
+    append_offline_restore_disk_metrics(&mut body, offline_restore_disk.as_ref());
     cluster::append_metrics(
         &mut body,
         ClusterMetrics {
@@ -685,9 +747,14 @@ pub(super) fn render_metrics(
             hotspot: &cluster_hotspot,
         },
     );
+    append_cluster_audit_metrics(&mut body, &cluster_audit_health);
+    append_cluster_control_persistence_metrics(&mut body, &cluster_control_persistence);
     append_exemplar_metrics(&mut body, &exemplar_metrics, exemplar_store.config());
     append_rules_metrics(&mut body, &rules_snapshot);
     append_rollup_metrics(&mut body, &obs.rollups, &obs.query);
+    append_cardinality_metrics(&mut body, &obs.cardinality);
+    append_query_budget_metrics(&mut body, &obs.query_budget);
+    append_background_work_metrics(&mut body, &obs.background);
     append_prometheus_payload_metrics(&mut body, &payload_status);
     append_otlp_metrics(&mut body, &otlp_status);
     append_legacy_ingest_metrics(&mut body, &legacy_ingest_status);
@@ -706,6 +773,305 @@ pub(super) fn render_metrics(
 
     HttpResponse::new(200, body.into_bytes())
         .with_header("Content-Type", "text/plain; version=0.0.4")
+}
+
+fn append_background_work_metrics(
+    body: &mut String,
+    snapshot: &tsink::BackgroundWorkObservabilitySnapshot,
+) {
+    body.push_str(
+        "# HELP tsink_background_threads Instance-owned background thread bounds and current state\n\
+         # TYPE tsink_background_threads gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_background_threads{{state=\"limit\"}} {}\n",
+        snapshot.max_threads
+    ));
+    body.push_str(&format!(
+        "tsink_background_threads{{state=\"installed\"}} {}\n",
+        snapshot.installed_threads
+    ));
+    body.push_str(&format!(
+        "tsink_background_threads{{state=\"running\"}} {}\n",
+        snapshot.running_threads
+    ));
+    body.push_str(
+        "# HELP tsink_background_worker_state Fixed-cardinality lifecycle and cadence state for each engine worker slot\n\
+         # TYPE tsink_background_worker_state gauge\n\
+         # HELP tsink_background_worker_events_total Fixed-cardinality wait, pass, notification, exit, and join counters for each engine worker slot\n\
+         # TYPE tsink_background_worker_events_total counter\n",
+    );
+    for (worker, state) in [
+        ("flush", snapshot.flush),
+        ("compaction", snapshot.compaction),
+        ("persisted_refresh", snapshot.persisted_refresh),
+        ("rollup", snapshot.rollup),
+    ] {
+        body.push_str(&format!(
+            "tsink_background_worker_state{{worker=\"{worker}\",state=\"installed\"}} {}\n",
+            u8::from(state.installed)
+        ));
+        body.push_str(&format!(
+            "tsink_background_worker_state{{worker=\"{worker}\",state=\"running\"}} {}\n",
+            u8::from(state.running)
+        ));
+        body.push_str(&format!(
+            "tsink_background_worker_state{{worker=\"{worker}\",state=\"max_concurrency\"}} {}\n",
+            state.max_concurrency
+        ));
+        body.push_str(&format!(
+            "tsink_background_worker_state{{worker=\"{worker}\",state=\"interval_nanos\"}} {}\n",
+            state.interval_nanos.unwrap_or(0)
+        ));
+        for (event, value) in [
+            ("starts", state.starts_total),
+            ("exits", state.exits_total),
+            ("notifications", state.notifications_total),
+            ("idle_waits", state.idle_waits_total),
+            ("passes_started", state.passes_started_total),
+            ("passes_completed", state.passes_completed_total),
+            ("shutdown_joins", state.shutdown_joins_total),
+        ] {
+            body.push_str(&format!(
+                "tsink_background_worker_events_total{{worker=\"{worker}\",event=\"{event}\"}} {value}\n"
+            ));
+        }
+    }
+    body.push_str(
+        "# HELP tsink_storage_close_events_total Fixed-cardinality close lifecycle outcomes\n\
+         # TYPE tsink_storage_close_events_total counter\n\
+         # HELP tsink_storage_close_wait_nanos_total Time spent in close coordination and worker joins\n\
+         # TYPE tsink_storage_close_wait_nanos_total counter\n\
+         # HELP tsink_storage_close_duration_nanos_total Wall-clock duration of close attempts, including filesystem calls\n\
+         # TYPE tsink_storage_close_duration_nanos_total counter\n\
+         # HELP tsink_storage_close_compaction_passes_total Compaction passes attempted by close\n\
+         # TYPE tsink_storage_close_compaction_passes_total counter\n\
+         # HELP tsink_storage_close_compaction_pass_limit Maximum compaction passes attempted by one close\n\
+         # TYPE tsink_storage_close_compaction_pass_limit gauge\n",
+    );
+    for (event, value) in [
+        ("attempts", snapshot.close_attempts_total),
+        ("success", snapshot.close_success_total),
+        ("errors", snapshot.close_errors_total),
+        (
+            "coordination_timeouts",
+            snapshot.close_coordination_timeouts_total,
+        ),
+    ] {
+        body.push_str(&format!(
+            "tsink_storage_close_events_total{{event=\"{event}\"}} {value}\n"
+        ));
+    }
+    for (wait, value) in [
+        ("coordination", snapshot.close_coordination_wait_nanos_total),
+        ("worker_join", snapshot.shutdown_join_wait_nanos_total),
+    ] {
+        body.push_str(&format!(
+            "tsink_storage_close_wait_nanos_total{{wait=\"{wait}\"}} {value}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "tsink_storage_close_duration_nanos_total {}\n",
+        snapshot.close_duration_nanos_total
+    ));
+    body.push_str(&format!(
+        "tsink_storage_close_compaction_passes_total {}\n",
+        snapshot.close_compaction_passes_total
+    ));
+    body.push_str(&format!(
+        "tsink_storage_close_compaction_pass_limit {}\n",
+        snapshot.close_compaction_pass_limit
+    ));
+}
+
+fn append_cardinality_metrics(
+    body: &mut String,
+    snapshot: &tsink::CardinalityObservabilitySnapshot,
+) {
+    body.push_str(
+        "# HELP tsink_series_creation_pending New-series reservations awaiting write publication\n\
+         # TYPE tsink_series_creation_pending gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_pending {}\n",
+        snapshot.pending_new_series
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_committed_in_window New series committed in the current fixed creation-rate window\n\
+         # TYPE tsink_series_creation_committed_in_window gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_committed_in_window {}\n",
+        snapshot.committed_in_window
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_window_initialized Whether a creation-rate window has been initialized\n\
+         # TYPE tsink_series_creation_window_initialized gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_window_initialized {}\n",
+        u8::from(snapshot.current_window_start.is_some())
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_window_start Storage timestamp-unit start of the current creation-rate window, or zero when uninitialized\n\
+         # TYPE tsink_series_creation_window_start gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_window_start {}\n",
+        snapshot.current_window_start.unwrap_or(0)
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_admitted_total New-series reservations admitted since the storage instance opened\n\
+         # TYPE tsink_series_creation_admitted_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_admitted_total {}\n",
+        snapshot.admitted_new_series_total
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_committed_total New series successfully published since the storage instance opened\n\
+         # TYPE tsink_series_creation_committed_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_committed_total {}\n",
+        snapshot.committed_new_series_total
+    ));
+    body.push_str(
+        "# HELP tsink_series_creation_rejections_total New-series creation-rate admission rejections since the storage instance opened\n\
+         # TYPE tsink_series_creation_rejections_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_series_creation_rejections_total {}\n",
+        snapshot.creation_rate_rejections_total
+    ));
+}
+
+pub(super) fn append_query_budget_metrics(
+    body: &mut String,
+    snapshot: &tsink::QueryBudgetSnapshot,
+) {
+    body.push_str(
+        "# HELP tsink_query_budget_active_queries Queries currently holding a core query permit\n\
+         # TYPE tsink_query_budget_active_queries gauge\n\
+         # HELP tsink_query_budget_peak_active_queries Peak core query permits held concurrently\n\
+         # TYPE tsink_query_budget_peak_active_queries gauge\n\
+         # HELP tsink_query_budget_reserved_memory_bytes Modeled query memory currently reserved across live queries\n\
+         # TYPE tsink_query_budget_reserved_memory_bytes gauge\n\
+         # HELP tsink_query_budget_peak_reserved_memory_bytes Peak modeled query memory reserved across live queries\n\
+         # TYPE tsink_query_budget_peak_reserved_memory_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_query_budget_active_queries {}\n\
+         tsink_query_budget_peak_active_queries {}\n\
+         tsink_query_budget_reserved_memory_bytes {}\n\
+         tsink_query_budget_peak_reserved_memory_bytes {}\n",
+        snapshot.active_queries,
+        snapshot.peak_active_queries,
+        snapshot.shared_reserved_memory_bytes,
+        snapshot.peak_shared_reserved_memory_bytes,
+    ));
+    body.push_str(
+        "# HELP tsink_query_budget_queries_started_total Core queries admitted since the storage instance opened\n\
+         # TYPE tsink_query_budget_queries_started_total counter\n\
+         # HELP tsink_query_budget_queries_completed_total Admitted core query permits released since the storage instance opened\n\
+         # TYPE tsink_query_budget_queries_completed_total counter\n\
+         # HELP tsink_query_budget_limit_rejections_total Core query limit rejections across all reasons\n\
+         # TYPE tsink_query_budget_limit_rejections_total counter\n\
+         # HELP tsink_query_budget_limit_rejections_by_reason_total Core query limit rejections by stable reason\n\
+         # TYPE tsink_query_budget_limit_rejections_by_reason_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_query_budget_queries_started_total {}\n\
+         tsink_query_budget_queries_completed_total {}\n\
+         tsink_query_budget_limit_rejections_total {}\n",
+        snapshot.queries_started_total,
+        snapshot.queries_completed_total,
+        snapshot.limit_rejections_total,
+    ));
+    for (reason, value) in [
+        ("concurrent_queries", snapshot.concurrency_rejections_total),
+        (
+            "shared_memory_bytes",
+            snapshot.shared_memory_rejections_total,
+        ),
+        (
+            "per_query_memory_bytes",
+            snapshot.per_query_memory_rejections_total,
+        ),
+        ("series_matched", snapshot.series_matched_rejections_total),
+        ("samples_scanned", snapshot.samples_scanned_rejections_total),
+        (
+            "samples_returned",
+            snapshot.samples_returned_rejections_total,
+        ),
+        ("returned_bytes", snapshot.returned_bytes_rejections_total),
+        (
+            "pattern_expansion",
+            snapshot.pattern_expansion_rejections_total,
+        ),
+        ("steps", snapshot.steps_rejections_total),
+        (
+            "intermediate_vector_size",
+            snapshot.intermediate_vector_size_rejections_total,
+        ),
+    ] {
+        body.push_str(&format!(
+            "tsink_query_budget_limit_rejections_by_reason_total{{reason=\"{reason}\"}} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_query_budget_cancellations_total Query admission or execution attempts that observed cooperative cancellation\n\
+         # TYPE tsink_query_budget_cancellations_total counter\n\
+         # HELP tsink_query_budget_deadline_exceeded_total Query admission or execution attempts that observed their effective deadline\n\
+         # TYPE tsink_query_budget_deadline_exceeded_total counter\n\
+         # HELP tsink_query_budget_accounting_invariant_violations_total Internal query permit or memory release inconsistencies\n\
+         # TYPE tsink_query_budget_accounting_invariant_violations_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_query_budget_cancellations_total {}\n\
+         tsink_query_budget_deadline_exceeded_total {}\n\
+         tsink_query_budget_accounting_invariant_violations_total {}\n",
+        snapshot.cancellations_total,
+        snapshot.deadline_exceeded_total,
+        snapshot.accounting_invariant_violations_total,
+    ));
+
+    body.push_str(
+        "# HELP tsink_query_budget_configured_limit Effective finite core query limits; absent kinds are unbounded\n\
+         # TYPE tsink_query_budget_configured_limit gauge\n",
+    );
+    let per_query = snapshot.limits.per_query;
+    let wall_time_nanos = per_query
+        .max_wall_time
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
+    for (kind, value) in [
+        (
+            "max_concurrent_queries",
+            snapshot.limits.max_concurrent_queries,
+        ),
+        (
+            "max_shared_memory_bytes",
+            snapshot.limits.max_shared_memory_bytes,
+        ),
+        ("max_series_matched", per_query.max_series_matched),
+        ("max_samples_scanned", per_query.max_samples_scanned),
+        ("max_samples_returned", per_query.max_samples_returned),
+        ("max_returned_bytes", per_query.max_returned_bytes),
+        ("max_pattern_expansion", per_query.max_pattern_expansion),
+        ("max_steps", per_query.max_steps),
+        (
+            "max_intermediate_vector_size",
+            per_query.max_intermediate_vector_size,
+        ),
+        ("max_memory_bytes", per_query.max_memory_bytes),
+        ("max_wall_time_nanos", wall_time_nanos),
+    ] {
+        if let Some(value) = value {
+            body.push_str(&format!(
+                "tsink_query_budget_configured_limit{{kind=\"{kind}\"}} {value}\n"
+            ));
+        }
+    }
 }
 
 fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) {
@@ -821,6 +1187,117 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
     for usage in &snapshot.categories {
         body.push_str(&format!(
             "tsink_local_disk_category_bytes{{category=\"{}\"}} {}\n",
+            disk_category_name(usage.category),
+            usage.bytes
+        ));
+    }
+}
+
+fn append_offline_restore_disk_metrics(
+    body: &mut String,
+    snapshot: Option<&tsink::LocalDiskBudgetSnapshot>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+
+    for (suffix, help, value, metric_type) in [
+        (
+            "accounted_bytes",
+            "Bytes accounted beneath the dedicated offline restore root",
+            snapshot.accounted_bytes,
+            "gauge",
+        ),
+        (
+            "reserved_bytes",
+            "Bytes held by live offline restore reservations",
+            snapshot.reserved_bytes,
+            "gauge",
+        ),
+        (
+            "maintenance_reserved_bytes",
+            "Offline restore reservation bytes classified as maintenance",
+            snapshot.maintenance_reserved_bytes,
+            "gauge",
+        ),
+        (
+            "unknown_bytes",
+            "Bytes beneath the offline restore root not recognized as tsink-owned files",
+            snapshot.unknown_bytes,
+            "gauge",
+        ),
+        (
+            "filesystem_headroom_bytes",
+            "Configured filesystem free-space floor for offline restore work",
+            snapshot.limits.filesystem_free_headroom_bytes,
+            "gauge",
+        ),
+        (
+            "maintenance_reserve_bytes",
+            "Configured logical maintenance reserve beneath the offline restore root",
+            snapshot.limits.maintenance_temp_reserve_bytes,
+            "gauge",
+        ),
+        (
+            "over_limit",
+            "Whether reconciled offline restore usage exceeds its logical limit",
+            u64::from(snapshot.over_limit),
+            "gauge",
+        ),
+        (
+            "active_reservations",
+            "Live offline restore disk reservations",
+            snapshot.active_reservations,
+            "gauge",
+        ),
+        (
+            "rejections_total",
+            "Offline restore reservations rejected by logical or physical limits",
+            snapshot.rejections_total,
+            "counter",
+        ),
+        (
+            "reconciliations_total",
+            "Successful full scans of the offline restore root",
+            snapshot.reconciliations_total,
+            "counter",
+        ),
+        (
+            "reservation_overruns_total",
+            "Offline restore commits whose surviving growth exceeded their reservation",
+            snapshot.reservation_overruns_total,
+            "counter",
+        ),
+    ] {
+        let name = format!("tsink_offline_restore_disk_{suffix}");
+        body.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {metric_type}\n{name} {value}\n"
+        ));
+    }
+
+    if let Some(available) = snapshot.filesystem_available_bytes {
+        body.push_str(
+            "# HELP tsink_offline_restore_disk_filesystem_available_bytes Filesystem bytes available to the current user for the offline restore root\n\
+             # TYPE tsink_offline_restore_disk_filesystem_available_bytes gauge\n",
+        );
+        body.push_str(&format!(
+            "tsink_offline_restore_disk_filesystem_available_bytes {available}\n"
+        ));
+    }
+    if let Some(limit) = snapshot.limits.max_bytes {
+        body.push_str(
+            "# HELP tsink_offline_restore_disk_limit_bytes Configured logical byte limit for the offline restore root\n\
+             # TYPE tsink_offline_restore_disk_limit_bytes gauge\n",
+        );
+        body.push_str(&format!("tsink_offline_restore_disk_limit_bytes {limit}\n"));
+    }
+    body.push_str(
+        "# HELP tsink_offline_restore_disk_category_bytes Accounted bytes beneath the offline restore root by category\n\
+         # TYPE tsink_offline_restore_disk_category_bytes gauge\n",
+    );
+    for usage in &snapshot.categories {
+        body.push_str(&format!(
+            "tsink_offline_restore_disk_category_bytes{{category=\"{}\"}} {}\n",
             disk_category_name(usage.category),
             usage.bytes
         ));
@@ -964,12 +1441,36 @@ fn append_security_metrics(
 
 fn append_usage_metrics(body: &mut String, snapshot: &crate::usage::UsageLedgerStatus) {
     body.push_str(
-        "# HELP tsink_usage_ledger_records_total Durable or in-memory tenant usage ledger records\n\
-         # TYPE tsink_usage_ledger_records_total gauge\n",
+        "# HELP tsink_usage_ledger_records_total Cumulative durable or in-memory tenant usage ledger records\n\
+         # TYPE tsink_usage_ledger_records_total counter\n",
     );
     body.push_str(&format!(
         "tsink_usage_ledger_records_total {}\n",
         snapshot.records_total
+    ));
+    body.push_str(
+        "# HELP tsink_usage_ledger_retained_records Records retained in memory for bounded raw and bucketed reads\n\
+         # TYPE tsink_usage_ledger_retained_records gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_retained_records {}\n",
+        snapshot.retained_records
+    ));
+    body.push_str(
+        "# HELP tsink_usage_ledger_earliest_retained_sequence Earliest raw sequence available for bounded reads, or zero when empty\n\
+         # TYPE tsink_usage_ledger_earliest_retained_sequence gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_earliest_retained_sequence {}\n",
+        snapshot.earliest_retained_sequence.unwrap_or(0)
+    ));
+    body.push_str(
+        "# HELP tsink_usage_ledger_recent_record_limit Configured in-memory recent-record bound\n\
+         # TYPE tsink_usage_ledger_recent_record_limit gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_recent_record_limit {}\n",
+        snapshot.limits.recent_records
     ));
     body.push_str(
         "# HELP tsink_usage_ledger_tenants_total Distinct tenants observed in the usage ledger\n\
@@ -978,6 +1479,14 @@ fn append_usage_metrics(body: &mut String, snapshot: &crate::usage::UsageLedgerS
     body.push_str(&format!(
         "tsink_usage_ledger_tenants_total {}\n",
         snapshot.tenant_count
+    ));
+    body.push_str(
+        "# HELP tsink_usage_ledger_tenant_limit Configured exact-summary tenant bound\n\
+         # TYPE tsink_usage_ledger_tenant_limit gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_tenant_limit {}\n",
+        snapshot.limits.max_tenants
     ));
     body.push_str(
         "# HELP tsink_usage_ledger_storage_reconciliations_total Storage reconciliation snapshots recorded in the usage ledger\n\
@@ -1162,6 +1671,14 @@ fn append_rollup_metrics(
         snapshot.last_run_duration_nanos
     ));
     body.push_str(
+        "# HELP tsink_rollup_source_traversal_complete Whether the current bounded source traversal reached every active policy\n\
+         # TYPE tsink_rollup_source_traversal_complete gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_rollup_source_traversal_complete {}\n",
+        u8::from(snapshot.source_traversal_complete)
+    ));
+    body.push_str(
         "# HELP tsink_query_rollup_plans_total Queries that used persisted rollup artifacts\n\
          # TYPE tsink_query_rollup_plans_total counter\n",
     );
@@ -1207,6 +1724,13 @@ fn append_rollup_metrics(
             metric,
             aggregation,
             policy.materialized_series
+        ));
+        body.push_str(&format!(
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"source_traversal_complete\"}} {}\n",
+            policy_id,
+            metric,
+            aggregation,
+            u8::from(policy.source_traversal_complete)
         ));
         body.push_str(&format!(
             "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"interval\"}} {}\n",
@@ -1645,6 +2169,21 @@ fn append_edge_sync_metrics(
     ));
 
     body.push_str(
+        "# HELP tsink_edge_sync_queue_health Durable edge sync queue health flags\n\
+         # TYPE tsink_edge_sync_queue_health gauge\n",
+    );
+    for (state, active) in [
+        ("persistence_fenced", source.persistence_fenced),
+        ("cleanup_pending", source.cleanup_pending),
+        ("degraded", source.degraded),
+    ] {
+        body.push_str(&format!(
+            "tsink_edge_sync_queue_health{{state=\"{state}\"}} {}\n",
+            u8::from(active)
+        ));
+    }
+
+    body.push_str(
         "# HELP tsink_edge_sync_events_total Edge sync enqueue, replay, and retention-drop counters\n\
          # TYPE tsink_edge_sync_events_total counter\n",
     );
@@ -1687,6 +2226,83 @@ fn append_edge_sync_metrics(
             "tsink_edge_sync_accept_dedupe{{kind=\"{kind}\"}} {value}\n"
         ));
     }
+}
+
+fn append_cluster_audit_metrics(
+    body: &mut String,
+    snapshot: &crate::cluster::audit::ClusterAuditHealthSnapshot,
+) {
+    body.push_str(
+        "# HELP tsink_cluster_audit_log Durable cluster audit log gauges\n\
+         # TYPE tsink_cluster_audit_log gauge\n",
+    );
+    for (kind, value) in [
+        ("enabled", u64::from(snapshot.enabled)),
+        ("retained_entries", snapshot.retained_entries),
+        ("log_bytes", snapshot.log_bytes),
+    ] {
+        body.push_str(&format!(
+            "tsink_cluster_audit_log{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_cluster_audit_health Durable cluster audit persistence health flags\n\
+         # TYPE tsink_cluster_audit_health gauge\n",
+    );
+    for (state, active) in [
+        ("persistence_fenced", snapshot.persistence_fenced),
+        ("cleanup_pending", snapshot.cleanup_pending),
+        ("degraded", snapshot.degraded),
+    ] {
+        body.push_str(&format!(
+            "tsink_cluster_audit_health{{state=\"{state}\"}} {}\n",
+            u8::from(active)
+        ));
+    }
+}
+
+fn append_cluster_control_persistence_metrics(
+    body: &mut String,
+    snapshot: &ControlPersistenceStatus,
+) {
+    let checkpoint_pending = snapshot.pending_checkpoint.is_some();
+    body.push_str(
+        "# HELP tsink_cluster_control_persistence_health Durable control-log and checkpoint persistence health flags\n\
+         # TYPE tsink_cluster_control_persistence_health gauge\n",
+    );
+    for (state, active) in [
+        ("fenced", snapshot.fenced),
+        ("checkpoint_pending", checkpoint_pending),
+        ("cleanup_debt", snapshot.cleanup_debt),
+        (
+            "degraded",
+            snapshot.fenced || checkpoint_pending || snapshot.cleanup_debt,
+        ),
+    ] {
+        body.push_str(&format!(
+            "tsink_cluster_control_persistence_health{{state=\"{state}\"}} {}\n",
+            u8::from(active)
+        ));
+    }
+    let pending = snapshot
+        .pending_checkpoint
+        .unwrap_or(crate::cluster::consensus::ControlCommitPosition { index: 0, term: 0 });
+    body.push_str(
+        "# HELP tsink_cluster_control_persistence_pending_checkpoint_index Durable control-log index whose state mirror is pending repair, or zero when none is pending\n\
+         # TYPE tsink_cluster_control_persistence_pending_checkpoint_index gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_cluster_control_persistence_pending_checkpoint_index {}\n",
+        pending.index
+    ));
+    body.push_str(
+        "# HELP tsink_cluster_control_persistence_pending_checkpoint_term Durable control-log term whose state mirror is pending repair, or zero when none is pending\n\
+         # TYPE tsink_cluster_control_persistence_pending_checkpoint_term gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_cluster_control_persistence_pending_checkpoint_term {}\n",
+        pending.term
+    ));
 }
 
 fn append_legacy_request_metrics(
@@ -2000,17 +2616,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_work_metrics_render_fixed_worker_and_event_labels() {
+        let mut body = String::new();
+        append_background_work_metrics(
+            &mut body,
+            &tsink::BackgroundWorkObservabilitySnapshot {
+                max_threads: 4,
+                installed_threads: 3,
+                running_threads: 2,
+                close_attempts_total: 3,
+                close_success_total: 2,
+                close_errors_total: 1,
+                close_coordination_timeouts_total: 1,
+                close_coordination_wait_nanos_total: 17,
+                close_compaction_passes_total: 9,
+                close_compaction_pass_limit: 128,
+                close_duration_nanos_total: 23,
+                shutdown_join_wait_nanos_total: 5,
+                flush: tsink::BackgroundWorkerObservabilitySnapshot {
+                    installed: true,
+                    running: true,
+                    interval_nanos: Some(250_000_000),
+                    max_concurrency: 1,
+                    idle_waits_total: 7,
+                    passes_completed_total: 5,
+                    ..tsink::BackgroundWorkerObservabilitySnapshot::default()
+                },
+                ..tsink::BackgroundWorkObservabilitySnapshot::default()
+            },
+        );
+
+        assert!(body.contains("tsink_background_threads{state=\"limit\"} 4\n"));
+        assert!(body.contains(
+            "tsink_background_worker_state{worker=\"flush\",state=\"interval_nanos\"} 250000000\n"
+        ));
+        assert!(body.contains(
+            "tsink_background_worker_events_total{worker=\"flush\",event=\"idle_waits\"} 7\n"
+        ));
+        assert!(body.contains(
+            "tsink_background_worker_events_total{worker=\"flush\",event=\"passes_completed\"} 5\n"
+        ));
+        for worker in ["flush", "compaction", "persisted_refresh", "rollup"] {
+            assert!(body.contains(&format!(
+                "tsink_background_worker_state{{worker=\"{worker}\",state=\"installed\"}}"
+            )));
+        }
+        assert!(
+            body.contains("tsink_storage_close_events_total{event=\"coordination_timeouts\"} 1\n")
+        );
+        assert!(body.contains("tsink_storage_close_wait_nanos_total{wait=\"coordination\"} 17\n"));
+        assert!(body.contains("tsink_storage_close_compaction_pass_limit 128\n"));
+    }
+
+    #[test]
+    fn cardinality_metrics_render_creation_window_and_lifetime_state() {
+        let mut body = String::new();
+        append_cardinality_metrics(
+            &mut body,
+            &tsink::CardinalityObservabilitySnapshot {
+                series_count: 17,
+                pending_new_series: 2,
+                committed_in_window: 5,
+                current_window_start: Some(123),
+                admitted_new_series_total: 11,
+                committed_new_series_total: 9,
+                creation_rate_rejections_total: 3,
+            },
+        );
+
+        assert!(body.contains("tsink_series_creation_pending 2\n"));
+        assert!(body.contains("tsink_series_creation_committed_in_window 5\n"));
+        assert!(body.contains("tsink_series_creation_window_initialized 1\n"));
+        assert!(body.contains("tsink_series_creation_window_start 123\n"));
+        assert!(body.contains("tsink_series_creation_admitted_total 11\n"));
+        assert!(body.contains("tsink_series_creation_committed_total 9\n"));
+        assert!(body.contains("tsink_series_creation_rejections_total 3\n"));
+    }
+
+    #[test]
     fn usage_metrics_render_failed_durable_publications() {
         let mut body = String::new();
         append_usage_metrics(
             &mut body,
             &crate::usage::UsageLedgerStatus {
                 record_failures_total: 7,
+                retained_records: 3,
+                earliest_retained_sequence: Some(9),
                 ..crate::usage::UsageLedgerStatus::default()
             },
         );
 
         assert!(body.contains("tsink_usage_ledger_record_failures_total 7\n"));
+        assert!(body.contains("tsink_usage_ledger_retained_records 3\n"));
+        assert!(body.contains("tsink_usage_ledger_earliest_retained_sequence 9\n"));
+        assert!(body.contains(&format!(
+            "tsink_usage_ledger_recent_record_limit {}\n",
+            crate::usage::DEFAULT_USAGE_LEDGER_RECENT_RECORDS
+        )));
     }
 
     #[test]
@@ -2038,5 +2740,74 @@ mod tests {
         assert!(body.contains(
             "tsink_legacy_ingest_sidecar_items_total{adapter=\"statsd\",kind=\"exemplars_accepted\"} 11"
         ));
+    }
+
+    #[test]
+    fn edge_sync_metrics_render_queue_health_flags() {
+        let mut body = String::new();
+        append_edge_sync_metrics(
+            &mut body,
+            &edge_sync::EdgeSyncSourceStatusSnapshot {
+                persistence_fenced: true,
+                cleanup_pending: true,
+                degraded: true,
+                ..edge_sync::EdgeSyncSourceStatusSnapshot::default()
+            },
+            &edge_sync::EdgeSyncAcceptStatusSnapshot::default(),
+        );
+
+        assert!(body.contains("tsink_edge_sync_queue_health{state=\"persistence_fenced\"} 1\n"));
+        assert!(body.contains("tsink_edge_sync_queue_health{state=\"cleanup_pending\"} 1\n"));
+        assert!(body.contains("tsink_edge_sync_queue_health{state=\"degraded\"} 1\n"));
+    }
+
+    #[test]
+    fn cluster_audit_metrics_render_persistence_health() {
+        let mut body = String::new();
+        append_cluster_audit_metrics(
+            &mut body,
+            &crate::cluster::audit::ClusterAuditHealthSnapshot {
+                enabled: true,
+                retained_entries: 3,
+                log_bytes: 512,
+                cleanup_pending: true,
+                persistence_fenced: true,
+                degraded: true,
+                ..crate::cluster::audit::ClusterAuditHealthSnapshot::default()
+            },
+        );
+
+        assert!(body.contains("tsink_cluster_audit_log{kind=\"retained_entries\"} 3\n"));
+        assert!(body.contains("tsink_cluster_audit_log{kind=\"log_bytes\"} 512\n"));
+        assert!(body.contains("tsink_cluster_audit_health{state=\"persistence_fenced\"} 1\n"));
+        assert!(body.contains("tsink_cluster_audit_health{state=\"cleanup_pending\"} 1\n"));
+    }
+
+    #[test]
+    fn control_persistence_metrics_render_fixed_cardinality_health() {
+        let mut body = String::new();
+        append_cluster_control_persistence_metrics(
+            &mut body,
+            &ControlPersistenceStatus {
+                fenced: false,
+                pending_checkpoint: Some(crate::cluster::consensus::ControlCommitPosition {
+                    index: 17,
+                    term: 4,
+                }),
+                cleanup_debt: false,
+                detail: Some("checkpoint repair pending".to_string()),
+            },
+        );
+
+        assert!(body.contains("tsink_cluster_control_persistence_health{state=\"fenced\"} 0\n"));
+        assert!(body.contains(
+            "tsink_cluster_control_persistence_health{state=\"checkpoint_pending\"} 1\n"
+        ));
+        assert!(
+            body.contains("tsink_cluster_control_persistence_health{state=\"cleanup_debt\"} 0\n")
+        );
+        assert!(body.contains("tsink_cluster_control_persistence_health{state=\"degraded\"} 1\n"));
+        assert!(body.contains("tsink_cluster_control_persistence_pending_checkpoint_index 17\n"));
+        assert!(body.contains("tsink_cluster_control_persistence_pending_checkpoint_term 4\n"));
     }
 }

@@ -1,7 +1,8 @@
 use tempfile::TempDir;
 
 use super::policy::{encode_rollup_policies, load_rollup_policies};
-use super::runtime::encode_rollup_state;
+use super::runtime::encode_rollup_state_with_epoch;
+use super::state_journal::RollupSourceStateEvent;
 use super::*;
 
 #[test]
@@ -66,337 +67,491 @@ fn persist_rollup_state_returns_error_when_parent_sync_fails() {
 }
 
 #[test]
-fn snapshot_quota_failure_restores_both_files_before_reopen() {
-    fn policy(id: &str, interval: i64) -> RollupPolicy {
-        RollupPolicy {
-            id: id.to_string(),
-            metric: "cpu_usage".to_string(),
-            match_labels: Vec::new(),
-            interval,
-            aggregation: Aggregation::Avg,
-            bucket_origin: 0,
-        }
-    }
-
+fn source_state_event_is_durable_before_the_caller_mutates_memory() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
-    let stable_policy = policy("stable-policy", 1_000);
-    let mut original_policy = policy("updated-policy", 2_000);
-    let mut updated_policy = policy("updated-policy", 4_000);
-    let large_policy_match = (0..32)
-        .map(|index| {
-            Label::new(
-                format!("dimension_{index:02}"),
-                format!("policy-value-{index:02}-with-enough-bytes-for-second-file-admission"),
-            )
-        })
-        .collect::<Vec<_>>();
-    original_policy.match_labels = large_policy_match.clone();
-    updated_policy.match_labels = large_policy_match;
-
-    // Keep state small and policy definitions large. With exactly one candidate-state payload of
-    // temporary headroom, state.json is published first and policies.json is then rejected. This
-    // exercises cross-file rollback after the first publication, not only first-file preflight.
-    let stable_checkpoints = (0..2)
-        .map(|index| {
-            (
-                format!("cpu_usage{{host=\"host-{index:03}\",region=\"west\"}}"),
-                i64::from(index) * 1_000,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let original_snapshot = RollupRuntimeSnapshot {
-        policies: vec![stable_policy.clone(), original_policy.clone()],
-        checkpoints: HashMap::from([
-            (stable_policy.id.clone(), stable_checkpoints),
-            (
-                original_policy.id.clone(),
-                BTreeMap::from([("cpu_usage{host=\"target\"}".to_string(), 8_000)]),
-            ),
-        ]),
-        pending_materializations: HashMap::new(),
-        pending_delete_invalidations: Vec::new(),
-        generations: HashMap::from([
-            (stable_policy.id.clone(), 0),
-            (original_policy.id.clone(), 3),
-        ]),
-        policy_stats: BTreeMap::from([
-            (stable_policy.id.clone(), PolicyRunState::default()),
-            (original_policy.id.clone(), PolicyRunState::default()),
-        ]),
-    };
-
-    let initial_runtime = RollupRuntimeState::new_with_disk_budget(Some(data_path.clone()), None);
-    let initial_store = RollupStateStoreContext {
-        state: &initial_runtime,
-    };
-    initial_store.persist_snapshot(&original_snapshot).unwrap();
-    initial_store.install_snapshot(original_snapshot.clone());
-
-    let policies_path = data_path
-        .join(ROLLUP_DIR_NAME)
-        .join(ROLLUP_POLICIES_FILE_NAME);
     let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
-    let original_policy_bytes = fs::read(&policies_path).unwrap();
-    let original_state_bytes = fs::read(&state_path).unwrap();
-    let original_total =
-        u64::try_from(original_policy_bytes.len() + original_state_bytes.len()).unwrap();
-
-    let mut updated_policies = vec![stable_policy, updated_policy];
-    updated_policies.sort_by(|left, right| left.id.cmp(&right.id));
-    let candidate = initial_store.next_snapshot_for_policies(updated_policies);
-    let encoded_policies = encode_rollup_policies(&candidate.policies).unwrap();
-    let encoded_state = encode_rollup_state(
-        &candidate.checkpoints,
-        &candidate.generations,
-        &candidate.pending_materializations,
-        &candidate.pending_delete_invalidations,
+    let checkpoints = HashMap::from([(
+        "policy-a".to_string(),
+        BTreeMap::from([("cpu{host=\"a\"}".to_string(), 10)]),
+    )]);
+    let generations = HashMap::from([("policy-a".to_string(), 0)]);
+    persist_rollup_state(
+        Some(&state_path),
+        &checkpoints,
+        &generations,
+        &HashMap::new(),
+        &[],
     )
     .unwrap();
+
+    let runtime = RollupRuntimeState::new_with_disk_budget(Some(data_path), None);
+    *runtime.checkpoints.write() = checkpoints;
+    *runtime.generations.write() = generations;
+    let store = RollupStateStoreContext { state: &runtime };
+    let pending = PendingRollupMaterialization {
+        checkpoint: 10,
+        materialized_through: 20,
+        generation: 0,
+    };
+    store
+        .persist_source_state_event(RollupSourceStateEvent::pending(
+            0,
+            "policy-a",
+            "cpu{host=\"a\"}",
+            0,
+            Some(10),
+            &pending,
+        ))
+        .unwrap();
+
     assert!(
-        encoded_policies.len() > original_state_bytes.len(),
-        "test requires the second policy reservation to exceed the old state bytes left as headroom"
+        runtime.pending_materializations.read().is_empty(),
+        "the persistence primitive must not publish the caller's in-memory mutation"
     );
-
-    let budget = crate::LocalDiskBudget::open(
-        &data_path,
-        crate::LocalDiskLimits {
-            max_bytes: Some(original_total + u64::try_from(encoded_state.len()).unwrap()),
-            ..crate::LocalDiskLimits::default()
-        },
-    )
-    .unwrap();
-    drop(initial_runtime);
-    let budgeted_storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
-        8,
-        None,
-        Some(data_path.join("numeric")),
-        Some(data_path.join("blob")),
-        1,
-        ChunkStorageOptions::default(),
-        Some(Arc::clone(&budget)),
-    )
-    .unwrap();
-    budgeted_storage.load_rollup_runtime_state().unwrap();
-
-    let interruption_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    budgeted_storage.set_rollup_state_persist_hook({
-        let interruption_observed = Arc::clone(&interruption_observed);
-        let policies_path = policies_path.clone();
-        let state_path = state_path.clone();
-        let expected_policies = original_snapshot.policies.clone();
-        let expected_checkpoints = candidate.checkpoints.clone();
-        let expected_generations = candidate.generations.clone();
-        move || {
-            // This hook runs after candidate state is durable and before candidate policies are
-            // attempted. Treat loading these files as an interruption-point reopen: the old
-            // policy definitions must still pair with invalidating candidate state, never with
-            // checkpoints from their superseded definitions.
-            assert_eq!(
-                load_rollup_policies(Some(&policies_path)).unwrap(),
-                expected_policies
-            );
-            let interrupted_state = load_rollup_state(Some(&state_path)).unwrap();
-            assert_eq!(interrupted_state.checkpoints, expected_checkpoints);
-            assert_eq!(interrupted_state.generations, expected_generations);
-            interruption_observed.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    });
-
-    let err = budgeted_storage
-        .apply_rollup_policies(candidate.policies.clone())
-        .expect_err("policy replacement should exceed the deliberately tiny quota");
-    budgeted_storage.clear_rollup_state_persist_hook();
-    assert!(interruption_observed.load(Ordering::SeqCst));
-    assert!(
-        matches!(
-            err,
-            TsinkError::DiskQuotaExceeded { requested, .. }
-                if requested == u64::try_from(encoded_policies.len()).unwrap()
-        ),
-        "quota error should retain its typed variant after successful rollback: {err:?}"
-    );
+    let reloaded = load_rollup_state(Some(&state_path)).unwrap();
     assert_eq!(
-        budgeted_storage
-            .rollup_state_store_context()
-            .policies_snapshot(),
-        original_snapshot.policies,
-        "the public failed apply must not publish the candidate in memory"
-    );
-    assert_eq!(fs::read(&policies_path).unwrap(), original_policy_bytes);
-    assert_eq!(fs::read(&state_path).unwrap(), original_state_bytes);
-    let disk = budget.snapshot();
-    assert_eq!(disk.accounted_bytes, original_total);
-    assert_eq!(disk.active_reservations, 0);
-    assert_eq!(disk.reserved_bytes, 0);
-    assert_eq!(disk.rejections_total, 1);
-
-    drop(budgeted_storage);
-    let reopened_storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
-        8,
-        None,
-        Some(data_path.join("numeric")),
-        Some(data_path.join("blob")),
-        1,
-        ChunkStorageOptions::default(),
-        None,
-    )
-    .unwrap();
-    reopened_storage.load_rollup_runtime_state().unwrap();
-    assert_eq!(
-        reopened_storage
-            .rollup_state_store_context()
-            .policies_snapshot(),
-        original_snapshot.policies
-    );
-    let reopened_state = load_rollup_state(Some(&state_path)).unwrap();
-    assert_eq!(reopened_state.checkpoints, original_snapshot.checkpoints);
-    assert_eq!(reopened_state.generations, original_snapshot.generations);
-    assert_eq!(
-        reopened_state.pending_materializations,
-        original_snapshot.pending_materializations
-    );
-    assert_eq!(
-        reopened_state.pending_delete_invalidations,
-        original_snapshot.pending_delete_invalidations
+        reloaded.pending_materializations["policy-a"]["cpu{host=\"a\"}"], pending,
+        "a successful return must already be restart-durable"
     );
 }
 
 #[test]
-fn failed_policy_rollback_retains_candidate_state_for_safe_reopen() {
-    fn policy(interval: i64) -> RollupPolicy {
-        RollupPolicy {
-            id: "cpu-policy".to_string(),
-            metric: "cpu_usage".to_string(),
+fn full_state_snapshot_rejects_before_unbounded_flattening() {
+    let entries = (0..=ROLLUP_STATE_SNAPSHOT_MAX_ITEMS)
+        .map(|index| (format!("cpu{{series=\"{index}\"}}"), index as i64))
+        .collect::<BTreeMap<_, _>>();
+    let checkpoints = HashMap::from([("policy-a".to_string(), entries)]);
+    let error =
+        encode_rollup_state_with_epoch(&checkpoints, &HashMap::new(), &HashMap::new(), &[], 1)
+            .expect_err("a policy/delete full snapshot must stop at its pre-allocation item bound");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            item_limit: ROLLUP_STATE_SNAPSHOT_MAX_ITEMS,
+            selected_items,
+            ..
+        } if selected_items == ROLLUP_STATE_SNAPSHOT_MAX_ITEMS + 1
+    ));
+
+    let runtime = RollupRuntimeState::new_with_disk_budget(None, None);
+    *runtime.checkpoints.write() = checkpoints;
+    let capture_error = (RollupStateStoreContext { state: &runtime })
+        .capture_snapshot()
+        .expect_err("live policy/delete capture must apply the same guard before cloning maps");
+    assert!(matches!(
+        capture_error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn policy_payload_rejects_before_clone_or_json_encoding() {
+    let policies = (0..=ROLLUP_STATE_SNAPSHOT_MAX_ITEMS)
+        .map(|index| RollupPolicy {
+            id: format!("policy-{index}"),
+            metric: "cpu".to_string(),
             match_labels: Vec::new(),
-            interval,
+            interval: 1,
             aggregation: Aggregation::Avg,
             bucket_origin: 0,
-        }
-    }
+        })
+        .collect::<Vec<_>>();
+    let error = super::runtime::ensure_rollup_policies_within_limits(&policies)
+        .expect_err("the policy vector must stop at the shared snapshot item bound");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            item_limit: ROLLUP_STATE_SNAPSHOT_MAX_ITEMS,
+            selected_items,
+            ..
+        } if selected_items == ROLLUP_STATE_SNAPSHOT_MAX_ITEMS + 1
+    ));
+}
 
+#[test]
+fn policy_load_rejects_oversized_file_before_read_or_decode() {
     let temp_dir = TempDir::new().unwrap();
-    let data_path = temp_dir.path().to_path_buf();
-    let labels = vec![Label::new("host", "a")];
-    let source_key = source_series_key("cpu_usage", &labels);
-    let original_policy = policy(1_000);
-    let updated_policy = policy(2_000);
-    let original_snapshot = RollupRuntimeSnapshot {
-        policies: vec![original_policy.clone()],
+    let path = temp_dir.path().join("policies.json");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64 + 1)
+        .unwrap();
+    let error = load_rollup_policies(Some(&path))
+        .expect_err("policy startup must enforce the same finite byte envelope before reading");
+    assert!(error.to_string().contains("bounded decode limit"));
+}
+
+fn test_policy(interval: i64) -> RollupPolicy {
+    RollupPolicy {
+        id: "cpu-policy".to_string(),
+        metric: "cpu_usage".to_string(),
+        match_labels: Vec::new(),
+        interval,
+        aggregation: Aggregation::Avg,
+        bucket_origin: 0,
+    }
+}
+
+fn original_rollup_snapshot(policy: &RollupPolicy) -> RollupRuntimeSnapshot {
+    RollupRuntimeSnapshot {
+        policies: vec![policy.clone()],
         checkpoints: HashMap::from([(
-            original_policy.id.clone(),
-            BTreeMap::from([(source_key.clone(), 4_000)]),
+            policy.id.clone(),
+            BTreeMap::from([("cpu_usage{host=\"a\"}".to_string(), 4_000)]),
         )]),
         pending_materializations: HashMap::new(),
         pending_delete_invalidations: Vec::new(),
-        generations: HashMap::from([(original_policy.id.clone(), 7)]),
-        policy_stats: BTreeMap::from([(original_policy.id.clone(), PolicyRunState::default())]),
-    };
+        generations: HashMap::from([(policy.id.clone(), 7)]),
+        policy_stats: BTreeMap::from([(policy.id.clone(), PolicyRunState::default())]),
+    }
+}
 
-    let runtime = RollupRuntimeState::new_with_disk_budget(Some(data_path.clone()), None);
+fn persist_initial_snapshot(
+    data_path: &Path,
+) -> (
+    RollupRuntimeSnapshot,
+    RollupRuntimeSnapshot,
+    Vec<u8>,
+    Vec<u8>,
+) {
+    let original_policy = test_policy(1_000);
+    let original = original_rollup_snapshot(&original_policy);
+    let runtime = RollupRuntimeState::new_with_disk_budget(Some(data_path.to_path_buf()), None);
     let store = RollupStateStoreContext { state: &runtime };
-    store.persist_snapshot(&original_snapshot).unwrap();
-    store.install_snapshot(original_snapshot.clone());
-    let candidate = store.next_snapshot_for_policies(vec![updated_policy.clone()]);
-    assert!(!candidate.checkpoints.contains_key(&updated_policy.id));
-    assert_eq!(candidate.generations.get(&updated_policy.id), Some(&8));
-
-    let candidate_publish_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rollback_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    runtime.set_policy_persist_hook({
-        let candidate_publish_seen = Arc::clone(&candidate_publish_seen);
-        let rollback_seen = Arc::clone(&rollback_seen);
-        move |point| match point {
-            RollupPolicyPersistHookPoint::CandidatePublished => {
-                candidate_publish_seen.store(true, Ordering::SeqCst);
-                Err(TsinkError::Other(
-                    "injected candidate policy post-publication failure".to_string(),
-                ))
-            }
-            RollupPolicyPersistHookPoint::RollbackStarting => {
-                rollback_seen.store(true, Ordering::SeqCst);
-                Err(TsinkError::Other(
-                    "injected predecessor policy rollback failure".to_string(),
-                ))
-            }
-        }
-    });
-
-    let err = store
-        .persist_snapshot(&candidate)
-        .expect_err("late policy publication and rollback failures must be indeterminate");
-    runtime.clear_policy_persist_hook();
-    assert!(candidate_publish_seen.load(Ordering::SeqCst));
-    assert!(rollback_seen.load(Ordering::SeqCst));
-    assert!(
-        err.to_string()
-            .contains("injected predecessor policy rollback failure"),
-        "unexpected persistence error: {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .contains("candidate invalidating state retained"),
-        "error must explain the conservative state decision: {err:?}"
-    );
-
+    store
+        .persist_snapshot(&original)
+        .unwrap()
+        .report_cleanup_debt();
+    store.install_snapshot(original.clone());
+    let candidate = store
+        .next_snapshot_for_policies(vec![test_policy(2_000)])
+        .unwrap();
     let policies_path = data_path
         .join(ROLLUP_DIR_NAME)
         .join(ROLLUP_POLICIES_FILE_NAME);
     let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
-    assert_eq!(
-        load_rollup_policies(Some(&policies_path)).unwrap(),
-        candidate.policies,
-        "the injected rollback failure leaves the already-published candidate policies"
-    );
-    let durable_state = load_rollup_state(Some(&state_path)).unwrap();
-    assert_eq!(durable_state.checkpoints, candidate.checkpoints);
-    assert_eq!(durable_state.generations, candidate.generations);
-    assert!(
-        !durable_state
-            .checkpoints
-            .get(&updated_policy.id)
-            .is_some_and(|entries| entries.contains_key(&source_key)),
-        "candidate policies must never be paired with the predecessor checkpoint"
-    );
+    let original_policies = fs::read(policies_path).unwrap();
+    let original_state = fs::read(state_path).unwrap();
+    (original, candidate, original_policies, original_state)
+}
 
-    drop(runtime);
-    let reopened = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+fn open_budgeted_rollup_storage(
+    data_path: &Path,
+    budget: Arc<crate::LocalDiskBudget>,
+) -> ChunkStorage {
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
         8,
         None,
         Some(data_path.join("numeric")),
         Some(data_path.join("blob")),
         1,
         ChunkStorageOptions::default(),
-        None,
+        Some(budget),
     )
     .unwrap();
-    reopened.load_rollup_runtime_state().unwrap();
-    Storage::insert_rows(
-        &reopened,
-        &[Row::with_labels(
-            "cpu_usage",
-            labels.clone(),
-            DataPoint::new(0, 1.0),
-        )],
+    storage.load_rollup_runtime_state().unwrap();
+    storage
+}
+
+fn assert_no_rollup_reservation(budget: &crate::LocalDiskBudget, expected_bytes: u64) {
+    let snapshot = budget.snapshot();
+    assert_eq!(snapshot.accounted_bytes, expected_bytes);
+    assert_eq!(snapshot.active_reservations, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
+}
+
+#[test]
+fn snapshot_quota_failure_rejects_combined_peak_before_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let (original, candidate, original_policies, original_state) =
+        persist_initial_snapshot(&data_path);
+    let policies_path = data_path
+        .join(ROLLUP_DIR_NAME)
+        .join(ROLLUP_POLICIES_FILE_NAME);
+    let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
+    let encoded_policies = encode_rollup_policies(&candidate.policies).unwrap();
+    let encoded_state = encode_rollup_state_with_epoch(
+        &candidate.checkpoints,
+        &candidate.generations,
+        &candidate.pending_materializations,
+        &candidate.pending_delete_invalidations,
+        2,
     )
     .unwrap();
+    let original_total = u64::try_from(original_policies.len() + original_state.len()).unwrap();
+    let candidate_bytes = u64::try_from(encoded_policies.len() + encoded_state.len()).unwrap();
+    let probe_budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let entry_allowance = probe_budget
+        .snapshot_restore_entry_staging_allowance_bytes()
+        .unwrap();
+    drop(probe_budget);
+    let candidate_peak = candidate_bytes + 2 * entry_allowance;
+    let budget = crate::LocalDiskBudget::open(
+        &data_path,
+        crate::LocalDiskLimits {
+            // Either staged file fits. The complete pair is one byte over the remaining quota and
+            // must be rejected before the state-first publication closure is entered.
+            max_bytes: Some(original_total + candidate_peak - 1),
+            ..crate::LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+    let storage = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    let publication_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    storage.set_rollup_state_persist_hook({
+        let publication_started = Arc::clone(&publication_started);
+        move || {
+            publication_started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+
+    let error = storage
+        .apply_rollup_policies(candidate.policies.clone())
+        .expect_err("the combined replacement peak must exceed the quota");
+    storage.clear_rollup_state_persist_hook();
+
+    assert!(matches!(
+        error,
+        TsinkError::DiskQuotaExceeded { requested, .. } if requested == candidate_peak
+    ));
+    assert!(!publication_started.load(Ordering::SeqCst));
+    assert_eq!(fs::read(&policies_path).unwrap(), original_policies);
+    assert_eq!(fs::read(&state_path).unwrap(), original_state);
+    assert_eq!(
+        storage.rollup_state_store_context().policies_snapshot(),
+        original.policies
+    );
+    assert_no_rollup_reservation(&budget, original_total);
+    assert_eq!(budget.snapshot().rejections_total, 1);
+    assert_eq!(
+        fs::read_dir(data_path.join(ROLLUP_DIR_NAME))
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn interruption_after_invalidating_state_is_safe_and_reconciled_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let (original, candidate, original_policies, _) = persist_initial_snapshot(&data_path);
+    let policies_path = data_path
+        .join(ROLLUP_DIR_NAME)
+        .join(ROLLUP_POLICIES_FILE_NAME);
+    let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
+    let candidate_state = encode_rollup_state_with_epoch(
+        &candidate.checkpoints,
+        &candidate.generations,
+        &candidate.pending_materializations,
+        &candidate.pending_delete_invalidations,
+        2,
+    )
+    .unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    storage.set_rollup_state_persist_hook(|| {
+        Err(TsinkError::Other(
+            "injected interruption after durable invalidating state".to_string(),
+        ))
+    });
+
+    let error = storage
+        .apply_rollup_policies(candidate.policies.clone())
+        .expect_err("the interruption must leave the apply outcome indeterminate");
+    storage.clear_rollup_state_persist_hook();
+
+    assert!(error.to_string().contains("indeterminate"));
+    assert!(error
+        .to_string()
+        .contains("injected interruption after durable invalidating state"));
+    assert_eq!(fs::read(&policies_path).unwrap(), original_policies);
+    assert_eq!(fs::read(&state_path).unwrap(), candidate_state);
+    assert_eq!(
+        storage.rollup_state_store_context().policies_snapshot(),
+        original.policies
+    );
+    let expected_bytes = u64::try_from(original_policies.len() + candidate_state.len()).unwrap();
+    assert_no_rollup_reservation(&budget, expected_bytes);
+    assert_eq!(
+        fs::read_dir(data_path.join(ROLLUP_DIR_NAME))
+            .unwrap()
+            .count(),
+        2
+    );
+
+    drop(storage);
+    let reopened = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    assert_eq!(
+        reopened.rollup_state_store_context().policies_snapshot(),
+        original.policies
+    );
+    let reopened_state = load_rollup_state(Some(&state_path)).unwrap();
+    assert_eq!(reopened_state.checkpoints, candidate.checkpoints);
+    assert_eq!(reopened_state.generations, candidate.generations);
+    assert!(
+        !reopened_state.checkpoints.contains_key("cpu-policy"),
+        "old policies paired with candidate state must fall back to raw data"
+    );
+}
+
+#[test]
+fn indeterminate_candidate_publication_fences_retry_from_stale_predecessor() {
+    use std::sync::atomic::AtomicUsize;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let (original, candidate, _, _) = persist_initial_snapshot(&data_path);
+    let policies_path = data_path
+        .join(ROLLUP_DIR_NAME)
+        .join(ROLLUP_POLICIES_FILE_NAME);
+    let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
+    let candidate_policies = encode_rollup_policies(&candidate.policies).unwrap();
+    let candidate_state = encode_rollup_state_with_epoch(
+        &candidate.checkpoints,
+        &candidate.generations,
+        &candidate.pending_materializations,
+        &candidate.pending_delete_invalidations,
+        2,
+    )
+    .unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    let rollup_dir = fs::canonicalize(data_path.join(ROLLUP_DIR_NAME)).unwrap();
+    let sync_calls = Arc::new(AtomicUsize::new(0));
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        {
+            let sync_calls = Arc::clone(&sync_calls);
+            move |candidate_path| {
+                candidate_path == rollup_dir && sync_calls.fetch_add(1, Ordering::SeqCst) == 1
+            }
+        },
+        "injected candidate policies parent sync failure",
+    );
+
+    let error = storage
+        .apply_rollup_policies(candidate.policies.clone())
+        .expect_err("the second publication sync failure must be indeterminate");
+
+    assert!(error.to_string().contains("indeterminate"));
+    assert!(error
+        .to_string()
+        .contains("injected candidate policies parent sync failure"));
+    assert_eq!(fs::read(&state_path).unwrap(), candidate_state);
+    assert_eq!(fs::read(&policies_path).unwrap(), candidate_policies);
+    assert_eq!(
+        storage.rollup_state_store_context().policies_snapshot(),
+        original.policies,
+        "an indeterminate apply must not silently change the in-memory policy set"
+    );
+    let expected_bytes = u64::try_from(candidate_state.len() + candidate_policies.len()).unwrap();
+    assert_no_rollup_reservation(&budget, expected_bytes);
+
+    // Memory still contains predecessor O while the visible/durable files may contain candidate
+    // A. Retrying O would otherwise preserve O's checkpoints in the next state-first file and
+    // briefly pair them with A's policy definition. The fence must reject that retry before its
+    // state publication crash point.
+    let retry_state_published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    storage.set_rollup_state_persist_hook({
+        let retry_state_published = Arc::clone(&retry_state_published);
+        move || {
+            retry_state_published.store(true, Ordering::SeqCst);
+            Err(TsinkError::Other(
+                "injected retry interruption after state publication".to_string(),
+            ))
+        }
+    });
+    let retry_error = storage
+        .apply_rollup_policies(original.policies.clone())
+        .expect_err("a retry derived from the stale predecessor must remain fenced");
+    storage.clear_rollup_state_persist_hook();
+    assert!(retry_error.to_string().contains("fenced"));
+    assert!(retry_error.to_string().contains("reopen"));
+    assert!(!retry_state_published.load(Ordering::SeqCst));
+    let pipeline_error = storage
+        .trigger_rollup_run()
+        .expect_err("background materialization must share the indeterminate-publication fence");
+    assert!(pipeline_error.to_string().contains("fenced"));
+    assert_eq!(fs::read(&state_path).unwrap(), candidate_state);
+    assert_eq!(fs::read(&policies_path).unwrap(), candidate_policies);
+    assert_no_rollup_reservation(&budget, expected_bytes);
+
+    drop(storage);
+    let reopened = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
     assert_eq!(
         reopened.rollup_state_store_context().policies_snapshot(),
         candidate.policies
     );
-    assert!(
-        reopened
-            .rollup_query_candidate(
-                "cpu_usage",
-                &labels,
-                updated_policy.interval,
-                updated_policy.aggregation,
-                0,
-                4_000,
-            )
-            .is_none(),
-        "fresh reopen must fall back to raw data without the predecessor checkpoint"
+    let reopened_state = load_rollup_state(Some(&state_path)).unwrap();
+    assert_eq!(reopened_state.checkpoints, candidate.checkpoints);
+    assert_eq!(reopened_state.generations, candidate.generations);
+}
+
+#[test]
+fn committed_pair_surfaces_postcommit_debt_after_installing_candidate() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let (_, candidate, _, _) = persist_initial_snapshot(&data_path);
+    let policies_path = data_path
+        .join(ROLLUP_DIR_NAME)
+        .join(ROLLUP_POLICIES_FILE_NAME);
+    let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
+    let candidate_policies = encode_rollup_policies(&candidate.policies).unwrap();
+    let candidate_state = encode_rollup_state_with_epoch(
+        &candidate.checkpoints,
+        &candidate.generations,
+        &candidate.pending_materializations,
+        &candidate.pending_delete_invalidations,
+        2,
+    )
+    .unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    storage
+        .rollups
+        .runtime
+        .set_policy_persist_hook(|point| match point {
+            RollupPolicyPersistHookPoint::CandidatePublished => Err(TsinkError::Other(
+                "injected postcommit rollup cleanup failure".to_string(),
+            )),
+        });
+
+    let result = storage
+        .apply_rollup_policies(candidate.policies.clone())
+        .expect("a known committed pair must not be reported as rejected");
+    storage.rollups.runtime.clear_policy_persist_hook();
+
+    assert!(result.policies.iter().any(|policy| {
+        policy
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("postcommit rollup snapshot cleanup debt"))
+    }));
+    assert_eq!(fs::read(&state_path).unwrap(), candidate_state);
+    assert_eq!(fs::read(&policies_path).unwrap(), candidate_policies);
+    assert_eq!(
+        storage.rollup_state_store_context().policies_snapshot(),
+        candidate.policies,
+        "a known committed pair must be installed before postcommit debt is returned"
     );
-    reopened.close().unwrap();
+    let expected_bytes = u64::try_from(candidate_state.len() + candidate_policies.len()).unwrap();
+    assert_no_rollup_reservation(&budget, expected_bytes);
+
+    drop(storage);
+    let reopened = open_budgeted_rollup_storage(&data_path, Arc::clone(&budget));
+    assert_eq!(
+        reopened.rollup_state_store_context().policies_snapshot(),
+        candidate.policies
+    );
 }

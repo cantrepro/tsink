@@ -48,6 +48,7 @@ pub(super) struct PersistedSourceMergeCursor {
     current_points: Vec<DataPoint>,
     next_point_idx: usize,
     stats: PersistedTierFetchStats,
+    execution: Option<QueryExecution>,
     #[cfg(test)]
     chunk_decode_hook: Option<Arc<IngestCommitHook>>,
 }
@@ -59,6 +60,7 @@ impl PersistedSourceMergeCursor {
         segment_tiers: HashMap<usize, PersistedSegmentTier>,
         start: i64,
         end: i64,
+        execution: Option<QueryExecution>,
         #[cfg(test)] chunk_decode_hook: Option<Arc<IngestCommitHook>>,
     ) -> Self {
         Self {
@@ -71,6 +73,7 @@ impl PersistedSourceMergeCursor {
             current_points: Vec::new(),
             next_point_idx: 0,
             stats: PersistedTierFetchStats::default(),
+            execution,
             #[cfg(test)]
             chunk_decode_hook,
         }
@@ -89,6 +92,11 @@ impl PersistedSourceMergeCursor {
             self.next_chunk_idx = self.next_chunk_idx.saturating_add(1);
             self.current_points.clear();
             self.next_point_idx = 0;
+
+            if let Some(execution) = self.execution.as_ref() {
+                execution.checkpoint()?;
+                execution.charge_samples_scanned(u64::from(chunk_ref.point_count))?;
+            }
 
             let tier = self
                 .segment_tiers
@@ -146,10 +154,16 @@ pub(super) struct SealedSourceMergeCursor {
     next_chunk_idx: usize,
     current_points: Vec<DataPoint>,
     next_point_idx: usize,
+    execution: Option<QueryExecution>,
 }
 
 impl SealedSourceMergeCursor {
-    pub(super) fn new(chunks: Vec<Arc<Chunk>>, start: i64, end: i64) -> Self {
+    pub(super) fn new(
+        chunks: Vec<Arc<Chunk>>,
+        start: i64,
+        end: i64,
+        execution: Option<QueryExecution>,
+    ) -> Self {
         Self {
             chunks,
             start,
@@ -157,6 +171,7 @@ impl SealedSourceMergeCursor {
             next_chunk_idx: 0,
             current_points: Vec::new(),
             next_point_idx: 0,
+            execution,
         }
     }
 
@@ -173,6 +188,10 @@ impl SealedSourceMergeCursor {
             self.next_chunk_idx = self.next_chunk_idx.saturating_add(1);
             self.current_points.clear();
             self.next_point_idx = 0;
+            if let Some(execution) = self.execution.as_ref() {
+                execution.checkpoint()?;
+                execution.charge_samples_scanned(u64::from(chunk.header.point_count))?;
+            }
             decode_chunk_points_in_range_into(
                 chunk,
                 self.start,
@@ -261,6 +280,7 @@ impl SeriesSourceMergeCursors {
         active_points: ActiveSeriesSnapshot,
         start: i64,
         end: i64,
+        execution: Option<&QueryExecution>,
         #[cfg(test)] chunk_decode_hook: Option<Arc<IngestCommitHook>>,
     ) -> Self {
         Self {
@@ -270,10 +290,11 @@ impl SeriesSourceMergeCursors {
                 persisted.segment_tiers,
                 start,
                 end,
+                execution.cloned(),
                 #[cfg(test)]
                 chunk_decode_hook,
             ),
-            sealed: SealedSourceMergeCursor::new(sealed_chunks, start, end),
+            sealed: SealedSourceMergeCursor::new(sealed_chunks, start, end, execution.cloned()),
             active: ActiveSourceMergeCursor::new(active_points, start, end),
         }
     }
@@ -317,12 +338,19 @@ impl ChunkStorage {
         end: i64,
         snapshot: SeriesReadSnapshot,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
     ) -> Result<PersistedTierFetchStats> {
+        let mut working_reservation = reserve_query_read_working_set(
+            execution,
+            &snapshot,
+            snapshot.analysis.estimated_points,
+        )?;
         let SeriesReadSnapshot {
             persisted,
             sealed_chunks,
             active_points,
             analysis,
+            query_reservation: _source_snapshot_reservation,
         } = snapshot;
 
         out.clear();
@@ -334,6 +362,7 @@ impl ChunkStorage {
             active_points,
             start,
             end,
+            execution,
             #[cfg(test)]
             self.persist_test_hooks
                 .query_persisted_chunk_decode_hook
@@ -354,6 +383,9 @@ impl ChunkStorage {
             super::pagination::SortedSeriesDedupeMode::None => {}
         }
         self.apply_tombstone_filter(series_id, out);
+        if let Some(reservation) = working_reservation.as_mut() {
+            reservation.resize(modeled_points_bytes(out))?;
+        }
         Ok(persisted_stats)
     }
 
@@ -364,12 +396,20 @@ impl ChunkStorage {
         end: i64,
         snapshot: SeriesReadSnapshot,
         pagination: RawSeriesPagination,
+        execution: Option<&QueryExecution>,
     ) -> Result<RawSeriesScanPage> {
+        let output_capacity = pagination
+            .limit
+            .unwrap_or(snapshot.analysis.estimated_points)
+            .min(snapshot.analysis.estimated_points);
+        let mut working_reservation =
+            reserve_query_read_working_set(execution, &snapshot, output_capacity)?;
         let SeriesReadSnapshot {
             persisted,
             sealed_chunks,
             active_points,
             analysis,
+            query_reservation: _source_snapshot_reservation,
         } = snapshot;
 
         let mut cursors = SeriesSourceMergeCursors::new(
@@ -378,6 +418,7 @@ impl ChunkStorage {
             active_points,
             start,
             end,
+            execution,
             #[cfg(test)]
             self.persist_test_hooks
                 .query_persisted_chunk_decode_hook
@@ -385,8 +426,9 @@ impl ChunkStorage {
                 .clone(),
         );
 
-        self.tombstone_read_context()
-            .with_series_tombstone_ranges(series_id, |tombstone_ranges| {
+        let page = self.tombstone_read_context().with_series_tombstone_ranges(
+            series_id,
+            |tombstone_ranges| -> Result<RawSeriesScanPage> {
                 let mut collector = SortedSeriesPageCollector::new(
                     self.active_retention_cutoff(),
                     tombstone_ranges,
@@ -403,6 +445,11 @@ impl ChunkStorage {
                     reached_end,
                     stats: cursors.into_stats(),
                 })
-            })
+            },
+        )?;
+        if let Some(reservation) = working_reservation.as_mut() {
+            reservation.resize(modeled_points_bytes(&page.points))?;
+        }
+        Ok(page)
     }
 }

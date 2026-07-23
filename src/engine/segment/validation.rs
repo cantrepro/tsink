@@ -1,9 +1,13 @@
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
 use crate::engine::fs_utils::{path_exists_no_follow, rename_and_sync_parents, stage_dir_path};
 use crate::{Result, TsinkError};
+
+use super::LoadedSegment;
 
 pub(crate) const STARTUP_SEGMENT_QUARANTINE_PURPOSE: &str = "startup-segment-quarantine";
 
@@ -58,6 +62,108 @@ pub(crate) fn segment_validation_error(
         segment_root.display(),
         details
     ))
+}
+
+fn validate_exact_segment_entries_no_follow(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root).map_err(|source| TsinkError::IoWithPath {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted segment is link-like or not a directory: {}",
+            root.display()
+        )));
+    }
+
+    let expected_names = [
+        "chunks.bin",
+        "chunk_index.bin",
+        "series.bin",
+        "postings.bin",
+        "manifest.bin",
+    ];
+    let expected = expected_names.into_iter().collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(root).map_err(|source| TsinkError::IoWithPath {
+        path: root.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "persisted segment contains a non-UTF-8 entry: {}",
+                entry.path().display()
+            ))
+        })?;
+        if !observed.insert(name.to_string()) || !expected.contains(name) {
+            return Err(TsinkError::DataCorruption(format!(
+                "persisted segment contains an unowned entry: {}",
+                entry.path().display()
+            )));
+        }
+    }
+    if observed.len() != expected.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted segment does not contain exactly the five required files: {}",
+            root.display()
+        )));
+    }
+
+    for file_name in expected_names {
+        let path = root.join(file_name);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?;
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "persisted segment required file is link-like or not regular: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Loads one immutable segment only after proving that the directory contains exactly Tsink's
+/// five canonical regular files and that its manifest identity matches its intended final path.
+///
+/// The entry-shape check is repeated after decoding so a link or entry swap cannot silently pass
+/// retirement/replacement ownership validation.
+pub(crate) fn load_complete_segment_no_follow(
+    root: &Path,
+    expected_level: u8,
+    expected_segment_id: u64,
+    context: SegmentValidationContext,
+) -> Result<LoadedSegment> {
+    validate_exact_segment_entries_no_follow(root)
+        .map_err(|err| segment_validation_error(root, context, &err.to_string()))?;
+    let segment = super::load_segment(root)
+        .map_err(|err| segment_validation_error(root, context, &err.to_string()))?;
+    validate_exact_segment_entries_no_follow(root)
+        .map_err(|err| segment_validation_error(root, context, &err.to_string()))?;
+    if segment.manifest.level != expected_level
+        || segment.manifest.segment_id != expected_segment_id
+    {
+        return Err(segment_validation_error(
+            root,
+            context,
+            &format!(
+                "segment identity mismatch: expected L{expected_level}/seg-{expected_segment_id:016x}, manifest=L{}/seg-{:016x}",
+                segment.manifest.level, segment.manifest.segment_id
+            ),
+        ));
+    }
+    Ok(segment)
 }
 
 pub(crate) fn runtime_refresh_disappearance_error(

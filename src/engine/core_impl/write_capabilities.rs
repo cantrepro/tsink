@@ -138,7 +138,10 @@ pub(in crate::engine::storage_engine) struct WritePrepareWalContext<'a> {
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct WritePrepareMemoryBudgetContext<'a> {
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) tombstone_staged_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) write_transient: &'a Arc<WriteTransientMemoryAccounting>,
+    pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -210,8 +213,28 @@ pub(in crate::engine::storage_engine) struct WriteCommitWalCompletionContext<'a>
     pub(in crate::engine::storage_engine) observability: &'a StorageObservabilityCounters,
     pub(in crate::engine::storage_engine) wal: Option<&'a FramedWal>,
     pub(in crate::engine::storage_engine) wal_metrics: WalMetricsContext<'a>,
+    pub(in crate::engine::storage_engine) accounting_enabled: bool,
+    pub(in crate::engine::storage_engine) wal_series_definition_cache_used_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     #[cfg(test)]
     pub(in crate::engine::storage_engine) crash_before_publish_persisted: &'a AtomicBool,
+}
+
+impl WriteCommitWalCompletionContext<'_> {
+    pub(in crate::engine::storage_engine) fn sync_wal_series_definition_cache_memory_usage(self) {
+        let bytes = self
+            .wal
+            .map(FramedWal::cached_series_definition_index_memory_usage_bytes)
+            .unwrap_or(0);
+        grow_included_memory_component_to_bytes(
+            self.accounting_enabled,
+            self.wal_series_definition_cache_used_bytes,
+            self.shared_used_bytes,
+            self.used_bytes,
+            bytes,
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +245,7 @@ pub(in crate::engine::storage_engine) struct LifecyclePublicationContext<'a> {
     pub(in crate::engine::storage_engine) registry_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) persisted_index_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) persisted_mmap_used_bytes: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) wal_series_definition_cache_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) shared_used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
     pub(in crate::engine::storage_engine) registry_bookkeeping: RegistryBookkeepingContext<'a>,
@@ -229,4 +253,33 @@ pub(in crate::engine::storage_engine) struct LifecyclePublicationContext<'a> {
     pub(in crate::engine::storage_engine) runtime_metadata_delta:
         RuntimeMetadataDeltaWriteContext<'a>,
     pub(in crate::engine::storage_engine) metadata_shards: MetadataShardPublicationContext<'a>,
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) persisted_index_accounting_inspect_hook:
+        &'a RwLock<Option<Arc<IngestCommitHook>>>,
+}
+
+impl LifecyclePublicationContext<'_> {
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn inspect_persisted_index_accounting_entry(self) {
+        let hook = self.persisted_index_accounting_inspect_hook.read().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(in crate::engine::storage_engine) fn sync_wal_series_definition_cache_memory_usage(
+        self,
+        wal: Option<&FramedWal>,
+    ) {
+        let bytes = wal
+            .map(FramedWal::cached_series_definition_index_memory_usage_bytes)
+            .unwrap_or(0);
+        grow_included_memory_component_to_bytes(
+            self.accounting_enabled,
+            self.wal_series_definition_cache_used_bytes,
+            self.shared_used_bytes,
+            self.used_bytes,
+            bytes,
+        );
+    }
 }

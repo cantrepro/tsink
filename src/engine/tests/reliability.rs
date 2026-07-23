@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
@@ -189,6 +190,261 @@ fn data_path_lock_releases_on_close_and_allows_reopen() {
 }
 
 #[test]
+fn shared_object_store_writer_lock_rejects_second_data_path_and_releases_on_close() {
+    let temp_dir = TempDir::new().unwrap();
+    let object_store = temp_dir.path().join("shared-object-store");
+    let first_data = temp_dir.path().join("first-data");
+    let second_data = temp_dir.path().join("second-data");
+
+    let first = StorageBuilder::new()
+        .with_data_path(&first_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let err = match StorageBuilder::new()
+        .with_data_path(&second_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+    {
+        Ok(_) => panic!("a second read-write data path must not share an object-store writer root"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("shared object-store writer root")
+                && message.contains("already locked")
+    ));
+
+    let compute_only = StorageBuilder::new()
+        .with_object_store_path(&object_store)
+        .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .expect("compute-only readers must not acquire the shared writer lease");
+    compute_only.close().unwrap();
+
+    first.close().unwrap();
+    let reopened = StorageBuilder::new()
+        .with_data_path(&second_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    reopened.close().unwrap();
+}
+
+const SHARED_WRITER_LOCK_CHILD_MODE: &str = "TSINK_SHARED_WRITER_LOCK_CHILD_MODE";
+const SHARED_WRITER_LOCK_CHILD_DATA: &str = "TSINK_SHARED_WRITER_LOCK_CHILD_DATA";
+const SHARED_WRITER_LOCK_CHILD_OBJECT: &str = "TSINK_SHARED_WRITER_LOCK_CHILD_OBJECT";
+const SHARED_WRITER_LOCK_CHILD_READY: &str = "TSINK_SHARED_WRITER_LOCK_CHILD_READY";
+
+#[test]
+fn shared_object_store_writer_lock_subprocess_probe() {
+    let Ok(mode) = std::env::var(SHARED_WRITER_LOCK_CHILD_MODE) else {
+        // This helper remains a harmless passing test in an ordinary full-suite invocation. A
+        // parent test reruns only this case with an isolated child environment.
+        return;
+    };
+    let data_path = PathBuf::from(std::env::var_os(SHARED_WRITER_LOCK_CHILD_DATA).unwrap());
+    let object_store = PathBuf::from(std::env::var_os(SHARED_WRITER_LOCK_CHILD_OBJECT).unwrap());
+
+    match mode.as_str() {
+        "expect-rejected" => {
+            let err = match StorageBuilder::new()
+                .with_data_path(data_path)
+                .with_object_store_path(object_store)
+                .with_background_threads_enabled_for_tests(false)
+                .build()
+            {
+                Ok(storage) => {
+                    storage.close().unwrap();
+                    panic!("subprocess unexpectedly acquired a shared writer lease")
+                }
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                TsinkError::InvalidConfiguration(message)
+                    if message.contains("shared object-store writer root")
+                        && message.contains("already locked")
+            ));
+        }
+        "hold" => {
+            let storage = StorageBuilder::new()
+                .with_data_path(data_path)
+                .with_object_store_path(object_store)
+                .with_background_threads_enabled_for_tests(false)
+                .build()
+                .unwrap();
+            let ready = PathBuf::from(std::env::var_os(SHARED_WRITER_LOCK_CHILD_READY).unwrap());
+            std::fs::write(ready, b"ready").unwrap();
+            // The parent terminates this process to model an ungraceful holder exit. Keep the
+            // storage live (and therefore the OS lease held) until that happens.
+            loop {
+                std::thread::park_timeout(Duration::from_secs(30));
+                std::hint::black_box(&storage);
+            }
+        }
+        other => panic!("unknown shared-writer child mode: {other}"),
+    }
+}
+
+#[test]
+fn shared_object_store_writer_lock_is_process_wide_and_recovers_after_holder_exit() {
+    let temp_dir = TempDir::new().unwrap();
+    let object_store = temp_dir.path().join("shared-object-store");
+    let first_data = temp_dir.path().join("first-data");
+    let rejected_data = temp_dir.path().join("rejected-data");
+    let holder_data = temp_dir.path().join("holder-data");
+    let reacquired_data = temp_dir.path().join("reacquired-data");
+    let ready = temp_dir.path().join("holder-ready");
+    let current_test_binary = std::env::current_exe().unwrap();
+
+    let first = StorageBuilder::new()
+        .with_data_path(&first_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let rejected = Command::new(&current_test_binary)
+        .arg("shared_object_store_writer_lock_subprocess_probe")
+        .arg("--nocapture")
+        .env(SHARED_WRITER_LOCK_CHILD_MODE, "expect-rejected")
+        .env(SHARED_WRITER_LOCK_CHILD_DATA, &rejected_data)
+        .env(SHARED_WRITER_LOCK_CHILD_OBJECT, &object_store)
+        .output()
+        .unwrap();
+    assert!(
+        rejected.status.success(),
+        "subprocess lease rejection failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    first.close().unwrap();
+
+    let mut holder = Command::new(&current_test_binary)
+        .arg("shared_object_store_writer_lock_subprocess_probe")
+        .arg("--nocapture")
+        .env(SHARED_WRITER_LOCK_CHILD_MODE, "hold")
+        .env(SHARED_WRITER_LOCK_CHILD_DATA, &holder_data)
+        .env(SHARED_WRITER_LOCK_CHILD_OBJECT, &object_store)
+        .env(SHARED_WRITER_LOCK_CHILD_READY, &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    if !wait_for_condition(Duration::from_secs(5), Duration::from_millis(10), || {
+        ready.is_file()
+    }) {
+        let _ = holder.kill();
+        let _ = holder.wait();
+        panic!("subprocess shared-writer holder did not become ready");
+    }
+
+    let while_held = StorageBuilder::new()
+        .with_data_path(&reacquired_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build();
+    assert!(matches!(
+        while_held,
+        Err(TsinkError::InvalidConfiguration(message)) if message.contains("already locked")
+    ));
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let reacquired = StorageBuilder::new()
+        .with_data_path(&reacquired_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .expect("the OS must release the shared writer lease when its holder exits");
+    reacquired.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_object_store_writer_is_fenced_after_lock_path_replacement() {
+    let temp_dir = TempDir::new().unwrap();
+    let object_store = temp_dir.path().join("shared-object-store");
+    let first_data = temp_dir.path().join("first-data");
+    let second_data = temp_dir.path().join("second-data");
+    let first = StorageBuilder::new()
+        .with_data_path(&first_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    first
+        .insert_rows(&[Row::new("lease_fence_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    let lock_path = object_store.join(".tsink-writer.lock");
+    let displaced_lock_path = object_store.join(".tsink-writer.lock.displaced");
+    std::fs::rename(&lock_path, &displaced_lock_path).unwrap();
+    std::fs::write(&lock_path, b"replacement").unwrap();
+    let second = StorageBuilder::new()
+        .with_data_path(&second_data)
+        .with_object_store_path(&object_store)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .expect("a replacement inode demonstrates why the stale holder must be fenced");
+
+    let err = first
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("lease_fence_metric")
+                .with_time_range(0, 2),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::DataCorruption(message) if message.contains("lock file identity changed")
+    ));
+    assert!(
+        !object_store
+            .join("hot")
+            .join(NUMERIC_LANE_ROOT)
+            .join(crate::engine::tombstone::TOMBSTONES_FILE_NAME)
+            .exists(),
+        "the fenced stale holder must not publish a remote tombstone manifest"
+    );
+
+    second.close().unwrap();
+    first.abandon_without_close_for_tests().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_object_store_writer_lock_rejects_symlink_root_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let target = temp_dir.path().join("external-target");
+    let alias = temp_dir.path().join("shared-alias");
+    std::fs::create_dir_all(&target).unwrap();
+    let sentinel = target.join("sentinel");
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    symlink(&target, &alias).unwrap();
+
+    let err = match StorageBuilder::new()
+        .with_data_path(temp_dir.path().join("data"))
+        .with_object_store_path(&alias)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+    {
+        Ok(_) => panic!("a shared writer lease must reject a link-like root"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
+    assert!(!target.join(".tsink-writer.lock").exists());
+}
+
+#[test]
 fn data_path_lock_retries_until_last_handle_drops() {
     let temp_dir = TempDir::new().unwrap();
 
@@ -365,15 +621,17 @@ fn canonical_write_after_lifecycle_close_remains_storage_closed() {
     let series_before = storage.catalog.registry.read().series_count();
     let memory_before = storage.refresh_memory_usage();
     let rows = [Row::new("closed_write", DataPoint::new(1, 1.0))];
-    let result = storage.write_batch(&rows, WriteMode::Atomic).unwrap();
-    assert_eq!(result.accepted, 0);
-    assert_eq!(result.rejected, 1);
-    assert_eq!(result.acknowledgement, None);
-    assert!(matches!(
-        &result.outcomes[0].status,
-        RowWriteStatus::Rejected(rejection)
-            if rejection.category == WriteRejectionCategory::StorageClosed
-    ));
+    for mode in [WriteMode::Atomic, WriteMode::BestEffort] {
+        let result = storage.write_batch(&rows, mode).unwrap();
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.rejected, 1);
+        assert_eq!(result.acknowledgement, None);
+        assert!(matches!(
+            &result.outcomes[0].status,
+            RowWriteStatus::Rejected(rejection)
+                if rejection.category == WriteRejectionCategory::StorageClosed
+        ));
+    }
     assert!(matches!(
         storage.insert_rows(&rows),
         Err(TsinkError::StorageClosed)
@@ -418,6 +676,8 @@ fn background_compaction_failures_fence_new_work_by_default() {
             retention_enforced: false,
             background_threads_enabled: true,
             compaction_interval: Duration::from_secs(60),
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             ..ChunkStorageOptions::default()
         },
     )
@@ -905,6 +1165,7 @@ fn retention_maintenance_rejects_corrupt_runtime_inventory_before_tiering_other_
         },
     )
     .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
     storage
         .apply_loaded_segment_indexes(loaded_segments, false)
         .unwrap();

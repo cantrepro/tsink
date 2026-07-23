@@ -2,6 +2,28 @@ use super::{
     rollups, ChunkStorage, CompiledSeriesMatcher, MetadataShardScope, MetricSeries, Result,
     RetentionTierPolicy, RoaringTreemap, SeriesId, SeriesSelection, TieredQueryPlan,
 };
+use crate::{QueryExecution, QueryMemoryReservation};
+
+fn projected_growing_vec_capacity(current: usize, required: usize) -> usize {
+    if required <= current {
+        return current;
+    }
+    current
+        .saturating_mul(2)
+        .max(required)
+        .max(4)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+}
+
+pub(super) struct MetadataListMaterialization<'a> {
+    pub(super) listed: &'a mut Vec<MetricSeries>,
+    pub(super) dead_series_ids: &'a mut Vec<SeriesId>,
+    pub(super) execution: &'a QueryExecution,
+    pub(super) page_scratch_bytes: u64,
+    pub(super) retained_identity_bytes: &'a mut u64,
+    pub(super) reservation: &'a mut QueryMemoryReservation,
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct QueryPlanningContext<'a> {
@@ -34,7 +56,8 @@ trait MetadataCandidatePlanningOps {
         selection: &SeriesSelection,
         compiled_matchers: &[CompiledSeriesMatcher],
         scope_filter: Option<&RoaringTreemap>,
-    ) -> RuntimeMetadataCandidatePlan;
+        execution: &QueryExecution,
+    ) -> Result<RuntimeMetadataCandidatePlan>;
 
     #[cfg(test)]
     fn record_metadata_candidate_plan_hooks(
@@ -58,6 +81,7 @@ trait MetadataPostingsReadOps {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap>;
 
     #[cfg(test)]
@@ -66,6 +90,8 @@ trait MetadataPostingsReadOps {
 
 trait MetadataSeriesMaterializationOps {
     fn materialize_metric_series(&self, series_ids: RoaringTreemap) -> Vec<MetricSeries>;
+
+    fn modeled_metric_series_shapes(&self, series_ids: &RoaringTreemap) -> (u64, u64);
 }
 
 trait MetadataListingReadOps {
@@ -80,8 +106,7 @@ trait MetadataListingReadOps {
     fn append_live_metric_series_page(
         &self,
         series_ids: &[SeriesId],
-        listed: &mut Vec<MetricSeries>,
-        dead_series_ids: &mut Vec<SeriesId>,
+        materialization: &mut MetadataListMaterialization<'_>,
     ) -> Result<()>;
 
     fn prune_dead_materialized_series_ids_if_stable(
@@ -124,10 +149,11 @@ impl MetadataSelectionContext<'_> {
         self,
         selection: &SeriesSelection,
         compiled_matchers: &[CompiledSeriesMatcher],
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
         let plan = self
             .candidate_planning
-            .build_runtime_metadata_candidate_plan(selection, compiled_matchers, None);
+            .build_runtime_metadata_candidate_plan(selection, compiled_matchers, None, execution)?;
         #[cfg(test)]
         self.candidate_planning
             .record_metadata_candidate_plan_hooks(&plan, compiled_matchers);
@@ -140,6 +166,7 @@ impl MetadataSelectionContext<'_> {
         selection: &SeriesSelection,
         compiled_matchers: &[CompiledSeriesMatcher],
         scope_series_ids: &[SeriesId],
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
         let live_scope_series_ids = self
             .postings
@@ -150,7 +177,8 @@ impl MetadataSelectionContext<'_> {
                 selection,
                 compiled_matchers,
                 Some(&live_scope_series_ids),
-            );
+                execution,
+            )?;
         #[cfg(test)]
         self.candidate_planning
             .record_metadata_candidate_plan_hooks(&plan, compiled_matchers);
@@ -163,6 +191,7 @@ impl MetadataSelectionContext<'_> {
         start: i64,
         end: i64,
         time_range_plan: Option<TieredQueryPlan>,
+        execution: &QueryExecution,
     ) -> Result<()> {
         #[cfg(test)]
         if !items.is_empty() {
@@ -174,6 +203,7 @@ impl MetadataSelectionContext<'_> {
             start,
             end,
             time_range_plan.unwrap_or_else(|| self.query_tier_plan(start, end)),
+            execution,
         )?;
         *items = filtered;
         Ok(())
@@ -184,6 +214,11 @@ impl MetadataSelectionContext<'_> {
         series_ids: RoaringTreemap,
     ) -> Vec<MetricSeries> {
         self.materialization.materialize_metric_series(series_ids)
+    }
+
+    pub(super) fn modeled_metric_series_shapes(self, series_ids: &RoaringTreemap) -> (u64, u64) {
+        self.materialization
+            .modeled_metric_series_shapes(series_ids)
     }
 }
 
@@ -208,20 +243,31 @@ impl MetadataListingContext<'_> {
     pub(super) fn append_live_metric_series_page(
         self,
         series_ids: &[SeriesId],
-        listed: &mut Vec<MetricSeries>,
-        dead_series_ids: &mut Vec<SeriesId>,
+        materialization: &mut MetadataListMaterialization<'_>,
     ) -> Result<()> {
         self.ops
-            .append_live_metric_series_page(series_ids, listed, dead_series_ids)
+            .append_live_metric_series_page(series_ids, materialization)
     }
 
     pub(super) fn prune_dead_materialized_series_ids_if_stable(
         self,
         dead_series_ids: Vec<SeriesId>,
         generation_before: Option<u64>,
-    ) {
+        execution: &QueryExecution,
+    ) -> Result<()> {
+        execution.checkpoint()?;
+        let dead_len = dead_series_ids.len();
+        execution.observe_intermediate_vector_size(u64::try_from(dead_len).unwrap_or(u64::MAX))?;
+        // Stable pruning can hold the accumulated dead IDs plus one equally sized companion
+        // vector. The companion is reused by lifetime across removal, runtime-delta
+        // reconciliation, and shard-index unpublication, so charge it once rather than once per
+        // phase. The accumulated dead vector remains covered by the list materialization
+        // reservation.
+        let _pruning_reservation =
+            execution.reserve_memory(super::modeled_vec_capacity_bytes::<SeriesId>(dead_len))?;
         self.ops
             .prune_dead_materialized_series_ids_if_stable(dead_series_ids, generation_before);
+        Ok(())
     }
 
     pub(super) fn wal_metric_series(self) -> Result<Vec<MetricSeries>> {
@@ -285,8 +331,7 @@ impl ChunkStorage {
     fn append_live_metric_series_page_impl(
         &self,
         series_ids: &[SeriesId],
-        listed: &mut Vec<MetricSeries>,
-        dead_series_ids: &mut Vec<SeriesId>,
+        materialization: &mut MetadataListMaterialization<'_>,
     ) -> Result<()> {
         if series_ids.is_empty() {
             return Ok(());
@@ -295,14 +340,80 @@ impl ChunkStorage {
         let missing_series_ids =
             self.missing_visibility_summary_series_ids(series_ids.iter().copied());
         if !missing_series_ids.is_empty() {
-            self.refresh_series_visible_timestamp_cache(missing_series_ids)?;
+            self.refresh_series_visible_timestamp_cache_for_query(
+                missing_series_ids,
+                materialization.execution,
+            )?;
         }
 
         let retention_cutoff = self.active_retention_cutoff().unwrap_or(i64::MIN);
         let (live_series_ids, dead_series_page) =
             self.partition_series_by_retention(series_ids.iter().copied(), retention_cutoff);
+
+        let listed = &mut *materialization.listed;
+        let dead_series_ids = &mut *materialization.dead_series_ids;
+        let execution = materialization.execution;
+        execution.checkpoint()?;
+        let desired_listed_len = listed.len().saturating_add(live_series_ids.len());
+        let desired_dead_len = dead_series_ids.len().saturating_add(dead_series_page.len());
+        execution
+            .charge_series_matched(u64::try_from(live_series_ids.len()).unwrap_or(u64::MAX))?;
+        execution.observe_intermediate_vector_size(
+            u64::try_from(desired_listed_len).unwrap_or(u64::MAX),
+        )?;
+        execution.observe_intermediate_vector_size(
+            u64::try_from(desired_dead_len).unwrap_or(u64::MAX),
+        )?;
+
+        let (returned_bytes, identity_bytes) = {
+            let registry = self.catalog.registry.read();
+            live_series_ids
+                .iter()
+                .fold((0u64, 0u64), |(returned, retained), series_id| {
+                    let Some((metric_bytes, label_count, label_text_bytes)) =
+                        registry.decoded_series_key_shape(*series_id)
+                    else {
+                        return (returned, retained);
+                    };
+                    (
+                        returned.saturating_add(super::modeled_metric_series_shape_bytes(
+                            metric_bytes,
+                            label_count,
+                            label_text_bytes,
+                        )),
+                        retained.saturating_add(super::modeled_metric_series_shape_retained_bytes(
+                            metric_bytes,
+                            label_count,
+                            label_text_bytes,
+                        )),
+                    )
+                })
+        };
+        execution.ensure_returned_bytes(returned_bytes)?;
+        let next_identity_bytes = materialization
+            .retained_identity_bytes
+            .saturating_add(identity_bytes);
+        let projected_listed_capacity =
+            projected_growing_vec_capacity(listed.capacity(), desired_listed_len);
+        let projected_dead_capacity =
+            projected_growing_vec_capacity(dead_series_ids.capacity(), desired_dead_len);
+        let modeled_bytes = materialization
+            .page_scratch_bytes
+            .saturating_add(super::modeled_vec_capacity_bytes::<MetricSeries>(
+                projected_listed_capacity,
+            ))
+            .saturating_add(next_identity_bytes)
+            .saturating_add(super::modeled_vec_capacity_bytes::<SeriesId>(
+                projected_dead_capacity,
+            ));
+        materialization.reservation.resize(modeled_bytes)?;
+        execution.charge_returned_bytes(returned_bytes)?;
+
+        listed.reserve(live_series_ids.len());
+        dead_series_ids.reserve(dead_series_page.len());
         dead_series_ids.extend(dead_series_page);
-        listed.extend(self.metric_series_for_ids(live_series_ids));
+        self.append_metric_series_for_ids(live_series_ids, listed);
+        *materialization.retained_identity_bytes = next_identity_bytes;
         Ok(())
     }
 
@@ -311,8 +422,9 @@ impl ChunkStorage {
             return Ok(Vec::new());
         };
 
+        let definitions = wal.committed_series_definitions_snapshot()?;
         let mut series = Vec::new();
-        for definition in wal.committed_series_definitions_snapshot()? {
+        for definition in definitions {
             if rollups::is_internal_rollup_metric(&definition.metric) {
                 continue;
             }
@@ -331,12 +443,14 @@ impl MetadataCandidatePlanningOps for ChunkStorage {
         selection: &SeriesSelection,
         compiled_matchers: &[CompiledSeriesMatcher],
         scope_filter: Option<&RoaringTreemap>,
-    ) -> RuntimeMetadataCandidatePlan {
+        execution: &QueryExecution,
+    ) -> Result<RuntimeMetadataCandidatePlan> {
         ChunkStorage::runtime_metadata_candidate_plan(
             self,
             selection,
             compiled_matchers,
             scope_filter,
+            execution,
         )
     }
 
@@ -365,8 +479,11 @@ impl MetadataPostingsReadOps for ChunkStorage {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
-        ChunkStorage::series_postings_with_data_in_time_range(self, series_ids, start, end, plan)
+        ChunkStorage::series_postings_with_data_in_time_range(
+            self, series_ids, start, end, plan, execution,
+        )
     }
 
     #[cfg(test)]
@@ -378,6 +495,31 @@ impl MetadataPostingsReadOps for ChunkStorage {
 impl MetadataSeriesMaterializationOps for ChunkStorage {
     fn materialize_metric_series(&self, series_ids: RoaringTreemap) -> Vec<MetricSeries> {
         self.metric_series_for_ids(series_ids)
+    }
+
+    fn modeled_metric_series_shapes(&self, series_ids: &RoaringTreemap) -> (u64, u64) {
+        let registry = self.catalog.registry.read();
+        series_ids
+            .iter()
+            .fold((0u64, 0u64), |(returned, retained), series_id| {
+                let Some((metric_bytes, label_count, label_text_bytes)) =
+                    registry.decoded_series_key_shape(series_id)
+                else {
+                    return (returned, retained);
+                };
+                (
+                    returned.saturating_add(super::modeled_metric_series_shape_bytes(
+                        metric_bytes,
+                        label_count,
+                        label_text_bytes,
+                    )),
+                    retained.saturating_add(super::modeled_metric_series_shape_retained_bytes(
+                        metric_bytes,
+                        label_count,
+                        label_text_bytes,
+                    )),
+                )
+            })
     }
 }
 
@@ -397,10 +539,9 @@ impl MetadataListingReadOps for ChunkStorage {
     fn append_live_metric_series_page(
         &self,
         series_ids: &[SeriesId],
-        listed: &mut Vec<MetricSeries>,
-        dead_series_ids: &mut Vec<SeriesId>,
+        materialization: &mut MetadataListMaterialization<'_>,
     ) -> Result<()> {
-        self.append_live_metric_series_page_impl(series_ids, listed, dead_series_ids)
+        self.append_live_metric_series_page_impl(series_ids, materialization)
     }
 
     fn prune_dead_materialized_series_ids_if_stable(

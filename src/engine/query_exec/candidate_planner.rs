@@ -1,7 +1,7 @@
 use roaring::RoaringTreemap;
 
 use crate::query_matcher::CompiledSeriesMatcher;
-use crate::SeriesSelection;
+use crate::{QueryExecution, Result, SeriesSelection};
 
 #[path = "candidate_planner/bitmap_ops.rs"]
 mod bitmap_ops;
@@ -78,30 +78,45 @@ impl<'a, P: MetadataPostingsProvider + ?Sized> MetadataCandidatePlanner<'a, P> {
         selection: &SeriesSelection,
         compiled_matchers: &[CompiledSeriesMatcher],
         scope_filter: Option<&RoaringTreemap>,
-    ) -> CandidatePlanningResult {
+        execution: &QueryExecution,
+    ) -> Result<CandidatePlanningResult> {
+        execution.checkpoint()?;
+        // The initial seed cannot exceed the scoped universe (or the full registry). This
+        // no-side-effect preflight happens before any seed bitmap is cloned or constructed.
+        let initial_upper = scope_filter
+            .map(RoaringTreemap::len)
+            .unwrap_or_else(|| u64::try_from(self.postings.series_count()).unwrap_or(u64::MAX));
+        execution.ensure_pattern_expansion(initial_upper)?;
         let ordered_matchers = self.ordered_compiled_matchers(compiled_matchers);
         let (mut candidates, candidate_seed) =
             self.initial_series_candidates(selection, compiled_matchers, scope_filter);
+        execution.charge_pattern_expansion(candidates.len())?;
         #[cfg(test)]
         let used_all_series_seed = matches!(candidate_seed, CandidateSeed::AllSeries);
         let seeded_matcher_idx = candidate_seed.seeded_exact_matcher_idx();
         self.apply_selection_filters(&mut candidates, selection, scope_filter, candidate_seed);
 
         for (idx, matcher) in ordered_matchers {
+            execution.checkpoint()?;
             if seeded_matcher_idx == Some(idx) {
                 continue;
             }
+            // Every remaining candidate can be examined by this matcher. Preflight before the
+            // matcher constructs an indexed/rejection bitmap, then charge the exact input set.
+            let expanded = candidates.len();
+            execution.ensure_pattern_expansion(expanded)?;
+            execution.charge_pattern_expansion(expanded)?;
             self.apply_postings_matcher_to_candidates(&mut candidates, matcher);
             if candidates.is_empty() {
                 break;
             }
         }
 
-        CandidatePlanningResult {
+        Ok(CandidatePlanningResult {
             candidate_series_ids: candidates,
             #[cfg(test)]
             used_all_series_seed,
-        }
+        })
     }
 
     fn apply_selection_filters(
@@ -135,7 +150,14 @@ mod tests {
 
     use super::*;
     use crate::query_matcher::compile_series_matchers;
-    use crate::{Label, SeriesMatcher};
+    use crate::{Label, QueryBudget, QueryBudgetLimits, SeriesMatcher};
+
+    fn execution() -> crate::QueryExecution {
+        QueryBudget::new(QueryBudgetLimits::default())
+            .unwrap()
+            .begin_query()
+            .unwrap()
+    }
 
     struct FakeMetadataPostingsProvider {
         all_series: RoaringTreemap,
@@ -283,7 +305,9 @@ mod tests {
         let compiled = compile_series_matchers(&selection.matchers).unwrap();
         let scope_filter = bitmap(&[api, batch, other]);
 
-        let result = planner.plan_series_candidates(&selection, &compiled, Some(&scope_filter));
+        let result = planner
+            .plan_series_candidates(&selection, &compiled, Some(&scope_filter), &execution())
+            .unwrap();
 
         assert!(!result.used_all_series_seed);
         assert_eq!(
@@ -331,7 +355,9 @@ mod tests {
         let compiled = compile_series_matchers(&selection.matchers).unwrap();
         let scope_filter = bitmap(&[api, batch]);
 
-        let result = planner.plan_series_candidates(&selection, &compiled, Some(&scope_filter));
+        let result = planner
+            .plan_series_candidates(&selection, &compiled, Some(&scope_filter), &execution())
+            .unwrap();
 
         assert_eq!(direct_scans.get(), 1);
         assert_eq!(

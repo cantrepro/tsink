@@ -212,34 +212,79 @@ impl ActiveSeriesState {
         self.finalize_partition_head(partition_id)
     }
 
-    pub(in crate::engine::storage_engine) fn flush_background_eligible_partial(
+    fn background_bounded_partition_id(
+        &self,
+        include_current: bool,
+        include_underfilled_current: bool,
+    ) -> Option<i64> {
+        self.partition_heads
+            .iter()
+            .find(|(partition_id, head)| {
+                Some(**partition_id) != self.current_partition_id && !head.builder.is_empty()
+            })
+            .map(|(partition_id, _)| *partition_id)
+            .or_else(|| {
+                if !include_current {
+                    return None;
+                }
+                self.current_partition_id.filter(|partition_id| {
+                    self.partition_heads.get(partition_id).is_some_and(|head| {
+                        if head.builder.is_empty() {
+                            return false;
+                        }
+                        let half_initial_block =
+                            ChunkBuilder::initial_point_capacity(self.point_cap)
+                                .div_ceil(2)
+                                .max(1);
+                        include_underfilled_current || head.builder.len() >= half_initial_block
+                    })
+                })
+            })
+    }
+
+    /// Conservative modeled input bytes for the single head selected by a bounded background
+    /// flush. This models the live builder allocation and value payload that finalization reads;
+    /// it is a work-unit bound, not an additional retained-memory charge.
+    pub(in crate::engine::storage_engine) fn background_bounded_flush_input_bytes(
+        &self,
+        include_current: bool,
+        include_underfilled_current: bool,
+    ) -> Option<usize> {
+        let partition_id =
+            self.background_bounded_partition_id(include_current, include_underfilled_current)?;
+        let head = self.partition_heads.get(&partition_id)?;
+        Some(
+            std::mem::size_of::<ActivePartitionHead>()
+                .saturating_add(
+                    head.builder
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ChunkPoint>()),
+                )
+                .saturating_add(
+                    head.builder
+                        .point_block_capacity()
+                        .saturating_mul(std::mem::size_of::<Arc<Vec<ChunkPoint>>>()),
+                )
+                .saturating_add(
+                    head.builder
+                        .frozen_point_block_count()
+                        .saturating_mul(std::mem::size_of::<Vec<ChunkPoint>>()),
+                )
+                .saturating_add(head.builder_value_heap_bytes),
+        )
+    }
+
+    /// Finalizes at most one non-empty partition head, preferring an older non-current head.
+    pub(in crate::engine::storage_engine) fn flush_background_bounded_partial(
         &mut self,
+        include_current: bool,
+        include_underfilled_current: bool,
     ) -> Result<Option<Chunk>> {
-        // Background-eligible flushes keep the current head open so callers like admission
-        // pressure relief can persist older work without fragmenting the live head.
-        let Some(partition_id) = self
-            .partition_heads
-            .keys()
-            .copied()
-            .find(|partition_id| Some(*partition_id) != self.current_partition_id)
+        let Some(partition_id) =
+            self.background_bounded_partition_id(include_current, include_underfilled_current)
         else {
             return Ok(None);
         };
-        self.finalize_partition_head(partition_id)
-    }
-
-    pub(in crate::engine::storage_engine) fn flush_current_partial(
-        &mut self,
-    ) -> Result<Option<Chunk>> {
-        let Some(partition_id) = self.current_partition_id else {
-            return Ok(None);
-        };
-        let Some(head) = self.partition_heads.get(&partition_id) else {
-            return Ok(None);
-        };
-        if head.builder.is_empty() {
-            return Ok(None);
-        }
         self.finalize_partition_head(partition_id)
     }
 
@@ -259,6 +304,7 @@ impl ActiveSeriesState {
         self.partition_heads.len()
     }
 
+    #[cfg(test)]
     pub(in crate::engine::storage_engine) fn contains_partition_head(
         &self,
         partition_id: i64,
@@ -305,11 +351,12 @@ impl ActiveSeriesState {
             .flat_map(|head| head.builder.iter_points())
     }
 
-    pub(in crate::engine::storage_engine) fn min_wal_highwater(&self) -> Option<WalHighWatermark> {
+    pub(in crate::engine::storage_engine) fn wal_lowwaters(
+        &self,
+    ) -> impl Iterator<Item = WalHighWatermark> + '_ {
         self.partition_heads
             .values()
             .filter_map(|head| head.min_wal_highwater)
-            .min()
     }
 
     fn finalize_partition_head(&mut self, partition_id: i64) -> Result<Option<Chunk>> {
@@ -368,6 +415,7 @@ impl ActiveSeriesState {
             self.lane,
         )?);
         chunk.encoded_payload = encoded.payload;
+        chunk.wal_lowwater = head.min_wal_highwater.unwrap_or(head.max_wal_highwater);
         chunk.wal_highwater = head.max_wal_highwater;
 
         Ok(Some(chunk))

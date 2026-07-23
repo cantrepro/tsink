@@ -13,9 +13,11 @@ pub(super) use self::metadata::handle_series_with_admission;
 pub(super) use self::metadata::{
     handle_label_values, handle_labels, handle_metadata, handle_series,
 };
-#[cfg(test)]
-pub(super) use self::promql::handle_instant_query_with_admission;
 pub(super) use self::promql::{handle_instant_query, handle_query_exemplars, handle_range_query};
+#[cfg(test)]
+pub(super) use self::promql::{
+    handle_instant_query_with_admission, handle_range_query_with_admission,
+};
 pub(super) use self::remote_read::handle_remote_read;
 
 #[cfg(test)]

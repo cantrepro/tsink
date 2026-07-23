@@ -48,12 +48,15 @@ impl<'a> WriteCommitter<'a> {
     }
 
     pub(super) fn publish_applied_write(&self, mut applied: AppliedWrite<'a>) -> CommittedWrite {
-        CommittedWrite {
-            acknowledgement: self
-                .engine
-                .wal_completion
-                .publish_wal_write(applied.prepared_wal.as_ref(), applied.staged_wal.take()),
+        let acknowledgement = self
+            .engine
+            .wal_completion
+            .publish_wal_write(applied.prepared_wal.as_ref(), applied.staged_wal.take());
+        if let Some(reservation) = applied.series_creation_rate_reservation.take() {
+            reservation.commit();
         }
+        applied.transient_memory.reset_to_base();
+        CommittedWrite { acknowledgement }
     }
 }
 

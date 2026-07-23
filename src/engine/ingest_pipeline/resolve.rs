@@ -2,11 +2,73 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use super::super::super::{
-    lane_for_value, validate_labels, validate_metric, Label, Result, Row, SeriesDefinitionFrame,
-    SeriesRegistry, SeriesResolution, TsinkError, WalHighWatermark, WriteResolveContext,
+    lane_for_value, Label, Result, Row, SeriesCreationRateReservation, SeriesDefinitionFrame,
+    SeriesRegistry, SeriesResolution, TsinkError, Value, WalHighWatermark, WriteResolveContext,
+    WriteTransientMemoryReservation,
 };
 use super::phases::{PendingPoint, ResolvedWrite};
 use crate::engine::series::SeriesKey;
+use crate::validation::validate_series_identity;
+
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
+}
+
+fn checked_mul(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
+}
+
+/// Conservative peak for every tsink-owned allocation that can coexist between write
+/// preflight and WAL publication. Caller-owned rows are deliberately excluded.
+fn modeled_write_preparation_peak_bytes(rows: &[Row], wal_enabled: bool) -> Result<usize> {
+    let input = crate::modeled_write_batch_input_bytes(rows)?;
+    let rows_len = rows.len();
+
+    // Resolution can simultaneously own a pending value clone plus normalized raw key, new-series
+    // plan, WAL definition, and registry-estimation identity clones.
+    let clone_envelope = checked_mul(input, 4)?;
+    let per_row_control = std::mem::size_of::<PendingPoint>()
+        .checked_add(std::mem::size_of::<RawSeriesKey>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PendingNewSeriesPlan>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SeriesDefinitionFrame>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SeriesResolution>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::RowWriteOutcome>()))
+        // A rejected canonical outcome can own one bounded diagnostic string. Reserve the full
+        // allowance per row because atomic rejection clones one diagnostic across the response.
+        .and_then(|bytes| bytes.checked_add(crate::MAX_WRITE_REJECTION_MESSAGE_BYTES))
+        .and_then(|bytes| {
+            std::mem::size_of::<(usize, usize)>()
+                .checked_mul(4)
+                .and_then(|refs| bytes.checked_add(refs))
+        })
+        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+    let control_envelope = checked_mul(rows_len, per_row_control)?;
+
+    // WAL encoding can hold codec candidates, split batch payloads, the combined frame payload,
+    // and per-series reference/index vectors at once. Five logical-input copies conservatively
+    // cover the candidate and copy peaks for bytes, strings, and serialized histograms.
+    let wal_envelope = if wal_enabled {
+        checked_add(
+            checked_mul(input, 5)?,
+            checked_mul(
+                rows_len,
+                std::mem::size_of::<(i64, &Value)>()
+                    .checked_add(
+                        std::mem::size_of::<usize>()
+                            .checked_mul(4)
+                            .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+                    )
+                    .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+            )?,
+        )?
+    } else {
+        0
+    };
+
+    checked_add(checked_add(clone_envelope, control_envelope)?, wal_envelope)
+}
 
 struct PendingNewSeriesPlan {
     metric: String,
@@ -87,7 +149,15 @@ impl<'a> WriteResolveContext<'a> {
             .used_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
-        let required = used.saturating_add(estimated_registry_growth);
+        let staged = self
+            .tombstone_staged_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize;
+        let transient = self.write_transient.current_bytes();
+        let required = used
+            .saturating_add(staged)
+            .saturating_add(transient)
+            .saturating_add(estimated_registry_growth);
         if required > budget {
             let _ = self.memory_rejections_total.fetch_update(
                 Ordering::AcqRel,
@@ -98,6 +168,14 @@ impl<'a> WriteResolveContext<'a> {
         }
 
         Ok(())
+    }
+
+    fn reserve_new_series_rate(
+        self,
+        requested: usize,
+    ) -> Result<Option<SeriesCreationRateReservation>> {
+        self.series_creation_rate_limiter
+            .reserve(self.clock.current_timestamp_units(), requested)
     }
 }
 
@@ -110,13 +188,67 @@ impl<'a> WriteResolver<'a> {
         Self { engine }
     }
 
+    #[cfg(test)]
+    pub(super) fn preflight_and_reserve_write_rows(
+        &self,
+        rows: &[Row],
+    ) -> Result<WriteTransientMemoryReservation> {
+        let scratch = self.preflight_write_rows_scratch_bytes(rows)?;
+        self.reserve_write_scratch(scratch)
+    }
+
+    pub(super) fn preflight_write_rows_scratch_bytes(&self, rows: &[Row]) -> Result<usize> {
+        if let Some(limit) = self.engine.write_batch_limits.max_rows {
+            if rows.len() > limit {
+                return Err(TsinkError::WriteBatchRowLimitExceeded {
+                    limit,
+                    submitted: rows.len(),
+                });
+            }
+        }
+        let modeled_input = crate::modeled_write_batch_input_bytes(rows)?;
+        if let Some(limit) = self.engine.write_batch_limits.max_modeled_input_bytes {
+            if modeled_input > limit {
+                return Err(TsinkError::WriteBatchInputLimitExceeded {
+                    limit,
+                    submitted: modeled_input,
+                });
+            }
+        }
+        modeled_write_preparation_peak_bytes(rows, self.engine.wal_enabled)
+    }
+
+    pub(super) fn reserve_write_scratch(
+        &self,
+        scratch: usize,
+    ) -> Result<WriteTransientMemoryReservation> {
+        self.engine.write_transient.new_reservation(
+            scratch,
+            self.engine.used_bytes,
+            self.engine.tombstone_staged_bytes,
+            self.engine.budget_bytes,
+            self.engine.memory_rejections_total,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn resolve_write_rows(&self, rows: &[Row]) -> Result<ResolvedWrite> {
+        let transient_memory = self.preflight_and_reserve_write_rows(rows)?;
+        self.resolve_write_rows_with_reservation(rows, transient_memory)
+    }
+
+    pub(super) fn resolve_write_rows_with_reservation(
+        &self,
+        rows: &[Row],
+        transient_memory: WriteTransientMemoryReservation,
+    ) -> Result<ResolvedWrite> {
         let mut pending_points = Vec::with_capacity(rows.len());
         let mut new_series_defs = Vec::new();
         let mut created_series = Vec::<SeriesResolution>::new();
         let mut pending_new_series = HashMap::<RawSeriesKey, usize>::new();
         let mut pending_new_series_plans = Vec::<PendingNewSeriesPlan>::new();
         let mut pending_new_point_refs = Vec::<(usize, usize)>::new();
+        let mut series_creation_rate_reservation = None;
         let max_future_timestamp = self.engine.max_future_skew_window.map(|window| {
             self.engine
                 .clock
@@ -126,8 +258,12 @@ impl<'a> WriteResolver<'a> {
 
         self.engine.with_registry(|registry| {
             for row in rows {
-                validate_metric(row.metric())?;
-                validate_labels(row.labels())?;
+                validate_series_identity(
+                    row.metric(),
+                    row.labels(),
+                    self.engine.max_labels_per_series,
+                    self.engine.max_series_identity_bytes,
+                )?;
 
                 let data_point = row.data_point();
                 if let Some(cutoff) = max_future_timestamp {
@@ -212,6 +348,8 @@ impl<'a> WriteResolver<'a> {
                 reserved_capacity = self
                     .engine
                     .reserve_new_series_capacity(registry, requested)?;
+                series_creation_rate_reservation =
+                    self.engine.reserve_new_series_rate(requested)?;
 
                 if !missing_plan_indexes.is_empty() {
                     let planned_series = missing_plan_indexes
@@ -246,6 +384,9 @@ impl<'a> WriteResolver<'a> {
             }
 
             self.engine.release_new_series_capacity(reserved_capacity);
+            if let Some(reservation) = series_creation_rate_reservation.as_mut() {
+                reservation.retain(newly_created_series.len());
+            }
             if !newly_created_series.is_empty() {
                 self.engine.sync_registry_memory_usage();
             }
@@ -268,6 +409,8 @@ impl<'a> WriteResolver<'a> {
             pending_points,
             new_series_defs,
             created_series,
+            series_creation_rate_reservation,
+            transient_memory,
         })
     }
 

@@ -1,7 +1,47 @@
+use super::super::maintenance::{PersistedCatalogPublication, PersistedCatalogTransition};
 use super::*;
 use crate::engine::series::SeriesKey;
-use crate::MemoryPressureLevel;
+use crate::{
+    MemoryPressureLevel, RowWriteStatus, WriteMode, WriteRejectionCategory,
+    MAX_SUPPORTED_LABELS_PER_SERIES,
+};
 use std::sync::atomic::Ordering;
+
+fn new_cardinality_test_storage(
+    max_labels_per_series: usize,
+    max_series_identity_bytes: usize,
+    max_new_series_per_window: Option<usize>,
+    new_series_window_units: i64,
+    current_time: i64,
+) -> Arc<ChunkStorage> {
+    Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            4,
+            None,
+            None,
+            None,
+            1,
+            ChunkStorageOptions {
+                timestamp_precision: TimestampPrecision::Seconds,
+                max_writers: 32,
+                write_timeout: Duration::from_secs(2),
+                max_labels_per_series,
+                max_series_identity_bytes,
+                max_new_series_per_window,
+                new_series_window_units,
+                new_series_window_nanos: u64::try_from(new_series_window_units.max(1))
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(1_000_000_000),
+                background_threads_enabled: false,
+                background_fail_fast: false,
+                #[cfg(test)]
+                current_time_override: Some(current_time),
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    )
+}
 
 fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) -> ChunkStorage {
     ChunkStorage::new_with_data_path_and_options(
@@ -24,9 +64,17 @@ fn new_memory_budget_test_storage(temp_dir: &TempDir, memory_budget_bytes: u64) 
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -216,6 +264,32 @@ fn memory_budget_stats_reflect_builder_configuration() {
 }
 
 #[test]
+fn tombstone_staging_is_observable_and_released_with_unlimited_accounting() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = new_memory_budget_test_storage(&temp_dir, u64::MAX);
+    storage.refresh_memory_usage();
+    let baseline_used = storage.memory_used();
+    let baseline_tombstones = storage.observability_snapshot().memory.tombstone_bytes;
+
+    {
+        let mut reservation = storage.tombstone_memory_reservation();
+        reservation.resize(8 * 1024).unwrap();
+        assert_eq!(storage.memory_used(), baseline_used + 8 * 1024);
+        assert_eq!(
+            storage.observability_snapshot().memory.tombstone_bytes,
+            baseline_tombstones + 8 * 1024
+        );
+    }
+
+    assert_eq!(storage.memory_used(), baseline_used);
+    assert_eq!(
+        storage.observability_snapshot().memory.tombstone_bytes,
+        baseline_tombstones
+    );
+    storage.close().unwrap();
+}
+
+#[test]
 fn memory_pressure_levels_have_deterministic_precedence() {
     let temp_dir = TempDir::new().unwrap();
     let storage = new_memory_budget_test_storage(&temp_dir, 1_000);
@@ -314,9 +388,17 @@ fn memory_budget_rejects_registry_heavy_new_series_before_mutating_registry() {
             write_timeout: Duration::ZERO,
             memory_budget_bytes: 2_048,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -503,21 +585,44 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
     assert_eq!(snapshot.memory.excluded_bytes, 0);
     assert_eq!(snapshot.memory.excluded_persisted_mmap_bytes, 0);
 
-    let tightened_budget = 1;
     reopened.close().unwrap();
 
-    let over_budget = StorageBuilder::new()
+    let tightened_budget = 1;
+    let startup_error = match StorageBuilder::new()
         .with_data_path(temp_dir.path())
         .with_wal_enabled(false)
         .with_memory_limit(tightened_budget)
         .with_current_time_override_for_tests(0)
         .build()
-        .unwrap();
-    assert!(
-        over_budget.memory_used() > over_budget.memory_budget(),
-        "restart reconciliation should expose the full persisted footprint even under a tiny budget"
+    {
+        Ok(_) => panic!("tiny startup budget must reject before persistent-state loading"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        startup_error,
+        TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == tightened_budget && required > budget
+    ));
+
+    let verified = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .with_memory_limit(1_000_000)
+        .with_current_time_override_for_tests(0)
+        .build()
+        .expect("a fully-admitted retry must preserve the rejected startup's durable state");
+    assert_eq!(
+        verified
+            .select(
+                "reopen_budget_metric",
+                &[Label::new("host", "host-0"), Label::new("rack", "rack-0")],
+                0,
+                10,
+            )
+            .unwrap(),
+        vec![DataPoint::new(1, 0.0)]
     );
-    over_budget.close().unwrap();
+    verified.close().unwrap();
 }
 
 #[test]
@@ -567,19 +672,29 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
     let tightened_budget = baseline.memory_used().saturating_sub(1).max(1);
     baseline.close().unwrap();
 
-    let reopened = StorageBuilder::new()
-        .with_data_path(temp_dir.path())
-        .with_wal_enabled(false)
-        .with_memory_limit(tightened_budget)
-        .with_write_timeout(Duration::ZERO)
-        .with_current_time_override_for_tests(0)
-        .build()
-        .unwrap();
+    let mut admitted_budget = tightened_budget;
+    let reopened = loop {
+        match StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_wal_enabled(false)
+            .with_memory_limit(admitted_budget)
+            .with_write_timeout(Duration::ZERO)
+            .with_current_time_override_for_tests(0)
+            .build()
+        {
+            Ok(storage) => break storage,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, admitted_budget);
+                assert!(required > admitted_budget);
+                admitted_budget = required;
+            }
+            Err(err) => panic!("unexpected bounded restart error: {err}"),
+        }
+    };
 
-    assert!(
-        reopened.memory_used() > reopened.memory_budget(),
-        "persisted mmap bytes should keep the reopened storage over its tightened budget"
-    );
+    let available_after_startup = reopened
+        .memory_budget()
+        .saturating_sub(reopened.memory_used());
     assert_eq!(
         reopened
             .select("restart_query_budget_metric", &labels, 0, 10)
@@ -587,18 +702,26 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)],
     );
 
-    let err = reopened
-        .insert_rows(&[Row::with_labels(
-            "restart_query_budget_metric",
-            labels.clone(),
-            DataPoint::new(3, 3.0),
-        )])
-        .unwrap_err();
+    // Startup reconciliation itself has a larger bounded scratch peak than the retained runtime
+    // state, so the smallest admitted startup budget can leave write headroom. Make the attempted
+    // registry growth deterministically larger than that headroom instead of relying on the old
+    // behavior where startup was allowed to finish already over budget.
+    let rejected_rows = (0..256)
+        .map(|index| {
+            Row::with_labels(
+                format!("restart_rejected_metric_{index:02}"),
+                vec![Label::new("host", format!("rejected-{index:02}"))],
+                DataPoint::new(3, index as f64),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(available_after_startup < admitted_budget);
+    let err = reopened.insert_rows(&rejected_rows).unwrap_err();
     assert!(
         matches!(
             err,
             TsinkError::MemoryBudgetExceeded { budget, required }
-                if budget == tightened_budget && required > budget
+                if budget == admitted_budget && required > budget
         ),
         "unexpected error: {err:?}"
     );
@@ -608,6 +731,18 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
             .unwrap(),
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)],
         "budget rejection after restart/query must not mutate persisted data",
+    );
+    assert!(
+        reopened
+            .select(
+                "restart_rejected_metric_00",
+                &[Label::new("host", "rejected-00")],
+                0,
+                10,
+            )
+            .unwrap()
+            .is_empty(),
+        "rejected registry growth must not publish a new series",
     );
 
     reopened.close().unwrap();
@@ -685,6 +820,87 @@ fn runtime_persisted_segment_load_updates_memory_budget_accounting() {
         "persisted-index accounting should remain visible after runtime segment adoption"
     );
 
+    storage.close().unwrap();
+}
+
+#[test]
+fn catalog_tombstone_admission_failure_precedes_segment_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
+            .with_wal_enabled(false)
+            .with_current_time_override_for_tests(0)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[Row::new(
+                "catalog_tombstone_budget_metric",
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    crate::engine::tombstone::persist_tombstone_updates(
+        &lane_path.join(crate::engine::tombstone::TOMBSTONES_FILE_NAME),
+        &crate::engine::tombstone::TombstoneMap::from([(
+            1,
+            vec![crate::engine::tombstone::TombstoneRange { start: 0, end: 2 }],
+        )]),
+    )
+    .unwrap();
+    let loaded = load_segment_indexes(&lane_path).unwrap();
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path),
+        None,
+        loaded.next_segment_id,
+        ChunkStorageOptions {
+            memory_budget_bytes: 1_000_000,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage.memory.budget_bytes.store(1, Ordering::Release);
+    let transition = PersistedCatalogTransition {
+        visibility_fence: None,
+        loaded_segments: loaded.indexed_segments,
+        removed_roots: Vec::new(),
+        publication: PersistedCatalogPublication::Inventory {
+            inventory,
+            refresh_tombstones: true,
+        },
+        registry_catalog_update: None,
+    };
+
+    let err = match storage
+        .begin_persisted_catalog_publication()
+        .publish_transition(transition)
+    {
+        Err(err) => err,
+        Ok(_) => panic!("tiny memory budget must reject before catalog mutation"),
+    };
+    assert!(matches!(err, TsinkError::MemoryBudgetExceeded { .. }));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    assert!(storage.visibility.tombstones.read().is_empty());
+    storage
+        .memory
+        .budget_bytes
+        .store(1_000_000, Ordering::Release);
     storage.close().unwrap();
 }
 
@@ -797,9 +1013,17 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: 1,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -859,6 +1083,231 @@ fn cardinality_limit_rejection_does_not_grow_string_dictionaries() {
     assert_eq!(metric_len, baseline_metric_len);
     assert_eq!(label_name_len, baseline_label_name_len);
     assert_eq!(label_value_len, baseline_label_value_len);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn series_label_count_limit_accepts_boundary_and_rejects_before_registry_growth() {
+    let storage = new_cardinality_test_storage(2, usize::MAX, None, 10, 100);
+    let boundary_labels = vec![Label::new("a", "1"), Label::new("b", "2")];
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "shape_boundary",
+            boundary_labels,
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    let before = storage.catalog.registry.read().series_count();
+
+    let rejected_labels = vec![
+        Label::new("a", "1"),
+        Label::new("b", "2"),
+        Label::new("c", "3"),
+    ];
+    let err = storage
+        .insert_rows(&[Row::with_labels(
+            "shape_rejected",
+            rejected_labels,
+            DataPoint::new(1, 2.0),
+        )])
+        .unwrap_err();
+    assert!(
+        matches!(err, TsinkError::InvalidLabel(message) if message.contains("configured limit 2"))
+    );
+    assert_eq!(storage.catalog.registry.read().series_count(), before);
+    assert!(storage
+        .list_metrics()
+        .unwrap()
+        .iter()
+        .all(|series| series.name != "shape_rejected"));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn series_identity_byte_limit_accepts_exact_boundary_and_rejects_next_byte() {
+    let storage = new_cardinality_test_storage(8, 4, None, 10, 100);
+
+    // "m" + "a" + "bc" is exactly four UTF-8 bytes.
+    storage
+        .insert_rows(&[Row::with_labels(
+            "m",
+            vec![Label::new("a", "bc")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    // The second byte in the metric pushes this otherwise identical identity to five bytes.
+    let err = storage
+        .insert_rows(&[Row::with_labels(
+            "mm",
+            vec![Label::new("a", "bc")],
+            DataPoint::new(1, 2.0),
+        )])
+        .unwrap_err();
+    assert!(
+        matches!(err, TsinkError::InvalidLabel(message) if message.contains("5 bytes") && message.contains("limit 4"))
+    );
+    assert_eq!(storage.catalog.registry.read().series_count(), 1);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn cardinality_shape_and_rate_builder_configuration_is_validated() {
+    let too_many_labels = StorageBuilder::new()
+        .with_max_labels_per_series(MAX_SUPPORTED_LABELS_PER_SERIES.saturating_add(1))
+        .build();
+    assert!(matches!(
+        too_many_labels,
+        Err(TsinkError::InvalidConfiguration(message))
+            if message.contains("storage-format limit")
+    ));
+
+    let zero_window = StorageBuilder::new()
+        .with_series_creation_rate_limit(1, Duration::ZERO)
+        .build();
+    assert!(matches!(
+        zero_window,
+        Err(TsinkError::InvalidConfiguration(message))
+            if message.contains("greater than zero")
+    ));
+}
+
+#[test]
+fn series_creation_rate_limit_counts_only_newly_published_series() {
+    let storage = new_cardinality_test_storage(8, 1024, Some(2), 10, 100);
+    storage
+        .insert_rows(&[
+            Row::new("rate_a", DataPoint::new(1, 1.0)),
+            Row::new("rate_b", DataPoint::new(1, 2.0)),
+        ])
+        .unwrap();
+
+    let rejected = storage
+        .write_batch(
+            &[Row::new("rate_c", DataPoint::new(1, 3.0))],
+            WriteMode::Atomic,
+        )
+        .unwrap();
+    assert_eq!(rejected.accepted, 0);
+    assert_eq!(rejected.rejected, 1);
+    assert!(matches!(
+        &rejected.outcomes[0].status,
+        RowWriteStatus::Rejected(rejection)
+            if rejection.category == WriteRejectionCategory::CardinalityCreationRateExceeded
+    ));
+
+    storage
+        .insert_rows(&[Row::new("rate_a", DataPoint::new(2, 4.0))])
+        .unwrap();
+    let snapshot = storage.observability_snapshot();
+    assert_eq!(snapshot.cardinality.series_count, 2);
+    assert_eq!(snapshot.cardinality.pending_new_series, 0);
+    assert_eq!(snapshot.cardinality.committed_in_window, 2);
+    assert_eq!(snapshot.cardinality.current_window_start, Some(100));
+    assert_eq!(snapshot.cardinality.admitted_new_series_total, 2);
+    assert_eq!(snapshot.cardinality.committed_new_series_total, 2);
+    assert_eq!(snapshot.cardinality.creation_rate_rejections_total, 1);
+    assert_eq!(snapshot.limits.max_labels_per_series, Some(8));
+    assert_eq!(snapshot.limits.max_series_identity_bytes, Some(1024));
+    assert_eq!(snapshot.limits.max_new_series_per_window, Some(2));
+    assert_eq!(
+        snapshot.limits.new_series_window_nanos,
+        Some(10_000_000_000)
+    );
+
+    storage.set_current_time_override(110);
+    storage
+        .insert_rows(&[Row::new("rate_c", DataPoint::new(2, 5.0))])
+        .unwrap();
+    let advanced = storage.observability_snapshot().cardinality;
+    assert_eq!(advanced.series_count, 3);
+    assert_eq!(advanced.committed_in_window, 1);
+    assert_eq!(advanced.current_window_start, Some(110));
+    assert_eq!(advanced.admitted_new_series_total, 3);
+    assert_eq!(advanced.committed_new_series_total, 3);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn failed_new_series_write_releases_creation_rate_reservation() {
+    let storage = new_cardinality_test_storage(8, 1024, Some(1), 10, 100);
+
+    let err = storage
+        .insert_rows(&[
+            Row::new("rate_rollback", DataPoint::new(1, 1.0)),
+            Row::new("rate_rollback", DataPoint::new(2, 2_i64)),
+        ])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+    let after_failure = storage.observability_snapshot().cardinality;
+    assert_eq!(after_failure.series_count, 0);
+    assert_eq!(after_failure.pending_new_series, 0);
+    assert_eq!(after_failure.committed_in_window, 0);
+    assert_eq!(after_failure.admitted_new_series_total, 1);
+    assert_eq!(after_failure.committed_new_series_total, 0);
+
+    storage
+        .insert_rows(&[Row::new("rate_after_rollback", DataPoint::new(3, 3.0))])
+        .unwrap();
+    let after_success = storage.observability_snapshot().cardinality;
+    assert_eq!(after_success.series_count, 1);
+    assert_eq!(after_success.pending_new_series, 0);
+    assert_eq!(after_success.committed_in_window, 1);
+    assert_eq!(after_success.admitted_new_series_total, 2);
+    assert_eq!(after_success.committed_new_series_total, 1);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn concurrent_writers_cannot_collectively_bypass_series_creation_rate_limit() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    const WRITERS: usize = 32;
+    const LIMIT: usize = 8;
+
+    let storage = new_cardinality_test_storage(8, 1024, Some(LIMIT), 10, 100);
+    let barrier = Arc::new(Barrier::new(WRITERS + 1));
+    let mut writers = Vec::with_capacity(WRITERS);
+    for writer_idx in 0..WRITERS {
+        let storage = Arc::clone(&storage);
+        let barrier = Arc::clone(&barrier);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            storage.insert_rows(&[Row::new(
+                format!("concurrent_rate_{writer_idx}"),
+                DataPoint::new(1, writer_idx as f64),
+            )])
+        }));
+    }
+    barrier.wait();
+
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for writer in writers {
+        match writer.join().unwrap() {
+            Ok(()) => accepted += 1,
+            Err(TsinkError::CardinalityCreationRateExceeded { limit: LIMIT, .. }) => rejected += 1,
+            Err(err) => panic!("unexpected concurrent write error: {err:?}"),
+        }
+    }
+
+    assert_eq!(accepted, LIMIT);
+    assert_eq!(rejected, WRITERS - LIMIT);
+    let snapshot = storage.observability_snapshot().cardinality;
+    assert_eq!(snapshot.series_count, LIMIT as u64);
+    assert_eq!(snapshot.pending_new_series, 0);
+    assert_eq!(snapshot.committed_in_window, LIMIT as u64);
+    assert_eq!(
+        snapshot.creation_rate_rejections_total,
+        (WRITERS - LIMIT) as u64
+    );
 
     storage.close().unwrap();
 }

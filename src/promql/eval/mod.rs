@@ -8,10 +8,15 @@ pub mod time;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::promql::ast::{AtModifier, Expr, MatrixSelector, SubqueryExpr, UnaryOp, VectorSelector};
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::types::{PromqlValue, Series};
-use crate::{DataPoint, Label, Storage, TimestampPrecision};
+use crate::{
+    DataPoint, Label, NativeHistogram, QueryBudget, QueryBudgetLimits, QueryCancellationToken,
+    QueryExecution, QueryMemoryReservation, QueryWorkLimits, Storage, TimestampPrecision, Value,
+};
 
 use self::time::{duration_to_units, step_times};
 
@@ -36,11 +41,301 @@ pub(crate) struct QueryParams<'a> {
     pub query_start: i64,
     pub query_end: i64,
     pub query_step: Option<i64>,
+    pub execution: &'a QueryExecution,
+    pub memory: &'a PromqlMemoryTracker,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct PrefetchCache {
     by_metric: HashMap<String, MetricPrefetchRows>,
+}
+
+#[derive(Default)]
+pub(crate) struct PromqlMemoryTracker {
+    reservations: Mutex<Vec<QueryMemoryReservation>>,
+}
+
+impl PromqlMemoryTracker {
+    pub(crate) fn reserve(&self, execution: &QueryExecution, bytes: u64) -> Result<()> {
+        execution.checkpoint().map_err(crate::TsinkError::from)?;
+        let reservation = execution
+            .reserve_memory(bytes)
+            .map_err(crate::TsinkError::from)?;
+        self.reservations.lock().push(reservation);
+        Ok(())
+    }
+}
+
+const PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+
+fn modeled_vec_capacity_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_string_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_labels_bytes(labels: &[Label]) -> u64 {
+    modeled_vec_capacity_bytes::<Label>(labels.len()).saturating_add(labels.iter().fold(
+        0u64,
+        |bytes, label| {
+            bytes
+                .saturating_add(modeled_string_bytes(&label.name))
+                .saturating_add(modeled_string_bytes(&label.value))
+        },
+    ))
+}
+
+fn modeled_histogram_bytes(histogram: &NativeHistogram) -> u64 {
+    u64::try_from(std::mem::size_of::<NativeHistogram>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_vec_capacity_bytes::<crate::HistogramBucketSpan>(
+            histogram.negative_spans.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<i64>(
+            histogram.negative_deltas.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<f64>(
+            histogram.negative_counts.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<crate::HistogramBucketSpan>(
+            histogram.positive_spans.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<i64>(
+            histogram.positive_deltas.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<f64>(
+            histogram.positive_counts.capacity(),
+        ))
+        .saturating_add(modeled_vec_capacity_bytes::<f64>(
+            histogram.custom_values.capacity(),
+        ))
+}
+
+fn modeled_value_heap_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Bytes(bytes) => modeled_vec_capacity_bytes::<u8>(bytes.capacity()),
+        Value::String(value) => modeled_string_bytes(value),
+        Value::Histogram(histogram) => modeled_histogram_bytes(histogram),
+        Value::F64(_) | Value::I64(_) | Value::U64(_) | Value::Bool(_) => 0,
+    }
+}
+
+fn modeled_sample_bytes(
+    metric: &str,
+    labels: &[Label],
+    histogram: Option<&NativeHistogram>,
+) -> u64 {
+    u64::try_from(std::mem::size_of::<crate::promql::types::Sample>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_string_bytes(metric))
+        .saturating_add(modeled_labels_bytes(labels))
+        .saturating_add(histogram.map(modeled_histogram_bytes).unwrap_or(0))
+}
+
+fn modeled_prefetch_rows_bytes(rows: &MetricPrefetchRows) -> u64 {
+    modeled_vec_capacity_bytes::<LabelPoints>(rows.capacity()).saturating_add(rows.iter().fold(
+        0u64,
+        |bytes, (labels, points)| {
+            bytes
+                .saturating_add(modeled_labels_bytes(labels))
+                .saturating_add(modeled_vec_capacity_bytes::<DataPoint>(points.capacity()))
+                .saturating_add(points.iter().fold(0u64, |point_bytes, point| {
+                    point_bytes.saturating_add(modeled_value_heap_bytes(&point.value))
+                }))
+        },
+    ))
+}
+
+fn promql_value_shape(value: &PromqlValue) -> (u64, u64) {
+    match value {
+        PromqlValue::Scalar(_, _) => (
+            1,
+            u64::try_from(std::mem::size_of::<PromqlValue>()).unwrap_or(u64::MAX),
+        ),
+        PromqlValue::String(value, _) => (
+            1,
+            u64::try_from(std::mem::size_of::<PromqlValue>())
+                .unwrap_or(u64::MAX)
+                .saturating_add(modeled_string_bytes(value)),
+        ),
+        PromqlValue::InstantVector(samples) => (
+            u64::try_from(samples.len()).unwrap_or(u64::MAX),
+            modeled_vec_capacity_bytes::<crate::promql::types::Sample>(samples.capacity())
+                .saturating_add(samples.iter().fold(0u64, |bytes, sample| {
+                    bytes.saturating_add(modeled_sample_bytes(
+                        &sample.metric,
+                        &sample.labels,
+                        sample.histogram.as_deref(),
+                    ))
+                })),
+        ),
+        PromqlValue::RangeVector(series) => {
+            let samples = series.iter().fold(0u64, |count, series| {
+                count
+                    .saturating_add(u64::try_from(series.samples.len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(series.histograms.len()).unwrap_or(u64::MAX))
+            });
+            let bytes = modeled_vec_capacity_bytes::<Series>(series.capacity()).saturating_add(
+                series.iter().fold(0u64, |bytes, series| {
+                    bytes
+                        .saturating_add(modeled_string_bytes(&series.metric))
+                        .saturating_add(modeled_labels_bytes(&series.labels))
+                        .saturating_add(modeled_vec_capacity_bytes::<(i64, f64)>(
+                            series.samples.capacity(),
+                        ))
+                        .saturating_add(modeled_vec_capacity_bytes::<(i64, Box<NativeHistogram>)>(
+                            series.histograms.capacity(),
+                        ))
+                        .saturating_add(series.histograms.iter().fold(
+                            0u64,
+                            |histogram_bytes, (_, histogram)| {
+                                histogram_bytes.saturating_add(modeled_histogram_bytes(histogram))
+                            },
+                        ))
+                }),
+            );
+            (samples, bytes)
+        }
+    }
+}
+
+impl QueryParams<'_> {
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        self.execution
+            .checkpoint()
+            .map_err(crate::TsinkError::from)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn reserve_sample(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        histogram: Option<&NativeHistogram>,
+    ) -> Result<()> {
+        self.checkpoint()?;
+        self.execution
+            .observe_intermediate_vector_size(1)
+            .map_err(crate::TsinkError::from)?;
+        self.memory.reserve(
+            self.execution,
+            modeled_sample_bytes(metric, labels, histogram),
+        )
+    }
+
+    pub(crate) fn reserve_range_sample(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        histogram: bool,
+    ) -> Result<()> {
+        let histogram_bytes = if histogram {
+            u64::try_from(std::mem::size_of::<NativeHistogram>()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        self.memory.reserve(
+            self.execution,
+            u64::try_from(std::mem::size_of::<(i64, f64)>())
+                .unwrap_or(u64::MAX)
+                .saturating_add(modeled_string_bytes(metric))
+                .saturating_add(modeled_labels_bytes(labels))
+                .saturating_add(histogram_bytes),
+        )
+    }
+
+    pub(crate) fn reserve_range_series_upper(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        points: &[DataPoint],
+    ) -> Result<()> {
+        self.checkpoint()?;
+        self.execution
+            .observe_intermediate_vector_size(u64::try_from(points.len()).unwrap_or(u64::MAX))
+            .map_err(crate::TsinkError::from)?;
+        let histogram_bytes = points.iter().fold(0u64, |bytes, point| {
+            bytes.saturating_add(match &point.value {
+                Value::Histogram(histogram) => modeled_histogram_bytes(histogram),
+                _ => 0,
+            })
+        });
+        self.memory.reserve(
+            self.execution,
+            u64::try_from(std::mem::size_of::<Series>())
+                .unwrap_or(u64::MAX)
+                .saturating_add(modeled_string_bytes(metric))
+                .saturating_add(modeled_labels_bytes(labels))
+                .saturating_add(modeled_vec_capacity_bytes::<(i64, f64)>(points.len()))
+                .saturating_add(modeled_vec_capacity_bytes::<(i64, Box<NativeHistogram>)>(
+                    points.len(),
+                ))
+                .saturating_add(histogram_bytes),
+        )
+    }
+
+    pub(crate) fn reserve_metric_names<'a>(
+        &self,
+        metrics: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for metric in metrics {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(modeled_string_bytes(metric));
+        }
+        self.execution
+            .observe_intermediate_vector_size(u64::try_from(count).unwrap_or(u64::MAX))
+            .map_err(crate::TsinkError::from)?;
+        self.memory.reserve(
+            self.execution,
+            modeled_vec_capacity_bytes::<String>(count).saturating_add(bytes),
+        )
+    }
+
+    pub(crate) fn retain_value(&self, value: &PromqlValue) -> Result<()> {
+        let (size, bytes) = promql_value_shape(value);
+        self.execution
+            .observe_intermediate_vector_size(size)
+            .map_err(crate::TsinkError::from)?;
+        self.memory.reserve(self.execution, bytes)
+    }
+
+    /// Pre-admits a conservative upper bound for an operator that can retain cloned keys,
+    /// grouping maps, and an output collection while its input values are still live.
+    pub(crate) fn reserve_transform_upper(
+        &self,
+        values: &[&PromqlValue],
+        allocation_copies: u64,
+    ) -> Result<()> {
+        self.checkpoint()?;
+        let (size, bytes) = values.iter().fold((0u64, 0u64), |(size, bytes), value| {
+            let (value_size, value_bytes) = promql_value_shape(value);
+            (
+                size.saturating_add(value_size),
+                bytes.saturating_add(value_bytes),
+            )
+        });
+        self.execution
+            .observe_intermediate_vector_size(size)
+            .map_err(crate::TsinkError::from)?;
+        self.memory
+            .reserve(self.execution, bytes.saturating_mul(allocation_copies))
+    }
 }
 
 impl PrefetchCache {
@@ -73,16 +368,78 @@ impl Engine {
         }
     }
 
+    fn begin_execution(
+        &self,
+        request_limits: QueryWorkLimits,
+        cancellation: QueryCancellationToken,
+    ) -> Result<QueryExecution> {
+        if let Some(execution) = self
+            .storage
+            .begin_query_execution(request_limits, cancellation.clone())?
+        {
+            return Ok(execution);
+        }
+
+        // A compatibility backend with no shared query budget still receives one execution so
+        // PromQL cancellation, step, and modeled-memory accounting stay coherent. Its all-None
+        // fallback is deliberately unenforced and does not alter the backend's legacy behavior.
+        QueryBudget::new(QueryBudgetLimits::default())
+            .expect("the all-None fallback query budget is valid")
+            .begin_query_with(request_limits, cancellation)
+            .map_err(crate::TsinkError::from)
+            .map_err(Into::into)
+    }
+
     pub fn instant_query(&self, query_str: &str, time: i64) -> Result<PromqlValue> {
+        self.instant_query_with_control(
+            query_str,
+            time,
+            QueryWorkLimits::default(),
+            QueryCancellationToken::new(),
+        )
+    }
+
+    /// Evaluates one instant query under request-specific tightening and cancellation control.
+    ///
+    /// Exactly one storage query permit is admitted for the complete PromQL request. Backends
+    /// without a query budget receive an internal unbounded execution so evaluation checkpoints
+    /// remain active while their compatibility storage methods retain legacy behavior.
+    pub fn instant_query_with_control(
+        &self,
+        query_str: &str,
+        time: i64,
+        request_limits: QueryWorkLimits,
+        cancellation: QueryCancellationToken,
+    ) -> Result<PromqlValue> {
+        let execution = self.begin_execution(request_limits, cancellation)?;
+        self.instant_query_with_execution(query_str, time, &execution)
+    }
+
+    /// Evaluates one instant query using an already-admitted execution without acquiring another
+    /// concurrency permit.
+    pub fn instant_query_with_execution(
+        &self,
+        query_str: &str,
+        time: i64,
+        execution: &QueryExecution,
+    ) -> Result<PromqlValue> {
         let expr = crate::promql::parse(query_str)?;
+        execution.checkpoint().map_err(crate::TsinkError::from)?;
+        execution.ensure_steps(1).map_err(crate::TsinkError::from)?;
+        execution.charge_steps(1).map_err(crate::TsinkError::from)?;
+        let memory = PromqlMemoryTracker::default();
         let params = QueryParams {
             eval_time: time,
             prefetch: None,
             query_start: time,
             query_end: time,
             query_step: None,
+            execution,
+            memory: &memory,
         };
-        self.eval(&expr, &params)
+        let value = self.eval(&expr, &params)?;
+        charge_promql_result(execution, &value)?;
+        Ok(value)
     }
 
     pub fn range_query(
@@ -91,6 +448,39 @@ impl Engine {
         start: i64,
         end: i64,
         step: i64,
+    ) -> Result<PromqlValue> {
+        self.range_query_with_control(
+            query_str,
+            start,
+            end,
+            step,
+            QueryWorkLimits::default(),
+            QueryCancellationToken::new(),
+        )
+    }
+
+    /// Evaluates a range query under request-specific tightening and cancellation control.
+    pub fn range_query_with_control(
+        &self,
+        query_str: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+        request_limits: QueryWorkLimits,
+        cancellation: QueryCancellationToken,
+    ) -> Result<PromqlValue> {
+        let execution = self.begin_execution(request_limits, cancellation)?;
+        self.range_query_with_execution(query_str, start, end, step, &execution)
+    }
+
+    /// Evaluates a range query using one caller-owned execution for prefetch and every step.
+    pub fn range_query_with_execution(
+        &self,
+        query_str: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+        execution: &QueryExecution,
     ) -> Result<PromqlValue> {
         if step <= 0 {
             return Err(PromqlError::Eval("range step must be positive".to_string()));
@@ -102,37 +492,48 @@ impl Engine {
         }
 
         let expr = crate::promql::parse(query_str)?;
+        let step_count = inclusive_step_count(start, end, step);
+        execution
+            .ensure_steps(step_count)
+            .map_err(crate::TsinkError::from)?;
+        let memory = PromqlMemoryTracker::default();
         let prefetch = if self.supports_prefetch(&expr) {
-            Some(self.build_prefetch_cache(&expr, start, end)?)
+            Some(self.build_prefetch_cache(&expr, start, end, execution, &memory)?)
         } else {
             None
         };
 
         let mut out: BTreeMap<RangeSeriesKey, RangeSeriesAccumulator> = BTreeMap::new();
         for ts in step_times(start, end, step) {
+            execution.charge_steps(1).map_err(crate::TsinkError::from)?;
             let params = QueryParams {
                 eval_time: ts,
                 prefetch: prefetch.as_ref(),
                 query_start: start,
                 query_end: end,
                 query_step: Some(step),
+                execution,
+                memory: &memory,
             };
             let val = self.eval(&expr, &params)?;
-            Self::append_step_value(&mut out, ts, val);
+            Self::append_step_value(&mut out, ts, val, &params)?;
         }
 
         let series = out.into_values().collect();
-
-        Ok(PromqlValue::RangeVector(series))
+        let value = PromqlValue::RangeVector(series);
+        charge_promql_result(execution, &value)?;
+        Ok(value)
     }
 
     fn append_step_value(
         out: &mut BTreeMap<RangeSeriesKey, RangeSeriesAccumulator>,
         step_ts: i64,
         value: PromqlValue,
-    ) {
+        params: &QueryParams<'_>,
+    ) -> Result<()> {
         match value {
             PromqlValue::Scalar(v, _) => {
+                params.reserve_range_sample("", &[], false)?;
                 out.entry((String::new(), Vec::new()))
                     .or_insert_with(|| Series::new(String::new(), Vec::new()))
                     .samples
@@ -140,6 +541,11 @@ impl Engine {
             }
             PromqlValue::InstantVector(samples) => {
                 for sample in samples {
+                    params.reserve_range_sample(
+                        &sample.metric,
+                        &sample.labels,
+                        sample.histogram.is_some(),
+                    )?;
                     let metric = sample.metric;
                     let labels = sample.labels;
                     let histogram = sample.histogram;
@@ -164,6 +570,11 @@ impl Engine {
                     else {
                         continue;
                     };
+                    params.reserve_range_sample(
+                        &series.metric,
+                        &series.labels,
+                        matches!(&latest_point, LatestSeriesPoint::Histogram(_)),
+                    )?;
                     series.labels.sort();
                     let entry = out
                         .entry((series.metric.clone(), series.labels.clone()))
@@ -178,10 +589,12 @@ impl Engine {
             }
             PromqlValue::String(_, _) => {}
         }
+        Ok(())
     }
 
     pub(crate) fn eval(&self, expr: &Expr, params: &QueryParams<'_>) -> Result<PromqlValue> {
-        match expr {
+        params.checkpoint()?;
+        let value = match expr {
             Expr::NumberLiteral(v) => Ok(PromqlValue::Scalar(*v, params.eval_time)),
             Expr::StringLiteral(v) => Ok(PromqlValue::String(v.clone(), params.eval_time)),
             Expr::Paren(expr) => self.eval(expr, params),
@@ -202,7 +615,9 @@ impl Engine {
             Expr::Binary(binary) => binary::eval_binary(self, binary, params),
             Expr::Aggregation(agg) => aggregation::eval_aggregation(self, agg, params),
             Expr::Call(call) => functions::eval_call(self, call, params),
-        }
+        }?;
+        params.retain_value(&value)?;
+        Ok(value)
     }
 
     pub(crate) fn storage(&self) -> &Arc<dyn Storage> {
@@ -221,7 +636,15 @@ impl Engine {
         duration_to_units(DEFAULT_SUBQUERY_STEP_MS, self.timestamp_units_per_second)
     }
 
-    fn build_prefetch_cache(&self, expr: &Expr, start: i64, end: i64) -> Result<PrefetchCache> {
+    fn build_prefetch_cache(
+        &self,
+        expr: &Expr,
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+        memory: &PromqlMemoryTracker,
+    ) -> Result<PrefetchCache> {
+        execution.checkpoint().map_err(crate::TsinkError::from)?;
         let mut metrics = BTreeSet::new();
         let mut max_past_window = self.default_lookback_delta;
         let mut max_future_window = 0;
@@ -237,7 +660,14 @@ impl Engine {
 
         let mut cache = PrefetchCache::default();
         for metric in metrics {
-            let data = self.storage.select_all(&metric, fetch_start, fetch_end)?;
+            execution.checkpoint().map_err(crate::TsinkError::from)?;
+            let data = self.storage.select_all_with_execution(
+                &metric,
+                fetch_start,
+                fetch_end,
+                execution,
+            )?;
+            memory.reserve(execution, modeled_prefetch_rows_bytes(&data))?;
             cache.insert(metric, data);
         }
 
@@ -372,6 +802,33 @@ fn expr_uses_dynamic_time(expr: &Expr) -> bool {
         Expr::Paren(inner) => expr_uses_dynamic_time(inner),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
     }
+}
+
+pub(crate) fn inclusive_step_count(start: i64, end: i64, step: i64) -> u64 {
+    if step <= 0 || start > end {
+        return 0;
+    }
+    let distance = (end as i128).saturating_sub(start as i128);
+    let count = distance
+        .checked_div(step as i128)
+        .unwrap_or(i128::MAX)
+        .saturating_add(1);
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+fn charge_promql_result(execution: &QueryExecution, value: &PromqlValue) -> Result<()> {
+    execution.checkpoint().map_err(crate::TsinkError::from)?;
+    let (samples, bytes) = promql_value_shape(value);
+    execution
+        .observe_intermediate_vector_size(samples)
+        .map_err(crate::TsinkError::from)?;
+    execution
+        .charge_samples_returned(samples)
+        .map_err(crate::TsinkError::from)?;
+    execution
+        .charge_returned_bytes(bytes)
+        .map_err(crate::TsinkError::from)?;
+    Ok(())
 }
 
 pub(crate) fn resolve_at_modifier(

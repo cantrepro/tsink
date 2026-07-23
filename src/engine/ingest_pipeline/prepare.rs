@@ -1,13 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::super::super::{
-    partition_id_for_timestamp, state, value_heap_bytes, ActiveSeriesState, ChunkPoint, FramedWal,
-    Result, SeriesDefinitionFrame, SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily,
-    SeriesVisibilitySummary, TsinkError, ValueLane, WriteAdmissionControlContext,
-    WritePrepareContext, WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext,
-    WritePrepareWalContext, STORAGE_OPEN,
+    partition_id_for_timestamp, state, value_heap_bytes, ActiveSeriesState, ChunkBuilder,
+    ChunkPoint, FramedWal, Result, SeriesDefinitionFrame, SeriesId, SeriesRegistry,
+    SeriesResolution, SeriesValueFamily, SeriesVisibilitySummary, TsinkError, ValueLane,
+    WalHighWatermark, WriteAdmissionControlContext, WritePrepareContext,
+    WritePrepareMemoryBudgetContext, WritePrepareVisibilityContext, WritePrepareWalContext,
+    WriteTransientMemoryReservation, STORAGE_OPEN,
 };
 use super::apply::WriteApplier;
 use super::phases::{
@@ -17,8 +19,71 @@ use super::resolve::WriteResolver;
 
 struct PendingPartitionHeadState {
     point_cap: usize,
-    partition_heads: BTreeMap<i64, usize>,
+    partition_heads: BTreeMap<i64, PendingChunkBuilderAllocation>,
     current_partition_id: Option<i64>,
+    active_series_was_present: bool,
+    allocation_growth_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingChunkBuilderAllocation {
+    point_count: usize,
+    point_block_max_points: usize,
+    tail_point_count: usize,
+    frozen_point_block_count: usize,
+    frozen_point_block_capacity: usize,
+}
+
+impl PendingChunkBuilderAllocation {
+    fn new(point_cap: usize) -> Self {
+        let initial_point_capacity = ChunkBuilder::initial_point_capacity(point_cap);
+        Self {
+            point_count: 0,
+            point_block_max_points: initial_point_capacity,
+            tail_point_count: 0,
+            frozen_point_block_count: 0,
+            frozen_point_block_capacity: 0,
+        }
+    }
+
+    fn from_builder(builder: &ChunkBuilder) -> Self {
+        Self {
+            point_count: builder.len(),
+            point_block_max_points: builder.point_block_max_points(),
+            tail_point_count: builder.tail_point_count(),
+            frozen_point_block_count: builder.frozen_point_block_count(),
+            frozen_point_block_capacity: builder.point_block_capacity(),
+        }
+    }
+
+    fn initial_allocation_bytes(point_cap: usize) -> usize {
+        ChunkBuilder::initial_point_capacity(point_cap)
+            .saturating_mul(std::mem::size_of::<ChunkPoint>())
+    }
+
+    fn append_point(&mut self) -> usize {
+        self.point_count = self.point_count.saturating_add(1);
+        self.tail_point_count = self.tail_point_count.saturating_add(1);
+        if self.tail_point_count < self.point_block_max_points {
+            return 0;
+        }
+
+        self.tail_point_count = 0;
+        self.frozen_point_block_count = self.frozen_point_block_count.saturating_add(1);
+        let next_block_capacity = ChunkBuilder::projected_point_block_capacity(
+            self.frozen_point_block_capacity,
+            self.frozen_point_block_count,
+        );
+        let block_capacity_growth = next_block_capacity
+            .saturating_sub(self.frozen_point_block_capacity)
+            .saturating_mul(std::mem::size_of::<Arc<Vec<ChunkPoint>>>());
+        self.frozen_point_block_capacity = next_block_capacity;
+
+        self.point_block_max_points
+            .saturating_mul(std::mem::size_of::<ChunkPoint>())
+            .saturating_add(block_capacity_growth)
+            .saturating_add(std::mem::size_of::<Vec<ChunkPoint>>())
+    }
 }
 
 impl PendingPartitionHeadState {
@@ -27,6 +92,8 @@ impl PendingPartitionHeadState {
             point_cap: point_cap.max(1),
             partition_heads: BTreeMap::new(),
             current_partition_id: None,
+            active_series_was_present: false,
+            allocation_growth_bytes: 0,
         }
     }
 
@@ -36,9 +103,16 @@ impl PendingPartitionHeadState {
             partition_heads: state
                 .partition_heads
                 .iter()
-                .map(|(partition_id, head)| (*partition_id, head.builder.len()))
+                .map(|(partition_id, head)| {
+                    (
+                        *partition_id,
+                        PendingChunkBuilderAllocation::from_builder(&head.builder),
+                    )
+                })
                 .collect(),
             current_partition_id: state.current_partition_id,
+            active_series_was_present: true,
+            allocation_growth_bytes: 0,
         }
     }
 
@@ -65,7 +139,19 @@ impl PendingPartitionHeadState {
                     self.finalize_partition_head(partition_id);
                 }
                 self.current_partition_id = Some(next_partition);
-                self.partition_heads.entry(next_partition).or_insert(0);
+                let head_count_grows = evict_partition_id.is_none();
+                self.partition_heads
+                    .entry(next_partition)
+                    .or_insert_with(|| PendingChunkBuilderAllocation::new(self.point_cap));
+                self.allocation_growth_bytes = self.allocation_growth_bytes.saturating_add(
+                    PendingChunkBuilderAllocation::initial_allocation_bytes(self.point_cap),
+                );
+                if head_count_grows {
+                    self.allocation_growth_bytes = self
+                        .allocation_growth_bytes
+                        .saturating_add(std::mem::size_of::<state::ActivePartitionHead>())
+                        .saturating_add(std::mem::size_of::<(WalHighWatermark, usize)>());
+                }
                 Ok(())
             }
         }
@@ -79,7 +165,9 @@ impl PendingPartitionHeadState {
             .partition_heads
             .get_mut(&partition_id)
             .expect("active partition head must exist before append_point");
-        *head = head.saturating_add(1);
+        self.allocation_growth_bytes = self
+            .allocation_growth_bytes
+            .saturating_add(head.append_point());
     }
 
     fn rotate_full_if_needed(&mut self) {
@@ -89,9 +177,15 @@ impl PendingPartitionHeadState {
         if self
             .partition_heads
             .get(&partition_id)
-            .is_some_and(|point_count| *point_count >= self.point_cap)
+            .is_some_and(|head| head.point_count >= self.point_cap)
         {
-            self.partition_heads.insert(partition_id, 0);
+            self.partition_heads.insert(
+                partition_id,
+                PendingChunkBuilderAllocation::new(self.point_cap),
+            );
+            self.allocation_growth_bytes = self.allocation_growth_bytes.saturating_add(
+                PendingChunkBuilderAllocation::initial_allocation_bytes(self.point_cap),
+            );
         }
     }
 
@@ -102,6 +196,18 @@ impl PendingPartitionHeadState {
         if self.current_partition_id == Some(partition_id) {
             self.current_partition_id = self.partition_heads.keys().next_back().copied();
         }
+    }
+
+    fn active_series_growth_bytes(&self) -> usize {
+        if self.active_series_was_present {
+            0
+        } else {
+            std::mem::size_of::<ActiveSeriesState>()
+        }
+    }
+
+    fn allocation_growth_bytes(&self) -> usize {
+        self.allocation_growth_bytes
     }
 }
 
@@ -194,6 +300,23 @@ impl<'a> WritePrepareVisibilityContext<'a> {
 }
 
 impl<'a> WritePrepareMemoryBudgetContext<'a> {
+    fn retained_budget_after_reservations(self, estimated_growth_bytes: usize) -> usize {
+        let budget = self
+            .budget_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize;
+        let staged = self
+            .tombstone_staged_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize;
+        let transient = self.write_transient.current_bytes();
+
+        budget
+            .saturating_sub(staged)
+            .saturating_sub(transient)
+            .saturating_sub(estimated_growth_bytes)
+    }
+
     fn shortfall(self, estimated_growth_bytes: usize) -> Option<(usize, usize)> {
         let budget = self
             .budget_bytes
@@ -207,8 +330,34 @@ impl<'a> WritePrepareMemoryBudgetContext<'a> {
             .used_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
-        let required = used.saturating_add(estimated_growth_bytes);
+        let staged = self
+            .tombstone_staged_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize;
+        let transient = self.write_transient.current_bytes();
+        let required = used
+            .saturating_add(staged)
+            .saturating_add(transient)
+            .saturating_add(estimated_growth_bytes);
         (required > budget).then_some((budget, required))
+    }
+
+    fn reserve_retained_growth(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+        retained_growth_bytes: usize,
+    ) -> Result<()> {
+        let required_reservation = reservation
+            .base_reserved_bytes()
+            .checked_add(retained_growth_bytes)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        reservation.ensure(
+            required_reservation,
+            self.used_bytes,
+            self.tombstone_staged_bytes,
+            self.budget_bytes,
+            self.memory_rejections_total,
+        )
     }
 }
 
@@ -321,7 +470,7 @@ impl<'a> WriteAdmissionControlContext<'a> {
         std::thread::sleep(delay);
     }
 
-    fn enforce_admission_controls(
+    pub(in crate::engine::storage_engine) fn enforce_admission_controls(
         self,
         memory_budget: WritePrepareMemoryBudgetContext<'a>,
         wal: WritePrepareWalContext<'a>,
@@ -339,16 +488,26 @@ impl<'a> WriteAdmissionControlContext<'a> {
             // after the lifecycle transition would hold close() hostage until the write timeout.
             self.ensure_accepting_writes()?;
 
-            let memory_shortfall = if let Some((budget, _required)) =
+            let memory_shortfall = if let Some((_budget, _required)) =
                 memory_budget.shortfall(estimated_memory_growth_bytes)
             {
-                self.budget.evict_persisted_sealed_chunks_to_budget(budget);
+                let retained_budget =
+                    memory_budget.retained_budget_after_reservations(estimated_memory_growth_bytes);
+                self.budget
+                    .evict_persisted_sealed_chunks_to_budget(retained_budget);
                 memory_budget.shortfall(estimated_memory_growth_bytes)
             } else {
                 None
             };
 
             if let Some((post_budget, post_required)) = memory_shortfall {
+                if Instant::now() >= deadline {
+                    increment_atomic_saturating(self.memory_rejections_total);
+                    return Err(TsinkError::MemoryBudgetExceeded {
+                        budget: post_budget,
+                        required: post_required,
+                    });
+                }
                 if active_memory_backpressure.is_none() {
                     active_memory_backpressure = Some(ActiveMemoryBackpressureGuard::new(
                         self.active_memory_backpressured_writers,
@@ -357,13 +516,6 @@ impl<'a> WriteAdmissionControlContext<'a> {
                 if !memory_backpressure_recorded {
                     increment_atomic_saturating(self.memory_backpressure_events_total);
                     memory_backpressure_recorded = true;
-                }
-                if Instant::now() >= deadline {
-                    increment_atomic_saturating(self.memory_rejections_total);
-                    return Err(TsinkError::MemoryBudgetExceeded {
-                        budget: post_budget,
-                        required: post_required,
-                    });
                 }
                 if !relief_requested {
                     relief_requested = self.request_admission_pressure_relief();
@@ -428,35 +580,6 @@ impl<'a> WritePrepareContext<'a> {
             .get(&series_id)
             .map(PendingPartitionHeadState::from_active_state)
             .unwrap_or_else(|| PendingPartitionHeadState::new(self.config.chunk_point_cap))
-    }
-
-    fn planned_additional_partition_heads(
-        self,
-        series_id: SeriesId,
-        pending_partitions: &BTreeSet<i64>,
-    ) -> (usize, usize) {
-        let active = self.series_validation.chunks.active_shard(series_id).read();
-        if let Some(state) = active.get(&series_id) {
-            let additional_partitions = pending_partitions
-                .iter()
-                .filter(|partition_id| !state.contains_partition_head(**partition_id))
-                .count();
-            let bounded_partition_heads = state
-                .partition_head_count()
-                .saturating_add(additional_partitions)
-                .min(self.config.max_active_partition_heads_per_series);
-            (
-                0,
-                bounded_partition_heads.saturating_sub(state.partition_head_count()),
-            )
-        } else {
-            (
-                1,
-                pending_partitions
-                    .len()
-                    .min(self.config.max_active_partition_heads_per_series),
-            )
-        }
     }
 }
 
@@ -549,6 +672,13 @@ impl<'a> WritePreparer<'a> {
         ) {
             return Err(Box::new((resolved, err)));
         }
+        if let Err(err) = self
+            .engine
+            .memory_budget
+            .reserve_retained_growth(&resolved.transient_memory, estimated_memory_growth)
+        {
+            return Err(Box::new((resolved, err)));
+        }
 
         Ok(PreparedWrite {
             resolved,
@@ -586,40 +716,38 @@ impl<'a> WritePreparer<'a> {
         created_series: &[SeriesResolution],
         pending_series_families: &BTreeMap<SeriesId, SeriesValueFamily>,
     ) -> usize {
-        let per_point_bytes = std::mem::size_of::<ChunkPoint>();
-        let point_storage_bytes = points.len().saturating_mul(per_point_bytes);
         let heap_bytes = points.iter().fold(0usize, |acc, point| {
             acc.saturating_add(value_heap_bytes(&point.value))
         });
 
-        let per_new_partition_head = std::mem::size_of::<state::ActivePartitionHead>()
-            .saturating_add(
-                self.engine
-                    .config
-                    .chunk_point_cap
-                    .saturating_mul(std::mem::size_of::<ChunkPoint>()),
-            );
-        let mut new_active_series = 0usize;
-        let mut new_partition_heads = 0usize;
+        let mut active_state_bytes = 0usize;
+        let mut partition_head_growth_bytes = 0usize;
         for (series_id, (_, indexes)) in grouped {
-            let mut pending_partitions = BTreeSet::new();
+            let mut planner = self.engine.planner_for_series(*series_id);
             for idx in indexes {
-                pending_partitions.insert(partition_id_for_timestamp(
-                    points[*idx].ts,
-                    self.engine.config.partition_window,
-                ));
+                if planner
+                    .rotate_partition_if_needed(
+                        points[*idx].ts,
+                        self.engine.config.partition_window,
+                        self.engine.config.max_active_partition_heads_per_series,
+                    )
+                    .is_err()
+                {
+                    // Validation just replayed the same plan. If concurrent maintenance changed
+                    // the active-head topology between the two reads, reject conservatively
+                    // instead of admitting an unmodeled allocation.
+                    return usize::MAX;
+                }
+                planner.append_point();
+                planner.rotate_full_if_needed();
             }
 
-            let (additional_active_series, additional_partition_heads) = self
-                .engine
-                .planned_additional_partition_heads(*series_id, &pending_partitions);
-            new_active_series = new_active_series.saturating_add(additional_active_series);
-            new_partition_heads = new_partition_heads.saturating_add(additional_partition_heads);
+            active_state_bytes =
+                active_state_bytes.saturating_add(planner.active_series_growth_bytes());
+            partition_head_growth_bytes =
+                partition_head_growth_bytes.saturating_add(planner.allocation_growth_bytes());
         }
 
-        let active_state_bytes =
-            new_active_series.saturating_mul(std::mem::size_of::<ActiveSeriesState>());
-        let partition_head_bytes = new_partition_heads.saturating_mul(per_new_partition_head);
         let value_family_bytes = pending_series_families
             .len()
             .saturating_mul(SeriesRegistry::value_family_entry_bytes());
@@ -629,11 +757,125 @@ impl<'a> WritePreparer<'a> {
                 .visibility
                 .estimate_metadata_growth_bytes(points, grouped, created_series);
 
-        point_storage_bytes
-            .saturating_add(heap_bytes)
+        heap_bytes
             .saturating_add(active_state_bytes)
-            .saturating_add(partition_head_bytes)
+            .saturating_add(partition_head_growth_bytes)
             .saturating_add(value_family_bytes)
             .saturating_add(metadata_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Value;
+
+    fn modeled_builder_allocation_bytes(builder: &ChunkBuilder) -> usize {
+        builder
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ChunkPoint>())
+            .saturating_add(
+                builder
+                    .point_block_capacity()
+                    .saturating_mul(std::mem::size_of::<Arc<Vec<ChunkPoint>>>()),
+            )
+            .saturating_add(
+                builder
+                    .frozen_point_block_count()
+                    .saturating_mul(std::mem::size_of::<Vec<ChunkPoint>>()),
+            )
+    }
+
+    fn one_point_head_growth(planner: &mut PendingPartitionHeadState) -> usize {
+        planner.rotate_partition_if_needed(1, 1_000, 8).unwrap();
+        planner.append_point();
+        planner.rotate_full_if_needed();
+        planner.allocation_growth_bytes()
+    }
+
+    #[test]
+    fn one_point_new_and_reopened_heads_charge_one_initial_block_exactly() {
+        const SERIES_COUNT: usize = 4_096;
+        const POINT_CAP: usize = 2_048;
+
+        let expected_head_growth = std::mem::size_of::<state::ActivePartitionHead>()
+            + std::mem::size_of::<(WalHighWatermark, usize)>()
+            + ChunkBuilder::initial_point_capacity(POINT_CAP) * std::mem::size_of::<ChunkPoint>();
+
+        let mut new_total = 0usize;
+        let mut reopened_total = 0usize;
+        for series_id in 0..SERIES_COUNT {
+            let mut new = PendingPartitionHeadState::new(POINT_CAP);
+            assert_eq!(
+                new.active_series_growth_bytes(),
+                std::mem::size_of::<ActiveSeriesState>()
+            );
+            new_total = new_total.saturating_add(one_point_head_growth(&mut new));
+
+            // A bounded partial flush can leave an active-series object with no open head until
+            // the empty state is pruned. Reopening it must allocate the same one-block builder,
+            // but must not charge another ActiveSeriesState.
+            let empty_state = ActiveSeriesState::new(
+                u64::try_from(series_id).unwrap(),
+                ValueLane::Numeric,
+                POINT_CAP,
+            );
+            let mut reopened = PendingPartitionHeadState::from_active_state(&empty_state);
+            assert_eq!(reopened.active_series_growth_bytes(), 0);
+            reopened_total = reopened_total.saturating_add(one_point_head_growth(&mut reopened));
+        }
+
+        assert_eq!(new_total, SERIES_COUNT * expected_head_growth);
+        assert_eq!(reopened_total, SERIES_COUNT * expected_head_growth);
+        assert_eq!(ChunkBuilder::initial_point_capacity(POINT_CAP), 64);
+    }
+
+    #[test]
+    fn builder_growth_model_matches_exact_tail_and_block_capacity_boundaries() {
+        const POINT_CAP: usize = 2_048;
+        let mut builder = ChunkBuilder::new(1, ValueLane::Numeric, POINT_CAP);
+        let mut model = PendingChunkBuilderAllocation::new(POINT_CAP);
+
+        assert_eq!(
+            PendingChunkBuilderAllocation::initial_allocation_bytes(POINT_CAP),
+            modeled_builder_allocation_bytes(&builder)
+        );
+
+        // Cross four frozen-block boundaries and the outer block vector's 4 -> 8 boundary.
+        for timestamp in 0..321 {
+            let before = modeled_builder_allocation_bytes(&builder);
+            let predicted_growth = model.append_point();
+            builder.append(timestamp, Value::I64(timestamp));
+            let actual_growth = modeled_builder_allocation_bytes(&builder).saturating_sub(before);
+            assert_eq!(
+                predicted_growth,
+                actual_growth,
+                "allocation mismatch while appending point {}",
+                timestamp + 1
+            );
+        }
+    }
+
+    #[test]
+    fn full_head_reopen_charges_boundary_growth_and_fresh_initial_block() {
+        const POINT_CAP: usize = 64;
+        let initial = PendingChunkBuilderAllocation::initial_allocation_bytes(POINT_CAP);
+        let freeze_growth = POINT_CAP * std::mem::size_of::<ChunkPoint>()
+            + 4 * std::mem::size_of::<Arc<Vec<ChunkPoint>>>()
+            + std::mem::size_of::<Vec<ChunkPoint>>();
+        let head_entry = std::mem::size_of::<state::ActivePartitionHead>()
+            + std::mem::size_of::<(WalHighWatermark, usize)>();
+
+        let mut planner = PendingPartitionHeadState::new(POINT_CAP);
+        planner.rotate_partition_if_needed(1, 1_000, 8).unwrap();
+        for _ in 0..POINT_CAP {
+            planner.append_point();
+            planner.rotate_full_if_needed();
+        }
+
+        assert_eq!(
+            planner.allocation_growth_bytes(),
+            head_entry + initial + freeze_growth + initial
+        );
     }
 }

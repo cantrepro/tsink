@@ -57,6 +57,26 @@ pub enum UStorageRuntimeMode {
     ComputeOnly,
 }
 
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum UResourceProfile {
+    Test,
+    Embedded,
+    Edge,
+    Server,
+    ExpertUnlimited,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum UResourceProfileName {
+    Unreported,
+    Test,
+    Embedded,
+    Edge,
+    Server,
+    Custom,
+    ExpertUnlimited,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum UMemoryPressureLevel {
     Normal,

@@ -104,7 +104,7 @@ pub(crate) async fn handle_instant_query_with_admission(
             }
             response
         }
-        Ok(Err(err)) => promql_error_response("execution", &err.to_string()),
+        Ok(Err(err)) => promql_execution_error_response(&err),
         Err(err) => promql_error_response("execution", &format!("query task failed: {err}")),
     }
 }
@@ -235,8 +235,51 @@ pub(crate) async fn handle_range_query_with_admission(
             }
             response
         }
-        Ok(Err(err)) => promql_error_response("execution", &err.to_string()),
+        Ok(Err(err)) => promql_execution_error_response(&err),
         Err(err) => promql_error_response("execution", &format!("query task failed: {err}")),
+    }
+}
+
+fn promql_execution_error_response(error: &tsink::promql::PromqlError) -> HttpResponse {
+    let tsink::promql::PromqlError::Storage(tsink::TsinkError::QueryBudget(query_error)) = error
+    else {
+        return promql_error_response("execution", &error.to_string());
+    };
+
+    let response = |status, error_type: &str, error_code: &str| {
+        json_response(
+            status,
+            &json!({
+                "status": "error",
+                "errorType": error_type,
+                "error": error.to_string(),
+            }),
+        )
+        .with_header(READ_ERROR_CODE_HEADER, error_code)
+    };
+
+    match query_error {
+        tsink::QueryBudgetError::InvalidLimits(_) => {
+            response(400, "invalid_query_limits", "invalid_query_limits")
+        }
+        tsink::QueryBudgetError::LimitExceeded(exceeded) => {
+            let code = format!("query_limit_{}", exceeded.reason.as_str());
+            let retryable = matches!(
+                exceeded.reason,
+                tsink::QueryLimitReason::ConcurrentQueries
+                    | tsink::QueryLimitReason::SharedMemoryBytes
+            );
+            let mut response = response(if retryable { 429 } else { 413 }, &code, &code);
+            if retryable {
+                response = response.with_header("Retry-After", "1");
+            }
+            response
+        }
+        tsink::QueryBudgetError::Cancelled => response(503, "canceled", "query_cancelled"),
+        tsink::QueryBudgetError::DeadlineExceeded => {
+            response(503, "timeout", "query_deadline_exceeded")
+        }
+        _ => promql_error_response("execution", &error.to_string()),
     }
 }
 
@@ -626,6 +669,62 @@ mod tests {
 
     type LabelPair<'a> = (&'a str, &'a str);
     type ExemplarInput<'a> = (i64, f64, &'a [LabelPair<'a>]);
+
+    fn query_budget_promql_error(error: tsink::QueryBudgetError) -> tsink::promql::PromqlError {
+        tsink::promql::PromqlError::Storage(tsink::TsinkError::QueryBudget(error))
+    }
+
+    fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn query_budget_errors_have_stable_http_mappings() {
+        let steps = promql_execution_error_response(&query_budget_promql_error(
+            tsink::QueryBudgetError::LimitExceeded(tsink::QueryLimitExceeded::new(
+                tsink::QueryLimitReason::Steps,
+                2,
+                0,
+                3,
+            )),
+        ));
+        assert_eq!(steps.status, 413);
+        assert_eq!(
+            response_header(&steps, READ_ERROR_CODE_HEADER),
+            Some("query_limit_steps")
+        );
+        let body: JsonValue = serde_json::from_slice(&steps.body).unwrap();
+        assert_eq!(body["errorType"], "query_limit_steps");
+
+        let concurrency = promql_execution_error_response(&query_budget_promql_error(
+            tsink::QueryBudgetError::LimitExceeded(tsink::QueryLimitExceeded::new(
+                tsink::QueryLimitReason::ConcurrentQueries,
+                1,
+                1,
+                1,
+            )),
+        ));
+        assert_eq!(concurrency.status, 429);
+        assert_eq!(response_header(&concurrency, "Retry-After"), Some("1"));
+
+        let cancelled = promql_execution_error_response(&query_budget_promql_error(
+            tsink::QueryBudgetError::Cancelled,
+        ));
+        assert_eq!(cancelled.status, 503);
+        let body: JsonValue = serde_json::from_slice(&cancelled.body).unwrap();
+        assert_eq!(body["errorType"], "canceled");
+
+        let deadline = promql_execution_error_response(&query_budget_promql_error(
+            tsink::QueryBudgetError::DeadlineExceeded,
+        ));
+        assert_eq!(deadline.status, 503);
+        let body: JsonValue = serde_json::from_slice(&deadline.body).unwrap();
+        assert_eq!(body["errorType"], "timeout");
+    }
 
     fn exemplar_series(
         metric: &str,

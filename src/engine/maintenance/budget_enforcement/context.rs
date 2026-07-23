@@ -131,46 +131,53 @@ impl<'a> BudgetEnforcementContext<'a> {
         }
     }
 
-    pub(in crate::engine::storage_engine) fn evict_persisted_sealed_chunks(self) -> usize {
-        let persisted = self.persisted_sealed.persisted_chunk_watermarks.read();
-        let persisted_index = self.persisted_sealed.persisted_index.read();
+    pub(in crate::engine::storage_engine) fn evict_selected_persisted_sealed_chunks(
+        self,
+        selected: &[PendingSealedChunkLocation],
+    ) -> usize {
         let mut evicted = 0usize;
 
-        for (shard_idx, shard) in self.persisted_sealed.sealed_chunks.iter().enumerate() {
+        // Flush publication has already installed the selected chunks in the persisted view.
+        // Follow its exact locators here instead of rediscovering them by scanning every sealed
+        // series and comparing the complete persisted index.
+        for location in selected {
+            #[cfg(test)]
+            self.persisted_sealed.invoke_exact_eviction_inspect_hook();
+
+            let Some(shard) = self.persisted_sealed.sealed_chunks.get(location.shard_idx) else {
+                debug_assert!(false, "selected sealed chunk shard must be valid");
+                continue;
+            };
             let mut sealed = shard.write();
-            let mut removed_bytes = 0usize;
-            sealed.retain(|series_id, chunks| {
-                let persisted_sequence = persisted.get(series_id).copied().unwrap_or(0);
-                let persisted_chunks = persisted_index
-                    .chunk_refs
-                    .get(series_id)
-                    .map(|chunks| chunks.as_slice());
-
-                chunks.retain(|key, chunk| {
-                    let remove = key.sequence <= persisted_sequence
-                        && Self::sealed_chunk_is_present_in_persisted_chunks(
-                            persisted_chunks,
-                            *key,
-                            chunk,
-                        );
-                    if remove {
-                        evicted = evicted.saturating_add(1);
-                        if self.persisted_sealed.memory.accounting_enabled {
-                            removed_bytes = removed_bytes
-                                .saturating_add(ChunkStorage::chunk_memory_usage_bytes(chunk));
-                        }
-                    }
-                    !remove
-                });
-
-                !chunks.is_empty()
-            });
+            let Some(chunks) = sealed.get_mut(&location.series_id) else {
+                continue;
+            };
+            let Some(chunk) = chunks.get(&location.sealed_key) else {
+                continue;
+            };
+            if chunk.wal_lowwater != location.wal_lowwater
+                || chunk.wal_highwater != location.wal_highwater
+            {
+                debug_assert!(false, "selected sealed chunk WAL range must remain stable");
+                continue;
+            }
+            let removed_chunk = chunks.remove(&location.sealed_key);
+            if chunks.is_empty() {
+                sealed.remove(&location.series_id);
+            }
+            let Some(removed_chunk) = removed_chunk else {
+                continue;
+            };
             if self.persisted_sealed.memory.accounting_enabled {
                 self.persisted_sealed.memory.account_memory_delta(
-                    shard_idx,
-                    MemoryDeltaBytes::from_totals(0, removed_bytes),
+                    location.shard_idx,
+                    MemoryDeltaBytes::from_totals(
+                        0,
+                        ChunkStorage::chunk_memory_usage_bytes(&removed_chunk),
+                    ),
                 );
             }
+            evicted = evicted.saturating_add(1);
         }
 
         evicted

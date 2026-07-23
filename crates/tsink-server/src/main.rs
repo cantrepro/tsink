@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{error::ErrorKind, Parser};
-use tsink::{StorageRuntimeMode, TimestampPrecision, WalSyncMode};
+use tsink::{ResourceProfile, StorageRuntimeMode, TimestampPrecision, WalSyncMode};
 
 use crate::cluster::config::{
     ClusterConfig, ClusterInternalMtlsConfig, ClusterNodeRole, ClusterReadConsistency,
@@ -33,6 +33,15 @@ use crate::cluster::config::{
     DEFAULT_CLUSTER_SHARDS,
 };
 use crate::server::{run_server, ServerConfig};
+use crate::usage::{
+    UsageLedgerLimits, DEFAULT_USAGE_EXPORT_MAX_RECORDS, DEFAULT_USAGE_EXPORT_MAX_RESPONSE_BYTES,
+    DEFAULT_USAGE_EXPORT_RECORDS, DEFAULT_USAGE_LEDGER_MAX_BATCH_RECORDS,
+    DEFAULT_USAGE_LEDGER_MAX_FRAME_BYTES, DEFAULT_USAGE_LEDGER_MAX_LINE_BYTES,
+    DEFAULT_USAGE_LEDGER_MAX_RECORD_BYTES, DEFAULT_USAGE_LEDGER_MAX_SEQUENCE_RANGES,
+    DEFAULT_USAGE_LEDGER_MAX_TENANTS, DEFAULT_USAGE_LEDGER_RECENT_RECORDS,
+    DEFAULT_USAGE_LEDGER_STARTUP_SCRATCH_BYTES, DEFAULT_USAGE_REPORT_MAX_RECORDS,
+    DEFAULT_USAGE_REPORT_MAX_RESPONSE_BYTES, DEFAULT_USAGE_REPORT_RECORDS,
+};
 
 #[tokio::main]
 async fn main() {
@@ -149,6 +158,13 @@ struct ServerCliArgs {
     data_path: Option<PathBuf>,
     #[arg(
         long,
+        value_name = "PROFILE",
+        value_parser = parse_resource_profile,
+        help = "Core resource profile: test, embedded, edge, server, or expert-unlimited (default: server)"
+    )]
+    resource_profile: Option<ResourceProfile>,
+    #[arg(
+        long,
         value_name = "PATH",
         help = "Shared object-store root for hot/warm/cold segments"
     )]
@@ -224,6 +240,19 @@ struct ServerCliArgs {
     memory_limit: Option<usize>,
     #[arg(
         long,
+        value_name = "N",
+        help = "Maximum logical items selected by one bounded maintenance pass"
+    )]
+    maintenance_max_items_per_pass: Option<usize>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        help = "Maximum modeled bytes selected by one bounded maintenance pass (must cover the accounted-memory limit)"
+    )]
+    maintenance_max_bytes_per_pass: Option<u64>,
+    #[arg(
+        long,
         value_name = "BYTES",
         value_parser = parse_byte_size_u64,
         help = "Shared byte limit for integrated local writers (core storage, metadata, exemplars, rules, usage ledger, and managed state)"
@@ -245,8 +274,157 @@ struct ServerCliArgs {
         help = "Local-disk capacity reserved for maintenance temporary output"
     )]
     maintenance_temp_reserve: u64,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Dedicated parent directory for bounded offline restore targets"
+    )]
+    offline_restore_root: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        help = "Finite logical byte limit for offline restore staging and targets"
+    )]
+    offline_restore_disk_limit: Option<u64>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size_u64,
+        default_value = "0",
+        help = "Filesystem free space that offline restore work must leave available"
+    )]
+    offline_restore_filesystem_free_headroom: u64,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_LEDGER_RECENT_RECORDS,
+        help = "Recent usage-ledger records retained in memory for paged reads"
+    )]
+    usage_ledger_recent_records: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_TENANTS,
+        help = "Maximum tenants tracked by exact usage summaries"
+    )]
+    usage_ledger_max_tenants: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_RECORD_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum encoded bytes for one usage-ledger record"
+    )]
+    usage_ledger_max_record_bytes: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_FRAME_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum encoded bytes for one usage-ledger JSON frame"
+    )]
+    usage_ledger_max_frame_bytes: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_LINE_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum bytes for one usage-ledger line including its newline"
+    )]
+    usage_ledger_max_line_bytes: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_BATCH_RECORDS,
+        help = "Maximum records in one atomic usage-ledger frame"
+    )]
+    usage_ledger_max_batch_records: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_LEDGER_STARTUP_SCRATCH_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum startup scratch envelope for usage-ledger parsing"
+    )]
+    usage_ledger_startup_scratch_bytes: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_LEDGER_MAX_SEQUENCE_RANGES,
+        help = "Maximum disjoint legacy sequence ranges validated at startup"
+    )]
+    usage_ledger_max_sequence_ranges: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_REPORT_RECORDS,
+        help = "Default records aggregated by a paged usage report"
+    )]
+    usage_report_default_records: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_REPORT_MAX_RECORDS,
+        help = "Maximum records aggregated by one paged usage report"
+    )]
+    usage_report_max_records: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_REPORT_MAX_RESPONSE_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum encoded bytes in one usage report response"
+    )]
+    usage_report_max_response_bytes: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_EXPORT_RECORDS,
+        help = "Default records returned by one raw usage export page"
+    )]
+    usage_export_default_records: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_USAGE_EXPORT_MAX_RECORDS,
+        help = "Maximum records returned by one raw usage export page"
+    )]
+    usage_export_max_records: usize,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_USAGE_EXPORT_MAX_RESPONSE_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum encoded NDJSON bytes in one raw usage export page"
+    )]
+    usage_export_max_response_bytes: usize,
     #[arg(long, value_name = "N", help = "Max unique series")]
     cardinality_limit: Option<usize>,
+    #[arg(long, value_name = "N", help = "Max labels per series")]
+    max_labels_per_series: Option<usize>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = parse_byte_size,
+        help = "Max cumulative metric and label bytes per series identity"
+    )]
+    max_series_identity_bytes: Option<usize>,
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "new_series_window",
+        help = "Max new series committed per creation-rate window"
+    )]
+    max_new_series_per_window: Option<usize>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_duration,
+        requires = "max_new_series_per_window",
+        help = "Fixed window for the new-series creation-rate limit"
+    )]
+    new_series_window: Option<Duration>,
     #[arg(long, value_name = "N", help = "Target points per chunk")]
     chunk_points: Option<usize>,
     #[arg(long, value_name = "N", help = "Concurrent writer threads")]
@@ -458,6 +636,7 @@ impl ServerCliArgs {
             graphite_listen: self.graphite_listen,
             graphite_tenant_id: self.graphite_tenant_id,
             data_path: self.data_path,
+            resource_profile: self.resource_profile,
             object_store_path: self.object_store_path,
             wal_enabled: self.wal_enabled,
             timestamp_precision: self.timestamp_precision,
@@ -468,10 +647,35 @@ impl ServerCliArgs {
             remote_segment_refresh_interval: self.remote_segment_refresh_interval,
             mirror_hot_segments_to_object_store: self.mirror_hot_segments_to_object_store,
             memory_limit: self.memory_limit,
+            maintenance_max_items_per_pass: self.maintenance_max_items_per_pass,
+            maintenance_max_bytes_per_pass: self.maintenance_max_bytes_per_pass,
             local_disk_limit: self.local_disk_limit,
             filesystem_free_headroom: self.filesystem_free_headroom,
             maintenance_temp_reserve: self.maintenance_temp_reserve,
+            offline_restore_root: self.offline_restore_root,
+            offline_restore_disk_limit: self.offline_restore_disk_limit,
+            offline_restore_filesystem_free_headroom: self.offline_restore_filesystem_free_headroom,
+            usage_ledger_limits: UsageLedgerLimits {
+                recent_records: self.usage_ledger_recent_records,
+                max_tenants: self.usage_ledger_max_tenants,
+                max_record_bytes: self.usage_ledger_max_record_bytes,
+                max_frame_bytes: self.usage_ledger_max_frame_bytes,
+                max_line_bytes: self.usage_ledger_max_line_bytes,
+                max_batch_records: self.usage_ledger_max_batch_records,
+                startup_scratch_bytes: self.usage_ledger_startup_scratch_bytes,
+                max_sequence_ranges: self.usage_ledger_max_sequence_ranges,
+                report_default_records: self.usage_report_default_records,
+                report_max_records: self.usage_report_max_records,
+                report_max_response_bytes: self.usage_report_max_response_bytes,
+                export_default_records: self.usage_export_default_records,
+                export_max_records: self.usage_export_max_records,
+                export_max_response_bytes: self.usage_export_max_response_bytes,
+            },
             cardinality_limit: self.cardinality_limit,
+            max_labels_per_series: self.max_labels_per_series,
+            max_series_identity_bytes: self.max_series_identity_bytes,
+            max_new_series_per_window: self.max_new_series_per_window,
+            new_series_window: self.new_series_window,
             chunk_points: self.chunk_points,
             max_writers: self.max_writers,
             wal_sync_mode: self.wal_sync_mode,
@@ -676,6 +880,21 @@ fn parse_storage_mode(value: &str) -> Result<StorageRuntimeMode, String> {
     }
 }
 
+fn parse_resource_profile(value: &str) -> Result<ResourceProfile, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "test" => Ok(ResourceProfile::Test),
+        "embedded" => Ok(ResourceProfile::Embedded),
+        "edge" => Ok(ResourceProfile::Edge),
+        "server" => Ok(ResourceProfile::Server),
+        "expert-unlimited" | "expert_unlimited" | "unlimited" => {
+            Ok(ResourceProfile::ExpertUnlimited)
+        }
+        _ => Err(format!(
+            "invalid resource profile '{value}', expected one of: test, embedded, edge, server, expert-unlimited"
+        )),
+    }
+}
+
 fn parse_wal_sync_mode(value: &str) -> Result<WalSyncMode, String> {
     match value.to_ascii_lowercase().as_str() {
         "per-append" | "per_append" | "perappend" => Ok(WalSyncMode::PerAppend),
@@ -741,6 +960,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_resource_profile_and_rejects_unknown_names() {
+        let config = parse_server_args(
+            ["--resource-profile", "edge"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("named resource profile should parse");
+        assert_eq!(config.resource_profile, Some(ResourceProfile::Edge));
+
+        let error = parse_server_args(
+            ["--resource-profile", "bottomless"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("unknown resource profile must fail");
+        assert!(error.contains("invalid resource profile"), "{error}");
+    }
+
+    #[test]
+    fn parses_coupled_memory_and_maintenance_pass_limits() {
+        let config = parse_server_args(
+            [
+                "--memory-limit",
+                "128M",
+                "--maintenance-max-items-per-pass",
+                "2048",
+                "--maintenance-max-bytes-per-pass",
+                "128M",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("coupled resource overrides should parse");
+        assert_eq!(config.memory_limit, Some(128 * 1024 * 1024));
+        assert_eq!(config.maintenance_max_items_per_pass, Some(2048));
+        assert_eq!(
+            config.maintenance_max_bytes_per_pass,
+            Some(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
     fn parses_shared_local_disk_limit_flags() {
         let config = parse_server_args(
             [
@@ -761,6 +1022,105 @@ mod tests {
         assert_eq!(config.local_disk_limit, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(config.filesystem_free_headroom, 64 * 1024 * 1024);
         assert_eq!(config.maintenance_temp_reserve, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_offline_restore_disk_limit_flags() {
+        let config = parse_server_args(
+            [
+                "--offline-restore-root",
+                "/tmp/tsink-offline-restores",
+                "--offline-restore-disk-limit",
+                "3G",
+                "--offline-restore-filesystem-free-headroom",
+                "96M",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("offline restore disk flags should parse");
+
+        assert_eq!(
+            config.offline_restore_root,
+            Some(PathBuf::from("/tmp/tsink-offline-restores"))
+        );
+        assert_eq!(
+            config.offline_restore_disk_limit,
+            Some(3 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            config.offline_restore_filesystem_free_headroom,
+            96 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_usage_ledger_limit_flags() {
+        let config = parse_server_args(
+            [
+                "--usage-ledger-recent-records",
+                "64",
+                "--usage-ledger-max-tenants",
+                "8",
+                "--usage-report-default-records",
+                "4",
+                "--usage-report-max-records",
+                "8",
+                "--usage-export-default-records",
+                "5",
+                "--usage-export-max-records",
+                "10",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("usage ledger flags should parse");
+        assert_eq!(config.usage_ledger_limits.recent_records, 64);
+        assert_eq!(config.usage_ledger_limits.max_tenants, 8);
+        assert_eq!(config.usage_ledger_limits.report_default_records, 4);
+        assert_eq!(config.usage_ledger_limits.report_max_records, 8);
+        assert_eq!(config.usage_ledger_limits.export_default_records, 5);
+        assert_eq!(config.usage_ledger_limits.export_max_records, 10);
+
+        let err = parse_server_args(
+            [
+                "--usage-report-default-records",
+                "9",
+                "--usage-report-max-records",
+                "8",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("usage report default above maximum must fail");
+        assert!(err.contains("default records must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn offline_restore_root_and_finite_limit_are_paired() {
+        let missing_limit = parse_server_args(
+            ["--offline-restore-root", "/tmp/tsink-offline-restores"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("offline restore root without a finite limit should fail");
+        assert!(missing_limit.contains("requires --offline-restore-disk-limit"));
+
+        let missing_root = parse_server_args(
+            ["--offline-restore-disk-limit", "1G"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("offline restore limit without a root should fail");
+        assert!(missing_root.contains("require --offline-restore-root"));
+
+        let headroom_without_root = parse_server_args(
+            ["--offline-restore-filesystem-free-headroom", "1M"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("offline restore headroom without a root should fail");
+        assert!(headroom_without_root.contains("require --offline-restore-root"));
     }
 
     #[test]
@@ -983,6 +1343,8 @@ mod tests {
     #[test]
     fn cluster_enabled_requires_node_id() {
         let args = vec![
+            "--data-path".to_string(),
+            "/tmp/tsink-cluster".to_string(),
             "--cluster-enabled".to_string(),
             "true".to_string(),
             "--cluster-bind".to_string(),
@@ -995,6 +1357,8 @@ mod tests {
     #[test]
     fn cluster_enabled_requires_bind_address() {
         let args = vec![
+            "--data-path".to_string(),
+            "/tmp/tsink-cluster".to_string(),
             "--cluster-enabled".to_string(),
             "true".to_string(),
             "--cluster-node-id".to_string(),
@@ -1032,6 +1396,8 @@ mod tests {
     #[test]
     fn cluster_consistency_modes_parse() {
         let args = vec![
+            "--data-path".to_string(),
+            "/tmp/tsink-cluster".to_string(),
             "--cluster-enabled".to_string(),
             "true".to_string(),
             "--cluster-node-id".to_string(),
@@ -1076,6 +1442,8 @@ mod tests {
     #[test]
     fn cluster_internal_auth_token_parses() {
         let args = vec![
+            "--data-path".to_string(),
+            "/tmp/tsink-cluster".to_string(),
             "--cluster-enabled".to_string(),
             "true".to_string(),
             "--cluster-node-id".to_string(),
@@ -1134,6 +1502,8 @@ mod tests {
     #[test]
     fn cluster_query_role_and_compute_only_storage_mode_parse_together() {
         let args = vec![
+            "--data-path".to_string(),
+            "/tmp/tsink-cluster-query".to_string(),
             "--storage-mode".to_string(),
             "compute-only".to_string(),
             "--object-store-path".to_string(),

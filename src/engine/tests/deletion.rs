@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use super::*;
 use crate::engine::tombstone::{
-    fail_tombstone_manifest_rollback_once, referenced_tombstone_shard_files,
-    tombstone_store_sidecar_path, tombstone_transaction_peak_bytes_for_test, TombstoneRange,
+    fail_tombstone_transaction_once, referenced_tombstone_shard_files,
+    tombstone_store_sidecar_path, TombstoneRange, TombstoneTransactionTestPoint,
     TOMBSTONES_FILE_NAME,
 };
 use crate::label::stable_series_identity_hash;
@@ -50,7 +50,7 @@ fn clear_persisted_segments_but_keep_tombstones(data_path: &Path) {
 }
 
 fn read_rollup_state_file(data_path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(data_path.join(".rollups").join("state.json")).unwrap())
+    super::super::rollups::load_rollup_state_json(&data_path.join(".rollups").join("state.json"))
         .unwrap()
 }
 
@@ -213,6 +213,52 @@ fn delete_series_without_time_range_tombstones_all_matching_series() {
         storage.select("other_metric", &labels_a, 0, 10).unwrap(),
         vec![DataPoint::new(1, 3.0)]
     );
+}
+
+#[test]
+fn volatile_delete_rejects_publication_headroom_before_mutating_tombstones() {
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        16,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            memory_budget_bytes: 1_000_000,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "volatile_delete_budget_metric",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.refresh_memory_usage();
+    storage.memory.budget_bytes.store(
+        storage.memory_used().saturating_add(1) as u64,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let err = storage
+        .delete_series(&SeriesSelection::new().with_metric("volatile_delete_budget_metric"))
+        .expect_err("publication headroom must be admitted even without persistence lanes");
+    assert!(matches!(err, TsinkError::MemoryBudgetExceeded { .. }));
+    assert!(storage.visibility.tombstones.read().is_empty());
+    assert_eq!(
+        storage
+            .select("volatile_delete_budget_metric", &[], 0, 2)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    storage
+        .memory
+        .budget_bytes
+        .store(1_000_000, std::sync::atomic::Ordering::Release);
+    storage.close().unwrap();
 }
 
 #[test]
@@ -422,7 +468,7 @@ fn delete_series_tombstones_persist_across_restart() {
 }
 
 #[test]
-fn delete_series_second_lane_failure_is_invisible_same_process_and_after_restart() {
+fn delete_series_second_lane_failure_commits_and_recovers_every_lane() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().join("data");
     let labels = vec![Label::new("host", "transaction")];
@@ -459,62 +505,44 @@ fn delete_series_second_lane_failure_is_invisible_same_process_and_after_restart
         .observability_snapshot()
         .local_disk
         .expect("persistent storage should expose disk accounting");
-    // Tombstone paths are persisted in lexical order, so the blob manifest is committed before
-    // the numeric manifest for the standard dual-lane layout.
-    let numeric_lane_path = data_path.join(NUMERIC_LANE_ROOT);
-    let blob_tombstones_path = data_path.join(BLOB_LANE_ROOT).join(TOMBSTONES_FILE_NAME);
-    let sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
-        {
-            let blob_tombstones_path = blob_tombstones_path.clone();
-            move |candidate| candidate == numeric_lane_path && blob_tombstones_path.exists()
-        },
+    let sync_guard = fail_tombstone_transaction_once(
+        TombstoneTransactionTestPoint::BeforeManifest(1),
         "injected delete-series second-lane manifest failure",
     );
 
-    let err = storage
+    let result = storage
         .delete_series(
             &SeriesSelection::new()
                 .with_metric("transactional_delete_metric")
                 .with_matcher(SeriesMatcher::equal("host", "transaction")),
         )
-        .expect_err("the second-lane tombstone manifest failure must reject the delete");
-    assert!(
-        err.to_string()
-            .contains("injected delete-series second-lane manifest failure"),
-        "unexpected error: {err:?}"
-    );
-    assert_eq!(
-        storage
-            .select("transactional_delete_metric", &labels, 0, 20)
-            .unwrap(),
-        vec![point.clone()],
-        "a rejected delete must not publish in-memory tombstone visibility"
-    );
-    for lane_root in [NUMERIC_LANE_ROOT, BLOB_LANE_ROOT] {
-        let tombstones_path = data_path.join(lane_root).join(TOMBSTONES_FILE_NAME);
-        assert!(!tombstones_path.exists());
-        assert!(referenced_tombstone_shard_files(&tombstones_path)
-            .unwrap()
-            .is_empty());
-        let shards_dir = tombstone_store_sidecar_path(&tombstones_path).join("shards");
-        assert_eq!(
-            std::fs::read_dir(shards_dir)
-                .map(|entries| entries.count())
-                .unwrap_or(0),
-            0,
-            "a rejected delete must remove every staged shard"
-        );
-    }
+        .expect("the durable Committing coordinator makes a later local-lane failure committed");
+    assert_eq!(result.matched_series, 1);
+    assert_eq!(result.tombstones_applied, 1);
+    assert!(storage
+        .select("transactional_delete_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+    let first_manifest = data_path.join(NUMERIC_LANE_ROOT).join(TOMBSTONES_FILE_NAME);
+    assert!(first_manifest.is_file());
+    assert!(!referenced_tombstone_shard_files(&first_manifest)
+        .unwrap()
+        .is_empty());
+    let coordinator = data_path
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME);
+    assert!(coordinator.is_file());
     let after = storage
         .observability_snapshot()
         .local_disk
         .expect("persistent storage should expose disk accounting");
-    assert_eq!(after.accounted_bytes, before.accounted_bytes);
+    assert!(after.accounted_bytes >= before.accounted_bytes);
     assert_eq!(after.reserved_bytes, 0);
     assert_eq!(after.active_reservations, 0);
 
     drop(sync_guard);
-    storage.close().unwrap();
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
 
     let reopened = builder_at_time(10)
         .with_data_path(&data_path)
@@ -524,13 +552,18 @@ fn delete_series_second_lane_failure_is_invisible_same_process_and_after_restart
         .with_background_threads_enabled_for_tests(false)
         .build()
         .unwrap();
-    assert_eq!(
-        reopened
-            .select("transactional_delete_metric", &labels, 0, 20)
-            .unwrap(),
-        vec![point],
-        "a rejected delete must remain invisible after reopening storage"
-    );
+    assert!(!coordinator.exists());
+    assert!(reopened
+        .select("transactional_delete_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+    for lane_root in [NUMERIC_LANE_ROOT, BLOB_LANE_ROOT] {
+        let tombstones_path = data_path.join(lane_root).join(TOMBSTONES_FILE_NAME);
+        assert!(tombstones_path.is_file());
+        assert!(!referenced_tombstone_shard_files(&tombstones_path)
+            .unwrap()
+            .is_empty());
+    }
     reopened.close().unwrap();
 }
 
@@ -565,6 +598,7 @@ fn delete_series_tiny_quota_rejects_before_any_tombstone_lane_mutates() {
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(1)
         .with_wal_enabled(false)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_local_disk_limit(1)
         .with_background_threads_enabled_for_tests(false)
         .build()
@@ -629,15 +663,13 @@ fn delete_series_tiny_quota_rejects_before_any_tombstone_lane_mutates() {
 }
 
 #[test]
-fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
+fn tombstone_prepublication_failure_cancels_durable_pending_rollup_invalidation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().join("data");
     let labels = vec![Label::new("host", "rollup-quota")];
     let point = DataPoint::new(10, 1.0);
-    let series_id;
-
     {
         let storage = persistent_rollup_storage(&data_path);
         storage
@@ -647,13 +679,6 @@ fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
                 point.clone(),
             )])
             .unwrap();
-        series_id = storage
-            .catalog
-            .registry
-            .read()
-            .resolve_existing("rollup_quota_delete_metric", &labels)
-            .unwrap()
-            .series_id;
         storage
             .apply_rollup_policies(vec![crate::storage::RollupPolicy {
                 id: "rollup_quota_policy".to_string(),
@@ -667,45 +692,17 @@ fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
         storage.close().unwrap();
     }
 
-    let sizing_budget =
-        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
-    let baseline_bytes = sizing_budget.snapshot().accounted_bytes;
     let tombstone_paths = [
         data_path.join(BLOB_LANE_ROOT).join(TOMBSTONES_FILE_NAME),
         data_path.join(NUMERIC_LANE_ROOT).join(TOMBSTONES_FILE_NAME),
     ];
-    let tombstone_updates = HashMap::from([(
-        series_id,
-        vec![TombstoneRange {
-            start: i64::MIN,
-            end: i64::MAX,
-        }],
-    )]);
-    let tombstone_peak = tombstone_transaction_peak_bytes_for_test(
-        &tombstone_paths,
-        &tombstone_updates,
-        &sizing_budget,
-    )
-    .unwrap();
-    assert!(tombstone_peak > 1);
-    drop(sizing_budget);
-    let disk_limit = baseline_bytes
-        .checked_add(tombstone_peak - 1)
-        .expect("test disk limit should be representable");
-
-    let limited_budget = crate::LocalDiskBudget::open(
-        &data_path,
-        crate::LocalDiskLimits {
-            max_bytes: Some(disk_limit),
-            ..crate::LocalDiskLimits::default()
-        },
-    )
-    .unwrap();
-    let storage = reopen_persistent_rollup_storage_with_disk_budget(&data_path, limited_budget);
+    let local_disk_budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = reopen_persistent_rollup_storage_with_disk_budget(&data_path, local_disk_budget);
     let before = storage
         .observability_snapshot()
         .local_disk
-        .expect("disk-limited storage should expose accounting");
+        .expect("persistent storage should expose accounting");
     let rollup_persist_calls = Arc::new(AtomicUsize::new(0));
     storage.set_rollup_state_persist_hook({
         let rollup_persist_calls = Arc::clone(&rollup_persist_calls);
@@ -714,6 +711,19 @@ fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
             Ok(())
         }
     });
+    let shards_dir = std::fs::canonicalize(&data_path)
+        .unwrap()
+        .join(BLOB_LANE_ROOT)
+        .join(
+            tombstone_store_sidecar_path(Path::new(TOMBSTONES_FILE_NAME))
+                .file_name()
+                .unwrap(),
+        )
+        .join("shards");
+    let sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |candidate| candidate == shards_dir,
+        "injected prepublication tombstone shard sync failure",
+    );
 
     let err = storage
         .delete_series(
@@ -721,14 +731,11 @@ fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
                 .with_metric("rollup_quota_delete_metric")
                 .with_matcher(SeriesMatcher::equal("host", "rollup-quota")),
         )
-        .expect_err("the aggregate tombstone transaction should exceed the remaining quota");
+        .expect_err("the tombstone shard sync failure should reject the delete");
     storage.clear_rollup_state_persist_hook();
     assert!(
-        matches!(
-            &err,
-            TsinkError::DiskQuotaExceeded { .. }
-                | TsinkError::InsufficientCompactionHeadroom { .. }
-        ),
+        err.to_string()
+            .contains("injected prepublication tombstone shard sync failure"),
         "unexpected error: {err:?}"
     );
     assert_eq!(
@@ -750,16 +757,23 @@ fn tombstone_quota_rejection_cancels_durable_pending_rollup_invalidation() {
     );
     for tombstones_path in &tombstone_paths {
         assert!(!tombstones_path.exists());
-        assert!(!tombstone_store_sidecar_path(tombstones_path).exists());
+        assert!(referenced_tombstone_shard_files(tombstones_path)
+            .unwrap()
+            .is_empty());
     }
     let after = storage
         .observability_snapshot()
         .local_disk
-        .expect("disk-limited storage should expose accounting");
-    assert_eq!(after.accounted_bytes, before.accounted_bytes);
+        .expect("persistent storage should expose accounting");
+    assert!(
+        after.accounted_bytes <= before.accounted_bytes,
+        "cancellation may compact journaled source state into the full snapshot, but must not retain rollback growth: before={}, after={}",
+        before.accounted_bytes,
+        after.accounted_bytes
+    );
     assert_eq!(after.reserved_bytes, 0);
     assert_eq!(after.active_reservations, 0);
-    assert_eq!(after.rejections_total, before.rejections_total + 1);
+    drop(sync_guard);
     storage.close().unwrap();
 
     let reopened = reopen_persistent_rollup_storage(&data_path);
@@ -864,17 +878,9 @@ fn indeterminate_tombstone_rollback_retains_pending_rollup_marker_and_live_shard
 
     let blob_tombstones_path = data_path.join(BLOB_LANE_ROOT).join(TOMBSTONES_FILE_NAME);
     let numeric_tombstones_path = data_path.join(NUMERIC_LANE_ROOT).join(TOMBSTONES_FILE_NAME);
-    let rollback_guard = fail_tombstone_manifest_rollback_once(
-        blob_tombstones_path.clone(),
-        "injected first-lane tombstone manifest restore failure",
-    );
-    let sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
-        {
-            let numeric_lane_path = data_path.join(NUMERIC_LANE_ROOT);
-            let blob_tombstones_path = blob_tombstones_path.clone();
-            move |candidate| candidate == numeric_lane_path && blob_tombstones_path.exists()
-        },
-        "injected second-lane tombstone manifest publication failure",
+    let decision_guard = fail_tombstone_transaction_once(
+        TombstoneTransactionTestPoint::AmbiguousCommitDecision,
+        "injected ambiguous tombstone commit decision",
     );
 
     let err = storage
@@ -884,10 +890,10 @@ fn indeterminate_tombstone_rollback_retains_pending_rollup_marker_and_live_shard
                 .with_matcher(SeriesMatcher::equal("host", "indeterminate"))
                 .with_time_range(1_000, 2_000),
         )
-        .expect_err("a failed manifest restore must leave the delete outcome indeterminate");
+        .expect_err("an ambiguous commit decision must leave the delete outcome indeterminate");
     assert!(
         err.to_string()
-            .contains("injected first-lane tombstone manifest restore failure"),
+            .contains("injected ambiguous tombstone commit decision"),
         "unexpected error: {err:?}"
     );
     assert_eq!(
@@ -896,30 +902,33 @@ fn indeterminate_tombstone_rollback_retains_pending_rollup_marker_and_live_shard
             .unwrap()
             .len(),
         1,
-        "an indeterminate tombstone rollback must retain its durable rollup safety marker"
+        "an indeterminate commit decision must retain its durable rollup safety marker"
     );
     assert!(!numeric_tombstones_path.exists());
-    let live_shards = referenced_tombstone_shard_files(&blob_tombstones_path).unwrap();
-    let live_shard_name = live_shards.into_iter().flatten().next().unwrap();
-    let live_shard_path = tombstone_store_sidecar_path(&blob_tombstones_path)
-        .join("shards")
-        .join(live_shard_name);
+    assert!(!blob_tombstones_path.exists());
+    assert!(data_path
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME)
+        .is_file());
+    let deleted_series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("indeterminate_delete_metric", &labels)
+        .unwrap()
+        .series_id;
+    let blob_shards_dir = tombstone_store_sidecar_path(&blob_tombstones_path).join("shards");
+    let live_shard_path = std::fs::read_dir(&blob_shards_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .expect("the indeterminate transaction must preserve its candidate shard");
     assert!(live_shard_path.is_file());
-    assert_eq!(
-        crate::engine::tombstone::load_tombstones(&blob_tombstones_path).unwrap(),
-        HashMap::from([(
-            storage
-                .catalog
-                .registry
-                .read()
-                .resolve_existing("indeterminate_delete_metric", &labels)
-                .unwrap()
-                .series_id,
-            vec![TombstoneRange {
-                start: 1_000,
-                end: 2_000,
-            }],
-        )])
+    assert!(
+        crate::engine::tombstone::load_tombstones(&blob_tombstones_path)
+            .unwrap()
+            .is_empty(),
+        "no lane manifest may be published after an ambiguous commit decision"
     );
 
     assert_eq!(
@@ -942,15 +951,52 @@ fn indeterminate_tombstone_rollback_retains_pending_rollup_marker_and_live_shard
         "the failed delete must not serve a rollup candidate covered by its pending marker"
     );
 
-    drop(sync_guard);
-    drop(rollback_guard);
+    drop(decision_guard);
     storage
         .coordination
         .lifecycle
         .store(super::super::STORAGE_CLOSED, Ordering::SeqCst);
     drop(storage);
 
+    let recovery_lanes = [
+        crate::engine::tombstone::TombstoneLane {
+            role: crate::engine::tombstone::TombstoneLaneRole::LocalNumeric,
+            namespace_root: data_path.clone(),
+            manifest_path: numeric_tombstones_path.clone(),
+        },
+        crate::engine::tombstone::TombstoneLane {
+            role: crate::engine::tombstone::TombstoneLaneRole::LocalBlob,
+            namespace_root: data_path.clone(),
+            manifest_path: blob_tombstones_path.clone(),
+        },
+    ];
+    assert_eq!(
+        crate::engine::tombstone::recover_tombstone_transaction(&data_path, &recovery_lanes, None,)
+            .unwrap(),
+        crate::engine::tombstone::TombstoneRecoveryOutcome::RolledForwardCommitted
+    );
+
     let reopened = reopen_persistent_rollup_storage(&data_path);
+    assert!(live_shard_path.is_file());
+    assert!(!data_path
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME)
+        .exists());
+    let expected_tombstones = HashMap::from([(
+        deleted_series_id,
+        vec![TombstoneRange {
+            start: 1_000,
+            end: 2_000,
+        }],
+    )]);
+    assert_eq!(
+        crate::engine::tombstone::load_tombstones(&numeric_tombstones_path).unwrap(),
+        expected_tombstones
+    );
+    assert_eq!(
+        crate::engine::tombstone::load_tombstones(&blob_tombstones_path).unwrap(),
+        expected_tombstones
+    );
     assert_eq!(
         reopened
             .select_with_options("indeterminate_delete_metric", query)
@@ -1043,6 +1089,263 @@ fn committed_delete_reports_success_when_post_commit_cache_cleanup_fails() {
         .unwrap()
         .is_empty());
     reopened.close().unwrap();
+}
+
+#[test]
+fn catalog_refresh_recovers_committing_tombstone_before_manifest_reload() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let labels = vec![Label::new("host", "catalog-recovery")];
+    let point = DataPoint::new(10, 1.0);
+    {
+        let storage = persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+        storage
+            .insert_rows(&[Row::with_labels(
+                "catalog_recovery_delete_metric",
+                labels.clone(),
+                point.clone(),
+            )])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = reopen_persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+    let guard = fail_tombstone_transaction_once(
+        TombstoneTransactionTestPoint::BeforeManifest(0),
+        "injected committed coordinator before first manifest",
+    );
+    let result = storage
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("catalog_recovery_delete_metric")
+                .with_matcher(SeriesMatcher::equal("host", "catalog-recovery")),
+        )
+        .expect("a durable Committing decision must retain committed delete semantics");
+    assert_eq!(result.tombstones_applied, 1);
+    let coordinator = data_path
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME);
+    assert!(coordinator.is_file());
+    assert!(storage
+        .select("catalog_recovery_delete_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+
+    drop(guard);
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(!coordinator.exists());
+    assert!(storage
+        .select("catalog_recovery_delete_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+    storage.close().unwrap();
+}
+
+#[test]
+fn catalog_tombstone_swap_clears_stale_cache_when_refresh_fails() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let labels = vec![Label::new("host", "cache-repair")];
+    let point = DataPoint::new(10, 1.0);
+    {
+        let storage = persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+        storage
+            .insert_rows(&[Row::with_labels(
+                "catalog_cache_repair_metric",
+                labels.clone(),
+                point.clone(),
+            )])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = reopen_persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+    assert_eq!(
+        storage
+            .select("catalog_cache_repair_metric", &labels, 0, 20)
+            .unwrap(),
+        vec![point]
+    );
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("catalog_cache_repair_metric", &labels)
+        .unwrap()
+        .series_id;
+    crate::engine::tombstone::persist_tombstone_updates(
+        &data_path.join(NUMERIC_LANE_ROOT).join(TOMBSTONES_FILE_NAME),
+        &std::collections::HashMap::from([(series_id, vec![TombstoneRange { start: 0, end: 20 }])]),
+    )
+    .unwrap();
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_tombstone_post_commit_error_hook({
+        let hook_calls = Arc::clone(&hook_calls);
+        move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            Err(TsinkError::Other(
+                "injected catalog visibility refresh failure".to_string(),
+            ))
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    storage.clear_tombstone_post_commit_error_hook();
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert!(storage
+        .select("catalog_cache_repair_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+
+    // A no-diff retry cannot repair the swapped map itself; the first publication must already
+    // have cleared stale summaries and bumped the visibility generation.
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage
+        .select("catalog_cache_repair_metric", &labels, 0, 20)
+        .unwrap()
+        .is_empty());
+    storage.close().unwrap();
+}
+
+#[test]
+fn catalog_failure_after_tombstone_swap_stays_conservative_through_retry() {
+    use super::super::maintenance::{PersistedCatalogPublication, PersistedCatalogTransition};
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let labels = vec![Label::new("host", "catalog-late-failure")];
+    {
+        let storage = persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+        storage
+            .insert_rows(&[Row::with_labels(
+                "catalog_late_failure_metric",
+                labels.clone(),
+                DataPoint::new(10, 1.0),
+            )])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let mut conflicting = load_segment_indexes(&lane_path).unwrap();
+    let expected_series = conflicting.series.first().unwrap().clone();
+    let series_id = expected_series.series_id;
+    crate::engine::tombstone::persist_tombstone_updates(
+        &lane_path.join(TOMBSTONES_FILE_NAME),
+        &std::collections::HashMap::from([(series_id, vec![TombstoneRange { start: 0, end: 20 }])]),
+    )
+    .unwrap();
+    for segment in &mut conflicting.indexed_segments {
+        for series in &mut segment.series {
+            if series.series_id == series_id {
+                series.metric = "conflicting_catalog_identity".to_string();
+            }
+        }
+    }
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        conflicting.next_segment_id,
+        ChunkStorageOptions {
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .catalog
+        .registry
+        .write()
+        .register_series_with_id(series_id, &expected_series.metric, &expected_series.labels)
+        .unwrap();
+
+    let first_transition = PersistedCatalogTransition {
+        visibility_fence: None,
+        loaded_segments: conflicting.indexed_segments,
+        removed_roots: Vec::new(),
+        publication: PersistedCatalogPublication::Inventory {
+            inventory: inventory.clone(),
+            refresh_tombstones: true,
+        },
+        registry_catalog_update: None,
+    };
+    let err = match storage
+        .begin_persisted_catalog_publication()
+        .publish_transition(first_transition)
+    {
+        Err(err) => err,
+        Ok(_) => panic!("conflicting segment identity must fail after tombstone publication"),
+    };
+    assert!(matches!(
+        err,
+        TsinkError::DataCorruption(message)
+            if message.contains("already exists with a different series definition")
+    ));
+    assert!(storage
+        .visibility
+        .tombstones
+        .read()
+        .get(&series_id)
+        .is_some_and(|ranges| !ranges.is_empty()));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+
+    let valid = load_segment_indexes(&lane_path).unwrap();
+    let retry_transition = PersistedCatalogTransition {
+        visibility_fence: None,
+        loaded_segments: valid.indexed_segments,
+        removed_roots: Vec::new(),
+        publication: PersistedCatalogPublication::Inventory {
+            inventory,
+            refresh_tombstones: true,
+        },
+        registry_catalog_update: None,
+    };
+    storage
+        .begin_persisted_catalog_publication()
+        .publish_transition(retry_transition)
+        .unwrap();
+    assert!(storage
+        .select(&expected_series.metric, &expected_series.labels, 0, 20)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .visibility
+        .tombstones
+        .read()
+        .get(&series_id)
+        .is_some_and(|ranges| !ranges.is_empty()));
+    storage.close().unwrap();
 }
 
 #[test]
@@ -1290,6 +1593,241 @@ fn delete_series_persists_object_store_tombstones_for_compute_only_restart() {
             .is_empty());
         storage.close().unwrap();
     }
+}
+
+#[test]
+fn acknowledged_tiered_delete_publishes_shared_anchor_before_local_failure() {
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "shared-anchor")];
+    {
+        let storage = builder_at_time(3)
+            .with_data_path(data_dir.path())
+            .with_object_store_path(object_store_dir.path())
+            .with_mirror_hot_segments_to_object_store(true)
+            .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+            .with_retention(Duration::from_secs(100))
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_wal_enabled(false)
+            .with_background_threads_enabled_for_tests(false)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "shared_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    "shared_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(2, 2.0),
+                ),
+                Row::with_labels(
+                    "shared_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(3, 3.0),
+                ),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let writer = builder_at_time(3)
+        .with_data_path(data_dir.path())
+        .with_object_store_path(object_store_dir.path())
+        .with_mirror_hot_segments_to_object_store(true)
+        .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+        .with_retention(Duration::from_secs(100))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_enabled(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let compute_only = builder_at_time(3)
+        .with_object_store_path(object_store_dir.path())
+        .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
+        .with_remote_segment_refresh_interval(Duration::from_millis(1))
+        .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+        .with_retention(Duration::from_secs(100))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_enabled(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    assert_eq!(
+        compute_only
+            .select("shared_anchor_delete_metric", &labels, 0, 10)
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let guard = fail_tombstone_transaction_once(
+        TombstoneTransactionTestPoint::BeforeManifest(0),
+        "injected local manifest failure after shared visibility anchor",
+    );
+    let result = writer
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("shared_anchor_delete_metric")
+                .with_matcher(SeriesMatcher::equal("host", "shared-anchor"))
+                .with_time_range(2, 4),
+        )
+        .expect("the shared anchor makes a later local-manifest interruption committed");
+    assert_eq!(result.tombstones_applied, 1);
+    let coordinator = data_dir
+        .path()
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME);
+    assert!(coordinator.is_file());
+    drop(guard);
+    writer.abandon_without_close_for_tests().unwrap();
+    drop(writer);
+
+    std::thread::sleep(Duration::from_millis(5));
+    compute_only
+        .sync_persisted_segments_from_disk_if_dirty_for_tests()
+        .unwrap();
+    assert_eq!(
+        compute_only
+            .select("shared_anchor_delete_metric", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    assert!(
+        coordinator.is_file(),
+        "the reader cannot recover writer-local debt"
+    );
+    compute_only.close().unwrap();
+}
+
+#[test]
+fn tiered_delete_before_shared_anchor_is_indeterminate_and_not_remotely_visible() {
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "pre-anchor")];
+    {
+        let storage = builder_at_time(3)
+            .with_data_path(data_dir.path())
+            .with_object_store_path(object_store_dir.path())
+            .with_mirror_hot_segments_to_object_store(true)
+            .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+            .with_retention(Duration::from_secs(100))
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_wal_enabled(false)
+            .with_background_threads_enabled_for_tests(false)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "pre_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    "pre_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(2, 2.0),
+                ),
+                Row::with_labels(
+                    "pre_anchor_delete_metric",
+                    labels.clone(),
+                    DataPoint::new(3, 3.0),
+                ),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let writer = builder_at_time(3)
+        .with_data_path(data_dir.path())
+        .with_object_store_path(object_store_dir.path())
+        .with_mirror_hot_segments_to_object_store(true)
+        .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+        .with_retention(Duration::from_secs(100))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_enabled(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let compute_only = builder_at_time(3)
+        .with_object_store_path(object_store_dir.path())
+        .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
+        .with_remote_segment_refresh_interval(Duration::from_millis(1))
+        .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+        .with_retention(Duration::from_secs(100))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_enabled(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+
+    let guard = fail_tombstone_transaction_once(
+        // HotNumeric is the first shared lane and is deliberately published before manifest 0.
+        TombstoneTransactionTestPoint::BeforeManifest(2),
+        "injected interruption before the shared visibility anchor",
+    );
+    let err = writer
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("pre_anchor_delete_metric")
+                .with_matcher(SeriesMatcher::equal("host", "pre-anchor"))
+                .with_time_range(2, 4),
+        )
+        .expect_err("a delete interrupted before its shared anchor must be indeterminate");
+    assert!(err
+        .to_string()
+        .contains("before the shared visibility anchor"));
+    let coordinator = data_dir
+        .path()
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+        .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME);
+    assert!(coordinator.is_file());
+    drop(guard);
+    writer.abandon_without_close_for_tests().unwrap();
+    drop(writer);
+
+    std::thread::sleep(Duration::from_millis(5));
+    compute_only
+        .sync_persisted_segments_from_disk_if_dirty_for_tests()
+        .unwrap();
+    assert_eq!(
+        compute_only
+            .select("pre_anchor_delete_metric", &labels, 0, 10)
+            .unwrap()
+            .len(),
+        3,
+        "a compute-only reader must retain the predecessor before anchor publication"
+    );
+
+    let recovered_writer = builder_at_time(3)
+        .with_data_path(data_dir.path())
+        .with_object_store_path(object_store_dir.path())
+        .with_mirror_hot_segments_to_object_store(true)
+        .with_tiered_retention_policy(Duration::from_secs(10), Duration::from_secs(50))
+        .with_retention(Duration::from_secs(100))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_wal_enabled(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .expect("read-write restart must roll the committed transaction forward");
+    assert!(!coordinator.exists());
+    recovered_writer.close().unwrap();
+
+    std::thread::sleep(Duration::from_millis(5));
+    compute_only
+        .sync_persisted_segments_from_disk_if_dirty_for_tests()
+        .unwrap();
+    assert_eq!(
+        compute_only
+            .select("pre_anchor_delete_metric", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    compute_only.close().unwrap();
 }
 
 #[test]
@@ -2017,7 +2555,7 @@ fn full_series_delete_removes_rollup_backed_results() {
 }
 
 #[test]
-fn delete_series_repairs_pending_rollup_invalidation_after_restart() {
+fn delete_series_retains_durable_rollup_invalidation_when_finalize_is_interrupted() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let temp_dir = TempDir::new().unwrap();
@@ -2112,18 +2650,11 @@ fn delete_series_repairs_pending_rollup_invalidation_after_restart() {
     );
 
     let pending_state = read_rollup_state_file(temp_dir.path());
-    assert_eq!(
-        pending_state["pending_delete_invalidations"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(pending_state["checkpoints"]
+    assert!(pending_state["pending_delete_invalidations"]
         .as_array()
         .unwrap()
-        .iter()
-        .any(|entry| entry["policy_id"] == "cpu_2s_avg"));
+        .is_empty());
+    assert!(pending_state["checkpoints"].as_array().unwrap().is_empty());
 
     storage.close().unwrap();
 

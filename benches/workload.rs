@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,8 +19,9 @@ use tsink::engine::chunk::{ChunkPoint, ValueLane};
 use tsink::engine::wal::{FramedWal, SamplesBatchFrame, SeriesDefinitionFrame};
 use tsink::label::stable_series_identity_hash;
 use tsink::{
-    DataPoint, Label, MetadataShardScope, Row, SeriesMatcher, SeriesSelection, Storage,
-    StorageBuilder, TimestampPrecision, TsinkError, Value, WalSyncMode,
+    DataPoint, Label, MetadataShardScope, MetricSeries, QueryBudgetError, QueryCancellationToken,
+    QueryLimitReason, QueryWorkLimits, ResourceProfile, ResourceProfileName, Row, SeriesMatcher,
+    SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, Value, WalSyncMode,
     DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
 };
 
@@ -33,6 +34,9 @@ const WEIGHT_SCALE: u16 = 1000;
 
 #[derive(Debug, Clone)]
 struct WorkloadConfig {
+    resource_profile: ResourceProfile,
+    memory_limit_override_bytes: Option<usize>,
+    maintenance_max_bytes_override: Option<u64>,
     runs: usize,
     active_series: usize,
     shared_metric_names: bool,
@@ -40,6 +44,13 @@ struct WorkloadConfig {
     new_series_series_per_writer: usize,
     new_series_shared_metric_names: bool,
     new_series_cached_missing_label_names: usize,
+    query_saturation_bench: bool,
+    query_saturation_workers: usize,
+    query_saturation_series: usize,
+    query_saturation_points_per_series: usize,
+    query_saturation_series_per_query: usize,
+    query_saturation_writer_points: usize,
+    query_saturation_batch_size: usize,
     prime_all_series: bool,
     warmup_points: usize,
     measured_points: usize,
@@ -74,6 +85,11 @@ struct WorkloadConfig {
 impl WorkloadConfig {
     fn from_env() -> Self {
         Self {
+            resource_profile: parse_resource_profile_env(),
+            memory_limit_override_bytes: parse_optional_usize_env("TSINK_MEMORY_LIMIT_BYTES"),
+            maintenance_max_bytes_override: parse_optional_u64_env(
+                "TSINK_MAINTENANCE_MAX_BYTES_PER_PASS",
+            ),
             runs: parse_env("TSINK_BPP_RUNS", 5usize),
             active_series: parse_env("TSINK_ACTIVE_SERIES", SUITE_ACTIVE_SERIES_TARGET),
             shared_metric_names: parse_env_bool("TSINK_SHARED_METRIC_NAMES", false),
@@ -87,6 +103,22 @@ impl WorkloadConfig {
                 "TSINK_NEW_SERIES_CACHED_MISSING_LABEL_NAMES",
                 0usize,
             ),
+            query_saturation_bench: parse_env_bool("TSINK_QUERY_SATURATION_BENCH", false),
+            query_saturation_workers: parse_env("TSINK_QUERY_SATURATION_WORKERS", 0usize),
+            query_saturation_series: parse_env("TSINK_QUERY_SATURATION_SERIES", 4_096usize),
+            query_saturation_points_per_series: parse_env(
+                "TSINK_QUERY_SATURATION_POINTS_PER_SERIES",
+                64usize,
+            ),
+            query_saturation_series_per_query: parse_env(
+                "TSINK_QUERY_SATURATION_SERIES_PER_QUERY",
+                128usize,
+            ),
+            query_saturation_writer_points: parse_env(
+                "TSINK_QUERY_SATURATION_WRITER_POINTS",
+                100_000usize,
+            ),
+            query_saturation_batch_size: parse_env("TSINK_QUERY_SATURATION_BATCH_SIZE", 4_096usize),
             prime_all_series: parse_env_bool("TSINK_PRIME_ALL_SERIES", true),
             warmup_points: parse_env("TSINK_WARMUP_POINTS", 250_000usize),
             measured_points: parse_env("TSINK_MEASURE_POINTS", 1_000_000usize),
@@ -200,10 +232,31 @@ impl SeriesSlices {
 
 #[derive(Debug, Clone)]
 struct RunResult {
+    selected_profile: ResourceProfileName,
+    accounted_memory_limit_bytes: u64,
+    local_disk_limit_bytes: u64,
+    wal_limit_bytes: u64,
+    cardinality_limit: u64,
+    max_concurrent_writers: u64,
+    max_concurrent_queries: u64,
+    maintenance_max_items_per_pass: u64,
+    maintenance_max_bytes_per_pass: u64,
     retained_points: u64,
     late_rejected_points: u64,
+    max_post_write_accounted_memory_bytes: usize,
+    post_settle_accounted_memory_bytes: usize,
+    active_and_sealed_bytes: usize,
+    registry_bytes: usize,
+    metadata_cache_bytes: usize,
+    wal_series_definition_cache_bytes: usize,
+    write_transient_bytes: usize,
+    persisted_index_bytes: usize,
+    persisted_mmap_bytes: usize,
+    tombstone_bytes: usize,
+    local_disk_accounted_bytes_before_close: u64,
     persisted_bytes: u64,
     effective_bpp: f64,
+    process_peak_rss_bytes_so_far: Option<u64>,
     data_path: PathBuf,
 }
 
@@ -216,6 +269,29 @@ struct NewSeriesRunResult {
     writer_p95_ms: f64,
     writer_p99_ms: f64,
     writer_max_ms: f64,
+    process_peak_rss_bytes_so_far: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySaturationRunResult {
+    workers: usize,
+    seeded_series: usize,
+    seeded_points: usize,
+    series_per_query: usize,
+    queries_succeeded: usize,
+    query_points_returned: usize,
+    writer_points: usize,
+    elapsed: Duration,
+    query_p50_ms: f64,
+    query_p95_ms: f64,
+    query_max_ms: f64,
+    writer_ms: f64,
+    peak_active_queries: u64,
+    peak_shared_reserved_memory_bytes: u64,
+    concurrency_rejections: u64,
+    active_queries_after: u64,
+    shared_reserved_memory_bytes_after: u64,
+    process_peak_rss_bytes_so_far: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -609,7 +685,13 @@ fn insert_rows_with_late_write_retry(
             accepted_points: 0,
             late_rejected_points: rows.len() as u64,
         }),
-        Err(err) => Err(format!("insert failed: {err}")),
+        Err(err) => {
+            let snapshot = storage.observability_snapshot();
+            Err(format!(
+                "insert failed: {err}; memory={:?}; flush={:?}; storage_health={:?}",
+                snapshot.memory, snapshot.flush, snapshot.health,
+            ))
+        }
     }
 }
 
@@ -628,7 +710,15 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
         .map_err(|e| format!("failed to create data path {}: {e}", data_path.display()))?;
 
     let base_ts = current_unix_seconds().saturating_sub(3600);
-    let storage = StorageBuilder::new()
+    let mut storage_builder = StorageBuilder::new().with_resource_profile(cfg.resource_profile);
+    if let Some(memory_limit_bytes) = cfg.memory_limit_override_bytes {
+        storage_builder = storage_builder.with_memory_limit(memory_limit_bytes);
+    }
+    if let Some(maintenance_max_bytes) = cfg.maintenance_max_bytes_override {
+        storage_builder =
+            storage_builder.with_maintenance_max_bytes_per_pass(maintenance_max_bytes);
+    }
+    let storage = storage_builder
         .with_data_path(&data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_retention(Duration::from_secs(cfg.retention_seconds))
@@ -636,32 +726,55 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
         .with_max_active_partition_heads_per_series(cfg.max_active_partition_heads_per_series)
         .build()
         .map_err(|e| format!("storage build failed: {e}"))?;
+    let resource_configuration = storage.resource_configuration_snapshot();
+    if resource_configuration.selected_profile != cfg.resource_profile.name() {
+        return Err(format!(
+            "requested resource profile {} but storage selected {}",
+            resource_profile_label(cfg.resource_profile),
+            resource_profile_name_label(resource_configuration.selected_profile),
+        ));
+    }
 
     let mut generator = WorkloadGenerator::new(cfg.clone(), run_id, base_ts);
 
     let mut retained_points = 0u64;
     let mut late_rejected_points = 0u64;
+    let mut max_post_write_accounted_memory_bytes =
+        storage.observability_snapshot().memory.accounted_bytes;
     retained_points += generator.prime_all_series(|rows| {
-        insert_rows_with_late_write_retry(storage.as_ref(), rows)
-            .map_err(|e| format!("prime insert failed: {e}"))
+        let result = insert_rows_with_late_write_retry(storage.as_ref(), rows);
+        max_post_write_accounted_memory_bytes = max_post_write_accounted_memory_bytes
+            .max(storage.observability_snapshot().memory.accounted_bytes);
+        result.map_err(|e| format!("prime insert failed: {e}"))
     })?;
 
     let warmup_outcome = generator.ingest_points(cfg.warmup_points, false, |rows| {
-        insert_rows_with_late_write_retry(storage.as_ref(), rows)
-            .map_err(|e| format!("warmup insert failed: {e}"))
+        let result = insert_rows_with_late_write_retry(storage.as_ref(), rows);
+        max_post_write_accounted_memory_bytes = max_post_write_accounted_memory_bytes
+            .max(storage.observability_snapshot().memory.accounted_bytes);
+        result.map_err(|e| format!("warmup insert failed: {e}"))
     })?;
     retained_points = retained_points.saturating_add(warmup_outcome.accepted_points);
     late_rejected_points = late_rejected_points.saturating_add(warmup_outcome.late_rejected_points);
 
     let measured_outcome = generator.ingest_points(cfg.measured_points, true, |rows| {
-        insert_rows_with_late_write_retry(storage.as_ref(), rows)
-            .map_err(|e| format!("measure insert failed: {e}"))
+        let result = insert_rows_with_late_write_retry(storage.as_ref(), rows);
+        max_post_write_accounted_memory_bytes = max_post_write_accounted_memory_bytes
+            .max(storage.observability_snapshot().memory.accounted_bytes);
+        result.map_err(|e| format!("measure insert failed: {e}"))
     })?;
     retained_points = retained_points.saturating_add(measured_outcome.accepted_points);
     late_rejected_points =
         late_rejected_points.saturating_add(measured_outcome.late_rejected_points);
 
     std::thread::sleep(Duration::from_millis(cfg.settle_millis));
+    let observability = storage.observability_snapshot();
+    max_post_write_accounted_memory_bytes =
+        max_post_write_accounted_memory_bytes.max(observability.memory.accounted_bytes);
+    let local_disk_accounted_bytes_before_close = observability
+        .local_disk
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.accounted_bytes);
     storage
         .close()
         .map_err(|e| format!("storage close failed: {e}"))?;
@@ -682,10 +795,71 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
     let _temp_guard = temp_dir;
 
     Ok(RunResult {
+        selected_profile: resource_configuration.selected_profile,
+        accounted_memory_limit_bytes: resource_configuration
+            .resolved_limits
+            .storage
+            .accounted_memory_bytes
+            .ok_or_else(|| "selected profile did not expose a finite memory limit".to_string())?,
+        local_disk_limit_bytes: resource_configuration
+            .resolved_limits
+            .storage
+            .local_disk_bytes
+            .ok_or_else(|| {
+                "selected profile did not expose a finite local-disk limit".to_string()
+            })?,
+        wal_limit_bytes: resource_configuration
+            .resolved_limits
+            .storage
+            .wal_bytes
+            .ok_or_else(|| "selected profile did not expose a finite WAL limit".to_string())?,
+        cardinality_limit: resource_configuration
+            .resolved_limits
+            .storage
+            .cardinality
+            .ok_or_else(|| {
+                "selected profile did not expose a finite cardinality limit".to_string()
+            })?,
+        max_concurrent_writers: resource_configuration
+            .resolved_limits
+            .storage
+            .max_concurrent_writers
+            .ok_or_else(|| "selected profile did not expose a finite writer limit".to_string())?,
+        max_concurrent_queries: resource_configuration
+            .resolved_limits
+            .query
+            .max_concurrent_queries
+            .ok_or_else(|| {
+                "selected profile did not expose a finite query concurrency limit".to_string()
+            })?,
+        maintenance_max_items_per_pass: resource_configuration
+            .resolved_limits
+            .maintenance_max_items_per_pass
+            .ok_or_else(|| {
+                "selected profile did not expose a finite maintenance item limit".to_string()
+            })?,
+        maintenance_max_bytes_per_pass: resource_configuration
+            .resolved_limits
+            .maintenance_max_bytes_per_pass
+            .ok_or_else(|| {
+                "selected profile did not expose a finite maintenance byte limit".to_string()
+            })?,
         retained_points,
         late_rejected_points,
+        max_post_write_accounted_memory_bytes,
+        post_settle_accounted_memory_bytes: observability.memory.accounted_bytes,
+        active_and_sealed_bytes: observability.memory.active_and_sealed_bytes,
+        registry_bytes: observability.memory.registry_bytes,
+        metadata_cache_bytes: observability.memory.metadata_cache_bytes,
+        wal_series_definition_cache_bytes: observability.memory.wal_series_definition_cache_bytes,
+        write_transient_bytes: observability.memory.write_transient_bytes,
+        persisted_index_bytes: observability.memory.persisted_index_bytes,
+        persisted_mmap_bytes: observability.memory.persisted_mmap_bytes,
+        tombstone_bytes: observability.memory.tombstone_bytes,
+        local_disk_accounted_bytes_before_close,
         persisted_bytes,
         effective_bpp,
+        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
         data_path,
     })
 }
@@ -746,6 +920,7 @@ fn run_parallel_new_series_once(
         .map_err(|e| format!("failed to create data path {}: {e}", data_path.display()))?;
 
     let storage = StorageBuilder::new()
+        .with_resource_profile(cfg.resource_profile)
         .with_data_path(&data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_retention(Duration::from_secs(cfg.retention_seconds))
@@ -830,6 +1005,346 @@ fn run_parallel_new_series_once(
             .iter()
             .copied()
             .fold(0.0f64, |current, value| current.max(value)),
+        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
+    })
+}
+
+fn wait_for_query_saturation_start(gate: &(Mutex<bool>, Condvar)) -> Result<(), String> {
+    let (started, wake) = gate;
+    let mut started = started
+        .lock()
+        .map_err(|_| "query saturation start gate was poisoned".to_string())?;
+    while !*started {
+        started = wake
+            .wait(started)
+            .map_err(|_| "query saturation start gate was poisoned".to_string())?;
+    }
+    Ok(())
+}
+
+fn release_query_saturation_start(gate: &(Mutex<bool>, Condvar)) -> Result<(), String> {
+    let (started, wake) = gate;
+    let mut started = started
+        .lock()
+        .map_err(|_| "query saturation start gate was poisoned".to_string())?;
+    *started = true;
+    wake.notify_all();
+    Ok(())
+}
+
+fn run_query_saturation_once(
+    cfg: &WorkloadConfig,
+    run_id: usize,
+) -> Result<QuerySaturationRunResult, String> {
+    if cfg.query_saturation_series == 0
+        || cfg.query_saturation_points_per_series == 0
+        || cfg.query_saturation_series_per_query == 0
+        || cfg.query_saturation_writer_points == 0
+        || cfg.query_saturation_batch_size == 0
+    {
+        return Err("query saturation dimensions must all be greater than zero".to_string());
+    }
+    if cfg.query_saturation_series_per_query > cfg.query_saturation_series {
+        return Err(format!(
+            "query saturation series_per_query {} exceeds seeded series {}",
+            cfg.query_saturation_series_per_query, cfg.query_saturation_series
+        ));
+    }
+
+    let keep_root = env::var("TSINK_BPP_KEEP_DIR").ok();
+    let mut temp_dir: Option<TempDir> = None;
+    let data_path = if let Some(root) = keep_root {
+        PathBuf::from(root).join(format!("query-saturation-run-{run_id:02}"))
+    } else {
+        let created = TempDir::new().map_err(|e| format!("tempdir create failed: {e}"))?;
+        let path = created
+            .path()
+            .join(format!("query-saturation-run-{run_id:02}"));
+        temp_dir = Some(created);
+        path
+    };
+    fs::create_dir_all(&data_path)
+        .map_err(|e| format!("failed to create data path {}: {e}", data_path.display()))?;
+
+    let mut storage_builder = StorageBuilder::new().with_resource_profile(cfg.resource_profile);
+    if let Some(memory_limit_bytes) = cfg.memory_limit_override_bytes {
+        storage_builder = storage_builder.with_memory_limit(memory_limit_bytes);
+    }
+    if let Some(maintenance_max_bytes) = cfg.maintenance_max_bytes_override {
+        storage_builder =
+            storage_builder.with_maintenance_max_bytes_per_pass(maintenance_max_bytes);
+    }
+    let storage = storage_builder
+        .with_data_path(&data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_retention(Duration::from_secs(cfg.retention_seconds))
+        .with_partition_duration(Duration::from_secs(cfg.partition_seconds))
+        .with_max_active_partition_heads_per_series(cfg.max_active_partition_heads_per_series)
+        .build()
+        .map_err(|e| format!("storage build failed: {e}"))?;
+    let resource_configuration = storage.resource_configuration_snapshot();
+    let profile_query_workers = resource_configuration
+        .resolved_limits
+        .query
+        .max_concurrent_queries
+        .ok_or_else(|| "selected profile has no finite query concurrency limit".to_string())?
+        as usize;
+    let workers = if cfg.query_saturation_workers == 0 {
+        profile_query_workers
+    } else {
+        cfg.query_saturation_workers
+    };
+    if workers != profile_query_workers {
+        return Err(format!(
+            "query saturation requires exactly the profile limit ({profile_query_workers}) workers, got {workers}"
+        ));
+    }
+
+    let seeded_points = cfg
+        .query_saturation_series
+        .checked_mul(cfg.query_saturation_points_per_series)
+        .ok_or_else(|| "query saturation seed point count overflowed".to_string())?;
+    let base_ts = current_unix_seconds()
+        .saturating_sub(cfg.query_saturation_points_per_series as i64)
+        .saturating_sub(60);
+    let query_metric = "bench_query_saturation";
+    let mut seed_batch = Vec::with_capacity(cfg.query_saturation_batch_size);
+    for series_idx in 0..cfg.query_saturation_series {
+        for point_idx in 0..cfg.query_saturation_points_per_series {
+            seed_batch.push(Row::with_labels(
+                query_metric,
+                vec![
+                    Label::new("series", format!("s{series_idx}")),
+                    Label::new("run", format!("r{run_id}")),
+                ],
+                DataPoint::new(base_ts.saturating_add(point_idx as i64), point_idx as f64),
+            ));
+            if seed_batch.len() == cfg.query_saturation_batch_size {
+                storage
+                    .insert_rows(&seed_batch)
+                    .map_err(|e| format!("query saturation seed insert failed: {e}"))?;
+                seed_batch.clear();
+            }
+        }
+    }
+    if !seed_batch.is_empty() {
+        storage
+            .insert_rows(&seed_batch)
+            .map_err(|e| format!("query saturation seed insert failed: {e}"))?;
+    }
+
+    let start_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (admitted_tx, admitted_rx) = mpsc::channel();
+    let mut query_handles = Vec::with_capacity(workers);
+    for worker_id in 0..workers {
+        let worker_storage = Arc::clone(&storage);
+        let worker_gate = Arc::clone(&start_gate);
+        let worker_admitted = admitted_tx.clone();
+        let series = (0..cfg.query_saturation_series_per_query)
+            .map(|offset| {
+                let series_idx = (worker_id * cfg.query_saturation_series_per_query + offset)
+                    % cfg.query_saturation_series;
+                MetricSeries {
+                    name: query_metric.to_string(),
+                    labels: vec![
+                        Label::new("series", format!("s{series_idx}")),
+                        Label::new("run", format!("r{run_id}")),
+                    ],
+                }
+            })
+            .collect::<Vec<_>>();
+        let query_end = base_ts
+            .saturating_add(cfg.query_saturation_points_per_series as i64)
+            .saturating_add(1);
+        query_handles.push(thread::spawn(move || -> Result<(f64, usize), String> {
+            let execution = match worker_storage
+                .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            {
+                Ok(Some(execution)) => {
+                    let _ = worker_admitted.send(Ok(()));
+                    execution
+                }
+                Ok(None) => {
+                    let message = "built-in storage did not expose query admission".to_string();
+                    let _ = worker_admitted.send(Err(message.clone()));
+                    return Err(message);
+                }
+                Err(error) => {
+                    let message = format!("query worker admission failed: {error}");
+                    let _ = worker_admitted.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            wait_for_query_saturation_start(worker_gate.as_ref())?;
+            let started = Instant::now();
+            let result = worker_storage
+                .select_many_with_execution(&series, base_ts, query_end, &execution)
+                .map_err(|e| format!("query saturation select failed: {e}"))?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let returned_points = result.iter().map(|item| item.points.len()).sum();
+            Ok((elapsed_ms, returned_points))
+        }));
+    }
+    drop(admitted_tx);
+
+    let mut admission_error = None;
+    for _ in 0..workers {
+        match admitted_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                admission_error = Some(error);
+                break;
+            }
+            Err(error) => {
+                admission_error = Some(format!("timed out waiting for query admission: {error}"));
+                break;
+            }
+        }
+    }
+    if let Some(error) = admission_error {
+        let _ = release_query_saturation_start(start_gate.as_ref());
+        for handle in query_handles {
+            let _ = handle.join();
+        }
+        let _ = storage.close();
+        return Err(error);
+    }
+
+    let saturated_snapshot = storage.query_budget_snapshot();
+    if saturated_snapshot.active_queries != workers as u64 {
+        let _ = release_query_saturation_start(start_gate.as_ref());
+        for handle in query_handles {
+            let _ = handle.join();
+        }
+        let _ = storage.close();
+        return Err(format!(
+            "expected {workers} active queries before release, observed {}",
+            saturated_snapshot.active_queries
+        ));
+    }
+    let saturation_rejected = matches!(
+        storage.begin_query_execution(
+            QueryWorkLimits::default(),
+            QueryCancellationToken::new()
+        ),
+        Err(TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)))
+            if exceeded.reason == QueryLimitReason::ConcurrentQueries
+    );
+    if !saturation_rejected {
+        let _ = release_query_saturation_start(start_gate.as_ref());
+        for handle in query_handles {
+            let _ = handle.join();
+        }
+        let _ = storage.close();
+        return Err(
+            "N+1 query admission did not return the structured concurrency limit".to_string(),
+        );
+    }
+
+    let writer_storage = Arc::clone(&storage);
+    let writer_gate = Arc::clone(&start_gate);
+    let writer_points = cfg.query_saturation_writer_points;
+    let writer_batch_size = cfg.query_saturation_batch_size;
+    let writer_series = cfg.query_saturation_series.clamp(1, 1_024);
+    let writer_timestamp_offset = cfg.query_saturation_points_per_series as i64;
+    let writer_handle = thread::spawn(move || -> Result<(f64, usize), String> {
+        wait_for_query_saturation_start(writer_gate.as_ref())?;
+        let started = Instant::now();
+        let mut written = 0usize;
+        let mut batch = Vec::with_capacity(writer_batch_size);
+        while written < writer_points {
+            let take = (writer_points - written).min(writer_batch_size);
+            batch.clear();
+            for offset in 0..take {
+                let point_idx = written + offset;
+                let series_idx = point_idx % writer_series;
+                let series_step = point_idx / writer_series;
+                batch.push(Row::with_labels(
+                    "bench_query_pressure_writer",
+                    vec![
+                        Label::new("series", format!("s{series_idx}")),
+                        Label::new("run", format!("r{run_id}")),
+                    ],
+                    DataPoint::new(
+                        base_ts
+                            .saturating_add(writer_timestamp_offset)
+                            .saturating_add(series_step as i64)
+                            .saturating_add(1),
+                        point_idx as f64,
+                    ),
+                ));
+            }
+            writer_storage
+                .insert_rows(&batch)
+                .map_err(|e| format!("combined query-pressure insert failed: {e}"))?;
+            written = written.saturating_add(take);
+        }
+        Ok((started.elapsed().as_secs_f64() * 1000.0, written))
+    });
+
+    let started = Instant::now();
+    release_query_saturation_start(start_gate.as_ref())?;
+    let mut query_latencies_ms = Vec::with_capacity(workers);
+    let mut query_points_returned = 0usize;
+    let mut query_error = None;
+    for handle in query_handles {
+        match handle.join() {
+            Ok(Ok((latency_ms, returned_points))) => {
+                query_latencies_ms.push(latency_ms);
+                query_points_returned = query_points_returned.saturating_add(returned_points);
+            }
+            Ok(Err(error)) => {
+                query_error.get_or_insert(error);
+            }
+            Err(_) => {
+                query_error.get_or_insert_with(|| "query saturation worker panicked".to_string());
+            }
+        };
+    }
+    let (writer_ms, written_points) = writer_handle
+        .join()
+        .map_err(|_| "query-pressure writer panicked".to_string())??;
+    let elapsed = started.elapsed();
+    if let Some(error) = query_error {
+        let _ = storage.close();
+        return Err(error);
+    }
+
+    let query_snapshot = storage.query_budget_snapshot();
+    if query_snapshot.active_queries != 0 || query_snapshot.shared_reserved_memory_bytes != 0 {
+        let _ = storage.close();
+        return Err(format!(
+            "query resources leaked after saturation: active={} reserved_bytes={}",
+            query_snapshot.active_queries, query_snapshot.shared_reserved_memory_bytes
+        ));
+    }
+    storage
+        .close()
+        .map_err(|e| format!("storage close failed: {e}"))?;
+    let _temp_guard = temp_dir;
+
+    Ok(QuerySaturationRunResult {
+        workers,
+        seeded_series: cfg.query_saturation_series,
+        seeded_points,
+        series_per_query: cfg.query_saturation_series_per_query,
+        queries_succeeded: query_latencies_ms.len(),
+        query_points_returned,
+        writer_points: written_points,
+        elapsed,
+        query_p50_ms: percentile(query_latencies_ms.clone(), 0.50),
+        query_p95_ms: percentile(query_latencies_ms.clone(), 0.95),
+        query_max_ms: query_latencies_ms
+            .iter()
+            .copied()
+            .fold(0.0f64, |current, value| current.max(value)),
+        writer_ms,
+        peak_active_queries: query_snapshot.peak_active_queries,
+        peak_shared_reserved_memory_bytes: query_snapshot.peak_shared_reserved_memory_bytes,
+        concurrency_rejections: query_snapshot.concurrency_rejections_total,
+        active_queries_after: query_snapshot.active_queries,
+        shared_reserved_memory_bytes_after: query_snapshot.shared_reserved_memory_bytes,
+        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
     })
 }
 
@@ -853,6 +1368,7 @@ fn run_ingest_latency_once(
         .map_err(|e| format!("failed to create data path {}: {e}", data_path.display()))?;
 
     let storage = StorageBuilder::new()
+        .with_resource_profile(cfg.resource_profile)
         .with_data_path(&data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_retention(Duration::from_secs(cfg.retention_seconds))
@@ -1039,6 +1555,7 @@ fn run_metadata_selector_once(
         .map_err(|e| format!("failed to create data path {}: {e}", data_path.display()))?;
 
     let storage = StorageBuilder::new()
+        .with_resource_profile(cfg.resource_profile)
         .with_data_path(&data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_retention(Duration::from_secs(cfg.retention_seconds))
@@ -1227,11 +1744,40 @@ fn persisted_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+#[cfg(unix)]
+fn process_peak_rss_bytes_so_far() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` points to writable storage for one `rusage`, and `RUSAGE_SELF` asks the
+    // kernel only for this benchmark process. A successful call initializes the complete value.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `getrusage` returned success and therefore initialized `usage`.
+    let usage = unsafe { usage.assume_init() };
+    let raw = u64::try_from(usage.ru_maxrss).ok()?;
+    if cfg!(target_vendor = "apple") {
+        // Darwin reports `ru_maxrss` in bytes.
+        Some(raw)
+    } else {
+        // Linux and the other supported Unix targets report `ru_maxrss` in KiB.
+        Some(raw.saturating_mul(1_024))
+    }
+}
+
+#[cfg(not(unix))]
+fn process_peak_rss_bytes_so_far() -> Option<u64> {
+    None
+}
+
 fn current_unix_seconds() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
         Err(_) => 0,
     }
+}
+
+fn optional_u64_text(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
 }
 
 fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
@@ -1242,6 +1788,64 @@ fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
     values.sort_by(|a, b| a.total_cmp(b));
     let rank = ((values.len() - 1) as f64 * p).round() as usize;
     values[rank.min(values.len() - 1)]
+}
+
+fn percentile_u64(mut values: Vec<u64>, p: f64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+
+    values.sort_unstable();
+    let rank = ((values.len() - 1) as f64 * p).round() as usize;
+    values[rank.min(values.len() - 1)]
+}
+
+fn parse_resource_profile_env() -> ResourceProfile {
+    let raw = env::var("TSINK_RESOURCE_PROFILE").unwrap_or_else(|_| "embedded".to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "test" => ResourceProfile::Test,
+        "embedded" => ResourceProfile::Embedded,
+        "edge" => ResourceProfile::Edge,
+        "server" => ResourceProfile::Server,
+        _ => panic!("invalid TSINK_RESOURCE_PROFILE={raw:?}; expected test|embedded|edge|server"),
+    }
+}
+
+fn parse_optional_usize_env(name: &str) -> Option<usize> {
+    env::var(name).ok().map(|raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|_| panic!("invalid {name}={raw:?}; expected a non-negative integer"))
+    })
+}
+
+fn parse_optional_u64_env(name: &str) -> Option<u64> {
+    env::var(name).ok().map(|raw| {
+        raw.parse::<u64>()
+            .unwrap_or_else(|_| panic!("invalid {name}={raw:?}; expected a non-negative integer"))
+    })
+}
+
+fn resource_profile_label(profile: ResourceProfile) -> &'static str {
+    match profile {
+        ResourceProfile::Test => "test",
+        ResourceProfile::Embedded => "embedded",
+        ResourceProfile::Edge => "edge",
+        ResourceProfile::Server => "server",
+        ResourceProfile::Custom(_) => "custom",
+        ResourceProfile::ExpertUnlimited => "expert_unlimited",
+    }
+}
+
+fn resource_profile_name_label(profile: ResourceProfileName) -> &'static str {
+    match profile {
+        ResourceProfileName::Unreported => "unreported",
+        ResourceProfileName::Test => "test",
+        ResourceProfileName::Embedded => "embedded",
+        ResourceProfileName::Edge => "edge",
+        ResourceProfileName::Server => "server",
+        ResourceProfileName::Custom => "custom",
+        ResourceProfileName::ExpertUnlimited => "expert_unlimited",
+    }
 }
 
 fn parse_env<T>(name: &str, default: T) -> T
@@ -1309,6 +1913,15 @@ impl XorShift64 {
 
 fn main() {
     let cfg = WorkloadConfig::from_env();
+    println!(
+        "WORKLOAD_CONFIGURATION resource_profile={} memory_limit_override_bytes={} maintenance_max_bytes_override={} seed={}",
+        resource_profile_label(cfg.resource_profile),
+        cfg.memory_limit_override_bytes
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        cfg.maintenance_max_bytes_override
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        cfg.seed,
+    );
 
     if cfg.ingest_latency_bench {
         println!("workload: starting ingest latency benchmark");
@@ -1357,7 +1970,8 @@ fn main() {
         }
 
         println!(
-            "INGEST_LATENCY_SUITE_RESULT runs={} failures={} p50_p95_ms={:.3} p95_p95_ms={:.3}",
+            "INGEST_LATENCY_SUITE_RESULT resource_profile={} runs={} failures={} p50_p95_ms={:.3} p95_p95_ms={:.3}",
+            resource_profile_label(cfg.resource_profile),
             p95s.len(),
             failures,
             percentile(p95s.clone(), 0.50),
@@ -1454,6 +2068,82 @@ fn main() {
         return;
     }
 
+    if cfg.query_saturation_bench {
+        println!("workload: starting query saturation benchmark");
+        println!(
+            "workload: runs={} configured_workers={} seeded_series={} points_per_series={} series_per_query={} writer_points={} batch_size={}",
+            cfg.runs,
+            cfg.query_saturation_workers,
+            cfg.query_saturation_series,
+            cfg.query_saturation_points_per_series,
+            cfg.query_saturation_series_per_query,
+            cfg.query_saturation_writer_points,
+            cfg.query_saturation_batch_size,
+        );
+
+        let mut query_p95_ms = Vec::with_capacity(cfg.runs);
+        let mut writer_ms = Vec::with_capacity(cfg.runs);
+        let mut peak_query_memory_bytes = Vec::with_capacity(cfg.runs);
+        let mut process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
+        let mut failures = 0usize;
+        for run_id in 0..cfg.runs {
+            match run_query_saturation_once(&cfg, run_id) {
+                Ok(result) => {
+                    println!(
+                        "QUERY_SATURATION_RESULT run={} workers={} seeded_series={} seeded_points={} series_per_query={} queries_succeeded={} query_points_returned={} writer_points={} elapsed_ms={} query_p50_ms={:.3} query_p95_ms={:.3} query_max_ms={:.3} writer_ms={:.3} peak_active_queries={} peak_shared_reserved_memory_bytes={} concurrency_rejections={} active_queries_after={} shared_reserved_memory_bytes_after={} process_peak_rss_bytes_so_far={}",
+                        run_id + 1,
+                        result.workers,
+                        result.seeded_series,
+                        result.seeded_points,
+                        result.series_per_query,
+                        result.queries_succeeded,
+                        result.query_points_returned,
+                        result.writer_points,
+                        result.elapsed.as_millis(),
+                        result.query_p50_ms,
+                        result.query_p95_ms,
+                        result.query_max_ms,
+                        result.writer_ms,
+                        result.peak_active_queries,
+                        result.peak_shared_reserved_memory_bytes,
+                        result.concurrency_rejections,
+                        result.active_queries_after,
+                        result.shared_reserved_memory_bytes_after,
+                        optional_u64_text(result.process_peak_rss_bytes_so_far),
+                    );
+                    query_p95_ms.push(result.query_p95_ms);
+                    writer_ms.push(result.writer_ms);
+                    peak_query_memory_bytes.push(result.peak_shared_reserved_memory_bytes);
+                    if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                        process_peak_rss_bytes.push(bytes);
+                    }
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    eprintln!("QUERY_SATURATION_RESULT run={} ERROR {}", run_id + 1, error);
+                }
+            }
+        }
+        if query_p95_ms.is_empty() {
+            eprintln!("workload: all query saturation runs failed");
+            std::process::exit(1);
+        }
+        println!(
+            "QUERY_SATURATION_SUITE_RESULT resource_profile={} runs={} failures={} p50_query_p95_ms={:.3} p95_query_p95_ms={:.3} p50_writer_ms={:.3} p95_writer_ms={:.3} p50_peak_shared_reserved_memory_bytes={} p95_peak_shared_reserved_memory_bytes={} max_process_peak_rss_bytes_so_far={}",
+            resource_profile_label(cfg.resource_profile),
+            query_p95_ms.len(),
+            failures,
+            percentile(query_p95_ms.clone(), 0.50),
+            percentile(query_p95_ms, 0.95),
+            percentile(writer_ms.clone(), 0.50),
+            percentile(writer_ms, 0.95),
+            percentile_u64(peak_query_memory_bytes.clone(), 0.50),
+            percentile_u64(peak_query_memory_bytes, 0.95),
+            optional_u64_text(process_peak_rss_bytes.iter().copied().max()),
+        );
+        return;
+    }
+
     if cfg.new_series_writer_threads > 0 && cfg.new_series_series_per_writer > 0 {
         println!("workload: starting parallel new-series benchmark");
         println!(
@@ -1467,12 +2157,13 @@ fn main() {
 
         let mut series_per_sec = Vec::with_capacity(cfg.runs);
         let mut writer_p95_ms = Vec::with_capacity(cfg.runs);
+        let mut process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
         let mut failures = 0usize;
         for run_id in 0..cfg.runs {
             match run_parallel_new_series_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
-                        "NEW_SERIES_RESULT run={} created_series={} elapsed_ms={} series_per_sec={:.3} writer_p50_ms={:.3} writer_p95_ms={:.3} writer_p99_ms={:.3} writer_max_ms={:.3}",
+                        "NEW_SERIES_RESULT run={} created_series={} elapsed_ms={} series_per_sec={:.3} writer_p50_ms={:.3} writer_p95_ms={:.3} writer_p99_ms={:.3} writer_max_ms={:.3} process_peak_rss_bytes_so_far={}",
                         run_id + 1,
                         result.created_series,
                         result.elapsed.as_millis(),
@@ -1481,9 +2172,13 @@ fn main() {
                         result.writer_p95_ms,
                         result.writer_p99_ms,
                         result.writer_max_ms,
+                        optional_u64_text(result.process_peak_rss_bytes_so_far),
                     );
                     series_per_sec.push(result.series_per_sec);
                     writer_p95_ms.push(result.writer_p95_ms);
+                    if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                        process_peak_rss_bytes.push(bytes);
+                    }
                 }
                 Err(err) => {
                     failures += 1;
@@ -1498,13 +2193,15 @@ fn main() {
         }
 
         println!(
-            "NEW_SERIES_SUITE_RESULT runs={} failures={} p50_series_per_sec={:.3} p95_series_per_sec={:.3} p50_writer_p95_ms={:.3} p95_writer_p95_ms={:.3}",
+            "NEW_SERIES_SUITE_RESULT resource_profile={} runs={} failures={} p50_series_per_sec={:.3} p95_series_per_sec={:.3} p50_writer_p95_ms={:.3} p95_writer_p95_ms={:.3} max_process_peak_rss_bytes_so_far={}",
+            resource_profile_label(cfg.resource_profile),
             series_per_sec.len(),
             failures,
             percentile(series_per_sec.clone(), 0.50),
             percentile(series_per_sec, 0.95),
             percentile(writer_p95_ms.clone(), 0.50),
             percentile(writer_p95_ms, 0.95),
+            optional_u64_text(process_peak_rss_bytes.iter().copied().max()),
         );
         return;
     }
@@ -1536,21 +2233,56 @@ fn main() {
     }
 
     let mut run_bpps = Vec::with_capacity(cfg.runs);
+    let mut run_max_post_write_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
+    let mut run_post_settle_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
+    let mut run_local_disk_bytes = Vec::with_capacity(cfg.runs);
+    let mut run_persisted_bytes = Vec::with_capacity(cfg.runs);
+    let mut run_process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
     let mut failures = 0usize;
 
     for run_id in 0..cfg.runs {
         match run_once(&cfg, run_id) {
             Ok(result) => {
                 println!(
-                    "RUN_RESULT run={} retained_points={} late_rejected_points={} persisted_bytes={} effective_bpp={:.6} path={}",
+                    "RUN_RESULT run={} resource_profile={} accounted_memory_limit_bytes={} local_disk_limit_bytes={} wal_limit_bytes={} cardinality_limit={} max_concurrent_writers={} max_concurrent_queries={} maintenance_max_items_per_pass={} maintenance_max_bytes_per_pass={} retained_points={} late_rejected_points={} max_post_write_accounted_memory_bytes={} post_settle_accounted_memory_bytes={} active_and_sealed_bytes={} registry_bytes={} metadata_cache_bytes={} wal_series_definition_cache_bytes={} write_transient_bytes={} persisted_index_bytes={} persisted_mmap_bytes={} tombstone_bytes={} local_disk_accounted_bytes_before_close={} persisted_bytes={} effective_bpp={:.6} process_peak_rss_bytes_so_far={} path={}",
                     run_id + 1,
+                    resource_profile_name_label(result.selected_profile),
+                    result.accounted_memory_limit_bytes,
+                    result.local_disk_limit_bytes,
+                    result.wal_limit_bytes,
+                    result.cardinality_limit,
+                    result.max_concurrent_writers,
+                    result.max_concurrent_queries,
+                    result.maintenance_max_items_per_pass,
+                    result.maintenance_max_bytes_per_pass,
                     result.retained_points,
                     result.late_rejected_points,
+                    result.max_post_write_accounted_memory_bytes,
+                    result.post_settle_accounted_memory_bytes,
+                    result.active_and_sealed_bytes,
+                    result.registry_bytes,
+                    result.metadata_cache_bytes,
+                    result.wal_series_definition_cache_bytes,
+                    result.write_transient_bytes,
+                    result.persisted_index_bytes,
+                    result.persisted_mmap_bytes,
+                    result.tombstone_bytes,
+                    result.local_disk_accounted_bytes_before_close,
                     result.persisted_bytes,
                     result.effective_bpp,
+                    optional_u64_text(result.process_peak_rss_bytes_so_far),
                     result.data_path.display()
                 );
                 run_bpps.push(result.effective_bpp);
+                run_max_post_write_accounted_memory_bytes
+                    .push(result.max_post_write_accounted_memory_bytes as u64);
+                run_post_settle_accounted_memory_bytes
+                    .push(result.post_settle_accounted_memory_bytes as u64);
+                run_local_disk_bytes.push(result.local_disk_accounted_bytes_before_close);
+                run_persisted_bytes.push(result.persisted_bytes);
+                if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                    run_process_peak_rss_bytes.push(bytes);
+                }
             }
             Err(err) => {
                 failures += 1;
@@ -1566,25 +2298,65 @@ fn main() {
 
     let p50 = percentile(run_bpps.clone(), 0.50);
     let p95 = percentile(run_bpps.clone(), 0.95);
+    let p50_max_post_write_accounted_memory_bytes =
+        percentile_u64(run_max_post_write_accounted_memory_bytes.clone(), 0.50);
+    let p95_max_post_write_accounted_memory_bytes =
+        percentile_u64(run_max_post_write_accounted_memory_bytes.clone(), 0.95);
+    let max_post_write_accounted_memory_bytes = run_max_post_write_accounted_memory_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let p50_post_settle_accounted_memory_bytes =
+        percentile_u64(run_post_settle_accounted_memory_bytes.clone(), 0.50);
+    let p95_post_settle_accounted_memory_bytes =
+        percentile_u64(run_post_settle_accounted_memory_bytes.clone(), 0.95);
+    let max_post_settle_accounted_memory_bytes = run_post_settle_accounted_memory_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let p50_local_disk_bytes = percentile_u64(run_local_disk_bytes.clone(), 0.50);
+    let p95_local_disk_bytes = percentile_u64(run_local_disk_bytes.clone(), 0.95);
+    let max_local_disk_bytes = run_local_disk_bytes.iter().copied().max().unwrap_or(0);
+    let p50_persisted_bytes = percentile_u64(run_persisted_bytes.clone(), 0.50);
+    let p95_persisted_bytes = percentile_u64(run_persisted_bytes.clone(), 0.95);
+    let max_persisted_bytes = run_persisted_bytes.iter().copied().max().unwrap_or(0);
 
     println!(
-        "SUITE_RESULT runs={} failures={} p50_effective_bpp={:.6} p95_effective_bpp={:.6}",
+        "SUITE_RESULT resource_profile={} runs={} failures={} p50_effective_bpp={:.6} p95_effective_bpp={:.6} p50_max_post_write_accounted_memory_bytes={} p95_max_post_write_accounted_memory_bytes={} max_post_write_accounted_memory_bytes={} p50_post_settle_accounted_memory_bytes={} p95_post_settle_accounted_memory_bytes={} max_post_settle_accounted_memory_bytes={} p50_local_disk_accounted_bytes_before_close={} p95_local_disk_accounted_bytes_before_close={} max_local_disk_accounted_bytes_before_close={} p50_persisted_bytes={} p95_persisted_bytes={} max_persisted_bytes={} max_process_peak_rss_bytes_so_far={}",
+        resource_profile_label(cfg.resource_profile),
         run_bpps.len(),
         failures,
         p50,
-        p95
+        p95,
+        p50_max_post_write_accounted_memory_bytes,
+        p95_max_post_write_accounted_memory_bytes,
+        max_post_write_accounted_memory_bytes,
+        p50_post_settle_accounted_memory_bytes,
+        p95_post_settle_accounted_memory_bytes,
+        max_post_settle_accounted_memory_bytes,
+        p50_local_disk_bytes,
+        p95_local_disk_bytes,
+        max_local_disk_bytes,
+        p50_persisted_bytes,
+        p95_persisted_bytes,
+        max_persisted_bytes,
+        optional_u64_text(run_process_peak_rss_bytes.iter().copied().max()),
     );
 
     let target_p50_ok = p50 <= 0.75;
     let target_p95_ok = p95 <= 1.0;
+    let all_runs_ok = failures == 0;
     println!(
-        "TARGET_CHECK p50<=0.75={} p95<=1.0={} pass={}",
+        "TARGET_CHECK all_runs_succeeded={} p50<=0.75={} p95<=1.0={} pass={}",
+        all_runs_ok,
         target_p50_ok,
         target_p95_ok,
-        target_p50_ok && target_p95_ok
+        all_runs_ok && target_p50_ok && target_p95_ok
     );
 
-    if cfg.fail_on_target && !(target_p50_ok && target_p95_ok) {
+    if cfg.fail_on_target && !(all_runs_ok && target_p50_ok && target_p95_ok) {
         std::process::exit(2);
     }
 }

@@ -267,6 +267,7 @@ mod tests {
             },
             points: Vec::new(),
             encoded_payload: encoded.payload,
+            wal_lowwater: WalHighWatermark::default(),
             wal_highwater: WalHighWatermark::default(),
         };
 
@@ -314,6 +315,7 @@ mod tests {
                 value: Value::F64(1.0),
             }],
             encoded_payload: Vec::new(),
+            wal_lowwater: WalHighWatermark::default(),
             wal_highwater: WalHighWatermark::default(),
         }
     }

@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::engine::chunk::Chunk;
 use crate::engine::fs_utils::{
-    remove_path_if_exists, rename_tmp, sync_dir, sync_parent_dir, write_tmp_and_sync,
+    create_dir_all_and_sync_parents, remove_path_if_exists, rename_tmp, sync_dir, sync_parent_dir,
+    write_tmp_and_sync,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::{DiskCategory, DiskReservationKind, LocalDiskBudget, Result, TsinkError};
@@ -27,6 +28,40 @@ pub struct SegmentWriter {
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
     reservation_kind: DiskReservationKind,
     disk_category: DiskCategory,
+}
+
+struct EncodedSegment {
+    manifest: SegmentManifest,
+    chunks_bytes: Vec<u8>,
+    chunk_index_bytes: Vec<u8>,
+    series_bytes: Vec<u8>,
+    postings_bytes: Vec<u8>,
+    manifest_bytes: Vec<u8>,
+    total_bytes: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROLLBACK_FAILURE_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::engine) struct SegmentRollbackFailureGuard;
+
+#[cfg(test)]
+impl Drop for SegmentRollbackFailureGuard {
+    fn drop(&mut self) {
+        ROLLBACK_FAILURE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::engine) fn fail_segment_publish_rollback_once(
+    root: std::path::PathBuf,
+) -> SegmentRollbackFailureGuard {
+    ROLLBACK_FAILURE_ROOT.with(|slot| *slot.borrow_mut() = Some(root));
+    SegmentRollbackFailureGuard
 }
 
 impl SegmentWriter {
@@ -107,56 +142,21 @@ impl SegmentWriter {
     where
         T: AsRef<Chunk>,
     {
-        let (chunks_bytes, mut chunk_index, chunk_count, point_count, min_ts, max_ts) =
-            build_chunks_and_index(self.level, chunks_by_series)?;
-        let series_data = build_segment_series_data(registry, chunks_by_series)?;
-        let (series_bytes, series_count) = build_series_file(&series_data)?;
-        let postings_bytes = build_postings_file(&series_data)?;
-        let chunk_index_bytes = build_chunk_index_file(&mut chunk_index)?;
-        let manifest_files = [
-            ManifestFileEntry {
-                kind: FILE_KIND_CHUNKS,
-                file_len: chunks_bytes.len() as u64,
-                hash64: hash64(&chunks_bytes),
-            },
-            ManifestFileEntry {
-                kind: FILE_KIND_CHUNK_INDEX,
-                file_len: chunk_index_bytes.len() as u64,
-                hash64: hash64(&chunk_index_bytes),
-            },
-            ManifestFileEntry {
-                kind: FILE_KIND_SERIES,
-                file_len: series_bytes.len() as u64,
-                hash64: hash64(&series_bytes),
-            },
-            ManifestFileEntry {
-                kind: FILE_KIND_POSTINGS,
-                file_len: postings_bytes.len() as u64,
-                hash64: hash64(&postings_bytes),
-            },
-        ];
-
-        let manifest = SegmentManifest {
-            segment_id: self.segment_id,
-            level: self.level,
-            chunk_count,
-            point_count,
-            series_count,
-            min_ts,
-            max_ts,
+        let EncodedSegment {
+            manifest,
+            chunks_bytes,
+            chunk_index_bytes,
+            series_bytes,
+            postings_bytes,
+            manifest_bytes,
+            total_bytes: segment_bytes,
+        } = encode_segment(
+            self.segment_id,
+            self.level,
+            registry,
+            chunks_by_series,
             wal_highwater,
-        };
-
-        let manifest_bytes = build_manifest_file(&manifest, manifest_files)?;
-        let segment_bytes = [
-            chunks_bytes.len(),
-            chunk_index_bytes.len(),
-            series_bytes.len(),
-            postings_bytes.len(),
-            manifest_bytes.len(),
-        ]
-        .into_iter()
-        .fold(0u64, |total, bytes| total.saturating_add(bytes as u64));
+        )?;
         let governed_budget = match self.local_disk_budget.as_ref() {
             Some(budget) if budget.governs_entry(&self.layout.root)? => Some(budget),
             _ => None,
@@ -172,8 +172,9 @@ impl SegmentWriter {
             (&self.staging_layout.postings_path, postings_bytes),
         ];
         let mut published = false;
+        let mut staging_owned = false;
         let write_result = (|| -> Result<()> {
-            prepare_staging_dir(&self.staging_layout.root)?;
+            prepare_staging_dir(&self.staging_layout.root, &mut staging_owned)?;
             let mut staged_files = Vec::with_capacity(data_files.len());
             for (path, bytes) in &data_files {
                 staged_files.push((write_tmp_and_sync(path, bytes)?, *path));
@@ -188,6 +189,7 @@ impl SegmentWriter {
             sync_dir(&self.staging_layout.root)?;
             ensure_publish_target_clear(&self.layout)?;
             fs::rename(&self.staging_layout.root, &self.layout.root)?;
+            staging_owned = false;
             published = true;
             sync_dir(&self.layout.root)?;
             if let Some(level_root) = self.layout.root.parent() {
@@ -212,25 +214,34 @@ impl SegmentWriter {
                         published = false;
                     }
                 }
-                if let Err(err) = remove_path_if_exists(&self.staging_layout.root) {
-                    cleanup_errors.push(format!("staging cleanup failed: {err}"));
+                if staging_owned {
+                    match remove_path_if_exists(&self.staging_layout.root) {
+                        Ok(()) => staging_owned = false,
+                        Err(err) => cleanup_errors.push(format!("staging cleanup failed: {err}")),
+                    }
                 }
 
                 if let Some(reservation) = reservation {
-                    let surviving_root = if published {
-                        &self.layout.root
+                    if published || staging_owned {
+                        let surviving_root = if published {
+                            &self.layout.root
+                        } else {
+                            &self.staging_layout.root
+                        };
+                        let surviving_bytes =
+                            crate::disk_budget::measured_path_bytes(surviving_root)
+                                .unwrap_or(segment_bytes);
+                        let category = if published {
+                            self.disk_category
+                        } else {
+                            DiskCategory::Temporary
+                        };
+                        if let Err(err) = reservation.commit_as(category, surviving_bytes, 0) {
+                            cleanup_errors
+                                .push(format!("disk reservation settlement failed: {err}"));
+                        }
                     } else {
-                        &self.staging_layout.root
-                    };
-                    let surviving_bytes = crate::disk_budget::measured_path_bytes(surviving_root)
-                        .unwrap_or(segment_bytes);
-                    let category = if published {
-                        self.disk_category
-                    } else {
-                        DiskCategory::Temporary
-                    };
-                    if let Err(err) = reservation.commit_as(category, surviving_bytes, 0) {
-                        cleanup_errors.push(format!("disk reservation settlement failed: {err}"));
+                        drop(reservation);
                     }
                 }
 
@@ -245,37 +256,163 @@ impl SegmentWriter {
             }
         }
     }
+
+    /// Returns the exact regular-file bytes this writer would stage and publish.
+    ///
+    /// Encoding is filesystem side-effect free. Compaction uses this before its operation-level
+    /// maintenance reservation; the subsequent write reruns the deterministic encoders while the
+    /// aggregate reservation is held.
+    pub(in crate::engine) fn measure_segment_bytes_with_wal_highwater<T>(
+        &self,
+        registry: &SeriesRegistry,
+        chunks_by_series: &HashMap<SeriesId, Vec<T>>,
+        wal_highwater: WalHighWatermark,
+    ) -> Result<u64>
+    where
+        T: AsRef<Chunk>,
+    {
+        Ok(encode_segment(
+            self.segment_id,
+            self.level,
+            registry,
+            chunks_by_series,
+            wal_highwater,
+        )?
+        .total_bytes)
+    }
 }
 
-fn prepare_staging_dir(path: &Path) -> Result<()> {
+fn encode_segment<T>(
+    segment_id: u64,
+    level: u8,
+    registry: &SeriesRegistry,
+    chunks_by_series: &HashMap<SeriesId, Vec<T>>,
+    wal_highwater: WalHighWatermark,
+) -> Result<EncodedSegment>
+where
+    T: AsRef<Chunk>,
+{
+    let (chunks_bytes, mut chunk_index, chunk_count, point_count, min_ts, max_ts) =
+        build_chunks_and_index(level, chunks_by_series)?;
+    let series_data = build_segment_series_data(registry, chunks_by_series)?;
+    let (series_bytes, series_count) = build_series_file(&series_data)?;
+    let postings_bytes = build_postings_file(&series_data)?;
+    let chunk_index_bytes = build_chunk_index_file(&mut chunk_index)?;
+    let manifest_files = [
+        ManifestFileEntry {
+            kind: FILE_KIND_CHUNKS,
+            file_len: chunks_bytes.len() as u64,
+            hash64: hash64(&chunks_bytes),
+        },
+        ManifestFileEntry {
+            kind: FILE_KIND_CHUNK_INDEX,
+            file_len: chunk_index_bytes.len() as u64,
+            hash64: hash64(&chunk_index_bytes),
+        },
+        ManifestFileEntry {
+            kind: FILE_KIND_SERIES,
+            file_len: series_bytes.len() as u64,
+            hash64: hash64(&series_bytes),
+        },
+        ManifestFileEntry {
+            kind: FILE_KIND_POSTINGS,
+            file_len: postings_bytes.len() as u64,
+            hash64: hash64(&postings_bytes),
+        },
+    ];
+
+    let manifest = SegmentManifest {
+        segment_id,
+        level,
+        chunk_count,
+        point_count,
+        series_count,
+        min_ts,
+        max_ts,
+        wal_highwater,
+    };
+    let manifest_bytes = build_manifest_file(&manifest, manifest_files)?;
+    let total_bytes = [
+        chunks_bytes.len(),
+        chunk_index_bytes.len(),
+        series_bytes.len(),
+        postings_bytes.len(),
+        manifest_bytes.len(),
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, bytes| {
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            TsinkError::Other("encoded segment exceeds the supported byte range".to_string())
+        })?;
+        total.checked_add(bytes).ok_or_else(|| {
+            TsinkError::Other("encoded segment exceeds the supported byte range".to_string())
+        })
+    })?;
+
+    Ok(EncodedSegment {
+        manifest,
+        chunks_bytes,
+        chunk_index_bytes,
+        series_bytes,
+        postings_bytes,
+        manifest_bytes,
+        total_bytes,
+    })
+}
+
+fn prepare_staging_dir(path: &Path, owned: &mut bool) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(
             "staging directory has no parent".to_string(),
         ));
     };
-    fs::create_dir_all(parent)?;
-    remove_path_if_exists(path)?;
-    fs::create_dir_all(path)?;
+    create_dir_all_and_sync_parents(parent)?;
+    fs::create_dir(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    *owned = true;
+    sync_parent_dir(path)?;
+    sync_dir(path)?;
     Ok(())
 }
 
 fn ensure_publish_target_clear(layout: &SegmentLayout) -> Result<()> {
-    if !layout.root.exists() {
-        return Ok(());
-    }
-
-    if !layout.manifest_path.exists() {
-        remove_path_if_exists(&layout.root)?;
-        return Ok(());
+    match fs::symlink_metadata(&layout.root) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: layout.root.clone(),
+                source,
+            });
+        }
+        Ok(_) => {}
     }
 
     Err(TsinkError::InvalidConfiguration(format!(
-        "segment directory already exists: {}",
+        "segment publish target already exists: {}",
         layout.root.display()
     )))
 }
 
 fn rollback_failed_segment_publish(root: &Path) -> Result<()> {
+    #[cfg(test)]
+    let injected = ROLLBACK_FAILURE_ROOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_deref() == Some(root) {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(test)]
+    if injected {
+        return Err(TsinkError::Other(format!(
+            "injected segment publish rollback failure: {}",
+            root.display()
+        )));
+    }
     remove_path_if_exists(root)?;
     sync_parent_dir(root)?;
     Ok(())

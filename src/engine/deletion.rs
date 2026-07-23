@@ -16,14 +16,68 @@ struct DeleteBridgeContext<'a> {
 }
 
 impl<'a> DeleteBridgeContext<'a> {
+    fn update_staging_memory_upper_bound(
+        current: &TombstoneMap,
+        matched_series_ids: &[SeriesId],
+    ) -> usize {
+        let map_entries = matched_series_ids
+            .len()
+            .saturating_mul(std::mem::size_of::<(SeriesId, Vec<TombstoneRange>)>())
+            .saturating_mul(4);
+        let ranges = matched_series_ids.iter().fold(0usize, |total, series_id| {
+            total.saturating_add(
+                current
+                    .get(series_id)
+                    .map_or(1usize, |existing| existing.len().saturating_add(1))
+                    .saturating_mul(std::mem::size_of::<TombstoneRange>())
+                    .saturating_mul(3),
+            )
+        });
+        map_entries
+            .saturating_add(ranges)
+            .saturating_add(matched_series_ids.len().saturating_mul(64))
+            .saturating_add(16 * 1024)
+    }
+
     fn publish_tombstone_delete(
         self,
         tombstone: TombstoneRange,
         matched_series_ids: &[SeriesId],
     ) -> Result<usize> {
-        let (updated_series_ids, has_affected_rollups) =
-            self.storage.with_rollup_run_lock(|| -> Result<_> {
+        // Tombstone RMW/decode staging uses a conservative memory reservation. Drain writers
+        // before taking the rollup/visibility locks so ordinary admission cannot race that
+        // reservation and so close/snapshot share one global permits -> rollup order.
+        let write_permits = self
+            .storage
+            .runtime
+            .write_limiter
+            .acquire_all(self.storage.runtime.write_timeout)?;
+        self.storage.ensure_open()?;
+        let publication = self.storage.with_rollup_run_lock(|| -> Result<_> {
                 self.storage.with_visibility_write_stage(|| {
+                    // A delete that passed its outer open check before close began may have waited
+                    // behind shutdown's rollup/visibility transaction. Recheck after acquiring
+                    // both locks so it cannot publish a second coordinator during close.
+                    self.storage.ensure_open()?;
+                    // A prior call may have crossed the durable Committing decision but returned
+                    // before every lane was published. Roll it forward and reload the merged
+                    // durable map before deriving this read-modify-write update from memory.
+                    self.storage.recover_and_reload_tombstones_locked()?;
+                    self.storage.refresh_memory_usage();
+                    let index = self.storage.tombstone_index_context();
+                    let probe_bytes = index.transaction_probe_memory_upper_bound()?;
+                    let update_bytes = self
+                        .storage
+                        .tombstone_read_context()
+                        .with_tombstones(|current| {
+                            Self::update_staging_memory_upper_bound(
+                                current,
+                                matched_series_ids,
+                            )
+                        });
+                    let initial_reservation = probe_bytes.saturating_add(update_bytes);
+                    let mut memory_reservation = self.storage.tombstone_memory_reservation();
+                    memory_reservation.resize(initial_reservation)?;
                     // Tombstone updates are read-modify-write operations. Recompute them after
                     // acquiring the visibility fence so concurrent deletes cannot overwrite one
                     // another with snapshots prepared before either publication committed.
@@ -47,6 +101,13 @@ impl<'a> DeleteBridgeContext<'a> {
                         return Ok((Vec::new(), false));
                     }
 
+                    let transaction_staging = index
+                        .transaction_staging_memory_upper_bound(
+                            &updated_tombstones,
+                            &mut memory_reservation,
+                        )?;
+                    memory_reservation.resize(initial_reservation.max(transaction_staging))?;
+
                     let updated_series_ids = updated_tombstones.keys().copied().collect::<Vec<_>>();
                     let affected_policy_ids = self
                         .storage
@@ -64,8 +125,9 @@ impl<'a> DeleteBridgeContext<'a> {
                         .tombstone_publication_context()
                         .publish_tombstone_updates_locked(
                             self.storage,
-                            self.storage.tombstone_index_context(),
+                            index,
                             updated_tombstones,
+                            &mut memory_reservation,
                         );
                     if let Err(tombstone_failure) = tombstone_persist_result {
                         let definitively_clean = tombstone_failure.is_definitively_clean();
@@ -112,7 +174,9 @@ impl<'a> DeleteBridgeContext<'a> {
                     }
                     Ok((updated_series_ids, !affected_policy_ids.is_empty()))
                 })
-            })?;
+            });
+        drop(write_permits);
+        let (updated_series_ids, has_affected_rollups) = publication?;
         if updated_series_ids.is_empty() {
             return Ok(0);
         }

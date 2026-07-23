@@ -164,7 +164,43 @@ impl ChunkStorage {
         *self.coordination.data_path_process_lock.lock() = Some(data_path_process_lock);
     }
 
+    pub(in crate::engine::storage_engine) fn install_shared_object_store_process_lock(
+        &self,
+        shared_object_store_process_lock: SharedObjectStoreProcessLock,
+    ) {
+        *self.coordination.shared_object_store_process_lock.lock() =
+            Some(shared_object_store_process_lock);
+    }
+
+    /// Revalidates the pathname identity of the shared writer lease immediately before an
+    /// operation that can mutate object-store state. Keeping the original locked handle alive is
+    /// not sufficient on platforms that permit a locked file to be renamed or unlinked: another
+    /// writer could otherwise create and lock a replacement pathname while this process kept
+    /// writing through the stale lease.
+    pub(in crate::engine::storage_engine) fn validate_shared_object_store_writer_lock(
+        &self,
+    ) -> Result<()> {
+        if self.runtime.runtime_mode == StorageRuntimeMode::ComputeOnly
+            || self.persisted.tiered_storage.is_none()
+        {
+            return Ok(());
+        }
+
+        let shared_lock = self.coordination.shared_object_store_process_lock.lock();
+        let shared_lock = shared_lock.as_ref().ok_or_else(|| {
+            TsinkError::Other(
+                "read-write object-store mutation requires the held shared writer lease"
+                    .to_string(),
+            )
+        })?;
+        shared_lock.validate()
+    }
+
     pub(in crate::engine::storage_engine) fn release_data_path_process_lock(&self) {
+        self.coordination
+            .shared_object_store_process_lock
+            .lock()
+            .take();
         self.coordination.data_path_process_lock.lock().take();
     }
 

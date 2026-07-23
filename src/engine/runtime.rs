@@ -1,14 +1,20 @@
 use super::{
-    elapsed_nanos_u64, Arc, AtomicBool, AtomicU8, BackgroundWorkerSupervisorState, ChunkStorage,
-    Compactor, Duration, Instant, Mutex, Ordering, PendingPersistedSegmentDiff, Result,
+    elapsed_nanos_u64, Arc, AtomicBool, AtomicU8, BackgroundWorkerRuntimeState,
+    BackgroundWorkerSupervisorState, ChunkStorage, Compactor, Duration, Instant,
+    MaintenancePassSelection, Mutex, Ordering, PendingPersistedSegmentDiff, Result,
     StorageObservabilityCounters, StorageRuntimeMode, TsinkError, DEFAULT_FLUSH_INTERVAL,
     STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
 };
+use crate::engine::tombstone::TombstoneMap;
+use parking_lot::RwLock;
+use std::path::{Path, PathBuf};
 
 #[path = "runtime/supervision.rs"]
 mod supervision;
 
-use self::supervision::BackgroundThreadKind;
+use self::supervision::{
+    BackgroundThreadKind, BackgroundWorkerPassGuard, BackgroundWorkerRunGuard,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlushPipelinePolicy {
@@ -120,9 +126,10 @@ impl FlushWorkerSchedule {
         }
     }
 
-    fn park_until_due(&self) {
+    fn park_until_due(&self, runtime: &BackgroundWorkerRuntimeState) {
         let now = Instant::now();
         if now < self.next_bounded_flush_at {
+            runtime.record_idle_wait();
             std::thread::park_timeout(self.next_bounded_flush_at.saturating_duration_since(now));
         }
     }
@@ -167,6 +174,7 @@ impl ChunkStorage {
     fn run_background_worker_pass<G, L, F>(
         control: &BackgroundWorkerControl<'_>,
         worker: &'static str,
+        runtime: &BackgroundWorkerRuntimeState,
         pause_duration: Duration,
         acquire_guard: L,
         run: F,
@@ -176,7 +184,10 @@ impl ChunkStorage {
         F: FnOnce() -> Result<()>,
     {
         match Self::begin_background_worker_pass(control, pause_duration, acquire_guard) {
-            BackgroundWorkerPass::Ready(_guard) => control.handle_result(worker, run()),
+            BackgroundWorkerPass::Ready(_guard) => {
+                let _pass = BackgroundWorkerPassGuard::new(runtime);
+                control.handle_result(worker, run())
+            }
             BackgroundWorkerPass::Pause(duration) => BackgroundWorkerFlow::Pause(duration),
             BackgroundWorkerPass::Exit => BackgroundWorkerFlow::Exit,
         }
@@ -205,31 +216,37 @@ impl ChunkStorage {
 
     fn spawn_background_rollup_thread(
         storage: std::sync::Weak<Self>,
+        runtime: Arc<BackgroundWorkerRuntimeState>,
         rollup_interval: Duration,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         let handle = std::thread::Builder::new()
             .name("tsink-rollups".to_string())
-            .spawn(move || loop {
-                std::thread::park_timeout(rollup_interval);
+            .spawn(move || {
+                let _run = BackgroundWorkerRunGuard::new(Arc::clone(&runtime));
+                loop {
+                    runtime.record_idle_wait();
+                    std::thread::park_timeout(rollup_interval);
 
-                let Some(storage) = storage.upgrade() else {
-                    break;
-                };
+                    let Some(storage) = storage.upgrade() else {
+                        break;
+                    };
 
-                let control = BackgroundWorkerControl::for_storage(storage.as_ref());
-                match Self::run_background_worker_pass(
-                    &control,
-                    "rollup",
-                    rollup_interval,
-                    || storage.background_maintenance_gate(),
-                    || {
-                        // The rollup pipeline shares `rollup_run_lock` with policy mutations, so
-                        // background runs only execute against a fully persisted policy/runtime snapshot.
-                        storage.run_rollup_pipeline_once()
-                    },
-                ) {
-                    BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
-                    BackgroundWorkerFlow::Exit => break,
+                    let control = BackgroundWorkerControl::for_storage(storage.as_ref());
+                    match Self::run_background_worker_pass(
+                        &control,
+                        "rollup",
+                        runtime.as_ref(),
+                        rollup_interval,
+                        || storage.background_maintenance_gate(),
+                        || {
+                            // The rollup pipeline shares `rollup_run_lock` with policy mutations, so
+                            // background runs only execute against a fully persisted policy/runtime snapshot.
+                            storage.run_shared_background_rollup_pipeline_once()
+                        },
+                    ) {
+                        BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
+                        BackgroundWorkerFlow::Exit => break,
+                    }
                 }
             })?;
 
@@ -240,10 +257,13 @@ impl ChunkStorage {
     pub(super) fn spawn_background_compaction_thread(
         lifecycle: std::sync::Weak<AtomicU8>,
         compaction_lock: Arc<Mutex<()>>,
+        post_flush_replacement_data_path: Option<PathBuf>,
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
+        tombstones: Arc<RwLock<TombstoneMap>>,
         persisted_index_dirty: Arc<AtomicBool>,
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
+        runtime: Arc<BackgroundWorkerRuntimeState>,
         compaction_interval: Duration,
         observability: Arc<StorageObservabilityCounters>,
         background_fail_fast: bool,
@@ -254,41 +274,48 @@ impl ChunkStorage {
 
         let handle = std::thread::Builder::new()
             .name("tsink-compaction".to_string())
-            .spawn(move || loop {
-                std::thread::park_timeout(compaction_interval);
+            .spawn(move || {
+                let _run = BackgroundWorkerRunGuard::new(Arc::clone(&runtime));
+                let mut prefer_blob = false;
+                loop {
+                    runtime.record_idle_wait();
+                    std::thread::park_timeout(compaction_interval);
 
-                let Some(lifecycle) = lifecycle.upgrade() else {
-                    break;
-                };
+                    let Some(lifecycle) = lifecycle.upgrade() else {
+                        break;
+                    };
 
-                let control = BackgroundWorkerControl::new(
-                    lifecycle.as_ref(),
-                    observability.as_ref(),
-                    background_fail_fast,
-                );
-                match Self::run_background_worker_pass(
-                    &control,
-                    "compaction",
-                    compaction_interval,
-                    || Self::lock_compaction_gate(compaction_lock.as_ref()),
-                    || {
-                        match Self::compact_compactors_with_changes(
-                            numeric_compactor.as_ref(),
-                            blob_compactor.as_ref(),
-                            Some(observability.as_ref()),
-                        ) {
-                            Ok(changes) if !changes.is_empty() => {
-                                pending_persisted_segment_diff.lock().merge(changes);
-                                persisted_index_dirty.store(true, Ordering::SeqCst);
-                            }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
-                        }
-                        Ok(())
-                    },
-                ) {
-                    BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
-                    BackgroundWorkerFlow::Exit => break,
+                    let control = BackgroundWorkerControl::new(
+                        lifecycle.as_ref(),
+                        observability.as_ref(),
+                        background_fail_fast,
+                    );
+                    match Self::run_background_worker_pass(
+                        &control,
+                        "compaction",
+                        runtime.as_ref(),
+                        compaction_interval,
+                        || Self::lock_compaction_gate(compaction_lock.as_ref()),
+                        || {
+                            Self::compact_next_background_compactor_with_changes(
+                                post_flush_replacement_data_path.as_deref(),
+                                numeric_compactor.as_ref(),
+                                blob_compactor.as_ref(),
+                                prefer_blob,
+                                Some(tombstones.as_ref()),
+                                Some(observability.as_ref()),
+                                |changes| {
+                                    pending_persisted_segment_diff.lock().merge(changes);
+                                    persisted_index_dirty.store(true, Ordering::SeqCst);
+                                },
+                            )?;
+                            prefer_blob = !prefer_blob;
+                            Ok(())
+                        },
+                    ) {
+                        BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
+                        BackgroundWorkerFlow::Exit => break,
+                    }
                 }
             })?;
 
@@ -300,32 +327,44 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.background
-            .install_thread(BackgroundThreadKind::Compaction, || {
+        self.background.install_thread(
+            BackgroundThreadKind::Compaction,
+            self.background.compaction_interval,
+            |runtime, interval| {
                 Self::spawn_background_compaction_thread(
                     Arc::downgrade(&self.coordination.lifecycle),
                     Arc::clone(&self.coordination.compaction_lock),
+                    self.persisted
+                        .series_index_path
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .map(Path::to_path_buf),
                     self.persisted.numeric_compactor.clone(),
                     self.persisted.blob_compactor.clone(),
+                    Arc::clone(&self.visibility.tombstones),
                     Arc::clone(&self.persisted.persisted_index_dirty),
                     Arc::clone(&self.persisted.pending_persisted_segment_diff),
-                    self.background.compaction_interval,
+                    runtime,
+                    interval,
                     Arc::clone(&self.observability),
                     self.background.fail_fast_enabled,
                 )
-            })
+            },
+        )
     }
 
     fn spawn_background_flush_thread(
         storage: std::sync::Weak<Self>,
+        runtime: Arc<BackgroundWorkerRuntimeState>,
         flush_interval: Duration,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         let handle = std::thread::Builder::new()
             .name("tsink-flush".to_string())
             .spawn(move || {
+                let _run = BackgroundWorkerRunGuard::new(Arc::clone(&runtime));
                 let mut schedule = FlushWorkerSchedule::new(flush_interval);
                 loop {
-                    schedule.park_until_due();
+                    schedule.park_until_due(runtime.as_ref());
 
                     let Some(storage) = storage.upgrade() else {
                         break;
@@ -341,6 +380,7 @@ impl ChunkStorage {
                         FlushPipelinePolicy::BackgroundBounded => Self::run_background_worker_pass(
                             &control,
                             "flush",
+                            runtime.as_ref(),
                             flush_interval,
                             || storage.background_maintenance_gate(),
                             || storage.background_flush_pipeline_once(),
@@ -349,6 +389,7 @@ impl ChunkStorage {
                             Self::run_background_worker_pass(
                                 &control,
                                 "flush",
+                                runtime.as_ref(),
                                 flush_interval,
                                 || storage.background_maintenance_gate(),
                                 || storage.background_flush_eligible_pipeline_once(),
@@ -375,67 +416,77 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.background
-            .install_thread(BackgroundThreadKind::Flush, || {
-                Self::spawn_background_flush_thread(Arc::downgrade(self), flush_interval)
-            })
+        self.background.install_thread(
+            BackgroundThreadKind::Flush,
+            flush_interval,
+            |runtime, interval| {
+                Self::spawn_background_flush_thread(Arc::downgrade(self), runtime, interval)
+            },
+        )
     }
 
     fn spawn_background_persisted_refresh_thread(
         storage: std::sync::Weak<Self>,
+        runtime: Arc<BackgroundWorkerRuntimeState>,
+        configured_interval: Duration,
     ) -> Result<Option<std::thread::JoinHandle<()>>> {
         let handle = std::thread::Builder::new()
             .name("tsink-persisted-refresh".to_string())
-            .spawn(move || loop {
-                let Some(storage) = storage.upgrade() else {
-                    break;
-                };
-
-                let interval = storage.background_persisted_refresh_poll_interval();
-                let park_duration = 'pass: {
-                    let control = BackgroundWorkerControl::for_storage(storage.as_ref());
-                    let maintenance_pass =
-                        Self::begin_background_worker_pass(&control, interval, || {
-                            storage.background_maintenance_gate()
-                        });
-                    let maintenance_guard = match maintenance_pass {
-                        BackgroundWorkerPass::Ready(guard) => guard,
-                        BackgroundWorkerPass::Pause(duration) => break 'pass Some(duration),
-                        BackgroundWorkerPass::Exit => break 'pass None,
+            .spawn(move || {
+                let _run = BackgroundWorkerRunGuard::new(Arc::clone(&runtime));
+                loop {
+                    let Some(storage) = storage.upgrade() else {
+                        break;
                     };
 
-                    match control.handle_result(
-                        "flush_maintenance",
-                        storage.run_post_flush_maintenance_if_pending(),
-                    ) {
-                        BackgroundWorkerFlow::Continue => {}
-                        BackgroundWorkerFlow::Pause(duration) => {
-                            drop(maintenance_guard);
-                            break 'pass Some(duration);
-                        }
-                        BackgroundWorkerFlow::Exit => {
-                            drop(maintenance_guard);
-                            break 'pass None;
-                        }
-                    }
+                    let interval = configured_interval;
+                    let park_duration = 'pass: {
+                        let control = BackgroundWorkerControl::for_storage(storage.as_ref());
+                        let maintenance_pass =
+                            Self::begin_background_worker_pass(&control, interval, || {
+                                storage.background_maintenance_gate()
+                            });
+                        let maintenance_guard = match maintenance_pass {
+                            BackgroundWorkerPass::Ready(guard) => guard,
+                            BackgroundWorkerPass::Pause(duration) => break 'pass Some(duration),
+                            BackgroundWorkerPass::Exit => break 'pass None,
+                        };
+                        let _pass = BackgroundWorkerPassGuard::new(runtime.as_ref());
 
-                    let park_duration = match control.handle_result(
-                        "persisted_refresh",
-                        storage.sync_persisted_segments_from_disk_if_dirty(),
-                    ) {
-                        BackgroundWorkerFlow::Continue => Some(interval),
-                        BackgroundWorkerFlow::Pause(duration) => Some(duration),
-                        BackgroundWorkerFlow::Exit => None,
+                        match control.handle_result(
+                            "flush_maintenance",
+                            storage.run_post_flush_maintenance_if_pending(),
+                        ) {
+                            BackgroundWorkerFlow::Continue => {}
+                            BackgroundWorkerFlow::Pause(duration) => {
+                                drop(maintenance_guard);
+                                break 'pass Some(duration);
+                            }
+                            BackgroundWorkerFlow::Exit => {
+                                drop(maintenance_guard);
+                                break 'pass None;
+                            }
+                        }
+
+                        let park_duration = match control.handle_result(
+                            "persisted_refresh",
+                            storage.sync_persisted_segments_from_disk_if_dirty(),
+                        ) {
+                            BackgroundWorkerFlow::Continue => Some(interval),
+                            BackgroundWorkerFlow::Pause(duration) => Some(duration),
+                            BackgroundWorkerFlow::Exit => None,
+                        };
+                        drop(maintenance_guard);
+                        park_duration
                     };
-                    drop(maintenance_guard);
-                    park_duration
-                };
 
-                drop(storage);
-                let Some(park_duration) = park_duration else {
-                    break;
-                };
-                std::thread::park_timeout(park_duration);
+                    drop(storage);
+                    let Some(park_duration) = park_duration else {
+                        break;
+                    };
+                    runtime.record_idle_wait();
+                    std::thread::park_timeout(park_duration);
+                }
             })?;
 
         Ok(Some(handle))
@@ -446,10 +497,17 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.background
-            .install_thread(BackgroundThreadKind::PersistedRefresh, || {
-                Self::spawn_background_persisted_refresh_thread(Arc::downgrade(self))
-            })
+        self.background.install_thread(
+            BackgroundThreadKind::PersistedRefresh,
+            self.background_persisted_refresh_poll_interval(),
+            |runtime, interval| {
+                Self::spawn_background_persisted_refresh_thread(
+                    Arc::downgrade(self),
+                    runtime,
+                    interval,
+                )
+            },
+        )
     }
 
     pub(super) fn start_background_rollup_thread(
@@ -460,10 +518,13 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        self.background
-            .install_thread(BackgroundThreadKind::Rollup, || {
-                Self::spawn_background_rollup_thread(Arc::downgrade(self), rollup_interval)
-            })
+        self.background.install_thread(
+            BackgroundThreadKind::Rollup,
+            rollup_interval,
+            |runtime, interval| {
+                Self::spawn_background_rollup_thread(Arc::downgrade(self), runtime, interval)
+            },
+        )
     }
 
     fn record_background_worker_error(
@@ -513,23 +574,45 @@ impl ChunkStorage {
         }
 
         let flush_result = match policy {
-            FlushPipelinePolicy::Foreground => self.flush_all_active(),
-            FlushPipelinePolicy::BackgroundEligibleOnly => self.flush_background_eligible_active(),
-            FlushPipelinePolicy::BackgroundBounded => self.flush_background_bounded_active(),
+            FlushPipelinePolicy::Foreground => self
+                .flush_all_active()
+                .map(|()| MaintenancePassSelection::default()),
+            FlushPipelinePolicy::BackgroundEligibleOnly => {
+                self.flush_background_eligible_active_with_selection()
+            }
+            FlushPipelinePolicy::BackgroundBounded => {
+                self.flush_background_bounded_active_with_selection()
+            }
         };
-        if let Err(err) = flush_result {
-            self.observability
-                .flush
-                .pipeline_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            self.observability
-                .flush
-                .pipeline_duration_nanos_total
-                .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
-            return Err(err);
-        }
+        let active_selection = match flush_result {
+            Ok(selection) => selection,
+            Err(err) => {
+                self.observability
+                    .flush
+                    .pipeline_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.observability
+                    .flush
+                    .pipeline_duration_nanos_total
+                    .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                return Err(err);
+            }
+        };
 
-        if let Err(err) = self.persist_segment_with_outcome() {
+        let persist_result = match policy {
+            FlushPipelinePolicy::BackgroundEligibleOnly
+            | FlushPipelinePolicy::BackgroundBounded => self
+                .persist_segment_background_bounded_with_limits(
+                    self.runtime
+                        .maintenance_max_items_per_pass
+                        .saturating_sub(active_selection.items),
+                    self.runtime
+                        .maintenance_max_bytes_per_pass
+                        .saturating_sub(active_selection.input_bytes),
+                ),
+            FlushPipelinePolicy::Foreground => self.persist_segment_with_outcome(),
+        };
+        if let Err(err) = persist_result {
             self.observability
                 .flush
                 .pipeline_errors_total

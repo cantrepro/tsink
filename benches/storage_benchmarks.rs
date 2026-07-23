@@ -209,6 +209,7 @@ fn make_persisted_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk 
         },
         points: chunk_points,
         encoded_payload: encoded.payload,
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     }
 }

@@ -58,6 +58,48 @@ impl ChunkStorage {
         Ok(sources.into_values().collect())
     }
 
+    pub(in super::super) fn persisted_registry_catalog_delta_for_root_changes(
+        &self,
+        added_roots: &[PathBuf],
+        removed_roots: &[PathBuf],
+    ) -> Result<registry_catalog::PersistedRegistryCatalogDelta> {
+        let removed_states = {
+            let persisted_index = self.persisted.persisted_index.read();
+            removed_roots
+                .iter()
+                .map(|root| {
+                    persisted_index.segments_by_root.get(root).map(|segment| {
+                        registry_catalog::catalog_entry_key(segment.lane, &segment.manifest)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut removed = Vec::with_capacity(removed_roots.len());
+        for (root, key) in removed_roots.iter().zip(removed_states) {
+            if let Some(key) = key {
+                removed.push(key);
+                continue;
+            }
+            // A publication may have mutated the visible index before a later catalog write
+            // failed. The known-dirty/replacement retry still carries the exact removed root, and
+            // its canonical path encodes the lane-independent level/id needed to replay the same
+            // sidecar intent even when the physical source has already disappeared.
+            let (lane, _tier) = self.persisted_segment_location_for_root(root)?;
+            removed.push(registry_catalog::catalog_entry_key_from_root(lane, root)?);
+        }
+        let added = added_roots
+            .iter()
+            .map(|root| {
+                let (lane, _tier) = self.persisted_segment_location_for_root(root)?;
+                Ok(registry_catalog::PersistedRegistryCatalogSource {
+                    lane,
+                    root: root.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(registry_catalog::PersistedRegistryCatalogDelta { added, removed })
+    }
+
     fn persist_series_registry_catalog_index_with_sources_and_kind(
         &self,
         checkpoint_path: &Path,
@@ -67,6 +109,8 @@ impl ChunkStorage {
         match registry_catalog::validate_registry_catalog(checkpoint_path, sources) {
             Ok(Some(registry_catalog::ValidatedRegistryCatalog {
                 series_fingerprint: Some(_),
+                incremental_store: true,
+                legacy_snapshot: true,
             })) => return Ok(()),
             Ok(_) | Err(TsinkError::DataCorruption(_) | TsinkError::Json(_)) => {}
             Err(err) => return Err(err),
@@ -159,6 +203,55 @@ impl ChunkStorage {
             sources,
             crate::DiskReservationKind::Maintenance,
         )
+    }
+
+    pub(in super::super) fn persist_series_registry_index_with_catalog_update(
+        &self,
+        update: &registry_catalog::PersistedRegistryCatalogUpdate,
+    ) -> Result<()> {
+        match update {
+            registry_catalog::PersistedRegistryCatalogUpdate::Complete(sources) => {
+                self.persist_series_registry_index_with_catalog_sources(sources)
+            }
+            registry_catalog::PersistedRegistryCatalogUpdate::Delta(delta) => {
+                let Some(checkpoint_path) = &self.persisted.series_index_path else {
+                    return Ok(());
+                };
+                let delta_path = SeriesRegistry::incremental_path(checkpoint_path);
+                let delta_dir_path = SeriesRegistry::incremental_dir(checkpoint_path);
+                self.registry_persistence_context()
+                    .persist_series_registry_index(
+                        checkpoint_path,
+                        &delta_path,
+                        &delta_dir_path,
+                        &[],
+                        |checkpoint_path, _sources| {
+                            registry_catalog::persist_registry_catalog_delta_budgeted_with_kind(
+                                checkpoint_path,
+                                delta,
+                                self.persisted.local_disk_budget.as_ref(),
+                                crate::DiskReservationKind::Maintenance,
+                            )
+                        },
+                    )
+            }
+        }
+    }
+
+    pub(in super::super) fn persist_selected_series_registry_index_without_catalog(
+        &self,
+        selected_series_ids: &[SeriesId],
+    ) -> Result<()> {
+        let Some(checkpoint_path) = &self.persisted.series_index_path else {
+            return Ok(());
+        };
+        self.registry_persistence_context()
+            .persist_selected_series_registry_index(
+                checkpoint_path,
+                selected_series_ids,
+                &[],
+                |_checkpoint_path, _sources| Ok(()),
+            )
     }
 
     fn persist_series_registry_index_with_catalog_sources_and_kind(

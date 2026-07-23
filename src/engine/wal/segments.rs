@@ -55,6 +55,10 @@ struct WalOpenRecoveryState {
 }
 
 impl FramedWal {
+    pub(in crate::engine) fn write_buffer_capacity_bytes(&self) -> usize {
+        self.writer.lock().capacity()
+    }
+
     pub fn open(dir: impl AsRef<Path>, sync_mode: WalSyncMode) -> Result<Self> {
         Self::open_with_buffer_size(dir, sync_mode, DEFAULT_WAL_BUFFER_SIZE)
     }
@@ -635,9 +639,23 @@ pub(super) fn sync_dir_path(_path: &Path) -> Result<()> {
 }
 
 pub(super) fn collect_wal_segment_files(dir: &Path) -> Result<Vec<WalSegmentFile>> {
+    collect_wal_segment_files_with_limit(
+        dir,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+}
+
+fn collect_wal_segment_files_with_limit(
+    dir: &Path,
+    max_entries: usize,
+) -> Result<Vec<WalSegmentFile>> {
     let mut deduped = BTreeMap::<u64, WalSegmentFile>::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let entries = crate::engine::fs_utils::collect_directory_entries_bounded(
+        dir,
+        max_entries,
+        "WAL segment discovery",
+    )?;
+    for entry in entries {
         if !entry.file_type()?.is_file() {
             continue;
         }
@@ -852,4 +870,26 @@ pub(super) fn scan_last_seq(path: &Path) -> Result<u64> {
     }
 
     Ok(last_seq)
+}
+
+#[cfg(test)]
+mod namespace_bound_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn wal_segment_discovery_counts_unknown_entries_at_the_global_cap() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(WAL_FILE_NAME), b"wal").unwrap();
+        fs::write(temp_dir.path().join("host-owned"), b"opaque").unwrap();
+
+        let segments = collect_wal_segment_files_with_limit(temp_dir.path(), 2)
+            .expect("the exact namespace cap must succeed");
+        assert_eq!(segments.len(), 1);
+
+        fs::create_dir(temp_dir.path().join("unknown-directory")).unwrap();
+        let err = collect_wal_segment_files_with_limit(temp_dir.path(), 2)
+            .expect_err("cap plus one must fail before name filtering");
+        assert!(err.to_string().contains("2-entry global work bound"));
+    }
 }

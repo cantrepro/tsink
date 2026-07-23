@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tsink::{DiskCategory, LocalDiskBudget, TsinkError};
 
 pub const CLUSTER_AUDIT_RETENTION_SECS_ENV: &str = "TSINK_CLUSTER_AUDIT_RETENTION_SECS";
 pub const CLUSTER_AUDIT_MAX_LOG_BYTES_ENV: &str = "TSINK_CLUSTER_AUDIT_MAX_LOG_BYTES";
@@ -104,23 +105,185 @@ pub struct ClusterAuditQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterAuditHealthSnapshot {
+    pub enabled: bool,
+    pub retained_entries: u64,
+    pub log_bytes: u64,
+    pub cleanup_pending: bool,
+    pub last_cleanup_error: Option<String>,
+    pub persistence_fenced: bool,
+    pub persistence_fence_reason: Option<String>,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterAuditPersistenceStage {
+    Encode,
+    Append,
+    Compact,
+}
+
+impl ClusterAuditPersistenceStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Encode => "record encoding",
+            Self::Append => "record append",
+            Self::Compact => "log compaction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterAuditDiskResourceLimit {
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    InsufficientDiskSpace {
+        required: u64,
+        available: u64,
+    },
+    InsufficientCompactionHeadroom {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAuditAppendError {
+    stage: ClusterAuditPersistenceStage,
+    detail: String,
+    resource_limit: Option<ClusterAuditDiskResourceLimit>,
+    indeterminate: bool,
+}
+
+impl ClusterAuditAppendError {
+    fn new(stage: ClusterAuditPersistenceStage, detail: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            detail: detail.to_string(),
+            resource_limit: None,
+            indeterminate: false,
+        }
+    }
+
+    fn indeterminate(stage: ClusterAuditPersistenceStage, detail: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            detail: detail.to_string(),
+            resource_limit: None,
+            indeterminate: true,
+        }
+    }
+
+    fn from_tsink(stage: ClusterAuditPersistenceStage, err: TsinkError) -> Self {
+        let resource_limit = match &err {
+            TsinkError::DiskQuotaExceeded {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => Some(ClusterAuditDiskResourceLimit::DiskQuotaExceeded {
+                limit: *limit,
+                used: *used,
+                reserved: *reserved,
+                requested: *requested,
+            }),
+            TsinkError::InsufficientDiskSpace {
+                required,
+                available,
+            } => Some(ClusterAuditDiskResourceLimit::InsufficientDiskSpace {
+                required: *required,
+                available: *available,
+            }),
+            TsinkError::InsufficientCompactionHeadroom {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => Some(
+                ClusterAuditDiskResourceLimit::InsufficientCompactionHeadroom {
+                    limit: *limit,
+                    used: *used,
+                    reserved: *reserved,
+                    requested: *requested,
+                },
+            ),
+            _ => None,
+        };
+        let indeterminate =
+            stage == ClusterAuditPersistenceStage::Append && resource_limit.is_none();
+        Self {
+            stage,
+            detail: err.to_string(),
+            resource_limit,
+            indeterminate,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage(&self) -> ClusterAuditPersistenceStage {
+        self.stage
+    }
+
+    pub fn resource_limit(&self) -> Option<ClusterAuditDiskResourceLimit> {
+        self.resource_limit
+    }
+
+    pub fn is_indeterminate(&self) -> bool {
+        self.indeterminate
+    }
+}
+
+impl std::fmt::Display for ClusterAuditAppendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cluster audit persistence failed during {}: {}",
+            self.stage.as_str(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ClusterAuditAppendError {}
+
 #[derive(Debug, Clone)]
 pub struct ClusterAuditLog {
     path: PathBuf,
     config: ClusterAuditConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: Arc<Mutex<ClusterAuditState>>,
 }
 
 #[derive(Debug)]
 struct ClusterAuditState {
     entries: VecDeque<ClusterAuditRecord>,
-    file: File,
     log_bytes: u64,
     next_id: u64,
+    persistence_fenced: Option<String>,
+    last_cleanup_error: Option<String>,
+    #[cfg(test)]
+    fail_next_compaction: bool,
+    #[cfg(test)]
+    fail_next_append_indeterminate: bool,
 }
 
 impl ClusterAuditLog {
     pub fn open(path: PathBuf, config: ClusterAuditConfig) -> Result<Self, String> {
+        Self::open_with_disk_budget(path, config, None)
+    }
+
+    pub fn open_with_disk_budget(
+        path: PathBuf,
+        config: ClusterAuditConfig,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         if config.retention_secs == 0 {
             return Err("cluster audit retention must be greater than zero seconds".to_string());
         }
@@ -131,67 +294,156 @@ impl ClusterAuditLog {
             return Err("cluster audit max query limit must be greater than zero".to_string());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed to create cluster audit directory {}: {err}",
-                    parent.display()
-                )
-            })?;
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .create_dir_all_and_sync_parents(parent)
+                    .map_err(|err| {
+                        format!(
+                            "failed to create managed cluster audit directory {}: {err}",
+                            parent.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .cleanup_atomic_write_temps(&path)
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean managed cluster audit temporaries for {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                let legacy_compaction_temp = path.with_extension("tmp");
+                if legacy_compaction_temp != path {
+                    local_disk_budget
+                        .remove_managed_file_if_exists_and_sync_parent(
+                            &legacy_compaction_temp,
+                            DiskCategory::Temporary,
+                        )
+                        .map_err(|err| {
+                            format!(
+                                "failed to clean legacy cluster audit compaction file {}: {err}",
+                                legacy_compaction_temp.display()
+                            )
+                        })?;
+                }
+                local_disk_budget
+                    .validate_managed_file_path(&path)
+                    .map_err(|err| {
+                        format!(
+                            "invalid managed cluster audit path {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create cluster audit directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+
+        if !path.exists() {
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .append_file_and_sync_parent(&path, &[], DiskCategory::Cluster)
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize managed cluster audit log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                tsink::engine::fs_utils::write_file_atomically_and_sync_parent(&path, &[])
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize cluster audit log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            }
         }
 
         let now_ms = unix_timestamp_millis();
         let cutoff_ms = now_ms.saturating_sub(config.retention_secs.saturating_mul(1000));
         let mut entries = VecDeque::new();
         let mut next_id = 1_u64;
+        let mut skipped_expired = false;
         if path.exists() {
-            let reader = BufReader::new(File::open(&path).map_err(|err| {
+            let mut reader = BufReader::new(File::open(&path).map_err(|err| {
                 format!("failed to open cluster audit log {}: {err}", path.display())
             })?);
-            for (line_number, line) in reader.lines().enumerate() {
-                let line = line.map_err(|err| {
-                    format!(
-                        "failed to read cluster audit log {} line {}: {err}",
-                        path.display(),
-                        line_number + 1
-                    )
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line).map_err(|err| {
+                    format!("failed to read cluster audit log {}: {err}", path.display(),)
                 })?;
-                if line.trim().is_empty() {
+                if read == 0 {
+                    break;
+                }
+                line_number = line_number
+                    .checked_add(1)
+                    .ok_or_else(|| "cluster audit log line count overflow".to_string())?;
+                if line.last() != Some(&b'\n') {
+                    return Err(format!(
+                        "cluster audit log {} ends with an incomplete record at line {line_number}",
+                        path.display()
+                    ));
+                }
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let record: ClusterAuditRecord = serde_json::from_str(&line).map_err(|err| {
+                let record: ClusterAuditRecord = serde_json::from_slice(&line).map_err(|err| {
                     format!(
                         "failed to parse cluster audit log {} line {}: {err}",
                         path.display(),
-                        line_number + 1
+                        line_number
                     )
                 })?;
+                let following_id = record.id.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "cluster audit log {} exhausted its record id space at line {line_number}",
+                        path.display()
+                    )
+                })?;
+                next_id = next_id.max(following_id);
                 if record.timestamp_unix_ms < cutoff_ms {
+                    skipped_expired = true;
                     continue;
                 }
-                next_id = next_id.max(record.id.saturating_add(1));
                 entries.push_back(record);
             }
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(|err| format!("failed to open cluster audit log {}: {err}", path.display()))?;
-        let log_bytes = file
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or_default();
+        let log_bytes = std::fs::metadata(&path)
+            .map_err(|err| {
+                format!(
+                    "failed to inspect cluster audit log {}: {err}",
+                    path.display()
+                )
+            })?
+            .len();
 
         let store = Self {
             path,
             config,
+            local_disk_budget,
             state: Arc::new(Mutex::new(ClusterAuditState {
                 entries,
-                file,
                 log_bytes,
                 next_id,
+                persistence_fenced: None,
+                last_cleanup_error: None,
+                #[cfg(test)]
+                fail_next_compaction: false,
+                #[cfg(test)]
+                fail_next_append_indeterminate: false,
             })),
         };
 
@@ -200,13 +452,15 @@ impl ClusterAuditLog {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut changed = prune_retention_locked(
-                &mut state.entries,
-                now_ms.saturating_sub(store.config.retention_secs.saturating_mul(1000)),
-            );
+            let mut changed = skipped_expired
+                || prune_retention_locked(
+                    &mut state.entries,
+                    now_ms.saturating_sub(store.config.retention_secs.saturating_mul(1000)),
+                );
             changed |= enforce_size_bound_locked(&mut state.entries, store.config.max_log_bytes)?;
             if changed || state.log_bytes > store.config.max_log_bytes {
-                compact_locked(&store.path, &mut state)?;
+                compact_locked(&store.path, store.local_disk_budget.as_ref(), &mut state)
+                    .map_err(|err| format!("failed to initialize cluster audit log: {err}"))?;
             }
         }
 
@@ -217,7 +471,10 @@ impl ClusterAuditLog {
         &self.path
     }
 
-    pub fn append(&self, input: ClusterAuditEntryInput) -> Result<ClusterAuditRecord, String> {
+    pub fn append(
+        &self,
+        input: ClusterAuditEntryInput,
+    ) -> Result<ClusterAuditRecord, ClusterAuditAppendError> {
         let timestamp_unix_ms = input
             .timestamp_unix_ms
             .unwrap_or_else(unix_timestamp_millis);
@@ -225,6 +482,39 @@ impl ClusterAuditLog {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reason) = state.persistence_fenced.as_deref() {
+            return Err(ClusterAuditAppendError::new(
+                ClusterAuditPersistenceStage::Append,
+                format!(
+                    "cluster audit log is fenced after an indeterminate persistence failure: {reason}"
+                ),
+            ));
+        }
+        let now_ms = unix_timestamp_millis();
+        let mut cleanup_needed = state.last_cleanup_error.is_some()
+            || prune_retention_locked(
+                &mut state.entries,
+                now_ms.saturating_sub(self.config.retention_secs.saturating_mul(1000)),
+            );
+        cleanup_needed |= enforce_size_bound_locked(&mut state.entries, self.config.max_log_bytes)
+            .map_err(|err| {
+                ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Encode, err)
+            })?;
+        cleanup_needed |= state.log_bytes > self.config.max_log_bytes;
+        if cleanup_needed {
+            if let Err(err) =
+                compact_locked(&self.path, self.local_disk_budget.as_ref(), &mut state)
+            {
+                state.last_cleanup_error = Some(err.to_string());
+                return Err(err);
+            }
+        }
+        let next_id = state.next_id.checked_add(1).ok_or_else(|| {
+            ClusterAuditAppendError::new(
+                ClusterAuditPersistenceStage::Encode,
+                "cluster audit record id space exhausted",
+            )
+        })?;
         let record = ClusterAuditRecord {
             id: state.next_id,
             timestamp_unix_ms,
@@ -233,21 +523,35 @@ impl ClusterAuditLog {
             target: input.target,
             outcome: input.outcome,
         };
-        let encoded = serialize_record_line(&record)?;
-        state
-            .file
-            .write_all(&encoded)
-            .map_err(|err| format!("failed to append cluster audit record: {err}"))?;
-        state
-            .file
-            .flush()
-            .map_err(|err| format!("failed to flush cluster audit record: {err}"))?;
-        state
-            .file
-            .sync_data()
-            .map_err(|err| format!("failed to fsync cluster audit log: {err}"))?;
-        state.log_bytes = state.log_bytes.saturating_add(encoded.len() as u64);
-        state.next_id = state.next_id.saturating_add(1);
+        let encoded = serialize_record_line(&record).map_err(|err| {
+            ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Encode, err)
+        })?;
+        #[cfg(test)]
+        let append_result = if std::mem::take(&mut state.fail_next_append_indeterminate) {
+            Err(ClusterAuditAppendError::indeterminate(
+                ClusterAuditPersistenceStage::Append,
+                "injected append failure with failed rollback",
+            ))
+        } else {
+            append_record(&self.path, self.local_disk_budget.as_ref(), &encoded)
+        };
+        #[cfg(not(test))]
+        let append_result = append_record(&self.path, self.local_disk_budget.as_ref(), &encoded);
+        if let Err(err) = append_result {
+            if err.is_indeterminate() {
+                state.persistence_fenced = Some(err.to_string());
+            }
+            return Err(err);
+        }
+        state.log_bytes = std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "failed to inspect cluster audit log after durable append; deferring exact reconciliation: {err}"
+                );
+                state.log_bytes.saturating_add(encoded.len() as u64)
+            });
+        state.next_id = next_id;
         state.entries.push_back(record.clone());
 
         let now_ms = unix_timestamp_millis();
@@ -255,11 +559,56 @@ impl ClusterAuditLog {
             &mut state.entries,
             now_ms.saturating_sub(self.config.retention_secs.saturating_mul(1000)),
         );
-        changed |= enforce_size_bound_locked(&mut state.entries, self.config.max_log_bytes)?;
+        changed |= enforce_size_bound_locked(&mut state.entries, self.config.max_log_bytes)
+            .map_err(|err| {
+                ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Encode, err)
+            })?;
         if changed || state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+            if let Err(err) =
+                compact_locked(&self.path, self.local_disk_budget.as_ref(), &mut state)
+            {
+                // The appended record is already durable and visible in memory. Compaction is
+                // cleanup debt and must not turn that committed append into a false rejection.
+                state.last_cleanup_error = Some(err.to_string());
+                eprintln!("cluster audit compaction deferred after durable append: {err}");
+            }
         }
         Ok(record)
+    }
+
+    #[cfg(test)]
+    fn fail_next_compaction(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_next_compaction = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_append_indeterminate(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_next_append_indeterminate = true;
+    }
+
+    pub fn health_snapshot(&self) -> ClusterAuditHealthSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cleanup_pending = state.last_cleanup_error.is_some();
+        let persistence_fenced = state.persistence_fenced.is_some();
+        ClusterAuditHealthSnapshot {
+            enabled: true,
+            retained_entries: u64::try_from(state.entries.len()).unwrap_or(u64::MAX),
+            log_bytes: state.log_bytes,
+            cleanup_pending,
+            last_cleanup_error: state.last_cleanup_error.clone(),
+            persistence_fenced,
+            persistence_fence_reason: state.persistence_fenced.clone(),
+            degraded: cleanup_pending || persistence_fenced,
+        }
     }
 
     pub fn query(&self, query: &ClusterAuditQuery) -> Vec<ClusterAuditRecord> {
@@ -305,15 +654,9 @@ fn serialize_record_line(record: &ClusterAuditRecord) -> Result<Vec<u8>, String>
 }
 
 fn prune_retention_locked(entries: &mut VecDeque<ClusterAuditRecord>, cutoff_ms: u64) -> bool {
-    let mut changed = false;
-    while entries
-        .front()
-        .is_some_and(|record| record.timestamp_unix_ms < cutoff_ms)
-    {
-        entries.pop_front();
-        changed = true;
-    }
-    changed
+    let previous_len = entries.len();
+    entries.retain(|record| record.timestamp_unix_ms >= cutoff_ms);
+    entries.len() != previous_len
 }
 
 fn enforce_size_bound_locked(
@@ -335,46 +678,138 @@ fn enforce_size_bound_locked(
 fn estimate_entries_size(entries: &VecDeque<ClusterAuditRecord>) -> Result<u64, String> {
     let mut total = 0_u64;
     for entry in entries {
-        total = total.saturating_add(serialize_record_line(entry)?.len() as u64);
+        let encoded_bytes = u64::try_from(serialize_record_line(entry)?.len())
+            .map_err(|_| "encoded cluster audit record exceeds the supported byte range")?;
+        total = total
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| "cluster audit log exceeds the supported byte range".to_string())?;
     }
     Ok(total)
 }
 
-fn compact_locked(path: &Path, state: &mut ClusterAuditState) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|err| {
-            format!(
-                "failed to rewrite cluster audit log {}: {err}",
-                path.display()
-            )
-        })?;
-    let mut written_bytes = 0_u64;
-    for entry in &state.entries {
-        let line = serialize_record_line(entry)?;
-        file.write_all(&line)
-            .map_err(|err| format!("failed to write compacted cluster audit log: {err}"))?;
-        written_bytes = written_bytes.saturating_add(line.len() as u64);
+fn append_record(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    encoded: &[u8],
+) -> Result<(), ClusterAuditAppendError> {
+    if let Some(local_disk_budget) = local_disk_budget {
+        return local_disk_budget
+            .append_file_and_sync_parent(path, encoded, DiskCategory::Cluster)
+            .map_err(|err| {
+                ClusterAuditAppendError::from_tsink(ClusterAuditPersistenceStage::Append, err)
+            });
     }
-    file.flush()
-        .map_err(|err| format!("failed to flush compacted cluster audit log: {err}"))?;
-    file.sync_data()
-        .map_err(|err| format!("failed to fsync compacted cluster audit log: {err}"))?;
-    state.file = OpenOptions::new()
-        .create(true)
+
+    let initial_len = std::fs::metadata(path)
+        .map_err(|err| ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Append, err))?
+        .len();
+    let mut file = OpenOptions::new()
         .append(true)
-        .read(true)
         .open(path)
-        .map_err(|err| {
-            format!(
-                "failed to reopen cluster audit log {}: {err}",
-                path.display()
+        .map_err(|err| ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Append, err))?;
+    let append_result = (|| -> std::io::Result<()> {
+        file.write_all(encoded)?;
+        file.flush()?;
+        file.sync_all()?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    let Err(append_err) = append_result else {
+        return Ok(());
+    };
+
+    let rollback_result = file
+        .set_len(initial_len)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_parent_directory(path));
+    match rollback_result {
+        Ok(()) => Err(ClusterAuditAppendError::new(
+            ClusterAuditPersistenceStage::Append,
+            append_err,
+        )),
+        Err(rollback_err) => Err(ClusterAuditAppendError::indeterminate(
+            ClusterAuditPersistenceStage::Append,
+            format!("append failed: {append_err}; rollback failed: {rollback_err}"),
+        )),
+    }
+}
+
+fn compact_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut ClusterAuditState,
+) -> Result<(), ClusterAuditAppendError> {
+    #[cfg(test)]
+    if std::mem::take(&mut state.fail_next_compaction) {
+        return Err(ClusterAuditAppendError::new(
+            ClusterAuditPersistenceStage::Compact,
+            "injected cluster audit compaction failure",
+        ));
+    }
+
+    let compacted_bytes = estimate_entries_size(&state.entries)
+        .map_err(|err| ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Compact, err))?;
+    if let Some(local_disk_budget) = local_disk_budget {
+        local_disk_budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                path,
+                compacted_bytes,
+                DiskCategory::Cluster,
+                |writer| write_compacted_log(&state.entries, writer).map_err(TsinkError::Other),
             )
+            .map_err(|err| {
+                ClusterAuditAppendError::from_tsink(ClusterAuditPersistenceStage::Compact, err)
+            })?;
+    } else {
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent_with(
+            path,
+            compacted_bytes,
+            |writer| write_compacted_log(&state.entries, writer).map_err(TsinkError::Other),
+        )
+        .map_err(|err| {
+            ClusterAuditAppendError::from_tsink(ClusterAuditPersistenceStage::Compact, err)
         })?;
-    state.log_bytes = written_bytes;
+    }
+
+    let actual_bytes = std::fs::metadata(path)
+        .map_err(|err| ClusterAuditAppendError::new(ClusterAuditPersistenceStage::Compact, err))?
+        .len();
+    if actual_bytes != compacted_bytes {
+        return Err(ClusterAuditAppendError::new(
+            ClusterAuditPersistenceStage::Compact,
+            format!(
+                "compacted cluster audit log length mismatch: expected {compacted_bytes} bytes, found {actual_bytes} bytes"
+            ),
+        ));
+    }
+    state.log_bytes = actual_bytes;
+    state.last_cleanup_error = None;
+    Ok(())
+}
+
+fn write_compacted_log(
+    entries: &VecDeque<ClusterAuditRecord>,
+    writer: &mut dyn Write,
+) -> Result<(), String> {
+    for entry in entries {
+        let encoded = serialize_record_line(entry)?;
+        writer
+            .write_all(&encoded)
+            .map_err(|err| format!("failed to write compacted cluster audit log: {err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -436,7 +871,10 @@ fn unix_timestamp_millis() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Barrier;
+    use std::thread;
     use tempfile::TempDir;
+    use tsink::LocalDiskLimits;
 
     fn actor(id: &str) -> ClusterAuditActor {
         ClusterAuditActor {
@@ -452,6 +890,25 @@ mod tests {
             result: None,
             error_type: None,
         }
+    }
+
+    fn input(timestamp_unix_ms: u64, operation: &str) -> ClusterAuditEntryInput {
+        ClusterAuditEntryInput {
+            timestamp_unix_ms: Some(timestamp_unix_ms),
+            operation: operation.to_string(),
+            actor: actor("operator-a"),
+            target: json!({"path": "/api/v1/admin/cluster/test"}),
+            outcome: outcome("success", 200),
+        }
+    }
+
+    fn category_bytes(snapshot: &tsink::LocalDiskBudgetSnapshot, category: DiskCategory) -> u64 {
+        snapshot
+            .categories
+            .iter()
+            .find(|usage| usage.category == category)
+            .map(|usage| usage.bytes)
+            .unwrap_or_default()
     }
 
     #[test]
@@ -594,5 +1051,484 @@ mod tests {
             ..ClusterAuditQuery::default()
         });
         assert_eq!(queried.len(), 2);
+    }
+
+    #[test]
+    fn budgeted_append_rejects_tiny_quota_without_publication() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("cluster/audit/node-a.audit.log");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(1),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let log = ClusterAuditLog::open_with_disk_budget(
+            path.clone(),
+            ClusterAuditConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("audit log should open");
+
+        let err = log
+            .append(input(unix_timestamp_millis(), "tiny_quota"))
+            .expect_err("record should exceed the tiny quota");
+        assert_eq!(err.stage(), ClusterAuditPersistenceStage::Append);
+        assert!(matches!(
+            err.resource_limit(),
+            Some(ClusterAuditDiskResourceLimit::DiskQuotaExceeded {
+                limit: 1,
+                used: 0,
+                reserved: 0,
+                requested,
+            }) if requested > 1
+        ));
+        assert!(log.query(&ClusterAuditQuery::default()).is_empty());
+        assert_eq!(std::fs::metadata(path).expect("audit metadata").len(), 0);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(category_bytes(&snapshot, DiskCategory::Cluster), 0);
+    }
+
+    #[test]
+    fn physical_headroom_failure_preserves_typed_resource_detail() {
+        let err = ClusterAuditAppendError::from_tsink(
+            ClusterAuditPersistenceStage::Append,
+            TsinkError::InsufficientDiskSpace {
+                required: 4_096,
+                available: 1_024,
+            },
+        );
+
+        assert_eq!(err.stage(), ClusterAuditPersistenceStage::Append);
+        assert_eq!(
+            err.resource_limit(),
+            Some(ClusterAuditDiskResourceLimit::InsufficientDiskSpace {
+                required: 4_096,
+                available: 1_024,
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_audit_has_exact_cluster_accounting_across_restart() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("cluster/audit/node-a.audit.log");
+        let limits = LocalDiskLimits {
+            max_bytes: Some(8 * 1024 * 1024),
+            ..LocalDiskLimits::default()
+        };
+        let timestamp = unix_timestamp_millis();
+
+        let budget = LocalDiskBudget::open(temp_dir.path(), limits).expect("budget should open");
+        let log = ClusterAuditLog::open_with_disk_budget(
+            path.clone(),
+            ClusterAuditConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("audit log should open");
+        let appended = log
+            .append(input(timestamp, "restart_accounting"))
+            .expect("append should succeed");
+        let physical_bytes = std::fs::metadata(&path)
+            .expect("audit metadata should load")
+            .len();
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            physical_bytes
+        );
+        assert_eq!(snapshot.reserved_bytes, 0);
+        drop(log);
+        drop(budget);
+
+        let restarted_budget =
+            LocalDiskBudget::open(temp_dir.path(), limits).expect("restarted budget should open");
+        let restarted = ClusterAuditLog::open_with_disk_budget(
+            path,
+            ClusterAuditConfig::default(),
+            Some(Arc::clone(&restarted_budget)),
+        )
+        .expect("audit log should reopen");
+        assert_eq!(
+            restarted.query(&ClusterAuditQuery::default()),
+            vec![appended]
+        );
+        let restarted_snapshot = restarted_budget.snapshot();
+        assert_eq!(restarted_snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(
+            category_bytes(&restarted_snapshot, DiskCategory::Cluster),
+            physical_bytes
+        );
+        assert_eq!(restarted_snapshot.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_budgeted_audits_cannot_share_the_final_record_bytes() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let timestamp = unix_timestamp_millis();
+        let record_bytes = u64::try_from(
+            serialize_record_line(&ClusterAuditRecord {
+                id: 1,
+                timestamp_unix_ms: timestamp,
+                operation: "concurrent".to_string(),
+                actor: actor("operator-a"),
+                target: json!({"path": "/api/v1/admin/cluster/test"}),
+                outcome: outcome("success", 200),
+            })
+            .expect("test record should encode")
+            .len(),
+        )
+        .expect("record length should fit u64");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(record_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("budget should open");
+        let logs = ["a", "b"].map(|name| {
+            Arc::new(
+                ClusterAuditLog::open_with_disk_budget(
+                    temp_dir
+                        .path()
+                        .join(format!("cluster/audit/{name}.audit.log")),
+                    ClusterAuditConfig::default(),
+                    Some(Arc::clone(&budget)),
+                )
+                .expect("audit log should open"),
+            )
+        });
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = logs
+            .into_iter()
+            .map(|log| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    log.append(input(timestamp, "concurrent"))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("append thread should finish"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(err) if matches!(
+                        err.resource_limit(),
+                        Some(ClusterAuditDiskResourceLimit::DiskQuotaExceeded { .. })
+                    )
+                ))
+                .count(),
+            1
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, record_bytes);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            record_bytes
+        );
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn quota_full_open_compacts_non_growing_state_with_recovery_admission() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("cluster/audit/node-a.audit.log");
+        std::fs::create_dir_all(path.parent().expect("audit parent"))
+            .expect("audit parent should build");
+        let now = unix_timestamp_millis();
+        let expired = ClusterAuditRecord {
+            id: 1,
+            timestamp_unix_ms: now.saturating_sub(20_000),
+            operation: "expired".to_string(),
+            actor: actor("operator-a"),
+            target: json!({"path": "/expired"}),
+            outcome: outcome("success", 200),
+        };
+        let retained = ClusterAuditRecord {
+            id: 2,
+            timestamp_unix_ms: now,
+            operation: "retained".to_string(),
+            actor: actor("operator-a"),
+            target: json!({"path": "/retained"}),
+            outcome: outcome("success", 200),
+        };
+        let mut fixture = serialize_record_line(&expired).expect("expired record should encode");
+        let retained_line =
+            serialize_record_line(&retained).expect("retained record should encode");
+        fixture.extend_from_slice(&retained_line);
+        std::fs::write(&path, &fixture).expect("audit fixture should write");
+        let initial_bytes = u64::try_from(fixture.len()).expect("fixture length should fit u64");
+        let retained_bytes =
+            u64::try_from(retained_line.len()).expect("line length should fit u64");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(initial_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("budget should open at its quota");
+        let log = ClusterAuditLog::open_with_disk_budget(
+            path.clone(),
+            ClusterAuditConfig {
+                retention_secs: 1,
+                max_log_bytes: retained_bytes,
+                max_query_limit: 100,
+            },
+            Some(Arc::clone(&budget)),
+        )
+        .expect("recovery compaction should open the audit log");
+
+        assert_eq!(log.query(&ClusterAuditQuery::default()), vec![retained]);
+        assert_eq!(
+            std::fs::metadata(path).expect("audit metadata").len(),
+            retained_bytes
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, retained_bytes);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            retained_bytes
+        );
+        assert_eq!(snapshot.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn budgeted_open_cleans_only_owned_atomic_and_legacy_temporaries() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("cluster/audit/node-a.audit.log");
+        let parent = path.parent().expect("audit path should have a parent");
+        std::fs::create_dir_all(parent).expect("audit directory should build");
+        let target_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("audit file name should be UTF-8");
+        let generated_temp = parent.join(format!(".{target_name}.tmp-123-0000000000000000"));
+        let generated_lookalike = parent.join(format!(".{target_name}.tmp-123-000000000000000G"));
+        let legacy_temp = path.with_extension("tmp");
+        let legacy_lookalike = parent.join("node.audit.tmp.keep");
+        std::fs::write(&generated_temp, b"generated").expect("generated temp should write");
+        std::fs::write(&generated_lookalike, b"generated-lookalike")
+            .expect("generated lookalike should write");
+        std::fs::write(&legacy_temp, b"legacy").expect("legacy temp should write");
+        std::fs::write(&legacy_lookalike, b"legacy-lookalike")
+            .expect("legacy lookalike should write");
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("budget should open");
+
+        let _log = ClusterAuditLog::open_with_disk_budget(
+            path.clone(),
+            ClusterAuditConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("audit log should open");
+
+        assert!(!generated_temp.exists());
+        assert!(!legacy_temp.exists());
+        assert!(generated_lookalike.exists());
+        assert!(legacy_lookalike.exists());
+        assert_eq!(std::fs::metadata(path).expect("audit metadata").len(), 0);
+        let expected_bytes = std::fs::metadata(&generated_lookalike)
+            .expect("generated lookalike metadata")
+            .len()
+            .saturating_add(
+                std::fs::metadata(&legacy_lookalike)
+                    .expect("legacy lookalike metadata")
+                    .len(),
+            );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, expected_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn post_append_compaction_failure_is_cleanup_debt() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let config = ClusterAuditConfig {
+            retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
+            max_log_bytes: 1,
+            max_query_limit: 100,
+        };
+        let log = ClusterAuditLog::open(path.clone(), config).expect("audit log should open");
+        log.fail_next_compaction();
+
+        let appended = log
+            .append(input(unix_timestamp_millis(), "cleanup_debt"))
+            .expect("durable append must not fail when cleanup is deferred");
+        assert_eq!(
+            log.query(&ClusterAuditQuery::default()),
+            vec![appended.clone()]
+        );
+        let health = log.health_snapshot();
+        assert!(health.cleanup_pending);
+        assert!(health.degraded);
+        assert!(!health.persistence_fenced);
+        assert!(health
+            .last_cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected")));
+        drop(log);
+
+        let restarted = ClusterAuditLog::open(path, config).expect("audit log should reopen");
+        assert_eq!(
+            restarted.query(&ClusterAuditQuery::default()),
+            vec![appended]
+        );
+    }
+
+    #[test]
+    fn retention_only_cleanup_debt_is_observable_and_retried() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let config = ClusterAuditConfig {
+            retention_secs: 1,
+            max_log_bytes: 1024 * 1024,
+            max_query_limit: 100,
+        };
+        let log = ClusterAuditLog::open(path.clone(), config).expect("audit log should open");
+        log.fail_next_compaction();
+
+        log.append(input(
+            unix_timestamp_millis().saturating_sub(20_000),
+            "expired_cleanup_debt",
+        ))
+        .expect("durable expired append should survive deferred cleanup");
+        assert!(log.query(&ClusterAuditQuery::default()).is_empty());
+        assert!(log.health_snapshot().cleanup_pending);
+        assert!(std::fs::metadata(&path).expect("metadata").len() > 0);
+
+        let retained = log
+            .append(input(unix_timestamp_millis(), "cleanup_retry"))
+            .expect("next append should retry retention-only cleanup");
+        let health = log.health_snapshot();
+        assert!(!health.cleanup_pending);
+        assert!(!health.degraded);
+        assert!(health.last_cleanup_error.is_none());
+        assert_eq!(log.query(&ClusterAuditQuery::default()), vec![retained]);
+
+        drop(log);
+        let reopened = ClusterAuditLog::open(path, config).expect("cleaned log should reopen");
+        assert_eq!(reopened.query(&ClusterAuditQuery::default()).len(), 1);
+    }
+
+    #[test]
+    fn indeterminate_append_failure_fences_future_audit_appends() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let log = ClusterAuditLog::open(path.clone(), ClusterAuditConfig::default())
+            .expect("audit log should open");
+        log.fail_next_append_indeterminate();
+
+        let error = log
+            .append(input(unix_timestamp_millis(), "indeterminate"))
+            .expect_err("indeterminate persistence must fail the audit append");
+        assert!(error.is_indeterminate());
+        let health = log.health_snapshot();
+        assert!(health.persistence_fenced);
+        assert!(health.degraded);
+        assert!(!health.cleanup_pending);
+        assert!(health
+            .persistence_fence_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failed rollback")));
+        assert!(log.query(&ClusterAuditQuery::default()).is_empty());
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+
+        let second = log
+            .append(input(unix_timestamp_millis(), "must_remain_fenced"))
+            .expect_err("fenced audit log must reject later appends");
+        assert!(!second.is_indeterminate());
+        assert!(second.to_string().contains("is fenced"));
+        assert_eq!(std::fs::metadata(path).expect("metadata").len(), 0);
+    }
+
+    #[test]
+    fn open_rejects_an_unterminated_final_record() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let record = ClusterAuditRecord {
+            id: 1,
+            timestamp_unix_ms: unix_timestamp_millis(),
+            operation: "unterminated".to_string(),
+            actor: actor("operator-a"),
+            target: json!({"path": "/unterminated"}),
+            outcome: outcome("success", 200),
+        };
+        let mut encoded = serialize_record_line(&record).expect("record should encode");
+        assert_eq!(encoded.pop(), Some(b'\n'));
+        std::fs::write(&path, encoded).expect("fixture should write");
+
+        let err = ClusterAuditLog::open(path, ClusterAuditConfig::default())
+            .expect_err("unterminated record should fail closed");
+        assert!(err.contains("incomplete record"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn expired_records_advance_ids_before_startup_compaction() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let expired = ClusterAuditRecord {
+            id: 41,
+            timestamp_unix_ms: unix_timestamp_millis().saturating_sub(20_000),
+            operation: "expired".to_string(),
+            actor: actor("operator-a"),
+            target: json!({"path": "/expired"}),
+            outcome: outcome("success", 200),
+        };
+        std::fs::write(
+            &path,
+            serialize_record_line(&expired).expect("expired record should encode"),
+        )
+        .expect("fixture should write");
+        let config = ClusterAuditConfig {
+            retention_secs: 1,
+            ..ClusterAuditConfig::default()
+        };
+
+        let log = ClusterAuditLog::open(path.clone(), config).expect("audit log should open");
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+        let appended = log
+            .append(input(unix_timestamp_millis(), "after_expiry"))
+            .expect("append should succeed");
+        assert_eq!(appended.id, 42);
+    }
+
+    #[test]
+    fn retention_prunes_out_of_order_expired_records() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let path = temp_dir.path().join("audit.log");
+        let config = ClusterAuditConfig {
+            retention_secs: 1,
+            max_log_bytes: 1024 * 1024,
+            max_query_limit: 100,
+        };
+        let log = ClusterAuditLog::open(path, config).expect("audit log should open");
+        let now = unix_timestamp_millis();
+        let retained = log
+            .append(input(now, "retained"))
+            .expect("recent append should succeed");
+        log.append(input(now.saturating_sub(20_000), "expired"))
+            .expect("out-of-order append should persist before retention cleanup");
+
+        assert_eq!(log.query(&ClusterAuditQuery::default()), vec![retained]);
     }
 }

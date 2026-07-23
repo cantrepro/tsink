@@ -117,13 +117,18 @@ impl<'a> WriteApplier<'a> {
         );
 
         let StagedWrite {
-            prepared,
+            mut prepared,
             staged_wal,
             ..
         } = staged;
+        let series_creation_rate_reservation =
+            prepared.resolved.series_creation_rate_reservation.take();
+        let transient_memory = prepared.resolved.transient_memory.clone();
         Ok(AppliedWrite {
             prepared_wal: prepared.prepared_wal,
             staged_wal,
+            series_creation_rate_reservation,
+            transient_memory,
         })
     }
 

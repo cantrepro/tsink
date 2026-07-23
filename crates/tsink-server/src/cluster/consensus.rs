@@ -1,6 +1,6 @@
 use crate::cluster::control::{
-    ControlHandoffMutationOutcome, ControlMembershipMutationOutcome, ControlNodeStatus,
-    ControlState, ControlStateStore,
+    encode_control_state_file, ControlHandoffMutationOutcome, ControlMembershipMutationOutcome,
+    ControlNodeStatus, ControlState, ControlStateStore,
 };
 use crate::cluster::membership::MembershipView;
 use crate::cluster::rpc::{
@@ -9,14 +9,19 @@ use crate::cluster::rpc::{
     InternalControlLogEntry, RpcClient,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
+use tsink::disk_budget::{
+    DiskCategory, LocalDiskBudget, ManagedFileReplacement, StagedManagedFileReplacements,
+};
+use tsink::TsinkError;
 
 const CONTROL_LOG_MAGIC: &str = "tsink-control-log";
-const CONTROL_LOG_SCHEMA_VERSION: u16 = 1;
+const CONTROL_LOG_LEGACY_SCHEMA_VERSION: u16 = 1;
+const CONTROL_LOG_SCHEMA_VERSION: u16 = 2;
 
 pub const CLUSTER_CONTROL_TICK_INTERVAL_SECS_ENV: &str = "TSINK_CLUSTER_CONTROL_TICK_INTERVAL_SECS";
 pub const CLUSTER_CONTROL_MAX_APPEND_ENTRIES_ENV: &str = "TSINK_CLUSTER_CONTROL_MAX_APPEND_ENTRIES";
@@ -34,6 +39,355 @@ const DEFAULT_CONTROL_SUSPECT_TIMEOUT_SECS: u64 = 6;
 const DEFAULT_CONTROL_DEAD_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_CONTROL_LEADER_LEASE_SECS: u64 = 6;
 const CONTROL_SYNC_MAX_ATTEMPTS: usize = 4;
+
+#[cfg(test)]
+struct ControlCheckpointPublishFailureGuard {
+    target: PathBuf,
+    _serialization_guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ControlCheckpointPublishFailureGuard {
+    fn drop(&mut self) {
+        let mut target = control_checkpoint_publish_failure_target()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if target.as_ref() == Some(&self.target) {
+            *target = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn control_checkpoint_publish_failure_target() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static TARGET: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    TARGET.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn fail_control_checkpoint_after_log_publish_once(
+    target: PathBuf,
+) -> ControlCheckpointPublishFailureGuard {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serialization_guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *control_checkpoint_publish_failure_target()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target.clone());
+    ControlCheckpointPublishFailureGuard {
+        target,
+        _serialization_guard: serialization_guard,
+    }
+}
+
+#[cfg(test)]
+fn maybe_fail_control_checkpoint_after_log_publish(log_path: &Path) -> tsink::Result<()> {
+    let mut target = control_checkpoint_publish_failure_target()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if target.as_deref() == Some(log_path) {
+        *target = None;
+        return Err(TsinkError::Other(
+            "injected failure after authoritative control-log publication".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct ControlPairFinalizationFailureGuard {
+    target: PathBuf,
+    _serialization_guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ControlPairFinalizationFailureGuard {
+    fn drop(&mut self) {
+        let mut target = control_pair_finalization_failure_target()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if target.as_ref() == Some(&self.target) {
+            *target = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn control_pair_finalization_failure_target() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static TARGET: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    TARGET.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn fail_control_pair_finalization_once(target: PathBuf) -> ControlPairFinalizationFailureGuard {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serialization_guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *control_pair_finalization_failure_target()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target.clone());
+    ControlPairFinalizationFailureGuard {
+        target,
+        _serialization_guard: serialization_guard,
+    }
+}
+
+#[cfg(test)]
+fn maybe_fail_control_pair_finalization(log_path: &Path) -> tsink::Result<()> {
+    let mut target = control_pair_finalization_failure_target()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if target.as_deref() == Some(log_path) {
+        *target = None;
+        return Err(TsinkError::Other(
+            "injected failure after durable control-pair publication".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlDiskResourceLimit {
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    InsufficientDiskSpace {
+        required: u64,
+        available: u64,
+    },
+    InsufficientCompactionHeadroom {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlCommitPosition {
+    pub index: u64,
+    pub term: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPersistenceStage {
+    LogEncode,
+    CheckpointEncode,
+    LogPublish,
+    CheckpointPublish,
+    Repair,
+}
+
+impl ControlPersistenceStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LogEncode => "control-log encoding",
+            Self::CheckpointEncode => "control-state checkpoint encoding",
+            Self::LogPublish => "control-log publication",
+            Self::CheckpointPublish => "control-state checkpoint publication",
+            Self::Repair => "control checkpoint repair",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlConsensusError {
+    detail: String,
+    resource_limit: Option<ControlDiskResourceLimit>,
+    committed_checkpoint: Option<ControlCommitPosition>,
+    indeterminate: bool,
+    candidate_visible: bool,
+    persistence_failure: bool,
+    cleanup_pending: bool,
+}
+
+impl ControlConsensusError {
+    fn rejected(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            resource_limit: None,
+            committed_checkpoint: None,
+            indeterminate: false,
+            candidate_visible: false,
+            persistence_failure: false,
+            cleanup_pending: false,
+        }
+    }
+
+    fn persistence(stage: ControlPersistenceStage, err: TsinkError) -> Self {
+        Self {
+            detail: format!("{} failed: {err}", stage.as_str()),
+            resource_limit: control_disk_resource_limit(&err),
+            committed_checkpoint: None,
+            indeterminate: false,
+            candidate_visible: false,
+            persistence_failure: true,
+            cleanup_pending: false,
+        }
+    }
+
+    fn indeterminate(
+        stage: ControlPersistenceStage,
+        detail: impl std::fmt::Display,
+        candidate_visible: bool,
+    ) -> Self {
+        Self {
+            detail: format!("{} outcome is indeterminate: {detail}", stage.as_str()),
+            resource_limit: None,
+            committed_checkpoint: None,
+            indeterminate: true,
+            candidate_visible,
+            persistence_failure: true,
+            cleanup_pending: false,
+        }
+    }
+
+    fn committed_checkpoint_pending(
+        position: ControlCommitPosition,
+        stage: ControlPersistenceStage,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            detail: format!(
+                "committed control checkpoint at index {} term {} is pending repair after {} failed: {detail}",
+                position.index,
+                position.term,
+                stage.as_str()
+            ),
+            resource_limit: None,
+            committed_checkpoint: Some(position),
+            indeterminate: true,
+            candidate_visible: true,
+            persistence_failure: true,
+            cleanup_pending: false,
+        }
+    }
+
+    fn durable_candidate_pending(
+        stage: ControlPersistenceStage,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            detail: format!(
+                "consensus-observed control state is fenced pending durable {}: {detail}",
+                stage.as_str()
+            ),
+            resource_limit: None,
+            committed_checkpoint: None,
+            indeterminate: true,
+            candidate_visible: false,
+            persistence_failure: true,
+            cleanup_pending: false,
+        }
+    }
+
+    fn committed_cleanup_pending(
+        position: ControlCommitPosition,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            detail: format!(
+                "committed control state at index {} term {} has cleanup debt: {detail}",
+                position.index, position.term
+            ),
+            resource_limit: None,
+            committed_checkpoint: Some(position),
+            indeterminate: false,
+            candidate_visible: true,
+            persistence_failure: true,
+            cleanup_pending: true,
+        }
+    }
+
+    pub fn resource_limit(&self) -> Option<ControlDiskResourceLimit> {
+        self.resource_limit
+    }
+
+    pub fn committed_checkpoint(&self) -> Option<ControlCommitPosition> {
+        self.committed_checkpoint
+    }
+
+    pub fn is_committed_checkpoint_pending(&self) -> bool {
+        self.committed_checkpoint.is_some() && !self.cleanup_pending
+    }
+
+    pub fn is_committed_cleanup_pending(&self) -> bool {
+        self.cleanup_pending
+    }
+
+    pub fn is_indeterminate(&self) -> bool {
+        self.indeterminate
+    }
+
+    pub fn is_persistence_failure(&self) -> bool {
+        self.persistence_failure
+    }
+}
+
+impl std::fmt::Display for ControlConsensusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ControlConsensusError {}
+
+impl Deref for ControlConsensusError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.detail
+    }
+}
+
+impl From<ControlConsensusError> for String {
+    fn from(err: ControlConsensusError) -> Self {
+        err.detail
+    }
+}
+
+fn control_disk_resource_limit(err: &TsinkError) -> Option<ControlDiskResourceLimit> {
+    match err {
+        TsinkError::DiskQuotaExceeded {
+            limit,
+            used,
+            reserved,
+            requested,
+        } => Some(ControlDiskResourceLimit::DiskQuotaExceeded {
+            limit: *limit,
+            used: *used,
+            reserved: *reserved,
+            requested: *requested,
+        }),
+        TsinkError::InsufficientDiskSpace {
+            required,
+            available,
+        } => Some(ControlDiskResourceLimit::InsufficientDiskSpace {
+            required: *required,
+            available: *available,
+        }),
+        TsinkError::InsufficientCompactionHeadroom {
+            limit,
+            used,
+            reserved,
+            requested,
+        } => Some(ControlDiskResourceLimit::InsufficientCompactionHeadroom {
+            limit: *limit,
+            used: *used,
+            reserved: *reserved,
+            requested: *requested,
+        }),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlConsensusConfig {
@@ -118,6 +472,21 @@ pub enum ProposeOutcome {
         index: u64,
         term: u64,
     },
+    CommittedCheckpointPending {
+        index: u64,
+        term: u64,
+        detail: String,
+    },
+    CommittedCleanupPending {
+        index: u64,
+        term: u64,
+        detail: String,
+    },
+    CommittedPersistencePending {
+        index: u64,
+        term: u64,
+        detail: String,
+    },
     Pending {
         required: usize,
         acknowledged: usize,
@@ -128,6 +497,8 @@ pub enum ProposeOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct ControlLogRecoverySnapshot {
     pub current_term: u64,
+    #[serde(default)]
+    pub stepped_down_term: u64,
     pub commit_index: u64,
     pub snapshot_last_index: u64,
     pub snapshot_last_term: u64,
@@ -199,13 +570,16 @@ pub struct ControlConsensusRuntime {
     local_node_id: String,
     state_store: Arc<ControlStateStore>,
     log_path: PathBuf,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     config: ControlConsensusConfig,
     state: Arc<Mutex<ConsensusState>>,
+    proposal_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
 struct ConsensusState {
     current_term: u64,
+    stepped_down_term: u64,
     commit_index: u64,
     snapshot_last_index: u64,
     snapshot_last_term: u64,
@@ -214,6 +588,37 @@ struct ConsensusState {
     control_state: ControlState,
     peer_next_index: BTreeMap<String, u64>,
     peer_heartbeat: BTreeMap<String, PeerHeartbeatState>,
+    persistence_fence: Option<String>,
+    checkpoint_pending: Option<ControlCheckpointPending>,
+    pending_durable_candidate: Option<ControlPendingDurableCandidate>,
+    cleanup_debt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlCheckpointPending {
+    position: ControlCommitPosition,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCheckpointWriteMode {
+    Growth,
+    AuthoritativeRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPendingDurableCandidate {
+    LogOnly,
+    Checkpoint(ControlCheckpointWriteMode),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlPersistenceStatus {
+    pub fenced: bool,
+    pub pending_checkpoint: Option<ControlCommitPosition>,
+    pub cleanup_debt: bool,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -229,10 +634,14 @@ struct ControlLogFileV1 {
     magic: String,
     schema_version: u16,
     current_term: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stepped_down_term: Option<u64>,
     commit_index: u64,
     snapshot_last_index: u64,
     snapshot_last_term: u64,
     entries: Vec<InternalControlLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_state: Option<ControlState>,
 }
 
 impl ControlConsensusRuntime {
@@ -258,42 +667,138 @@ impl ControlConsensusRuntime {
         if config.leader_lease_secs < config.tick_interval_secs {
             return Err("cluster control leader lease must be >= tick interval".to_string());
         }
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
+        let log_parent = log_path.parent().ok_or_else(|| {
+            format!(
+                "control-log path has no parent directory: {}",
+                log_path.display()
+            )
+        })?;
+        let local_disk_budget = state_store.local_disk_budget().cloned();
+        if let Some(budget) = local_disk_budget.as_ref() {
+            budget
+                .create_dir_all_and_sync_parents(log_parent)
+                .map_err(|err| {
+                    format!(
+                        "failed to create control-log directory {}: {err}",
+                        log_parent.display()
+                    )
+                })?;
+            budget
+                .validate_managed_file_path(&log_path)
+                .map_err(|err| {
+                    format!(
+                        "failed to validate control-log path {}: {err}",
+                        log_path.display()
+                    )
+                })?;
+            budget
+                .cleanup_atomic_write_temps(&log_path)
+                .map_err(|err| {
+                    format!(
+                        "failed to clean control-log temporary files for {}: {err}",
+                        log_path.display()
+                    )
+                })?;
+        } else {
+            std::fs::create_dir_all(log_parent).map_err(|err| {
                 format!(
                     "failed to create control-log directory {}: {err}",
-                    parent.display()
+                    log_parent.display()
                 )
             })?;
         }
 
-        let mut persisted = if log_path.exists() {
-            load_log_file(&log_path)?
+        let log_existed = log_path.try_exists().map_err(|err| {
+            format!(
+                "failed to inspect control-log path {}: {err}",
+                log_path.display()
+            )
+        })?;
+        let mut persisted = if log_existed {
+            let persisted = load_log_file(&log_path)?;
+            validate_log_file(&persisted, &log_path)?;
+            persisted
         } else {
+            let mirror = state_store.load()?;
+            let seed_state = if let Some(mirror) = mirror {
+                let mut normalized_mirror = mirror.clone();
+                let mut normalized_bootstrap = bootstrap_state.clone();
+                normalized_mirror.updated_unix_ms = 0;
+                normalized_bootstrap.updated_unix_ms = 0;
+                if normalized_mirror != normalized_bootstrap {
+                    return Err(format!(
+                        "control-log file {} is missing and the index-0 state mirror is not equivalent to the configured runtime bootstrap; refusing to promote a non-authoritative mirror",
+                        log_path.display()
+                    ));
+                }
+                mirror
+            } else {
+                bootstrap_state.clone()
+            };
+            if seed_state.applied_log_index != 0 {
+                return Err(format!(
+                    "control-log file {} is missing while the state mirror is applied through index {}; refusing to make the non-authoritative mirror authoritative",
+                    log_path.display(),
+                    seed_state.applied_log_index
+                ));
+            }
             ControlLogFileV1 {
                 magic: CONTROL_LOG_MAGIC.to_string(),
                 schema_version: CONTROL_LOG_SCHEMA_VERSION,
-                current_term: bootstrap_state.applied_log_term.max(1),
-                commit_index: bootstrap_state.applied_log_index,
-                snapshot_last_index: bootstrap_state.applied_log_index,
-                snapshot_last_term: bootstrap_state.applied_log_term,
+                current_term: seed_state.applied_log_term.max(1),
+                stepped_down_term: Some(0),
+                commit_index: seed_state.applied_log_index,
+                snapshot_last_index: seed_state.applied_log_index,
+                snapshot_last_term: seed_state.applied_log_term,
                 entries: Vec::new(),
+                checkpoint_state: Some(seed_state),
             }
         };
         validate_log_file(&persisted, &log_path)?;
+        let stepped_down_term = persisted.stepped_down_term.unwrap_or(0);
 
-        if bootstrap_state.applied_log_index < persisted.snapshot_last_index {
-            return Err(format!(
-                "control state applied_log_index {} is older than control-log snapshot index {}",
-                bootstrap_state.applied_log_index, persisted.snapshot_last_index
-            ));
-        }
-        if bootstrap_state.applied_log_index > persisted.commit_index {
-            return Err(format!(
-                "control state applied_log_index {} exceeds control-log commit index {}",
-                bootstrap_state.applied_log_index, persisted.commit_index
-            ));
-        }
+        let embedded_checkpoint = persisted.checkpoint_state.clone();
+        let mirror_state = if embedded_checkpoint.is_some() {
+            match state_store.load() {
+                Ok(state) => state,
+                Err(err) => {
+                    eprintln!(
+                        "cluster control-state mirror {} is invalid and will be repaired from the authoritative schema-v{} log: {err}",
+                        state_store.path().display(),
+                        CONTROL_LOG_SCHEMA_VERSION
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(state_store.load()?.ok_or_else(|| {
+                format!(
+                    "legacy schema-v{} control-log file {} requires a valid control-state mirror",
+                    persisted.schema_version,
+                    log_path.display()
+                )
+            })?)
+        };
+        let recovered_state = if let Some(checkpoint) = embedded_checkpoint.as_ref() {
+            checkpoint.clone()
+        } else {
+            let mirror = mirror_state
+                .as_ref()
+                .expect("legacy control log required a state mirror above");
+            if mirror.applied_log_index < persisted.snapshot_last_index {
+                return Err(format!(
+                    "control state applied_log_index {} is older than control-log snapshot index {}",
+                    mirror.applied_log_index, persisted.snapshot_last_index
+                ));
+            }
+            if mirror.applied_log_index > persisted.commit_index {
+                return Err(format!(
+                    "control state applied_log_index {} exceeds control-log commit index {}",
+                    mirror.applied_log_index, persisted.commit_index
+                ));
+            }
+            mirror.clone()
+        };
 
         let last_index = persisted
             .entries
@@ -301,7 +806,7 @@ impl ControlConsensusRuntime {
             .map(|entry| entry.index)
             .unwrap_or(persisted.snapshot_last_index);
         let next_index = last_index.saturating_add(1);
-        let peer_next_index = bootstrap_state
+        let peer_next_index = recovered_state
             .nodes
             .iter()
             .filter(|node| {
@@ -309,7 +814,7 @@ impl ControlConsensusRuntime {
             })
             .map(|node| (node.id.clone(), next_index))
             .collect::<BTreeMap<_, _>>();
-        let peer_heartbeat = bootstrap_state
+        let peer_heartbeat = recovered_state
             .nodes
             .iter()
             .filter(|node| {
@@ -323,18 +828,25 @@ impl ControlConsensusRuntime {
             local_node_id: membership.local_node_id.clone(),
             state_store,
             log_path,
+            local_disk_budget,
             config,
             state: Arc::new(Mutex::new(ConsensusState {
                 current_term: persisted.current_term.max(1),
+                stepped_down_term,
                 commit_index: persisted.commit_index,
                 snapshot_last_index: persisted.snapshot_last_index,
                 snapshot_last_term: persisted.snapshot_last_term,
                 last_leader_contact_unix_ms: now_ms,
                 entries: std::mem::take(&mut persisted.entries),
-                control_state: bootstrap_state,
+                control_state: recovered_state,
                 peer_next_index,
                 peer_heartbeat,
+                persistence_fence: None,
+                checkpoint_pending: None,
+                pending_durable_candidate: None,
+                cleanup_debt: None,
             })),
+            proposal_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         {
@@ -342,9 +854,38 @@ impl ControlConsensusRuntime {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.apply_committed_entries_locked(&mut state)?;
+            runtime.apply_committed_entries_in_memory_locked(&mut state)?;
             runtime.reconcile_dynamic_peers_locked(&mut state);
-            runtime.persist_log_locked(&state)?;
+            ensure_control_state_runtime_compatible(
+                &state.control_state,
+                &bootstrap_state,
+                &membership.local_node_id,
+            )?;
+            let mirror_matches = mirror_state.as_ref() == Some(&state.control_state);
+            if !log_existed || embedded_checkpoint.is_none() {
+                runtime
+                    .persist_checkpoint_candidate_locked(&state, ControlCheckpointWriteMode::Growth)
+                    .map_err(String::from)?;
+            } else if !mirror_matches {
+                if let Err(err) = runtime.persist_authoritative_mirror_candidate_locked(&state) {
+                    if err.is_committed_cleanup_pending() {
+                        state.cleanup_debt = Some(err.to_string());
+                    } else {
+                        let position = err
+                            .committed_checkpoint()
+                            .expect("authoritative mirror repair reports committed position");
+                        state.persistence_fence = Some(err.to_string());
+                        state.checkpoint_pending = Some(ControlCheckpointPending {
+                            position,
+                            detail: err.to_string(),
+                        });
+                    }
+                    eprintln!(
+                        "cluster control-state mirror {} remains pending repair from the authoritative log: {err}",
+                        runtime.state_store.path().display()
+                    );
+                }
+            }
         }
 
         Ok(runtime)
@@ -362,15 +903,78 @@ impl ControlConsensusRuntime {
             .clone()
     }
 
+    pub fn persistence_status(&self) -> ControlPersistenceStatus {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ControlPersistenceStatus {
+            fenced: state.persistence_fence.is_some()
+                || state.checkpoint_pending.is_some()
+                || state.pending_durable_candidate.is_some(),
+            pending_checkpoint: state
+                .checkpoint_pending
+                .as_ref()
+                .map(|pending| pending.position),
+            cleanup_debt: state.cleanup_debt.is_some(),
+            detail: state
+                .persistence_fence
+                .clone()
+                .or_else(|| {
+                    state
+                        .checkpoint_pending
+                        .as_ref()
+                        .map(|pending| pending.detail.clone())
+                })
+                .or_else(|| state.cleanup_debt.clone()),
+        }
+    }
+
     pub fn recovery_snapshot_bundle(&self) -> (ControlState, ControlLogRecoverySnapshot) {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recovery_snapshot_bundle_locked(&state)
+    }
+
+    pub fn exportable_recovery_snapshot_bundle(
+        &self,
+    ) -> Result<(ControlState, ControlLogRecoverySnapshot), String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.persistence_fence.is_some()
+            || state.checkpoint_pending.is_some()
+            || state.pending_durable_candidate.is_some()
+        {
+            let detail = state
+                .persistence_fence
+                .as_deref()
+                .or_else(|| {
+                    state
+                        .checkpoint_pending
+                        .as_ref()
+                        .map(|pending| pending.detail.as_str())
+                })
+                .unwrap_or("control persistence repair is pending");
+            return Err(format!(
+                "control recovery snapshot is unavailable while durable authority is fenced: {detail}"
+            ));
+        }
+        Ok(self.recovery_snapshot_bundle_locked(&state))
+    }
+
+    fn recovery_snapshot_bundle_locked(
+        &self,
+        state: &ConsensusState,
+    ) -> (ControlState, ControlLogRecoverySnapshot) {
         (
             state.control_state.clone(),
             ControlLogRecoverySnapshot {
                 current_term: state.current_term,
+                stepped_down_term: state.stepped_down_term,
                 commit_index: state.commit_index,
                 snapshot_last_index: state.snapshot_last_index,
                 snapshot_last_term: state.snapshot_last_term,
@@ -463,6 +1067,22 @@ impl ControlConsensusRuntime {
                 self.local_node_id
             ));
         }
+        if force_local_leader
+            && !control_state.nodes.iter().any(|node| {
+                node.id == self.local_node_id && node.status == ControlNodeStatus::Active
+            })
+        {
+            return Err(format!(
+                "control recovery snapshot cannot force local node '{}' as leader because it is not an active voter",
+                self.local_node_id
+            ));
+        }
+        let current_state = self.current_state();
+        ensure_control_state_runtime_compatible(
+            &control_state,
+            &current_state,
+            &self.local_node_id,
+        )?;
         validate_recovery_log_snapshot(log_snapshot)?;
         if control_state.applied_log_index < log_snapshot.snapshot_last_index {
             return Err(format!(
@@ -474,6 +1094,23 @@ impl ControlConsensusRuntime {
             return Err(format!(
                 "control recovery state applied_log_index {} exceeds log commit index {}",
                 control_state.applied_log_index, log_snapshot.commit_index
+            ));
+        }
+        let expected_applied_term =
+            recovery_snapshot_term_at(log_snapshot, control_state.applied_log_index).ok_or_else(
+                || {
+                    format!(
+                        "control recovery log is missing term at applied index {}",
+                        control_state.applied_log_index
+                    )
+                },
+            )?;
+        if control_state.applied_log_term != expected_applied_term {
+            return Err(format!(
+                "control recovery state applied_log_term {} does not match log term {} at index {}",
+                control_state.applied_log_term,
+                expected_applied_term,
+                control_state.applied_log_index
             ));
         }
 
@@ -505,9 +1142,10 @@ impl ControlConsensusRuntime {
         control_state: ControlState,
         log_snapshot: ControlLogRecoverySnapshot,
         force_local_leader: bool,
-    ) -> Result<ControlState, String> {
-        let control_state =
-            self.preflight_recovery_snapshot(control_state, &log_snapshot, force_local_leader)?;
+    ) -> Result<ControlState, ControlConsensusError> {
+        let control_state = self
+            .preflight_recovery_snapshot(control_state, &log_snapshot, force_local_leader)
+            .map_err(ControlConsensusError::rejected)?;
 
         let last_log_index = log_snapshot
             .entries
@@ -516,31 +1154,54 @@ impl ControlConsensusRuntime {
             .unwrap_or(log_snapshot.snapshot_last_index);
         let next_peer_index = last_log_index.saturating_add(1);
 
-        let mut state = self
+        let mut live = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.current_term = log_snapshot.current_term.max(1);
-        state.commit_index = log_snapshot.commit_index;
-        state.snapshot_last_index = log_snapshot.snapshot_last_index;
-        state.snapshot_last_term = log_snapshot.snapshot_last_term;
-        state.entries = log_snapshot.entries;
-        state.control_state = control_state;
-        state.last_leader_contact_unix_ms = unix_timestamp_millis();
-        state.peer_next_index = self
-            .control_peer_nodes_locked(&state)
+        self.repair_persistence_fence_locked(&mut live)?;
+        let mut candidate = live.clone();
+        if force_local_leader {
+            candidate.current_term = live
+                .current_term
+                .max(log_snapshot.current_term)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ControlConsensusError::rejected(
+                        "control consensus term exhausted while forcing local restore leadership",
+                    )
+                })?;
+            candidate.stepped_down_term = 0;
+        } else {
+            candidate.current_term = live.current_term.max(log_snapshot.current_term).max(1);
+            candidate.stepped_down_term = live
+                .stepped_down_term
+                .max(log_snapshot.stepped_down_term)
+                .min(candidate.current_term);
+        }
+        candidate.commit_index = log_snapshot.commit_index;
+        candidate.snapshot_last_index = log_snapshot.snapshot_last_index;
+        candidate.snapshot_last_term = log_snapshot.snapshot_last_term;
+        candidate.entries = log_snapshot.entries;
+        candidate.control_state = control_state;
+        candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+        candidate.peer_next_index = self
+            .control_peer_nodes_locked(&candidate)
             .into_iter()
             .map(|(node_id, _)| (node_id, next_peer_index))
             .collect();
 
-        self.apply_committed_entries_locked(&mut state)?;
-        self.reconcile_dynamic_peers_locked(&mut state);
-        if state.current_term < state.control_state.applied_log_term {
-            state.current_term = state.control_state.applied_log_term.max(1);
+        self.apply_committed_entries_in_memory_locked(&mut candidate)
+            .map_err(ControlConsensusError::rejected)?;
+        self.reconcile_dynamic_peers_locked(&mut candidate);
+        if candidate.current_term < candidate.control_state.applied_log_term {
+            candidate.current_term = candidate.control_state.applied_log_term.max(1);
         }
-        self.state_store.replace(&state.control_state)?;
-        self.persist_log_locked(&state)?;
-        Ok(state.control_state.clone())
+        self.publish_checkpoint_and_install_locked(
+            &mut live,
+            candidate,
+            ControlCheckpointWriteMode::Growth,
+        )?;
+        Ok(live.control_state.clone())
     }
 
     pub fn start_reconciler(
@@ -555,6 +1216,7 @@ impl ControlConsensusRuntime {
                 interval.tick().await;
                 if let Err(err) = runtime.ensure_leader_established(&rpc_client).await {
                     eprintln!("cluster control leader proposal failed: {err}");
+                    continue;
                 }
                 if !runtime.is_local_control_leader() {
                     continue;
@@ -566,12 +1228,16 @@ impl ControlConsensusRuntime {
         })
     }
 
-    pub async fn ensure_leader_established(&self, rpc_client: &RpcClient) -> Result<(), String> {
+    pub async fn ensure_leader_established(
+        &self,
+        rpc_client: &RpcClient,
+    ) -> Result<(), ControlConsensusError> {
         let should_propose = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.repair_persistence_fence_locked(&mut state)?;
             if self.local_is_control_leader_locked(&state) {
                 state.last_leader_contact_unix_ms = unix_timestamp_millis();
                 false
@@ -598,35 +1264,70 @@ impl ControlConsensusRuntime {
         &self,
         rpc_client: &RpcClient,
         command: InternalControlCommand,
-    ) -> Result<ProposeOutcome, String> {
-        let (request, proposal_index, proposal_term, quorum, peers) = {
-            let mut state = self
+    ) -> Result<ProposeOutcome, ControlConsensusError> {
+        let _proposal_guard = self.proposal_lock.lock().await;
+        let (
+            request,
+            proposal_entry,
+            proposal_index,
+            proposal_term,
+            proposal_leader_term,
+            quorum,
+            active_voters,
+            peers,
+        ) = {
+            let mut live = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let quorum = self.quorum_size_locked(&state);
-            let peers = self.control_peer_nodes_locked(&state);
-            self.validate_local_proposal_locked(&state, &command, unix_timestamp_millis())?;
-            let (entry, prev_log_index, prev_log_term, leader_commit_before) =
-                self.prepare_proposal_locked(&mut state, command)?;
+            self.repair_persistence_fence_locked(&mut live)?;
+            let active_voters = self
+                .control_voter_node_ids_locked(&live)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let quorum = self.quorum_size_locked(&live);
+            let peers = self.control_peer_nodes_locked(&live);
+            self.validate_local_proposal_locked(&live, &command, unix_timestamp_millis())
+                .map_err(ControlConsensusError::rejected)?;
+            let mut candidate = live.clone();
+            let (entry, prev_log_index, prev_log_term, leader_commit_before) = self
+                .prepare_proposal_locked(&mut candidate, command)
+                .map_err(ControlConsensusError::rejected)?;
+            let needs_log_publication = candidate.current_term != live.current_term
+                || candidate.entries.len() != live.entries.len();
             if matches!(
                 &entry.command,
                 InternalControlCommand::SetLeader { leader_node_id } if leader_node_id == &self.local_node_id
             ) {
-                state.last_leader_contact_unix_ms = unix_timestamp_millis();
+                candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
             }
+            if needs_log_publication {
+                self.publish_log_and_install_locked(&mut live, candidate)?;
+            } else {
+                live.last_leader_contact_unix_ms = candidate.last_leader_contact_unix_ms;
+            }
+            let proposal_leader_term = live.current_term;
             let request = InternalControlAppendRequest {
-                term: entry.term,
+                term: proposal_leader_term,
                 leader_node_id: self.local_node_id.clone(),
                 prev_log_index,
                 prev_log_term,
                 entries: vec![entry.clone()],
                 leader_commit: leader_commit_before,
             };
-            (request, entry.index, entry.term, quorum, peers)
+            (
+                request,
+                entry.clone(),
+                entry.index,
+                entry.term,
+                proposal_leader_term,
+                quorum,
+                active_voters,
+                peers,
+            )
         };
 
-        let mut acknowledged = 1usize;
+        let mut acknowledged = usize::from(active_voters.contains(&self.local_node_id));
         let mut acknowledged_peers = Vec::new();
         let mut highest_remote_term = 0u64;
         let mut tasks = tokio::task::JoinSet::new();
@@ -640,15 +1341,22 @@ impl ControlConsensusRuntime {
         }
 
         while let Some(result) = tasks.join_next().await {
-            let (node_id, response) = result
-                .map_err(|err| format!("control proposal replication task join failed: {err}"))?;
+            let (node_id, response) = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!("control proposal replication task join failed: {err}");
+                    continue;
+                }
+            };
             match response {
                 Ok(response) => {
-                    if response.term > highest_remote_term {
+                    if active_voters.contains(&node_id) && response.term > highest_remote_term {
                         highest_remote_term = response.term;
                     }
                     if response.success {
-                        acknowledged += 1;
+                        if active_voters.contains(&node_id) {
+                            acknowledged += 1;
+                        }
                         acknowledged_peers.push(node_id);
                     }
                 }
@@ -658,13 +1366,18 @@ impl ControlConsensusRuntime {
             }
         }
 
-        if highest_remote_term > proposal_term {
-            let mut state = self
+        if highest_remote_term > proposal_leader_term && acknowledged < quorum {
+            let mut live = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.current_term = highest_remote_term;
-            self.persist_log_locked(&state)?;
+            live.current_term = live.current_term.max(highest_remote_term);
+            live.stepped_down_term = live.stepped_down_term.max(highest_remote_term);
+            self.repair_persistence_fence_locked(&mut live)?;
+            let mut candidate = live.clone();
+            candidate.current_term = candidate.current_term.max(highest_remote_term);
+            candidate.stepped_down_term = candidate.stepped_down_term.max(highest_remote_term);
+            self.publish_required_log_candidate_and_install_locked(&mut live, candidate)?;
             return Ok(ProposeOutcome::Pending {
                 required: quorum,
                 acknowledged,
@@ -678,54 +1391,194 @@ impl ControlConsensusRuntime {
             });
         }
 
-        let commit_index = {
-            let mut state = self
+        let (commit_index, publication_error, send_commit_notices) = {
+            let mut live = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.commit_index < proposal_index {
-                state.commit_index = proposal_index;
+            if highest_remote_term > proposal_leader_term {
+                live.current_term = live.current_term.max(highest_remote_term);
+                live.stepped_down_term = live.stepped_down_term.max(highest_remote_term);
+            }
+            if let Err(err) = self.repair_persistence_fence_locked(&mut live) {
+                let indeterminate = ControlConsensusError::indeterminate(
+                    ControlPersistenceStage::Repair,
+                    format!(
+                        "proposal at index {proposal_index} term {proposal_term} reached quorum before local persistence repair failed: {err}"
+                    ),
+                    false,
+                );
+                live.persistence_fence = Some(indeterminate.to_string());
+                return Err(indeterminate);
+            }
+            let proposal_still_present = live.entries.iter().any(|entry| entry == &proposal_entry);
+            if !proposal_still_present {
+                let indeterminate = ControlConsensusError::indeterminate(
+                    ControlPersistenceStage::Repair,
+                    format!(
+                        "control proposal at index {proposal_index} term {proposal_term} is no longer present after quorum acknowledgement"
+                    ),
+                    false,
+                );
+                live.persistence_fence = Some(indeterminate.to_string());
+                return Err(indeterminate);
+            }
+            let mut candidate = live.clone();
+            if highest_remote_term > candidate.current_term {
+                candidate.current_term = highest_remote_term;
+                candidate.stepped_down_term = candidate.stepped_down_term.max(highest_remote_term);
+            }
+            if candidate.commit_index < proposal_index {
+                candidate.commit_index = proposal_index;
             }
             for node_id in &acknowledged_peers {
-                state
+                candidate
                     .peer_next_index
                     .insert(node_id.clone(), proposal_index.saturating_add(1));
             }
-            self.apply_committed_entries_locked(&mut state)?;
-            if self.local_is_control_leader_locked(&state) {
-                state.last_leader_contact_unix_ms = unix_timestamp_millis();
+            if let Err(err) = self.apply_committed_entries_in_memory_locked(&mut candidate) {
+                let indeterminate = ControlConsensusError::indeterminate(
+                    ControlPersistenceStage::Repair,
+                    format!(
+                        "proposal at index {proposal_index} term {proposal_term} reached quorum but local apply failed: {err}"
+                    ),
+                    false,
+                );
+                live.persistence_fence = Some(indeterminate.to_string());
+                return Err(indeterminate);
             }
-            self.persist_log_locked(&state)?;
-            state.commit_index
+            if self.local_is_control_leader_locked(&candidate) {
+                candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+            }
+            let commit_index = candidate.commit_index;
+            let publication_error = self
+                .publish_required_checkpoint_candidate_and_install_locked(
+                    &mut live,
+                    candidate,
+                    ControlCheckpointWriteMode::Growth,
+                )
+                .err();
+            let send_commit_notices = highest_remote_term <= proposal_leader_term
+                && self.may_send_proposal_commit_notice_locked(
+                    &live,
+                    proposal_leader_term,
+                    proposal_index,
+                );
+            (commit_index, publication_error, send_commit_notices)
         };
 
         let commit_notice = InternalControlAppendRequest {
-            term: proposal_term,
+            term: proposal_leader_term,
             leader_node_id: self.local_node_id.clone(),
             prev_log_index: proposal_index,
             prev_log_term: proposal_term,
             entries: Vec::new(),
             leader_commit: commit_index,
         };
-        let mut tasks = tokio::task::JoinSet::new();
-        let commit_peers = {
+        let commit_peers = if send_commit_notices {
             let state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.control_peer_nodes_locked(&state)
+            if self.may_send_proposal_commit_notice_locked(
+                &state,
+                proposal_leader_term,
+                proposal_index,
+            ) {
+                self.control_peer_nodes_locked(&state)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
-        for (_node_id, endpoint) in commit_peers {
-            let rpc_client = rpc_client.clone();
-            let request = commit_notice.clone();
-            tasks.spawn(async move {
-                let _ = rpc_client.control_append(&endpoint, &request).await;
+        let mut post_commit_persistence_detail = None;
+        for (node_id, endpoint) in commit_peers {
+            let still_authorized = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.may_send_proposal_commit_notice_locked(
+                    &state,
+                    proposal_leader_term,
+                    proposal_index,
+                )
+            };
+            if !still_authorized {
+                break;
+            }
+            let response = rpc_client.control_append(&endpoint, &commit_notice).await;
+            if let Ok(response) = response {
+                let mut live = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if response.term > proposal_leader_term && active_voters.contains(&node_id) {
+                    if let Err(err) = self.repair_persistence_fence_locked(&mut live) {
+                        live.current_term = live.current_term.max(response.term);
+                        live.stepped_down_term = live.stepped_down_term.max(response.term);
+                        let detail = format!(
+                            "committed proposal observed higher response term {} from '{}' but could not repair existing durable authority before recording it: {err}",
+                            response.term, node_id
+                        );
+                        live.persistence_fence = Some(detail.clone());
+                        post_commit_persistence_detail = Some(detail);
+                        break;
+                    }
+                    if response.term > live.current_term || response.term > live.stepped_down_term {
+                        let mut candidate = live.clone();
+                        candidate.current_term = candidate.current_term.max(response.term);
+                        candidate.stepped_down_term =
+                            candidate.stepped_down_term.max(response.term);
+                        if let Err(err) = self
+                            .publish_required_log_candidate_and_install_locked(&mut live, candidate)
+                        {
+                            post_commit_persistence_detail = Some(format!(
+                                "committed proposal could not durably record higher response term {} from '{}': {err}",
+                                response.term, node_id
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(detail) = post_commit_persistence_detail {
+            return Ok(ProposeOutcome::CommittedPersistencePending {
+                index: proposal_index,
+                term: proposal_term,
+                detail,
             });
         }
-        while let Some(result) = tasks.join_next().await {
-            if let Err(err) = result {
-                eprintln!("control commit-notice task join failed: {err}");
+
+        if let Some(err) = publication_error {
+            let persistence = self.persistence_status();
+            if !persistence.fenced
+                && persistence.pending_checkpoint.is_none()
+                && !persistence.cleanup_debt
+            {
+                return Ok(ProposeOutcome::Committed {
+                    index: proposal_index,
+                    term: proposal_term,
+                });
             }
+            if err.is_committed_cleanup_pending() {
+                return Ok(ProposeOutcome::CommittedCleanupPending {
+                    index: proposal_index,
+                    term: proposal_term,
+                    detail: err.to_string(),
+                });
+            }
+            if err.is_committed_checkpoint_pending() {
+                return Ok(ProposeOutcome::CommittedCheckpointPending {
+                    index: proposal_index,
+                    term: proposal_term,
+                    detail: err.to_string(),
+                });
+            }
+            return Err(err);
         }
 
         Ok(ProposeOutcome::Committed {
@@ -736,10 +1589,18 @@ impl ControlConsensusRuntime {
 
     pub async fn replicate_to_all_followers(&self, rpc_client: &RpcClient) -> Result<(), String> {
         let peers = {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.repair_persistence_fence_locked(&mut state)
+                .map_err(String::from)?;
+            if !self.local_is_control_leader_locked(&state) {
+                return Err(format!(
+                    "node '{}' is not an unfenced control leader",
+                    self.local_node_id
+                ));
+            }
             self.control_peer_nodes_locked(&state)
         };
 
@@ -763,7 +1624,7 @@ impl ControlConsensusRuntime {
     pub fn handle_append_request(
         &self,
         request: InternalControlAppendRequest,
-    ) -> Result<InternalControlAppendResponse, String> {
+    ) -> Result<InternalControlAppendResponse, ControlConsensusError> {
         let leader_node_id = request.leader_node_id.trim();
         if request.term == 0 {
             return Ok(InternalControlAppendResponse {
@@ -789,79 +1650,201 @@ impl ControlConsensusRuntime {
                 message: Some("leader_node_id must not be empty".to_string()),
             });
         }
-        let mut state = self
+        let mut live = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.is_membership_node_locked(&state, leader_node_id) {
+        if !self.is_membership_node_locked(&live, leader_node_id) {
             return Ok(InternalControlAppendResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
                 match_index: 0,
                 message: Some("unknown_leader_node".to_string()),
             });
         }
-        let previous_term = state.current_term;
+        if !self.is_active_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlAppendResponse {
+                term: live.current_term,
+                success: false,
+                match_index: 0,
+                message: Some("leader_not_active_voter".to_string()),
+            });
+        }
+        let pre_repair_term = live.current_term;
+        let pre_repair_same_term_conflict = request.term == pre_repair_term
+            && live
+                .control_state
+                .leader_node_id
+                .as_deref()
+                .is_some_and(|leader| leader != leader_node_id);
+        if let Err(err) = self.repair_persistence_fence_locked(&mut live) {
+            if request.term > pre_repair_term || pre_repair_same_term_conflict {
+                live.current_term = live.current_term.max(request.term);
+                live.stepped_down_term = live.stepped_down_term.max(request.term);
+            }
+            return Err(err);
+        }
+        if !self.is_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlAppendResponse {
+                term: live.current_term,
+                success: false,
+                match_index: 0,
+                message: Some("unknown_leader_node".to_string()),
+            });
+        }
+        if !self.is_active_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlAppendResponse {
+                term: live.current_term,
+                success: false,
+                match_index: 0,
+                message: Some("leader_not_active_voter".to_string()),
+            });
+        }
+        let previous_term = live.current_term;
         if request.term < previous_term {
             return Ok(InternalControlAppendResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
-                match_index: self.last_log_index_locked(&state),
+                match_index: self.last_log_index_locked(&live),
                 message: Some("stale_term".to_string()),
             });
         }
         if request.term == previous_term
-            && state
+            && live
                 .control_state
                 .leader_node_id
                 .as_deref()
                 .is_some_and(|leader| leader != leader_node_id)
         {
+            if self.local_is_control_leader_locked(&live) && leader_node_id != self.local_node_id {
+                let mut step_down_candidate = live.clone();
+                step_down_candidate.stepped_down_term = request.term;
+                step_down_candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+                self.publish_required_log_candidate_and_install_locked(
+                    &mut live,
+                    step_down_candidate,
+                )?;
+            }
             return Ok(InternalControlAppendResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
-                match_index: self.last_log_index_locked(&state),
+                match_index: self.last_log_index_locked(&live),
                 message: Some("conflicting_leader_same_term".to_string()),
             });
         }
-        if request.term > state.current_term {
-            state.current_term = request.term;
+        if request.term > previous_term {
+            let mut term_candidate = live.clone();
+            term_candidate.current_term = request.term;
+            term_candidate.stepped_down_term = term_candidate.stepped_down_term.max(request.term);
+            term_candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+            if leader_node_id != self.local_node_id {
+                self.mark_peer_success_locked(&mut term_candidate, leader_node_id);
+            }
+            self.publish_required_log_candidate_and_install_locked(&mut live, term_candidate)?;
         }
+        let mut state = live.clone();
         state.last_leader_contact_unix_ms = unix_timestamp_millis();
         if leader_node_id != self.local_node_id {
             self.mark_peer_success_locked(&mut state, leader_node_id);
         }
 
         if request.prev_log_index < state.snapshot_last_index {
-            return Ok(InternalControlAppendResponse {
+            let response = InternalControlAppendResponse {
                 term: state.current_term,
                 success: false,
                 match_index: state.snapshot_last_index,
                 message: Some("snapshot_required".to_string()),
-            });
+            };
+            self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+            return Ok(response);
         }
 
         let Some(local_prev_term) = self.term_at_locked(&state, request.prev_log_index) else {
-            return Ok(InternalControlAppendResponse {
+            let response = InternalControlAppendResponse {
                 term: state.current_term,
                 success: false,
                 match_index: self.last_log_index_locked(&state),
                 message: Some("missing_prev_log_index".to_string()),
-            });
+            };
+            self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+            return Ok(response);
         };
         if local_prev_term != request.prev_log_term {
-            return Ok(InternalControlAppendResponse {
+            let response = InternalControlAppendResponse {
                 term: state.current_term,
                 success: false,
                 match_index: self.last_log_index_locked(&state),
                 message: Some("prev_log_term_mismatch".to_string()),
-            });
+            };
+            self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+            return Ok(response);
         }
 
-        let mut expected_index = request.prev_log_index.saturating_add(1);
-        for entry in request.entries {
+        if !request.entries.is_empty() {
+            let mut expected_index = match request.prev_log_index.checked_add(1) {
+                Some(index) => index,
+                None => {
+                    let response = InternalControlAppendResponse {
+                        term: state.current_term,
+                        success: false,
+                        match_index: self.last_log_index_locked(&state),
+                        message: Some("entry_index_overflow".to_string()),
+                    };
+                    self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                    return Ok(response);
+                }
+            };
+            let mut previous_entry_term = local_prev_term;
+            for (position, entry) in request.entries.iter().enumerate() {
+                let invalid_message = if entry.index != expected_index {
+                    Some(format!(
+                        "non_contiguous_entry_index: expected {expected_index}, got {}",
+                        entry.index
+                    ))
+                } else if entry.term == 0 {
+                    Some("entry_term_must_be_positive".to_string())
+                } else if entry.term > request.term {
+                    Some("entry_term_exceeds_request_term".to_string())
+                } else if entry.term < previous_entry_term {
+                    Some("entry_terms_must_not_decrease".to_string())
+                } else {
+                    None
+                };
+                if let Some(message) = invalid_message {
+                    let response = InternalControlAppendResponse {
+                        term: state.current_term,
+                        success: false,
+                        match_index: self.last_log_index_locked(&state),
+                        message: Some(message),
+                    };
+                    self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                    return Ok(response);
+                }
+                previous_entry_term = entry.term;
+                if position + 1 < request.entries.len() {
+                    expected_index = match entry.index.checked_add(1) {
+                        Some(index) => index,
+                        None => {
+                            let response = InternalControlAppendResponse {
+                                term: state.current_term,
+                                success: false,
+                                match_index: self.last_log_index_locked(&state),
+                                message: Some("entry_index_overflow".to_string()),
+                            };
+                            self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                            return Ok(response);
+                        }
+                    };
+                }
+            }
+        }
+
+        let entries_len = request.entries.len();
+        let mut expected_index = request.prev_log_index.checked_add(1).unwrap_or(0);
+        for (position, entry) in request.entries.into_iter().enumerate() {
+            let entry_index = entry.index;
             if entry.index != expected_index {
-                return Ok(InternalControlAppendResponse {
+                let response = InternalControlAppendResponse {
                     term: state.current_term,
                     success: false,
                     match_index: self.last_log_index_locked(&state),
@@ -869,28 +1852,38 @@ impl ControlConsensusRuntime {
                         "non_contiguous_entry_index: expected {expected_index}, got {}",
                         entry.index
                     )),
-                });
+                };
+                self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                return Ok(response);
             }
             if entry.term == 0 {
-                return Ok(InternalControlAppendResponse {
+                let response = InternalControlAppendResponse {
                     term: state.current_term,
                     success: false,
                     match_index: self.last_log_index_locked(&state),
                     message: Some("entry_term_must_be_positive".to_string()),
-                });
+                };
+                self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                return Ok(response);
             }
 
             if entry.index <= state.snapshot_last_index {
                 let snapshot_term = self.term_at_locked(&state, entry.index).unwrap_or(0);
                 if snapshot_term != entry.term {
-                    return Ok(InternalControlAppendResponse {
+                    let response = InternalControlAppendResponse {
                         term: state.current_term,
                         success: false,
                         match_index: state.snapshot_last_index,
                         message: Some("snapshot_conflict".to_string()),
-                    });
+                    };
+                    self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                    return Ok(response);
                 }
-                expected_index = expected_index.saturating_add(1);
+                if position + 1 < entries_len {
+                    expected_index = entry_index
+                        .checked_add(1)
+                        .expect("incoming entry indexes were prevalidated");
+                }
                 continue;
             }
 
@@ -898,48 +1891,83 @@ impl ControlConsensusRuntime {
                 let existing = &state.entries[offset];
                 if existing.term != entry.term || existing.command != entry.command {
                     if entry.index <= state.commit_index {
-                        return Err(format!(
+                        return Err(ControlConsensusError::rejected(format!(
                             "cannot overwrite committed control-log entry at index {}",
                             entry.index
-                        ));
+                        )));
                     }
                     state.entries.truncate(offset);
                     state.entries.push(entry);
                 }
             } else {
                 let last_index = self.last_log_index_locked(&state);
-                if entry.index != last_index.saturating_add(1) {
-                    return Ok(InternalControlAppendResponse {
+                if last_index.checked_add(1) != Some(entry.index) {
+                    let response = InternalControlAppendResponse {
                         term: state.current_term,
                         success: false,
                         match_index: last_index,
                         message: Some("entry_index_gap".to_string()),
-                    });
+                    };
+                    self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+                    return Ok(response);
                 }
                 state.entries.push(entry);
             }
-            expected_index = expected_index.saturating_add(1);
+            if position + 1 < entries_len {
+                expected_index = entry_index
+                    .checked_add(1)
+                    .expect("incoming entry indexes were prevalidated");
+            }
         }
 
         let last_index = self.last_log_index_locked(&state);
+        let previous_commit_index = state.commit_index;
         if request.leader_commit > state.commit_index {
             state.commit_index = std::cmp::min(request.leader_commit, last_index);
-            self.apply_committed_entries_locked(&mut state)?;
+            self.apply_committed_entries_in_memory_locked(&mut state)
+                .map_err(ControlConsensusError::rejected)?;
         }
-        self.persist_log_locked(&state)?;
+        let commit_advanced = state.commit_index > previous_commit_index;
+        let durable_log_changed = state.current_term != live.current_term
+            || state.entries != live.entries
+            || state.snapshot_last_index != live.snapshot_last_index
+            || state.snapshot_last_term != live.snapshot_last_term;
+        let persistence_message = if commit_advanced {
+            match self.publish_required_checkpoint_candidate_and_install_locked(
+                &mut live,
+                state,
+                ControlCheckpointWriteMode::Growth,
+            ) {
+                Ok(()) => None,
+                Err(err) if err.is_committed_checkpoint_pending() => {
+                    Some("checkpoint_pending".to_string())
+                }
+                Err(err) if err.is_committed_cleanup_pending() => {
+                    Some("cleanup_pending".to_string())
+                }
+                Err(err) => return Err(err),
+            }
+        } else if durable_log_changed {
+            self.publish_log_and_install_locked(&mut live, state)?;
+            None
+        } else {
+            live.last_leader_contact_unix_ms = state.last_leader_contact_unix_ms;
+            live.peer_heartbeat = state.peer_heartbeat;
+            None
+        };
 
         Ok(InternalControlAppendResponse {
-            term: state.current_term,
+            term: live.current_term,
             success: true,
             match_index: last_index,
-            message: None,
+            message: persistence_message,
         })
     }
 
     pub fn handle_install_snapshot_request(
         &self,
         request: InternalControlInstallSnapshotRequest,
-    ) -> Result<InternalControlInstallSnapshotResponse, String> {
+    ) -> Result<InternalControlInstallSnapshotResponse, ControlConsensusError> {
         let leader_node_id = request.leader_node_id.trim();
         if request.term == 0 {
             return Ok(InternalControlInstallSnapshotResponse {
@@ -977,51 +2005,122 @@ impl ControlConsensusRuntime {
                 message: Some("leader_node_id must not be empty".to_string()),
             });
         }
-        let mut snapshot_state: ControlState = serde_json::from_value(request.state)
-            .map_err(|err| format!("failed to decode control snapshot payload: {err}"))?;
-        snapshot_state.applied_log_index = request.snapshot_last_index;
-        snapshot_state.applied_log_term = request.snapshot_last_term;
-        snapshot_state.updated_unix_ms = unix_timestamp_millis();
-        snapshot_state.leader_node_id = Some(leader_node_id.to_string());
-        snapshot_state.validate()?;
-
-        let mut state = self
+        let mut live = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.is_membership_node_locked(&state, leader_node_id) {
+        if !self.is_membership_node_locked(&live, leader_node_id) {
             return Ok(InternalControlInstallSnapshotResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
                 last_index: 0,
                 message: Some("unknown_leader_node".to_string()),
             });
         }
-        let previous_term = state.current_term;
+        if !self.is_active_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlInstallSnapshotResponse {
+                term: live.current_term,
+                success: false,
+                last_index: 0,
+                message: Some("leader_not_active_voter".to_string()),
+            });
+        }
+        let pre_repair_term = live.current_term;
+        let pre_repair_same_term_conflict = request.term == pre_repair_term
+            && live
+                .control_state
+                .leader_node_id
+                .as_deref()
+                .is_some_and(|leader| leader != leader_node_id);
+        if let Err(err) = self.repair_persistence_fence_locked(&mut live) {
+            if request.term > pre_repair_term || pre_repair_same_term_conflict {
+                live.current_term = live.current_term.max(request.term);
+                live.stepped_down_term = live.stepped_down_term.max(request.term);
+            }
+            return Err(err);
+        }
+        if !self.is_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlInstallSnapshotResponse {
+                term: live.current_term,
+                success: false,
+                last_index: 0,
+                message: Some("unknown_leader_node".to_string()),
+            });
+        }
+        if !self.is_active_membership_node_locked(&live, leader_node_id) {
+            return Ok(InternalControlInstallSnapshotResponse {
+                term: live.current_term,
+                success: false,
+                last_index: 0,
+                message: Some("leader_not_active_voter".to_string()),
+            });
+        }
+        let previous_term = live.current_term;
         if request.term < previous_term {
             return Ok(InternalControlInstallSnapshotResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
-                last_index: self.last_log_index_locked(&state),
+                last_index: self.last_log_index_locked(&live),
                 message: Some("stale_term".to_string()),
             });
         }
         if request.term == previous_term
-            && state
+            && live
                 .control_state
                 .leader_node_id
                 .as_deref()
                 .is_some_and(|leader| leader != leader_node_id)
         {
+            if self.local_is_control_leader_locked(&live) && leader_node_id != self.local_node_id {
+                let mut step_down_candidate = live.clone();
+                step_down_candidate.stepped_down_term = request.term;
+                step_down_candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+                self.publish_required_log_candidate_and_install_locked(
+                    &mut live,
+                    step_down_candidate,
+                )?;
+            }
             return Ok(InternalControlInstallSnapshotResponse {
-                term: state.current_term,
+                term: live.current_term,
                 success: false,
-                last_index: self.last_log_index_locked(&state),
+                last_index: self.last_log_index_locked(&live),
                 message: Some("conflicting_leader_same_term".to_string()),
             });
         }
+        if request.term > previous_term {
+            let mut term_candidate = live.clone();
+            term_candidate.current_term = request.term;
+            term_candidate.stepped_down_term = term_candidate.stepped_down_term.max(request.term);
+            term_candidate.last_leader_contact_unix_ms = unix_timestamp_millis();
+            if leader_node_id != self.local_node_id {
+                self.mark_peer_success_locked(&mut term_candidate, leader_node_id);
+            }
+            self.publish_required_log_candidate_and_install_locked(&mut live, term_candidate)?;
+        }
+        if request.snapshot_last_term == 0 || request.snapshot_last_term > request.term {
+            return Ok(InternalControlInstallSnapshotResponse {
+                term: live.current_term,
+                success: false,
+                last_index: self.last_log_index_locked(&live),
+                message: Some("invalid_snapshot_term".to_string()),
+            });
+        }
 
-        state.current_term = request.term;
+        let mut snapshot_state: ControlState =
+            serde_json::from_value(request.state).map_err(|err| {
+                ControlConsensusError::rejected(format!(
+                    "failed to decode control snapshot payload: {err}"
+                ))
+            })?;
+        snapshot_state.applied_log_index = request.snapshot_last_index;
+        snapshot_state.applied_log_term = request.snapshot_last_term;
+        snapshot_state.updated_unix_ms = unix_timestamp_millis();
+        snapshot_state.leader_node_id = Some(leader_node_id.to_string());
+        snapshot_state
+            .validate()
+            .map_err(ControlConsensusError::rejected)?;
+
+        let mut state = live.clone();
         state.last_leader_contact_unix_ms = unix_timestamp_millis();
         if leader_node_id != self.local_node_id {
             self.mark_peer_success_locked(&mut state, leader_node_id);
@@ -1030,29 +2129,48 @@ impl ControlConsensusRuntime {
             .commit_index
             .max(state.control_state.applied_log_index);
         if request.snapshot_last_index < min_snapshot_index {
-            return Ok(InternalControlInstallSnapshotResponse {
+            let response = InternalControlInstallSnapshotResponse {
                 term: state.current_term,
                 success: false,
                 last_index: self.last_log_index_locked(&state),
                 message: Some("stale_snapshot".to_string()),
-            });
+            };
+            self.persist_observed_term_before_rejection_locked(&mut live, &state)?;
+            return Ok(response);
         }
-        state.commit_index = state.commit_index.max(request.snapshot_last_index);
+        let suffix_is_compatible = self.term_at_locked(&state, request.snapshot_last_index)
+            == Some(request.snapshot_last_term);
+        state.commit_index = request.snapshot_last_index;
         state.snapshot_last_index = request.snapshot_last_index;
         state.snapshot_last_term = request.snapshot_last_term;
-        state
-            .entries
-            .retain(|entry| entry.index > request.snapshot_last_index);
+        if suffix_is_compatible {
+            state
+                .entries
+                .retain(|entry| entry.index > request.snapshot_last_index);
+        } else {
+            state.entries.clear();
+        }
         state.control_state = snapshot_state;
         self.reconcile_dynamic_peers_locked(&mut state);
-        self.state_store.persist(&state.control_state)?;
-        self.persist_log_locked(&state)?;
+        let persistence_message = match self
+            .publish_required_checkpoint_candidate_and_install_locked(
+                &mut live,
+                state,
+                ControlCheckpointWriteMode::Growth,
+            ) {
+            Ok(()) => None,
+            Err(err) if err.is_committed_checkpoint_pending() => {
+                Some("checkpoint_pending".to_string())
+            }
+            Err(err) if err.is_committed_cleanup_pending() => Some("cleanup_pending".to_string()),
+            Err(err) => return Err(err),
+        };
 
         Ok(InternalControlInstallSnapshotResponse {
-            term: state.current_term,
+            term: live.current_term,
             success: true,
-            last_index: self.last_log_index_locked(&state),
-            message: None,
+            last_index: self.last_log_index_locked(&live),
+            message: persistence_message,
         })
     }
 
@@ -1065,6 +2183,14 @@ impl ControlConsensusRuntime {
 
     fn quorum_size_locked(&self, state: &ConsensusState) -> usize {
         (self.control_voter_node_ids_locked(state).len() / 2) + 1
+    }
+
+    fn is_active_membership_node_locked(&self, state: &ConsensusState, node_id: &str) -> bool {
+        state
+            .control_state
+            .nodes
+            .iter()
+            .any(|node| node.status == ControlNodeStatus::Active && node.id == node_id)
     }
 
     fn is_membership_node_locked(&self, state: &ConsensusState, node_id: &str) -> bool {
@@ -1155,6 +2281,15 @@ impl ControlConsensusRuntime {
                     self.local_node_id, leader
                 ))
             }
+            InternalControlCommand::LeaveNode { node_id }
+                if node_id == &self.local_node_id
+                    && self.local_is_control_leader_locked(state) =>
+            {
+                Err(format!(
+                    "active control leader '{}' cannot leave itself before leadership is transferred",
+                    self.local_node_id
+                ))
+            }
             InternalControlCommand::JoinNode { .. }
             | InternalControlCommand::LeaveNode { .. }
             | InternalControlCommand::RecommissionNode { .. }
@@ -1197,7 +2332,37 @@ impl ControlConsensusRuntime {
     }
 
     fn local_is_control_leader_locked(&self, state: &ConsensusState) -> bool {
-        state.control_state.leader_node_id.as_deref() == Some(self.local_node_id.as_str())
+        state.persistence_fence.is_none()
+            && state.checkpoint_pending.is_none()
+            && state.pending_durable_candidate.is_none()
+            && state.current_term > state.stepped_down_term
+            && self.is_active_membership_node_locked(state, &self.local_node_id)
+            && state.control_state.leader_node_id.as_deref() == Some(self.local_node_id.as_str())
+    }
+
+    fn may_send_proposal_commit_notice_locked(
+        &self,
+        state: &ConsensusState,
+        proposal_leader_term: u64,
+        proposal_index: u64,
+    ) -> bool {
+        let authoritative_checkpoint_pending = state
+            .checkpoint_pending
+            .as_ref()
+            .is_some_and(|pending| pending.position.index >= proposal_index);
+        if state.pending_durable_candidate.is_some()
+            || ((state.persistence_fence.is_some() || state.checkpoint_pending.is_some())
+                && !authoritative_checkpoint_pending)
+            || state.current_term != proposal_leader_term
+            || state.current_term <= state.stepped_down_term
+            || state.commit_index < proposal_index
+            || state.control_state.applied_log_index < proposal_index
+            || state.control_state.leader_node_id.as_deref() != Some(self.local_node_id.as_str())
+        {
+            return false;
+        }
+
+        self.is_active_membership_node_locked(state, &self.local_node_id)
     }
 
     fn current_leader_id_locked<'a>(&self, state: &'a ConsensusState) -> Option<&'a str> {
@@ -1231,9 +2396,12 @@ impl ControlConsensusRuntime {
             return node_ids.first().cloned();
         }
 
-        let current_idx = node_ids
+        let Some(current_idx) = node_ids
             .iter()
-            .position(|node_id| node_id == current_leader)?;
+            .position(|node_id| node_id == current_leader)
+        else {
+            return node_ids.first().cloned();
+        };
         for offset in 1..=node_ids.len() {
             let candidate = &node_ids[(current_idx + offset) % node_ids.len()];
             if candidate != current_leader {
@@ -1296,21 +2464,36 @@ impl ControlConsensusRuntime {
                 .ok_or_else(|| "missing prev term for existing proposal entry".to_string())?;
             return Ok((existing, prev_log_index, prev_log_term, state.commit_index));
         }
+        if let Some(pending) = state
+            .entries
+            .iter()
+            .find(|entry| entry.index > state.commit_index)
+        {
+            return Err(format!(
+                "control proposal is blocked by uncommitted entry {} term {}; retry after it commits or is replaced",
+                pending.index, pending.term
+            ));
+        }
 
-        let term = state.current_term.saturating_add(1).max(1);
-        state.current_term = term;
+        let term = state
+            .current_term
+            .checked_add(1)
+            .ok_or_else(|| "control consensus term exhausted u64 range".to_string())?
+            .max(1);
         let prev_log_index = self.last_log_index_locked(state);
         let prev_log_term = self
             .term_at_locked(state, prev_log_index)
             .ok_or_else(|| "missing prev term for proposal".to_string())?;
         let entry = InternalControlLogEntry {
-            index: prev_log_index.saturating_add(1),
+            index: prev_log_index
+                .checked_add(1)
+                .ok_or_else(|| "control-log index exhausted u64 range".to_string())?,
             term,
             command,
             created_unix_ms: unix_timestamp_millis(),
         };
+        state.current_term = term;
         state.entries.push(entry.clone());
-        self.persist_log_locked(state)?;
         Ok((entry, prev_log_index, prev_log_term, state.commit_index))
     }
 
@@ -1326,7 +2509,10 @@ impl ControlConsensusRuntime {
             .cloned()
     }
 
-    fn apply_committed_entries_locked(&self, state: &mut ConsensusState) -> Result<(), String> {
+    fn apply_committed_entries_in_memory_locked(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<bool, String> {
         let mut changed = false;
         while state.control_state.applied_log_index < state.commit_index {
             let next_index = state.control_state.applied_log_index.saturating_add(1);
@@ -1355,11 +2541,10 @@ impl ControlConsensusRuntime {
         self.reconcile_dynamic_peers_locked(state);
 
         if changed {
-            self.state_store.persist(&state.control_state)?;
             self.maybe_compact_locked(state)?;
         }
 
-        Ok(())
+        Ok(changed)
     }
 
     fn apply_command_locked(
@@ -1377,13 +2562,11 @@ impl ControlConsensusRuntime {
                         "control command set_leader has an empty leader_node_id".to_string()
                     );
                 }
-                if !control_state
-                    .nodes
-                    .iter()
-                    .any(|node| node.id == *leader_node_id)
-                {
+                if !control_state.nodes.iter().any(|node| {
+                    node.id == *leader_node_id && node.status == ControlNodeStatus::Active
+                }) {
                     return Err(format!(
-                        "control command set_leader references unknown node '{}'",
+                        "control command set_leader references node '{}' that is not an active voter",
                         leader_node_id
                     ));
                 }
@@ -1501,18 +2684,553 @@ impl ControlConsensusRuntime {
         Ok(())
     }
 
-    fn persist_log_locked(&self, state: &ConsensusState) -> Result<(), String> {
-        let encoded = serde_json::to_vec_pretty(&ControlLogFileV1 {
+    fn encode_log_candidate_locked(
+        &self,
+        state: &ConsensusState,
+    ) -> Result<Vec<u8>, ControlConsensusError> {
+        let file = ControlLogFileV1 {
             magic: CONTROL_LOG_MAGIC.to_string(),
             schema_version: CONTROL_LOG_SCHEMA_VERSION,
             current_term: state.current_term,
+            stepped_down_term: Some(state.stepped_down_term),
             commit_index: state.commit_index,
             snapshot_last_index: state.snapshot_last_index,
             snapshot_last_term: state.snapshot_last_term,
             entries: state.entries.clone(),
-        })
-        .map_err(|err| format!("failed to serialize control-log state: {err}"))?;
-        write_atomically(&self.log_path, &encoded)
+            checkpoint_state: Some(state.control_state.clone()),
+        };
+        validate_log_file(&file, &self.log_path).map_err(ControlConsensusError::rejected)?;
+        let mut encoded = serde_json::to_vec_pretty(&file).map_err(|err| {
+            ControlConsensusError::rejected(format!(
+                "{} failed: {err}",
+                ControlPersistenceStage::LogEncode.as_str()
+            ))
+        })?;
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    fn persist_log_candidate_locked(
+        &self,
+        state: &ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        let encoded = self.encode_log_candidate_locked(state)?;
+        let replacement = [ManagedFileReplacement::new(&self.log_path, &encoded)];
+        let mut log_published = false;
+        let mut publication_ambiguous = false;
+        let publish = |staged: &mut StagedManagedFileReplacements| {
+            let result = staged.publish(0);
+            log_published = staged.is_published(0);
+            publication_ambiguous = staged.publication_ambiguous();
+            result
+        };
+        let result = if let Some(budget) = self.local_disk_budget.as_ref() {
+            budget.with_staged_managed_file_replacements(
+                &replacement,
+                DiskCategory::Cluster,
+                publish,
+            )
+        } else {
+            tsink::with_staged_file_replacements(&replacement, publish)
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if log_published || publication_ambiguous => {
+                let candidate_visible = std::fs::read(&self.log_path)
+                    .map(|current| current == encoded)
+                    .unwrap_or(false);
+                Err(ControlConsensusError::indeterminate(
+                    ControlPersistenceStage::LogPublish,
+                    err,
+                    candidate_visible,
+                ))
+            }
+            Err(err) => Err(ControlConsensusError::persistence(
+                ControlPersistenceStage::LogPublish,
+                err,
+            )),
+        }
+    }
+
+    fn persist_checkpoint_candidate_locked(
+        &self,
+        state: &ConsensusState,
+        mode: ControlCheckpointWriteMode,
+    ) -> Result<(), ControlConsensusError> {
+        let log_encoded = self.encode_log_candidate_locked(state)?;
+        let checkpoint_encoded =
+            encode_control_state_file(&state.control_state).map_err(|err| {
+                ControlConsensusError::rejected(format!(
+                    "{} failed: {err}",
+                    ControlPersistenceStage::CheckpointEncode.as_str()
+                ))
+            })?;
+        let replacements = [
+            ManagedFileReplacement::new(&self.log_path, &log_encoded),
+            ManagedFileReplacement::new(self.state_store.path(), &checkpoint_encoded),
+        ];
+        let mut log_published = false;
+        let mut log_durable = false;
+        let mut checkpoint_published = false;
+        let mut checkpoint_durable = false;
+        let mut publication_ambiguous = false;
+        let publish = |staged: &mut StagedManagedFileReplacements| {
+            let log_result = staged.publish(0);
+            log_published = staged.is_published(0);
+            publication_ambiguous = staged.publication_ambiguous();
+            log_result?;
+            log_durable = true;
+
+            #[cfg(test)]
+            maybe_fail_control_checkpoint_after_log_publish(&self.log_path)?;
+
+            let checkpoint_result = staged.publish(1);
+            checkpoint_published = staged.is_published(1);
+            publication_ambiguous |= staged.publication_ambiguous();
+            checkpoint_result?;
+            checkpoint_durable = true;
+
+            #[cfg(test)]
+            maybe_fail_control_pair_finalization(&self.log_path)?;
+
+            Ok(())
+        };
+        let result = if let Some(budget) = self.local_disk_budget.as_ref() {
+            match mode {
+                ControlCheckpointWriteMode::Growth => budget.with_staged_managed_file_replacements(
+                    &replacements,
+                    DiskCategory::Cluster,
+                    publish,
+                ),
+                ControlCheckpointWriteMode::AuthoritativeRecovery => budget
+                    .with_staged_managed_file_replacements_for_authoritative_recovery(
+                        &replacements,
+                        DiskCategory::Cluster,
+                        publish,
+                    ),
+            }
+        } else {
+            tsink::with_staged_file_replacements(&replacements, publish)
+        };
+
+        match result {
+            Ok(()) => {
+                self.state_store
+                    .record_persisted_checkpoint(&state.control_state);
+                Ok(())
+            }
+            Err(err) if log_durable && checkpoint_durable => {
+                self.state_store
+                    .record_persisted_checkpoint(&state.control_state);
+                Err(ControlConsensusError::committed_cleanup_pending(
+                    ControlCommitPosition {
+                        index: state.commit_index,
+                        term: state.control_state.applied_log_term,
+                    },
+                    err,
+                ))
+            }
+            Err(err) if log_durable => {
+                let position = ControlCommitPosition {
+                    index: state.commit_index,
+                    term: state.control_state.applied_log_term,
+                };
+                let stage = if checkpoint_published {
+                    ControlPersistenceStage::Repair
+                } else {
+                    ControlPersistenceStage::CheckpointPublish
+                };
+                Err(ControlConsensusError::committed_checkpoint_pending(
+                    position, stage, err,
+                ))
+            }
+            Err(err) if log_published || publication_ambiguous => {
+                let candidate_visible = std::fs::read(&self.log_path)
+                    .map(|current| current == log_encoded)
+                    .unwrap_or(false);
+                Err(ControlConsensusError::indeterminate(
+                    ControlPersistenceStage::LogPublish,
+                    err,
+                    candidate_visible,
+                ))
+            }
+            Err(err) => Err(ControlConsensusError::persistence(
+                ControlPersistenceStage::LogPublish,
+                err,
+            )),
+        }
+    }
+
+    fn persist_authoritative_mirror_candidate_locked(
+        &self,
+        state: &ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        let checkpoint_encoded =
+            encode_control_state_file(&state.control_state).map_err(|err| {
+                ControlConsensusError::rejected(format!(
+                    "{} failed: {err}",
+                    ControlPersistenceStage::CheckpointEncode.as_str()
+                ))
+            })?;
+        let replacement = [ManagedFileReplacement::new(
+            self.state_store.path(),
+            &checkpoint_encoded,
+        )];
+        let mut checkpoint_published = false;
+        let mut checkpoint_durable = false;
+        let publish = |staged: &mut StagedManagedFileReplacements| {
+            let result = staged.publish(0);
+            checkpoint_published = staged.is_published(0);
+            result?;
+            checkpoint_durable = true;
+
+            #[cfg(test)]
+            maybe_fail_control_pair_finalization(&self.log_path)?;
+
+            Ok(())
+        };
+        let result = if let Some(budget) = self.local_disk_budget.as_ref() {
+            budget.with_staged_managed_file_replacements_for_authoritative_recovery(
+                &replacement,
+                DiskCategory::Cluster,
+                publish,
+            )
+        } else {
+            tsink::with_staged_file_replacements(&replacement, publish)
+        };
+        match result {
+            Ok(()) => {
+                self.state_store
+                    .record_persisted_checkpoint(&state.control_state);
+                Ok(())
+            }
+            Err(err) if checkpoint_durable => {
+                self.state_store
+                    .record_persisted_checkpoint(&state.control_state);
+                Err(ControlConsensusError::committed_cleanup_pending(
+                    ControlCommitPosition {
+                        index: state.commit_index,
+                        term: state.control_state.applied_log_term,
+                    },
+                    err,
+                ))
+            }
+            Err(err) => Err(ControlConsensusError::committed_checkpoint_pending(
+                ControlCommitPosition {
+                    index: state.commit_index,
+                    term: state.control_state.applied_log_term,
+                },
+                if checkpoint_published {
+                    ControlPersistenceStage::Repair
+                } else {
+                    ControlPersistenceStage::CheckpointPublish
+                },
+                err,
+            )),
+        }
+    }
+
+    fn publish_log_and_install_locked(
+        &self,
+        live: &mut ConsensusState,
+        mut candidate: ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        match self.persist_log_candidate_locked(&candidate) {
+            Ok(()) => {
+                candidate.persistence_fence = None;
+                candidate.pending_durable_candidate = None;
+                *live = candidate;
+                Ok(())
+            }
+            Err(err) if err.is_indeterminate() => {
+                if err.candidate_visible {
+                    candidate.persistence_fence = Some(err.to_string());
+                    *live = candidate;
+                } else {
+                    live.persistence_fence = Some(err.to_string());
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn publish_required_log_candidate_and_install_locked(
+        &self,
+        live: &mut ConsensusState,
+        mut candidate: ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        match self.publish_log_and_install_locked(live, candidate.clone()) {
+            Ok(()) => Ok(()),
+            Err(err) if !err.is_persistence_failure() => Err(err),
+            Err(err) => {
+                let pending = ControlConsensusError::durable_candidate_pending(
+                    ControlPersistenceStage::LogPublish,
+                    err,
+                );
+                candidate.persistence_fence = Some(pending.to_string());
+                candidate.pending_durable_candidate = Some(ControlPendingDurableCandidate::LogOnly);
+                *live = candidate;
+                Err(pending)
+            }
+        }
+    }
+
+    fn persist_observed_term_before_rejection_locked(
+        &self,
+        live: &mut ConsensusState,
+        observed: &ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        if observed.current_term > live.current_term
+            || observed.stepped_down_term > live.stepped_down_term
+        {
+            let mut candidate = live.clone();
+            candidate.current_term = observed.current_term;
+            candidate.stepped_down_term = observed.stepped_down_term;
+            candidate.last_leader_contact_unix_ms = observed.last_leader_contact_unix_ms;
+            candidate.peer_heartbeat = observed.peer_heartbeat.clone();
+            self.publish_required_log_candidate_and_install_locked(live, candidate)
+        } else {
+            live.last_leader_contact_unix_ms = observed.last_leader_contact_unix_ms;
+            live.peer_heartbeat = observed.peer_heartbeat.clone();
+            Ok(())
+        }
+    }
+
+    fn publish_checkpoint_and_install_locked(
+        &self,
+        live: &mut ConsensusState,
+        mut candidate: ConsensusState,
+        mode: ControlCheckpointWriteMode,
+    ) -> Result<(), ControlConsensusError> {
+        match self.persist_checkpoint_candidate_locked(&candidate, mode) {
+            Ok(()) => {
+                candidate.persistence_fence = None;
+                candidate.checkpoint_pending = None;
+                candidate.pending_durable_candidate = None;
+                candidate.cleanup_debt = None;
+                *live = candidate;
+                Ok(())
+            }
+            Err(err) if err.is_committed_cleanup_pending() => {
+                candidate.persistence_fence = None;
+                candidate.checkpoint_pending = None;
+                candidate.pending_durable_candidate = None;
+                candidate.cleanup_debt = Some(err.to_string());
+                *live = candidate;
+                Err(err)
+            }
+            Err(err) if err.is_committed_checkpoint_pending() => {
+                let position = err
+                    .committed_checkpoint()
+                    .expect("checked committed position");
+                candidate.checkpoint_pending = Some(ControlCheckpointPending {
+                    position,
+                    detail: err.to_string(),
+                });
+                candidate.persistence_fence = Some(err.to_string());
+                candidate.pending_durable_candidate = None;
+                *live = candidate;
+                Err(err)
+            }
+            Err(err) if err.is_indeterminate() => {
+                live.persistence_fence = Some(err.to_string());
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn publish_required_checkpoint_candidate_and_install_locked(
+        &self,
+        live: &mut ConsensusState,
+        mut candidate: ConsensusState,
+        mode: ControlCheckpointWriteMode,
+    ) -> Result<(), ControlConsensusError> {
+        match self.publish_checkpoint_and_install_locked(live, candidate.clone(), mode) {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_committed_cleanup_pending() => Err(err),
+            Err(err) if err.is_committed_checkpoint_pending() => Err(err),
+            Err(err) if !err.is_persistence_failure() => Err(err),
+            Err(err) => {
+                let pending = ControlConsensusError::durable_candidate_pending(
+                    ControlPersistenceStage::LogPublish,
+                    err,
+                );
+                candidate.persistence_fence = Some(pending.to_string());
+                candidate.checkpoint_pending = None;
+                candidate.pending_durable_candidate =
+                    Some(ControlPendingDurableCandidate::Checkpoint(mode));
+                *live = candidate;
+                Err(pending)
+            }
+        }
+    }
+
+    fn repair_persistence_fence_locked(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        let result = self.try_repair_persistence_fence_locked(state);
+        if let Err(err) = &result {
+            state.persistence_fence = Some(err.to_string());
+        }
+        result
+    }
+
+    fn try_repair_persistence_fence_locked(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<(), ControlConsensusError> {
+        let repair_required = state.cleanup_debt.is_some()
+            || state.persistence_fence.is_some()
+            || state.checkpoint_pending.is_some()
+            || state.pending_durable_candidate.is_some();
+        if repair_required {
+            if let Some(budget) = self.local_disk_budget.as_ref() {
+                budget
+                    .cleanup_atomic_write_temps(&self.log_path)
+                    .map_err(|err| {
+                        ControlConsensusError::persistence(ControlPersistenceStage::Repair, err)
+                    })?;
+                budget
+                    .cleanup_atomic_write_temps(self.state_store.path())
+                    .map_err(|err| {
+                        ControlConsensusError::persistence(ControlPersistenceStage::Repair, err)
+                    })?;
+                budget.reconcile_when_idle().map_err(|err| {
+                    ControlConsensusError::persistence(ControlPersistenceStage::Repair, err)
+                })?;
+            }
+            state.cleanup_debt = None;
+        }
+
+        if let Some(pending) = state.pending_durable_candidate {
+            let mut candidate = state.clone();
+            candidate.persistence_fence = None;
+            candidate.checkpoint_pending = None;
+            candidate.pending_durable_candidate = None;
+            let repair_result = match pending {
+                ControlPendingDurableCandidate::LogOnly => {
+                    self.persist_log_candidate_locked(&candidate)
+                }
+                ControlPendingDurableCandidate::Checkpoint(mode) => {
+                    self.persist_checkpoint_candidate_locked(&candidate, mode)
+                }
+            };
+            return match repair_result {
+                Ok(()) => {
+                    *state = candidate;
+                    Ok(())
+                }
+                Err(err) if err.is_committed_cleanup_pending() => {
+                    candidate.cleanup_debt = Some(err.to_string());
+                    *state = candidate;
+                    Ok(())
+                }
+                Err(err) if err.is_committed_checkpoint_pending() => {
+                    let position = err
+                        .committed_checkpoint()
+                        .expect("checked committed checkpoint position");
+                    candidate.persistence_fence = Some(err.to_string());
+                    candidate.checkpoint_pending = Some(ControlCheckpointPending {
+                        position,
+                        detail: err.to_string(),
+                    });
+                    *state = candidate;
+                    Err(err)
+                }
+                Err(err) => {
+                    if err.is_persistence_failure() {
+                        let stage = match pending {
+                            ControlPendingDurableCandidate::LogOnly => {
+                                ControlPersistenceStage::LogPublish
+                            }
+                            ControlPendingDurableCandidate::Checkpoint(_) => {
+                                ControlPersistenceStage::CheckpointPublish
+                            }
+                        };
+                        let pending = ControlConsensusError::durable_candidate_pending(stage, err);
+                        state.persistence_fence = Some(pending.to_string());
+                        Err(pending)
+                    } else {
+                        state.persistence_fence = Some(err.to_string());
+                        Err(err)
+                    }
+                }
+            };
+        }
+
+        if state.persistence_fence.is_none() && state.checkpoint_pending.is_none() {
+            return Ok(());
+        }
+
+        let persisted = load_log_file(&self.log_path).map_err(|err| {
+            ControlConsensusError::indeterminate(ControlPersistenceStage::Repair, err, false)
+        })?;
+        validate_log_file(&persisted, &self.log_path).map_err(|err| {
+            ControlConsensusError::indeterminate(ControlPersistenceStage::Repair, err, false)
+        })?;
+        let checkpoint = persisted.checkpoint_state.clone().ok_or_else(|| {
+            ControlConsensusError::indeterminate(
+                ControlPersistenceStage::Repair,
+                "authoritative control log does not contain a checkpoint",
+                false,
+            )
+        })?;
+        let persisted_stepped_down_term = persisted.stepped_down_term.unwrap_or(0);
+        let repair_mirror_only = state.checkpoint_pending.is_some()
+            && state.current_term <= persisted.current_term
+            && state.stepped_down_term <= persisted_stepped_down_term;
+        let mut candidate = state.clone();
+        candidate.current_term = state.current_term.max(persisted.current_term);
+        candidate.stepped_down_term = state
+            .stepped_down_term
+            .max(persisted_stepped_down_term)
+            .min(candidate.current_term);
+        candidate.commit_index = persisted.commit_index;
+        candidate.snapshot_last_index = persisted.snapshot_last_index;
+        candidate.snapshot_last_term = persisted.snapshot_last_term;
+        candidate.entries = persisted.entries;
+        candidate.control_state = checkpoint;
+        candidate.persistence_fence = None;
+        candidate.checkpoint_pending = None;
+        candidate.pending_durable_candidate = None;
+        self.reconcile_dynamic_peers_locked(&mut candidate);
+        if !repair_mirror_only {
+            return match self.publish_checkpoint_and_install_locked(
+                state,
+                candidate,
+                ControlCheckpointWriteMode::AuthoritativeRecovery,
+            ) {
+                Ok(()) => Ok(()),
+                Err(err) if err.is_committed_cleanup_pending() => Ok(()),
+                Err(err) => Err(err),
+            };
+        }
+        match self.persist_authoritative_mirror_candidate_locked(&candidate) {
+            Ok(()) => {
+                *state = candidate;
+                Ok(())
+            }
+            Err(err) if err.is_committed_cleanup_pending() => {
+                candidate.cleanup_debt = Some(err.to_string());
+                *state = candidate;
+                Ok(())
+            }
+            Err(err) => {
+                let position = err
+                    .committed_checkpoint()
+                    .expect("authoritative mirror repair reports committed position");
+                candidate.persistence_fence = Some(err.to_string());
+                candidate.checkpoint_pending = Some(ControlCheckpointPending {
+                    position,
+                    detail: err.to_string(),
+                });
+                *state = candidate;
+                Err(err)
+            }
+        }
     }
 
     fn last_log_index_locked(&self, state: &ConsensusState) -> u64 {
@@ -1527,7 +3245,10 @@ impl ControlConsensusRuntime {
         if index <= state.snapshot_last_index {
             return None;
         }
-        let offset = (index - state.snapshot_last_index - 1) as usize;
+        let offset = index
+            .checked_sub(state.snapshot_last_index)?
+            .checked_sub(1)?;
+        let offset = usize::try_from(offset).ok()?;
         (offset < state.entries.len()).then_some(offset)
     }
 
@@ -1549,12 +3270,21 @@ impl ControlConsensusRuntime {
         endpoint: &str,
     ) -> Result<(), String> {
         for attempt in 0..CONTROL_SYNC_MAX_ATTEMPTS {
-            let plan = {
+            let (plan, peer_was_active) = {
                 let state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                self.build_peer_plan_locked(&state, node_id)?
+                if !self.local_is_control_leader_locked(&state) {
+                    return Err(format!(
+                        "node '{}' stepped down before synchronizing peer '{node_id}'",
+                        self.local_node_id
+                    ));
+                }
+                (
+                    self.build_peer_plan_locked(&state, node_id)?,
+                    self.is_active_membership_node_locked(&state, node_id),
+                )
             };
 
             match plan {
@@ -1568,15 +3298,16 @@ impl ControlConsensusRuntime {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 self.mark_peer_success_locked(&mut state, node_id);
                             }
-                            if response.term > request.term {
-                                let mut state = self
+                            if response.term > request.term && peer_was_active {
+                                let mut live = self
                                     .state
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if response.term > state.current_term {
-                                    state.current_term = response.term;
-                                    self.persist_log_locked(&state)?;
-                                }
+                                self.persist_observed_higher_peer_term_locked(
+                                    &mut live,
+                                    response.term,
+                                    node_id,
+                                )?;
                                 return Ok(());
                             }
                             if response.success {
@@ -1588,7 +3319,6 @@ impl ControlConsensusRuntime {
                                     node_id.to_string(),
                                     response.match_index.saturating_add(1),
                                 );
-                                self.persist_log_locked(&state)?;
                                 return Ok(());
                             }
 
@@ -1601,7 +3331,6 @@ impl ControlConsensusRuntime {
                             state
                                 .peer_next_index
                                 .insert(node_id.to_string(), next_index);
-                            self.persist_log_locked(&state)?;
                         }
                         Err(err) => {
                             let mut state = self
@@ -1629,15 +3358,16 @@ impl ControlConsensusRuntime {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 self.mark_peer_success_locked(&mut state, node_id);
                             }
-                            if response.term > request.term {
-                                let mut state = self
+                            if response.term > request.term && peer_was_active {
+                                let mut live = self
                                     .state
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if response.term > state.current_term {
-                                    state.current_term = response.term;
-                                    self.persist_log_locked(&state)?;
-                                }
+                                self.persist_observed_higher_peer_term_locked(
+                                    &mut live,
+                                    response.term,
+                                    node_id,
+                                )?;
                                 return Ok(());
                             }
                             if response.success {
@@ -1649,7 +3379,6 @@ impl ControlConsensusRuntime {
                                     node_id.to_string(),
                                     response.last_index.saturating_add(1),
                                 );
-                                self.persist_log_locked(&state)?;
                                 continue;
                             }
                             return Ok(());
@@ -1671,6 +3400,35 @@ impl ControlConsensusRuntime {
         }
 
         Ok(())
+    }
+
+    fn persist_observed_higher_peer_term_locked(
+        &self,
+        live: &mut ConsensusState,
+        observed_term: u64,
+        node_id: &str,
+    ) -> Result<(), String> {
+        if observed_term <= live.current_term && observed_term <= live.stepped_down_term {
+            return Ok(());
+        }
+        if let Err(err) = self.repair_persistence_fence_locked(live) {
+            live.current_term = live.current_term.max(observed_term);
+            live.stepped_down_term = live.stepped_down_term.max(observed_term);
+            let detail = format!(
+                "observed higher control term {observed_term} from active peer '{node_id}' but could not repair existing durable authority before recording it: {err}"
+            );
+            live.persistence_fence = Some(detail.clone());
+            return Err(detail);
+        }
+        if observed_term <= live.current_term && observed_term <= live.stepped_down_term {
+            return Ok(());
+        }
+
+        let mut candidate = live.clone();
+        candidate.current_term = candidate.current_term.max(observed_term);
+        candidate.stepped_down_term = candidate.stepped_down_term.max(observed_term);
+        self.publish_required_log_candidate_and_install_locked(live, candidate)
+            .map_err(String::from)
     }
 
     fn peer_next_index_after_append_reject(
@@ -1712,8 +3470,8 @@ impl ControlConsensusRuntime {
                 InternalControlInstallSnapshotRequest {
                     term: current_term,
                     leader_node_id: self.local_node_id.clone(),
-                    snapshot_last_index: state.snapshot_last_index,
-                    snapshot_last_term: state.snapshot_last_term,
+                    snapshot_last_index: state.commit_index,
+                    snapshot_last_term: state.control_state.applied_log_term,
                     state: snapshot_payload,
                 },
             ));
@@ -1760,6 +3518,55 @@ enum PeerPlan {
     InstallSnapshot(InternalControlInstallSnapshotRequest),
 }
 
+fn ensure_control_state_runtime_compatible(
+    recovered: &ControlState,
+    runtime_bootstrap: &ControlState,
+    local_node_id: &str,
+) -> Result<(), String> {
+    recovered.validate()?;
+    runtime_bootstrap.validate()?;
+    let runtime_local = runtime_bootstrap
+        .node_record(local_node_id)
+        .ok_or_else(|| {
+            format!("runtime bootstrap is missing local cluster node '{local_node_id}'")
+        })?;
+    let recovered_local = recovered.node_record(local_node_id).ok_or_else(|| {
+        format!("persisted control membership is missing local cluster node '{local_node_id}'")
+    })?;
+    if recovered_local.endpoint != runtime_local.endpoint {
+        return Err(format!(
+            "persisted control membership endpoint mismatch for local node '{}': '{}' != '{}'",
+            local_node_id, recovered_local.endpoint, runtime_local.endpoint
+        ));
+    }
+    if recovered.ring.shard_count != runtime_bootstrap.ring.shard_count {
+        return Err(format!(
+            "persisted control ring shard_count {} does not match runtime shard_count {}",
+            recovered.ring.shard_count, runtime_bootstrap.ring.shard_count
+        ));
+    }
+    if recovered.ring.hash_version != runtime_bootstrap.ring.hash_version {
+        return Err(format!(
+            "persisted control ring hash_version {} does not match runtime hash_version {}",
+            recovered.ring.hash_version, runtime_bootstrap.ring.hash_version
+        ));
+    }
+    if recovered.ring.replication_factor != runtime_bootstrap.ring.replication_factor {
+        return Err(format!(
+            "persisted control ring replication_factor {} does not match runtime replication_factor {}",
+            recovered.ring.replication_factor, runtime_bootstrap.ring.replication_factor
+        ));
+    }
+    if recovered.ring.virtual_nodes_per_node != runtime_bootstrap.ring.virtual_nodes_per_node {
+        return Err(format!(
+            "persisted control ring virtual_nodes_per_node {} does not match runtime virtual_nodes_per_node {}",
+            recovered.ring.virtual_nodes_per_node,
+            runtime_bootstrap.ring.virtual_nodes_per_node
+        ));
+    }
+    Ok(())
+}
+
 fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String> {
     if file.magic != CONTROL_LOG_MAGIC {
         return Err(format!(
@@ -1768,7 +3575,10 @@ fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String>
             file.magic
         ));
     }
-    if file.schema_version != CONTROL_LOG_SCHEMA_VERSION {
+    if !matches!(
+        file.schema_version,
+        CONTROL_LOG_LEGACY_SCHEMA_VERSION | CONTROL_LOG_SCHEMA_VERSION
+    ) {
         return Err(format!(
             "control-log file {} has unsupported schema version {}",
             path.display(),
@@ -1781,6 +3591,33 @@ fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String>
             path.display()
         ));
     }
+    match (file.schema_version, file.stepped_down_term) {
+        (CONTROL_LOG_SCHEMA_VERSION, Some(term)) if term <= file.current_term => {}
+        (CONTROL_LOG_SCHEMA_VERSION, Some(term)) => {
+            return Err(format!(
+                "control-log file {} has steppedDownTerm {} greater than current term {}",
+                path.display(),
+                term,
+                file.current_term
+            ));
+        }
+        (CONTROL_LOG_SCHEMA_VERSION, None) => {
+            return Err(format!(
+                "control-log schema v{} file {} is missing steppedDownTerm",
+                CONTROL_LOG_SCHEMA_VERSION,
+                path.display()
+            ));
+        }
+        (CONTROL_LOG_LEGACY_SCHEMA_VERSION, None) => {}
+        (CONTROL_LOG_LEGACY_SCHEMA_VERSION, Some(_)) => {
+            return Err(format!(
+                "legacy control-log schema v{} file {} unexpectedly contains steppedDownTerm",
+                CONTROL_LOG_LEGACY_SCHEMA_VERSION,
+                path.display()
+            ));
+        }
+        _ => unreachable!("schema version was validated above"),
+    }
     if file.snapshot_last_index > file.commit_index {
         return Err(format!(
             "control-log file {} has snapshot_last_index {} greater than commit_index {}",
@@ -1789,8 +3626,37 @@ fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String>
             file.commit_index
         ));
     }
+    if file.snapshot_last_index == 0 && file.snapshot_last_term != 0 {
+        return Err(format!(
+            "control-log file {} has snapshot term {} at index 0",
+            path.display(),
+            file.snapshot_last_term
+        ));
+    }
+    if file.snapshot_last_index > 0 && file.snapshot_last_term == 0 {
+        return Err(format!(
+            "control-log file {} has term 0 at nonzero snapshot index {}",
+            path.display(),
+            file.snapshot_last_index
+        ));
+    }
+    if file.snapshot_last_term > file.current_term {
+        return Err(format!(
+            "control-log file {} has snapshot term {} greater than current term {}",
+            path.display(),
+            file.snapshot_last_term,
+            file.current_term
+        ));
+    }
 
-    let mut expected_index = file.snapshot_last_index.saturating_add(1);
+    let mut expected_index = file.snapshot_last_index.checked_add(1).ok_or_else(|| {
+        format!(
+            "control-log file {} cannot contain entries after index {}",
+            path.display(),
+            file.snapshot_last_index
+        )
+    })?;
+    let mut previous_term = file.snapshot_last_term;
     for entry in &file.entries {
         if entry.index != expected_index {
             return Err(format!(
@@ -1807,7 +3673,31 @@ fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String>
                 entry.index
             ));
         }
-        expected_index = expected_index.saturating_add(1);
+        if entry.term < previous_term {
+            return Err(format!(
+                "control-log file {} has decreasing term {} at entry {} after term {}",
+                path.display(),
+                entry.term,
+                entry.index,
+                previous_term
+            ));
+        }
+        if entry.term > file.current_term {
+            return Err(format!(
+                "control-log file {} has entry {} term {} greater than current term {}",
+                path.display(),
+                entry.index,
+                entry.term,
+                file.current_term
+            ));
+        }
+        previous_term = entry.term;
+        expected_index = expected_index.checked_add(1).ok_or_else(|| {
+            format!(
+                "control-log file {} entry indexes exceed the supported range",
+                path.display()
+            )
+        })?;
     }
 
     let last_index = file
@@ -1824,21 +3714,110 @@ fn validate_log_file(file: &ControlLogFileV1, path: &Path) -> Result<(), String>
         ));
     }
 
+    if file.schema_version == CONTROL_LOG_SCHEMA_VERSION {
+        let checkpoint = file.checkpoint_state.as_ref().ok_or_else(|| {
+            format!(
+                "control-log schema v{} file {} is missing checkpointState",
+                CONTROL_LOG_SCHEMA_VERSION,
+                path.display()
+            )
+        })?;
+        checkpoint.validate().map_err(|err| {
+            format!(
+                "control-log checkpointState validation failed for {}: {err}",
+                path.display()
+            )
+        })?;
+        if checkpoint.applied_log_index != file.commit_index {
+            return Err(format!(
+                "control-log checkpointState in {} is applied through index {}, expected commit index {}",
+                path.display(),
+                checkpoint.applied_log_index,
+                file.commit_index
+            ));
+        }
+        let committed_term = if file.commit_index == 0 {
+            0
+        } else if file.commit_index == file.snapshot_last_index {
+            file.snapshot_last_term
+        } else {
+            let offset = usize::try_from(
+                file.commit_index
+                    .saturating_sub(file.snapshot_last_index)
+                    .saturating_sub(1),
+            )
+            .map_err(|_| {
+                format!(
+                    "control-log commit index {} exceeds platform limits in {}",
+                    file.commit_index,
+                    path.display()
+                )
+            })?;
+            file.entries
+                .get(offset)
+                .map(|entry| entry.term)
+                .ok_or_else(|| {
+                    format!(
+                        "control-log file {} is missing committed entry {}",
+                        path.display(),
+                        file.commit_index
+                    )
+                })?
+        };
+        if checkpoint.applied_log_term != committed_term {
+            return Err(format!(
+                "control-log checkpointState in {} has applied term {}, expected {} at commit index {}",
+                path.display(),
+                checkpoint.applied_log_term,
+                committed_term,
+                file.commit_index
+            ));
+        }
+    } else if file.checkpoint_state.is_some() {
+        return Err(format!(
+            "legacy control-log schema v{} file {} unexpectedly contains checkpointState",
+            CONTROL_LOG_LEGACY_SCHEMA_VERSION,
+            path.display()
+        ));
+    }
+
     Ok(())
 }
 
 fn validate_recovery_log_snapshot(snapshot: &ControlLogRecoverySnapshot) -> Result<(), String> {
+    if snapshot.stepped_down_term > snapshot.current_term {
+        return Err(format!(
+            "control recovery snapshot steppedDownTerm {} exceeds currentTerm {}",
+            snapshot.stepped_down_term, snapshot.current_term
+        ));
+    }
     let path = Path::new("<recovery-snapshot>");
     let file = ControlLogFileV1 {
         magic: CONTROL_LOG_MAGIC.to_string(),
-        schema_version: CONTROL_LOG_SCHEMA_VERSION,
+        schema_version: CONTROL_LOG_LEGACY_SCHEMA_VERSION,
         current_term: snapshot.current_term,
+        stepped_down_term: None,
         commit_index: snapshot.commit_index,
         snapshot_last_index: snapshot.snapshot_last_index,
         snapshot_last_term: snapshot.snapshot_last_term,
         entries: snapshot.entries.clone(),
+        checkpoint_state: None,
     };
     validate_log_file(&file, path)
+}
+
+fn recovery_snapshot_term_at(snapshot: &ControlLogRecoverySnapshot, index: u64) -> Option<u64> {
+    if index == 0 {
+        return Some(0);
+    }
+    if index == snapshot.snapshot_last_index {
+        return Some(snapshot.snapshot_last_term);
+    }
+    let offset = index
+        .checked_sub(snapshot.snapshot_last_index)?
+        .checked_sub(1)?;
+    let offset = usize::try_from(offset).ok()?;
+    snapshot.entries.get(offset).map(|entry| entry.term)
 }
 
 fn load_log_file(path: &Path) -> Result<ControlLogFileV1, String> {
@@ -1846,15 +3825,6 @@ fn load_log_file(path: &Path) -> Result<ControlLogFileV1, String> {
         .map_err(|err| format!("failed to read control-log file {}: {err}", path.display()))?;
     serde_json::from_slice(&raw)
         .map_err(|err| format!("failed to parse control-log file {}: {err}", path.display()))
-}
-
-fn write_atomically(path: &Path, encoded: &[u8]) -> Result<(), String> {
-    write_file_atomically_and_sync_parent(path, encoded).map_err(|err| {
-        format!(
-            "failed to persist control-log file {}: {err}",
-            path.display()
-        )
-    })
 }
 
 fn unix_timestamp_millis() -> u64 {
@@ -1892,7 +3862,10 @@ mod tests {
     use crate::cluster::rpc::{
         derive_shared_internal_token, RpcClientConfig, INTERNAL_RPC_PROTOCOL_VERSION,
     };
+    use crate::http::{read_http_request, write_http_response, HttpResponse};
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tsink::disk_budget::LocalDiskLimits;
 
     fn sample_membership_and_state() -> (MembershipView, ControlState) {
         let config = ClusterConfig {
@@ -1956,6 +3929,63 @@ mod tests {
             },
         )
         .expect("runtime should open")
+    }
+
+    fn force_local_leader(runtime: &ControlConsensusRuntime) {
+        let state = runtime.current_state();
+        let log = runtime.log_recovery_snapshot();
+        runtime
+            .restore_recovery_snapshot(state, log, true)
+            .expect("local leader fixture should persist");
+        assert!(runtime.is_local_control_leader());
+    }
+
+    fn set_in_memory_node_status(
+        runtime: &ControlConsensusRuntime,
+        node_id: &str,
+        status: ControlNodeStatus,
+    ) {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .control_state
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .unwrap_or_else(|| panic!("node '{node_id}' should exist in the test membership"))
+            .status = status;
+    }
+
+    fn test_rpc_client(local_node_id: &str) -> RpcClient {
+        RpcClient::new(crate::cluster::rpc::RpcClientConfig {
+            timeout: Duration::from_millis(20),
+            max_retries: 0,
+            protocol_version: crate::cluster::rpc::INTERNAL_RPC_PROTOCOL_VERSION.to_string(),
+            internal_auth_token: "test-token".to_string(),
+            internal_auth_runtime: None,
+            local_node_id: local_node_id.to_string(),
+            compatibility: crate::cluster::rpc::CompatibilityProfile::default(),
+            internal_mtls: None,
+        })
+    }
+
+    fn single_node_membership_and_state() -> (MembershipView, ControlState) {
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: Some("node-a".to_string()),
+            bind: Some("127.0.0.1:9301".to_string()),
+            shards: 16,
+            replication_factor: 1,
+            ..ClusterConfig::default()
+        };
+        let membership = MembershipView::from_config(&config).expect("membership should build");
+        let ring = ShardRing::build(16, 1, &membership).expect("ring should build");
+        (
+            membership.clone(),
+            ControlState::from_runtime(&membership, &ring),
+        )
     }
 
     #[test]
@@ -2088,6 +4118,16 @@ mod tests {
                 unix_timestamp_millis(),
             )
             .expect("leader handoff mutation proposal should pass");
+        let self_leave_err = runtime
+            .validate_local_proposal_locked(
+                &state,
+                &InternalControlCommand::LeaveNode {
+                    node_id: "node-a".to_string(),
+                },
+                unix_timestamp_millis(),
+            )
+            .expect_err("an active leader must transfer leadership before leaving itself");
+        assert!(self_leave_err.contains("cannot leave itself"));
     }
 
     #[test]
@@ -2397,6 +4437,56 @@ mod tests {
     }
 
     #[test]
+    fn append_and_snapshot_from_non_active_members_cannot_advance_term() {
+        for status in [ControlNodeStatus::Joining, ControlNodeStatus::Leaving] {
+            let temp_dir = TempDir::new().expect("temp dir should create");
+            let runtime = open_runtime_for_node(
+                &temp_dir,
+                "node-a",
+                "127.0.0.1:9301",
+                &["node-b@127.0.0.1:9302"],
+                status.as_str(),
+                64,
+            );
+            set_in_memory_node_status(&runtime, "node-b", status);
+            let before = runtime.log_recovery_snapshot();
+
+            let append = runtime
+                .handle_append_request(InternalControlAppendRequest {
+                    term: before.current_term.checked_add(10).unwrap(),
+                    leader_node_id: "node-b".to_string(),
+                    prev_log_index: before.snapshot_last_index,
+                    prev_log_term: before.snapshot_last_term,
+                    entries: Vec::new(),
+                    leader_commit: before.commit_index,
+                })
+                .expect("non-active append should return a protocol rejection");
+            assert!(!append.success, "{status:?} leader append was accepted");
+            assert_eq!(append.message.as_deref(), Some("leader_not_active_voter"));
+            assert_eq!(append.term, before.current_term);
+
+            let snapshot = runtime
+                .handle_install_snapshot_request(InternalControlInstallSnapshotRequest {
+                    term: before.current_term.checked_add(11).unwrap(),
+                    leader_node_id: "node-b".to_string(),
+                    snapshot_last_index: 1,
+                    snapshot_last_term: 1,
+                    state: serde_json::to_value(runtime.current_state())
+                        .expect("snapshot fixture should encode"),
+                })
+                .expect("non-active snapshot should return a protocol rejection");
+            assert!(!snapshot.success, "{status:?} leader snapshot was accepted");
+            assert_eq!(snapshot.message.as_deref(), Some("leader_not_active_voter"));
+            assert_eq!(snapshot.term, before.current_term);
+
+            let after = runtime.log_recovery_snapshot();
+            assert_eq!(after.current_term, before.current_term);
+            assert_eq!(after.stepped_down_term, before.stepped_down_term);
+            assert_eq!(after.entries, before.entries);
+        }
+    }
+
+    #[test]
     fn append_rejects_conflicting_leader_for_same_term() {
         let temp_dir = TempDir::new().expect("temp dir should create");
         let (membership, bootstrap_state) = sample_membership_and_state();
@@ -2575,6 +4665,66 @@ mod tests {
             state.last_leader_contact_unix_ms = 0;
             assert!(!node_c_runtime.can_local_node_propose_locked(&state, now_ms));
         }
+    }
+
+    #[test]
+    fn inactive_local_member_is_neither_control_leader_nor_voter() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "inactive-local",
+            64,
+        );
+        force_local_leader(&runtime);
+        set_in_memory_node_status(&runtime, "node-a", ControlNodeStatus::Leaving);
+
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.control_state.leader_node_id.as_deref(),
+            Some("node-a"),
+            "the regression fixture must retain the recorded local leader"
+        );
+        assert!(!runtime.local_is_control_leader_locked(&state));
+        let voters = runtime.control_voter_node_ids_locked(&state);
+        assert_eq!(voters, vec!["node-b".to_string()]);
+        assert!(!voters.iter().any(|node_id| node_id == "node-a"));
+        assert!(!runtime.can_local_node_propose_locked(&state, u64::MAX));
+        drop(state);
+        assert!(!runtime.is_local_control_leader());
+    }
+
+    #[test]
+    fn failover_with_recorded_non_voter_leader_selects_first_active_voter() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-b",
+            "127.0.0.1:9302",
+            &["node-a@127.0.0.1:9301", "node-c@127.0.0.1:9303"],
+            "non-voter-leader",
+            64,
+        );
+        set_in_memory_node_status(&runtime, "node-a", ControlNodeStatus::Leaving);
+
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.control_state.leader_node_id = Some("node-a".to_string());
+        state.last_leader_contact_unix_ms = 0;
+        let voters = runtime.control_voter_node_ids_locked(&state);
+        assert_eq!(voters, vec!["node-b".to_string(), "node-c".to_string()]);
+        assert_eq!(
+            runtime.next_failover_candidate_id_locked(&state, Some("node-a")),
+            Some("node-b".to_string())
+        );
+        assert!(runtime.can_local_node_propose_locked(&state, u64::MAX));
     }
 
     #[test]
@@ -2823,6 +4973,329 @@ mod tests {
             runtime.current_state().leader_node_id.as_deref(),
             Some("node-b")
         );
+    }
+
+    #[tokio::test]
+    async fn successful_non_active_peer_does_not_count_for_quorum_or_raise_observed_term() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("joining-peer listener should bind");
+        let joining_endpoint = listener
+            .local_addr()
+            .expect("joining-peer listener should have an address")
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proposal RPC expected");
+            let mut read_buffer = Vec::new();
+            let request = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("proposal request should parse");
+            assert_eq!(request.path_without_query(), "/internal/v1/control/append");
+            let append: InternalControlAppendRequest =
+                serde_json::from_slice(&request.body).expect("proposal body should decode");
+            assert_eq!(append.entries.len(), 1);
+            let response = InternalControlAppendResponse {
+                term: append.term.checked_add(100).unwrap(),
+                success: true,
+                match_index: append.entries[0].index,
+                message: None,
+            };
+            write_http_response(
+                &mut stream,
+                &HttpResponse::new(
+                    200,
+                    serde_json::to_vec(&response).expect("response should encode"),
+                )
+                .with_header("Content-Type", "application/json"),
+            )
+            .await
+            .expect("proposal response should write");
+        });
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let joining_seed = format!("node-c@{joining_endpoint}");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:1", joining_seed.as_str()],
+            "non-active-quorum",
+            64,
+        );
+        force_local_leader(&runtime);
+        set_in_memory_node_status(&runtime, "node-c", ControlNodeStatus::Joining);
+        let before = runtime.log_recovery_snapshot();
+
+        let outcome = runtime
+            .propose_command(
+                &test_rpc_client("node-a"),
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect("proposal should remain pending without an active remote vote");
+        assert!(matches!(
+            outcome,
+            ProposeOutcome::Pending {
+                required: 2,
+                acknowledged: 1
+            }
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("joining-peer server should finish")
+            .expect("joining-peer server task should succeed");
+
+        let after = runtime.log_recovery_snapshot();
+        assert_eq!(
+            after.current_term,
+            before.current_term.checked_add(1).unwrap()
+        );
+        assert!(after.current_term < before.current_term.checked_add(100).unwrap());
+        assert_eq!(after.stepped_down_term, before.stepped_down_term);
+        assert_eq!(after.commit_index, before.commit_index);
+    }
+
+    #[tokio::test]
+    async fn higher_term_commit_notice_response_durably_revokes_local_leadership() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("active-peer listener should bind");
+        let active_endpoint = listener
+            .local_addr()
+            .expect("active-peer listener should have an address")
+            .to_string();
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("control RPC expected");
+                let mut read_buffer = Vec::new();
+                let request = read_http_request(&mut stream, &mut read_buffer)
+                    .await
+                    .expect("control request should parse");
+                assert_eq!(request.path_without_query(), "/internal/v1/control/append");
+                let append: InternalControlAppendRequest =
+                    serde_json::from_slice(&request.body).expect("control body should decode");
+                let (term, success, match_index, message) = if request_number == 0 {
+                    assert_eq!(append.entries.len(), 1);
+                    (append.term, true, append.entries[0].index, None)
+                } else {
+                    assert!(append.entries.is_empty());
+                    assert!(append.leader_commit >= 1);
+                    (
+                        append.term.checked_add(1).unwrap(),
+                        false,
+                        append.prev_log_index,
+                        Some("stale_term".to_string()),
+                    )
+                };
+                let response = InternalControlAppendResponse {
+                    term,
+                    success,
+                    match_index,
+                    message,
+                };
+                write_http_response(
+                    &mut stream,
+                    &HttpResponse::new(
+                        200,
+                        serde_json::to_vec(&response).expect("response should encode"),
+                    )
+                    .with_header("Content-Type", "application/json"),
+                )
+                .await
+                .expect("control response should write");
+            }
+        });
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let active_seed = format!("node-b@{active_endpoint}");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &[active_seed.as_str()],
+            "commit-notice-term",
+            64,
+        );
+        force_local_leader(&runtime);
+        let outcome = runtime
+            .propose_command(
+                &test_rpc_client("node-a"),
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect("quorum proposal should commit before the higher-term notice response");
+        let proposal_term = match outcome {
+            ProposeOutcome::Committed { term, .. } => term,
+            other => panic!("expected committed proposal, got {other:?}"),
+        };
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("active-peer server should receive proposal and commit notice")
+            .expect("active-peer server task should succeed");
+
+        let after = runtime.log_recovery_snapshot();
+        assert_eq!(after.current_term, proposal_term.checked_add(1).unwrap());
+        assert_eq!(after.stepped_down_term, after.current_term);
+        assert!(!runtime.is_local_control_leader());
+        let persisted = load_log_file(runtime.log_path()).expect("durable log should load");
+        assert_eq!(persisted.current_term, after.current_term);
+        assert_eq!(persisted.stepped_down_term, Some(after.stepped_down_term));
+    }
+
+    #[tokio::test]
+    async fn committed_proposal_remains_success_when_higher_term_persistence_is_pending() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let pressure_path = temp_dir.path().join("external-pressure.bin");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("active-peer listener should bind");
+        let active_endpoint = listener
+            .local_addr()
+            .expect("active-peer listener should have an address")
+            .to_string();
+        let server_budget = Arc::clone(&budget);
+        let server_pressure_path = pressure_path.clone();
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("control RPC expected");
+                let mut read_buffer = Vec::new();
+                let request = read_http_request(&mut stream, &mut read_buffer)
+                    .await
+                    .expect("control request should parse");
+                let append: InternalControlAppendRequest =
+                    serde_json::from_slice(&request.body).expect("control body should decode");
+                let response = if request_number == 0 {
+                    InternalControlAppendResponse {
+                        term: append.term,
+                        success: true,
+                        match_index: append.entries[0].index,
+                        message: None,
+                    }
+                } else {
+                    assert!(append.entries.is_empty());
+                    std::fs::write(&server_pressure_path, vec![0u8; 2 * 1024 * 1024])
+                        .expect("external pressure fixture should write");
+                    let snapshot = server_budget
+                        .reconcile()
+                        .expect("external pressure should reconcile");
+                    assert!(snapshot.over_limit);
+                    InternalControlAppendResponse {
+                        term: append.term.checked_add(1).unwrap(),
+                        success: false,
+                        match_index: append.prev_log_index,
+                        message: Some("stale_term".to_string()),
+                    }
+                };
+                write_http_response(
+                    &mut stream,
+                    &HttpResponse::new(
+                        200,
+                        serde_json::to_vec(&response).expect("response should encode"),
+                    )
+                    .with_header("Content-Type", "application/json"),
+                )
+                .await
+                .expect("control response should write");
+            }
+        });
+
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: Some("node-a".to_string()),
+            bind: Some("127.0.0.1:9301".to_string()),
+            seeds: vec![format!("node-b@{active_endpoint}")],
+            shards: 16,
+            replication_factor: 2,
+            ..ClusterConfig::default()
+        };
+        let membership = MembershipView::from_config(&config).expect("membership should build");
+        let ring = ShardRing::build(16, 2, &membership).expect("ring should build");
+        let bootstrap_state = ControlState::from_runtime(&membership, &ring);
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let state_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path, Some(Arc::clone(&budget)))
+                .expect("budgeted state store should open"),
+        );
+        state_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let runtime = ControlConsensusRuntime::open(
+            membership,
+            state_store,
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("runtime should open");
+        force_local_leader(&runtime);
+
+        let outcome = runtime
+            .propose_command(
+                &test_rpc_client("node-a"),
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect("a quorum-committed proposal must remain a success");
+        let (proposal_term, detail) = match outcome {
+            ProposeOutcome::CommittedPersistencePending { term, detail, .. } => (term, detail),
+            other => panic!("expected committed persistence debt, got {other:?}"),
+        };
+        assert!(detail.contains("higher response term"));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("active-peer server should finish")
+            .expect("active-peer server task should succeed");
+
+        assert_eq!(runtime.current_state().applied_log_index, 1);
+        assert!(runtime.persistence_status().fenced);
+        assert!(!runtime.is_local_control_leader());
+        let in_memory = runtime.log_recovery_snapshot();
+        assert_eq!(
+            in_memory.current_term,
+            proposal_term.checked_add(1).unwrap()
+        );
+        assert_eq!(in_memory.stepped_down_term, in_memory.current_term);
+        let before_repair = load_log_file(&log_path).expect("committed log should remain readable");
+        assert_eq!(before_repair.commit_index, 1);
+        assert_eq!(before_repair.current_term, proposal_term);
+
+        std::fs::remove_file(&pressure_path).expect("pressure fixture should remove");
+        budget
+            .reconcile()
+            .expect("released pressure should reconcile");
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime
+                .repair_persistence_fence_locked(&mut state)
+                .expect("pending higher term should repair after pressure clears");
+        }
+        let repaired = load_log_file(&log_path).expect("repaired log should load");
+        assert_eq!(repaired.commit_index, 1);
+        assert_eq!(repaired.current_term, in_memory.current_term);
+        assert_eq!(
+            repaired.stepped_down_term,
+            Some(in_memory.stepped_down_term)
+        );
+        assert!(!runtime.persistence_status().fenced);
+        assert!(!runtime.is_local_control_leader());
     }
 
     #[test]
@@ -3172,12 +5645,15 @@ mod tests {
                     .expect("proposal should prepare");
                 leader_state.commit_index = entry.index;
                 leader
-                    .apply_committed_entries_locked(&mut leader_state)
+                    .apply_committed_entries_in_memory_locked(&mut leader_state)
                     .expect("committed entries should apply");
             }
             leader
-                .persist_log_locked(&leader_state)
-                .expect("leader log should persist");
+                .persist_checkpoint_candidate_locked(
+                    &leader_state,
+                    ControlCheckpointWriteMode::Growth,
+                )
+                .expect("leader checkpoint should persist");
             leader_state.peer_next_index.insert("node-b".to_string(), 1);
         }
 
@@ -3383,6 +5859,1082 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_failure_after_log_publication_is_committed_and_repairs_on_reopen() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let state_store =
+            Arc::new(ControlStateStore::open(state_path.clone()).expect("state store should open"));
+        state_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let runtime = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&state_store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("runtime should open");
+
+        let append = InternalControlAppendRequest {
+            term: 2,
+            leader_node_id: "node-a".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![InternalControlLogEntry {
+                index: 1,
+                term: 2,
+                command: InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+                created_unix_ms: 1,
+            }],
+            leader_commit: 0,
+        };
+        assert!(
+            runtime
+                .handle_append_request(append)
+                .expect("uncommitted append should persist")
+                .success
+        );
+
+        let _failure_guard = fail_control_checkpoint_after_log_publish_once(log_path.clone());
+        let response = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 1,
+                prev_log_term: 2,
+                entries: Vec::new(),
+                leader_commit: 1,
+            })
+            .expect("durable log commit should still be acknowledged");
+        assert!(response.success);
+        assert_eq!(response.message.as_deref(), Some("checkpoint_pending"));
+        assert_eq!(runtime.current_state().applied_log_index, 1);
+        let persistence = runtime.persistence_status();
+        assert!(persistence.fenced);
+        assert_eq!(persistence.pending_checkpoint.unwrap().index, 1);
+        assert_eq!(
+            state_store
+                .load()
+                .expect("state mirror should load")
+                .expect("state mirror should exist")
+                .applied_log_index,
+            0,
+            "the injected failure must leave the mirror behind the authoritative log"
+        );
+        drop(runtime);
+        drop(state_store);
+
+        let reopened_store =
+            Arc::new(ControlStateStore::open(state_path).expect("state mirror should reopen"));
+        let stale_state = reopened_store
+            .load()
+            .expect("state mirror should load")
+            .expect("state mirror should exist");
+        let reopened = ControlConsensusRuntime::open(
+            membership,
+            Arc::clone(&reopened_store),
+            stale_state,
+            log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect("authoritative log should repair the stale mirror");
+        assert_eq!(reopened.current_state().applied_log_index, 1);
+        assert!(!reopened.persistence_status().fenced);
+        assert_eq!(
+            reopened_store
+                .load()
+                .expect("repaired mirror should load")
+                .expect("repaired mirror should exist")
+                .applied_log_index,
+            1
+        );
+    }
+
+    #[test]
+    fn durable_pair_finalization_failure_records_cleanup_debt_and_repairs_owned_temps() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        let state_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path.clone(), Some(Arc::clone(&budget)))
+                .expect("state store should open"),
+        );
+        state_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let runtime = ControlConsensusRuntime::open(
+            membership,
+            Arc::clone(&state_store),
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("runtime should open");
+
+        let append = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![InternalControlLogEntry {
+                    index: 1,
+                    term: 2,
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                    created_unix_ms: 1,
+                }],
+                leader_commit: 0,
+            })
+            .expect("uncommitted append should persist");
+        assert!(append.success);
+
+        let _failure_guard = fail_control_pair_finalization_once(log_path.clone());
+        let commit = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 1,
+                prev_log_term: 2,
+                entries: Vec::new(),
+                leader_commit: 1,
+            })
+            .expect("both durable files should allow a successful commit response");
+        assert!(commit.success);
+        assert_eq!(commit.message.as_deref(), Some("cleanup_pending"));
+
+        let persistence = runtime.persistence_status();
+        assert!(!persistence.fenced);
+        assert!(persistence.pending_checkpoint.is_none());
+        assert!(persistence.cleanup_debt);
+        assert!(runtime.exportable_recovery_snapshot_bundle().is_ok());
+
+        let authoritative_state = runtime.current_state();
+        assert_eq!(authoritative_state.applied_log_index, 1);
+        assert_eq!(
+            state_store
+                .load()
+                .expect("state mirror should load")
+                .expect("state mirror should exist"),
+            authoritative_state
+        );
+        let authoritative_log = load_log_file(&log_path).expect("control log should load");
+        assert_eq!(authoritative_log.commit_index, 1);
+        assert_eq!(
+            authoritative_log.checkpoint_state.as_ref(),
+            Some(&authoritative_state)
+        );
+
+        let owned_orphan = temp_dir
+            .path()
+            .join(".control-log.json.tmp-123-0000000000000001");
+        std::fs::write(&owned_orphan, b"owned orphan")
+            .expect("owned temporary fixture should write");
+        assert!(owned_orphan.is_file());
+
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime
+                .repair_persistence_fence_locked(&mut state)
+                .expect("cleanup-only repair should succeed");
+            assert!(state.cleanup_debt.is_none());
+            assert!(state.persistence_fence.is_none());
+            assert!(state.checkpoint_pending.is_none());
+        }
+        assert!(!owned_orphan.exists());
+        let repaired = runtime.persistence_status();
+        assert!(!repaired.fenced);
+        assert!(!repaired.cleanup_debt);
+    }
+
+    #[test]
+    fn exportable_recovery_snapshot_blocks_authority_fences_but_allows_cleanup_debt() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "exportability",
+            64,
+        );
+
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cleanup_debt = Some("post-durable cleanup remains".to_string());
+        }
+        runtime
+            .exportable_recovery_snapshot_bundle()
+            .expect("cleanup debt must not hide an authoritative durable pair");
+
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cleanup_debt = None;
+            state.persistence_fence = Some("publication authority is ambiguous".to_string());
+        }
+        let fenced = runtime
+            .exportable_recovery_snapshot_bundle()
+            .expect_err("a persistence fence must block recovery export");
+        assert!(fenced.contains("publication authority is ambiguous"));
+
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.persistence_fence = None;
+            state.checkpoint_pending = Some(ControlCheckpointPending {
+                position: ControlCommitPosition { index: 1, term: 1 },
+                detail: "checkpoint mirror is behind".to_string(),
+            });
+        }
+        let checkpoint_pending = runtime
+            .exportable_recovery_snapshot_bundle()
+            .expect_err("checkpoint-pending authority must block recovery export");
+        assert!(checkpoint_pending.contains("checkpoint mirror is behind"));
+    }
+
+    #[test]
+    fn consensus_required_pair_quota_fences_without_definitive_rejection() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let initial_budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("initial budget should open");
+        let initial_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(
+                state_path.clone(),
+                Some(Arc::clone(&initial_budget)),
+            )
+            .expect("budgeted state store should open"),
+        );
+        initial_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let initial_runtime = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&initial_store),
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("initial runtime should open");
+        initial_runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![InternalControlLogEntry {
+                    index: 1,
+                    term: 2,
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                    created_unix_ms: 1,
+                }],
+                leader_commit: 0,
+            })
+            .expect("uncommitted entry should persist before quota restart");
+        drop(initial_runtime);
+        drop(initial_store);
+        drop(initial_budget);
+
+        let exact_bytes = std::fs::metadata(&state_path)
+            .expect("state metadata should load")
+            .len()
+            .checked_add(
+                std::fs::metadata(&log_path)
+                    .expect("log metadata should load")
+                    .len(),
+            )
+            .expect("fixture size should fit");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(exact_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("exact budget should open");
+        let state_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path, Some(Arc::clone(&budget)))
+                .expect("state store should reopen"),
+        );
+        let recovered = state_store
+            .load()
+            .expect("state should load")
+            .expect("state should exist");
+        let runtime = ControlConsensusRuntime::open(
+            membership,
+            state_store,
+            recovered,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("runtime should reopen without rewriting a coherent pair");
+        let before_state = runtime.current_state();
+        let before_log = std::fs::read(&log_path).expect("log should read");
+
+        let err = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 1,
+                prev_log_term: 2,
+                entries: Vec::new(),
+                leader_commit: 1,
+            })
+            .expect_err("the exact logical quota should reject paired checkpoint staging");
+        assert!(err.resource_limit().is_none());
+        assert!(err.is_indeterminate());
+        assert_eq!(before_state.applied_log_index, 0);
+        assert_eq!(runtime.current_state().applied_log_index, 1);
+        let persistence = runtime.persistence_status();
+        assert!(persistence.fenced);
+        assert_eq!(persistence.pending_checkpoint, None);
+        assert_eq!(
+            std::fs::read(&log_path).expect("log should remain readable"),
+            before_log
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, exact_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reservation_overruns_total, 0);
+    }
+
+    #[test]
+    fn authoritative_checkpoint_repairs_stale_mirror_at_logical_quota() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let initial_budget = LocalDiskBudget::open(temp_dir.path(), LocalDiskLimits::default())
+            .expect("initial budget should open");
+        let initial_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(
+                state_path.clone(),
+                Some(Arc::clone(&initial_budget)),
+            )
+            .expect("budgeted state store should open"),
+        );
+        initial_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let runtime = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&initial_store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("initial runtime should open");
+        runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 2,
+                leader_node_id: "node-a".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![InternalControlLogEntry {
+                    index: 1,
+                    term: 2,
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                    created_unix_ms: 1,
+                }],
+                leader_commit: 1,
+            })
+            .expect("committed append should persist");
+        assert_eq!(runtime.current_state().applied_log_index, 1);
+        drop(runtime);
+        drop(initial_store);
+        drop(initial_budget);
+
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent(
+            &state_path,
+            &encode_control_state_file(&bootstrap_state).expect("stale state should encode"),
+        )
+        .expect("stale mirror should replace the checkpoint");
+        let stale_pair_bytes = std::fs::metadata(&state_path)
+            .expect("state metadata should load")
+            .len()
+            .checked_add(
+                std::fs::metadata(&log_path)
+                    .expect("log metadata should load")
+                    .len(),
+            )
+            .expect("fixture size should fit");
+        let exact_budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(stale_pair_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("exact budget should open");
+        let reopened_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path, Some(Arc::clone(&exact_budget)))
+                .expect("stale state store should reopen"),
+        );
+        let stale_state = reopened_store
+            .load()
+            .expect("stale mirror should load")
+            .expect("stale mirror should exist");
+        assert_eq!(stale_state.applied_log_index, 0);
+
+        let reopened = ControlConsensusRuntime::open(
+            membership,
+            Arc::clone(&reopened_store),
+            stale_state,
+            log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect("authoritative recovery admission should repair at the logical quota");
+        assert_eq!(reopened.current_state().applied_log_index, 1);
+        assert_eq!(
+            reopened_store
+                .load()
+                .expect("repaired mirror should load")
+                .expect("repaired mirror should exist")
+                .applied_log_index,
+            1
+        );
+        let snapshot = exact_budget.snapshot();
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reservation_overruns_total, 0);
+    }
+
+    #[test]
+    fn higher_term_is_durable_even_when_append_is_rejected() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "higher-term-reject",
+            64,
+        );
+        let response = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: 9,
+                leader_node_id: "node-b".to_string(),
+                prev_log_index: 99,
+                prev_log_term: 9,
+                entries: Vec::new(),
+                leader_commit: 0,
+            })
+            .expect("rejection should persist the observed term");
+        assert!(!response.success);
+        assert_eq!(response.message.as_deref(), Some("missing_prev_log_index"));
+        let persisted = load_log_file(runtime.log_path()).expect("log should load");
+        assert_eq!(persisted.current_term, 9);
+        assert!(persisted.entries.is_empty());
+    }
+
+    #[test]
+    fn proposal_term_exhaustion_does_not_mutate_candidate() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "term-exhaustion",
+            64,
+        );
+        let mut candidate = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        candidate.current_term = u64::MAX;
+        let entries_before = candidate.entries.clone();
+        let err = runtime
+            .prepare_proposal_locked(
+                &mut candidate,
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .expect_err("term exhaustion must reject the proposal");
+        assert!(err.contains("term exhausted"));
+        assert_eq!(candidate.current_term, u64::MAX);
+        assert_eq!(candidate.entries, entries_before);
+
+        candidate.current_term = 7;
+        candidate.commit_index = u64::MAX;
+        candidate.snapshot_last_index = u64::MAX;
+        candidate.snapshot_last_term = 7;
+        candidate.control_state.applied_log_index = u64::MAX;
+        candidate.control_state.applied_log_term = 7;
+        let err = runtime
+            .prepare_proposal_locked(
+                &mut candidate,
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .expect_err("index exhaustion must reject the proposal");
+        assert!(err.contains("index exhausted"));
+        assert_eq!(candidate.current_term, 7);
+        assert_eq!(candidate.entries, entries_before);
+    }
+
+    #[test]
+    fn schema_v2_log_repairs_missing_and_invalid_state_mirrors() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let store =
+            Arc::new(ControlStateStore::open(state_path.clone()).expect("state store should open"));
+        let runtime = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("fresh paired runtime should open");
+        force_local_leader(&runtime);
+        let authoritative = runtime.current_state();
+        drop(runtime);
+        drop(store);
+
+        std::fs::remove_file(&state_path).expect("state mirror should be removable");
+        let missing_store = Arc::new(
+            ControlStateStore::open(state_path.clone()).expect("missing mirror store should open"),
+        );
+        let reopened = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&missing_store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("authoritative log should repair a missing mirror");
+        assert_eq!(reopened.current_state(), authoritative);
+        assert_eq!(missing_store.load().unwrap(), Some(authoritative.clone()));
+        drop(reopened);
+        drop(missing_store);
+
+        std::fs::write(&state_path, b"{invalid-json").expect("invalid mirror fixture should write");
+        let invalid_store = Arc::new(
+            ControlStateStore::open(state_path.clone()).expect("invalid mirror store should open"),
+        );
+        let reopened = ControlConsensusRuntime::open(
+            membership,
+            Arc::clone(&invalid_store),
+            bootstrap_state,
+            log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect("authoritative log should repair an invalid mirror");
+        assert_eq!(reopened.current_state(), authoritative);
+        assert_eq!(invalid_store.load().unwrap(), Some(authoritative));
+    }
+
+    #[test]
+    fn legacy_log_requires_valid_mirror_and_corrupt_v2_log_never_uses_mirror_authority() {
+        let legacy_dir = TempDir::new().expect("legacy temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = legacy_dir.path().join("control-state.json");
+        let log_path = legacy_dir.path().join("control-log.json");
+        let legacy = ControlLogFileV1 {
+            magic: CONTROL_LOG_MAGIC.to_string(),
+            schema_version: CONTROL_LOG_LEGACY_SCHEMA_VERSION,
+            current_term: 1,
+            stepped_down_term: None,
+            commit_index: 0,
+            snapshot_last_index: 0,
+            snapshot_last_term: 0,
+            entries: Vec::new(),
+            checkpoint_state: None,
+        };
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent(
+            &log_path,
+            &serde_json::to_vec_pretty(&legacy).expect("legacy log should encode"),
+        )
+        .expect("legacy log should write");
+        let missing_store =
+            Arc::new(ControlStateStore::open(state_path.clone()).expect("state store should open"));
+        let err = ControlConsensusRuntime::open(
+            membership.clone(),
+            missing_store,
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect_err("legacy log without a mirror must fail closed");
+        assert!(err.contains("requires a valid control-state mirror"));
+
+        std::fs::write(&state_path, b"not-json").expect("corrupt mirror should write");
+        let corrupt_store = Arc::new(
+            ControlStateStore::open(state_path).expect("corrupt mirror store should open"),
+        );
+        let err = ControlConsensusRuntime::open(
+            membership.clone(),
+            corrupt_store,
+            bootstrap_state.clone(),
+            log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect_err("legacy log with corrupt mirror must fail closed");
+        assert!(err.contains("failed to parse control-state file"));
+
+        let v2_dir = TempDir::new().expect("v2 temp dir should create");
+        let state_path = v2_dir.path().join("control-state.json");
+        let log_path = v2_dir.path().join("control-log.json");
+        let store = Arc::new(
+            ControlStateStore::open(state_path.clone()).expect("v2 state store should open"),
+        );
+        let runtime = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("v2 runtime should open");
+        drop(runtime);
+        drop(store);
+        let mirror_before = std::fs::read(&state_path).expect("mirror should read");
+        std::fs::write(&log_path, b"not-json").expect("corrupt log should write");
+        let store = Arc::new(
+            ControlStateStore::open(state_path.clone()).expect("state store should reopen"),
+        );
+        let err = ControlConsensusRuntime::open(
+            membership,
+            store,
+            bootstrap_state,
+            log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect_err("corrupt authoritative log must fail closed");
+        assert!(err.contains("failed to parse control-log file"));
+        assert_eq!(std::fs::read(state_path).unwrap(), mirror_before);
+    }
+
+    #[test]
+    fn missing_log_refuses_non_bootstrap_index_zero_mirror_without_mutation() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_path = temp_dir.path().join("control-state.json");
+        let log_path = temp_dir.path().join("control-log.json");
+        let store =
+            Arc::new(ControlStateStore::open(state_path.clone()).expect("state store should open"));
+        let mut mutated = bootstrap_state.clone();
+        mutated.leader_node_id = Some("node-a".to_string());
+        mutated.updated_unix_ms = mutated.updated_unix_ms.saturating_add(1);
+        store
+            .persist(&mutated)
+            .expect("mutated mirror should persist");
+        let mirror_before = std::fs::read(&state_path).expect("mirror should read");
+
+        let err = ControlConsensusRuntime::open(
+            membership,
+            store,
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect_err("non-bootstrap mirror must not become authority");
+        assert!(err.contains("not equivalent to the configured runtime bootstrap"));
+        assert!(!log_path.exists());
+        assert_eq!(std::fs::read(state_path).unwrap(), mirror_before);
+    }
+
+    #[test]
+    fn log_validation_rejects_invalid_term_relationships() {
+        let path = Path::new("<term-validation>");
+        let baseline = ControlLogFileV1 {
+            magic: CONTROL_LOG_MAGIC.to_string(),
+            schema_version: CONTROL_LOG_LEGACY_SCHEMA_VERSION,
+            current_term: 3,
+            stepped_down_term: None,
+            commit_index: 3,
+            snapshot_last_index: 1,
+            snapshot_last_term: 1,
+            entries: vec![
+                InternalControlLogEntry {
+                    index: 2,
+                    term: 2,
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                    created_unix_ms: 1,
+                },
+                InternalControlLogEntry {
+                    index: 3,
+                    term: 3,
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                    created_unix_ms: 2,
+                },
+            ],
+            checkpoint_state: None,
+        };
+        validate_log_file(&baseline, path).expect("baseline log should validate");
+
+        let mut zero_snapshot_term = baseline.clone();
+        zero_snapshot_term.snapshot_last_term = 0;
+        assert!(validate_log_file(&zero_snapshot_term, path)
+            .unwrap_err()
+            .contains("term 0 at nonzero snapshot index"));
+
+        let mut future_snapshot_term = baseline.clone();
+        future_snapshot_term.snapshot_last_term = 4;
+        assert!(validate_log_file(&future_snapshot_term, path)
+            .unwrap_err()
+            .contains("greater than current term"));
+
+        let mut decreasing_terms = baseline;
+        decreasing_terms.entries[0].term = 3;
+        decreasing_terms.entries[1].term = 2;
+        assert!(validate_log_file(&decreasing_terms, path)
+            .unwrap_err()
+            .contains("decreasing term"));
+    }
+
+    #[test]
+    fn malformed_follower_entries_step_down_term_without_installing_invalid_candidate() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "malformed-entry",
+            64,
+        );
+        force_local_leader(&runtime);
+        let before = runtime.log_recovery_snapshot();
+        let response = runtime
+            .handle_append_request(InternalControlAppendRequest {
+                term: before.current_term.saturating_add(1),
+                leader_node_id: "node-b".to_string(),
+                prev_log_index: before.commit_index,
+                prev_log_term: runtime.current_state().applied_log_term,
+                entries: vec![InternalControlLogEntry {
+                    index: before.commit_index.saturating_add(1),
+                    term: before.current_term.saturating_add(2),
+                    command: InternalControlCommand::SetLeader {
+                        leader_node_id: "node-b".to_string(),
+                    },
+                    created_unix_ms: 1,
+                }],
+                leader_commit: before.commit_index.saturating_add(1),
+            })
+            .expect("malformed append should return a protocol rejection");
+        assert!(!response.success);
+        assert_eq!(
+            response.message.as_deref(),
+            Some("entry_term_exceeds_request_term")
+        );
+        let after = runtime.log_recovery_snapshot();
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.commit_index, before.commit_index);
+        assert!(after.current_term > before.current_term);
+        assert_eq!(after.stepped_down_term, after.current_term);
+        assert!(!runtime.persistence_status().fenced);
+        assert!(!runtime.is_local_control_leader());
+    }
+
+    #[test]
+    fn higher_term_heartbeat_revokes_local_leadership_across_restart_and_restore() {
+        let source_dir = TempDir::new().expect("source temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let source_state_path = source_dir.path().join("control-state.json");
+        let source_log_path = source_dir.path().join("control-log.json");
+        let source_store = Arc::new(
+            ControlStateStore::open(source_state_path.clone()).expect("state store should open"),
+        );
+        let source = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&source_store),
+            bootstrap_state.clone(),
+            source_log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("source runtime should open");
+        force_local_leader(&source);
+        let before = source.log_recovery_snapshot();
+        let response = source
+            .handle_append_request(InternalControlAppendRequest {
+                term: before.current_term.checked_add(1).unwrap(),
+                leader_node_id: "node-b".to_string(),
+                prev_log_index: before.snapshot_last_index,
+                prev_log_term: before.snapshot_last_term,
+                entries: Vec::new(),
+                leader_commit: before.commit_index,
+            })
+            .expect("higher-term heartbeat should persist");
+        assert!(response.success);
+        assert!(!source.is_local_control_leader());
+        let (saved_state, saved_log) = source.recovery_snapshot_bundle();
+        assert_eq!(saved_log.stepped_down_term, saved_log.current_term);
+        drop(source);
+        drop(source_store);
+
+        let reopened_store = Arc::new(
+            ControlStateStore::open(source_state_path).expect("state store should reopen"),
+        );
+        let reopened = ControlConsensusRuntime::open(
+            membership.clone(),
+            reopened_store,
+            bootstrap_state.clone(),
+            source_log_path,
+            ControlConsensusConfig::default(),
+        )
+        .expect("runtime should reopen");
+        assert!(!reopened.is_local_control_leader());
+
+        let target_dir = TempDir::new().expect("target temp dir should create");
+        let target_store = Arc::new(
+            ControlStateStore::open(target_dir.path().join("control-state.json"))
+                .expect("target store should open"),
+        );
+        let target = ControlConsensusRuntime::open(
+            membership,
+            target_store,
+            bootstrap_state,
+            target_dir.path().join("control-log.json"),
+            ControlConsensusConfig::default(),
+        )
+        .expect("target runtime should open");
+        target
+            .restore_recovery_snapshot(saved_state.clone(), saved_log.clone(), false)
+            .expect("ordinary restore should preserve stepdown");
+        assert!(!target.is_local_control_leader());
+        target
+            .restore_recovery_snapshot(saved_state, saved_log, true)
+            .expect("forced restore should establish a fresh local term");
+        assert!(target.is_local_control_leader());
+    }
+
+    #[tokio::test]
+    async fn pre_quorum_quota_is_typed_but_post_quorum_quota_is_indeterminate() {
+        let pre_dir = TempDir::new().expect("pre-quorum temp dir should create");
+        let (membership, bootstrap_state) = single_node_membership_and_state();
+        let state_path = pre_dir.path().join("control-state.json");
+        let log_path = pre_dir.path().join("control-log.json");
+        let initial_budget = LocalDiskBudget::open(pre_dir.path(), LocalDiskLimits::default())
+            .expect("initial budget should open");
+        let initial_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(
+                state_path.clone(),
+                Some(Arc::clone(&initial_budget)),
+            )
+            .expect("initial store should open"),
+        );
+        let initial = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&initial_store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("initial runtime should open");
+        force_local_leader(&initial);
+        drop(initial);
+        drop(initial_store);
+        drop(initial_budget);
+        let exact_bytes = std::fs::metadata(&state_path).unwrap().len()
+            + std::fs::metadata(&log_path).unwrap().len();
+        let exact_budget = LocalDiskBudget::open(
+            pre_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(exact_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("exact budget should open");
+        let exact_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path, Some(Arc::clone(&exact_budget)))
+                .expect("exact store should open"),
+        );
+        let runtime = ControlConsensusRuntime::open(
+            membership,
+            exact_store,
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("exact runtime should open");
+        let before_state = runtime.current_state();
+        let before_log = std::fs::read(&log_path).unwrap();
+        let err = runtime
+            .propose_command(
+                &test_rpc_client("node-a"),
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect_err("uncommitted log admission should fail before quorum");
+        assert!(matches!(
+            err.resource_limit(),
+            Some(ControlDiskResourceLimit::DiskQuotaExceeded { .. })
+        ));
+        assert!(!err.is_indeterminate());
+        assert!(!runtime.persistence_status().fenced);
+        assert_eq!(runtime.current_state(), before_state);
+        assert_eq!(std::fs::read(log_path).unwrap(), before_log);
+
+        let post_dir = TempDir::new().expect("post-quorum temp dir should create");
+        let (membership, bootstrap_state) = single_node_membership_and_state();
+        let state_path = post_dir.path().join("control-state.json");
+        let log_path = post_dir.path().join("control-log.json");
+        let initial_budget = LocalDiskBudget::open(post_dir.path(), LocalDiskLimits::default())
+            .expect("initial budget should open");
+        let initial_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(
+                state_path.clone(),
+                Some(Arc::clone(&initial_budget)),
+            )
+            .expect("initial store should open"),
+        );
+        let initial = ControlConsensusRuntime::open(
+            membership.clone(),
+            Arc::clone(&initial_store),
+            bootstrap_state.clone(),
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("initial runtime should open");
+        force_local_leader(&initial);
+        {
+            let mut live = initial
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut candidate = live.clone();
+            initial
+                .prepare_proposal_locked(
+                    &mut candidate,
+                    InternalControlCommand::SetLeader {
+                        leader_node_id: "node-a".to_string(),
+                    },
+                )
+                .expect("uncommitted fixture should prepare");
+            initial
+                .publish_log_and_install_locked(&mut live, candidate)
+                .expect("uncommitted fixture should persist");
+        }
+        drop(initial);
+        drop(initial_store);
+        drop(initial_budget);
+        let exact_bytes = std::fs::metadata(&state_path).unwrap().len()
+            + std::fs::metadata(&log_path).unwrap().len();
+        let exact_budget = LocalDiskBudget::open(
+            post_dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(exact_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("exact budget should open");
+        let exact_store = Arc::new(
+            ControlStateStore::open_with_disk_budget(state_path, Some(Arc::clone(&exact_budget)))
+                .expect("exact store should open"),
+        );
+        let runtime = ControlConsensusRuntime::open(
+            membership,
+            exact_store,
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("exact runtime should open");
+        let before_log = std::fs::read(&log_path).unwrap();
+        let err = runtime
+            .propose_command(
+                &test_rpc_client("node-a"),
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect_err("paired publication after quorum should be indeterminate");
+        assert!(err.resource_limit().is_none());
+        assert!(err.is_indeterminate());
+        assert_eq!(runtime.current_state().applied_log_index, 1);
+        assert!(runtime.persistence_status().fenced);
+        assert_eq!(std::fs::read(log_path).unwrap(), before_log);
+    }
+
+    #[test]
+    fn legacy_v1_log_is_upgraded_to_required_v2_checkpoint() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let (membership, bootstrap_state) = sample_membership_and_state();
+        let state_store = Arc::new(
+            ControlStateStore::open(temp_dir.path().join("control-state.json"))
+                .expect("state store should open"),
+        );
+        state_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap state should persist");
+        let log_path = temp_dir.path().join("control-log.json");
+        let legacy = ControlLogFileV1 {
+            magic: CONTROL_LOG_MAGIC.to_string(),
+            schema_version: CONTROL_LOG_LEGACY_SCHEMA_VERSION,
+            current_term: 1,
+            stepped_down_term: None,
+            commit_index: 0,
+            snapshot_last_index: 0,
+            snapshot_last_term: 0,
+            entries: Vec::new(),
+            checkpoint_state: None,
+        };
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent(
+            &log_path,
+            &serde_json::to_vec_pretty(&legacy).expect("legacy log should encode"),
+        )
+        .expect("legacy log should persist");
+
+        ControlConsensusRuntime::open(
+            membership,
+            state_store,
+            bootstrap_state,
+            log_path.clone(),
+            ControlConsensusConfig::default(),
+        )
+        .expect("legacy pair should migrate");
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(log_path).expect("upgraded log should read"))
+                .expect("upgraded log should parse");
+        assert_eq!(
+            upgraded["schemaVersion"],
+            serde_json::json!(CONTROL_LOG_SCHEMA_VERSION)
+        );
+        assert_eq!(upgraded["checkpointState"]["appliedLogIndex"], 0);
+    }
+
     #[tokio::test]
     async fn replicate_to_all_followers_collects_all_peer_failures() {
         let temp_dir = TempDir::new().expect("temp dir should create");
@@ -3394,6 +6946,16 @@ mod tests {
             "node-a",
             64,
         );
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.control_state.leader_node_id = Some("node-a".to_string());
+            state.current_term = 2;
+            state.stepped_down_term = 1;
+        }
+        assert!(runtime.is_local_control_leader());
         let rpc_client = RpcClient::new(crate::cluster::rpc::RpcClientConfig {
             timeout: Duration::from_millis(20),
             max_retries: 0,

@@ -1232,6 +1232,296 @@ fn flush_pipeline_post_publish_load_failure_replays_wal_after_reopen() {
 }
 
 #[test]
+fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("hot");
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let wal_path = data_path.join(WAL_DIR_NAME);
+    let local_catalog_path = data_path.join("local_segment_catalog.json");
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: temp_dir.path().to_path_buf(),
+        segment_catalog_path: Some(local_catalog_path.clone()),
+        mirror_hot_segments: false,
+        hot_retention_window: i64::MAX,
+        warm_retention_window: i64::MAX,
+    };
+    let labels = vec![Label::new("host", "publication-fault")];
+    let metric = "flush_visibility_publication_fault";
+    let now = 100i64;
+
+    let wal =
+        FramedWal::open(&wal_path, WalSyncMode::Periodic(Duration::from_secs(3_600))).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, Some(now));
+    options.retention_enforced = false;
+    options.tiered_storage = Some(tiered_storage.clone());
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(lane_path.clone()),
+            None,
+            1,
+            options,
+        )
+        .unwrap(),
+    );
+    install_shared_object_store_writer_lock_for_test(&storage, temp_dir.path());
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(metric, labels.clone(), DataPoint::new(1, 1.0)),
+            Row::with_labels(metric, labels.clone(), DataPoint::new(2, 2.0)),
+        ])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+
+    let wal = storage.persisted.wal.as_ref().unwrap();
+    let first_write_highwater = wal.current_appended_highwater();
+    let durable_before = wal.current_durable_highwater();
+    assert!(first_write_highwater > durable_before);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_flush_pre_visibility_publish_hook({
+        let hook_calls = Arc::clone(&hook_calls);
+        let lane_path = lane_path.clone();
+        move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            let staged = load_segments_for_level(&lane_path, 0)?;
+            if staged.len() != 1 {
+                return Err(TsinkError::Other(format!(
+                    "expected one verified staged segment, found {}",
+                    staged.len()
+                )));
+            }
+            Err(TsinkError::Other(
+                "injected flush visibility publication failure".to_string(),
+            ))
+        }
+    });
+
+    let error = storage.persist_segment_with_outcome().unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::Other(message)
+            if message == "injected flush visibility publication failure"
+    ));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert_eq!(
+        wal.current_durable_highwater(),
+        durable_before,
+        "failed visibility publication must not make periodic WAL writes durable",
+    );
+    assert_eq!(
+        storage.chunks.pending_sealed_chunks.read().len(),
+        1,
+        "rollback must retain the pending sealed locator for retry",
+    );
+    assert_eq!(
+        storage.select(metric, &labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)],
+        "rollback must keep the sealed source visible",
+    );
+
+    storage.clear_flush_pre_visibility_publish_hook();
+
+    let post_index_hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_catalog_transition_post_index_mutation_hook({
+        let post_index_hook_calls = Arc::clone(&post_index_hook_calls);
+        let storage = Arc::downgrade(&storage);
+        move || {
+            post_index_hook_calls.fetch_add(1, Ordering::SeqCst);
+            let storage = storage.upgrade().ok_or_else(|| {
+                TsinkError::Other("storage dropped before catalog transition hook".to_string())
+            })?;
+            let persisted_index = storage.persisted.persisted_index.read();
+            if persisted_index.segments_by_root.len() != 1
+                || persisted_index
+                    .chunk_refs
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    != 1
+            {
+                return Err(TsinkError::Other(
+                    "catalog transition hook did not observe the installed flush segment"
+                        .to_string(),
+                ));
+            }
+            drop(persisted_index);
+            Err(TsinkError::Other(
+                "injected post-index catalog publication failure".to_string(),
+            ))
+        }
+    });
+
+    let error = storage.persist_segment_with_outcome().unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::Other(message)
+            if message == "injected post-index catalog publication failure"
+    ));
+    assert_eq!(post_index_hook_calls.load(Ordering::SeqCst), 1);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    {
+        let persisted_index = storage.persisted.persisted_index.read();
+        assert!(persisted_index.segments_by_root.is_empty());
+        assert!(persisted_index.chunk_refs.is_empty());
+    }
+    assert!(storage.chunks.persisted_chunk_watermarks.read().is_empty());
+    assert_eq!(wal.current_durable_highwater(), durable_before);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert_eq!(
+        storage.select(metric, &labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)],
+        "post-index rollback must restore sealed-only visibility",
+    );
+
+    storage.clear_catalog_transition_post_index_mutation_hook();
+
+    let post_catalog_hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_catalog_transition_post_catalog_publication_hook({
+        let post_catalog_hook_calls = Arc::clone(&post_catalog_hook_calls);
+        let storage = Arc::downgrade(&storage);
+        let lane_path = lane_path.clone();
+        let local_catalog_path = local_catalog_path.clone();
+        let shared_catalog_path =
+            super::super::tiering::shared_segment_catalog_path(&tiered_storage);
+        let tiered_storage = tiered_storage.clone();
+        move || {
+            let call = post_catalog_hook_calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 {
+                return Ok(());
+            }
+            let storage = storage.upgrade().ok_or_else(|| {
+                TsinkError::Other("storage dropped before post-catalog hook".to_string())
+            })?;
+            let local_inventory = super::super::tiering::load_segment_catalog(
+                &local_catalog_path,
+                Some(&lane_path),
+                None,
+                Some(&tiered_storage),
+            )?;
+            let shared_inventory = super::super::tiering::load_segment_catalog(
+                &shared_catalog_path,
+                None,
+                None,
+                Some(&tiered_storage),
+            )?;
+            let visible_hot_segments = storage
+                .observability
+                .flush
+                .hot_segments_visible
+                .load(Ordering::Relaxed);
+            if local_inventory.entries().len() != 1
+                || shared_inventory.entries().len() != 1
+                || visible_hot_segments != 1
+            {
+                return Err(TsinkError::Other(
+                    "post-catalog hook did not observe the published flush inventory".to_string(),
+                ));
+            }
+            Err(TsinkError::Other(
+                "injected post-catalog flush publication failure".to_string(),
+            ))
+        }
+    });
+
+    let error = storage.persist_segment_with_outcome().unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::Other(message)
+            if message == "injected post-catalog flush publication failure"
+    ));
+    assert_eq!(
+        post_catalog_hook_calls.load(Ordering::SeqCst),
+        1,
+        "the injected failure should run after the original catalog publication",
+    );
+    let rolled_back_local_inventory = super::super::tiering::load_segment_catalog(
+        &local_catalog_path,
+        Some(&lane_path),
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let shared_catalog_path = super::super::tiering::shared_segment_catalog_path(&tiered_storage);
+    let rolled_back_shared_inventory = super::super::tiering::load_segment_catalog(
+        &shared_catalog_path,
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    assert!(rolled_back_local_inventory.entries().is_empty());
+    assert!(rolled_back_shared_inventory.entries().is_empty());
+    assert_eq!(
+        storage
+            .observability
+            .flush
+            .hot_segments_visible
+            .load(Ordering::Relaxed),
+        0,
+    );
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    assert_eq!(wal.current_durable_highwater(), durable_before);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+
+    storage.clear_catalog_transition_post_catalog_publication_hook();
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(3, 3.0),
+        )])
+        .unwrap();
+    let suffix_highwater = wal.current_appended_highwater();
+    assert!(suffix_highwater > first_write_highwater);
+
+    let retry = storage.persist_segment_with_outcome().unwrap();
+    assert!(retry.persisted);
+    assert_eq!(retry.chunks, 1);
+    assert_eq!(retry.points, 2);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 0);
+    assert_eq!(
+        wal.current_durable_highwater(),
+        first_write_highwater,
+        "successful retry may advance only through the published segment prefix",
+    );
+    assert!(wal.current_durable_highwater() < suffix_highwater);
+
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = builder_at_time(now)
+        .with_data_path(&data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &labels, 0, 10).unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0),
+        ],
+        "restart must neither replay the persisted prefix nor skip or duplicate the WAL suffix",
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn close_post_publish_load_failure_replays_wal_after_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
@@ -1644,6 +1934,42 @@ fn assert_registry_catalog_restart_fixture_is_healthy(
 }
 
 #[test]
+fn startup_migrates_legacy_registry_catalog_to_incremental_store() {
+    let temp_dir = TempDir::new().unwrap();
+    let metric = "startup_legacy_registry_catalog_migration";
+    let (checkpoint_path, _catalog_path, labels, expected_points) =
+        seed_registry_catalog_restart_fixture(temp_dir.path(), metric);
+    let catalog_store = super::super::registry_catalog::catalog_store_path(&checkpoint_path);
+    std::fs::remove_dir_all(&catalog_store).unwrap();
+
+    let reopened = open_registry_catalog_restart_fixture(temp_dir.path());
+
+    assert_registry_catalog_restart_fixture_is_healthy(
+        &reopened,
+        temp_dir.path(),
+        &checkpoint_path,
+        metric,
+        &labels,
+        &expected_points,
+    );
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        Some(&temp_dir.path().join(NUMERIC_LANE_ROOT)),
+        None,
+        None,
+    )
+    .unwrap();
+    let validated = super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .expect("startup should rebuild the native catalog store");
+    assert!(validated.incremental_store);
+    assert!(catalog_store.is_dir());
+    reopened.close().unwrap();
+}
+
+#[test]
 fn startup_self_heals_malformed_registry_catalog_sidecar() {
     let temp_dir = TempDir::new().unwrap();
     let metric = "startup_malformed_registry_catalog";
@@ -1742,6 +2068,7 @@ fn over_limit_startup_repairs_missing_registry_catalog_sidecar() {
     std::fs::remove_file(&catalog_path).unwrap();
 
     let reopened = StorageBuilder::new()
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_data_path(temp_dir.path())
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(2)
@@ -1757,6 +2084,10 @@ fn over_limit_startup_repairs_missing_registry_catalog_sidecar() {
         metric,
         &labels,
         &expected_points,
+    );
+    assert!(
+        catalog_path.is_file(),
+        "startup should restore the legacy compatibility snapshot from the native catalog"
     );
     let disk = reopened
         .observability_snapshot()

@@ -3,7 +3,7 @@ use super::*;
 impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn build_visibility_state() -> VisibilityState {
         VisibilityState {
-            tombstones: RwLock::new(HashMap::new()),
+            tombstones: Arc::new(RwLock::new(HashMap::new())),
             materialized_series: RwLock::new(BTreeSet::new()),
             series_visibility_summaries: RwLock::new(HashMap::new()),
             series_visible_max_timestamps: RwLock::new(HashMap::new()),

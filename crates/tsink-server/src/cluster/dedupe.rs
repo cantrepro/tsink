@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tsink::{DiskCategory, LocalDiskBudget, TsinkError};
 
 pub const CLUSTER_DEDUPE_WINDOW_SECS_ENV: &str = "TSINK_CLUSTER_DEDUPE_WINDOW_SECS";
 pub const CLUSTER_DEDUPE_MAX_ENTRIES_ENV: &str = "TSINK_CLUSTER_DEDUPE_MAX_ENTRIES";
@@ -137,6 +138,7 @@ impl DedupePersistenceStage {
 pub struct DedupePersistenceError {
     stage: DedupePersistenceStage,
     detail: String,
+    resource_limit: Option<DedupeDiskResourceLimit>,
 }
 
 impl DedupePersistenceError {
@@ -144,12 +146,46 @@ impl DedupePersistenceError {
         Self {
             stage,
             detail: truncate_error_detail(&detail.to_string()),
+            resource_limit: None,
+        }
+    }
+
+    fn from_tsink(stage: DedupePersistenceStage, err: TsinkError) -> Self {
+        let resource_limit = match &err {
+            TsinkError::DiskQuotaExceeded {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => Some(DedupeDiskResourceLimit::DiskQuotaExceeded {
+                limit: *limit,
+                used: *used,
+                reserved: *reserved,
+                requested: *requested,
+            }),
+            TsinkError::InsufficientDiskSpace {
+                required,
+                available,
+            } => Some(DedupeDiskResourceLimit::InsufficientDiskSpace {
+                required: *required,
+                available: *available,
+            }),
+            _ => None,
+        };
+        Self {
+            stage,
+            detail: truncate_error_detail(&err.to_string()),
+            resource_limit,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn stage(&self) -> DedupePersistenceStage {
         self.stage
+    }
+
+    pub fn resource_limit(&self) -> Option<DedupeDiskResourceLimit> {
+        self.resource_limit
     }
 }
 
@@ -164,6 +200,44 @@ impl std::fmt::Display for DedupePersistenceError {
 }
 
 impl std::error::Error for DedupePersistenceError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeDiskResourceLimit {
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    InsufficientDiskSpace {
+        required: u64,
+        available: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupeBeginError {
+    InvalidIdempotencyKey { message: String },
+    Persistence(DedupePersistenceError),
+}
+
+impl std::fmt::Display for DedupeBeginError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidIdempotencyKey { message } => formatter.write_str(message),
+            Self::Persistence(err) => err.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DedupeBeginError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidIdempotencyKey { .. } => None,
+            Self::Persistence(err) => Some(err),
+        }
+    }
+}
 
 /// An accepted dedupe reservation that is automatically aborted unless committed.
 ///
@@ -234,6 +308,8 @@ pub fn dedupe_metrics_snapshot() -> DedupeMetricsSnapshot {
 pub struct DedupeWindowStore {
     path: PathBuf,
     config: DedupeConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    disk_category: DiskCategory,
     state: Arc<Mutex<DedupeState>>,
 }
 
@@ -242,7 +318,6 @@ struct DedupeState {
     entries: HashMap<String, DedupeEntry>,
     entries_by_expiry: BTreeMap<u64, BTreeSet<String>>,
     in_flight: HashSet<String>,
-    file: File,
     log_bytes: u64,
     next_cleanup_unix_secs: u64,
     persistence_error: Option<DedupePersistenceError>,
@@ -266,6 +341,15 @@ struct DedupeRecord {
 
 impl DedupeWindowStore {
     pub fn open(path: PathBuf, config: DedupeConfig) -> Result<Self, String> {
+        Self::open_with_disk_budget(path, config, None, DiskCategory::Cluster)
+    }
+
+    pub fn open_with_disk_budget(
+        path: PathBuf,
+        config: DedupeConfig,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+        disk_category: DiskCategory,
+    ) -> Result<Self, String> {
         if config.window_secs == 0 {
             return Err("cluster dedupe window must be greater than zero seconds".to_string());
         }
@@ -277,42 +361,94 @@ impl DedupeWindowStore {
         }
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed to create cluster dedupe directory {}: {err}",
-                    parent.display()
-                )
-            })?;
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .create_dir_all_and_sync_parents(parent)
+                    .map_err(|err| {
+                        format!(
+                            "failed to create managed cluster dedupe directory {}: {err}",
+                            parent.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .cleanup_atomic_write_temps(&path)
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean managed cluster dedupe temporaries for {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                let legacy_compaction_temp = path.with_extension("tmp");
+                if legacy_compaction_temp != path {
+                    local_disk_budget
+                        .remove_managed_file_if_exists_and_sync_parent(
+                            &legacy_compaction_temp,
+                            DiskCategory::Temporary,
+                        )
+                        .map_err(|err| {
+                            format!(
+                                "failed to clean legacy cluster dedupe compaction file {}: {err}",
+                                legacy_compaction_temp.display()
+                            )
+                        })?;
+                }
+                local_disk_budget
+                    .validate_managed_file_path(&path)
+                    .map_err(|err| {
+                        format!(
+                            "invalid managed cluster dedupe path {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create cluster dedupe directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+
+        if !path.exists() {
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .append_file_and_sync_parent(&path, &[], disk_category)
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize managed cluster dedupe marker log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                tsink::engine::fs_utils::write_file_atomically_and_sync_parent(&path, &[])
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize cluster dedupe marker log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            }
         }
 
         let now = unix_timestamp_secs();
         let mut entries = HashMap::new();
         let mut entries_by_expiry = BTreeMap::new();
-        if path.exists() {
-            load_existing_records(&path, now, &mut entries, &mut entries_by_expiry)?;
-        }
+        load_existing_records(&path, now, &mut entries, &mut entries_by_expiry)?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
+        let log_bytes = std::fs::metadata(&path)
             .map_err(|err| {
                 format!(
-                    "failed to open cluster dedupe marker log {}: {err}",
+                    "failed to inspect cluster dedupe marker log {}: {err}",
                     path.display()
                 )
-            })?;
-        let log_bytes = file
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or_default();
+            })?
+            .len();
 
         let state = DedupeState {
             entries,
             entries_by_expiry,
             in_flight: HashSet::new(),
-            file,
             log_bytes,
             next_cleanup_unix_secs: now.saturating_add(config.cleanup_interval_secs),
             persistence_error: None,
@@ -323,6 +459,8 @@ impl DedupeWindowStore {
         let store = Self {
             path,
             config,
+            local_disk_budget,
+            disk_category,
             state: Arc::new(Mutex::new(state)),
         };
         store.run_cleanup_cycle(now, true);
@@ -340,8 +478,9 @@ impl DedupeWindowStore {
         Ok(store)
     }
 
-    pub fn begin(&self, key: &str) -> Result<DedupeBeginOutcome<'_>, String> {
-        validate_idempotency_key(key)?;
+    pub fn begin(&self, key: &str) -> Result<DedupeBeginOutcome<'_>, DedupeBeginError> {
+        validate_idempotency_key(key)
+            .map_err(|message| DedupeBeginError::InvalidIdempotencyKey { message })?;
         CLUSTER_DEDUPE_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         let now = unix_timestamp_secs();
@@ -367,7 +506,7 @@ impl DedupeWindowStore {
         // accepting a new key would create a result that cannot be made restart-safe.
         if let Some(err) = &state.persistence_error {
             update_gauges(&state);
-            return Err(err.to_string());
+            return Err(DedupeBeginError::Persistence(err.clone()));
         }
 
         if state.in_flight.contains(key) {
@@ -424,7 +563,15 @@ impl DedupeWindowStore {
             return Err(err);
         }
 
-        if let Err(err) = append_record_locked(&mut state, key, expires_at, completion) {
+        if let Err(err) = append_record_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
+            self.disk_category,
+            &mut state,
+            key,
+            expires_at,
+            completion,
+        ) {
             CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "cluster dedupe append failed: {err}; detail: {}",
@@ -500,7 +647,8 @@ impl DedupeWindowStore {
     }
 
     fn maybe_cleanup_locked(&self, state: &mut DedupeState, now: u64, force_compact: bool) {
-        if !force_compact && now < state.next_cleanup_unix_secs {
+        if !force_compact && state.persistence_error.is_none() && now < state.next_cleanup_unix_secs
+        {
             return;
         }
 
@@ -516,14 +664,25 @@ impl DedupeWindowStore {
             CLUSTER_DEDUPE_EVICTED_KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
 
-        if force_compact || state.log_bytes > self.config.max_log_bytes {
-            if let Err(err) = compact_locked(&self.path, state) {
-                CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                eprintln!("cluster dedupe compaction failed: {err}");
-                state.persistence_error = Some(DedupePersistenceError::new(
-                    DedupePersistenceStage::Compact,
-                    err,
-                ));
+        if force_compact
+            || state.persistence_error.is_some()
+            || state.log_bytes > self.config.max_log_bytes
+        {
+            match compact_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                self.disk_category,
+                state,
+            ) {
+                Ok(()) => state.persistence_error = None,
+                Err(err) => {
+                    CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "cluster dedupe compaction failed: {err}; detail: {}",
+                        err.detail
+                    );
+                    state.persistence_error = Some(err);
+                }
             }
         }
 
@@ -716,6 +875,9 @@ fn evict_oldest_entry_locked(state: &mut DedupeState) -> bool {
 }
 
 fn append_record_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    disk_category: DiskCategory,
     state: &mut DedupeState,
     key: &str,
     expires_at: u64,
@@ -738,103 +900,141 @@ fn append_record_locked(
             "injected append failure",
         ));
     }
-    state
-        .file
-        .write_all(&encoded)
-        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Append, err))?;
-    #[cfg(test)]
-    if state.append_fault == Some(DedupePersistenceStage::Flush) {
-        state.append_fault = None;
-        return Err(DedupePersistenceError::new(
-            DedupePersistenceStage::Flush,
-            "injected flush failure",
-        ));
+
+    if let Some(local_disk_budget) = local_disk_budget {
+        local_disk_budget
+            .append_file_and_sync_parent(path, &encoded, disk_category)
+            .map_err(|err| {
+                DedupePersistenceError::from_tsink(DedupePersistenceStage::Append, err)
+            })?;
+    } else {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Append, err))?;
+        file.write_all(&encoded)
+            .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Append, err))?;
+        #[cfg(test)]
+        if state.append_fault == Some(DedupePersistenceStage::Flush) {
+            state.append_fault = None;
+            return Err(DedupePersistenceError::new(
+                DedupePersistenceStage::Flush,
+                "injected flush failure",
+            ));
+        }
+        file.flush()
+            .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Flush, err))?;
+        #[cfg(test)]
+        if state.append_fault == Some(DedupePersistenceStage::Sync) {
+            state.append_fault = None;
+            return Err(DedupePersistenceError::new(
+                DedupePersistenceStage::Sync,
+                "injected fsync failure",
+            ));
+        }
+        file.sync_data()
+            .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Sync, err))?;
     }
-    state
-        .file
-        .flush()
-        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Flush, err))?;
-    #[cfg(test)]
-    if state.append_fault == Some(DedupePersistenceStage::Sync) {
-        state.append_fault = None;
-        return Err(DedupePersistenceError::new(
-            DedupePersistenceStage::Sync,
-            "injected fsync failure",
-        ));
-    }
-    state
-        .file
-        .sync_data()
-        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Sync, err))?;
     state.log_bytes = state.log_bytes.saturating_add(encoded.len() as u64);
     Ok(())
 }
 
-fn compact_locked(path: &Path, state: &mut DedupeState) -> Result<(), String> {
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
+fn compact_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    disk_category: DiskCategory,
+    state: &mut DedupeState,
+) -> Result<(), DedupePersistenceError> {
+    let compacted_bytes = compacted_log_len(state)?;
+
+    if let Some(local_disk_budget) = local_disk_budget {
+        local_disk_budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                path,
+                compacted_bytes,
+                disk_category,
+                |writer| write_compacted_log(state, writer).map_err(TsinkError::Other),
+            )
             .map_err(|err| {
-                format!(
-                    "failed to open temporary dedupe marker file {}: {err}",
-                    tmp_path.display()
-                )
+                DedupePersistenceError::from_tsink(DedupePersistenceStage::Compact, err)
             })?;
-        for (expires_at, keys) in &state.entries_by_expiry {
-            for key in keys {
-                let record = DedupeRecord {
-                    key: key.clone(),
-                    expires_at_unix_secs: *expires_at,
-                    completion: state
-                        .entries
-                        .get(key)
-                        .and_then(|entry| entry.completion.clone()),
-                };
-                let mut encoded = serde_json::to_vec(&record)
-                    .map_err(|err| format!("failed to serialize dedupe marker record: {err}"))?;
-                encoded.push(b'\n');
-                tmp_file
-                    .write_all(&encoded)
-                    .map_err(|err| format!("failed to write compacted dedupe marker log: {err}"))?;
-            }
-        }
-        tmp_file
-            .flush()
-            .map_err(|err| format!("failed to flush compacted dedupe marker log: {err}"))?;
-        tmp_file
-            .sync_all()
-            .map_err(|err| format!("failed to fsync compacted dedupe marker log: {err}"))?;
+    } else {
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent_with(
+            path,
+            compacted_bytes,
+            |writer| write_compacted_log(state, writer).map_err(TsinkError::Other),
+        )
+        .map_err(|err| DedupePersistenceError::from_tsink(DedupePersistenceStage::Compact, err))?;
     }
 
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace dedupe marker log {} with {}: {err}",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
-
-    state.file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)
-        .map_err(|err| {
+    let actual_bytes = std::fs::metadata(path)
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Compact, err))?
+        .len();
+    if actual_bytes != compacted_bytes {
+        return Err(DedupePersistenceError::new(
+            DedupePersistenceStage::Compact,
             format!(
-                "failed to reopen dedupe marker log {} after compaction: {err}",
-                path.display()
-            )
-        })?;
-    state.log_bytes = state
-        .file
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+                "compacted dedupe marker log length mismatch: expected {compacted_bytes} bytes, found {actual_bytes} bytes"
+            ),
+        ));
+    }
+    state.log_bytes = actual_bytes;
     Ok(())
+}
+
+fn compacted_log_len(state: &DedupeState) -> Result<u64, DedupePersistenceError> {
+    state
+        .entries_by_expiry
+        .iter()
+        .try_fold(0u64, |total, (expires_at, keys)| {
+            keys.iter().try_fold(total, |total, key| {
+                let encoded = encode_compacted_record(state, key, *expires_at)?;
+                let record_bytes = u64::try_from(encoded.len()).map_err(|_| {
+                    DedupePersistenceError::new(
+                        DedupePersistenceStage::Compact,
+                        "encoded dedupe marker exceeds the supported byte range",
+                    )
+                })?;
+                total.checked_add(record_bytes).ok_or_else(|| {
+                    DedupePersistenceError::new(
+                        DedupePersistenceStage::Compact,
+                        "compacted dedupe marker log exceeds the supported byte range",
+                    )
+                })
+            })
+        })
+}
+
+fn write_compacted_log(state: &DedupeState, writer: &mut dyn Write) -> Result<(), String> {
+    for (expires_at, keys) in &state.entries_by_expiry {
+        for key in keys {
+            let encoded =
+                encode_compacted_record(state, key, *expires_at).map_err(|err| err.detail)?;
+            writer
+                .write_all(&encoded)
+                .map_err(|err| format!("failed to write compacted dedupe marker log: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_compacted_record(
+    state: &DedupeState,
+    key: &str,
+    expires_at: u64,
+) -> Result<Vec<u8>, DedupePersistenceError> {
+    let record = DedupeRecord {
+        key: key.to_string(),
+        expires_at_unix_secs: expires_at,
+        completion: state
+            .entries
+            .get(key)
+            .and_then(|entry| entry.completion.clone()),
+    };
+    let mut encoded = serde_json::to_vec(&record)
+        .map_err(|err| DedupePersistenceError::new(DedupePersistenceStage::Compact, err))?;
+    encoded.push(b'\n');
+    Ok(encoded)
 }
 
 fn parse_env_u64(name: &str, default: u64, must_be_positive: bool) -> Result<u64, String> {
@@ -882,6 +1082,33 @@ fn update_gauges(state: &DedupeState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+    use tsink::LocalDiskLimits;
+
+    fn test_config() -> DedupeConfig {
+        DedupeConfig {
+            window_secs: 60,
+            max_entries: 64,
+            max_log_bytes: 64 * 1024,
+            cleanup_interval_secs: 3_600,
+        }
+    }
+
+    fn test_completion() -> DedupeCompletion {
+        DedupeCompletion::IngestRows {
+            inserted_rows: 1,
+            write_result: None,
+        }
+    }
+
+    fn category_bytes(snapshot: &tsink::LocalDiskBudgetSnapshot, category: DiskCategory) -> u64 {
+        snapshot
+            .categories
+            .iter()
+            .find(|usage| usage.category == category)
+            .map_or(0, |usage| usage.bytes)
+    }
 
     fn expect_accepted<'a>(store: &'a DedupeWindowStore, key: &str) -> DedupeReservation<'a> {
         match store.begin(key).expect("begin should succeed") {
@@ -1031,13 +1258,7 @@ mod tests {
             }
             other => panic!("expected exact duplicate replay, got {other:?}"),
         }
-        let new_key_error = store
-            .begin("tsink:key:new-after-failure")
-            .expect_err("new keys must be fenced after persistence failure");
-        assert_eq!(
-            new_key_error,
-            "cluster dedupe completion marker persistence failed during record append"
-        );
+        drop(expect_accepted(&store, "tsink:key:new-after-failure"));
     }
 
     #[test]
@@ -1137,5 +1358,445 @@ mod tests {
             DedupeBeginOutcome::Duplicate { completion } => assert_eq!(completion, None),
             other => panic!("expected legacy marker to be a duplicate, got {other:?}"),
         };
+    }
+
+    #[test]
+    fn physical_headroom_failure_preserves_typed_resource_detail() {
+        let err = DedupePersistenceError::from_tsink(
+            DedupePersistenceStage::Append,
+            TsinkError::InsufficientDiskSpace {
+                required: 4_096,
+                available: 1_024,
+            },
+        );
+
+        assert_eq!(err.stage(), DedupePersistenceStage::Append);
+        assert_eq!(
+            err.resource_limit(),
+            Some(DedupeDiskResourceLimit::InsufficientDiskSpace {
+                required: 4_096,
+                available: 1_024,
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_append_continues_after_nonempty_atomic_compaction() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("cluster/dedupe/node-a.markers.log");
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = DedupeWindowStore::open_with_disk_budget(
+            path.clone(),
+            test_config(),
+            Some(Arc::clone(&budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("budgeted dedupe store should open");
+        let completion = test_completion();
+        expect_accepted(&store, "tsink:key:after-compaction:a")
+            .commit(completion.clone())
+            .expect("first marker should persist");
+
+        store.run_cleanup_cycle(unix_timestamp_secs(), true);
+        assert!(store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persistence_error
+            .is_none());
+
+        expect_accepted(&store, "tsink:key:after-compaction:b")
+            .commit(completion.clone())
+            .expect("append after atomic replacement should persist");
+        let physical_bytes = std::fs::metadata(&path)
+            .expect("marker metadata should load")
+            .len();
+        assert_eq!(budget.snapshot().accounted_bytes, physical_bytes);
+        drop(store);
+
+        let reopened = DedupeWindowStore::open_with_disk_budget(
+            path,
+            test_config(),
+            Some(Arc::clone(&budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("dedupe store should reopen");
+        for key in [
+            "tsink:key:after-compaction:a",
+            "tsink:key:after-compaction:b",
+        ] {
+            assert!(matches!(
+                reopened.begin(key).expect("marker lookup should succeed"),
+                DedupeBeginOutcome::Duplicate { .. }
+            ));
+        }
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn budgeted_append_reports_typed_quota_and_preserves_exact_replay() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("cluster/dedupe/node-a.markers.log");
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(1),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = DedupeWindowStore::open_with_disk_budget(
+            path.clone(),
+            test_config(),
+            Some(Arc::clone(&budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("budgeted dedupe store should open");
+        let completion = test_completion();
+
+        let err = expect_accepted(&store, "tsink:key:budget:failed")
+            .commit(completion.clone())
+            .expect_err("completion marker should exceed the disk quota");
+        assert_eq!(err.stage(), DedupePersistenceStage::Append);
+        assert!(matches!(
+            err.resource_limit(),
+            Some(DedupeDiskResourceLimit::DiskQuotaExceeded {
+                limit: 1,
+                used: 0,
+                reserved: 0,
+                requested,
+            }) if requested > 1
+        ));
+
+        match store
+            .begin("tsink:key:budget:failed")
+            .expect("the failed key should remain exactly replayable")
+        {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion));
+            }
+            other => panic!("expected duplicate replay, got {other:?}"),
+        }
+        let new_key_err = store
+            .begin("tsink:key:budget:new")
+            .expect_err("a new key should retain the typed persistence fence");
+        assert!(matches!(
+            new_key_err,
+            DedupeBeginError::Persistence(ref persistence)
+                if persistence.stage() == DedupePersistenceStage::Compact
+                    && persistence.resource_limit() == err.resource_limit()
+        ));
+
+        assert_eq!(std::fs::metadata(path).expect("marker metadata").len(), 0);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(category_bytes(&snapshot, DiskCategory::Cluster), 0);
+    }
+
+    #[test]
+    fn budgeted_markers_have_exact_category_accounting_across_restart() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("edge_sync/dedupe/accepted.log");
+        let limits = LocalDiskLimits {
+            max_bytes: Some(8 * 1024 * 1024),
+            ..LocalDiskLimits::default()
+        };
+        let completion = test_completion();
+
+        let budget = LocalDiskBudget::open(dir.path(), limits).expect("disk budget should open");
+        let store = DedupeWindowStore::open_with_disk_budget(
+            path.clone(),
+            test_config(),
+            Some(Arc::clone(&budget)),
+            DiskCategory::EdgeSync,
+        )
+        .expect("budgeted dedupe store should open");
+        expect_accepted(&store, "tsink:edge:budget:restart")
+            .commit(completion.clone())
+            .expect("completion marker should persist");
+        let physical_bytes = std::fs::metadata(&path)
+            .expect("marker metadata should load")
+            .len();
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::EdgeSync),
+            physical_bytes
+        );
+        assert_eq!(snapshot.reserved_bytes, 0);
+        drop(store);
+        drop(budget);
+
+        let restarted_budget =
+            LocalDiskBudget::open(dir.path(), limits).expect("restarted budget should open");
+        let restarted = DedupeWindowStore::open_with_disk_budget(
+            path,
+            test_config(),
+            Some(Arc::clone(&restarted_budget)),
+            DiskCategory::EdgeSync,
+        )
+        .expect("dedupe store should reopen");
+        match restarted
+            .begin("tsink:edge:budget:restart")
+            .expect("persisted key lookup should succeed")
+        {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion));
+            }
+            other => panic!("expected duplicate after restart, got {other:?}"),
+        }
+        let restarted_snapshot = restarted_budget.snapshot();
+        assert_eq!(restarted_snapshot.accounted_bytes, physical_bytes);
+        assert_eq!(restarted_snapshot.reserved_bytes, 0);
+        assert_eq!(restarted_snapshot.active_reservations, 0);
+        assert_eq!(
+            category_bytes(&restarted_snapshot, DiskCategory::EdgeSync),
+            physical_bytes
+        );
+    }
+
+    #[test]
+    fn concurrent_budgeted_stores_cannot_share_the_final_record_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let key_a = "tsink:key:concurrent:a";
+        let key_b = "tsink:key:concurrent:b";
+        let expires_at = unix_timestamp_secs().saturating_add(test_config().window_secs);
+        let encoded_a = serde_json::to_vec(&DedupeRecord {
+            key: key_a.to_string(),
+            expires_at_unix_secs: expires_at,
+            completion: Some(test_completion()),
+        })
+        .expect("test marker should encode");
+        let encoded_b = serde_json::to_vec(&DedupeRecord {
+            key: key_b.to_string(),
+            expires_at_unix_secs: expires_at,
+            completion: Some(test_completion()),
+        })
+        .expect("test marker should encode");
+        assert_eq!(encoded_a.len(), encoded_b.len());
+        let record_bytes = encoded_a.len() as u64 + 1;
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(record_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store_a = Arc::new(
+            DedupeWindowStore::open_with_disk_budget(
+                dir.path().join("cluster/dedupe/a.log"),
+                test_config(),
+                Some(Arc::clone(&budget)),
+                DiskCategory::Cluster,
+            )
+            .expect("first store should open"),
+        );
+        let store_b = Arc::new(
+            DedupeWindowStore::open_with_disk_budget(
+                dir.path().join("cluster/dedupe/b.log"),
+                test_config(),
+                Some(Arc::clone(&budget)),
+                DiskCategory::Cluster,
+            )
+            .expect("second store should open"),
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [(store_a, key_a), (store_b, key_b)]
+            .into_iter()
+            .map(|(store, key)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    expect_accepted(&store, key).commit(test_completion())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("commit thread should finish"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(err) if matches!(
+                        err.resource_limit(),
+                        Some(DedupeDiskResourceLimit::DiskQuotaExceeded { .. })
+                    )
+                ))
+                .count(),
+            1
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, record_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(
+            category_bytes(&snapshot, DiskCategory::Cluster),
+            record_bytes
+        );
+    }
+
+    #[test]
+    fn quota_full_maintenance_compacts_with_recovery_and_clears_the_fence() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("cluster/dedupe/node-a.markers.log");
+        let mut config = test_config();
+        config.max_entries = 1;
+        let completion = test_completion();
+        let first_key = "tsink:key:cleanup:a";
+        let second_key = "tsink:key:cleanup:b";
+
+        let initial = DedupeWindowStore::open(path.clone(), config)
+            .expect("unbudgeted fixture store should open");
+        expect_accepted(&initial, first_key)
+            .commit(completion.clone())
+            .expect("initial marker should persist");
+        drop(initial);
+        let record_bytes = std::fs::metadata(&path)
+            .expect("initial marker metadata")
+            .len();
+
+        let limits = LocalDiskLimits {
+            max_bytes: Some(record_bytes),
+            ..LocalDiskLimits::default()
+        };
+        let budget = LocalDiskBudget::open(dir.path(), limits).expect("disk budget should open");
+        let store = DedupeWindowStore::open_with_disk_budget(
+            path.clone(),
+            config,
+            Some(Arc::clone(&budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("budgeted dedupe store should open at its quota");
+
+        let err = expect_accepted(&store, second_key)
+            .commit(completion.clone())
+            .expect_err("growth append should fail at the exact quota");
+        assert!(matches!(
+            err.resource_limit(),
+            Some(DedupeDiskResourceLimit::DiskQuotaExceeded { .. })
+        ));
+        assert!(store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persistence_error
+            .is_some());
+
+        store.run_maintenance();
+        match store
+            .begin(second_key)
+            .expect("successful cleanup should preserve the replacement marker")
+        {
+            DedupeBeginOutcome::Duplicate { completion: actual } => {
+                assert_eq!(actual, Some(completion.clone()));
+            }
+            other => panic!("expected replacement key replay, got {other:?}"),
+        }
+        drop(expect_accepted(&store, "tsink:key:cleanup:new"));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("compacted marker metadata")
+                .len(),
+            record_bytes
+        );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, record_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        drop(store);
+        drop(budget);
+
+        let restarted_budget =
+            LocalDiskBudget::open(dir.path(), limits).expect("restarted budget should open");
+        let restarted = DedupeWindowStore::open_with_disk_budget(
+            path,
+            config,
+            Some(Arc::clone(&restarted_budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("compacted dedupe store should reopen");
+        assert!(matches!(
+            restarted
+                .begin(second_key)
+                .expect("replacement key lookup should succeed"),
+            DedupeBeginOutcome::Duplicate { .. }
+        ));
+        assert_eq!(restarted_budget.snapshot().accounted_bytes, record_bytes);
+    }
+
+    #[test]
+    fn budgeted_open_cleans_only_owned_atomic_and_legacy_temporaries() {
+        let dir = tempfile::tempdir().expect("tempdir should build");
+        let path = dir.path().join("cluster/dedupe/node-a.markers.log");
+        let parent = path.parent().expect("marker path should have a parent");
+        std::fs::create_dir_all(parent).expect("dedupe directory should build");
+        let target_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("marker file name should be UTF-8");
+        let generated_temp = parent.join(format!(".{target_name}.tmp-123-0000000000000000"));
+        let generated_lookalike = parent.join(format!(".{target_name}.tmp-123-000000000000000G"));
+        let legacy_temp = path.with_extension("tmp");
+        let legacy_lookalike = parent.join(format!(
+            "{}.keep",
+            legacy_temp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("legacy file name should be UTF-8")
+        ));
+        std::fs::write(&generated_temp, b"generated").expect("generated temporary should write");
+        std::fs::write(&generated_lookalike, b"generated-lookalike")
+            .expect("generated lookalike should write");
+        std::fs::write(&legacy_temp, b"legacy").expect("legacy temporary should write");
+        std::fs::write(&legacy_lookalike, b"legacy-lookalike")
+            .expect("legacy lookalike should write");
+
+        let budget = LocalDiskBudget::open(dir.path(), LocalDiskLimits::default())
+            .expect("disk budget should open");
+        let store = DedupeWindowStore::open_with_disk_budget(
+            path.clone(),
+            test_config(),
+            Some(Arc::clone(&budget)),
+            DiskCategory::Cluster,
+        )
+        .expect("budgeted dedupe store should open");
+
+        assert!(!generated_temp.exists());
+        assert!(!legacy_temp.exists());
+        assert!(generated_lookalike.exists());
+        assert!(legacy_lookalike.exists());
+        assert_eq!(std::fs::metadata(path).expect("marker metadata").len(), 0);
+        let expected_bytes = std::fs::metadata(&generated_lookalike)
+            .expect("generated lookalike metadata")
+            .len()
+            .saturating_add(
+                std::fs::metadata(&legacy_lookalike)
+                    .expect("legacy lookalike metadata")
+                    .len(),
+            );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, expected_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+        drop(store);
     }
 }

@@ -9,14 +9,16 @@ use crate::cluster::config::{
     ClusterReadConsistency, ClusterReadPartialResponsePolicy, ClusterWriteConsistency,
 };
 use crate::cluster::consensus::{
-    ControlLivenessSnapshot, ControlLogRecoverySnapshot, ControlPeerLivenessStatus, ProposeOutcome,
+    ControlConsensusError, ControlLivenessSnapshot, ControlLogRecoverySnapshot,
+    ControlPeerLivenessStatus, ControlPersistenceStatus, ProposeOutcome,
 };
 use crate::cluster::control::{
     ClusterHandoffSnapshot, ControlHandoffMutationOutcome, ControlMembershipMutationOutcome,
     ControlNodeStatus, ControlState, ShardHandoffPhase, ShardHandoffSnapshot,
 };
 use crate::cluster::dedupe::{
-    dedupe_metrics_snapshot, validate_idempotency_key, DedupeBeginOutcome, DedupeWindowStore,
+    dedupe_metrics_snapshot, validate_idempotency_key, DedupeBeginError, DedupeBeginOutcome,
+    DedupeWindowStore,
 };
 use crate::cluster::distributed_storage::{DistributedPromqlReadBridge, DistributedStorageAdapter};
 use crate::cluster::hotspot::{self, build_cluster_hotspot_snapshot, ClusterHotspotSnapshot};
@@ -59,12 +61,12 @@ use crate::cluster::rpc::{
     InternalRepairBackfillResponse, InternalRow, InternalSelectBatchRequest,
     InternalSelectBatchResponse, InternalSelectRequest, InternalSelectResponse,
     InternalSelectSeriesRequest, InternalSelectSeriesResponse, InternalWriteExemplar, RpcError,
-    CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1, CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1,
-    CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1, CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1,
-    CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1, CLUSTER_CAPABILITY_METADATA_INGEST_V1,
-    DEFAULT_INTERNAL_RING_VERSION, EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES,
-    HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES, INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS,
-    METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
+    CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1, CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1,
+    CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1, CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1,
+    CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1, CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1,
+    CLUSTER_CAPABILITY_METADATA_INGEST_V1, DEFAULT_INTERNAL_RING_VERSION,
+    EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES, HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES,
+    INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS, METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
 };
 #[cfg(test)]
 use crate::cluster::rpc::{
@@ -143,8 +145,8 @@ use self::internal_api::{
     handle_internal_control_auto_join, handle_internal_control_install_snapshot,
     handle_internal_digest_window, handle_internal_ingest_rows, handle_internal_ingest_write,
     handle_internal_list_metrics, handle_internal_query_exemplars, handle_internal_repair_backfill,
-    handle_internal_restore_data, handle_internal_select, handle_internal_select_batch,
-    handle_internal_select_series, handle_internal_snapshot_data,
+    handle_internal_restore_data, handle_internal_restore_data_budgeted, handle_internal_select,
+    handle_internal_select_batch, handle_internal_select_series, handle_internal_snapshot_data,
     internal_write_exemplar_to_store_write, membership_from_control_state,
     metric_series_identity_key,
 };
@@ -169,6 +171,7 @@ const READ_PARTIAL_RESPONSE_HEADER: &str = "X-Tsink-Read-Partial-Response";
 const READ_PARTIAL_WARNINGS_HEADER: &str = "X-Tsink-Read-Partial-Warnings";
 const READ_ERROR_CODE_HEADER: &str = "X-Tsink-Read-Error-Code";
 const WRITE_ERROR_CODE_HEADER: &str = "X-Tsink-Write-Error-Code";
+const CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE: &str = "control_persistence_indeterminate";
 const WRITE_ACKNOWLEDGEMENT_HEADER: &str = "X-Tsink-Write-Acknowledgement";
 const WRITE_PARTIAL_HEADER: &str = "X-Tsink-Write-Partial";
 const WRITE_ROWS_ACCEPTED_HEADER: &str = "X-Tsink-Rows-Accepted";
@@ -220,7 +223,7 @@ static OTLP_EXPONENTIAL_HISTOGRAM_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXPONENTIAL_HISTOGRAM_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXEMPLAR_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OTLP_EXEMPLAR_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-const WRITE_REJECTION_REASON_COUNT: usize = 17;
+const WRITE_REJECTION_REASON_COUNT: usize = 18;
 static WRITE_REJECTION_REASON_TOTALS: [AtomicU64; WRITE_REJECTION_REASON_COUNT] =
     [const { AtomicU64::new(0) }; WRITE_REJECTION_REASON_COUNT];
 static WRITE_INDETERMINATE_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -233,6 +236,7 @@ const WRITE_REJECTION_REASON_NAMES: [&str; WRITE_REJECTION_REASON_COUNT] = [
     "future_skew_exceeded",
     "cardinality_limit_exceeded",
     "cardinality_creation_rate_exceeded",
+    "write_batch_limit_exceeded",
     "memory_pressure",
     "disk_quota_exceeded",
     "wal_quota_exceeded",
@@ -369,6 +373,7 @@ pub(crate) struct AppContext<'a> {
     pub usage_accounting: Option<&'a UsageAccounting>,
     pub managed_control_plane: Option<&'a ManagedControlPlane>,
     pub local_disk_budget: Option<&'a tsink::LocalDiskBudget>,
+    pub offline_restore_disk_budget: Option<&'a Arc<tsink::LocalDiskBudget>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1025,6 +1030,7 @@ pub struct TestRequestOptions<'a> {
     pub usage_accounting: Option<&'a UsageAccounting>,
     pub managed_control_plane: Option<&'a ManagedControlPlane>,
     pub local_disk_budget: Option<&'a tsink::LocalDiskBudget>,
+    pub offline_restore_disk_budget: Option<&'a Arc<tsink::LocalDiskBudget>>,
 }
 
 #[cfg(test)]
@@ -1047,6 +1053,7 @@ impl<'a> Default for TestRequestOptions<'a> {
             usage_accounting: None,
             managed_control_plane: None,
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         }
     }
 }
@@ -1075,6 +1082,7 @@ pub async fn handle_test_request(
             usage_accounting: options.usage_accounting,
             managed_control_plane: options.managed_control_plane,
             local_disk_budget: options.local_disk_budget,
+            offline_restore_disk_budget: options.offline_restore_disk_budget,
         },
         RequestContext {
             request,
@@ -1389,6 +1397,7 @@ pub async fn handle_request_with_admin_and_cluster_and_tenant_and_metadata_and_s
             usage_accounting,
             managed_control_plane,
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         },
     )
     .await
@@ -1750,7 +1759,13 @@ fn emit_mutating_admin_audit_entry(
         target,
         outcome,
     }) {
-        eprintln!("cluster audit append failed for operation '{operation}': {err}");
+        if let Some(resource_limit) = err.resource_limit() {
+            eprintln!(
+                "cluster audit append rejected by the shared local-disk budget for operation '{operation}': {resource_limit:?}"
+            );
+        } else {
+            eprintln!("cluster audit append failed for operation '{operation}': {err}");
+        }
     }
 }
 
@@ -2031,6 +2046,7 @@ fn handle_metrics(
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     metrics::render_metrics(
         storage,
@@ -2043,6 +2059,7 @@ fn handle_metrics(
         security_manager,
         usage_accounting,
         local_disk_budget,
+        offline_restore_disk_budget,
     )
 }
 
@@ -2100,6 +2117,30 @@ fn cluster_control_liveness_snapshot(
                 .unwrap_or_else(|| "standalone".to_string());
             ControlLivenessSnapshot::empty(local_node_id)
         })
+}
+
+fn cluster_control_persistence_status(
+    cluster_context: Option<&ClusterRequestContext>,
+) -> ControlPersistenceStatus {
+    cluster_context
+        .and_then(|context| context.control_consensus.as_ref())
+        .map(|consensus| consensus.persistence_status())
+        .unwrap_or(ControlPersistenceStatus {
+            fenced: false,
+            pending_checkpoint: None,
+            cleanup_debt: false,
+            detail: None,
+        })
+}
+
+fn cluster_control_persistence_status_json(status: &ControlPersistenceStatus) -> JsonValue {
+    json!({
+        "fenced": status.fenced,
+        "pendingCheckpoint": status.pending_checkpoint,
+        "cleanupDebt": status.cleanup_debt,
+        "detail": status.detail,
+        "degraded": status.fenced || status.pending_checkpoint.is_some() || status.cleanup_debt
+    })
 }
 
 fn cluster_handoff_snapshot(
@@ -2164,6 +2205,66 @@ fn local_disk_status_json(snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) -> 
     })
 }
 
+fn background_worker_status_json(
+    snapshot: tsink::BackgroundWorkerObservabilitySnapshot,
+) -> JsonValue {
+    json!({
+        "installed": snapshot.installed,
+        "running": snapshot.running,
+        "intervalNanos": snapshot.interval_nanos,
+        "maxConcurrency": snapshot.max_concurrency,
+        "startsTotal": snapshot.starts_total,
+        "exitsTotal": snapshot.exits_total,
+        "notificationsTotal": snapshot.notifications_total,
+        "idleWaitsTotal": snapshot.idle_waits_total,
+        "passesStartedTotal": snapshot.passes_started_total,
+        "passesCompletedTotal": snapshot.passes_completed_total,
+        "shutdownJoinsTotal": snapshot.shutdown_joins_total,
+    })
+}
+
+fn query_budget_status_json(snapshot: &tsink::QueryBudgetSnapshot) -> JsonValue {
+    let per_query = snapshot.limits.per_query;
+    json!({
+        "limits": {
+            "maxConcurrentQueries": snapshot.limits.max_concurrent_queries,
+            "maxSharedMemoryBytes": snapshot.limits.max_shared_memory_bytes,
+            "perQuery": {
+                "maxSeriesMatched": per_query.max_series_matched,
+                "maxSamplesScanned": per_query.max_samples_scanned,
+                "maxSamplesReturned": per_query.max_samples_returned,
+                "maxReturnedBytes": per_query.max_returned_bytes,
+                "maxPatternExpansion": per_query.max_pattern_expansion,
+                "maxSteps": per_query.max_steps,
+                "maxIntermediateVectorSize": per_query.max_intermediate_vector_size,
+                "maxMemoryBytes": per_query.max_memory_bytes,
+                "maxWallTimeNanos": per_query.max_wall_time
+                    .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)),
+            }
+        },
+        "activeQueries": snapshot.active_queries,
+        "peakActiveQueries": snapshot.peak_active_queries,
+        "sharedReservedMemoryBytes": snapshot.shared_reserved_memory_bytes,
+        "peakSharedReservedMemoryBytes": snapshot.peak_shared_reserved_memory_bytes,
+        "queriesStartedTotal": snapshot.queries_started_total,
+        "queriesCompletedTotal": snapshot.queries_completed_total,
+        "limitRejectionsTotal": snapshot.limit_rejections_total,
+        "concurrencyRejectionsTotal": snapshot.concurrency_rejections_total,
+        "sharedMemoryRejectionsTotal": snapshot.shared_memory_rejections_total,
+        "perQueryMemoryRejectionsTotal": snapshot.per_query_memory_rejections_total,
+        "seriesMatchedRejectionsTotal": snapshot.series_matched_rejections_total,
+        "samplesScannedRejectionsTotal": snapshot.samples_scanned_rejections_total,
+        "samplesReturnedRejectionsTotal": snapshot.samples_returned_rejections_total,
+        "returnedBytesRejectionsTotal": snapshot.returned_bytes_rejections_total,
+        "patternExpansionRejectionsTotal": snapshot.pattern_expansion_rejections_total,
+        "stepsRejectionsTotal": snapshot.steps_rejections_total,
+        "intermediateVectorSizeRejectionsTotal": snapshot.intermediate_vector_size_rejections_total,
+        "cancellationsTotal": snapshot.cancellations_total,
+        "deadlineExceededTotal": snapshot.deadline_exceeded_total,
+        "accountingInvariantViolationsTotal": snapshot.accounting_invariant_violations_total,
+    })
+}
+
 // The status adapter assembles independent optional server subsystems without making them core
 // storage dependencies; keeping those borrowed inputs explicit makes that boundary visible.
 #[allow(clippy::too_many_arguments)]
@@ -2179,6 +2280,7 @@ async fn handle_tsdb_status(
     usage_accounting: Option<&UsageAccounting>,
     managed_control_plane: Option<&ManagedControlPlane>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let tenant_id = match tenant_id_for_text_request(request) {
         Ok(tenant_id) => tenant_id,
@@ -2207,6 +2309,7 @@ async fn handle_tsdb_status(
     let memory_budget = storage.memory_budget();
     let effective_storage_limits = storage.effective_storage_limits();
     let local_disk = local_disk_budget.map(tsink::LocalDiskBudget::snapshot);
+    let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let server_disk_limits = local_disk_budget.map(tsink::LocalDiskBudget::limits);
     let storage = Arc::clone(&storage);
     let result = tokio::task::spawn_blocking(move || {
@@ -2251,6 +2354,7 @@ async fn handle_tsdb_status(
         .map(|outbox| outbox.config())
         .unwrap_or_default();
     let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
+    let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
     let cluster_handoff = cluster_handoff_snapshot(cluster_context);
     let cluster_digest = cluster_digest_snapshot(cluster_context);
     let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
@@ -2306,6 +2410,10 @@ async fn handle_tsdb_status(
         .unwrap_or_default();
     let edge_sync_accept_status = edge_sync_context
         .map(|context| context.accept_status_snapshot())
+        .unwrap_or_default();
+    let cluster_audit_health = cluster_context
+        .and_then(|context| context.audit_log.as_ref())
+        .map(|audit_log| audit_log.health_snapshot())
         .unwrap_or_default();
     let usage_journal = usage_accounting
         .map(UsageAccounting::ledger_status)
@@ -2375,15 +2483,32 @@ async fn handle_tsdb_status(
                     "walEnabled": effective_storage_limits.wal_enabled,
                     "accountedMemoryBytes": effective_storage_limits.accounted_memory_bytes,
                     "cardinality": effective_storage_limits.cardinality,
+                    "maxLabelsPerSeries": effective_storage_limits.max_labels_per_series,
+                    "maxSeriesIdentityBytes": effective_storage_limits.max_series_identity_bytes,
+                    "maxNewSeriesPerWindow": effective_storage_limits.max_new_series_per_window,
+                    "newSeriesWindowNanos": effective_storage_limits.new_series_window_nanos,
                     "walBytes": effective_storage_limits.wal_bytes,
                     "localDiskBytes": server_disk_limits.and_then(|limits| limits.max_bytes).or(effective_storage_limits.local_disk_bytes),
                     "filesystemFreeHeadroomBytes": server_disk_limits.map(|limits| limits.filesystem_free_headroom_bytes).or(effective_storage_limits.filesystem_free_headroom_bytes),
                     "maintenanceTempReserveBytes": server_disk_limits.map(|limits| limits.maintenance_temp_reserve_bytes).or(effective_storage_limits.maintenance_temp_reserve_bytes),
                     "maxConcurrentWriters": effective_storage_limits.max_concurrent_writers,
                     "writeTimeoutNanos": effective_storage_limits.write_timeout_nanos,
+                    "maxBackgroundThreads": effective_storage_limits.max_background_threads,
+                    "maxFlushConcurrency": effective_storage_limits.max_flush_concurrency,
+                    "maxCompactionConcurrency": effective_storage_limits.max_compaction_concurrency,
+                    "maxRetentionTieringConcurrency": effective_storage_limits.max_retention_tiering_concurrency,
+                    "maxRemoteCatalogRefreshConcurrency": effective_storage_limits.max_remote_catalog_refresh_concurrency,
+                    "maxRemoteTierFetchConcurrency": effective_storage_limits.max_remote_tier_fetch_concurrency,
+                    "maxRollupConcurrency": effective_storage_limits.max_rollup_concurrency,
+                    "flushIntervalNanos": effective_storage_limits.flush_interval_nanos,
+                    "compactionIntervalNanos": effective_storage_limits.compaction_interval_nanos,
+                    "persistedRefreshPollIntervalNanos": effective_storage_limits.persisted_refresh_poll_interval_nanos,
+                    "rollupIntervalNanos": effective_storage_limits.rollup_interval_nanos,
                     "maxActivePartitionHeadsPerSeries": effective_storage_limits.max_active_partition_heads_per_series
                 },
+                "resourceConfiguration": observability.resource_configuration,
                 "localDisk": local_disk_status_json(local_disk.as_ref()),
+                "offlineRestoreDisk": local_disk_status_json(offline_restore_disk.as_ref()),
                 "memory": {
                     "accountedBytes": observability.memory.accounted_bytes,
                     "estimatedAccountedBytes": observability.memory.estimated_accounted_bytes,
@@ -2397,6 +2522,12 @@ async fn handle_tsdb_status(
                     "persistedIndexBytes": observability.memory.persisted_index_bytes,
                     "persistedMmapBytes": observability.memory.persisted_mmap_bytes,
                     "tombstoneBytes": observability.memory.tombstone_bytes,
+                    "walSeriesDefinitionCacheBytes": observability.memory.wal_series_definition_cache_bytes,
+                    "writeTransientBytes": observability.memory.write_transient_bytes,
+                    "peakWriteTransientBytes": observability.memory.peak_write_transient_bytes,
+                    "writeTransientReservationsTotal": observability.memory.write_transient_reservations_total,
+                    "writeTransientRejectionsTotal": observability.memory.write_transient_rejections_total,
+                    "writeTransientBytesEstimated": observability.memory.write_transient_bytes_estimated,
                     "excludedPersistedMmapBytes": observability.memory.excluded_persisted_mmap_bytes,
                     "pressure": {
                         "level": observability.memory.pressure.level,
@@ -2443,6 +2574,10 @@ async fn handle_tsdb_status(
                     "pipelineDurationNanosTotal": observability.flush.pipeline_duration_nanos_total,
                     "activeFlushRunsTotal": observability.flush.active_flush_runs_total,
                     "activeFlushErrorsTotal": observability.flush.active_flush_errors_total,
+                    "activeFlushInspectedSeriesTotal": observability.flush.active_flush_inspected_series_total,
+                    "activeFlushSelectedInputBytesTotal": observability.flush.active_flush_selected_input_bytes_total,
+                    "activeFlushItemLimitHitsTotal": observability.flush.active_flush_item_limit_hits_total,
+                    "activeFlushByteLimitSkipsTotal": observability.flush.active_flush_byte_limit_skips_total,
                     "activeFlushedSeriesTotal": observability.flush.active_flushed_series_total,
                     "activeFlushedChunksTotal": observability.flush.active_flushed_chunks_total,
                     "activeFlushedPointsTotal": observability.flush.active_flushed_points_total,
@@ -2450,6 +2585,10 @@ async fn handle_tsdb_status(
                     "persistSuccessTotal": observability.flush.persist_success_total,
                     "persistNoopTotal": observability.flush.persist_noop_total,
                     "persistErrorsTotal": observability.flush.persist_errors_total,
+                    "persistInspectedChunksTotal": observability.flush.persist_inspected_chunks_total,
+                    "persistSelectedInputBytesTotal": observability.flush.persist_selected_input_bytes_total,
+                    "persistItemLimitHitsTotal": observability.flush.persist_item_limit_hits_total,
+                    "persistByteLimitHitsTotal": observability.flush.persist_byte_limit_hits_total,
                     "persistedSeriesTotal": observability.flush.persisted_series_total,
                     "persistedChunksTotal": observability.flush.persisted_chunks_total,
                     "persistedPointsTotal": observability.flush.persisted_points_total,
@@ -2511,6 +2650,7 @@ async fn handle_tsdb_status(
                     "partialRollupQueryPlansTotal": observability.query.partial_rollup_query_plans_total,
                     "rollupPointsReadTotal": observability.query.rollup_points_read_total
                 },
+                "queryBudget": query_budget_status_json(&observability.query_budget),
                 "rollups": {
                     "workerRunsTotal": observability.rollups.worker_runs_total,
                     "workerSuccessTotal": observability.rollups.worker_success_total,
@@ -2536,6 +2676,15 @@ async fn handle_tsdb_status(
                     "nextRefreshRetryUnixMs": observability.remote.next_refresh_retry_unix_ms,
                     "backoffActive": observability.remote.backoff_active,
                     "lastRefreshError": observability.remote.last_refresh_error
+                },
+                "backgroundWork": {
+                    "maxThreads": observability.background.max_threads,
+                    "installedThreads": observability.background.installed_threads,
+                    "runningThreads": observability.background.running_threads,
+                    "flush": background_worker_status_json(observability.background.flush),
+                    "compaction": background_worker_status_json(observability.background.compaction),
+                    "persistedRefresh": background_worker_status_json(observability.background.persisted_refresh),
+                    "rollup": background_worker_status_json(observability.background.rollup)
                 },
                 "prometheusPayloads": {
                     "localCapabilities": payload_status.local_capabilities,
@@ -2656,6 +2805,10 @@ async fn handle_tsdb_status(
                         "lastEnqueueError": edge_sync_source_status.last_enqueue_error,
                         "lastReplayError": edge_sync_source_status.last_replay_error,
                         "lastUpstreamAcknowledgement": edge_sync_source_status.last_upstream_acknowledgement,
+                        "persistenceFenced": edge_sync_source_status.persistence_fenced,
+                        "persistenceFenceReason": edge_sync_source_status.persistence_fence_reason,
+                        "cleanupPending": edge_sync_source_status.cleanup_pending,
+                        "lastCleanupError": edge_sync_source_status.last_cleanup_error,
                         "degraded": edge_sync_source_status.degraded
                     },
                     "accept": {
@@ -2745,6 +2898,16 @@ async fn handle_tsdb_status(
                     "localReadsServeGlobalQueries": cluster_context
                         .map(|context| context.runtime.local_reads_serve_global_queries)
                         .unwrap_or(false),
+                    "audit": {
+                        "enabled": cluster_audit_health.enabled,
+                        "retainedEntries": cluster_audit_health.retained_entries,
+                        "logBytes": cluster_audit_health.log_bytes,
+                        "cleanupPending": cluster_audit_health.cleanup_pending,
+                        "lastCleanupError": cluster_audit_health.last_cleanup_error,
+                        "persistenceFenced": cluster_audit_health.persistence_fenced,
+                        "persistenceFenceReason": cluster_audit_health.persistence_fence_reason,
+                        "degraded": cluster_audit_health.degraded
+                    },
                     "writeRouting": {
                         "requestsTotal": cluster_write_metrics.requests_total,
                         "localRowsTotal": cluster_write_metrics.local_rows_total,
@@ -2895,6 +3058,7 @@ async fn handle_tsdb_status(
                         "leaderContactAgeMs": cluster_control_liveness.leader_contact_age_ms,
                         "suspectPeers": cluster_control_liveness.suspect_peers,
                         "deadPeers": cluster_control_liveness.dead_peers,
+                        "persistence": cluster_control_persistence_status_json(&cluster_control_persistence),
                         "peers": cluster_control_liveness.peers.iter().map(|peer| {
                             json!({
                                 "nodeId": peer.node_id,
@@ -3482,14 +3646,41 @@ async fn execute_admin_membership_operation(
             .ensure_leader_established(&cluster_context.rpc_client)
             .await
         {
-            return admin_membership_error_response(
-                503,
-                "control_leader_establish_failed",
+            let (status, code) = if err.is_indeterminate() || consensus.persistence_status().fenced
+            {
+                (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            } else if err.resource_limit().is_some() {
+                (413, "write_disk_quota_exceeded")
+            } else {
+                (503, "control_leader_establish_failed")
+            };
+            let response = admin_membership_error_response(
+                status,
+                code,
                 format!("failed to establish control leader before mutation: {err}"),
             );
+            return if status == 413 || code == CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            };
         }
     }
     if !consensus.is_local_control_leader() {
+        let persistence = consensus.persistence_status();
+        if persistence.fenced {
+            return admin_membership_error_response(
+                503,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+                persistence.detail.unwrap_or_else(|| {
+                    "control persistence remains fenced after leader establishment".to_string()
+                }),
+            )
+            .with_header(
+                WRITE_ERROR_CODE_HEADER,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+            );
+        }
         let state = consensus.current_state();
         let current_leader = state.leader_node_id.as_deref().unwrap_or("<none>");
         return admin_membership_error_response(
@@ -3543,6 +3734,63 @@ async fn execute_admin_membership_operation(
                 None,
             )
         }
+        Ok(ProposeOutcome::CommittedCheckpointPending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_membership_success_response(
+                200,
+                operation,
+                "committed_checkpoint_pending",
+                &node_id,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
+        Ok(ProposeOutcome::CommittedCleanupPending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_membership_success_response(
+                200,
+                operation,
+                "committed_cleanup_pending",
+                &node_id,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
+        Ok(ProposeOutcome::CommittedPersistencePending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_membership_success_response(
+                200,
+                operation,
+                "committed_persistence_pending",
+                &node_id,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
         Ok(ProposeOutcome::Pending {
             required,
             acknowledged,
@@ -3562,8 +3810,14 @@ async fn execute_admin_membership_operation(
             )
         }
         Err(err) => {
-            let (status, code) = classify_membership_proposal_error(&err);
-            admin_membership_error_response(status, code, err)
+            let persistence_fenced = consensus.persistence_status().fenced;
+            let (status, code) = classify_membership_proposal_error(&err, persistence_fenced);
+            let response = admin_membership_error_response(status, code, err.to_string());
+            if err.resource_limit().is_some() || err.is_indeterminate() || persistence_fenced {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            }
         }
     }
 }
@@ -3598,14 +3852,41 @@ async fn execute_admin_handoff_operation(
             .ensure_leader_established(&cluster_context.rpc_client)
             .await
         {
-            return admin_handoff_error_response(
-                503,
-                "control_leader_establish_failed",
+            let (status, code) = if err.is_indeterminate() || consensus.persistence_status().fenced
+            {
+                (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            } else if err.resource_limit().is_some() {
+                (413, "write_disk_quota_exceeded")
+            } else {
+                (503, "control_leader_establish_failed")
+            };
+            let response = admin_handoff_error_response(
+                status,
+                code,
                 format!("failed to establish control leader before mutation: {err}"),
             );
+            return if status == 413 || code == CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            };
         }
     }
     if !consensus.is_local_control_leader() {
+        let persistence = consensus.persistence_status();
+        if persistence.fenced {
+            return admin_handoff_error_response(
+                503,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+                persistence.detail.unwrap_or_else(|| {
+                    "control persistence remains fenced after leader establishment".to_string()
+                }),
+            )
+            .with_header(
+                WRITE_ERROR_CODE_HEADER,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+            );
+        }
         let state = consensus.current_state();
         let current_leader = state.leader_node_id.as_deref().unwrap_or("<none>");
         return admin_handoff_error_response(
@@ -3657,6 +3938,63 @@ async fn execute_admin_handoff_operation(
                 None,
             )
         }
+        Ok(ProposeOutcome::CommittedCheckpointPending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_handoff_success_response(
+                200,
+                operation,
+                "committed_checkpoint_pending",
+                shard,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
+        Ok(ProposeOutcome::CommittedCleanupPending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_handoff_success_response(
+                200,
+                operation,
+                "committed_cleanup_pending",
+                shard,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
+        Ok(ProposeOutcome::CommittedPersistencePending {
+            index,
+            term,
+            detail,
+        }) => {
+            let state = consensus.current_state();
+            admin_handoff_success_response(
+                200,
+                operation,
+                "committed_persistence_pending",
+                shard,
+                &state,
+                &detail,
+                Some(index),
+                Some(term),
+                None,
+                None,
+            )
+        }
         Ok(ProposeOutcome::Pending {
             required,
             acknowledged,
@@ -3676,8 +4014,14 @@ async fn execute_admin_handoff_operation(
             )
         }
         Err(err) => {
-            let (status, code) = classify_handoff_proposal_error(&err);
-            admin_handoff_error_response(status, code, err)
+            let persistence_fenced = consensus.persistence_status().fenced;
+            let (status, code) = classify_handoff_proposal_error(&err, persistence_fenced);
+            let response = admin_handoff_error_response(status, code, err.to_string());
+            if err.resource_limit().is_some() || err.is_indeterminate() || persistence_fenced {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            }
         }
     }
 }
@@ -3786,33 +4130,57 @@ fn preview_handoff_command(
     Ok(outcome)
 }
 
-fn classify_membership_proposal_error(err: &str) -> (u16, &'static str) {
-    if err.contains("not the active control leader") || err.contains("not eligible to propose") {
+fn classify_membership_proposal_error(
+    err: &ControlConsensusError,
+    persistence_fenced: bool,
+) -> (u16, &'static str) {
+    if err.is_indeterminate() || persistence_fenced {
+        return (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE);
+    }
+    if err.resource_limit().is_some() {
+        return (413, "write_disk_quota_exceeded");
+    }
+    let detail: &str = err;
+    if detail.contains("not the active control leader")
+        || detail.contains("not eligible to propose")
+    {
         return (409, "not_control_leader");
     }
-    if err.contains("unknown node")
-        || err.contains("endpoint mismatch")
-        || err.contains("empty node_id")
-        || err.contains("empty endpoint")
-        || err.contains("activate_node")
-        || err.contains("remove_node")
+    if detail.contains("unknown node")
+        || detail.contains("endpoint mismatch")
+        || detail.contains("empty node_id")
+        || detail.contains("empty endpoint")
+        || detail.contains("activate_node")
+        || detail.contains("remove_node")
     {
         return (409, "invalid_membership_mutation");
     }
     (503, "control_mutation_failed")
 }
 
-fn classify_handoff_proposal_error(err: &str) -> (u16, &'static str) {
-    if err.contains("not the active control leader") || err.contains("not eligible to propose") {
+fn classify_handoff_proposal_error(
+    err: &ControlConsensusError,
+    persistence_fenced: bool,
+) -> (u16, &'static str) {
+    if err.is_indeterminate() || persistence_fenced {
+        return (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE);
+    }
+    if err.resource_limit().is_some() {
+        return (413, "write_disk_quota_exceeded");
+    }
+    let detail: &str = err;
+    if detail.contains("not the active control leader")
+        || detail.contains("not eligible to propose")
+    {
         return (409, "not_control_leader");
     }
-    if err.contains("unknown shard transition")
-        || err.contains("invalid handoff phase transition")
-        || err.contains("begin_shard_handoff")
-        || err.contains("exceeds ring shard_count")
-        || err.contains("unknown from_node_id")
-        || err.contains("unknown to_node_id")
-        || err.contains("requires distinct owners")
+    if detail.contains("unknown shard transition")
+        || detail.contains("invalid handoff phase transition")
+        || detail.contains("begin_shard_handoff")
+        || detail.contains("exceeds ring shard_count")
+        || detail.contains("unknown from_node_id")
+        || detail.contains("unknown to_node_id")
+        || detail.contains("requires distinct owners")
     {
         return (409, "invalid_handoff_mutation");
     }
@@ -4083,6 +4451,15 @@ fn admin_membership_success_response(
     data.insert("ringVersion".to_string(), json!(state.ring_version));
     data.insert("leaderNodeId".to_string(), json!(state.leader_node_id));
     data.insert("message".to_string(), json!(message));
+    data.insert(
+        "degraded".to_string(),
+        json!(matches!(
+            result,
+            "committed_checkpoint_pending"
+                | "committed_cleanup_pending"
+                | "committed_persistence_pending"
+        )),
+    );
     data.insert("eventUnixMs".to_string(), json!(event_unix_ms));
 
     if let Some(node) = state.node_record(node_id) {
@@ -4144,6 +4521,15 @@ fn admin_handoff_success_response(
     data.insert("ringVersion".to_string(), json!(state.ring_version));
     data.insert("leaderNodeId".to_string(), json!(state.leader_node_id));
     data.insert("message".to_string(), json!(message));
+    data.insert(
+        "degraded".to_string(),
+        json!(matches!(
+            result,
+            "committed_checkpoint_pending"
+                | "committed_cleanup_pending"
+                | "committed_persistence_pending"
+        )),
+    );
     data.insert("eventUnixMs".to_string(), json!(event_unix_ms));
 
     if let Some(snapshot) = handoff_snapshot_for_shard(state, shard) {
@@ -4482,14 +4868,43 @@ async fn ensure_local_control_leader(
             .ensure_leader_established(&cluster_context.rpc_client)
             .await
         {
-            return Err(admin_cluster_snapshot_error_response(
-                503,
-                "control_leader_establish_failed",
+            let (status, code) = if err.is_indeterminate() || consensus.persistence_status().fenced
+            {
+                (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            } else if err.resource_limit().is_some() {
+                (413, "write_disk_quota_exceeded")
+            } else {
+                (503, "control_leader_establish_failed")
+            };
+            let response = admin_cluster_snapshot_error_response(
+                status,
+                code,
                 format!("failed to establish control leader before cluster DR operation: {err}"),
-            ));
+            );
+            return Err(
+                if status == 413 || code == CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE {
+                    response.with_header(WRITE_ERROR_CODE_HEADER, code)
+                } else {
+                    response
+                },
+            );
         }
     }
     if !consensus.is_local_control_leader() {
+        let persistence = consensus.persistence_status();
+        if persistence.fenced {
+            return Err(admin_cluster_snapshot_error_response(
+                503,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+                persistence.detail.unwrap_or_else(|| {
+                    "control persistence remains fenced after leader establishment".to_string()
+                }),
+            )
+            .with_header(
+                WRITE_ERROR_CODE_HEADER,
+                CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE,
+            ));
+        }
         let state = consensus.current_state();
         let current_leader = state.leader_node_id.as_deref().unwrap_or("<none>");
         return Err(admin_cluster_snapshot_error_response(
@@ -4547,10 +4962,7 @@ fn build_control_recovery_snapshot_file(
         .control_state_store
         .as_ref()
         .ok_or_else(|| "cluster control state store is not available".to_string())?;
-    let (control_state, log_snapshot) = consensus.recovery_snapshot_bundle();
-    control_state_store
-        .persist(&control_state)
-        .map_err(|err| format!("failed to persist control state before snapshot: {err}"))?;
+    let (control_state, log_snapshot) = consensus.exportable_recovery_snapshot_bundle()?;
     Ok(ControlRecoverySnapshotFileV1 {
         magic: CONTROL_RECOVERY_SNAPSHOT_MAGIC.to_string(),
         schema_version: CONTROL_RECOVERY_SNAPSHOT_SCHEMA_VERSION,
@@ -4674,7 +5086,8 @@ async fn perform_local_data_restore(
     snapshot_path: &Path,
     data_path: &Path,
     cluster_context: Option<&ClusterRequestContext>,
-) -> Result<InternalDataRestoreResponse, String> {
+    offline_restore_disk_budget: Arc<tsink::LocalDiskBudget>,
+) -> Result<InternalDataRestoreResponse, tsink::TsinkError> {
     let node_id = cluster_context
         .map(|context| context.runtime.membership.local_node_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
@@ -4684,13 +5097,11 @@ async fn perform_local_data_restore(
     let data_path_display = data_path.display().to_string();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        StorageBuilder::restore_from_snapshot(&snapshot_path, &data_path).map_err(|err| {
-            format!(
-                "restore failed from {} to {}: {err}",
-                snapshot_path.display(),
-                data_path.display()
-            )
-        })
+        StorageBuilder::restore_from_snapshot_with_disk_budget(
+            &snapshot_path,
+            &data_path,
+            offline_restore_disk_budget,
+        )
     })
     .await;
     match result {
@@ -4702,7 +5113,9 @@ async fn perform_local_data_restore(
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }),
         Ok(Err(err)) => Err(err),
-        Err(err) => Err(format!("restore task failed: {err}")),
+        Err(err) => Err(tsink::TsinkError::Other(format!(
+            "restore task failed: {err}"
+        ))),
     }
 }
 
@@ -4845,8 +5258,40 @@ fn load_cluster_snapshot_manifest_file(
 fn write_cluster_restore_report_file(
     path: &Path,
     report: &ClusterRestoreReportFileV1,
+    offline_restore_disk_budget: Arc<tsink::LocalDiskBudget>,
 ) -> Result<(), String> {
-    write_json_file(path, report, "cluster restore report")
+    let governed = offline_restore_disk_budget
+        .governs(path)
+        .map_err(|err| format!("failed to validate cluster restore report path: {err}"))?;
+    if !governed || path == offline_restore_disk_budget.root() {
+        return Err(format!(
+            "cluster restore report path '{}' must be a strict descendant of offline restore root '{}'",
+            path.display(),
+            offline_restore_disk_budget.root().display()
+        ));
+    }
+
+    let mut encoded = serde_json::to_vec_pretty(report)
+        .map_err(|err| format!("failed to serialize cluster restore report: {err}"))?;
+    encoded.push(b'\n');
+    if let Some(parent) = path.parent() {
+        offline_restore_disk_budget
+            .create_dir_all_and_sync_parents(parent)
+            .map_err(|err| {
+                format!(
+                    "failed to create cluster restore report directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+    }
+    offline_restore_disk_budget
+        .write_file_atomically_and_sync_parent(path, &encoded, tsink::DiskCategory::ServerState)
+        .map_err(|err| {
+            format!(
+                "failed to write cluster restore report file {} atomically: {err}",
+                path.display()
+            )
+        })
 }
 
 fn unix_timestamp_millis() -> u64 {
@@ -6367,45 +6812,49 @@ pub(crate) async fn ingest_adapter_write_envelope(
 fn maybe_enqueue_edge_sync_rows(
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     rows: &[Row],
-) -> Result<usize, edge_sync::EdgeSyncEnqueueError> {
+) -> Result<usize, edge_sync::EdgeSyncTypedEnqueueError> {
     if rows.is_empty() {
         return Ok(0);
     }
     if let Some(runtime) = edge_sync_context.and_then(|context| context.source.as_ref()) {
-        return runtime.enqueue_rows(rows);
+        return runtime.enqueue_rows_typed(rows);
     }
     Ok(0)
 }
 
 fn edge_sync_enqueue_error_response(
     action: &str,
-    error: &edge_sync::EdgeSyncEnqueueError,
+    error: &edge_sync::EdgeSyncTypedEnqueueError,
     accepted_rows: usize,
     acknowledgement: WriteAcknowledgement,
 ) -> HttpResponse {
-    partial_write_error_response(
-        text_response(
-            503,
-            &format!(
-                "{action} accepted locally but could not be fully persisted to the edge-sync queue"
-            ),
-        )
-        .with_header(WRITE_ERROR_CODE_HEADER, "edge_sync_enqueue_failed")
-        .with_header("Retry-After", "1")
-        .with_header(
-            "X-Tsink-Edge-Sync-Rows-Submitted",
-            error.submitted_rows.to_string(),
-        )
-        .with_header(
-            "X-Tsink-Edge-Sync-Rows-Queued",
-            error.queued_rows.to_string(),
+    let disk_resource_limit = error.cause.is_disk_resource_limit();
+    let mut response = text_response(
+        if disk_resource_limit { 413 } else { 503 },
+        &format!(
+            "{action} accepted locally but could not be fully persisted to the edge-sync queue"
         ),
-        accepted_rows,
-        Some(acknowledgement),
-        0,
-        0,
-        0,
     )
+    .with_header(
+        WRITE_ERROR_CODE_HEADER,
+        if disk_resource_limit {
+            "write_disk_quota_exceeded"
+        } else {
+            "edge_sync_enqueue_failed"
+        },
+    )
+    .with_header(
+        "X-Tsink-Edge-Sync-Rows-Submitted",
+        error.submitted_rows.to_string(),
+    )
+    .with_header(
+        "X-Tsink-Edge-Sync-Rows-Queued",
+        error.queued_rows.to_string(),
+    );
+    if !disk_resource_limit && error.cause.retryable() {
+        response = response.with_header("Retry-After", "1");
+    }
+    partial_write_error_response(response, accepted_rows, Some(acknowledgement), 0, 0, 0)
 }
 
 fn http_response_message(response: HttpResponse) -> String {
@@ -6941,6 +7390,9 @@ fn write_admission_error_response(err: WriteAdmissionError) -> HttpResponse {
 fn classify_storage_write_error(err: &tsink::TsinkError) -> Option<(u16, &'static str)> {
     match err {
         tsink::TsinkError::OutOfRetention { .. } => Some((422, "write_out_of_retention")),
+        tsink::TsinkError::WriteBatchRowLimitExceeded { .. }
+        | tsink::TsinkError::WriteBatchInputLimitExceeded { .. }
+        | tsink::TsinkError::WriteBatchSizeOverflow => Some((413, "write_batch_limit_exceeded")),
         tsink::TsinkError::InsufficientDiskSpace { .. }
         | tsink::TsinkError::DiskQuotaExceeded { .. }
         | tsink::TsinkError::InsufficientCompactionHeadroom { .. } => {
@@ -6951,6 +7403,20 @@ fn classify_storage_write_error(err: &tsink::TsinkError) -> Option<(u16, &'stati
 }
 
 fn storage_write_error_response(action: &str, err: &tsink::TsinkError) -> HttpResponse {
+    if matches!(
+        err,
+        tsink::TsinkError::WriteBatchRowLimitExceeded { .. }
+            | tsink::TsinkError::WriteBatchInputLimitExceeded { .. }
+            | tsink::TsinkError::WriteBatchSizeOverflow
+    ) {
+        record_write_rejection_category(WriteRejectionCategory::WriteBatchLimitExceeded);
+        return text_response(
+            413,
+            bounded_write_rejection_diagnostic(&format!("{action} rejected: {err}")),
+        )
+        .with_header(WRITE_ERROR_CODE_HEADER, "write_batch_limit_exceeded");
+    }
+
     let (status, error_code, message) = match classify_storage_write_error(err) {
         Some((status, error_code)) => (status, error_code, format!("{action} failed: {err}")),
         None => (
@@ -7148,16 +7614,17 @@ fn write_rejection_category_index(category: WriteRejectionCategory) -> usize {
         WriteRejectionCategory::FutureSkewExceeded => 5,
         WriteRejectionCategory::CardinalityLimitExceeded => 6,
         WriteRejectionCategory::CardinalityCreationRateExceeded => 7,
-        WriteRejectionCategory::MemoryPressure => 8,
-        WriteRejectionCategory::DiskQuotaExceeded => 9,
-        WriteRejectionCategory::WalQuotaExceeded => 10,
-        WriteRejectionCategory::PolicyRejected => 11,
-        WriteRejectionCategory::WriteTimeout => 12,
-        WriteRejectionCategory::StorageClosed => 13,
-        WriteRejectionCategory::StorageDegraded => 14,
-        WriteRejectionCategory::InternalIo => 15,
-        WriteRejectionCategory::Internal => 16,
-        _ => 16,
+        WriteRejectionCategory::WriteBatchLimitExceeded => 8,
+        WriteRejectionCategory::MemoryPressure => 9,
+        WriteRejectionCategory::DiskQuotaExceeded => 10,
+        WriteRejectionCategory::WalQuotaExceeded => 11,
+        WriteRejectionCategory::PolicyRejected => 12,
+        WriteRejectionCategory::WriteTimeout => 13,
+        WriteRejectionCategory::StorageClosed => 14,
+        WriteRejectionCategory::StorageDegraded => 15,
+        WriteRejectionCategory::InternalIo => 16,
+        WriteRejectionCategory::Internal => 17,
+        _ => 17,
     }
 }
 
@@ -7200,6 +7667,9 @@ fn write_rejection_http_mapping(
         }
         WriteRejectionCategory::CardinalityCreationRateExceeded => {
             (429, "write_cardinality_creation_rate_exceeded", Some("1"))
+        }
+        WriteRejectionCategory::WriteBatchLimitExceeded => {
+            (413, "write_batch_limit_exceeded", None)
         }
         WriteRejectionCategory::MemoryPressure => (413, "write_memory_pressure", None),
         WriteRejectionCategory::DiskQuotaExceeded => (413, "write_disk_quota_exceeded", None),
@@ -7675,8 +8145,8 @@ mod tests {
     use tokio::sync::oneshot;
     use tsink::{
         HistogramBucketSpan, HistogramCount, HistogramResetHint as TsinkHistogramResetHint,
-        MetadataShardScope, NativeHistogram, StorageBuilder, StorageRuntimeMode,
-        TimestampPrecision, TsinkError, Value,
+        MetadataShardScope, NativeHistogram, QueryBudgetLimits, QueryWorkLimits, StorageBuilder,
+        StorageRuntimeMode, TimestampPrecision, TsinkError, Value,
     };
 
     fn make_storage() -> Arc<dyn Storage> {
@@ -8702,6 +9172,7 @@ mod tests {
         storage: &Arc<dyn Storage>,
         metadata_store: &Arc<MetricMetadataStore>,
         exemplar_store: &Arc<ExemplarStore>,
+        offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
         request: &HttpRequest,
     ) -> HttpResponse {
         match request.path_without_query() {
@@ -8973,7 +9444,15 @@ mod tests {
                     },
                 )
             }
-            "/internal/v1/restore_data" => {
+            "/internal/v1/restore_data" | "/internal/v1/restore_data_budgeted" => {
+                let Some(offline_restore_disk_budget) = offline_restore_disk_budget else {
+                    return internal_error_response(
+                        503,
+                        "offline_restore_unconfigured",
+                        "mock peer has no dedicated offline restore budget",
+                        false,
+                    );
+                };
                 let payload: InternalDataRestoreRequest =
                     match serde_json::from_slice(&request.body) {
                         Ok(payload) => payload,
@@ -8986,9 +9465,18 @@ mod tests {
                     };
                 let snapshot_path = PathBuf::from(payload.snapshot_path);
                 let data_path = PathBuf::from(payload.data_path);
-                if let Err(err) = StorageBuilder::restore_from_snapshot(&snapshot_path, &data_path)
-                {
-                    return text_response(500, &format!("mock restore_data failed: {err}"));
+                if let Err(err) = validate_restore_target_within_offline_root(
+                    &data_path,
+                    offline_restore_disk_budget,
+                ) {
+                    return internal_error_response(422, "invalid_restore_path", err, false);
+                }
+                if let Err(err) = StorageBuilder::restore_from_snapshot_with_disk_budget(
+                    &snapshot_path,
+                    &data_path,
+                    Arc::clone(offline_restore_disk_budget),
+                ) {
+                    return admin_restore_error_response(&err);
                 }
                 json_response(
                     200,
@@ -9101,6 +9589,44 @@ mod tests {
         oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_internal_storage_peer_with_metadata_and_exemplars_and_restore_budget(
+            storage,
+            metadata_store,
+            exemplar_store,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_internal_storage_peer_with_restore_budget(
+        storage: Arc<dyn Storage>,
+        offline_restore_disk_budget: Arc<tsink::LocalDiskBudget>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_internal_storage_peer_with_metadata_and_exemplars_and_restore_budget(
+            storage,
+            Arc::new(MetricMetadataStore::in_memory()),
+            Arc::new(ExemplarStore::in_memory()),
+            Some(offline_restore_disk_budget),
+        )
+        .await
+    }
+
+    async fn spawn_internal_storage_peer_with_metadata_and_exemplars_and_restore_budget(
+        storage: Arc<dyn Storage>,
+        metadata_store: Arc<MetricMetadataStore>,
+        exemplar_store: Arc<ExemplarStore>,
+        offline_restore_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock peer listener should bind");
@@ -9131,6 +9657,7 @@ mod tests {
                             &storage,
                             &metadata_store,
                             &exemplar_store,
+                            offline_restore_disk_budget.as_ref(),
                             &request,
                         );
                         let _ = write_http_response(&mut stream, &response).await;
@@ -15290,6 +15817,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promql_http_preserves_one_core_execution_and_reports_budget_state() {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                per_query: QueryWorkLimits {
+                    max_steps: Some(3),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            })
+            .build()
+            .expect("storage should build");
+        storage
+            .insert_rows(&[
+                Row::new("up", DataPoint::new(0, 1.0)),
+                Row::new("up", DataPoint::new(60_000, 2.0)),
+            ])
+            .unwrap();
+        let read_admission = ReadAdmissionController::new(admission::ReadAdmissionGuardrails {
+            max_inflight_requests: 2,
+            max_inflight_queries: 2,
+            acquire_timeout: Duration::from_millis(10),
+        })
+        .unwrap();
+
+        let success = handle_range_query_with_admission(
+            &storage,
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/query_range?query=up&start=0&end=120&step=60".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TimestampPrecision::Milliseconds,
+            PublicReadContext::new(None, None, None, None),
+            &read_admission,
+        )
+        .await;
+        assert_eq!(success.status, 200);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.peak_active_queries, 1);
+        assert_eq!(snapshot.concurrency_rejections_total, 0);
+
+        let rejected = handle_range_query_with_admission(
+            &storage,
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/query_range?query=up&start=0&end=180&step=60".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TimestampPrecision::Milliseconds,
+            PublicReadContext::new(None, None, None, None),
+            &read_admission,
+        )
+        .await;
+        assert_eq!(rejected.status, 413);
+        assert_eq!(
+            response_header(&rejected, READ_ERROR_CODE_HEADER),
+            Some("query_limit_steps")
+        );
+        let body: JsonValue = serde_json::from_slice(&rejected.body).unwrap();
+        assert_eq!(body["errorType"], "query_limit_steps");
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.queries_started_total, 2);
+        assert_eq!(snapshot.queries_completed_total, 2);
+        assert_eq!(snapshot.steps_rejections_total, 1);
+
+        let status = query_budget_status_json(&snapshot);
+        assert_eq!(status["limits"]["maxConcurrentQueries"], 1);
+        assert_eq!(status["limits"]["perQuery"]["maxSteps"], 3);
+        assert_eq!(status["stepsRejectionsTotal"], 1);
+
+        let mut metrics = String::new();
+        metrics::append_query_budget_metrics(&mut metrics, &snapshot);
+        assert!(metrics.contains("tsink_query_budget_configured_limit{kind=\"max_steps\"} 3"));
+        assert!(metrics
+            .contains("tsink_query_budget_limit_rejections_by_reason_total{reason=\"steps\"} 1"));
+    }
+
+    #[tokio::test]
     async fn cluster_promql_instant_query_uses_distributed_storage_adapter() {
         let temp_dir = TempDir::new().expect("temp dir should create");
         let cluster_context = cluster_context_with_single_node_control(&temp_dir);
@@ -16204,6 +16817,40 @@ mod tests {
     }
 
     #[test]
+    fn storage_write_error_response_maps_batch_limits_to_413() {
+        for error in [
+            TsinkError::WriteBatchRowLimitExceeded {
+                limit: 10,
+                submitted: 11,
+            },
+            TsinkError::WriteBatchInputLimitExceeded {
+                limit: 1024,
+                submitted: 1025,
+            },
+            TsinkError::WriteBatchSizeOverflow,
+        ] {
+            let response = storage_write_error_response("insert", &error);
+            assert_eq!(response.status, 413);
+            assert_eq!(
+                response_header(&response, WRITE_ERROR_CODE_HEADER),
+                Some("write_batch_limit_exceeded")
+            );
+            assert_eq!(response_header(&response, WRITE_OUTCOME_HEADER), None);
+            assert_eq!(response_header(&response, WRITE_PARTIAL_HEADER), None);
+        }
+
+        assert_eq!(
+            write_rejection_http_mapping(WriteRejectionCategory::WriteBatchLimitExceeded),
+            (413, "write_batch_limit_exceeded", None)
+        );
+        assert_eq!(
+            WRITE_REJECTION_REASON_NAMES
+                [write_rejection_category_index(WriteRejectionCategory::WriteBatchLimitExceeded)],
+            "write_batch_limit_exceeded"
+        );
+    }
+
+    #[test]
     fn storage_write_error_response_redacts_unclassified_backend_details() {
         let secret = "private-storage-detail".repeat(1_024);
         let response = storage_write_error_response("insert", &TsinkError::Other(secret.clone()));
@@ -16554,10 +17201,12 @@ mod tests {
     fn edge_sync_enqueue_failure_discloses_local_commit_and_queue_progress() {
         let response = edge_sync_enqueue_error_response(
             "insert",
-            &edge_sync::EdgeSyncEnqueueError {
+            &edge_sync::EdgeSyncTypedEnqueueError {
                 submitted_rows: 5,
                 queued_rows: 3,
-                message: "sensitive internal queue path".to_string(),
+                cause: edge_sync::EdgeSyncEnqueueCause::Persistence {
+                    message: "sensitive internal queue path".to_string(),
+                },
             },
             5,
             WriteAcknowledgement::Durable,
@@ -16584,7 +17233,128 @@ mod tests {
             response_header(&response, "X-Tsink-Edge-Sync-Rows-Queued"),
             Some("3")
         );
+        assert_eq!(response_header(&response, "Retry-After"), Some("1"));
         assert!(!String::from_utf8_lossy(&response.body).contains("sensitive internal queue path"));
+    }
+
+    #[test]
+    fn indeterminate_edge_append_fences_queue_without_retry_advice() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let runtime = edge_sync::EdgeSyncSourceRuntime::open(
+            temp_dir.path(),
+            edge_sync::EdgeSyncSourceBootstrap {
+                source_id: "edge-a".to_string(),
+                upstream_endpoint: "127.0.0.1:1".to_string(),
+                shared_auth_token: "edge-token".to_string(),
+                tenant_mapping: edge_sync::EdgeSyncTenantMapping::preserve(),
+            },
+        )
+        .expect("edge source should open");
+        let queue_path = edge_sync::edge_sync_dir(temp_dir.path()).join("queue.log");
+        let _append_failure = edge_sync::inject_append_failure(&queue_path);
+        let rows = vec![Row::new("edge_indeterminate", DataPoint::new(1, 1.0))];
+        let error = runtime
+            .enqueue_rows_typed(&rows)
+            .expect_err("indeterminate append should reject and fence the queue");
+        assert!(matches!(
+            &error.cause,
+            edge_sync::EdgeSyncEnqueueCause::PersistenceFenced { .. }
+        ));
+
+        let response = edge_sync_enqueue_error_response(
+            "insert",
+            &error,
+            rows.len(),
+            WriteAcknowledgement::Durable,
+        );
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("edge_sync_enqueue_failed")
+        );
+        assert_eq!(response_header(&response, "Retry-After"), None);
+        assert!(runtime.status_snapshot().persistence_fenced);
+    }
+
+    #[test]
+    fn edge_sync_disk_quota_failure_is_a_non_retryable_partial_413() {
+        let response = edge_sync_enqueue_error_response(
+            "insert",
+            &edge_sync::EdgeSyncTypedEnqueueError {
+                submitted_rows: 5,
+                queued_rows: 3,
+                cause: edge_sync::EdgeSyncEnqueueCause::DiskQuotaExceeded {
+                    limit: 100,
+                    used: 90,
+                    reserved: 0,
+                    requested: 20,
+                },
+            },
+            5,
+            WriteAcknowledgement::Durable,
+        );
+
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(response_header(&response, "Retry-After"), None);
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("5")
+        );
+        assert_eq!(
+            response_header(&response, "X-Tsink-Edge-Sync-Rows-Queued"),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn budgeted_edge_source_preserves_typed_quota_through_partial_http_response() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let budget = tsink::LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let runtime = edge_sync::EdgeSyncSourceRuntime::open_with_disk_budget(
+            temp_dir.path(),
+            edge_sync::EdgeSyncSourceBootstrap {
+                source_id: "edge-a".to_string(),
+                upstream_endpoint: "127.0.0.1:1".to_string(),
+                shared_auth_token: "edge-token".to_string(),
+                tenant_mapping: edge_sync::EdgeSyncTenantMapping::preserve(),
+            },
+            Some(Arc::clone(&budget)),
+        )
+        .expect("edge source should open");
+        let rows = vec![Row::new("edge_quota", DataPoint::new(1, 1.0))];
+        let error = runtime
+            .enqueue_rows_typed(&rows)
+            .expect_err("queue growth should exceed the shared quota");
+        assert!(error.cause.is_disk_resource_limit());
+
+        let response = edge_sync_enqueue_error_response(
+            "insert",
+            &error,
+            rows.len(),
+            WriteAcknowledgement::Durable,
+        );
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        assert_eq!(
+            response_header(&response, WRITE_ROWS_ACCEPTED_HEADER),
+            Some("1")
+        );
+        assert_eq!(response_header(&response, "Retry-After"), None);
+        assert_eq!(budget.snapshot().active_reservations, 0);
     }
 
     #[test]
@@ -16698,16 +17468,32 @@ mod tests {
         assert!(body.contains("tsink_memory_rejections_total"));
         assert!(body.contains("tsink_memory_persisted_mmap_bytes"));
         assert!(body.contains("tsink_memory_registry_bytes"));
+        assert!(body.contains("tsink_memory_wal_series_definition_cache_bytes"));
+        assert!(body.contains("tsink_memory_write_transient_bytes"));
+        assert!(body.contains("tsink_memory_write_transient_peak_bytes"));
+        assert!(body.contains("tsink_memory_write_transient_reservations_total"));
+        assert!(body.contains("tsink_memory_write_transient_rejections_total"));
         assert!(body.contains("tsink_series_total"));
         assert!(body.contains("tsink_uptime_seconds"));
         assert!(body.contains("tsink_wal_enabled"));
         assert!(body.contains("tsink_wal_acknowledged_writes_durable"));
         assert!(body.contains("tsink_wal_durable_highwater_segment"));
         assert!(body.contains("tsink_flush_pipeline_runs_total"));
+        assert!(body.contains("tsink_flush_persist_inspected_chunks_total"));
+        assert!(body.contains("tsink_flush_persist_selected_input_bytes_total"));
+        assert!(body.contains("tsink_flush_persist_item_limit_hits_total"));
+        assert!(body.contains("tsink_flush_persist_byte_limit_hits_total"));
         assert!(body.contains("tsink_flush_hot_segments_visible"));
         assert!(body.contains("tsink_compaction_runs_total"));
         assert!(body.contains("tsink_query_select_calls_total"));
         assert!(body.contains("tsink_query_hot_only_plans_total"));
+        assert!(body.contains("tsink_query_budget_active_queries"));
+        assert!(body.contains("tsink_query_budget_queries_started_total"));
+        assert!(
+            body.contains("tsink_query_budget_limit_rejections_by_reason_total{reason=\"steps\"}")
+        );
+        assert!(body.contains("tsink_query_budget_cancellations_total"));
+        assert!(body.contains("tsink_query_budget_configured_limit"));
         assert!(body.contains("tsink_remote_storage_catalog_refreshes_total"));
         assert!(body.contains("tsink_remote_storage_catalog_refresh_consecutive_failures"));
         assert!(body.contains("tsink_remote_storage_catalog_refresh_backoff_active"));
@@ -16756,6 +17542,7 @@ mod tests {
         assert!(body.contains("tsink_cluster_read_planner_operation_requests_total"));
         assert!(body.contains("tsink_cluster_control_current_term"));
         assert!(body.contains("tsink_cluster_control_peer_status"));
+        assert!(body.contains("tsink_cluster_control_persistence_health"));
         assert!(body.contains("tsink_cluster_handoff_total"));
         assert!(body.contains("tsink_cluster_handoff_shard_phase"));
         assert!(body.contains("tsink_cluster_repair_digest_runs_total"));
@@ -17026,6 +17813,53 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn control_checkpoint_pending_status_and_admin_response_are_degraded_successes() {
+        let status = ControlPersistenceStatus {
+            fenced: false,
+            pending_checkpoint: Some(crate::cluster::consensus::ControlCommitPosition {
+                index: 17,
+                term: 4,
+            }),
+            cleanup_debt: false,
+            detail: Some("checkpoint repair pending".to_string()),
+        };
+        let status_json = cluster_control_persistence_status_json(&status);
+        assert_eq!(status_json["fenced"], false);
+        assert_eq!(status_json["pendingCheckpoint"]["index"], 17);
+        assert_eq!(status_json["pendingCheckpoint"]["term"], 4);
+        assert_eq!(status_json["cleanupDebt"], false);
+        assert_eq!(status_json["degraded"], true);
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let context = cluster_context_with_control_state(&temp_dir, |_| {});
+        let state = context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should exist")
+            .current_state();
+        let response = admin_membership_success_response(
+            200,
+            AdminMembershipOperation::Join,
+            "committed_checkpoint_pending",
+            "node-a",
+            &state,
+            "committed control checkpoint is pending mirror repair",
+            Some(17),
+            Some(4),
+            None,
+            None,
+        );
+        assert_eq!(response.status, 200);
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("success response should decode");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["result"], "committed_checkpoint_pending");
+        assert_eq!(body["data"]["degraded"], true);
+        assert_eq!(body["data"]["committedLogIndex"], 17);
+        assert_eq!(body["data"]["committedLogTerm"], 4);
     }
 
     #[tokio::test]
@@ -17586,12 +18420,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_cluster_restore_rejects_report_path_outside_offline_root_before_restore() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let manifest_path = temp_dir.path().join("placeholder-manifest.json");
+        std::fs::write(&manifest_path, b"{}\n").expect("placeholder manifest should exist");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_root = offline_restore_root.join("cluster-restored");
+        let outside_report_path = temp_dir.path().join("unbudgeted-report.json");
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": manifest_path.to_string_lossy(),
+                    "restoreRoot": restore_root.to_string_lossy(),
+                    "reportPath": outside_report_path.to_string_lossy(),
+                }))
+                .expect("json should encode"),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status, 422);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        assert_eq!(body["errorType"], "invalid_restore_path");
+        assert!(!restore_root.exists());
+        assert!(!outside_report_path.exists());
+    }
+
+    #[test]
+    fn cluster_restore_preserves_remote_quota_status_and_error_code() {
+        let response = cluster_restore_remote_error_response(
+            &RpcError::HttpStatus {
+                endpoint: "node-b.example:9301".to_string(),
+                path: "/internal/v1/restore_data_budgeted".to_string(),
+                status: 413,
+                error_code: Some("write_disk_quota_exceeded".to_string()),
+                message: "offline restore disk quota exceeded".to_string(),
+                retryable: false,
+            },
+            "node-b",
+            "node-b.example:9301",
+        );
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response_header_value(&response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        assert_eq!(body["errorType"], "write_disk_quota_exceeded");
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_restore_preflight_rejects_report_overlap_and_tampered_control_term() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source-local");
+        let snapshot_root = temp_dir.path().join("cluster-snapshot");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_root = offline_restore_root.join("cluster-restored");
+
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("local source storage should build");
+        let engine = make_engine(&storage);
+        let cluster_context = cluster_context_with_single_node_control_state(&temp_dir, |state| {
+            state.leader_node_id = Some("node-a".to_string());
+        });
+
+        let snapshot_response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/snapshot".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "path": snapshot_root.to_string_lossy()
+                }))
+                .expect("json should encode"),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(snapshot_response.status, 200);
+        let snapshot_body: JsonValue =
+            serde_json::from_slice(&snapshot_response.body).expect("valid JSON");
+        let manifest_path = PathBuf::from(
+            snapshot_body["data"]["manifestPath"]
+                .as_str()
+                .expect("manifestPath should be present"),
+        );
+
+        let consensus = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should be present");
+        let state_before_restore = consensus.current_state();
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let overlapping_report_path = restore_root
+            .join("nodes")
+            .join("node-a")
+            .join("data")
+            .join("cluster-restore-report.json");
+        let overlap_response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": manifest_path.to_string_lossy(),
+                    "restoreRoot": restore_root.to_string_lossy(),
+                    "reportPath": overlapping_report_path.to_string_lossy(),
+                }))
+                .expect("json should encode"),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(overlap_response.status, 422);
+        let overlap_body: JsonValue =
+            serde_json::from_slice(&overlap_response.body).expect("valid JSON");
+        assert_eq!(overlap_body["errorType"], "invalid_restore_path");
+        assert!(overlap_body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("must not overlap local restore target")));
+        assert!(!restore_root.exists());
+        assert_eq!(consensus.current_state(), state_before_restore);
+
+        let mut manifest =
+            load_cluster_snapshot_manifest_file(&manifest_path).expect("manifest should load");
+        manifest.control_snapshot.control_state.applied_log_term = manifest
+            .control_snapshot
+            .control_state
+            .applied_log_term
+            .checked_add(1)
+            .expect("fixture term should have headroom");
+        write_cluster_snapshot_manifest_file(&manifest_path, &manifest)
+            .expect("tampered manifest should persist");
+
+        let restore_response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": manifest_path.to_string_lossy(),
+                    "restoreRoot": restore_root.to_string_lossy()
+                }))
+                .expect("json should encode"),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(restore_response.status, 409);
+        let restore_body: JsonValue =
+            serde_json::from_slice(&restore_response.body).expect("valid JSON");
+        assert_eq!(restore_body["errorType"], "control_restore_rejected");
+        assert!(!restore_root.exists());
+        assert_eq!(consensus.current_state(), state_before_restore);
+
+        storage.close().expect("storage should close");
+    }
+
+    #[tokio::test]
     async fn admin_cluster_data_restore_failure_leaves_control_state_unchanged() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let source_path = temp_dir.path().join("source-local");
         let snapshot_root = temp_dir.path().join("cluster-snapshot");
-        let restore_root = temp_dir.path().join("cluster-restored");
-        let blocked_data_path = temp_dir.path().join("blocked-data-path");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_root = offline_restore_root.join("cluster-restored");
+        std::fs::create_dir_all(&offline_restore_root).expect("offline restore root should exist");
+        let blocked_data_path = offline_restore_root.join("blocked-data-path");
         std::fs::write(&blocked_data_path, b"not a directory")
             .expect("blocked data path should exist as a file");
 
@@ -17657,7 +18715,15 @@ mod tests {
         write_cluster_snapshot_manifest_file(&manifest_path, &manifest)
             .expect("modified manifest should persist");
 
-        let restore_response = handle_request_with_admin_and_cluster(
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let restore_response = handle_test_request(
             &storage,
             &engine,
             HttpRequest {
@@ -17676,6 +18742,64 @@ mod tests {
                 }))
                 .expect("json should encode"),
             },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(restore_response.status, 422);
+        let restore_body: JsonValue =
+            serde_json::from_slice(&restore_response.body).expect("valid JSON");
+        assert_eq!(restore_body["errorType"], "invalid_restore_path");
+        assert_eq!(consensus.current_state(), state_before_restore);
+
+        storage.close().expect("storage should close");
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_restore_reports_post_commit_publication_failure_as_degraded_success() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source-local");
+        let snapshot_root = temp_dir.path().join("cluster-snapshot");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_root = offline_restore_root.join("cluster-restored");
+        let report_path = offline_restore_root.join("report-target-is-a-directory");
+
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("local source storage should build");
+        storage
+            .insert_rows(&[Row::new(
+                "degraded_report_restore_metric",
+                DataPoint::new(7, 7.0),
+            )])
+            .expect("source row should insert");
+        let engine = make_engine(&storage);
+        let cluster_context = cluster_context_with_single_node_control_state(&temp_dir, |state| {
+            state.leader_node_id = Some("node-a".to_string());
+        });
+
+        let snapshot_response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/snapshot".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "path": snapshot_root.to_string_lossy()
+                }))
+                .expect("json should encode"),
+            },
             start_time(),
             TimestampPrecision::Milliseconds,
             true,
@@ -17684,13 +18808,105 @@ mod tests {
             Some(cluster_context.as_ref()),
         )
         .await;
-        assert_eq!(restore_response.status, 503);
+        assert_eq!(snapshot_response.status, 200);
+        let snapshot_body: JsonValue =
+            serde_json::from_slice(&snapshot_response.body).expect("valid JSON");
+        let manifest_path = PathBuf::from(
+            snapshot_body["data"]["manifestPath"]
+                .as_str()
+                .expect("manifestPath should be present"),
+        );
+
+        let consensus = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should be present");
+        let mut manifest =
+            load_cluster_snapshot_manifest_file(&manifest_path).expect("manifest should load");
+        manifest.control_snapshot.control_state.updated_unix_ms = manifest
+            .control_snapshot
+            .control_state
+            .updated_unix_ms
+            .saturating_add(1);
+        let committed_updated_unix_ms = manifest.control_snapshot.control_state.updated_unix_ms;
+        write_cluster_snapshot_manifest_file(&manifest_path, &manifest)
+            .expect("modified manifest should persist");
+
+        std::fs::create_dir_all(&offline_restore_root).expect("offline restore root should exist");
+        std::fs::create_dir(&report_path)
+            .expect("report target directory should inject a publication failure");
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let restore_response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": manifest_path.to_string_lossy(),
+                    "restoreRoot": restore_root.to_string_lossy(),
+                    "reportPath": report_path.to_string_lossy(),
+                }))
+                .expect("json should encode"),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            restore_response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&restore_response.body)
+        );
         let restore_body: JsonValue =
             serde_json::from_slice(&restore_response.body).expect("valid JSON");
-        assert_eq!(restore_body["errorType"], "restore_failed");
-        assert_eq!(consensus.current_state(), state_before_restore);
+        assert_eq!(restore_body["status"], "success");
+        assert_eq!(restore_body["data"]["reportPending"], true);
+        assert_eq!(restore_body["data"]["degraded"], true);
+        assert!(restore_body["data"]["reportDetail"]
+            .as_str()
+            .is_some_and(|detail| detail.len() <= MAX_WRITE_REJECTION_MESSAGE_BYTES));
+        assert_eq!(
+            consensus.current_state().updated_unix_ms,
+            committed_updated_unix_ms,
+            "control state must stay committed when report publication fails"
+        );
+        assert!(report_path.is_dir());
+        drop(offline_restore_disk_budget);
 
-        storage.close().expect("storage should close");
+        let restored_path = restore_root.join("nodes").join("node-a").join("data");
+        let restored_storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&restored_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("restored storage should build");
+        assert_eq!(
+            restored_storage
+                .select("degraded_report_restore_metric", &[], 0, 10)
+                .expect("restored metric should be readable"),
+            vec![DataPoint::new(7, 7.0)]
+        );
+        restored_storage
+            .close()
+            .expect("restored storage should close");
+        storage.close().expect("source storage should close");
     }
 
     #[tokio::test]
@@ -17699,7 +18915,8 @@ mod tests {
         let source_local_path = temp_dir.path().join("source-local");
         let source_remote_path = temp_dir.path().join("source-remote");
         let snapshot_root = temp_dir.path().join("cluster-snapshot");
-        let restore_root = temp_dir.path().join("cluster-restored");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_root = offline_restore_root.join("cluster-restored");
 
         let local_storage: Arc<dyn Storage> = StorageBuilder::new()
             .with_data_path(&source_local_path)
@@ -17714,8 +18931,20 @@ mod tests {
             .build()
             .expect("remote source storage should build");
 
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(128 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
         let (remote_endpoint, _request_count, remote_shutdown_tx, remote_server) =
-            spawn_internal_storage_peer(Arc::clone(&remote_storage)).await;
+            spawn_internal_storage_peer_with_restore_budget(
+                Arc::clone(&remote_storage),
+                Arc::clone(&offline_restore_disk_budget),
+            )
+            .await;
 
         let config = ClusterConfig {
             enabled: true,
@@ -17821,16 +19050,16 @@ mod tests {
             }))
             .expect("json should encode"),
         };
-        let restore_response = handle_request_with_admin_and_cluster(
+        let restore_response = handle_test_request(
             &local_storage,
             &engine,
             restore_request,
-            start_time(),
-            TimestampPrecision::Milliseconds,
-            true,
-            None,
-            None,
-            Some(cluster_context.as_ref()),
+            TestRequestOptions {
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
         )
         .await;
         assert_eq!(restore_response.status, 200);
@@ -17843,6 +19072,13 @@ mod tests {
             .as_str()
             .expect("reportPath should be present");
         assert!(Path::new(report_path).exists());
+        assert_eq!(restore_body["data"]["reportPending"], false);
+
+        let _ = remote_shutdown_tx.send(());
+        remote_server
+            .await
+            .expect("remote server should stop cleanly");
+        drop(offline_restore_disk_budget);
 
         let restored_remote_path = restore_root.join("nodes").join("node-b").join("data");
         let restored_local_path = restore_root.join("nodes").join("node-a").join("data");
@@ -17876,8 +19112,10 @@ mod tests {
             restored_shutdown_tx,
             restored_remote_server,
         ) = spawn_internal_storage_peer(Arc::clone(&restored_remote_storage)).await;
+        let restored_cluster_temp_dir =
+            TempDir::new().expect("restored cluster tempdir should build");
         let restored_cluster_context = cluster_context_with_control_state_for_config(
-            &temp_dir,
+            &restored_cluster_temp_dir,
             ClusterConfig {
                 enabled: true,
                 node_id: Some("node-a".to_string()),
@@ -17916,10 +19154,6 @@ mod tests {
         restored_remote_server
             .await
             .expect("restored remote server should stop cleanly");
-        let _ = remote_shutdown_tx.send(());
-        remote_server
-            .await
-            .expect("remote server should stop cleanly");
         restored_local_storage
             .close()
             .expect("restored local storage should close");
@@ -19120,9 +20354,28 @@ mod tests {
         );
         assert_eq!(body["data"]["effectiveStorageLimits"]["persistent"], false);
         assert_eq!(body["data"]["effectiveStorageLimits"]["walEnabled"], false);
-        assert!(body["data"]["effectiveStorageLimits"]["accountedMemoryBytes"].is_null());
+        assert_eq!(
+            body["data"]["effectiveStorageLimits"]["accountedMemoryBytes"],
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            body["data"]["resourceConfiguration"]["selectedProfile"],
+            "embedded"
+        );
         assert!(body["data"]["effectiveStorageLimits"]["maxConcurrentWriters"].is_number());
         assert!(body["data"]["effectiveStorageLimits"]["writeTimeoutNanos"].is_number());
+        assert_eq!(
+            body["data"]["effectiveStorageLimits"]["maxBackgroundThreads"],
+            0
+        );
+        assert_eq!(body["data"]["backgroundWork"]["maxThreads"], 0);
+        assert_eq!(body["data"]["backgroundWork"]["installedThreads"], 0);
+        assert_eq!(body["data"]["backgroundWork"]["runningThreads"], 0);
+        assert!(body["data"]["backgroundWork"]["flush"]["installed"].is_boolean());
+        assert!(body["data"]["backgroundWork"]["flush"]["intervalNanos"].is_null());
+        assert_eq!(body["data"]["backgroundWork"]["flush"]["maxConcurrency"], 1);
+        assert!(body["data"]["backgroundWork"]["flush"]["idleWaitsTotal"].is_number());
+        assert!(body["data"]["backgroundWork"]["flush"]["interval_nanos"].is_null());
         assert!(body["data"]["memory"]["accountedBytes"].is_number());
         assert!(body["data"]["memory"]["estimatedAccountedBytes"].is_number());
         assert!(body["data"]["memory"]["budgetedBytes"].is_number());
@@ -19133,6 +20386,12 @@ mod tests {
         assert!(body["data"]["memory"]["registryBytes"].is_number());
         assert!(body["data"]["memory"]["persistedIndexBytes"].is_number());
         assert!(body["data"]["memory"]["persistedMmapBytes"].is_number());
+        assert!(body["data"]["memory"]["walSeriesDefinitionCacheBytes"].is_number());
+        assert!(body["data"]["memory"]["writeTransientBytes"].is_number());
+        assert!(body["data"]["memory"]["peakWriteTransientBytes"].is_number());
+        assert!(body["data"]["memory"]["writeTransientReservationsTotal"].is_number());
+        assert!(body["data"]["memory"]["writeTransientRejectionsTotal"].is_number());
+        assert!(body["data"]["memory"]["writeTransientBytesEstimated"].is_boolean());
         assert!(body["data"]["memory"]["excludedPersistedMmapBytes"].is_number());
         assert!(body["data"]["wal"]["enabled"].is_boolean());
         assert!(body["data"]["wal"]["syncMode"].is_string());
@@ -19140,6 +20399,10 @@ mod tests {
         assert!(body["data"]["wal"]["appendedHighwaterSegment"].is_number());
         assert!(body["data"]["wal"]["durableHighwaterSegment"].is_number());
         assert!(body["data"]["flush"]["pipelineRunsTotal"].is_number());
+        assert!(body["data"]["flush"]["persistInspectedChunksTotal"].is_number());
+        assert!(body["data"]["flush"]["persistSelectedInputBytesTotal"].is_number());
+        assert!(body["data"]["flush"]["persistItemLimitHitsTotal"].is_number());
+        assert!(body["data"]["flush"]["persistByteLimitHitsTotal"].is_number());
         assert!(body["data"]["flush"]["hotSegmentsVisible"].is_number());
         assert!(body["data"]["compaction"]["runsTotal"].is_number());
         assert!(body["data"]["query"]["selectCallsTotal"].is_number());
@@ -19147,6 +20410,17 @@ mod tests {
         assert!(body["data"]["query"]["rollupQueryPlansTotal"].is_number());
         assert!(body["data"]["query"]["partialRollupQueryPlansTotal"].is_number());
         assert!(body["data"]["query"]["rollupPointsReadTotal"].is_number());
+        assert!(body["data"]["queryBudget"]["activeQueries"].is_number());
+        assert!(body["data"]["queryBudget"]["sharedReservedMemoryBytes"].is_number());
+        assert_eq!(
+            body["data"]["queryBudget"]["limits"]["maxConcurrentQueries"],
+            8
+        );
+        assert_eq!(
+            body["data"]["queryBudget"]["limits"]["perQuery"]["maxSteps"],
+            1_000_000
+        );
+        assert!(body["data"]["queryBudget"]["stepsRejectionsTotal"].is_number());
         assert!(body["data"]["rollups"]["workerRunsTotal"].is_number());
         assert!(body["data"]["rollups"]["policies"].is_array());
         assert!(body["data"]["remoteStorage"]["enabled"].is_boolean());
@@ -19189,6 +20463,9 @@ mod tests {
         assert!(body["data"]["legacyIngest"]["graphite"]["enabled"].is_boolean());
         assert!(body["data"]["legacyIngest"]["graphite"]["maxLineBytes"].is_number());
         assert!(body["data"]["edgeSync"]["source"]["enabled"].is_boolean());
+        assert!(body["data"]["edgeSync"]["source"]["persistenceFenced"].is_boolean());
+        assert!(body["data"]["edgeSync"]["source"]["cleanupPending"].is_boolean());
+        assert!(body["data"]["edgeSync"]["source"]["degraded"].is_boolean());
         assert!(body["data"]["edgeSync"]["accept"]["enabled"].is_boolean());
         assert!(body["data"]["admission"]["publicRead"]["rejectionsTotal"].is_number());
         assert!(body["data"]["admission"]["publicRead"]["requestSlotRejectionsTotal"].is_number());
@@ -19225,6 +20502,11 @@ mod tests {
         assert!(body["data"]["admission"]["tenant"]["surfaceActiveUnits"]["metadata"].is_number());
         assert!(body["data"]["admission"]["tenant"]["currentTenant"].is_null());
         assert!(body["data"]["cluster"]["writeRouting"]["requestsTotal"].is_number());
+        assert!(body["data"]["cluster"]["audit"]["enabled"].is_boolean());
+        assert!(body["data"]["cluster"]["audit"]["retainedEntries"].is_number());
+        assert!(body["data"]["cluster"]["audit"]["cleanupPending"].is_boolean());
+        assert!(body["data"]["cluster"]["audit"]["persistenceFenced"].is_boolean());
+        assert!(body["data"]["cluster"]["audit"]["degraded"].is_boolean());
         assert!(body["data"]["cluster"]["writeRouting"]["hotShards"].is_array());
         assert!(body["data"]["cluster"]["readFanout"]["requestsTotal"].is_number());
         assert!(body["data"]["cluster"]["readFanout"]["operations"].is_array());
@@ -19257,6 +20539,9 @@ mod tests {
         assert!(body["data"]["cluster"]["writeOutbox"]["stalledPeerDetails"].is_array());
         assert!(body["data"]["cluster"]["control"]["currentTerm"].is_number());
         assert!(body["data"]["cluster"]["control"]["leaderStale"].is_boolean());
+        assert!(body["data"]["cluster"]["control"]["persistence"]["fenced"].is_boolean());
+        assert!(body["data"]["cluster"]["control"]["persistence"]["cleanupDebt"].is_boolean());
+        assert!(body["data"]["cluster"]["control"]["persistence"]["degraded"].is_boolean());
         assert!(body["data"]["cluster"]["control"]["peers"].is_array());
         assert!(body["data"]["cluster"]["handoff"]["totalShards"].is_number());
         assert!(body["data"]["cluster"]["handoff"]["inProgressShards"].is_number());
@@ -19353,9 +20638,20 @@ mod tests {
         assert!(limits["walBytes"].is_null());
         assert!(limits["localDiskBytes"].is_null());
         assert!(body["data"]["localDisk"].is_null());
+        assert!(body["data"]["offlineRestoreDisk"].is_null());
         assert_eq!(limits["maxConcurrentWriters"], 2);
         assert_eq!(limits["writeTimeoutNanos"], 29);
         assert_eq!(limits["maxActivePartitionHeadsPerSeries"], 3);
+        let resources = &body["data"]["resourceConfiguration"];
+        assert_eq!(resources["schemaVersion"], 1);
+        assert_eq!(resources["selectedProfile"], "embedded");
+        assert_eq!(
+            resources["resolvedLimits"]["storage"]["accounted_memory_bytes"],
+            8 * 1024 * 1024
+        );
+        assert!(resources["overrides"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("accounted_memory"))));
         assert_eq!(
             body["data"]["memory"]["pressure"]["approachingLimitBasisPoints"],
             9_000
@@ -19396,6 +20692,18 @@ mod tests {
         assert_eq!(limits["localDiskBytes"], 8 * 1024 * 1024);
         assert_eq!(limits["filesystemFreeHeadroomBytes"], 2048);
         assert_eq!(limits["maintenanceTempReserveBytes"], 4096);
+        assert_eq!(limits["maxBackgroundThreads"], 4);
+        assert_eq!(limits["maxFlushConcurrency"], 1);
+        assert_eq!(limits["maxCompactionConcurrency"], 1);
+        assert_eq!(limits["maxRollupConcurrency"], 1);
+        assert_eq!(limits["flushIntervalNanos"], 250_000_000_u64);
+        assert_eq!(limits["compactionIntervalNanos"], 5_000_000_000_u64);
+        let background = &status_body["data"]["backgroundWork"];
+        assert_eq!(background["maxThreads"], 4);
+        assert_eq!(background["installedThreads"], 4);
+        assert_eq!(background["flush"]["intervalNanos"], 250_000_000_u64);
+        assert_eq!(background["flush"]["maxConcurrency"], 1);
+        assert!(background["flush"]["startsTotal"].is_number());
         let disk = &status_body["data"]["localDisk"];
         assert_eq!(disk["limits"]["maxBytes"], 8 * 1024 * 1024);
         assert_eq!(disk["activeReservations"], 0);
@@ -19419,6 +20727,13 @@ mod tests {
         assert!(metrics_body.contains("tsink_local_disk_accounted_bytes"));
         assert!(metrics_body.contains("tsink_local_disk_limit_bytes 8388608"));
         assert!(metrics_body.contains("tsink_local_disk_reconciliations_total"));
+        assert!(metrics_body.contains("tsink_background_threads{state=\"limit\"} 4"));
+        assert!(metrics_body.contains(
+            "tsink_background_worker_state{worker=\"flush\",state=\"max_concurrency\"} 1"
+        ));
+        assert!(metrics_body.contains(
+            "tsink_background_worker_events_total{worker=\"persisted_refresh\",event=\"idle_waits\"}"
+        ));
 
         storage.close().unwrap();
     }
@@ -19428,10 +20743,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let object_store_path = dir.path().join("object-store");
         let server_data_path = dir.path().join("server-data");
+        let offline_restore_path = dir.path().join("offline-restores");
         std::fs::create_dir_all(&server_data_path).unwrap();
         std::fs::write(
             server_data_path.join("owned-server-state.bin"),
             b"server-state",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&offline_restore_path).unwrap();
+        std::fs::write(
+            offline_restore_path.join("offline-restore-state.bin"),
+            b"offline-restore",
         )
         .unwrap();
         let storage = StorageBuilder::new()
@@ -19449,6 +20771,15 @@ mod tests {
             },
         )
         .unwrap();
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_path,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(654_321),
+                filesystem_free_headroom_bytes: 13,
+                maintenance_temp_reserve_bytes: 0,
+            },
+        )
+        .unwrap();
 
         let status = handle_test_request(
             &storage,
@@ -19461,6 +20792,7 @@ mod tests {
             },
             TestRequestOptions {
                 local_disk_budget: Some(local_disk_budget.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
                 ..TestRequestOptions::default()
             },
         )
@@ -19475,6 +20807,14 @@ mod tests {
             status_body["data"]["localDisk"]["accountedBytes"],
             b"server-state".len()
         );
+        assert_eq!(
+            status_body["data"]["offlineRestoreDisk"]["limits"]["maxBytes"],
+            654_321
+        );
+        assert_eq!(
+            status_body["data"]["offlineRestoreDisk"]["accountedBytes"],
+            b"offline-restore".len()
+        );
 
         let metrics = handle_test_request(
             &storage,
@@ -19487,6 +20827,7 @@ mod tests {
             },
             TestRequestOptions {
                 local_disk_budget: Some(local_disk_budget.as_ref()),
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
                 ..TestRequestOptions::default()
             },
         )
@@ -19495,6 +20836,9 @@ mod tests {
         let metrics_body = std::str::from_utf8(&metrics.body).unwrap();
         assert!(metrics_body.contains("tsink_local_disk_accounted_bytes 12"));
         assert!(metrics_body.contains("tsink_local_disk_limit_bytes 123456"));
+        assert!(metrics_body.contains("tsink_offline_restore_disk_accounted_bytes 15"));
+        assert!(metrics_body.contains("tsink_offline_restore_disk_limit_bytes 654321"));
+        assert!(!metrics_body.contains(&offline_restore_path.to_string_lossy().to_string()));
 
         storage.close().unwrap();
     }
@@ -19785,7 +21129,21 @@ mod tests {
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
         let exemplar_store = make_exemplar_store(None);
-        let usage_accounting = UsageAccounting::open(None).expect("usage accounting should open");
+        let mut usage_limits = crate::usage::UsageLedgerLimits::default();
+        usage_limits.recent_records = 1;
+        let usage_accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, usage_limits, None)
+                .expect("usage accounting should open");
+        for _ in 0..3 {
+            usage_accounting
+                .record(UsageRecordInput::success(
+                    "team-a",
+                    UsageCategory::Query,
+                    "support_bundle_summary",
+                    "test",
+                ))
+                .expect("usage record should append");
+        }
         let engine = make_engine(&storage);
         let disk_root = TempDir::new().expect("disk root should build");
         let local_disk_budget = tsink::LocalDiskBudget::open(
@@ -19854,6 +21212,12 @@ mod tests {
             "team-a"
         );
         assert_eq!(body["sections"]["usage"]["httpStatus"], 200);
+        let usage = &body["sections"]["usage"]["body"]["data"];
+        assert_eq!(usage["journal"]["retainedRecords"], 1);
+        assert_eq!(usage["report"]["page"]["allTimeExact"], true);
+        assert_eq!(usage["report"]["page"]["rawHistoryComplete"], false);
+        assert_eq!(usage["report"]["page"]["recordsAggregated"], 3);
+        assert_eq!(usage["report"]["tenants"][0]["query"]["eventsTotal"], 3);
         assert_eq!(
             body["sections"]["statusTsdb"]["body"]["data"]["localDisk"]["limits"]["maxBytes"],
             4_096
@@ -20184,6 +21548,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_snapshot_rejects_destination_inside_offline_restore_root() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let snapshot_path = offline_restore_root.join("forbidden-snapshot");
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("storage should build");
+        let engine = make_engine(&storage);
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/snapshot".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "path": snapshot_path.to_string_lossy()
+                }))
+                .expect("json should encode"),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status, 422);
+        let body: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("snapshot response should decode");
+        assert_eq!(body.code, "invalid_snapshot_path");
+        assert!(!body.retryable);
+        assert!(!snapshot_path.exists());
+        storage.close().expect("storage should close");
+    }
+
+    #[tokio::test]
     async fn rules_snapshot_failure_removes_the_composite_snapshot_destination() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let source_path = temp_dir.path().join("source");
@@ -20222,7 +21638,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir");
         let source_path = temp_dir.path().join("source");
         let snapshot_path = temp_dir.path().join("snapshot");
-        let restore_path = temp_dir.path().join("restored");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_path = offline_restore_root.join("restored");
 
         let source_storage: Arc<dyn Storage> = StorageBuilder::new()
             .with_data_path(&source_path)
@@ -20250,17 +21667,27 @@ mod tests {
             .expect("json should encode"),
         };
 
-        let response = handle_request_with_admin(
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let response = handle_test_request(
             &storage,
             &engine,
             request,
-            start_time(),
-            TimestampPrecision::Milliseconds,
-            true,
-            None,
+            TestRequestOptions {
+                admin_api_enabled: true,
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
         )
         .await;
         assert_eq!(response.status, 200);
+        drop(offline_restore_disk_budget);
 
         let restored_storage = StorageBuilder::new()
             .with_data_path(&restore_path)
@@ -20275,6 +21702,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_restore_fails_closed_without_an_offline_restore_budget() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/restore".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 503);
+        let body: JsonValue = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "offline_restore_unconfigured");
+        assert_eq!(body["retryable"], false);
+        storage.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_restore_maps_offline_quota_and_target_validation_to_typed_errors() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_path).unwrap();
+        std::fs::write(snapshot_path.join("payload.bin"), b"snapshot-payload").unwrap();
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let quota_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(1),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let quota_target = offline_restore_root.join("quota-target");
+
+        let quota_response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/restore".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "snapshotPath": snapshot_path,
+                    "dataPath": quota_target,
+                }))
+                .unwrap(),
+            },
+            TestRequestOptions {
+                admin_api_enabled: true,
+                offline_restore_disk_budget: Some(&quota_budget),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(quota_response.status, 413);
+        assert_eq!(
+            response_header(&quota_response, WRITE_ERROR_CODE_HEADER),
+            Some("write_disk_quota_exceeded")
+        );
+        let quota_body: JsonValue = serde_json::from_slice(&quota_response.body).unwrap();
+        assert_eq!(quota_body["code"], "write_disk_quota_exceeded");
+        assert_eq!(quota_body["retryable"], false);
+        assert!(!quota_target.exists());
+        drop(quota_budget);
+
+        let roomy_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("roomy offline restore disk budget should open");
+        for invalid_target in [
+            offline_restore_root.clone(),
+            temp_dir.path().join("outside-offline-root"),
+        ] {
+            let response = handle_test_request(
+                &storage,
+                &engine,
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/api/v1/admin/restore".to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                    body: serde_json::to_vec(&json!({
+                        "snapshotPath": snapshot_path,
+                        "dataPath": invalid_target,
+                    }))
+                    .unwrap(),
+                },
+                TestRequestOptions {
+                    admin_api_enabled: true,
+                    offline_restore_disk_budget: Some(&roomy_budget),
+                    ..TestRequestOptions::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status, 422);
+            let body: JsonValue = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["code"], "invalid_restore_path");
+            assert_eq!(body["retryable"], false);
+        }
+        storage.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn admin_restore_rejects_targets_overlapping_the_live_data_root() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let snapshot_path = temp_dir.path().join("snapshot");
@@ -20286,6 +21836,14 @@ mod tests {
         let local_disk_budget =
             tsink::LocalDiskBudget::open(&live_data_path, tsink::LocalDiskLimits::default())
                 .expect("live disk budget should open");
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            temp_dir.path().join("offline-restores"),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
         let storage = make_storage();
         let engine = make_engine(&storage);
 
@@ -20312,6 +21870,7 @@ mod tests {
                 TestRequestOptions {
                     admin_api_enabled: true,
                     local_disk_budget: Some(local_disk_budget.as_ref()),
+                    offline_restore_disk_budget: Some(&offline_restore_disk_budget),
                     ..TestRequestOptions::default()
                 },
             )
@@ -20331,7 +21890,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir");
         let source_path = temp_dir.path().join("source");
         let snapshot_path = temp_dir.path().join("snapshot");
-        let restore_path = temp_dir.path().join("restored");
+        let offline_restore_root = temp_dir.path().join("offline-restores");
+        let restore_path = offline_restore_root.join("restored");
 
         let storage = make_persistent_storage(&source_path);
         let metadata_store = make_metadata_store(Some(&source_path));
@@ -20423,7 +21983,15 @@ mod tests {
 
         let restore_driver_storage = make_storage();
         let restore_driver_engine = make_engine(&restore_driver_storage);
-        let restore_response = handle_request_with_admin(
+        let offline_restore_disk_budget = tsink::LocalDiskBudget::open(
+            &offline_restore_root,
+            tsink::LocalDiskLimits {
+                max_bytes: Some(64 * 1024 * 1024),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
+        let restore_response = handle_test_request(
             &restore_driver_storage,
             &restore_driver_engine,
             HttpRequest {
@@ -20439,13 +22007,15 @@ mod tests {
                 }))
                 .expect("json should encode"),
             },
-            start_time(),
-            TimestampPrecision::Milliseconds,
-            true,
-            None,
+            TestRequestOptions {
+                admin_api_enabled: true,
+                offline_restore_disk_budget: Some(&offline_restore_disk_budget),
+                ..TestRequestOptions::default()
+            },
         )
         .await;
         assert_eq!(restore_response.status, 200);
+        drop(offline_restore_disk_budget);
         restore_driver_storage
             .close()
             .expect("restore driver storage should close");

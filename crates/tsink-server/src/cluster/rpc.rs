@@ -41,6 +41,7 @@ pub const CLUSTER_CAPABILITY_CONTROL_STATE_V1: &str = "control_state_v1";
 pub const CLUSTER_CAPABILITY_CONTROL_LOG_V1: &str = "control_log_v1";
 pub const CLUSTER_CAPABILITY_CONTROL_RECOVERY_SNAPSHOT_V1: &str = "control_recovery_snapshot_v1";
 pub const CLUSTER_CAPABILITY_CLUSTER_SNAPSHOT_V1: &str = "cluster_snapshot_v1";
+pub const CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1: &str = "budgeted_restore_v1";
 pub const CLUSTER_CAPABILITY_METADATA_INGEST_V1: &str = "metadata_ingest_v1";
 pub const CLUSTER_CAPABILITY_METADATA_STORE_V1: &str = "metadata_store_v1";
 
@@ -92,7 +93,7 @@ pub const HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES: [&str; 2] = [
     CLUSTER_CAPABILITY_HISTOGRAM_STORAGE_V1,
 ];
 
-pub fn default_cluster_capabilities() -> [&'static str; 13] {
+pub fn default_cluster_capabilities() -> [&'static str; 14] {
     [
         CLUSTER_CAPABILITY_RPC_V1,
         CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1,
@@ -101,6 +102,7 @@ pub fn default_cluster_capabilities() -> [&'static str; 13] {
         CLUSTER_CAPABILITY_CONTROL_LOG_V1,
         CLUSTER_CAPABILITY_CONTROL_RECOVERY_SNAPSHOT_V1,
         CLUSTER_CAPABILITY_CLUSTER_SNAPSHOT_V1,
+        CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1,
         CLUSTER_CAPABILITY_METADATA_INGEST_V1,
         CLUSTER_CAPABILITY_METADATA_STORE_V1,
         CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1,
@@ -1127,12 +1129,12 @@ impl RpcClient {
             .await
     }
 
-    pub async fn data_restore(
+    pub async fn data_restore_budgeted(
         &self,
         endpoint: &str,
         request: &InternalDataRestoreRequest,
     ) -> Result<InternalDataRestoreResponse, RpcError> {
-        self.post_json(endpoint, "/internal/v1/restore_data", request)
+        self.post_json(endpoint, "/internal/v1/restore_data_budgeted", request)
             .await
     }
 
@@ -1972,6 +1974,64 @@ mod tests {
             .expect("RPC call should succeed");
         assert!(response.series.is_empty());
 
+        server.await.expect("server task should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn budgeted_restore_rpc_never_falls_back_to_legacy_restore_path() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection expected");
+            let mut read_buffer = Vec::new();
+            let request = read_http_request(&mut stream, &mut read_buffer)
+                .await
+                .expect("request should parse");
+            assert_eq!(
+                request.path_without_query(),
+                "/internal/v1/restore_data_budgeted"
+            );
+            let payload: InternalDataRestoreRequest =
+                serde_json::from_slice(&request.body).expect("request body should decode");
+            assert_eq!(payload.snapshot_path, "/snapshots/node-a");
+            assert_eq!(payload.data_path, "/offline-restores/node-a");
+            write_http_response(&mut stream, &text_response(404, "not found"))
+                .await
+                .expect("response write should succeed");
+        });
+
+        let client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(500),
+            max_retries: 3,
+            protocol_version: INTERNAL_RPC_PROTOCOL_VERSION.to_string(),
+            internal_auth_token: "cluster-shared-token".to_string(),
+            internal_auth_runtime: None,
+            local_node_id: "node-a".to_string(),
+            compatibility: CompatibilityProfile::default(),
+            internal_mtls: None,
+        });
+        let err = client
+            .data_restore_budgeted(
+                &addr.to_string(),
+                &InternalDataRestoreRequest {
+                    snapshot_path: "/snapshots/node-a".to_string(),
+                    data_path: "/offline-restores/node-a".to_string(),
+                },
+            )
+            .await
+            .expect_err("an old peer without the new route must be rejected");
+        match err {
+            RpcError::HttpStatus { path, status, .. } => {
+                assert_eq!(path, "/internal/v1/restore_data_budgeted");
+                assert_eq!(status, 404);
+            }
+            other => panic!("expected HTTP status error, got {other:?}"),
+        }
         server.await.expect("server task should complete");
     }
 

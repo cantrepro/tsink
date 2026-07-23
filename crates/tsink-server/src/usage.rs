@@ -1,6 +1,6 @@
 use crate::tenant;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -16,6 +16,171 @@ const USAGE_LEDGER_BATCH_SCHEMA_VERSION: u16 = 1;
 const ESTIMATED_SERIES_OVERHEAD_BYTES: u64 = 64;
 const ESTIMATED_SAMPLE_BYTES: u64 = 16;
 const STORAGE_RECONCILE_BATCH_SIZE: usize = 128;
+const USAGE_LEDGER_STARTUP_READER_MAX_BYTES: usize = 8 * 1024;
+const USAGE_LEDGER_STARTUP_INDEX_ALLOWANCE_BYTES: usize = 64;
+
+pub const DEFAULT_USAGE_LEDGER_RECENT_RECORDS: usize = 8_192;
+pub const DEFAULT_USAGE_LEDGER_MAX_TENANTS: usize = 4_096;
+pub const DEFAULT_USAGE_LEDGER_MAX_RECORD_BYTES: usize = 64 * 1024;
+pub const DEFAULT_USAGE_LEDGER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_USAGE_LEDGER_MAX_LINE_BYTES: usize = DEFAULT_USAGE_LEDGER_MAX_FRAME_BYTES + 1;
+pub const DEFAULT_USAGE_LEDGER_MAX_BATCH_RECORDS: usize = 4_096;
+pub const DEFAULT_USAGE_LEDGER_STARTUP_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_USAGE_LEDGER_MAX_SEQUENCE_RANGES: usize = 4_096;
+pub const DEFAULT_USAGE_REPORT_RECORDS: usize = 1_000;
+pub const DEFAULT_USAGE_REPORT_MAX_RECORDS: usize = 4_096;
+pub const DEFAULT_USAGE_REPORT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_USAGE_EXPORT_RECORDS: usize = 1_000;
+pub const DEFAULT_USAGE_EXPORT_MAX_RECORDS: usize = 4_096;
+pub const DEFAULT_USAGE_EXPORT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLedgerLimits {
+    pub recent_records: usize,
+    pub max_tenants: usize,
+    pub max_record_bytes: usize,
+    pub max_frame_bytes: usize,
+    pub max_line_bytes: usize,
+    pub max_batch_records: usize,
+    pub startup_scratch_bytes: usize,
+    pub max_sequence_ranges: usize,
+    pub report_default_records: usize,
+    pub report_max_records: usize,
+    pub report_max_response_bytes: usize,
+    pub export_default_records: usize,
+    pub export_max_records: usize,
+    pub export_max_response_bytes: usize,
+}
+
+impl Default for UsageLedgerLimits {
+    fn default() -> Self {
+        Self {
+            recent_records: DEFAULT_USAGE_LEDGER_RECENT_RECORDS,
+            max_tenants: DEFAULT_USAGE_LEDGER_MAX_TENANTS,
+            max_record_bytes: DEFAULT_USAGE_LEDGER_MAX_RECORD_BYTES,
+            max_frame_bytes: DEFAULT_USAGE_LEDGER_MAX_FRAME_BYTES,
+            max_line_bytes: DEFAULT_USAGE_LEDGER_MAX_LINE_BYTES,
+            max_batch_records: DEFAULT_USAGE_LEDGER_MAX_BATCH_RECORDS,
+            startup_scratch_bytes: DEFAULT_USAGE_LEDGER_STARTUP_SCRATCH_BYTES,
+            max_sequence_ranges: DEFAULT_USAGE_LEDGER_MAX_SEQUENCE_RANGES,
+            report_default_records: DEFAULT_USAGE_REPORT_RECORDS,
+            report_max_records: DEFAULT_USAGE_REPORT_MAX_RECORDS,
+            report_max_response_bytes: DEFAULT_USAGE_REPORT_MAX_RESPONSE_BYTES,
+            export_default_records: DEFAULT_USAGE_EXPORT_RECORDS,
+            export_max_records: DEFAULT_USAGE_EXPORT_MAX_RECORDS,
+            export_max_response_bytes: DEFAULT_USAGE_EXPORT_MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
+impl UsageLedgerLimits {
+    pub fn validate(self) -> Result<Self, String> {
+        for (name, value) in [
+            ("recent records", self.recent_records),
+            ("maximum tenants", self.max_tenants),
+            ("maximum record bytes", self.max_record_bytes),
+            ("maximum frame bytes", self.max_frame_bytes),
+            ("maximum line bytes", self.max_line_bytes),
+            ("maximum batch records", self.max_batch_records),
+            ("startup scratch bytes", self.startup_scratch_bytes),
+            ("maximum sequence ranges", self.max_sequence_ranges),
+            ("report default records", self.report_default_records),
+            ("report maximum records", self.report_max_records),
+            (
+                "report maximum response bytes",
+                self.report_max_response_bytes,
+            ),
+            ("export default records", self.export_default_records),
+            ("export maximum records", self.export_max_records),
+            (
+                "export maximum response bytes",
+                self.export_max_response_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("usage ledger {name} must be greater than zero"));
+            }
+        }
+        if self.max_frame_bytes < self.max_record_bytes {
+            return Err(
+                "usage ledger maximum frame bytes must be at least maximum record bytes"
+                    .to_string(),
+            );
+        }
+        let frame_line_bytes = self.max_frame_bytes.checked_add(1).ok_or_else(|| {
+            "usage ledger maximum frame bytes leaves no room for a newline".to_string()
+        })?;
+        if self.max_line_bytes < frame_line_bytes {
+            return Err(
+                "usage ledger maximum line bytes must fit the maximum frame plus its newline"
+                    .to_string(),
+            );
+        }
+        if self.max_batch_records < self.max_tenants {
+            return Err(
+                "usage ledger maximum batch records must be at least maximum tenants so storage reconciliation remains atomic"
+                    .to_string(),
+            );
+        }
+        if self.report_default_records > self.report_max_records {
+            return Err(
+                "usage report default records must not exceed its maximum records".to_string(),
+            );
+        }
+        if self.export_default_records > self.export_max_records {
+            return Err(
+                "usage export default records must not exceed its maximum records".to_string(),
+            );
+        }
+        let record_line_bytes = self.max_record_bytes.checked_add(1).ok_or_else(|| {
+            "usage ledger maximum record bytes leaves no room for a newline".to_string()
+        })?;
+        if self.export_max_response_bytes < record_line_bytes {
+            return Err(
+                "usage export maximum response bytes must fit one maximum-size record plus its newline"
+                    .to_string(),
+            );
+        }
+        // JSON string storage is bounded by the frame bytes. Reserve two record-slot arrays for
+        // the decoder's geometric Vec capacity, plus the fixed line/reader buffers and bounded
+        // temporary sequence/recent indexes used while constructing the final state.
+        let minimum_startup_scratch = self
+            .max_line_bytes
+            .checked_add(self.max_frame_bytes)
+            .and_then(|bytes| {
+                self.max_batch_records
+                    .checked_mul(std::mem::size_of::<UsageLedgerRecord>().saturating_mul(2))
+                    .and_then(|record_slots| bytes.checked_add(record_slots))
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.max_line_bytes
+                        .min(USAGE_LEDGER_STARTUP_READER_MAX_BYTES),
+                )
+            })
+            .and_then(|bytes| {
+                self.max_sequence_ranges
+                    .checked_mul(USAGE_LEDGER_STARTUP_INDEX_ALLOWANCE_BYTES)
+                    .and_then(|range_index| bytes.checked_add(range_index))
+            })
+            .and_then(|bytes| {
+                self.recent_records
+                    .checked_mul(
+                        std::mem::size_of::<UsageLedgerRecord>()
+                            .saturating_add(USAGE_LEDGER_STARTUP_INDEX_ALLOWANCE_BYTES),
+                    )
+                    .and_then(|recent_index| bytes.checked_add(recent_index))
+            })
+            .ok_or_else(|| "usage ledger startup scratch limits overflow usize".to_string())?;
+        if self.startup_scratch_bytes < minimum_startup_scratch {
+            return Err(format!(
+                "usage ledger startup scratch bytes must be at least {minimum_startup_scratch} for the configured line, frame, and batch limits"
+            ));
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -141,6 +306,9 @@ pub struct UsageLedgerStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger_path: Option<String>,
     pub records_total: u64,
+    pub retained_records: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_retained_sequence: Option<u64>,
     pub tenant_count: u64,
     pub last_sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,12 +317,14 @@ pub struct UsageLedgerStatus {
     pub record_failures_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_record_error_code: Option<String>,
+    pub limits: UsageLedgerLimits,
 }
 
 #[derive(Debug)]
 pub enum UsageAccountingError {
     Disk(tsink::TsinkError),
     Persistence(String),
+    Limit(String),
     Other(String),
 }
 
@@ -162,7 +332,7 @@ impl UsageAccountingError {
     pub fn disk_error(&self) -> Option<&tsink::TsinkError> {
         match self {
             Self::Disk(err) => Some(err),
-            Self::Persistence(_) | Self::Other(_) => None,
+            Self::Persistence(_) | Self::Limit(_) | Self::Other(_) => None,
         }
     }
 
@@ -179,6 +349,7 @@ impl UsageAccountingError {
             ) => "usage_ledger_disk_quota_exceeded",
             Self::Disk(_) => "usage_ledger_disk_error",
             Self::Persistence(_) => "usage_ledger_persistence_error",
+            Self::Limit(_) => "usage_ledger_limit_exceeded",
             Self::Other(_) => "usage_accounting_error",
         }
     }
@@ -188,7 +359,9 @@ impl fmt::Display for UsageAccountingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disk(err) => write!(formatter, "{err}"),
-            Self::Persistence(message) | Self::Other(message) => formatter.write_str(message),
+            Self::Persistence(message) | Self::Limit(message) | Self::Other(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -207,16 +380,144 @@ pub struct UsageReportFilter {
     pub bucket_width: UsageBucketWidth,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReadPage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_after_sequence: Option<u64>,
+    pub snapshot_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_available_sequence: Option<u64>,
+    pub records_aggregated: u64,
+    pub limit: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_sequence: Option<u64>,
+    pub all_time_exact: bool,
+    pub raw_history_complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageReport {
     pub filter: UsageReportFilter,
     pub journal: UsageLedgerStatus,
+    pub page: UsageReadPage,
     #[serde(default)]
     pub tenants: Vec<UsageTenantSummary>,
     #[serde(default)]
     pub buckets: Vec<UsageBucketSummary>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageReadOptions {
+    pub after_sequence: Option<u64>,
+    pub snapshot_sequence: Option<u64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExportPage {
+    #[serde(default)]
+    pub records: Vec<UsageLedgerRecord>,
+    pub snapshot_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_available_sequence: Option<u64>,
+    pub records_returned: usize,
+    pub response_bytes: usize,
+    pub has_more: bool,
+    pub raw_history_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageReadError {
+    InvalidLimit {
+        requested: usize,
+        maximum: usize,
+    },
+    InvalidResponseBytes {
+        requested: usize,
+        maximum: usize,
+    },
+    InvalidSnapshot {
+        requested: u64,
+        latest: u64,
+    },
+    CursorExpired {
+        requested_after: u64,
+        earliest_available: u64,
+    },
+    RecordExceedsResponseLimit {
+        sequence: u64,
+        required_bytes: usize,
+        maximum_bytes: usize,
+    },
+    Encoding(String),
+}
+
+impl UsageReadError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidLimit { .. } => "usage_page_limit_invalid",
+            Self::InvalidResponseBytes { .. } => "usage_response_limit_invalid",
+            Self::InvalidSnapshot { .. } => "usage_snapshot_invalid",
+            Self::CursorExpired { .. } => "usage_cursor_expired",
+            Self::RecordExceedsResponseLimit { .. } => "usage_record_exceeds_response_limit",
+            Self::Encoding(_) => "usage_export_encoding_failed",
+        }
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::CursorExpired { .. } => 410,
+            Self::RecordExceedsResponseLimit { .. } => 413,
+            Self::Encoding(_) => 500,
+            Self::InvalidLimit { .. }
+            | Self::InvalidResponseBytes { .. }
+            | Self::InvalidSnapshot { .. } => 400,
+        }
+    }
+}
+
+impl fmt::Display for UsageReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimit { requested, maximum } => write!(
+                formatter,
+                "usage page limit {requested} is outside the configured range 1..={maximum}"
+            ),
+            Self::InvalidResponseBytes { requested, maximum } => write!(
+                formatter,
+                "usage response byte limit {requested} is outside the configured range 1..={maximum}"
+            ),
+            Self::InvalidSnapshot { requested, latest } => write!(
+                formatter,
+                "usage snapshot sequence {requested} is newer than the latest sequence {latest}"
+            ),
+            Self::CursorExpired {
+                requested_after,
+                earliest_available,
+            } => write!(
+                formatter,
+                "usage cursor after sequence {requested_after} is no longer retained; earliest available sequence is {earliest_available}"
+            ),
+            Self::RecordExceedsResponseLimit {
+                sequence,
+                required_bytes,
+                maximum_bytes,
+            } => write!(
+                formatter,
+                "usage record {sequence} requires {required_bytes} response bytes, exceeding the page limit {maximum_bytes}"
+            ),
+            Self::Encoding(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for UsageReadError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -324,15 +625,67 @@ impl<'a> UsageRecordInput<'a> {
 #[derive(Debug)]
 struct UsageLedgerState {
     next_seq: u64,
-    records: Vec<UsageLedgerRecord>,
+    records_total: u64,
+    storage_reconciliations_total: u64,
+    last_sequence: u64,
+    last_record_unix_ms: Option<u64>,
+    records: VecDeque<UsageLedgerRecord>,
+    tenant_summaries: BTreeMap<String, SummaryAccumulator>,
 }
 
 impl Default for UsageLedgerState {
     fn default() -> Self {
         Self {
             next_seq: 1,
-            records: Vec::new(),
+            records_total: 0,
+            storage_reconciliations_total: 0,
+            last_sequence: 0,
+            last_record_unix_ms: None,
+            records: VecDeque::new(),
+            tenant_summaries: BTreeMap::new(),
         }
+    }
+}
+
+impl UsageLedgerState {
+    fn apply_record(
+        &mut self,
+        record: UsageLedgerRecord,
+        limits: UsageLedgerLimits,
+    ) -> Result<(), String> {
+        if !self.tenant_summaries.contains_key(&record.tenant_id)
+            && self.tenant_summaries.len() >= limits.max_tenants
+        {
+            return Err(format!(
+                "usage ledger tenant limit {} exceeded by tenant '{}'",
+                limits.max_tenants, record.tenant_id
+            ));
+        }
+        self.records_total = self
+            .records_total
+            .checked_add(1)
+            .ok_or_else(|| "usage ledger record count is exhausted".to_string())?;
+        if record.category == UsageCategory::Storage {
+            self.storage_reconciliations_total = self
+                .storage_reconciliations_total
+                .checked_add(1)
+                .ok_or_else(|| {
+                    "usage ledger storage reconciliation count is exhausted".to_string()
+                })?;
+        }
+        if record.seq >= self.last_sequence {
+            self.last_sequence = record.seq;
+            self.last_record_unix_ms = Some(record.unix_ms);
+        }
+        self.tenant_summaries
+            .entry(record.tenant_id.clone())
+            .or_default()
+            .apply_all_time(&record);
+        self.records.push_back(record);
+        while self.records.len() > limits.recent_records {
+            self.records.pop_front();
+        }
+        Ok(())
     }
 }
 
@@ -344,6 +697,7 @@ struct UsageLedgerHealth {
 
 #[derive(Debug)]
 struct UsageAccountingInner {
+    limits: UsageLedgerLimits,
     ledger_path: Option<PathBuf>,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
     append_serialization: Mutex<()>,
@@ -362,13 +716,27 @@ pub struct UsageAccounting {
 impl UsageAccounting {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_path: Option<&Path>) -> Result<Arc<Self>, String> {
-        Self::open_with_disk_budget(data_path, None)
+        Self::open_with_limits_and_disk_budget(data_path, UsageLedgerLimits::default(), None)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_with_disk_budget(
         data_path: Option<&Path>,
         local_disk_budget: Option<Arc<LocalDiskBudget>>,
     ) -> Result<Arc<Self>, String> {
+        Self::open_with_limits_and_disk_budget(
+            data_path,
+            UsageLedgerLimits::default(),
+            local_disk_budget,
+        )
+    }
+
+    pub fn open_with_limits_and_disk_budget(
+        data_path: Option<&Path>,
+        limits: UsageLedgerLimits,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Arc<Self>, String> {
+        let limits = limits.validate()?;
         if data_path.is_none() && local_disk_budget.is_some() {
             return Err(
                 "usage accounting cannot use a local disk budget without a data path".to_string(),
@@ -404,7 +772,7 @@ impl UsageAccounting {
                         )
                     })?;
                 }
-                let state = load_usage_ledger(&ledger_path)?;
+                let state = load_usage_ledger(&ledger_path, limits)?;
                 let writer = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -422,6 +790,7 @@ impl UsageAccounting {
 
         Ok(Arc::new(Self {
             inner: Arc::new(UsageAccountingInner {
+                limits,
                 ledger_path,
                 local_disk_budget,
                 append_serialization: Mutex::new(()),
@@ -445,7 +814,16 @@ impl UsageAccounting {
             .health
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ledger_status_from_records(self.inner.ledger_path.as_deref(), &state.records, &health)
+        ledger_status_from_state(
+            self.inner.ledger_path.as_deref(),
+            &state,
+            &health,
+            self.inner.limits,
+        )
+    }
+
+    pub fn limits(&self) -> UsageLedgerLimits {
+        self.inner.limits
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -538,6 +916,24 @@ impl UsageAccounting {
         if records.is_empty() {
             return Ok(records);
         }
+        if records.len() > self.inner.limits.max_batch_records {
+            let err = UsageAccountingError::Limit(format!(
+                "usage ledger batch contains {} records, exceeding the configured maximum {}",
+                records.len(),
+                self.inner.limits.max_batch_records
+            ));
+            self.note_failure(&err);
+            return Err(err);
+        }
+        for record in &records {
+            if let Err(message) =
+                validate_usage_record_size(record, self.inner.limits.max_record_bytes)
+            {
+                let err = UsageAccountingError::Limit(message);
+                self.note_failure(&err);
+                return Err(err);
+            }
+        }
 
         let result = (|| {
             // Serialize sequence allocation, durable append, and publication without holding the
@@ -548,12 +944,15 @@ impl UsageAccounting {
                 .append_serialization
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let initial_next_seq = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .next_seq;
+            let initial_next_seq = {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                validate_append_tenants(&state, &records, self.inner.limits)?;
+                state.next_seq
+            };
             let mut next_seq = initial_next_seq;
             for record in &mut records {
                 record.seq = next_seq;
@@ -564,28 +963,13 @@ impl UsageAccounting {
                 })?;
             }
 
+            for record in &records {
+                validate_usage_record_size(record, self.inner.limits.max_record_bytes)
+                    .map_err(UsageAccountingError::Limit)?;
+            }
+
             if self.inner.ledger_path.is_some() {
-                let mut encoded = Vec::new();
-                if records.len() == 1 {
-                    serde_json::to_writer(&mut encoded, &records[0]).map_err(|err| {
-                        UsageAccountingError::Other(format!("failed to encode usage record: {err}"))
-                    })?;
-                } else {
-                    serde_json::to_writer(
-                        &mut encoded,
-                        &PersistedUsageLedgerBatchRef {
-                            magic: USAGE_LEDGER_BATCH_MAGIC,
-                            schema_version: USAGE_LEDGER_BATCH_SCHEMA_VERSION,
-                            records: &records,
-                        },
-                    )
-                    .map_err(|err| {
-                        UsageAccountingError::Other(format!(
-                            "failed to encode usage record batch: {err}"
-                        ))
-                    })?;
-                }
-                encoded.push(b'\n');
+                let encoded = encode_usage_frame(&records, self.inner.limits)?;
                 let mut writer = self
                     .inner
                     .writer
@@ -640,7 +1024,11 @@ impl UsageAccounting {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             debug_assert_eq!(state.next_seq, initial_next_seq);
             state.next_seq = next_seq;
-            state.records.extend(records.iter().cloned());
+            for record in records.iter().cloned() {
+                state
+                    .apply_record(record, self.inner.limits)
+                    .map_err(UsageAccountingError::Limit)?;
+            }
             Ok(records)
         })();
 
@@ -657,29 +1045,128 @@ impl UsageAccounting {
         end_unix_ms: Option<u64>,
         bucket_width: UsageBucketWidth,
     ) -> UsageReport {
+        self.report_page(
+            tenant_id,
+            start_unix_ms,
+            end_unix_ms,
+            bucket_width,
+            UsageReadOptions {
+                after_sequence: None,
+                snapshot_sequence: None,
+                limit: self.inner.limits.report_max_records,
+            },
+        )
+        .expect("configured usage report limits must be valid")
+    }
+
+    pub fn report_page(
+        &self,
+        tenant_id: Option<&str>,
+        start_unix_ms: Option<u64>,
+        end_unix_ms: Option<u64>,
+        bucket_width: UsageBucketWidth,
+        options: UsageReadOptions,
+    ) -> Result<UsageReport, UsageReadError> {
+        if options.limit == 0 || options.limit > self.inner.limits.report_max_records {
+            return Err(UsageReadError::InvalidLimit {
+                requested: options.limit,
+                maximum: self.inner.limits.report_max_records,
+            });
+        }
         let state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let journal = ledger_status_from_state(
+            self.inner.ledger_path.as_deref(),
+            &state,
+            &health,
+            self.inner.limits,
+        );
+
+        let all_time_exact = start_unix_ms.is_none()
+            && end_unix_ms.is_none()
+            && bucket_width == UsageBucketWidth::None
+            && options.after_sequence.is_none()
+            && options.snapshot_sequence.is_none();
+        if all_time_exact {
+            let mut records_aggregated = 0u64;
+            let mut tenants = Vec::with_capacity(
+                tenant_id
+                    .map(|_| usize::from(!state.tenant_summaries.is_empty()))
+                    .unwrap_or(state.tenant_summaries.len()),
+            );
+            for (candidate, summary) in &state.tenant_summaries {
+                if tenant_id.is_some_and(|id| id != candidate.as_str()) {
+                    continue;
+                }
+                records_aggregated = records_aggregated.saturating_add(summary.records_total());
+                tenants.push(summary.to_summary(candidate.clone()));
+            }
+            return Ok(UsageReport {
+                filter: UsageReportFilter {
+                    tenant_id: tenant_id.map(str::to_string),
+                    start_unix_ms,
+                    end_unix_ms,
+                    bucket_width,
+                },
+                journal,
+                page: UsageReadPage {
+                    requested_after_sequence: None,
+                    snapshot_sequence: state.last_sequence,
+                    earliest_available_sequence: state.records.front().map(|record| record.seq),
+                    records_aggregated,
+                    limit: options.limit,
+                    has_more: false,
+                    next_after_sequence: None,
+                    all_time_exact: true,
+                    raw_history_complete: state.records_total == state.records.len() as u64,
+                },
+                tenants,
+                buckets: Vec::new(),
+            });
+        }
+
+        let (snapshot_sequence, earliest_available, after_sequence) =
+            resolve_read_window(&state, options)?;
 
         let mut tenants = BTreeMap::<String, SummaryAccumulator>::new();
         let mut buckets = BTreeMap::<u64, BTreeMap<String, BucketAccumulator>>::new();
         let end_limit = end_unix_ms.unwrap_or(u64::MAX);
         let bucket_size_ms = bucket_width.bucket_size_ms();
+        let mut records_aggregated = 0usize;
+        let mut last_aggregated_sequence = None;
+        let mut has_more = false;
 
         for record in &state.records {
+            if record.seq <= after_sequence || record.seq > snapshot_sequence {
+                continue;
+            }
             if !matches_tenant_filter(record, tenant_id) {
                 continue;
             }
+            let is_matching_storage =
+                record.category == UsageCategory::Storage && record.unix_ms <= end_limit;
+            if !is_matching_storage && !matches_time_filter(record, start_unix_ms, end_unix_ms) {
+                continue;
+            }
+            if records_aggregated == options.limit {
+                has_more = true;
+                break;
+            }
+            records_aggregated += 1;
+            last_aggregated_sequence = Some(record.seq);
             if record.category == UsageCategory::Storage && record.unix_ms <= end_limit {
                 tenants
                     .entry(record.tenant_id.clone())
                     .or_default()
                     .apply_storage(record);
-                continue;
-            }
-            if !matches_time_filter(record, start_unix_ms, end_unix_ms) {
                 continue;
             }
             tenants
@@ -715,28 +1202,35 @@ impl UsageAccounting {
             })
             .collect::<Vec<_>>();
 
-        let health = self
-            .inner
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        UsageReport {
+        Ok(UsageReport {
             filter: UsageReportFilter {
                 tenant_id: tenant_id.map(str::to_string),
                 start_unix_ms,
                 end_unix_ms,
                 bucket_width,
             },
-            journal: ledger_status_from_records(
-                self.inner.ledger_path.as_deref(),
-                &state.records,
-                &health,
-            ),
+            journal,
+            page: UsageReadPage {
+                requested_after_sequence: options.after_sequence,
+                snapshot_sequence,
+                earliest_available_sequence: earliest_available,
+                records_aggregated: records_aggregated as u64,
+                limit: options.limit,
+                has_more,
+                next_after_sequence: if has_more {
+                    last_aggregated_sequence
+                } else {
+                    None
+                },
+                all_time_exact: false,
+                raw_history_complete: state.records_total == state.records.len() as u64,
+            },
             tenants: tenant_summaries,
             buckets: bucket_summaries,
-        }
+        })
     }
 
+    #[cfg(test)]
     pub fn export_records(
         &self,
         tenant_id: Option<&str>,
@@ -757,11 +1251,104 @@ impl UsageAccounting {
             .collect()
     }
 
+    pub fn export_page(
+        &self,
+        tenant_id: Option<&str>,
+        start_unix_ms: Option<u64>,
+        end_unix_ms: Option<u64>,
+        options: UsageReadOptions,
+        max_response_bytes: usize,
+    ) -> Result<UsageExportPage, UsageReadError> {
+        if options.limit == 0 || options.limit > self.inner.limits.export_max_records {
+            return Err(UsageReadError::InvalidLimit {
+                requested: options.limit,
+                maximum: self.inner.limits.export_max_records,
+            });
+        }
+        if max_response_bytes == 0
+            || max_response_bytes > self.inner.limits.export_max_response_bytes
+        {
+            return Err(UsageReadError::InvalidResponseBytes {
+                requested: max_response_bytes,
+                maximum: self.inner.limits.export_max_response_bytes,
+            });
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (snapshot_sequence, earliest_available, after_sequence) =
+            resolve_read_window(&state, options)?;
+        let mut records = Vec::with_capacity(options.limit.min(state.records.len()));
+        let mut response_bytes = 0usize;
+        let mut has_more = false;
+        for record in &state.records {
+            if record.seq <= after_sequence || record.seq > snapshot_sequence {
+                continue;
+            }
+            if !matches_tenant_filter(record, tenant_id)
+                || !matches_time_filter(record, start_unix_ms, end_unix_ms)
+            {
+                continue;
+            }
+            if records.len() == options.limit {
+                has_more = true;
+                break;
+            }
+            let encoded = serde_json::to_vec(record).map_err(|err| {
+                UsageReadError::Encoding(format!("failed to encode usage record: {err}"))
+            })?;
+            let line_bytes = encoded.len().checked_add(1).ok_or_else(|| {
+                UsageReadError::Encoding("usage export line byte count overflowed".to_string())
+            })?;
+            let projected_response_bytes =
+                response_bytes.checked_add(line_bytes).ok_or_else(|| {
+                    UsageReadError::Encoding(
+                        "usage export response byte count overflowed".to_string(),
+                    )
+                })?;
+            if projected_response_bytes > max_response_bytes {
+                if records.is_empty() {
+                    return Err(UsageReadError::RecordExceedsResponseLimit {
+                        sequence: record.seq,
+                        required_bytes: line_bytes,
+                        maximum_bytes: max_response_bytes,
+                    });
+                }
+                has_more = true;
+                break;
+            }
+            response_bytes = projected_response_bytes;
+            records.push(record.clone());
+        }
+        let next_after_sequence = if has_more {
+            records.last().map(|record| record.seq)
+        } else {
+            None
+        };
+        Ok(UsageExportPage {
+            records_returned: records.len(),
+            records,
+            snapshot_sequence,
+            earliest_available_sequence: earliest_available,
+            response_bytes,
+            has_more,
+            raw_history_complete: state.records_total == state.records.len() as u64,
+            next_after_sequence,
+        })
+    }
+
     pub fn tenant_summary(&self, tenant_id: &str) -> UsageTenantSummary {
-        self.report(Some(tenant_id), None, None, UsageBucketWidth::None)
-            .tenants
-            .into_iter()
-            .find(|summary| summary.tenant_id == tenant_id)
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .tenant_summaries
+            .get(tenant_id)
+            .map(|summary| summary.to_summary(tenant_id.to_string()))
             .unwrap_or_else(|| UsageTenantSummary {
                 tenant_id: tenant_id.to_string(),
                 ..UsageTenantSummary::default()
@@ -774,20 +1361,17 @@ impl UsageAccounting {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.records.iter().rev().find_map(|record| {
-            if record.category == UsageCategory::Storage && record.tenant_id == tenant_id {
-                Some(UsageStorageSnapshot::from(record))
-            } else {
-                None
-            }
-        })
+        state
+            .tenant_summaries
+            .get(tenant_id)
+            .and_then(|summary| summary.latest_storage_snapshot.clone())
     }
 
     pub fn reconcile_storage(
         &self,
         storage: &Arc<dyn Storage>,
     ) -> Result<Vec<UsageStorageSnapshot>, UsageAccountingError> {
-        let records = collect_storage_reconciliation_records(storage)?;
+        let records = collect_storage_reconciliation_records(storage, self.inner.limits)?;
         Ok(storage_snapshots_from_records(
             self.append_records(records)?,
         ))
@@ -816,8 +1400,9 @@ impl UsageAccounting {
         // The storage scan can be substantially slower than the final ledger append. Keep it off
         // runtime workers, but do not hold the one-permit append coordinator while it runs so
         // ordinary request metering remains independent of reconciliation latency.
+        let limits = self.inner.limits;
         let records = match tokio::task::spawn_blocking(move || {
-            collect_storage_reconciliation_records(&storage)
+            collect_storage_reconciliation_records(&storage, limits)
         })
         .await
         {
@@ -850,6 +1435,7 @@ fn append_task_join_failure(
 
 fn collect_storage_reconciliation_records(
     storage: &Arc<dyn Storage>,
+    limits: UsageLedgerLimits,
 ) -> Result<Vec<UsageLedgerRecord>, UsageAccountingError> {
     let metrics = storage.list_metrics().map_err(|err| {
         UsageAccountingError::Other(format!(
@@ -868,6 +1454,12 @@ fn collect_storage_reconciliation_records(
             })?;
         for series in selected {
             let tenant_id = tenant_id_for_metric_series(&series.series);
+            if !per_tenant.contains_key(&tenant_id) && per_tenant.len() >= limits.max_tenants {
+                return Err(UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation observed more than {} tenants",
+                    limits.max_tenants
+                )));
+            }
             let point_count = series.points.len() as u64;
             let acc = per_tenant.entry(tenant_id).or_default();
             acc.series_total = acc.series_total.saturating_add(1);
@@ -876,6 +1468,13 @@ fn collect_storage_reconciliation_records(
                 .logical_storage_bytes
                 .saturating_add(estimated_series_bytes(&series.series, point_count));
         }
+    }
+
+    if per_tenant.len() > limits.max_batch_records {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation produced {} tenant records, exceeding the configured batch maximum {}",
+            per_tenant.len(), limits.max_batch_records
+        )));
     }
 
     let reconciled_unix_ms = unix_timestamp_millis();
@@ -923,16 +1522,22 @@ fn storage_snapshots_from_records(records: Vec<UsageLedgerRecord>) -> Vec<UsageS
     snapshots
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct SummaryAccumulator {
     ingest: UsageTotals,
     query: UsageTotals,
     retention: UsageTotals,
     background: UsageTotals,
     latest_storage_snapshot: Option<UsageStorageSnapshot>,
+    latest_storage_sequence: u64,
+    storage_events_total: u64,
 }
 
 impl SummaryAccumulator {
+    fn apply_all_time(&mut self, record: &UsageLedgerRecord) {
+        self.apply_usage(record);
+    }
+
     fn apply_usage(&mut self, record: &UsageLedgerRecord) {
         match record.category {
             UsageCategory::Ingest => self.ingest.apply(record),
@@ -944,14 +1549,33 @@ impl SummaryAccumulator {
     }
 
     fn apply_storage(&mut self, record: &UsageLedgerRecord) {
+        self.storage_events_total = self.storage_events_total.saturating_add(1);
         let replace = self
             .latest_storage_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.reconciled_unix_ms <= record.unix_ms)
+            .map(|snapshot| {
+                snapshot.reconciled_unix_ms < record.unix_ms
+                    || (snapshot.reconciled_unix_ms == record.unix_ms
+                        && self.latest_storage_sequence <= record.seq)
+            })
             .unwrap_or(true);
         if replace {
             self.latest_storage_snapshot = Some(UsageStorageSnapshot::from(record));
+            self.latest_storage_sequence = record.seq;
         }
+    }
+
+    fn to_summary(&self, tenant_id: String) -> UsageTenantSummary {
+        self.clone().into_summary(tenant_id)
+    }
+
+    fn records_total(&self) -> u64 {
+        self.ingest
+            .events_total
+            .saturating_add(self.query.events_total)
+            .saturating_add(self.retention.events_total)
+            .saturating_add(self.background.events_total)
+            .saturating_add(self.storage_events_total)
     }
 
     fn into_summary(self, tenant_id: String) -> UsageTenantSummary {
@@ -1041,7 +1665,7 @@ fn usage_record_from_input(input: UsageRecordInput<'_>) -> UsageLedgerRecord {
     }
 }
 
-fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
+fn load_usage_ledger(path: &Path, limits: UsageLedgerLimits) -> Result<UsageLedgerState, String> {
     if !path.exists() {
         return Ok(UsageLedgerState::default());
     }
@@ -1052,7 +1676,7 @@ fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
         .map_err(|err| format!("failed to inspect usage ledger {}: {err}", path.display()))?
         .len();
     if file_len > 0 {
-        file.seek(SeekFrom::End(-1)).map_err(|err| {
+        file.seek(SeekFrom::Start(file_len - 1)).map_err(|err| {
             format!(
                 "failed to seek to the usage ledger tail {}: {err}",
                 path.display()
@@ -1075,28 +1699,55 @@ fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
             .map_err(|err| format!("failed to rewind usage ledger {}: {err}", path.display()))?;
     }
 
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut max_seq = 0u64;
-    let mut seen_sequences = BTreeSet::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|err| {
-            format!(
-                "failed to read usage ledger line {} from {}: {err}",
-                index + 1,
-                path.display()
-            )
-        })?;
-        if line.trim().is_empty() {
+    // Read exactly the length inspected above. This deliberately does not follow concurrent file
+    // growth, and the bounded line buffer rejects an oversized frame before extending past the
+    // configured allocation ceiling.
+    let mut reader = BufReader::with_capacity(
+        limits
+            .max_line_bytes
+            .min(USAGE_LEDGER_STARTUP_READER_MAX_BYTES),
+        file.take(file_len),
+    );
+    let mut line = Vec::with_capacity(limits.max_line_bytes);
+    let mut state = UsageLedgerState::default();
+    let mut recent_by_sequence = BTreeMap::<u64, UsageLedgerRecord>::new();
+    let mut seen_sequences = SequenceRanges::new(limits.max_sequence_ranges);
+    let mut line_number = 0u64;
+    loop {
+        line.clear();
+        let has_line = read_bounded_usage_line(&mut reader, &mut line, limits.max_line_bytes)
+            .map_err(|err| {
+                format!(
+                    "failed to read usage ledger line {} from {}: {err}",
+                    line_number.saturating_add(1),
+                    path.display()
+                )
+            })?;
+        if !has_line {
+            break;
+        }
+        line_number = line_number
+            .checked_add(1)
+            .ok_or_else(|| format!("usage ledger {} has too many lines", path.display()))?;
+        let frame = line.strip_suffix(b"\n").unwrap_or(&line);
+        if frame.len() > limits.max_frame_bytes {
+            return Err(format!(
+                "usage ledger line {line_number} from {} is {} frame bytes, exceeding the configured maximum {}",
+                path.display(),
+                frame.len(),
+                limits.max_frame_bytes
+            ));
+        }
+        if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let persisted = serde_json::from_str::<PersistedUsageLedgerLine>(&line).map_err(|err| {
-            format!(
-                "failed to parse usage ledger line {} from {}: {err}",
-                index + 1,
-                path.display()
-            )
-        })?;
+        let persisted =
+            decode_persisted_usage_line(frame, limits.max_batch_records).map_err(|err| {
+                format!(
+                    "failed to parse usage ledger line {line_number} from {}: {err}",
+                    path.display()
+                )
+            })?;
         let line_records = match persisted {
             PersistedUsageLedgerLine::Record(record) => vec![record],
             PersistedUsageLedgerLine::Batch(batch) => {
@@ -1105,7 +1756,7 @@ fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
                         "usage ledger {} has unsupported batch magic '{}' on line {}",
                         path.display(),
                         batch.magic,
-                        index + 1
+                        line_number
                     ));
                 }
                 if batch.schema_version != USAGE_LEDGER_BATCH_SCHEMA_VERSION {
@@ -1113,39 +1764,319 @@ fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
                         "usage ledger {} has unsupported batch schema version {} on line {}",
                         path.display(),
                         batch.schema_version,
-                        index + 1
+                        line_number
                     ));
                 }
                 if batch.records.is_empty() {
                     return Err(format!(
                         "usage ledger {} has an empty record batch on line {}",
                         path.display(),
-                        index + 1
+                        line_number
+                    ));
+                }
+                if batch.records.len() > limits.max_batch_records {
+                    return Err(format!(
+                        "usage ledger {} has {} records on line {}, exceeding the configured batch maximum {}",
+                        path.display(),
+                        batch.records.len(),
+                        line_number,
+                        limits.max_batch_records
                     ));
                 }
                 batch.records
             }
         };
         for record in line_records {
-            if record.seq == 0 || !seen_sequences.insert(record.seq) {
+            validate_usage_record_size(&record, limits.max_record_bytes).map_err(|message| {
+                format!(
+                    "usage ledger {} has an oversized record on line {}: {message}",
+                    path.display(),
+                    line_number
+                )
+            })?;
+            let is_new_sequence = seen_sequences.insert(record.seq).map_err(|err| {
+                format!(
+                    "usage ledger {} cannot validate sequence {} on line {}: {err}",
+                    path.display(),
+                    record.seq,
+                    line_number
+                )
+            })?;
+            if record.seq == 0 || !is_new_sequence {
                 return Err(format!(
                     "usage ledger {} has an invalid or duplicate sequence {} on line {}",
                     path.display(),
                     record.seq,
-                    index + 1
+                    line_number
                 ));
             }
-            max_seq = max_seq.max(record.seq);
-            records.push(record);
+            if !state.tenant_summaries.contains_key(&record.tenant_id)
+                && state.tenant_summaries.len() >= limits.max_tenants
+            {
+                return Err(format!(
+                    "usage ledger {} exceeds the configured tenant limit {} on line {}",
+                    path.display(),
+                    limits.max_tenants,
+                    line_number
+                ));
+            }
+            state.records_total = state.records_total.checked_add(1).ok_or_else(|| {
+                format!("usage ledger {} record count overflowed", path.display())
+            })?;
+            if record.category == UsageCategory::Storage {
+                state.storage_reconciliations_total = state
+                    .storage_reconciliations_total
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        format!(
+                            "usage ledger {} storage reconciliation count overflowed",
+                            path.display()
+                        )
+                    })?;
+            }
+            if record.seq >= state.last_sequence {
+                state.last_sequence = record.seq;
+                state.last_record_unix_ms = Some(record.unix_ms);
+            }
+            state
+                .tenant_summaries
+                .entry(record.tenant_id.clone())
+                .or_default()
+                .apply_all_time(&record);
+            recent_by_sequence.insert(record.seq, record);
+            while recent_by_sequence.len() > limits.recent_records {
+                let Some(oldest) = recent_by_sequence.keys().next().copied() else {
+                    break;
+                };
+                recent_by_sequence.remove(&oldest);
+            }
         }
     }
-    let next_seq = max_seq.checked_add(1).ok_or_else(|| {
+    state.next_seq = state.last_sequence.checked_add(1).ok_or_else(|| {
         format!(
             "usage ledger {} exhausted its sequence space",
             path.display()
         )
     })?;
-    Ok(UsageLedgerState { next_seq, records })
+    state.records = recent_by_sequence.into_values().collect();
+    Ok(state)
+}
+
+fn decode_persisted_usage_line(
+    frame: &[u8],
+    max_batch_records: usize,
+) -> Result<PersistedUsageLedgerLine, String> {
+    // Try the legacy record shape directly. Unlike serde's generic untagged representation, this
+    // does not materialize an allocation-heavy intermediate tree for every startup line.
+    if let Ok(record) = serde_json::from_slice::<UsageLedgerRecord>(frame) {
+        return Ok(PersistedUsageLedgerLine::Record(record));
+    }
+    validate_records_array_count_before_decode(frame, max_batch_records)?;
+    serde_json::from_slice::<PersistedUsageLedgerBatch>(frame)
+        .map(PersistedUsageLedgerLine::Batch)
+        .map_err(|err| err.to_string())
+}
+
+fn validate_records_array_count_before_decode(frame: &[u8], maximum: usize) -> Result<(), String> {
+    let mut index = 0usize;
+    let mut object_depth = 0usize;
+    let mut array_depth = 0usize;
+    while index < frame.len() {
+        match frame[index] {
+            b'"' => {
+                let end = scan_json_string_end(frame, index)?;
+                if object_depth == 1 && array_depth == 0 {
+                    let mut after = end;
+                    while after < frame.len() && frame[after].is_ascii_whitespace() {
+                        after += 1;
+                    }
+                    if after < frame.len() && frame[after] == b':' {
+                        let token = &frame[index..end];
+                        let is_records = token == b"\"records\""
+                            || (token.contains(&b'\\')
+                                && serde_json::from_slice::<String>(token)
+                                    .map(|key| key == "records")
+                                    .unwrap_or(false));
+                        if is_records {
+                            after += 1;
+                            while after < frame.len() && frame[after].is_ascii_whitespace() {
+                                after += 1;
+                            }
+                            if after < frame.len() && frame[after] == b'[' {
+                                let (_, end) = count_bounded_json_array(frame, after, maximum)?;
+                                index = end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                index = end;
+                continue;
+            }
+            b'{' => object_depth = object_depth.saturating_add(1),
+            b'}' => object_depth = object_depth.saturating_sub(1),
+            b'[' => array_depth = array_depth.saturating_add(1),
+            b']' => array_depth = array_depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn scan_json_string_end(frame: &[u8], start: usize) -> Result<usize, String> {
+    let mut index = start.saturating_add(1);
+    while index < frame.len() {
+        match frame[index] {
+            b'"' => return Ok(index + 1),
+            b'\\' => index = index.saturating_add(2),
+            _ => index += 1,
+        }
+    }
+    Err("unterminated JSON string".to_string())
+}
+
+fn count_bounded_json_array(
+    frame: &[u8],
+    start: usize,
+    maximum: usize,
+) -> Result<(usize, usize), String> {
+    let mut index = start + 1;
+    while index < frame.len() && frame[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index < frame.len() && frame[index] == b']' {
+        return Ok((0, index + 1));
+    }
+    let mut count = 1usize;
+    if count > maximum {
+        return Err(format!(
+            "usage ledger batch contains more than the configured {maximum} records"
+        ));
+    }
+    let mut array_depth = 1usize;
+    let mut object_depth = 0usize;
+    while index < frame.len() {
+        match frame[index] {
+            b'"' => {
+                index = scan_json_string_end(frame, index)?;
+                continue;
+            }
+            b'[' => array_depth = array_depth.saturating_add(1),
+            b']' => {
+                array_depth = array_depth.saturating_sub(1);
+                if array_depth == 0 {
+                    return Ok((count, index + 1));
+                }
+            }
+            b'{' => object_depth = object_depth.saturating_add(1),
+            b'}' => object_depth = object_depth.saturating_sub(1),
+            b',' if array_depth == 1 && object_depth == 0 => {
+                count = count.checked_add(1).ok_or_else(|| {
+                    "usage ledger batch record count overflowed usize".to_string()
+                })?;
+                if count > maximum {
+                    return Err(format!(
+                        "usage ledger batch contains more than the configured {maximum} records"
+                    ));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok((count, index))
+}
+
+fn read_bounded_usage_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    max_line_bytes: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!output.is_empty());
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .unwrap_or(available.len());
+        if take > max_line_bytes.saturating_sub(output.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line exceeds configured maximum {max_line_bytes} bytes"),
+            ));
+        }
+        output.extend_from_slice(&available[..take]);
+        let found_newline = available[take - 1] == b'\n';
+        reader.consume(take);
+        if found_newline {
+            return Ok(true);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SequenceRanges {
+    ranges: BTreeMap<u64, u64>,
+    maximum_ranges: usize,
+}
+
+impl SequenceRanges {
+    fn new(maximum_ranges: usize) -> Self {
+        Self {
+            ranges: BTreeMap::new(),
+            maximum_ranges,
+        }
+    }
+
+    fn insert(&mut self, sequence: u64) -> Result<bool, String> {
+        let previous = self
+            .ranges
+            .range(..=sequence)
+            .next_back()
+            .map(|(start, end)| (*start, *end));
+        if previous.is_some_and(|(_, end)| sequence <= end) {
+            return Ok(false);
+        }
+        let next = self
+            .ranges
+            .range(sequence..)
+            .next()
+            .map(|(start, end)| (*start, *end));
+        let joins_previous = previous.is_some_and(|(_, end)| end.checked_add(1) == Some(sequence));
+        let joins_next = next.is_some_and(|(start, _)| sequence.checked_add(1) == Some(start));
+
+        match (joins_previous, joins_next) {
+            (true, true) => {
+                let (previous_start, _) = previous.expect("joined previous range must exist");
+                let (next_start, next_end) = next.expect("joined next range must exist");
+                self.ranges.insert(previous_start, next_end);
+                self.ranges.remove(&next_start);
+            }
+            (true, false) => {
+                let (previous_start, _) = previous.expect("joined previous range must exist");
+                self.ranges.insert(previous_start, sequence);
+            }
+            (false, true) => {
+                let (next_start, next_end) = next.expect("joined next range must exist");
+                self.ranges.remove(&next_start);
+                self.ranges.insert(sequence, next_end);
+            }
+            (false, false) => {
+                if self.ranges.len() == self.maximum_ranges {
+                    return Err(format!(
+                        "usage ledger sequence validation requires more than the configured {} disjoint ranges",
+                        self.maximum_ranges
+                    ));
+                }
+                self.ranges.insert(sequence, sequence);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn append_usage_record_unbudgeted(
@@ -1171,30 +2102,224 @@ fn append_usage_record_unbudgeted(
     Ok(())
 }
 
-fn ledger_status_from_records(
+fn ledger_status_from_state(
     ledger_path: Option<&Path>,
-    records: &[UsageLedgerRecord],
+    state: &UsageLedgerState,
     health: &UsageLedgerHealth,
+    limits: UsageLedgerLimits,
 ) -> UsageLedgerStatus {
-    let mut tenants = BTreeSet::new();
-    let mut storage_reconciliations_total = 0u64;
-    for record in records {
-        tenants.insert(record.tenant_id.clone());
-        if record.category == UsageCategory::Storage {
-            storage_reconciliations_total = storage_reconciliations_total.saturating_add(1);
-        }
-    }
     UsageLedgerStatus {
         durable: ledger_path.is_some(),
         ledger_path: ledger_path.map(|path| path.display().to_string()),
-        records_total: records.len() as u64,
-        tenant_count: tenants.len() as u64,
-        last_sequence: records.iter().map(|record| record.seq).max().unwrap_or(0),
-        last_record_unix_ms: records.last().map(|record| record.unix_ms),
-        storage_reconciliations_total,
+        records_total: state.records_total,
+        retained_records: state.records.len() as u64,
+        earliest_retained_sequence: state.records.front().map(|record| record.seq),
+        tenant_count: state.tenant_summaries.len() as u64,
+        last_sequence: state.last_sequence,
+        last_record_unix_ms: state.last_record_unix_ms,
+        storage_reconciliations_total: state.storage_reconciliations_total,
         record_failures_total: health.record_failures_total,
         last_record_error_code: health.last_record_error_code.clone(),
+        limits,
     }
+}
+
+fn resolve_read_window(
+    state: &UsageLedgerState,
+    options: UsageReadOptions,
+) -> Result<(u64, Option<u64>, u64), UsageReadError> {
+    let snapshot_sequence = options.snapshot_sequence.unwrap_or(state.last_sequence);
+    if snapshot_sequence > state.last_sequence {
+        return Err(UsageReadError::InvalidSnapshot {
+            requested: snapshot_sequence,
+            latest: state.last_sequence,
+        });
+    }
+    let earliest_available = state.records.front().map(|record| record.seq);
+    let default_after = earliest_available
+        .map(|sequence| {
+            if snapshot_sequence < sequence {
+                snapshot_sequence.saturating_sub(1)
+            } else {
+                sequence.saturating_sub(1)
+            }
+        })
+        .unwrap_or(snapshot_sequence);
+    let after_sequence = options.after_sequence.unwrap_or(default_after);
+    if let Some(earliest) = earliest_available {
+        if after_sequence < earliest.saturating_sub(1) && after_sequence < snapshot_sequence {
+            return Err(UsageReadError::CursorExpired {
+                requested_after: after_sequence,
+                earliest_available: earliest,
+            });
+        }
+    }
+    Ok((snapshot_sequence, earliest_available, after_sequence))
+}
+
+fn validate_append_tenants(
+    state: &UsageLedgerState,
+    records: &[UsageLedgerRecord],
+    limits: UsageLedgerLimits,
+) -> Result<(), UsageAccountingError> {
+    let record_count = u64::try_from(records.len()).map_err(|_| {
+        UsageAccountingError::Other("usage ledger batch length exceeds u64".to_string())
+    })?;
+    state
+        .records_total
+        .checked_add(record_count)
+        .ok_or_else(|| {
+            UsageAccountingError::Other("usage ledger record count is exhausted".to_string())
+        })?;
+    let storage_count = records
+        .iter()
+        .filter(|record| record.category == UsageCategory::Storage)
+        .count();
+    let storage_count = u64::try_from(storage_count).map_err(|_| {
+        UsageAccountingError::Other("usage ledger storage batch length exceeds u64".to_string())
+    })?;
+    state
+        .storage_reconciliations_total
+        .checked_add(storage_count)
+        .ok_or_else(|| {
+            UsageAccountingError::Other(
+                "usage ledger storage reconciliation count is exhausted".to_string(),
+            )
+        })?;
+    let mut new_tenants = BTreeMap::<&str, ()>::new();
+    for record in records {
+        if !state.tenant_summaries.contains_key(&record.tenant_id) {
+            new_tenants.insert(record.tenant_id.as_str(), ());
+        }
+    }
+    if state
+        .tenant_summaries
+        .len()
+        .saturating_add(new_tenants.len())
+        > limits.max_tenants
+    {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage ledger tenant limit {} would be exceeded by this batch",
+            limits.max_tenants
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CappedWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl CappedWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(maximum.min(8 * 1024)),
+            maximum,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.maximum.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded value exceeds configured limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CountingWriter {
+    bytes: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.maximum.saturating_sub(self.bytes) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded value exceeds configured limit",
+            ));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_usage_record_size(record: &UsageLedgerRecord, maximum: usize) -> Result<(), String> {
+    let mut writer = CountingWriter {
+        bytes: 0,
+        maximum,
+        exceeded: false,
+    };
+    if let Err(err) = serde_json::to_writer(&mut writer, record) {
+        if writer.exceeded {
+            return Err(format!(
+                "usage record sequence {} exceeds the configured maximum {maximum} bytes",
+                record.seq
+            ));
+        }
+        return Err(format!("failed to encode usage record: {err}"));
+    }
+    Ok(())
+}
+
+fn encode_usage_frame(
+    records: &[UsageLedgerRecord],
+    limits: UsageLedgerLimits,
+) -> Result<Vec<u8>, UsageAccountingError> {
+    let mut writer = CappedWriter::new(limits.max_frame_bytes);
+    let result = if records.len() == 1 {
+        serde_json::to_writer(&mut writer, &records[0])
+    } else {
+        serde_json::to_writer(
+            &mut writer,
+            &PersistedUsageLedgerBatchRef {
+                magic: USAGE_LEDGER_BATCH_MAGIC,
+                schema_version: USAGE_LEDGER_BATCH_SCHEMA_VERSION,
+                records,
+            },
+        )
+    };
+    if let Err(err) = result {
+        if writer.exceeded {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage ledger frame exceeds the configured maximum {} bytes",
+                limits.max_frame_bytes
+            )));
+        }
+        return Err(UsageAccountingError::Other(format!(
+            "failed to encode usage ledger frame: {err}"
+        )));
+    }
+    if writer.bytes.len().saturating_add(1) > limits.max_line_bytes {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage ledger line exceeds the configured maximum {} bytes",
+            limits.max_line_bytes
+        )));
+    }
+    writer.bytes.push(b'\n');
+    Ok(writer.bytes)
 }
 
 fn matches_tenant_filter(record: &UsageLedgerRecord, tenant_id: Option<&str>) -> bool {
@@ -2072,5 +3197,606 @@ mod tests {
                 .collect::<Vec<_>>(),
             (1..=(CONCURRENT_RECORDS as u64 + 2)).collect::<Vec<_>>()
         );
+    }
+
+    fn bounded_test_limits(recent_records: usize) -> UsageLedgerLimits {
+        UsageLedgerLimits {
+            recent_records,
+            max_tenants: 8,
+            report_default_records: 2,
+            report_max_records: 16,
+            export_default_records: 2,
+            export_max_records: 16,
+            ..UsageLedgerLimits::default()
+        }
+    }
+
+    fn record_background_events(accounting: &UsageAccounting, count: usize) {
+        for index in 0..count {
+            let mut input = UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Background,
+                "bounded_test",
+                "test",
+            );
+            input.result_units = index as u64;
+            accounting.record(input).expect("record should append");
+        }
+    }
+
+    #[test]
+    fn retained_window_is_bounded_across_many_appends_and_reopen() {
+        let dir = tempdir().expect("temp dir should build");
+        let limits = bounded_test_limits(3);
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 10);
+
+        let status = accounting.ledger_status();
+        assert_eq!(status.records_total, 10);
+        assert_eq!(status.retained_records, 3);
+        assert_eq!(status.earliest_retained_sequence, Some(8));
+        assert_eq!(
+            accounting
+                .export_records(None, None, None)
+                .iter()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert_eq!(
+            accounting.tenant_summary("team-a").background.events_total,
+            10
+        );
+        let exact_report = accounting.report(Some("team-a"), None, None, UsageBucketWidth::None);
+        assert!(exact_report.page.all_time_exact);
+        assert!(!exact_report.page.raw_history_complete);
+        assert_eq!(exact_report.page.records_aggregated, 10);
+        assert_eq!(exact_report.tenants[0].background.events_total, 10);
+        drop(accounting);
+
+        let reopened =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+                .expect("bounded ledger should reopen");
+        assert_eq!(reopened.ledger_status().records_total, 10);
+        assert_eq!(reopened.ledger_status().retained_records, 3);
+        assert_eq!(
+            reopened.tenant_summary("team-a").background.events_total,
+            10
+        );
+        assert_eq!(
+            reopened
+                .export_records(None, None, None)
+                .iter()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn evicted_storage_snapshot_and_usage_totals_remain_exact_after_reopen() {
+        let dir = tempdir().expect("temp dir should build");
+        let limits = bounded_test_limits(2);
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+                .expect("usage store should open");
+        let mut ingest =
+            UsageRecordInput::success("team-a", UsageCategory::Ingest, "ingest", "test");
+        ingest.rows = 7;
+        accounting.record(ingest).expect("ingest should append");
+        let mut storage = UsageRecordInput::success(
+            "team-a",
+            UsageCategory::Storage,
+            "reconcile_storage",
+            "test",
+        );
+        storage.logical_storage_series = 3;
+        storage.logical_storage_samples = 11;
+        storage.logical_storage_bytes = 1_024;
+        accounting.record(storage).expect("snapshot should append");
+        record_background_events(&accounting, 4);
+        assert_eq!(
+            accounting
+                .export_records(None, None, None)
+                .iter()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        let summary = accounting.tenant_summary("team-a");
+        assert_eq!(summary.ingest.rows, 7);
+        assert_eq!(summary.background.events_total, 4);
+        assert_eq!(
+            summary
+                .latest_storage_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.logical_storage_bytes),
+            Some(1_024)
+        );
+        drop(accounting);
+
+        let reopened =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+                .expect("ledger should reopen");
+        let summary = reopened.tenant_summary("team-a");
+        assert_eq!(summary.ingest.rows, 7);
+        assert_eq!(summary.background.events_total, 4);
+        assert_eq!(
+            summary
+                .latest_storage_snapshot
+                .map(|snapshot| snapshot.logical_storage_bytes),
+            Some(1_024)
+        );
+        assert_eq!(reopened.ledger_status().storage_reconciliations_total, 1);
+    }
+
+    #[test]
+    fn export_pages_have_exact_n_plus_one_boundaries_without_gaps_or_duplicates() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(16), None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 5);
+
+        let first = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 2,
+                },
+                accounting.limits().export_max_response_bytes,
+            )
+            .expect("first page should read");
+        assert_eq!(first.records_returned, 2);
+        assert!(first.has_more);
+        assert_eq!(first.next_after_sequence, Some(2));
+        assert_eq!(first.snapshot_sequence, 5);
+        assert!(first.raw_history_complete);
+
+        accounting
+            .record(UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Background,
+                "concurrent_after_snapshot",
+                "test",
+            ))
+            .expect("concurrent record should append");
+
+        let mut sequences = first
+            .records
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>();
+        let second = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: first.next_after_sequence,
+                    snapshot_sequence: Some(first.snapshot_sequence),
+                    limit: 2,
+                },
+                accounting.limits().export_max_response_bytes,
+            )
+            .expect("second page should read");
+        assert_eq!(second.records_returned, 2);
+        assert!(second.has_more);
+        let third = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: second.next_after_sequence,
+                    snapshot_sequence: Some(second.snapshot_sequence),
+                    limit: 2,
+                },
+                accounting.limits().export_max_response_bytes,
+            )
+            .expect("third page should read");
+        assert_eq!(third.records_returned, 1);
+        assert!(!third.has_more);
+        sequences.extend(second.records.iter().map(|record| record.seq));
+        sequences.extend(third.records.iter().map(|record| record.seq));
+        assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_move_a_pinned_export_snapshot() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(128), None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 32);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let accounting = Arc::clone(&accounting);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                record_background_events(&accounting, 32);
+            })
+        };
+
+        barrier.wait();
+        let mut after_sequence = None;
+        let mut snapshot_sequence = None;
+        let mut exported = Vec::new();
+        loop {
+            let page = accounting
+                .export_page(
+                    None,
+                    None,
+                    None,
+                    UsageReadOptions {
+                        after_sequence,
+                        snapshot_sequence,
+                        limit: 3,
+                    },
+                    accounting.limits().export_max_response_bytes,
+                )
+                .expect("concurrent export page should remain available");
+            snapshot_sequence = Some(page.snapshot_sequence);
+            exported.extend(page.records.iter().map(|record| record.seq));
+            if !page.has_more {
+                break;
+            }
+            after_sequence = page.next_after_sequence;
+        }
+        writer.join().expect("writer should not panic");
+
+        let snapshot = snapshot_sequence.expect("export must publish a snapshot");
+        assert_eq!(
+            exported,
+            (1..=snapshot).collect::<Vec<_>>(),
+            "the pinned traversal must contain every initial sequence exactly once"
+        );
+        assert!(accounting.ledger_status().last_sequence >= snapshot);
+    }
+
+    #[test]
+    fn report_record_limit_uses_n_plus_one_continuation() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(16), None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 2);
+
+        let exact = accounting
+            .report_page(
+                None,
+                None,
+                None,
+                UsageBucketWidth::Hour,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 2,
+                },
+            )
+            .expect("exact-limit report page should build");
+        assert_eq!(exact.page.records_aggregated, 2);
+        assert!(!exact.page.has_more);
+        assert_eq!(exact.page.next_after_sequence, None);
+        assert_eq!(exact.tenants[0].background.events_total, 2);
+
+        record_background_events(&accounting, 1);
+        let n_plus_one = accounting
+            .report_page(
+                None,
+                None,
+                None,
+                UsageBucketWidth::Hour,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 2,
+                },
+            )
+            .expect("N+1 report page should build");
+        assert_eq!(n_plus_one.page.records_aggregated, 2);
+        assert!(n_plus_one.page.has_more);
+        assert_eq!(n_plus_one.page.next_after_sequence, Some(2));
+        assert_eq!(n_plus_one.tenants[0].background.events_total, 2);
+    }
+
+    #[test]
+    fn all_time_and_bucket_reports_have_stable_tenant_order() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(16), None)
+                .expect("usage store should open");
+        let records = ["team-z", "team-a", "team-m"]
+            .into_iter()
+            .map(|tenant_id| {
+                let mut record = usage_record_from_input(UsageRecordInput::success(
+                    tenant_id,
+                    UsageCategory::Query,
+                    "stable_order",
+                    "test",
+                ));
+                record.unix_ms = 1_700_000_000_000;
+                record
+            })
+            .collect();
+        accounting
+            .append_records(records)
+            .expect("usage records should append");
+
+        let exact = accounting.report(None, None, None, UsageBucketWidth::None);
+        assert_eq!(
+            exact
+                .tenants
+                .iter()
+                .map(|tenant| tenant.tenant_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["team-a", "team-m", "team-z"]
+        );
+
+        let bucketed = accounting
+            .report_page(
+                None,
+                None,
+                None,
+                UsageBucketWidth::Hour,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 3,
+                },
+            )
+            .expect("bucketed report should build");
+        assert_eq!(bucketed.buckets.len(), 1);
+        assert_eq!(
+            bucketed.buckets[0]
+                .tenants
+                .iter()
+                .map(|tenant| tenant.tenant_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["team-a", "team-m", "team-z"]
+        );
+    }
+
+    #[test]
+    fn expired_cursor_is_explicit_after_retention_advances() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(2), None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 4);
+
+        let err = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: Some(1),
+                    snapshot_sequence: Some(4),
+                    limit: 2,
+                },
+                accounting.limits().export_max_response_bytes,
+            )
+            .expect_err("evicted cursor must not silently skip records");
+        assert_eq!(
+            err,
+            UsageReadError::CursorExpired {
+                requested_after: 1,
+                earliest_available: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn export_response_bytes_accept_exact_n_and_reject_n_minus_one() {
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(None, bounded_test_limits(4), None)
+                .expect("usage store should open");
+        record_background_events(&accounting, 1);
+        let record = accounting.export_records(None, None, None).remove(0);
+        let exact_bytes = serde_json::to_vec(&record)
+            .expect("record should encode")
+            .len()
+            + 1;
+
+        let exact = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 1,
+                },
+                exact_bytes,
+            )
+            .expect("exact byte limit should fit");
+        assert_eq!(exact.response_bytes, exact_bytes);
+        let err = accounting
+            .export_page(
+                None,
+                None,
+                None,
+                UsageReadOptions {
+                    after_sequence: None,
+                    snapshot_sequence: None,
+                    limit: 1,
+                },
+                exact_bytes - 1,
+            )
+            .expect_err("one byte below the record must fail explicitly");
+        assert!(matches!(
+            err,
+            UsageReadError::RecordExceedsResponseLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_line_and_frame_limits_reject_n_plus_one() {
+        let dir = tempdir().expect("temp dir should build");
+        let ledger_dir = dir.path().join(USAGE_LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger directory should build");
+        let ledger_path = ledger_dir.join(USAGE_LEDGER_FILE);
+        let mut record = usage_record_from_input(UsageRecordInput::success(
+            "team-a",
+            UsageCategory::Background,
+            "startup_limit",
+            "test",
+        ));
+        record.seq = 1;
+        let encoded = serde_json::to_vec(&record).expect("record should encode");
+        fs::write(&ledger_path, [&encoded[..], b"\n"].concat()).expect("ledger should write");
+
+        let mut exact_limits = bounded_test_limits(2);
+        exact_limits.max_record_bytes = encoded.len();
+        exact_limits.max_frame_bytes = encoded.len();
+        exact_limits.max_line_bytes = encoded.len() + 1;
+        UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), exact_limits, None)
+            .expect("exact frame and line limits should open");
+
+        fs::write(&ledger_path, [&encoded[..], b" \n"].concat())
+            .expect("oversized frame fixture should write");
+        let mut frame_limits = exact_limits;
+        frame_limits.max_line_bytes = encoded.len() + 2;
+        let err =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), frame_limits, None)
+                .expect_err("N+1 frame must fail");
+        assert!(err.contains("frame bytes"), "{err}");
+
+        fs::write(&ledger_path, [&encoded[..], b" \n"].concat())
+            .expect("oversized line fixture should write");
+        let err =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), exact_limits, None)
+                .expect_err("N+1 line must fail before extending the line buffer");
+        assert!(err.contains("line exceeds configured maximum"), "{err}");
+    }
+
+    #[test]
+    fn startup_sequence_range_limit_accepts_n_and_rejects_n_plus_one() {
+        let dir = tempdir().expect("temp dir should build");
+        let ledger_dir = dir.path().join(USAGE_LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger directory should build");
+        let ledger_path = ledger_dir.join(USAGE_LEDGER_FILE);
+        let make_record = |seq| {
+            let mut record = usage_record_from_input(UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Background,
+                "legacy_ranges",
+                "test",
+            ));
+            record.seq = seq;
+            serde_json::to_string(&record).expect("record should encode")
+        };
+        let mut limits = bounded_test_limits(4);
+        limits.max_sequence_ranges = 2;
+        fs::write(
+            &ledger_path,
+            format!("{}\n{}\n", make_record(1), make_record(3)),
+        )
+        .expect("two-range ledger should write");
+        UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+            .expect("exact sequence-range limit should open");
+
+        fs::write(
+            &ledger_path,
+            format!(
+                "{}\n{}\n{}\n",
+                make_record(1),
+                make_record(3),
+                make_record(5)
+            ),
+        )
+        .expect("three-range ledger should write");
+        let err = UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+            .expect_err("N+1 disjoint sequence range must fail");
+        assert!(
+            err.contains("more than the configured 2 disjoint ranges"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn tenant_cardinality_limit_rejects_n_plus_one_without_publication() {
+        let mut limits = bounded_test_limits(8);
+        limits.max_tenants = 2;
+        let accounting = UsageAccounting::open_with_limits_and_disk_budget(None, limits, None)
+            .expect("usage store should open");
+        for tenant_id in ["team-a", "team-b"] {
+            accounting
+                .record(UsageRecordInput::success(
+                    tenant_id,
+                    UsageCategory::Query,
+                    "query",
+                    "test",
+                ))
+                .expect("tenant within limit should append");
+        }
+        let err = accounting
+            .record(UsageRecordInput::success(
+                "team-c",
+                UsageCategory::Query,
+                "query",
+                "test",
+            ))
+            .expect_err("N+1 tenant must be rejected");
+        assert!(matches!(err, UsageAccountingError::Limit(_)));
+        assert_eq!(accounting.ledger_status().records_total, 2);
+        assert_eq!(accounting.ledger_status().tenant_count, 2);
+        assert_eq!(accounting.ledger_status().last_sequence, 2);
+    }
+
+    #[test]
+    fn atomic_batch_record_limit_accepts_n_and_rejects_n_plus_one() {
+        let mut limits = bounded_test_limits(8);
+        limits.max_batch_records = 2;
+        limits.max_tenants = 2;
+        let accounting = UsageAccounting::open_with_limits_and_disk_budget(None, limits, None)
+            .expect("usage store should open");
+        let make_record = || {
+            usage_record_from_input(UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Background,
+                "batch_limit",
+                "test",
+            ))
+        };
+        accounting
+            .append_records(vec![make_record(), make_record()])
+            .expect("exact batch limit should append atomically");
+        let err = accounting
+            .append_records(vec![make_record(), make_record(), make_record()])
+            .expect_err("N+1 batch should be rejected before publication");
+        assert!(matches!(err, UsageAccountingError::Limit(_)));
+        assert_eq!(accounting.ledger_status().records_total, 2);
+        assert_eq!(accounting.ledger_status().last_sequence, 2);
+    }
+
+    #[test]
+    fn startup_batch_scanner_rejects_n_plus_one_before_typed_decode() {
+        let records = (1..=3)
+            .map(|seq| {
+                let mut record = usage_record_from_input(UsageRecordInput::success(
+                    "team-a",
+                    UsageCategory::Background,
+                    "startup_batch_limit",
+                    "test",
+                ));
+                record.seq = seq;
+                record
+            })
+            .collect::<Vec<_>>();
+        let frame = serde_json::to_vec(&PersistedUsageLedgerBatchRef {
+            magic: USAGE_LEDGER_BATCH_MAGIC,
+            schema_version: USAGE_LEDGER_BATCH_SCHEMA_VERSION,
+            records: &records,
+        })
+        .expect("batch should encode");
+        decode_persisted_usage_line(&frame, 3).expect("exact batch limit should decode");
+        let err = decode_persisted_usage_line(&frame, 2)
+            .expect_err("N+1 batch must fail in the lexical guard");
+        assert!(err.contains("more than the configured 2 records"), "{err}");
     }
 }

@@ -2531,6 +2531,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "roaring",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

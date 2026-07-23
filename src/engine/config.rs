@@ -37,9 +37,17 @@ pub(super) struct ChunkStorageOptions {
     pub(super) write_timeout: Duration,
     pub(super) memory_budget_bytes: u64,
     pub(super) cardinality_limit: usize,
+    pub(super) max_labels_per_series: usize,
+    pub(super) max_series_identity_bytes: usize,
+    pub(super) max_new_series_per_window: Option<usize>,
+    pub(super) new_series_window_units: i64,
+    pub(super) new_series_window_nanos: u64,
+    pub(super) write_batch_limits: crate::WriteBatchLimits,
     pub(super) wal_size_limit_bytes: u64,
     pub(super) admission_poll_interval: Duration,
     pub(super) compaction_interval: Duration,
+    pub(super) maintenance_max_items_per_pass: usize,
+    pub(super) maintenance_max_bytes_per_pass: u64,
     pub(super) background_threads_enabled: bool,
     pub(super) background_fail_fast: bool,
     pub(super) metadata_shard_count: Option<u32>,
@@ -77,9 +85,21 @@ impl Default for ChunkStorageOptions {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: duration_to_timestamp_units(
+                Duration::from_secs(60),
+                TimestampPrecision::Nanoseconds,
+            )
+            .max(1),
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: crate::WriteBatchLimits::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             background_fail_fast: true,
             metadata_shard_count: None,
@@ -136,6 +156,17 @@ impl From<&StorageBuilder> for StoragePathLayout {
 impl From<&StorageBuilder> for ChunkStorageOptions {
     fn from(builder: &StorageBuilder) -> Self {
         let timestamp_precision = builder.timestamp_precision();
+        let new_series_window_units =
+            duration_to_timestamp_units(builder.new_series_window(), timestamp_precision).max(1);
+        let nanos_per_timestamp_unit = match timestamp_precision {
+            TimestampPrecision::Seconds => 1_000_000_000,
+            TimestampPrecision::Milliseconds => 1_000_000,
+            TimestampPrecision::Microseconds => 1_000,
+            TimestampPrecision::Nanoseconds => 1,
+        };
+        let effective_new_series_window_nanos = u64::try_from(new_series_window_units)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(nanos_per_timestamp_unit);
         let runtime_mode = builder.runtime_mode();
         let has_data_path =
             builder.data_path().is_some() && runtime_mode == StorageRuntimeMode::ReadWrite;
@@ -164,9 +195,17 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             write_timeout: builder.write_timeout(),
             memory_budget_bytes: builder.memory_limit_bytes().min(u64::MAX as usize) as u64,
             cardinality_limit: builder.cardinality_limit(),
+            max_labels_per_series: builder.max_labels_per_series(),
+            max_series_identity_bytes: builder.max_series_identity_bytes(),
+            max_new_series_per_window: builder.max_new_series_per_window(),
+            new_series_window_units,
+            new_series_window_nanos: effective_new_series_window_nanos,
+            write_batch_limits: builder.write_batch_limits(),
             wal_size_limit_bytes: builder.wal_size_limit_bytes().min(u64::MAX as usize) as u64,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: builder.maintenance_max_items_per_pass(),
+            maintenance_max_bytes_per_pass: builder.maintenance_max_bytes_per_pass(),
             background_threads_enabled: {
                 let enabled = has_data_path || needs_compute_only_refresh_worker;
                 #[cfg(test)]

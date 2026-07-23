@@ -10,8 +10,9 @@ const MEMORY_APPROACHING_LIMIT_BASIS_POINTS: u16 = 9_000;
 const KNOWN_EXCLUDED_MEMORY_CATEGORIES: &[&str] = &[
     "query_working_sets",
     "decompression_buffers",
-    "pending_write_batches",
-    "wal_buffers_and_replay",
+    "caller_owned_write_inputs",
+    "wal_writer_buffer_finite_unbudgeted",
+    "public_wal_helper_result_collections",
     "rollup_working_state",
     "remote_refresh_staging",
     "thread_stacks",
@@ -19,13 +20,326 @@ const KNOWN_EXCLUDED_MEMORY_CATEGORIES: &[&str] = &[
     "adapter_and_server_state",
 ];
 
+/// Shared accounting for conservative foreground-write and startup-WAL scratch reservations.
+#[derive(Debug, Default)]
+pub(in super::super) struct WriteTransientMemoryAccounting {
+    current_bytes: AtomicU64,
+    peak_bytes: AtomicU64,
+    reservations_total: AtomicU64,
+    rejections_total: AtomicU64,
+}
+
+#[derive(Debug)]
+struct WriteTransientMemoryLease {
+    accounting: Arc<WriteTransientMemoryAccounting>,
+    /// Immutable scratch envelope admitted before the write owns any retained engine state.
+    /// Retried and best-effort sub-writes size their temporary retained-growth overlap from this
+    /// baseline instead of cumulatively adding the same conversion allowance to the lease.
+    base_reserved_bytes: u64,
+    reserved_bytes: AtomicU64,
+}
+
+/// Cloneable handle to one reservation. Clones share one lease, and the final drop releases it.
+#[derive(Debug, Clone)]
+pub(in super::super) struct WriteTransientMemoryReservation {
+    lease: Arc<WriteTransientMemoryLease>,
+}
+
+impl WriteTransientMemoryAccounting {
+    fn increment(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
+    fn update_peak(&self, current: u64) {
+        let _ = self
+            .peak_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |peak| {
+                (current > peak).then_some(current)
+            });
+    }
+
+    fn reserve_additional(
+        &self,
+        additional: u64,
+        used_bytes: &AtomicU64,
+        tombstone_staged_bytes: &AtomicU64,
+        budget_bytes: &AtomicU64,
+        memory_rejections_total: &AtomicU64,
+    ) -> Result<()> {
+        if additional == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let current = self.current_bytes.load(Ordering::Acquire);
+            let used = used_bytes.load(Ordering::Acquire);
+            let tombstone_staged = tombstone_staged_bytes.load(Ordering::Acquire);
+            let budget = budget_bytes.load(Ordering::Acquire);
+            let required = used
+                .checked_add(tombstone_staged)
+                .and_then(|bytes| bytes.checked_add(current))
+                .and_then(|bytes| bytes.checked_add(additional))
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            if budget != u64::MAX && required > budget {
+                Self::increment(&self.rejections_total);
+                Self::increment(memory_rejections_total);
+                return Err(TsinkError::MemoryBudgetExceeded {
+                    budget: budget.min(usize::MAX as u64) as usize,
+                    required: required.min(usize::MAX as u64) as usize,
+                });
+            }
+            let next = current
+                .checked_add(additional)
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.update_peak(next);
+                    return Ok(());
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(in crate::engine::storage_engine) fn new_reservation(
+        self: &Arc<Self>,
+        requested_bytes: usize,
+        used_bytes: &AtomicU64,
+        tombstone_staged_bytes: &AtomicU64,
+        budget_bytes: &AtomicU64,
+        memory_rejections_total: &AtomicU64,
+    ) -> Result<WriteTransientMemoryReservation> {
+        let requested =
+            u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+        self.reserve_additional(
+            requested,
+            used_bytes,
+            tombstone_staged_bytes,
+            budget_bytes,
+            memory_rejections_total,
+        )?;
+        Self::increment(&self.reservations_total);
+        Ok(WriteTransientMemoryReservation {
+            lease: Arc::new(WriteTransientMemoryLease {
+                accounting: Arc::clone(self),
+                base_reserved_bytes: requested,
+                reserved_bytes: AtomicU64::new(requested),
+            }),
+        })
+    }
+
+    pub(in crate::engine::storage_engine) fn current_bytes(&self) -> usize {
+        self.current_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize
+    }
+}
+
+impl WriteTransientMemoryReservation {
+    pub(in super::super) fn base_reserved_bytes(&self) -> usize {
+        self.lease.base_reserved_bytes.min(usize::MAX as u64) as usize
+    }
+
+    pub(in super::super) fn reserved_bytes(&self) -> usize {
+        self.lease
+            .reserved_bytes
+            .load(Ordering::Acquire)
+            .min(usize::MAX as u64) as usize
+    }
+
+    /// Releases the temporary retained-growth overlap after publication while preserving the
+    /// original top-level scratch envelope for outcomes, best-effort rows, or a caller-held clone.
+    pub(in super::super) fn reset_to_base(&self) {
+        let base = self.lease.base_reserved_bytes;
+        let previous = self.lease.reserved_bytes.swap(base, Ordering::AcqRel);
+        if previous > base {
+            self.lease
+                .accounting
+                .current_bytes
+                .fetch_sub(previous - base, Ordering::AcqRel);
+        }
+    }
+
+    pub(in super::super) fn ensure(
+        &self,
+        requested_bytes: usize,
+        used_bytes: &AtomicU64,
+        tombstone_staged_bytes: &AtomicU64,
+        budget_bytes: &AtomicU64,
+        memory_rejections_total: &AtomicU64,
+    ) -> Result<()> {
+        let requested =
+            u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+        loop {
+            let current = self.lease.reserved_bytes.load(Ordering::Acquire);
+            if requested <= current {
+                return Ok(());
+            }
+            let additional = requested - current;
+            self.lease.accounting.reserve_additional(
+                additional,
+                used_bytes,
+                tombstone_staged_bytes,
+                budget_bytes,
+                memory_rejections_total,
+            )?;
+            match self.lease.reserved_bytes.compare_exchange(
+                current,
+                requested,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => {
+                    self.lease
+                        .accounting
+                        .current_bytes
+                        .fetch_sub(additional, Ordering::AcqRel);
+                    if observed >= requested {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WriteTransientMemoryLease {
+    fn drop(&mut self) {
+        let reserved = self.reserved_bytes.swap(0, Ordering::AcqRel);
+        if reserved > 0 {
+            self.accounting
+                .current_bytes
+                .fetch_sub(reserved, Ordering::AcqRel);
+        }
+    }
+}
+
+/// A conservative admission charge for tombstone decode/RMW staging. The durable delete and
+/// snapshot/recovery callers also drain writer permits, while ordinary write admission includes
+/// this counter so future call sites cannot silently ignore an active staging envelope.
+pub(in super::super) struct TombstoneMemoryReservation<'a> {
+    used_bytes: &'a AtomicU64,
+    staged_bytes: &'a AtomicU64,
+    budget_bytes: &'a AtomicU64,
+    rejections_total: &'a AtomicU64,
+    reserved_bytes: u64,
+}
+
+impl TombstoneMemoryReservation<'_> {
+    pub(in super::super) fn ensure(&mut self, requested_bytes: usize) -> Result<()> {
+        let requested = saturating_u64_from_usize(requested_bytes);
+        let current = self.reserved_bytes.min(usize::MAX as u64) as usize;
+        if requested <= self.reserved_bytes {
+            return Ok(());
+        }
+        self.resize(current.max(requested_bytes))
+    }
+
+    pub(in super::super) fn resize(&mut self, requested_bytes: usize) -> Result<()> {
+        let requested = saturating_u64_from_usize(requested_bytes);
+        if requested <= self.reserved_bytes {
+            let released = self.reserved_bytes - requested;
+            if released > 0 {
+                self.staged_bytes.fetch_sub(released, Ordering::AcqRel);
+                self.reserved_bytes = requested;
+            }
+            return Ok(());
+        }
+
+        let additional = requested - self.reserved_bytes;
+        loop {
+            let budget = self.budget_bytes.load(Ordering::Acquire);
+            let used = self.used_bytes.load(Ordering::Acquire);
+            let staged = self.staged_bytes.load(Ordering::Acquire);
+            let required = used.saturating_add(staged).saturating_add(additional);
+            if budget != u64::MAX && required > budget {
+                let _ = self.rejections_total.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |value| Some(value.saturating_add(1)),
+                );
+                return Err(TsinkError::MemoryBudgetExceeded {
+                    budget: budget.min(usize::MAX as u64) as usize,
+                    required: required.min(usize::MAX as u64) as usize,
+                });
+            }
+            match self.staged_bytes.compare_exchange_weak(
+                staged,
+                staged.saturating_add(additional),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.reserved_bytes = requested;
+                    return Ok(());
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+impl Drop for TombstoneMemoryReservation<'_> {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.staged_bytes
+                .fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+        }
+    }
+}
+
 impl ChunkStorage {
+    pub(in super::super) fn reserve_write_transient_memory(
+        &self,
+        requested_bytes: usize,
+    ) -> Result<WriteTransientMemoryReservation> {
+        self.memory.write_transient.new_reservation(
+            requested_bytes,
+            &self.memory.used_bytes,
+            &self.memory.tombstone_staged_bytes,
+            &self.memory.budget_bytes,
+            &self.memory.rejections_total,
+        )
+    }
+
+    pub(in super::super) fn ensure_write_transient_memory(
+        &self,
+        reservation: &WriteTransientMemoryReservation,
+        requested_bytes: usize,
+    ) -> Result<()> {
+        reservation.ensure(
+            requested_bytes,
+            &self.memory.used_bytes,
+            &self.memory.tombstone_staged_bytes,
+            &self.memory.budget_bytes,
+            &self.memory.rejections_total,
+        )
+    }
+
     pub(in super::super) fn memory_budget_value(&self) -> usize {
         self.memory_accounting_context().budget_value()
     }
 
     pub(in super::super) fn memory_used_value(&self) -> usize {
         self.memory_accounting_context().used_value()
+    }
+
+    pub(in super::super) fn tombstone_memory_reservation(&self) -> TombstoneMemoryReservation<'_> {
+        TombstoneMemoryReservation {
+            used_bytes: &self.memory.used_bytes,
+            staged_bytes: &self.memory.tombstone_staged_bytes,
+            budget_bytes: &self.memory.budget_bytes,
+            rejections_total: &self.memory.rejections_total,
+            reserved_bytes: 0,
+        }
     }
 
     pub(in super::super) fn add_included_memory_component_bytes(
@@ -264,9 +578,35 @@ impl ChunkStorage {
                 &self.memory.persisted_index_used_bytes,
             ),
             persisted_mmap_bytes,
+            // Tombstone memory includes the live map plus an active decode/RMW staging envelope.
+            // The envelope converts to live accounting before it is released at publication.
             tombstone_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.tombstone_used_bytes,
+            )
+            .saturating_add(context::MemoryAccountingContext::component_value(
+                &self.memory.tombstone_staged_bytes,
+            )),
+            wal_series_definition_cache_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.wal_series_definition_cache_used_bytes,
             ),
+            write_transient_bytes: self.memory.write_transient.current_bytes(),
+            peak_write_transient_bytes: self
+                .memory
+                .write_transient
+                .peak_bytes
+                .load(Ordering::Acquire)
+                .min(usize::MAX as u64) as usize,
+            write_transient_reservations_total: self
+                .memory
+                .write_transient
+                .reservations_total
+                .load(Ordering::Acquire),
+            write_transient_rejections_total: self
+                .memory
+                .write_transient
+                .rejections_total
+                .load(Ordering::Acquire),
+            write_transient_bytes_estimated: true,
             excluded_persisted_mmap_bytes: 0,
             pressure: crate::MemoryPressureSnapshot {
                 level: Some(pressure_level),
@@ -288,8 +628,11 @@ impl ChunkStorage {
             .saturating_add(
                 state
                     .partition_head_count()
-                    .saturating_mul(
-                        std::mem::size_of::<super::super::state::ActivePartitionHead>(),
+                    .saturating_mul(std::mem::size_of::<super::super::state::ActivePartitionHead>())
+                    .saturating_add(
+                        state
+                            .partition_head_count()
+                            .saturating_mul(std::mem::size_of::<(WalHighWatermark, usize)>()),
                     ),
             )
             .saturating_add(state.partition_heads.values().fold(0usize, |acc, head| {
@@ -316,7 +659,12 @@ impl ChunkStorage {
         let mut bytes = std::mem::size_of::<ActiveSeriesState>().saturating_add(
             state
                 .partition_head_count()
-                .saturating_mul(std::mem::size_of::<super::super::state::ActivePartitionHead>()),
+                .saturating_mul(std::mem::size_of::<super::super::state::ActivePartitionHead>())
+                .saturating_add(
+                    state
+                        .partition_head_count()
+                        .saturating_mul(std::mem::size_of::<(WalHighWatermark, usize)>()),
+                ),
         );
         for head in state.partition_heads.values() {
             bytes = bytes.saturating_add(
@@ -343,6 +691,11 @@ impl ChunkStorage {
 
     pub(in super::super) fn chunk_memory_usage_bytes(chunk: &Chunk) -> usize {
         let mut bytes = std::mem::size_of::<Chunk>()
+            // Every sealed chunk also owns one fixed-size entry in each view of the pending
+            // persistence index. B-tree allocator overhead remains part of the documented
+            // allocator/runtime estimate, consistent with the other ordered indexes.
+            .saturating_add(std::mem::size_of::<PendingSealedChunkIndexKey>())
+            .saturating_add(std::mem::size_of::<PendingSealedChunkLocation>())
             .saturating_add(
                 chunk
                     .points
@@ -402,7 +755,7 @@ impl ChunkStorage {
             })
     }
 
-    fn persisted_segment_state_memory_usage_bytes(
+    pub(in super::super) fn persisted_segment_state_memory_usage_bytes(
         root: &std::path::Path,
         state: &super::super::state::PersistedSegmentState,
     ) -> usize {

@@ -33,9 +33,17 @@ fn test_options(current_time_override: Option<i64>) -> ChunkStorageOptions {
         write_timeout: Duration::from_secs(2),
         memory_budget_bytes: u64::MAX,
         cardinality_limit: usize::MAX,
+        max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+        max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+        max_new_series_per_window: None,
+        new_series_window_units: 1,
+        new_series_window_nanos: 60_000_000_000,
+        write_batch_limits: Default::default(),
         wal_size_limit_bytes: u64::MAX,
         admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
         compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+        maintenance_max_items_per_pass: 1_024,
+        maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
         background_threads_enabled: false,
         background_fail_fast: false,
         metadata_shard_count: None,
@@ -94,6 +102,7 @@ fn unsorted_chunk(series_id: SeriesId, points: &[(i64, f64)]) -> Arc<Chunk> {
         },
         points: chunk_points,
         encoded_payload: Vec::new(),
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     })
 }
@@ -331,7 +340,7 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
     assert!(merge_snapshot.analysis.can_use_merge_path());
     let mut merge_points = Vec::new();
     storage
-        .execute_series_read_merge_path(series_id, 0, 10, merge_snapshot, &mut merge_points)
+        .execute_series_read_merge_path(series_id, 0, 10, merge_snapshot, &mut merge_points, None)
         .unwrap();
 
     let (append_snapshot, _) = storage
@@ -345,6 +354,7 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
             10,
             append_snapshot,
             &mut append_sort_points,
+            None,
         )
         .unwrap();
 

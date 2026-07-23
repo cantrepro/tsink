@@ -1,4 +1,7 @@
-use super::{decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor, Encoder};
+use super::{
+    decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor, Encoder,
+    MAX_FORMAT_CHUNK_POINTS,
+};
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::{
     DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, NativeHistogram,
@@ -247,4 +250,54 @@ fn rejects_i64_delta_overflow() {
 
     let err = Encoder::encode(&points).unwrap_err();
     assert!(matches!(err, TsinkError::Codec(_)));
+}
+
+#[test]
+fn decoded_chunk_point_ceiling_accepts_n_and_rejects_n_plus_one_before_payload_read() {
+    Encoder::ensure_format_point_count(MAX_FORMAT_CHUNK_POINTS).unwrap();
+    let err = Encoder::decode_chunk_points_from_payload(
+        ValueLane::Numeric,
+        TimestampCodecId::FixedStepRle,
+        ValueCodecId::ConstantRle,
+        MAX_FORMAT_CHUNK_POINTS + 1,
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(err, TsinkError::DataCorruption(message)
+        if message.contains("exceeds the format safety limit")));
+}
+
+#[test]
+fn decoded_chunk_peak_ceiling_accepts_n_and_rejects_n_plus_one() {
+    // Constant-RLE bytes value: tag, one-byte varint length, payload.
+    let value_payload = [5u8, 3, b'a', b'b', b'c'];
+    let modeled = Encoder::modeled_decoded_chunk_peak_bytes(
+        ValueLane::Blob,
+        ValueCodecId::ConstantRle,
+        2,
+        &value_payload,
+    )
+    .unwrap();
+    let peak = modeled + value_payload.len();
+
+    Encoder::ensure_decoded_chunk_peak_within_limit(
+        ValueLane::Blob,
+        ValueCodecId::ConstantRle,
+        2,
+        &value_payload,
+        value_payload.len(),
+        peak,
+    )
+    .unwrap();
+    let err = Encoder::ensure_decoded_chunk_peak_within_limit(
+        ValueLane::Blob,
+        ValueCodecId::ConstantRle,
+        2,
+        &value_payload,
+        value_payload.len(),
+        peak - 1,
+    )
+    .unwrap_err();
+    assert!(matches!(err, TsinkError::DataCorruption(message)
+        if message.contains("exceeds the format safety limit")));
 }

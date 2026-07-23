@@ -34,18 +34,30 @@ pub(crate) fn eval_subquery(
     }
 
     let start = eval_at.saturating_sub(range);
+    let step_count = super::inclusive_step_count(start, eval_at, step);
+    params
+        .execution
+        .ensure_steps(step_count)
+        .map_err(crate::TsinkError::from)?;
     let mut out: BTreeMap<(String, Vec<crate::Label>), Series> = BTreeMap::new();
     for ts in step_times(start, eval_at, step) {
+        params
+            .execution
+            .charge_steps(1)
+            .map_err(crate::TsinkError::from)?;
         let inner_params = QueryParams {
             eval_time: ts,
             prefetch: params.prefetch,
             query_start: params.query_start,
             query_end: params.query_end,
             query_step: params.query_step,
+            execution: params.execution,
+            memory: params.memory,
         };
         let value = engine.eval(&subquery.expr, &inner_params)?;
         match value {
             PromqlValue::Scalar(v, _) => {
+                params.reserve_range_sample("", &[], false)?;
                 out.entry((String::new(), Vec::new()))
                     .or_insert_with(|| Series::new(String::new(), Vec::new()))
                     .samples
@@ -53,6 +65,11 @@ pub(crate) fn eval_subquery(
             }
             PromqlValue::InstantVector(samples) => {
                 for sample in samples {
+                    params.reserve_range_sample(
+                        &sample.metric,
+                        &sample.labels,
+                        sample.histogram.is_some(),
+                    )?;
                     let metric = sample.metric;
                     let labels = sample.labels;
                     let histogram = sample.histogram;

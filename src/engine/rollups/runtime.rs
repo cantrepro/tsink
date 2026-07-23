@@ -1,6 +1,4 @@
-use super::policy::{
-    encode_rollup_policies, load_rollup_policies, persist_encoded_rollup_policies_budgeted,
-};
+use super::policy::{encode_rollup_policies, load_rollup_policies};
 use super::*;
 use crate::engine::series::SeriesKey;
 
@@ -21,12 +19,14 @@ impl RollupRuntimeState {
             policies_path,
             state_path,
             local_disk_budget,
+            snapshot_publication_fenced: AtomicBool::new(false),
             snapshot_visibility: RwLock::new(()),
             policies: RwLock::new(Vec::new()),
             checkpoints: RwLock::new(HashMap::new()),
             pending_materializations: RwLock::new(HashMap::new()),
             pending_delete_invalidations: RwLock::new(Vec::new()),
             generations: RwLock::new(HashMap::new()),
+            journal_epoch: AtomicU64::new(0),
             policy_stats: RwLock::new(BTreeMap::new()),
             #[cfg(test)]
             test_hooks: RollupTestHooks::default(),
@@ -64,6 +64,32 @@ impl RollupRuntimeState {
     #[cfg(test)]
     pub(super) fn clear_policy_start_hook(&self) {
         *self.test_hooks.policy_start_hook.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn invoke_source_read_hook(
+        &self,
+        policy: &RollupPolicy,
+        series_id: SeriesId,
+    ) -> Result<()> {
+        let hook = self.test_hooks.source_read_hook.read().clone();
+        if let Some(hook) = hook {
+            hook(policy, series_id)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_source_read_hook<F>(&self, hook: F)
+    where
+        F: Fn(&RollupPolicy, SeriesId) -> Result<()> + Send + Sync + 'static,
+    {
+        *self.test_hooks.source_read_hook.write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_source_read_hook(&self) {
+        *self.test_hooks.source_read_hook.write() = None;
     }
 
     #[cfg(test)]
@@ -115,11 +141,33 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
     let Some(path) = path else {
         return Ok(LoadedRollupState::default());
     };
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LoadedRollupState::default());
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+                || !metadata.file_type().is_file()
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "rollup state path is link-like or not a regular file: {}",
+                    path.display()
+                )));
+            }
+            if metadata.len() > ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64 {
+                return Err(TsinkError::DataCorruption(format!(
+                    "rollup state snapshot size {} exceeds the bounded decode limit {ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES}",
+                    metadata.len()
+                )));
+            }
+            let mut file = fs::File::open(path)?;
+            Some(crate::engine::binio::read_to_end_bounded(
+                &mut file,
+                ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES,
+                usize::try_from(metadata.len())
+                    .unwrap_or(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES)
+                    .min(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES),
+                "rollup state snapshot",
+            )?)
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             return Err(TsinkError::IoWithPath {
                 path: path.to_path_buf(),
@@ -128,29 +176,51 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
         }
     };
 
-    let file: PersistedRollupStateFile = serde_json::from_slice(&bytes)?;
-    if file.magic != ROLLUP_STATE_MAGIC || file.version != ROLLUP_SCHEMA_VERSION {
-        return Err(TsinkError::DataCorruption(format!(
-            "unsupported rollup state file {}",
-            path.display()
-        )));
-    }
+    let file = if let Some(bytes) = bytes {
+        let file: PersistedRollupStateFile = serde_json::from_slice(&bytes)?;
+        if file.magic != ROLLUP_STATE_MAGIC || file.version != ROLLUP_SCHEMA_VERSION {
+            return Err(TsinkError::DataCorruption(format!(
+                "unsupported rollup state file {}",
+                path.display()
+            )));
+        }
+        Some(file)
+    } else {
+        None
+    };
+
+    let journal_epoch = file.as_ref().map_or(0, |file| file.journal_epoch);
 
     let mut checkpoints = HashMap::<String, BTreeMap<String, i64>>::new();
-    for checkpoint in file.checkpoints {
+    for checkpoint in file
+        .as_ref()
+        .map(|file| file.checkpoints.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+    {
         checkpoints
             .entry(checkpoint.policy_id)
             .or_default()
             .insert(checkpoint.source_key, checkpoint.materialized_through);
     }
     let generations = file
-        .generations
-        .into_iter()
+        .as_ref()
+        .map(|file| file.generations.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .cloned()
         .map(|entry| (entry.policy_id, entry.generation))
         .collect::<HashMap<_, _>>();
     let mut pending_materializations =
         HashMap::<String, BTreeMap<String, PendingRollupMaterialization>>::new();
-    for pending in file.pending_materializations {
+    for pending in file
+        .as_ref()
+        .map(|file| file.pending_materializations.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+    {
         pending_materializations
             .entry(pending.policy_id)
             .or_default()
@@ -164,8 +234,11 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
             );
     }
     let mut pending_delete_invalidations = file
-        .pending_delete_invalidations
-        .into_iter()
+        .as_ref()
+        .map(|file| file.pending_delete_invalidations.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .cloned()
         .map(|pending| PendingRollupDeleteInvalidation {
             tombstone: pending.tombstone,
             series_ids: pending.series_ids,
@@ -174,12 +247,30 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
         .collect::<Vec<_>>();
     normalize_pending_delete_invalidations(&mut pending_delete_invalidations);
 
-    Ok(LoadedRollupState {
+    let mut state = LoadedRollupState {
+        journal_epoch,
         checkpoints,
         pending_materializations,
         pending_delete_invalidations,
         generations,
-    })
+    };
+    super::state_journal::load_rollup_state_journal(path.parent(), journal_epoch, &mut state)?;
+    Ok(state)
+}
+
+#[cfg(test)]
+pub(in crate::engine::storage_engine) fn load_rollup_state_json(
+    path: &Path,
+) -> Result<serde_json::Value> {
+    let state = load_rollup_state(Some(path))?;
+    let encoded = encode_rollup_state_with_epoch(
+        &state.checkpoints,
+        &state.generations,
+        &state.pending_materializations,
+        &state.pending_delete_invalidations,
+        state.journal_epoch,
+    )?;
+    Ok(serde_json::from_slice(&encoded)?)
 }
 
 #[cfg(test)]
@@ -196,6 +287,7 @@ pub(super) fn persist_rollup_state(
         generations,
         pending_materializations,
         pending_delete_invalidations,
+        0,
         None,
     )
 }
@@ -206,6 +298,7 @@ fn persist_rollup_state_budgeted(
     generations: &HashMap<String, u64>,
     pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
     pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+    journal_epoch: u64,
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
 ) -> Result<()> {
     let Some(path) = path else {
@@ -221,11 +314,12 @@ fn persist_rollup_state_budgeted(
         ));
     };
 
-    let encoded = encode_rollup_state(
+    let encoded = encode_rollup_state_with_epoch(
         checkpoints,
         generations,
         pending_materializations,
         pending_delete_invalidations,
+        journal_epoch,
     )?;
     persist_encoded_rollup_state_budgeted(
         path,
@@ -235,12 +329,133 @@ fn persist_rollup_state_budgeted(
     )
 }
 
-pub(super) fn encode_rollup_state(
+fn charge_rollup_snapshot_item(
+    selected_items: &mut usize,
+    selected_bytes: &mut usize,
+    modeled_bytes: usize,
+) -> Result<()> {
+    *selected_items = selected_items.saturating_add(1);
+    *selected_bytes = selected_bytes.saturating_add(modeled_bytes);
+    if *selected_items > ROLLUP_STATE_SNAPSHOT_MAX_ITEMS
+        || *selected_bytes > ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES
+    {
+        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            item_limit: ROLLUP_STATE_SNAPSHOT_MAX_ITEMS,
+            byte_limit: ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64,
+            selected_items: *selected_items,
+            selected_bytes: u64::try_from(*selected_bytes).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_rollup_snapshot_within_limits(
+    policies: &[RollupPolicy],
     checkpoints: &HashMap<String, BTreeMap<String, i64>>,
     generations: &HashMap<String, u64>,
     pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
     pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+) -> Result<()> {
+    let mut selected_items = 0usize;
+    let mut selected_bytes = 512usize;
+    for policy in policies {
+        charge_rollup_snapshot_item(
+            &mut selected_items,
+            &mut selected_bytes,
+            policy
+                .id
+                .len()
+                .saturating_add(policy.metric.len())
+                .saturating_mul(6)
+                .saturating_add(192),
+        )?;
+        for label in &policy.match_labels {
+            charge_rollup_snapshot_item(
+                &mut selected_items,
+                &mut selected_bytes,
+                label
+                    .name
+                    .len()
+                    .saturating_add(label.value.len())
+                    .saturating_mul(6)
+                    .saturating_add(64),
+            )?;
+        }
+    }
+    for (policy_id, entries) in checkpoints {
+        for source_key in entries.keys() {
+            charge_rollup_snapshot_item(
+                &mut selected_items,
+                &mut selected_bytes,
+                policy_id
+                    .len()
+                    .saturating_add(source_key.len())
+                    .saturating_mul(6)
+                    .saturating_add(128),
+            )?;
+        }
+    }
+    for policy_id in generations.keys() {
+        charge_rollup_snapshot_item(
+            &mut selected_items,
+            &mut selected_bytes,
+            policy_id.len().saturating_mul(6).saturating_add(96),
+        )?;
+    }
+    for (policy_id, entries) in pending_materializations {
+        for source_key in entries.keys() {
+            charge_rollup_snapshot_item(
+                &mut selected_items,
+                &mut selected_bytes,
+                policy_id
+                    .len()
+                    .saturating_add(source_key.len())
+                    .saturating_mul(6)
+                    .saturating_add(192),
+            )?;
+        }
+    }
+    for pending in pending_delete_invalidations {
+        charge_rollup_snapshot_item(&mut selected_items, &mut selected_bytes, 192)?;
+        for _ in &pending.series_ids {
+            charge_rollup_snapshot_item(&mut selected_items, &mut selected_bytes, 32)?;
+        }
+        for policy_id in &pending.affected_policy_ids {
+            charge_rollup_snapshot_item(
+                &mut selected_items,
+                &mut selected_bytes,
+                policy_id.len().saturating_mul(6).saturating_add(32),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_rollup_policies_within_limits(policies: &[RollupPolicy]) -> Result<()> {
+    ensure_rollup_snapshot_within_limits(
+        policies,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    )
+}
+
+pub(super) fn encode_rollup_state_with_epoch(
+    checkpoints: &HashMap<String, BTreeMap<String, i64>>,
+    generations: &HashMap<String, u64>,
+    pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
+    pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+    journal_epoch: u64,
 ) -> Result<Vec<u8>> {
+    ensure_rollup_snapshot_within_limits(
+        &[],
+        checkpoints,
+        generations,
+        pending_materializations,
+        pending_delete_invalidations,
+    )?;
     let mut flattened = Vec::new();
     let mut policy_ids = checkpoints.keys().cloned().collect::<Vec<_>>();
     policy_ids.sort();
@@ -298,6 +513,7 @@ pub(super) fn encode_rollup_state(
     let payload = PersistedRollupStateFile {
         magic: ROLLUP_STATE_MAGIC.to_string(),
         version: ROLLUP_SCHEMA_VERSION,
+        journal_epoch,
         checkpoints: flattened,
         pending_materializations: persisted_pending,
         pending_delete_invalidations: persisted_pending_delete_invalidations,
@@ -324,71 +540,34 @@ fn persist_encoded_rollup_state_budgeted(
     )
 }
 
-fn read_rollup_file_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(TsinkError::IoWithPath {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn restore_rollup_file(
-    path: &Path,
-    previous: Option<&[u8]>,
+fn with_staged_rollup_snapshot_replacements<T, F>(
+    replacements: &[crate::ManagedFileReplacement<'_>],
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-) -> Result<()> {
-    if read_rollup_file_if_present(path)?.as_deref() == previous {
-        return Ok(());
-    }
-
-    match previous {
-        Some(previous) => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            write_file_atomically_and_sync_parent_budgeted(
-                path,
-                previous,
-                local_disk_budget,
+    reservation_kind: crate::DiskReservationKind,
+    publish: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut crate::StagedManagedFileReplacements) -> Result<T>,
+{
+    match (local_disk_budget, reservation_kind) {
+        (Some(budget), crate::DiskReservationKind::Growth) => budget
+            .with_staged_managed_file_replacements(
+                replacements,
                 crate::DiskCategory::Rollups,
-                crate::DiskReservationKind::Recovery,
-            )
+                publish,
+            ),
+        (Some(budget), crate::DiskReservationKind::Recovery) => budget
+            .with_staged_managed_file_replacements_for_recovery(
+                replacements,
+                crate::DiskCategory::Rollups,
+                publish,
+            ),
+        (Some(_), crate::DiskReservationKind::Maintenance) => {
+            Err(TsinkError::InvalidConfiguration(
+                "rollup snapshot pairs do not support maintenance admission".to_string(),
+            ))
         }
-        None => crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
-            path,
-            local_disk_budget,
-            crate::DiskCategory::Rollups,
-        ),
-    }
-}
-
-fn snapshot_persistence_error_after_rollback(
-    persist_error: TsinkError,
-    policies_rollback: Result<()>,
-    state_rollback: Option<Result<()>>,
-) -> TsinkError {
-    let mut rollback_errors = Vec::new();
-    if let Err(err) = policies_rollback {
-        rollback_errors.push(format!("policies rollback failed: {err}"));
-    }
-    match state_rollback {
-        Some(Err(err)) => rollback_errors.push(format!("state rollback failed: {err}")),
-        None => rollback_errors.push(
-            "state rollback skipped after indeterminate policies rollback; candidate invalidating state retained"
-                .to_string(),
-        ),
-        Some(Ok(())) => {}
-    }
-    if rollback_errors.is_empty() {
-        persist_error
-    } else {
-        TsinkError::Other(format!(
-            "rollup snapshot persistence failed: {persist_error}; {}",
-            rollback_errors.join("; ")
-        ))
+        (None, _) => crate::with_staged_file_replacements(replacements, publish),
     }
 }
 
@@ -512,8 +691,10 @@ pub(super) fn invalidate_rollup_state_for_policy_ids(
     if let Some(policy_stats) = policy_stats {
         for policy_id in affected_policy_ids {
             let state = policy_stats.entry(policy_id.clone()).or_default();
+            state.matched_series = 0;
             state.materialized_series = 0;
             state.materialized_through = None;
+            state.source_traversal_complete = false;
             state.last_error = None;
         }
     }
@@ -538,6 +719,20 @@ impl<'a> RollupStateStoreContext<'a> {
         self.state.dir_path()
     }
 
+    pub(super) fn ensure_snapshot_mutations_unfenced(self) -> Result<()> {
+        if self
+            .state
+            .snapshot_publication_fenced
+            .load(Ordering::Acquire)
+        {
+            return Err(TsinkError::Other(
+                "rollup snapshot mutations are fenced after an indeterminate publication; reopen storage to reload the durable state/policy pair before retrying"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn policies_snapshot(self) -> Vec<RollupPolicy> {
         self.state.policies.read().clone()
     }
@@ -550,12 +745,6 @@ impl<'a> RollupStateStoreContext<'a> {
         self,
     ) -> HashMap<String, BTreeMap<String, PendingRollupMaterialization>> {
         self.state.pending_materializations.read().clone()
-    }
-
-    pub(super) fn pending_delete_invalidations_snapshot(
-        self,
-    ) -> Vec<PendingRollupDeleteInvalidation> {
-        self.state.pending_delete_invalidations.read().clone()
     }
 
     pub(super) fn generations_snapshot(self) -> HashMap<String, u64> {
@@ -612,6 +801,8 @@ impl<'a> RollupStateStoreContext<'a> {
         pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
         pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
     ) -> Result<()> {
+        self.ensure_snapshot_mutations_unfenced()?;
+        let journal_epoch = self.state.journal_epoch.load(Ordering::Acquire);
         #[cfg(test)]
         self.state.invoke_state_persist_hook()?;
         persist_rollup_state_budgeted(
@@ -620,23 +811,58 @@ impl<'a> RollupStateStoreContext<'a> {
             generations,
             pending_materializations,
             pending_delete_invalidations,
+            journal_epoch,
+            self.state.local_disk_budget.as_ref(),
+        )?;
+        super::state_journal::cleanup_rollup_state_journal(
+            self.state.dir_path(),
             self.state.local_disk_budget.as_ref(),
         )
     }
 
-    pub(super) fn capture_snapshot(self) -> RollupRuntimeSnapshot {
-        let _visibility = self.state.snapshot_visibility.read();
-        RollupRuntimeSnapshot {
-            policies: self.policies_snapshot(),
-            checkpoints: self.checkpoints_snapshot(),
-            pending_materializations: self.pending_materializations_snapshot(),
-            pending_delete_invalidations: self.pending_delete_invalidations_snapshot(),
-            generations: self.generations_snapshot(),
-            policy_stats: self.policy_stats_snapshot(),
-        }
+    pub(super) fn persist_source_state_event(
+        self,
+        event: super::state_journal::RollupSourceStateEvent,
+    ) -> Result<()> {
+        self.ensure_snapshot_mutations_unfenced()?;
+        #[cfg(test)]
+        self.state.invoke_state_persist_hook()?;
+        super::state_journal::persist_rollup_source_state_event(
+            self.state.dir_path(),
+            event,
+            self.state.local_disk_budget.as_ref(),
+        )
     }
 
-    pub(super) fn persist_snapshot(self, snapshot: &RollupRuntimeSnapshot) -> Result<()> {
+    pub(super) fn capture_snapshot(self) -> Result<RollupRuntimeSnapshot> {
+        let _visibility = self.state.snapshot_visibility.read();
+        let policies = self.state.policies.read();
+        let checkpoints = self.state.checkpoints.read();
+        let pending_materializations = self.state.pending_materializations.read();
+        let pending_delete_invalidations = self.state.pending_delete_invalidations.read();
+        let generations = self.state.generations.read();
+        let policy_stats = self.state.policy_stats.read();
+        ensure_rollup_snapshot_within_limits(
+            &policies,
+            &checkpoints,
+            &generations,
+            &pending_materializations,
+            &pending_delete_invalidations,
+        )?;
+        Ok(RollupRuntimeSnapshot {
+            policies: policies.clone(),
+            checkpoints: checkpoints.clone(),
+            pending_materializations: pending_materializations.clone(),
+            pending_delete_invalidations: pending_delete_invalidations.clone(),
+            generations: generations.clone(),
+            policy_stats: policy_stats.clone(),
+        })
+    }
+
+    pub(super) fn persist_snapshot(
+        self,
+        snapshot: &RollupRuntimeSnapshot,
+    ) -> Result<RollupSnapshotPersistenceOutcome> {
         self.persist_snapshot_with_kind(snapshot, crate::DiskReservationKind::Growth)
     }
 
@@ -644,13 +870,29 @@ impl<'a> RollupStateStoreContext<'a> {
         self,
         snapshot: &RollupRuntimeSnapshot,
         reservation_kind: crate::DiskReservationKind,
-    ) -> Result<()> {
-        let encoded_policies = encode_rollup_policies(&snapshot.policies)?;
-        let encoded_state = encode_rollup_state(
+    ) -> Result<RollupSnapshotPersistenceOutcome> {
+        self.ensure_snapshot_mutations_unfenced()?;
+
+        ensure_rollup_snapshot_within_limits(
+            &snapshot.policies,
             &snapshot.checkpoints,
             &snapshot.generations,
             &snapshot.pending_materializations,
             &snapshot.pending_delete_invalidations,
+        )?;
+        let next_epoch = self
+            .state
+            .journal_epoch
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| TsinkError::Other("rollup state journal epoch exhausted".to_string()))?;
+        let encoded_policies = encode_rollup_policies(&snapshot.policies)?;
+        let encoded_state = encode_rollup_state_with_epoch(
+            &snapshot.checkpoints,
+            &snapshot.generations,
+            &snapshot.pending_materializations,
+            &snapshot.pending_delete_invalidations,
+            next_epoch,
         )?;
 
         let Some(policies_path) = self.state.policies_path() else {
@@ -660,7 +902,7 @@ impl<'a> RollupStateStoreContext<'a> {
                 && snapshot.pending_materializations.is_empty()
                 && snapshot.pending_delete_invalidations.is_empty()
             {
-                return Ok(());
+                return Ok(RollupSnapshotPersistenceOutcome::Clean);
             }
             return Err(TsinkError::InvalidConfiguration(
                 "rollup snapshots require persistent storage".to_string(),
@@ -672,75 +914,95 @@ impl<'a> RollupStateStoreContext<'a> {
             ));
         };
 
-        // These two files form one logical snapshot. Capture both before publishing either file,
-        // then use recovery admission to put both entries back before returning any error. This
-        // keeps a typed quota rejection deterministic for callers while preventing a failed apply
-        // from becoming a policy-only durable update after restart.
-        let previous_policies = read_rollup_file_if_present(policies_path)?;
-        let previous_state = read_rollup_file_if_present(state_path)?;
-        let persist_result = (|| {
-            // Publish the invalidating state first. If the process stops before policies are
-            // replaced, the old policy definition has no reusable checkpoint and queries fall
-            // back to raw data. Publishing policies first could pair a changed definition with a
-            // checkpoint and generation produced by its predecessor.
-            persist_encoded_rollup_state_budgeted(
-                state_path,
-                &encoded_state,
-                self.state.local_disk_budget.as_ref(),
-                reservation_kind,
-            )?;
-            #[cfg(test)]
-            self.state.invoke_state_persist_hook()?;
-            persist_encoded_rollup_policies_budgeted(
-                policies_path,
-                &encoded_policies,
-                self.state.local_disk_budget.as_ref(),
-                reservation_kind,
-            )?;
-            #[cfg(test)]
-            self.state
-                .invoke_policy_persist_hook(RollupPolicyPersistHookPoint::CandidatePublished)?;
-            Ok(())
-        })();
+        // These two files form one logical snapshot. Admit and fully stage the complete pair
+        // before either target is replaced. State is the conservative, invalidating half and must
+        // remain first: an interruption can therefore expose either the predecessor pair, the
+        // predecessor policies with candidate invalidation state, or the complete candidate pair.
+        // Every one of those combinations is safe on reopen; candidate policies can never become
+        // durable while predecessor checkpoints remain reusable. If publication is indeterminate,
+        // the fence below also prevents a later snapshot from being derived from stale in-memory
+        // predecessor state before reopen resolves which pair became durable.
+        let replacements = [
+            crate::ManagedFileReplacement::new(state_path, &encoded_state),
+            crate::ManagedFileReplacement::new(policies_path, &encoded_policies),
+        ];
+        let mut state_published = false;
+        let mut state_durable = false;
+        let mut policies_published = false;
+        let mut policies_durable = false;
+        let mut publication_ambiguous = false;
+        // Arm the fence before staging begins. An unwind then remains conservative even if it
+        // happens after a rename but before the publication outcome can be classified below.
+        // Ordinary pre-publication failures and proven complete commits clear it again.
+        self.state
+            .snapshot_publication_fenced
+            .store(true, Ordering::Release);
+        let persist_result = with_staged_rollup_snapshot_replacements(
+            &replacements,
+            self.state.local_disk_budget.as_ref(),
+            reservation_kind,
+            |staged| {
+                let state_result = staged.publish(0);
+                state_published = staged.is_published(0);
+                publication_ambiguous |= staged.publication_ambiguous();
+                state_result?;
+                state_durable = true;
+                self.state
+                    .journal_epoch
+                    .store(next_epoch, Ordering::Release);
+
+                #[cfg(test)]
+                self.state.invoke_state_persist_hook()?;
+
+                let policies_result = staged.publish(1);
+                policies_published = staged.is_published(1);
+                publication_ambiguous |= staged.publication_ambiguous();
+                policies_result?;
+                policies_durable = true;
+
+                #[cfg(test)]
+                self.state
+                    .invoke_policy_persist_hook(RollupPolicyPersistHookPoint::CandidatePublished)?;
+                Ok(())
+            },
+        );
 
         match persist_result {
-            Ok(()) => Ok(()),
-            Err(persist_error) => {
-                // Restore policies before state. If recovery itself is interrupted, the old
-                // policies remain paired with the invalidating candidate state, which is a safe
-                // raw-data fallback. Restoring state first could briefly pair new policies with
-                // checkpoints produced by their predecessors.
-                let policies_rollback = {
-                    #[cfg(test)]
-                    let hook_result = self
-                        .state
-                        .invoke_policy_persist_hook(RollupPolicyPersistHookPoint::RollbackStarting);
-                    #[cfg(not(test))]
-                    let hook_result = Ok(());
-                    hook_result.and_then(|()| {
-                        restore_rollup_file(
-                            policies_path,
-                            previous_policies.as_deref(),
-                            self.state.local_disk_budget.as_ref(),
-                        )
-                    })
-                };
-                // Candidate state invalidates predecessor checkpoints and is safe with either
-                // policy version. Restore predecessor state only after predecessor policies are
-                // definitively back; otherwise a failed policy rollback could leave candidate
-                // policies paired with stale predecessor checkpoints.
-                let state_rollback = policies_rollback.is_ok().then(|| {
-                    restore_rollup_file(
-                        state_path,
-                        previous_state.as_deref(),
-                        self.state.local_disk_budget.as_ref(),
-                    )
-                });
-                Err(snapshot_persistence_error_after_rollback(
-                    persist_error,
-                    policies_rollback,
-                    state_rollback,
+            Ok(()) => {
+                let cleanup_result = super::state_journal::cleanup_rollup_state_journal(
+                    self.state.dir_path(),
+                    self.state.local_disk_budget.as_ref(),
+                );
+                self.state
+                    .snapshot_publication_fenced
+                    .store(false, Ordering::Release);
+                match cleanup_result {
+                    Ok(()) => Ok(RollupSnapshotPersistenceOutcome::Clean),
+                    Err(error) => Ok(
+                        RollupSnapshotPersistenceOutcome::CommittedWithCleanupDebt(error),
+                    ),
+                }
+            }
+            Err(error) if state_durable && policies_durable => {
+                self.state
+                    .snapshot_publication_fenced
+                    .store(false, Ordering::Release);
+                Ok(RollupSnapshotPersistenceOutcome::CommittedWithCleanupDebt(
+                    error,
                 ))
+            }
+            Err(error)
+                if state_published || policies_published || publication_ambiguous =>
+            {
+                Err(TsinkError::Other(format!(
+                    "rollup snapshot publication outcome is indeterminate after ordered state-first publication; the durable invalidation ordering remains safe for reopen, and further in-process mutations are fenced: {error}"
+                )))
+            }
+            Err(error) => {
+                self.state
+                    .snapshot_publication_fenced
+                    .store(false, Ordering::Release);
+                Err(error)
             }
         }
     }
@@ -761,8 +1023,9 @@ impl<'a> RollupStateStoreContext<'a> {
     pub(super) fn next_snapshot_for_policies(
         self,
         policies: Vec<RollupPolicy>,
-    ) -> RollupRuntimeSnapshot {
-        let mut snapshot = self.capture_snapshot();
+    ) -> Result<RollupRuntimeSnapshot> {
+        ensure_rollup_policies_within_limits(&policies)?;
+        let mut snapshot = self.capture_snapshot()?;
         let current_policies = snapshot
             .policies
             .iter()
@@ -819,13 +1082,31 @@ impl<'a> RollupStateStoreContext<'a> {
             snapshot.policy_stats.entry(policy.id.clone()).or_default();
         }
 
-        snapshot
+        ensure_rollup_snapshot_within_limits(
+            &snapshot.policies,
+            &snapshot.checkpoints,
+            &snapshot.generations,
+            &snapshot.pending_materializations,
+            &snapshot.pending_delete_invalidations,
+        )?;
+        Ok(snapshot)
     }
 }
 
 impl<'a> RollupRegistryReadContext<'a> {
-    pub(super) fn series_ids_for_metric(self, metric: &str) -> Vec<SeriesId> {
-        self.registry.read().series_ids_for_metric(metric)
+    pub(super) fn has_series_for_metric(self, metric: &str) -> bool {
+        self.registry.read().has_series_for_metric(metric)
+    }
+
+    pub(super) fn series_ids_for_metric_after(
+        self,
+        metric: &str,
+        after: Option<SeriesId>,
+        limit: usize,
+    ) -> (Vec<SeriesId>, bool) {
+        self.registry
+            .read()
+            .series_ids_for_metric_after(metric, after, limit)
     }
 
     pub(super) fn resolve_existing_series_id(
@@ -925,12 +1206,17 @@ impl<'a> RollupDeleteRepairContext<'a> {
         }
 
         let LoadedRollupState {
+            journal_epoch,
             checkpoints,
             pending_materializations,
             pending_delete_invalidations,
             generations,
         } = state;
 
+        self.store
+            .state
+            .journal_epoch
+            .store(journal_epoch, Ordering::Release);
         *self.store.state.policies.write() = policies.clone();
         *self.store.state.checkpoints.write() = checkpoints;
         *self.store.state.pending_materializations.write() = pending_materializations;
@@ -987,11 +1273,12 @@ impl<'a> RollupInvalidationContext<'a> {
             return Ok(());
         };
 
-        let mut snapshot = self.store.capture_snapshot();
+        let mut snapshot = self.store.capture_snapshot()?;
         snapshot.pending_delete_invalidations.push(pending_delete);
         normalize_pending_delete_invalidations(&mut snapshot.pending_delete_invalidations);
-        self.store.persist_snapshot(&snapshot)?;
+        let persistence = self.store.persist_snapshot(&snapshot)?;
         self.store.install_snapshot(snapshot);
+        persistence.report_cleanup_debt();
         Ok(())
     }
 
@@ -1007,7 +1294,7 @@ impl<'a> RollupInvalidationContext<'a> {
             return Ok(());
         };
 
-        let mut snapshot = self.store.capture_snapshot();
+        let mut snapshot = self.store.capture_snapshot()?;
         invalidate_rollup_state_for_policy_ids(
             &mut snapshot.checkpoints,
             &mut snapshot.generations,
@@ -1021,7 +1308,7 @@ impl<'a> RollupInvalidationContext<'a> {
 
         let persist_result = self.store.persist_snapshot(&snapshot);
         self.store.install_snapshot(snapshot);
-        persist_result
+        persist_result.map(RollupSnapshotPersistenceOutcome::report_cleanup_debt)
     }
 
     fn cancel_pending_rollup_delete_invalidation(
@@ -1036,7 +1323,7 @@ impl<'a> RollupInvalidationContext<'a> {
             return Ok(());
         };
 
-        let mut snapshot = self.store.capture_snapshot();
+        let mut snapshot = self.store.capture_snapshot()?;
         let previous_len = snapshot.pending_delete_invalidations.len();
         snapshot
             .pending_delete_invalidations
@@ -1048,9 +1335,11 @@ impl<'a> RollupInvalidationContext<'a> {
         // Cancellation restores the pre-delete state after tombstone persistence rejected the
         // operation. It is recovery work, so it must remain possible while the logical data root
         // is at or above its normal-growth limit.
-        self.store
+        let persistence = self
+            .store
             .persist_snapshot_with_kind(&snapshot, crate::DiskReservationKind::Recovery)?;
         self.store.install_snapshot(snapshot);
+        persistence.report_cleanup_debt();
         Ok(())
     }
 
@@ -1059,7 +1348,7 @@ impl<'a> RollupInvalidationContext<'a> {
             return Ok(false);
         }
 
-        let mut snapshot = self.store.capture_snapshot();
+        let mut snapshot = self.store.capture_snapshot()?;
         invalidate_rollup_state_for_policy_ids(
             &mut snapshot.checkpoints,
             &mut snapshot.generations,
@@ -1067,8 +1356,9 @@ impl<'a> RollupInvalidationContext<'a> {
             Some(&mut snapshot.policy_stats),
             affected_policy_ids,
         );
-        self.store.persist_snapshot(&snapshot)?;
+        let persistence = self.store.persist_snapshot(&snapshot)?;
         self.store.install_snapshot(snapshot);
+        persistence.report_cleanup_debt();
         Ok(true)
     }
 }

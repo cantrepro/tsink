@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use tempfile::TempDir;
 
@@ -16,6 +18,7 @@ use crate::engine::segment::{QuarantinedSegmentRoot, SegmentManifest, StartupQua
 
 fn startup_builder(data_path: &Path) -> StorageBuilder {
     StorageBuilder::new()
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_data_path(data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(2)
@@ -134,7 +137,7 @@ fn build_storage_returns_structured_error_for_invalid_data_path() {
     };
     assert!(matches!(
         err,
-        TsinkError::Io(_) | TsinkError::IoWithPath { .. }
+        TsinkError::Io(_) | TsinkError::IoWithPath { .. } | TsinkError::InvalidConfiguration(_)
     ));
 }
 
@@ -187,19 +190,312 @@ fn planning_rejects_shared_disk_budget_for_a_different_data_root() {
     ));
 }
 
+#[test]
+fn budgeted_restore_rolls_back_and_reconciles_after_activation_sync_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    let target_path = budget_root.join("target");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("new"), b"new-state").unwrap();
+    std::fs::create_dir_all(&target_path).unwrap();
+    std::fs::write(target_path.join("old"), b"old-state").unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&budget_root, crate::LocalDiskLimits::default()).unwrap();
+
+    let synchronized_root = budget.root().to_path_buf();
+    let root_syncs = Arc::new(AtomicUsize::new(0));
+    let observed_syncs = Arc::clone(&root_syncs);
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            path == synchronized_root && observed_syncs.fetch_add(1, Ordering::SeqCst) + 1 == 3
+        },
+        "injected restore activation sync failure",
+    );
+
+    let err = restore_storage_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &target_path,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("restore activation parent sync failed"));
+    assert_eq!(root_syncs.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        std::fs::read(target_path.join("old")).unwrap(),
+        b"old-state"
+    );
+    assert!(!target_path.join("new").exists());
+    assert!(std::fs::read_dir(&budget_root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-tsink-restore-")));
+    let accounting = budget.snapshot();
+    assert_eq!(accounting.accounted_bytes, 9);
+    assert_eq!(accounting.active_reservations, 0);
+    assert_eq!(accounting.reserved_bytes, 0);
+}
+
+#[test]
+fn unbudgeted_restore_rolls_back_after_activation_sync_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let target_path = temp_dir.path().join("target");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("new"), b"new-state").unwrap();
+    std::fs::create_dir_all(&target_path).unwrap();
+    std::fs::write(target_path.join("old"), b"old-state").unwrap();
+
+    let synchronized_root = temp_dir.path().to_path_buf();
+    let root_syncs = Arc::new(AtomicUsize::new(0));
+    let observed_syncs = Arc::clone(&root_syncs);
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            path == synchronized_root && observed_syncs.fetch_add(1, Ordering::SeqCst) + 1 == 2
+        },
+        "injected unbudgeted restore activation sync failure",
+    );
+
+    let err = restore_storage_from_snapshot(&snapshot_path, &target_path).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("restore activation parent sync failed"));
+    assert_eq!(root_syncs.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        std::fs::read(target_path.join("old")).unwrap(),
+        b"old-state"
+    );
+    assert!(!target_path.join("new").exists());
+    assert!(std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn unbudgeted_restore_removes_staging_after_staging_sync_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let target_path = temp_dir.path().join("target");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("payload"), b"new-state").unwrap();
+
+    let staging_syncs = Arc::new(AtomicUsize::new(0));
+    let observed_syncs = Arc::clone(&staging_syncs);
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".tmp-tsink-restore-staging-")
+            }) && observed_syncs.fetch_add(1, Ordering::SeqCst) + 1 == 2
+        },
+        "injected unbudgeted restore staging sync failure",
+    );
+
+    let err = restore_storage_from_snapshot(&snapshot_path, &target_path).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("injected unbudgeted restore staging sync failure"));
+    assert_eq!(staging_syncs.load(Ordering::SeqCst), 2);
+    assert!(!target_path.exists());
+    assert!(std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn unbudgeted_restore_removes_staging_after_copy_sync_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let target_path = temp_dir.path().join("target");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("payload"), b"new-state").unwrap();
+
+    let staging_syncs = Arc::new(AtomicUsize::new(0));
+    let observed_syncs = Arc::clone(&staging_syncs);
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".tmp-tsink-restore-staging-")
+            }) && observed_syncs.fetch_add(1, Ordering::SeqCst) == 0
+        },
+        "injected unbudgeted restore copy sync failure",
+    );
+
+    let err = restore_storage_from_snapshot(&snapshot_path, &target_path).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("injected unbudgeted restore copy sync failure"));
+    assert_eq!(staging_syncs.load(Ordering::SeqCst), 1);
+    assert!(!target_path.exists());
+    assert!(std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn unbudgeted_restore_synchronizes_missing_target_ancestors_before_staging() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let restore_parent = temp_dir.path().join("restore-parent");
+    let target_path = restore_parent.join("nested/target");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("payload"), b"state").unwrap();
+
+    let synchronized_parent = restore_parent.clone();
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| path == synchronized_parent,
+        "injected missing restore ancestor sync failure",
+    );
+
+    let err = restore_storage_from_snapshot(&snapshot_path, &target_path).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("injected missing restore ancestor sync failure"));
+    assert!(!target_path.exists());
+    assert!(std::fs::read_dir(restore_parent.join("nested"))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn post_flush_stage_cleanup_preflights_every_candidate_tree_before_removal() {
+    let temp_dir = TempDir::new().unwrap();
+    let parent = temp_dir.path().join("segments/L0");
+    let exact = parent.join("owned-exact");
+    let first = parent.join("owned-first");
+    let second = parent.join("owned-second");
+    std::fs::create_dir_all(&exact).unwrap();
+    std::fs::write(exact.join("one"), b"one").unwrap();
+    std::fs::write(exact.join("two"), b"two").unwrap();
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("one"), b"one").unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("two"), b"two").unwrap();
+    std::fs::write(second.join("three"), b"three").unwrap();
+
+    super::planning::cleanup_exact_post_flush_stage_dirs_with_namespace_limits(
+        &parent,
+        |name| name == "owned-exact",
+        None,
+        8,
+        2,
+        4,
+        usize::MAX,
+        true,
+    )
+    .expect("the exact descendant cap must be accepted");
+    assert!(!exact.exists());
+
+    let err = super::planning::cleanup_exact_post_flush_stage_dirs_with_namespace_limits(
+        &parent,
+        |name| matches!(name, "owned-first" | "owned-second"),
+        None,
+        8,
+        2,
+        4,
+        usize::MAX,
+        true,
+    )
+    .expect_err("cap plus one across candidate trees must fail closed");
+    assert!(err.to_string().contains("2-entry global work bound"));
+    assert_eq!(std::fs::read(first.join("one")).unwrap(), b"one");
+    assert_eq!(std::fs::read(second.join("two")).unwrap(), b"two");
+    assert_eq!(std::fs::read(second.join("three")).unwrap(), b"three");
+}
+
+#[test]
+fn post_flush_stage_preflight_shares_one_namespace_cap_across_parents() {
+    let temp_dir = TempDir::new().unwrap();
+    let first_parent = temp_dir.path().join("first");
+    let second_parent = temp_dir.path().join("second");
+    let first = first_parent.join("owned");
+    let second = second_parent.join("owned");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(first.join("one"), b"one").unwrap();
+    std::fs::write(second.join("two"), b"two").unwrap();
+
+    let mut too_small = crate::engine::fs_utils::RecoveryNamespaceBudget::new(3);
+    super::planning::preflight_exact_post_flush_stage_dirs_global(
+        &first_parent,
+        |name| name == "owned",
+        &mut too_small,
+        4,
+        usize::MAX,
+    )
+    .unwrap();
+    let error = super::planning::preflight_exact_post_flush_stage_dirs_global(
+        &second_parent,
+        |name| name == "owned",
+        &mut too_small,
+        4,
+        usize::MAX,
+    )
+    .expect_err("the second parent's descendant must consume the same global cap");
+    assert!(error.to_string().contains("3-entry global work bound"));
+    assert_eq!(std::fs::read(first.join("one")).unwrap(), b"one");
+    assert_eq!(std::fs::read(second.join("two")).unwrap(), b"two");
+
+    let mut exact = crate::engine::fs_utils::RecoveryNamespaceBudget::new(4);
+    super::planning::preflight_exact_post_flush_stage_dirs_global(
+        &first_parent,
+        |name| name == "owned",
+        &mut exact,
+        4,
+        usize::MAX,
+    )
+    .unwrap();
+    super::planning::preflight_exact_post_flush_stage_dirs_global(
+        &second_parent,
+        |name| name == "owned",
+        &mut exact,
+        4,
+        usize::MAX,
+    )
+    .expect("the exact shared namespace cap must succeed");
+}
+
 #[cfg(unix)]
 #[test]
 fn planning_rejects_symlinked_owned_directory_namespaces() {
     use std::os::unix::fs::symlink;
 
     type OwnedDirectoryPath = fn(&Path) -> PathBuf;
-    let cases: [(&str, OwnedDirectoryPath); 4] = [
+    let cases: [(&str, OwnedDirectoryPath); 5] = [
         ("numeric lane", |data_path| {
             data_path.join(NUMERIC_LANE_ROOT)
         }),
         ("WAL", |data_path| data_path.join(WAL_DIR_NAME)),
         ("rollups", |data_path| {
             data_path.join(rollups::ROLLUP_DIR_NAME)
+        }),
+        ("registry catalog", |data_path| {
+            registry_catalog::catalog_store_path(&data_path.join(SERIES_INDEX_FILE_NAME))
         }),
         ("tombstones", |data_path| {
             data_path.join(NUMERIC_LANE_ROOT).join(format!(
@@ -329,6 +625,218 @@ fn planning_without_orphans_keeps_the_initial_single_reconciliation() {
 }
 
 #[test]
+fn compute_only_planning_does_not_recover_or_clean_an_unleased_writer_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("writer-data");
+    let object_store_path = temp_dir.path().join("object-store");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_path = marker_dir.join("transaction-0000000000000001-0000000000000002.json");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&marker_path, b"writer-owned-pending-marker").unwrap();
+
+    let staged = object_store_path
+        .join("hot")
+        .join("numeric")
+        .join("segments")
+        .join("L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000003-0000000000000004");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("writer-owned"), b"keep").unwrap();
+
+    let builder = startup_builder(&data_path)
+        .with_object_store_path(&object_store_path)
+        .with_runtime_mode(StorageRuntimeMode::ComputeOnly);
+    let _plan = StartupPlanningPhase::prepare(&builder)
+        .expect("compute-only planning must not parse or mutate an unleased writer path");
+
+    assert_eq!(
+        std::fs::read(&marker_path).unwrap(),
+        b"writer-owned-pending-marker"
+    );
+    assert_eq!(std::fs::read(staged.join("writer-owned")).unwrap(), b"keep");
+}
+
+#[test]
+fn planning_reclaims_exact_post_flush_recovery_blockers_before_parsing_a_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let marker_path = marker_dir.join(marker_name);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&marker_path, b"intentionally-invalid-marker").unwrap();
+
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::write(&atomic_temp, vec![b'x'; 1024 * 1024]).unwrap();
+    let atomic_lookalike = marker_dir.join(format!(".{marker_name}.tmp-123-000000000000000A"));
+    std::fs::write(&atomic_lookalike, b"keep-atomic-lookalike").unwrap();
+
+    let numeric_lane = data_path.join(NUMERIC_LANE_ROOT);
+    let copy_stage = numeric_lane
+        .join("segments")
+        .join("L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&copy_stage).unwrap();
+    std::fs::write(
+        copy_stage.join("large-crash-debris"),
+        vec![b'y'; 1024 * 1024],
+    )
+    .unwrap();
+    let copy_lookalike = numeric_lane
+        .join("segments")
+        .join("L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-000000000000000A");
+    std::fs::create_dir_all(&copy_lookalike).unwrap();
+    std::fs::write(copy_lookalike.join("keep"), b"keep-copy-lookalike").unwrap();
+
+    let rewrite_stage =
+        data_path.join(".tmp-tsink-post-flush-retention-rewrite-lane_numeric-0000000000000006");
+    std::fs::create_dir_all(&rewrite_stage).unwrap();
+    std::fs::write(
+        rewrite_stage.join("large-crash-debris"),
+        vec![b'z'; 1024 * 1024],
+    )
+    .unwrap();
+    let rewrite_lookalike =
+        data_path.join(".tmp-tsink-post-flush-retention-rewrite-lane_numeric-000000000000000A");
+    std::fs::create_dir_all(&rewrite_lookalike).unwrap();
+    std::fs::write(rewrite_lookalike.join("keep"), b"keep-rewrite-lookalike").unwrap();
+
+    let error = planning_error(&startup_builder(&data_path));
+    assert!(matches!(error, TsinkError::Json(_)));
+    assert!(!atomic_temp.exists());
+    assert!(!copy_stage.exists());
+    assert!(!rewrite_stage.exists());
+    assert_eq!(
+        std::fs::read(&atomic_lookalike).unwrap(),
+        b"keep-atomic-lookalike"
+    );
+    assert_eq!(
+        std::fs::read(copy_lookalike.join("keep")).unwrap(),
+        b"keep-copy-lookalike"
+    );
+    assert_eq!(
+        std::fs::read(rewrite_lookalike.join("keep")).unwrap(),
+        b"keep-rewrite-lookalike"
+    );
+    assert_eq!(
+        std::fs::read(&marker_path).unwrap(),
+        b"intentionally-invalid-marker"
+    );
+}
+
+#[test]
+fn full_startup_memory_rejection_preserves_all_blockers_until_exact_threshold() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::write(&atomic_temp, b"atomic-temp").unwrap();
+
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&stage).unwrap();
+    for index in 0..512u32 {
+        std::fs::write(stage.join(format!("owned-{index:04x}")), b"stage").unwrap();
+    }
+    let unknown_dir = data_path.join("operator-tree");
+    std::fs::create_dir_all(&unknown_dir).unwrap();
+    for index in 0..512u32 {
+        std::fs::write(unknown_dir.join(format!("opaque-{index:04x}")), b"keep").unwrap();
+    }
+
+    let mut reconcile_limit = 0usize;
+    loop {
+        match crate::LocalDiskBudget::open_with_startup_memory_limit(
+            &data_path,
+            crate::LocalDiskLimits::default(),
+            reconcile_limit,
+        ) {
+            Ok(_) => break,
+            Err(TsinkError::MemoryBudgetExceeded { required, .. }) => {
+                assert!(required > reconcile_limit);
+                reconcile_limit = required;
+            }
+            Err(err) => panic!("unexpected reconciliation preflight error: {err}"),
+        }
+    }
+
+    let mut exact_startup_limit = reconcile_limit;
+    loop {
+        let builder = startup_builder(&data_path).with_memory_limit(exact_startup_limit);
+        match builder.build() {
+            Ok(storage) => {
+                storage.close().unwrap();
+                break;
+            }
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact_startup_limit);
+                assert!(required > exact_startup_limit);
+                assert!(atomic_temp.is_file());
+                assert!(stage.is_dir());
+                assert_eq!(std::fs::read(stage.join("owned-0000")).unwrap(), b"stage");
+                exact_startup_limit = required;
+            }
+            Err(err) => panic!("unexpected bounded full-startup error: {err}"),
+        }
+    }
+    assert!(exact_startup_limit > reconcile_limit);
+    assert!(!atomic_temp.exists());
+    assert!(!stage.exists());
+    for index in 0..512u32 {
+        assert_eq!(
+            std::fs::read(unknown_dir.join(format!("opaque-{index:04x}"))).unwrap(),
+            b"keep"
+        );
+    }
+}
+
+#[test]
+fn full_startup_memory_rejection_preserves_generic_orphans_across_categories() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let atomic_temp = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    std::fs::write(&atomic_temp, b"atomic").unwrap();
+    let segment_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-0000000000000002");
+    std::fs::create_dir_all(&segment_stage).unwrap();
+    for index in 0..256u32 {
+        std::fs::write(segment_stage.join(format!("entry-{index:04x}")), b"stage").unwrap();
+    }
+
+    let mut memory_limit = 0usize;
+    loop {
+        let builder = startup_builder(&data_path).with_memory_limit(memory_limit);
+        match builder.build() {
+            Ok(storage) => {
+                storage.close().unwrap();
+                break;
+            }
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, memory_limit);
+                assert!(required > memory_limit);
+                assert!(atomic_temp.is_file());
+                assert!(segment_stage.is_dir());
+                assert_eq!(
+                    std::fs::read(segment_stage.join("entry-0000")).unwrap(),
+                    b"stage"
+                );
+                memory_limit = required;
+            }
+            Err(err) => panic!("unexpected generic startup-cleanup error: {err}"),
+        }
+    }
+    assert!(!atomic_temp.exists());
+    assert!(!segment_stage.exists());
+}
+
+#[test]
 fn planning_cleans_exact_owned_orphans_before_enforcing_future_growth() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().join("data");
@@ -357,6 +865,7 @@ fn planning_cleans_exact_owned_orphans_before_enforcing_future_growth() {
         rollup_dir.join(".state.json.tmp-123-0000000000000005"),
         lane_path.join(".tombstones.json.tmp-123-0000000000000006"),
         delta_dir.join(".delta-0000000000000007.bin.tmp-123-0000000000000008"),
+        delta_dir.join(".journal-active.bin.tmp-123-0000000000000015"),
         tombstone_shards.join(".shard-007-0000000000000009.bin.tmp-123-000000000000000a"),
         tombstone_shards.join("shard-007-000000000000000f.bin"),
         replacement_dir
@@ -582,6 +1091,76 @@ fn recovery_phase_rebuilds_registry_from_segments_when_checkpoint_load_fails() {
         .iter()
         .any(|series| series.metric == metric
             && series.labels == vec![Label::new("host", "startup")]));
+}
+
+#[test]
+fn hydration_memory_rejection_precedes_corrupt_segment_quarantine() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let mut random_state = 0x9e37_79b9_u32;
+    let payload = (0..4 * 1024 * 1024)
+        .map(|_| {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 17;
+            random_state ^= random_state << 5;
+            random_state as u8
+        })
+        .collect::<Vec<_>>();
+    {
+        let storage = startup_builder(&data_path).build().unwrap();
+        storage
+            .insert_rows(&[Row::new(
+                "startup_hydration_blob",
+                DataPoint::new(1, payload),
+            )])
+            .unwrap();
+        storage.close().unwrap();
+    }
+    assert!(
+        !crate::engine::segment::list_segment_dirs(data_path.join(BLOB_LANE_ROOT))
+            .unwrap()
+            .is_empty()
+    );
+
+    let corrupt_root = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/seg-fffffffffffffffe");
+    std::fs::create_dir_all(&corrupt_root).unwrap();
+    let corrupt_manifest = corrupt_root.join("manifest.bin");
+    std::fs::write(&corrupt_manifest, b"invalid-manifest-sentinel").unwrap();
+
+    let mut memory_limit = 1usize;
+    let mut saw_hydration_rejection = false;
+    for _ in 0..32 {
+        let builder = startup_builder(&data_path).with_memory_limit(memory_limit);
+        let plan = match StartupPlanningPhase::prepare(&builder) {
+            Ok(plan) => plan,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, memory_limit);
+                assert!(required > memory_limit);
+                memory_limit = required;
+                continue;
+            }
+            Err(err) => panic!("unexpected bounded startup planning error: {err}"),
+        };
+        match StartupDiscoveryPhase::discover(&builder, &plan) {
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, memory_limit);
+                assert!(required > memory_limit);
+                saw_hydration_rejection = true;
+                break;
+            }
+            Err(err) => panic!("unexpected bounded startup discovery error: {err}"),
+            Ok(_) => panic!("expected persisted hydration to exceed the planning-only threshold"),
+        }
+    }
+
+    assert!(saw_hydration_rejection);
+    assert!(corrupt_root.is_dir());
+    assert_eq!(
+        std::fs::read(&corrupt_manifest).unwrap(),
+        b"invalid-manifest-sentinel"
+    );
 }
 
 #[test]

@@ -59,6 +59,10 @@ pub struct Chunk {
     pub header: ChunkHeader,
     pub points: Vec<ChunkPoint>,
     pub encoded_payload: Vec<u8>,
+    /// Earliest WAL frame represented by this in-memory chunk. Segment decoding initializes this
+    /// transient field to the default value because only sealed, not-yet-persisted chunks
+    /// participate in partial-flush replay-floor selection.
+    pub wal_lowwater: WalHighWatermark,
     pub wal_highwater: WalHighWatermark,
 }
 
@@ -71,6 +75,7 @@ impl Clone for Chunk {
             header: self.header.clone(),
             points: self.points.clone(),
             encoded_payload: self.encoded_payload.clone(),
+            wal_lowwater: self.wal_lowwater,
             wal_highwater: self.wal_highwater,
         }
     }
@@ -339,9 +344,29 @@ impl ChunkBuilderSnapshotCursor {
 }
 
 impl ChunkBuilder {
+    pub(crate) fn initial_point_capacity(max_points: usize) -> usize {
+        max_points.clamp(1, ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS)
+    }
+
+    pub(crate) fn projected_point_block_capacity(
+        current_capacity: usize,
+        required_capacity: usize,
+    ) -> usize {
+        if required_capacity <= current_capacity {
+            return current_capacity;
+        }
+
+        current_capacity
+            .saturating_mul(2)
+            .max(required_capacity)
+            // Match `Vec`'s small non-zero allocation while making the growth rule explicit for
+            // the write-admission model.
+            .max(4)
+    }
+
     pub fn new(series_id: SeriesId, lane: ValueLane, max_points: usize) -> Self {
         let max_points = max_points.max(1);
-        let point_block_max_points = max_points.min(ACTIVE_POINT_SNAPSHOT_BLOCK_POINTS);
+        let point_block_max_points = Self::initial_point_capacity(max_points);
         Self {
             series_id,
             lane,
@@ -385,6 +410,14 @@ impl ChunkBuilder {
 
     pub(crate) fn point_block_capacity(&self) -> usize {
         self.frozen_point_blocks.capacity()
+    }
+
+    pub(crate) fn point_block_max_points(&self) -> usize {
+        self.point_block_max_points
+    }
+
+    pub(crate) fn tail_point_count(&self) -> usize {
+        self.tail_points.len()
     }
 
     pub(crate) fn frozen_point_block_count(&self) -> usize {
@@ -477,6 +510,7 @@ impl ChunkBuilder {
             },
             points,
             encoded_payload: Vec::new(),
+            wal_lowwater: WalHighWatermark::default(),
             wal_highwater: WalHighWatermark::default(),
         })
     }
@@ -488,6 +522,14 @@ impl ChunkBuilder {
 
         let mut frozen = Vec::with_capacity(self.point_block_max_points);
         std::mem::swap(&mut frozen, &mut self.tail_points);
+        if self.frozen_point_blocks.len() == self.frozen_point_blocks.capacity() {
+            let next_capacity = Self::projected_point_block_capacity(
+                self.frozen_point_blocks.capacity(),
+                self.frozen_point_blocks.len().saturating_add(1),
+            );
+            self.frozen_point_blocks
+                .reserve_exact(next_capacity.saturating_sub(self.frozen_point_blocks.len()));
+        }
         self.frozen_point_blocks.push(FrozenPointBlock::new(frozen));
         self.tail_points = Vec::with_capacity(self.point_block_max_points);
     }

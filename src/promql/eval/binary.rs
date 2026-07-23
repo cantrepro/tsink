@@ -15,6 +15,9 @@ pub(crate) fn eval_binary(
 ) -> Result<PromqlValue> {
     let lhs = engine.eval(&expr.lhs, params)?;
     let rhs = engine.eval(&expr.rhs, params)?;
+    // Matching can retain cardinality maps, keyed sample groups, and output while both operands
+    // remain live. Admit that modeled working set before constructing those collections.
+    params.reserve_transform_upper(&[&lhs, &rhs], 4)?;
 
     match (lhs, rhs) {
         (PromqlValue::Scalar(lv, lts), PromqlValue::Scalar(rv, rts)) => {
@@ -22,13 +25,13 @@ pub(crate) fn eval_binary(
             eval_scalar_scalar(expr.op, lv, rv, expr.return_bool, ts)
         }
         (PromqlValue::InstantVector(samples), PromqlValue::Scalar(s, _)) => {
-            eval_vector_scalar(expr.op, samples, s, true, expr.return_bool)
+            eval_vector_scalar(expr.op, samples, s, true, expr.return_bool, params)
         }
         (PromqlValue::Scalar(s, _), PromqlValue::InstantVector(samples)) => {
-            eval_vector_scalar(expr.op, samples, s, false, expr.return_bool)
+            eval_vector_scalar(expr.op, samples, s, false, expr.return_bool, params)
         }
         (PromqlValue::InstantVector(lhs), PromqlValue::InstantVector(rhs)) => {
-            eval_vector_vector(expr, lhs, rhs)
+            eval_vector_vector(expr, lhs, rhs, params)
         }
         (l, r) => Err(PromqlError::Type(format!(
             "binary operator cannot combine {l:?} and {r:?}"
@@ -70,6 +73,7 @@ fn eval_vector_scalar(
     scalar: f64,
     vector_on_lhs: bool,
     return_bool: bool,
+    params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
     if op.is_set() {
         return Err(PromqlError::Type(
@@ -85,6 +89,7 @@ fn eval_vector_scalar(
 
     let mut out = Vec::with_capacity(samples.len());
     for mut sample in samples.drain(..) {
+        params.checkpoint()?;
         let (lhs, rhs) = if vector_on_lhs {
             (sample.value, scalar)
         } else {
@@ -115,6 +120,7 @@ fn eval_vector_vector(
     expr: &BinaryExpr,
     lhs: Vec<Sample>,
     rhs: Vec<Sample>,
+    params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
     if expr.op.is_set() {
         if expr
@@ -126,7 +132,7 @@ fn eval_vector_vector(
                 "group_left/group_right modifiers cannot be used with set operators".to_string(),
             ));
         }
-        return eval_set_op(expr.op, lhs, rhs, expr.matching.as_ref());
+        return eval_set_op(expr.op, lhs, rhs, expr.matching.as_ref(), params);
     }
     if lhs.iter().any(|sample| sample.histogram.is_some())
         || rhs.iter().any(|sample| sample.histogram.is_some())
@@ -145,6 +151,7 @@ fn eval_vector_vector(
     match matching_cardinality(expr.matching.as_ref()) {
         VectorMatchCardinality::OneToOne | VectorMatchCardinality::ManyToOne => {
             for lhs_sample in lhs {
+                params.checkpoint()?;
                 let key = sample_key(&lhs_sample, expr.matching.as_ref());
                 let Some(rhs_sample) = rhs_groups.get(&key).and_then(|samples| samples.first())
                 else {
@@ -159,6 +166,7 @@ fn eval_vector_vector(
         }
         VectorMatchCardinality::OneToMany => {
             for rhs_sample in rhs {
+                params.checkpoint()?;
                 let key = sample_key(&rhs_sample, expr.matching.as_ref());
                 let Some(lhs_sample) = lhs_groups.get(&key).and_then(|samples| samples.first())
                 else {
@@ -231,6 +239,7 @@ fn eval_set_op(
     lhs: Vec<Sample>,
     rhs: Vec<Sample>,
     matching: Option<&VectorMatching>,
+    params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
     let rhs_map = build_sample_map(&rhs, matching);
 
@@ -238,6 +247,7 @@ fn eval_set_op(
     match op {
         BinaryOp::And => {
             for sample in lhs {
+                params.checkpoint()?;
                 let key = sample_key(&sample, matching);
                 if rhs_map.contains_key(&key) {
                     out.push(sample);
@@ -247,11 +257,13 @@ fn eval_set_op(
         BinaryOp::Or => {
             let mut seen = BTreeSet::new();
             for sample in lhs {
+                params.checkpoint()?;
                 let key = sample_key(&sample, matching);
                 seen.insert(key.clone());
                 out.push(sample);
             }
             for sample in rhs {
+                params.checkpoint()?;
                 let key = sample_key(&sample, matching);
                 if !seen.contains(&key) {
                     out.push(sample);
@@ -260,6 +272,7 @@ fn eval_set_op(
         }
         BinaryOp::Unless => {
             for sample in lhs {
+                params.checkpoint()?;
                 let key = sample_key(&sample, matching);
                 if !rhs_map.contains_key(&key) {
                     out.push(sample);

@@ -29,8 +29,23 @@ pub(crate) fn eval_vector_selector(
 
     if let Some(metric) = &selector.metric_name {
         if let Some(labels) = exact_equal_labels(metric, &selector.matchers) {
-            if has_exact_series(engine, metric, &labels)? {
-                let points = engine.storage().select(metric, &labels, start, end)?;
+            if has_exact_series(engine, metric, &labels, params)? {
+                let points = engine.storage().select_with_execution(
+                    metric,
+                    &labels,
+                    start,
+                    end,
+                    params.execution,
+                )?;
+                if let Some(point) = points
+                    .iter()
+                    .filter(|point| point.timestamp >= start && point.timestamp < end)
+                    .max_by_key(|point| point.timestamp)
+                {
+                    if !is_stale_nan_value(&point.value) {
+                        params.reserve_sample(metric, &labels, point.value.as_histogram())?;
+                    }
+                }
                 if let Some(sample) = latest_point_as_sample(metric, labels, points, start, end) {
                     out.push(sample);
                 }
@@ -40,7 +55,7 @@ pub(crate) fn eval_vector_selector(
 
         collect_instant_samples_for_metric(engine, metric, selector, start, end, params, &mut out)?;
     } else {
-        for metric in candidate_metrics(engine, selector)? {
+        for metric in candidate_metrics(engine, selector, params)? {
             collect_instant_samples_for_metric(
                 engine, &metric, selector, start, end, params, &mut out,
             )?;
@@ -70,8 +85,15 @@ pub(crate) fn eval_matrix_selector(
 
     if let Some(metric) = &selector.vector.metric_name {
         if let Some(labels) = exact_equal_labels(metric, &selector.vector.matchers) {
-            if has_exact_series(engine, metric, &labels)? {
-                let points = engine.storage().select(metric, &labels, start, end)?;
+            if has_exact_series(engine, metric, &labels, params)? {
+                let points = engine.storage().select_with_execution(
+                    metric,
+                    &labels,
+                    start,
+                    end,
+                    params.execution,
+                )?;
+                params.reserve_range_series_upper(metric, &labels, &points)?;
                 let samples = points
                     .into_iter()
                     .filter(|p| p.timestamp > start && p.timestamp < end)
@@ -97,7 +119,7 @@ pub(crate) fn eval_matrix_selector(
 
         collect_range_series_for_metric(engine, metric, selector, start, end, params, &mut out)?;
     } else {
-        for metric in candidate_metrics_for_matrix(engine, selector)? {
+        for metric in candidate_metrics_for_matrix(engine, selector, params)? {
             collect_range_series_for_metric(
                 engine, &metric, selector, start, end, params, &mut out,
             )?;
@@ -107,14 +129,20 @@ pub(crate) fn eval_matrix_selector(
     Ok(PromqlValue::RangeVector(out))
 }
 
-fn candidate_metrics(engine: &Engine, selector: &VectorSelector) -> Result<Vec<String>> {
+fn candidate_metrics(
+    engine: &Engine,
+    selector: &VectorSelector,
+    params: &QueryParams<'_>,
+) -> Result<Vec<String>> {
     if let Some(metric) = &selector.metric_name {
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine
-        .storage()
-        .select_series(&selection_from_promql_matchers(&selector.matchers))?;
+    let all = engine.storage().select_series_with_execution(
+        &selection_from_promql_matchers(&selector.matchers),
+        params.execution,
+    )?;
+    params.reserve_metric_names(all.iter().map(|series| series.name.as_str()))?;
     let mut metrics = BTreeSet::new();
     for series in all {
         metrics.insert(series.name);
@@ -122,14 +150,20 @@ fn candidate_metrics(engine: &Engine, selector: &VectorSelector) -> Result<Vec<S
     Ok(metrics.into_iter().collect())
 }
 
-fn candidate_metrics_for_matrix(engine: &Engine, selector: &MatrixSelector) -> Result<Vec<String>> {
+fn candidate_metrics_for_matrix(
+    engine: &Engine,
+    selector: &MatrixSelector,
+    params: &QueryParams<'_>,
+) -> Result<Vec<String>> {
     if let Some(metric) = &selector.vector.metric_name {
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine
-        .storage()
-        .select_series(&selection_from_promql_matchers(&selector.vector.matchers))?;
+    let all = engine.storage().select_series_with_execution(
+        &selection_from_promql_matchers(&selector.vector.matchers),
+        params.execution,
+    )?;
+    params.reserve_metric_names(all.iter().map(|series| series.name.as_str()))?;
     let mut metrics = BTreeSet::new();
     for series in all {
         metrics.insert(series.name);
@@ -152,6 +186,7 @@ fn collect_instant_samples_for_metric(
             continue;
         }
         if let Some(point) = latest_instant_point(points, start, end) {
+            params.reserve_sample(metric, &labels, point.value.as_histogram())?;
             if let Some(histogram) = point.value.as_histogram() {
                 out.push(Sample::from_histogram(
                     metric.to_string(),
@@ -187,6 +222,8 @@ fn collect_range_series_for_metric(
         if !matchers_match(metric, &labels, &selector.vector.matchers)? {
             continue;
         }
+
+        params.reserve_range_series_upper(metric, &labels, &points)?;
 
         let series = points
             .into_iter()
@@ -225,28 +262,49 @@ fn fetch_metric_series(
 ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
     if let Some(cache) = params.prefetch {
         if let Some(all) = cache.get(metric) {
-            let filtered = all
-                .iter()
-                .filter_map(|(labels, points)| {
-                    let points = points
+            params.memory.reserve(
+                params.execution,
+                super::modeled_vec_capacity_bytes::<(Vec<Label>, Vec<DataPoint>)>(all.len()),
+            )?;
+            let mut filtered = Vec::new();
+            for (labels, points) in all {
+                params.checkpoint()?;
+                let selected_count = points
+                    .iter()
+                    .filter(|point| point.timestamp >= start && point.timestamp < end)
+                    .count();
+                if selected_count == 0 {
+                    continue;
+                }
+                let retained_bytes = super::modeled_labels_bytes(labels)
+                    .saturating_add(super::modeled_vec_capacity_bytes::<DataPoint>(
+                        selected_count,
+                    ))
+                    .saturating_add(
+                        points
+                            .iter()
+                            .filter(|point| point.timestamp >= start && point.timestamp < end)
+                            .fold(0u64, |bytes, point| {
+                                bytes.saturating_add(super::modeled_value_heap_bytes(&point.value))
+                            }),
+                    );
+                params.memory.reserve(params.execution, retained_bytes)?;
+                filtered.push((
+                    labels.clone(),
+                    points
                         .iter()
-                        .filter(|p| p.timestamp >= start && p.timestamp < end)
+                        .filter(|point| point.timestamp >= start && point.timestamp < end)
                         .cloned()
-                        .collect::<Vec<_>>();
-                    if points.is_empty() {
-                        None
-                    } else {
-                        Some((labels.clone(), points))
-                    }
-                })
-                .collect();
+                        .collect(),
+                ));
+            }
             return Ok(filtered);
         }
     }
 
     engine
         .storage()
-        .select_all(metric, start, end)
+        .select_all_with_execution(metric, start, end, params.execution)
         .map_err(Into::into)
 }
 
@@ -347,7 +405,12 @@ fn selection_from_promql_matchers(
     selection
 }
 
-fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<bool> {
+fn has_exact_series(
+    engine: &Engine,
+    metric: &str,
+    labels: &[Label],
+    params: &QueryParams<'_>,
+) -> Result<bool> {
     let mut expected = labels.to_vec();
     expected.sort();
 
@@ -356,7 +419,10 @@ fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<b
         selection = selection.with_matcher(SeriesMatcher::equal(&label.name, &label.value));
     }
 
-    for series in engine.storage().select_series(&selection)? {
+    for series in engine
+        .storage()
+        .select_series_with_execution(&selection, params.execution)?
+    {
         let mut labels = series.labels;
         labels.sort();
         if labels == expected {

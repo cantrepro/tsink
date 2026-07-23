@@ -45,7 +45,14 @@ logical WAL write, applied to staged in-memory state, and then published. A reje
 has no accepted rows, no acknowledgement, and is not replayable.
 
 `BestEffort` deliberately creates one such boundary per input row. Its indexed outcomes are the
-source of truth for which rows committed.
+source of truth for which rows committed. The complete submission is nevertheless checked and
+admitted once before row-wise execution, so a configured row/input bound also caps the outcome
+allocation and cannot be bypassed by selecting this mode.
+
+Crash recovery walks committed WAL frames in order under the same modeled-memory budget. It admits
+a frame before payload allocation, registers one series definition at a time, and decodes/applies
+one sample batch at a time. A configured write-batch limit or the intrinsic decoded-batch safety
+ceiling fails open with a structured error instead of partially publishing a later frame.
 
 If logical WAL publication fails after in-memory application, tsink cannot truthfully claim WAL
 recovery for that batch. The current core returns a successful `Volatile` acknowledgement and marks
@@ -58,6 +65,11 @@ The built-in engine fences or reports background persistence failure according t
 `with_background_fail_fast`. A successful `close()` waits for owned lifecycle work and returns only
 after its required flush/synchronization work succeeds. A failed close is not a durability
 acknowledgement and must be handled by the embedder.
+
+Close unparks all four possible instance-owned workers and attempts every join in fixed order. If a
+worker panicked, the returned error names it, but that first error does not leave later worker handles
+unjoined. Close still has no timeout and cannot interrupt a worker blocked inside a filesystem call;
+embedders must not interpret this lifecycle contract as a bounded shutdown-duration guarantee.
 
 A fail-fast fence remains `TsinkError::StorageShuttingDown` on the compatibility write API and is
 reported as `WriteRejectionCategory::StorageDegraded` by the canonical API. Lifecycle close is
@@ -108,11 +120,140 @@ acknowledgements. Hinted-handoff Put and Ack records are flushed and synchronize
 in-memory state changes. Compaction synchronizes its replacement file, atomically renames it, and
 synchronizes the parent directory; when a shared logical disk quota is full, the Ack append can use
 Recovery admission and is followed by a shrinking-compaction attempt. Compaction failure leaves
-retryable cleanup debt without changing an already-durable Ack. Edge-sync queue records are flushed
-but are not currently synchronized with
-`sync_data`/`sync_all`; queue acceptance therefore is not a crash-durable upload guarantee. A
-successfully replayed edge entry is removed after any valid upstream acknowledgement, including
-`Volatile`, and a still-pending entry can also expire under the configured pre-ack retention.
+retryable cleanup debt without changing an already-durable Ack. Edge-sync Put, Ack, and batched
+expiry records are likewise flushed and synchronized before their corresponding in-memory state
+changes. Under the shared budget, Ack and expiry records may use Recovery admission and are followed
+by an exact, bounded shrinking-compaction attempt. Successful queue acceptance is therefore
+crash-durable local queue state, but it is not a durable-upload guarantee: a replayed entry is
+removed after any valid upstream acknowledgement, including `Volatile`, and a still-pending entry
+can expire under the configured pre-ack retention.
+
+Cluster and standalone edge-accept dedupe completion markers are synchronized before a marker
+commit succeeds. Under a shared local-disk budget the append also synchronizes the parent directory,
+and compaction publishes an exactly bounded, synchronized atomic replacement. A marker failure does
+not undo primary rows or sidecars that already committed; the internal response discloses that
+partial progress and keeps the completion in memory for same-process replay.
+
+Rollup policies and their checkpoint/invalidation state form an ordered two-file persistence
+boundary. Both complete replacements are admitted and synchronized before publication. The
+invalidating state is published first, so a crash can expose the predecessor pair, predecessor
+policies with more-conservative candidate state, or the complete candidate pair; it cannot expose a
+new policy with reusable predecessor checkpoints. A partial or ambiguous publication fences later
+policy changes, checkpoint writes, delete-invalidation updates, and materialization until storage is
+reopened and the durable pair is reloaded. If both files are proven durable but final cleanup or
+accounting reconciliation fails, the policy change remains committed and the failure is recorded as
+cleanup debt rather than returned as a false rejection.
+
+Post-flush retention and tiering use a leased two-phase replacement marker under
+`.post-flush-replacements/` ([ADR 0004](adr/0004-post-flush-segment-replacement.md)). A durable
+`Prepared` marker keeps exact sources authoritative and makes published outputs rollback-owned. A
+durable `Committing` marker is the commit point: outputs are never rolled back, the catalog is
+converged idempotently, and exact sources are retired before the marker is removed. Startup finishes
+this protocol before inventory discovery. Ordinary compaction, snapshot export, dirty inventory
+scan, and flush recovery metadata scan are fenced while a marker remains. Marker absence is not
+reported as finalized until its parent is synchronized.
+
+Tombstone manifests can span the numeric and blob lanes plus configured tier roots on unrelated
+filesystems. A parent-synchronized local coordinator records the exact lane identities, complete
+previous/candidate manifest images, and candidate shard fingerprints. `Prepared` recovery rolls
+back only exact transaction-owned shards; `Committing` recovery always rolls every lane forward.
+After the commit decision, a complete shared manifest is published first as the compute-only
+visibility anchor. An interruption before that anchor is indeterminate; after it is durable, a
+later failure is committed recovery debt and cannot be returned as a false rejection. Startup and
+catalog refresh recover before loading manifests, while compute-only readers remain read-only and
+consume the remote anchor. One read-write process holds and identity-revalidates
+`<object-store-root>/.tsink-writer.lock`; other read-write opens on that root are rejected. See
+[ADR 0005](adr/0005-cross-filesystem-tombstone-transactions.md).
+
+The experimental cluster control plane has a paired persistence boundary. A checkpoint candidate
+contains both a schema-v2 consensus log with its required authoritative `checkpointState` and
+restart-durable `steppedDownTerm`, and the separate control-state mirror. Both complete replacements
+are staged under one shared `Cluster` disk reservation, then the log file and parent directory are
+synchronized before the mirror is published and synchronized. Before consensus requires a
+candidate, a typed quota, headroom, or maintenance-reserve admission failure leaves it unpublished
+and can be returned as a definitive resource rejection. Other encode, staging, or publication
+failures use the ordinary persistence-error contract (HTTP 503 on the control surfaces) rather than
+being mislabeled as quota. After quorum or a leader commit makes the candidate required, any
+pre-log persistence failure installs it in memory as pending durability and fences mutation; the
+response is indeterminate rather than a misleading definitive rejection.
+
+The two renames are ordered, not a single filesystem transaction. Only after the log replacement
+and its parent-directory synchronization succeed is its embedded checkpoint authoritative. A later
+mirror failure cannot truthfully be reported as an uncommitted mutation: the runtime installs that
+candidate, reports a committed checkpoint pending, and fences subsequent control mutations until
+the mirror can be rebuilt from the log using Recovery admission. An ambiguous rename or failed
+parent synchronization is indeterminate and fenced, never classified as committed. A required
+higher consensus term is likewise adopted in memory and fenced if its log publication fails. On
+reopen, a valid v2 log repairs a stale, missing, or invalid mirror; legacy v1 logs have no embedded
+checkpoint and still require a valid mirror for migration. If that mirror repair cannot complete,
+startup keeps the v2 checkpoint live but opens the control runtime fenced with its checkpoint
+pending. Recovery snapshots default a missing step-down term to zero and normal restore merges the
+live and restored revocation floors; only an explicit `forceLocalLeader` restore clears it.
+
+Authoritative mirror repair may recreate a missing mirror or grow a stale mirror at the logical
+quota because the durable v2 checkpoint already accounts for the logical state being materialized.
+It still reserves the complete temporary peak against physical free space and filesystem
+headroom. If both files are durable but grouped finalization, owned-temp cleanup, or accounting
+reconciliation fails, `cleanupDebt` records that post-commit work without fencing the pair. Cleanup
+is retried before any separate fence repair. Control and cluster recovery-snapshot exports return
+HTTP 503 `control_persistence_indeterminate` while authority is fenced or a mirror checkpoint is
+pending, but cleanup-only debt remains exportable.
+
+If a command is already quorum-committed but a commit-notice response reveals a higher term that
+cannot yet be written to the log, the command returns successful degraded
+`committed_persistence_pending`. The higher term and step-down floor take effect in memory,
+leadership is fenced, and the required log-only candidate is retried. This is post-commit
+persistence debt, not permission to retry the command. As a related crash-safe membership rule, an
+Active leader must transfer leadership before another voter can commit that leader's leave.
+
+## Offline snapshot restore
+
+Restore is an offline operation: complete it before opening storage at the target. Both restore APIs
+measure and validate the snapshot before destination mutation, reject resolved source/target overlap
+in either direction, and cap the trusted source at 100,000 entries and descendant-directory depth
+128. Static symlinks, Windows reparse points, and other non-file entries are rejected during
+measurement and checked again during bounded copy. These are path-based checks, not a descriptor-
+relative traversal guarantee; the caller must keep the source trusted and immutable so another
+process cannot replace a validated namespace entry before it is opened.
+
+`StorageBuilder::restore_from_snapshot_with_disk_budget` uses a caller-owned offline
+`LocalDiskBudget` rooted above the strict-descendant target. Before creating target ancestry or a
+staging tree, it reserves the measured logical file bytes plus one per-entry allowance for every
+snapshot entry and missing target-parent directory. The allowance is the greater of the 4 KiB
+policy floor and the destination filesystem's reported allocation unit. This is deliberately
+conservative admission, not an exact physical-allocation assertion.
+
+The staged copy synchronizes its files and directory before activation. Missing target ancestry is
+created with its new parent links synchronized. If a target already exists, activation first moves
+it to a distinct backup, synchronizes the parent, publishes the staged tree, and synchronizes the
+parent again. A publication failure attempts to restore and synchronize the preceding target rather
+than claiming that the replacement never became visible. After the managed operation returns, an
+exclusive tree scan installs exact logical accounting before new admission resumes. A scan failure
+is explicit and conservatively retains the full reservation; if activation had committed, the
+result says that restore committed but accounting reconciliation failed.
+
+Server restore requires a separate offline root and finite limit and retains that root's process
+lease until listener drain and storage shutdown complete. Standalone restore, the compatibility
+and capability-gated internal routes, local cluster-node targets, and the cluster restore report
+share one coordinator. Cluster restore validates all local report/source/target overlaps before
+the first data mutation. A report failure after data and control publication is explicit degraded
+success (`reportPending`) because rolling back the already-restored cluster would be dishonest.
+Remote peers must advertise `budgeted_restore_v1`; there is no legacy unbudgeted fallback.
+
+The legacy `StorageBuilder::restore_from_snapshot` uses the same validation, finite traversal,
+bounded copy, durable ancestry creation, and rollback-aware activation, but it remains
+caller-unbudgeted. Its caller is responsible for providing enough logical and physical capacity.
+
+## Capacity cleanup before write rejection
+
+When rollback-safe flush staging or foreground WAL Growth admission receives a typed disk-capacity
+rejection, the engine makes at most one reclaim-and-retry attempt. That reclaim plan can retire only
+fully expired owned segment roots: it disables mixed-age rewrites and tier moves, and it never
+selects unknown or host-created files. Finding no eligible reclaim, or receiving another typed
+capacity rejection during cleanup, preserves the original rejection; an independent non-capacity
+cleanup failure is reported in its own right. No WAL or new flush visibility is published merely
+because cleanup ran; the normal publication and acknowledgement rules still apply to the single
+retry.
 
 ## Platform boundary
 

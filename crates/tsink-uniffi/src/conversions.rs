@@ -374,6 +374,32 @@ impl From<tsink_core::StorageRuntimeMode> for UStorageRuntimeMode {
     }
 }
 
+impl From<UResourceProfile> for tsink_core::ResourceProfile {
+    fn from(profile: UResourceProfile) -> Self {
+        match profile {
+            UResourceProfile::Test => Self::Test,
+            UResourceProfile::Embedded => Self::Embedded,
+            UResourceProfile::Edge => Self::Edge,
+            UResourceProfile::Server => Self::Server,
+            UResourceProfile::ExpertUnlimited => Self::ExpertUnlimited,
+        }
+    }
+}
+
+impl From<tsink_core::ResourceProfileName> for UResourceProfileName {
+    fn from(profile: tsink_core::ResourceProfileName) -> Self {
+        match profile {
+            tsink_core::ResourceProfileName::Unreported => Self::Unreported,
+            tsink_core::ResourceProfileName::Test => Self::Test,
+            tsink_core::ResourceProfileName::Embedded => Self::Embedded,
+            tsink_core::ResourceProfileName::Edge => Self::Edge,
+            tsink_core::ResourceProfileName::Server => Self::Server,
+            tsink_core::ResourceProfileName::Custom => Self::Custom,
+            tsink_core::ResourceProfileName::ExpertUnlimited => Self::ExpertUnlimited,
+        }
+    }
+}
+
 impl From<tsink_core::MemoryPressureLevel> for UMemoryPressureLevel {
     fn from(level: tsink_core::MemoryPressureLevel) -> Self {
         match level {
@@ -671,6 +697,15 @@ impl From<tsink_core::DeleteSeriesResult> for UDeleteSeriesResult {
     }
 }
 
+impl From<tsink_core::WriteBatchLimits> for UWriteBatchLimits {
+    fn from(limits: tsink_core::WriteBatchLimits) -> Self {
+        Self {
+            max_rows: limits.max_rows.map(usize_to_u64),
+            max_modeled_input_bytes: limits.max_modeled_input_bytes.map(usize_to_u64),
+        }
+    }
+}
+
 impl From<tsink_core::EffectiveStorageLimits> for UEffectiveStorageLimits {
     fn from(limits: tsink_core::EffectiveStorageLimits) -> Self {
         UEffectiveStorageLimits {
@@ -679,13 +714,109 @@ impl From<tsink_core::EffectiveStorageLimits> for UEffectiveStorageLimits {
             wal_enabled: limits.wal_enabled,
             accounted_memory_bytes: limits.accounted_memory_bytes,
             cardinality: limits.cardinality,
+            max_labels_per_series: limits.max_labels_per_series,
+            max_series_identity_bytes: limits.max_series_identity_bytes,
+            max_new_series_per_window: limits.max_new_series_per_window,
+            new_series_window_nanos: limits.new_series_window_nanos,
+            max_write_batch_rows: limits.max_write_batch_rows,
+            max_write_batch_input_bytes: limits.max_write_batch_input_bytes,
             wal_bytes: limits.wal_bytes,
+            wal_write_buffer_bytes: limits.wal_write_buffer_bytes,
             local_disk_bytes: limits.local_disk_bytes,
             filesystem_free_headroom_bytes: limits.filesystem_free_headroom_bytes,
             maintenance_temp_reserve_bytes: limits.maintenance_temp_reserve_bytes,
             max_concurrent_writers: limits.max_concurrent_writers,
             write_timeout_nanos: limits.write_timeout_nanos,
+            max_background_threads: limits.max_background_threads,
+            max_flush_concurrency: limits.max_flush_concurrency,
+            max_compaction_concurrency: limits.max_compaction_concurrency,
+            max_retention_tiering_concurrency: limits.max_retention_tiering_concurrency,
+            max_remote_catalog_refresh_concurrency: limits.max_remote_catalog_refresh_concurrency,
+            max_remote_tier_fetch_concurrency: limits.max_remote_tier_fetch_concurrency,
+            max_rollup_concurrency: limits.max_rollup_concurrency,
+            flush_interval_nanos: limits.flush_interval_nanos,
+            compaction_interval_nanos: limits.compaction_interval_nanos,
+            persisted_refresh_poll_interval_nanos: limits.persisted_refresh_poll_interval_nanos,
+            rollup_interval_nanos: limits.rollup_interval_nanos,
             max_active_partition_heads_per_series: limits.max_active_partition_heads_per_series,
+        }
+    }
+}
+
+impl From<tsink_core::AsyncResourceLimits> for UAsyncResourceLimits {
+    fn from(limits: tsink_core::AsyncResourceLimits) -> Self {
+        Self {
+            queue_command_capacity: usize_to_u64(limits.queue_command_capacity),
+            write_queue_byte_capacity: usize_to_u64(limits.write_queue_byte_capacity),
+            read_queue_byte_capacity: usize_to_u64(limits.read_queue_byte_capacity),
+            read_workers: usize_to_u64(limits.read_workers),
+        }
+    }
+}
+
+fn resource_override_name(value: tsink_core::ResourceLimitOverride) -> &'static str {
+    match value {
+        tsink_core::ResourceLimitOverride::AccountedMemory => "accounted_memory",
+        tsink_core::ResourceLimitOverride::LocalDisk => "local_disk",
+        tsink_core::ResourceLimitOverride::FilesystemFreeHeadroom => "filesystem_free_headroom",
+        tsink_core::ResourceLimitOverride::MaintenanceTempReserve => "maintenance_temp_reserve",
+        tsink_core::ResourceLimitOverride::WalBytes => "wal_bytes",
+        tsink_core::ResourceLimitOverride::WalWriteBuffer => "wal_write_buffer",
+        tsink_core::ResourceLimitOverride::Cardinality => "cardinality",
+        tsink_core::ResourceLimitOverride::MaxLabelsPerSeries => "max_labels_per_series",
+        tsink_core::ResourceLimitOverride::MaxSeriesIdentityBytes => "max_series_identity_bytes",
+        tsink_core::ResourceLimitOverride::SeriesCreationRate => "series_creation_rate",
+        tsink_core::ResourceLimitOverride::WriteBatch => "write_batch",
+        tsink_core::ResourceLimitOverride::ConcurrentWriters => "concurrent_writers",
+        tsink_core::ResourceLimitOverride::WriteTimeout => "write_timeout",
+        tsink_core::ResourceLimitOverride::PartitionHeads => "partition_heads",
+        tsink_core::ResourceLimitOverride::QueryBudget => "query_budget",
+        tsink_core::ResourceLimitOverride::AsyncQueueCommands => "async_queue_commands",
+        tsink_core::ResourceLimitOverride::AsyncWriteQueueBytes => "async_write_queue_bytes",
+        tsink_core::ResourceLimitOverride::AsyncReadQueueBytes => "async_read_queue_bytes",
+        tsink_core::ResourceLimitOverride::AsyncReadWorkers => "async_read_workers",
+        tsink_core::ResourceLimitOverride::MaintenanceWork => "maintenance_work",
+    }
+}
+
+impl From<tsink_core::ResolvedResourceLimits> for UResolvedResourceLimits {
+    fn from(limits: tsink_core::ResolvedResourceLimits) -> Self {
+        Self {
+            storage: limits.storage.into(),
+            query: limits.query.into(),
+            async_runtime: limits.async_runtime.map(Into::into),
+            maintenance_max_items_per_pass: limits.maintenance_max_items_per_pass,
+            maintenance_max_bytes_per_pass: limits.maintenance_max_bytes_per_pass,
+        }
+    }
+}
+
+impl From<tsink_core::ResourceConfigurationSnapshot> for UResourceConfigurationSnapshot {
+    fn from(snapshot: tsink_core::ResourceConfigurationSnapshot) -> Self {
+        Self {
+            schema_version: snapshot.schema_version,
+            reported_by_backend: snapshot.reported_by_backend,
+            selected_profile: snapshot.selected_profile.into(),
+            overrides: snapshot
+                .overrides
+                .into_iter()
+                .map(|value| resource_override_name(value).to_string())
+                .collect(),
+            resolved_limits: snapshot.resolved_limits.into(),
+        }
+    }
+}
+
+impl From<tsink_core::CardinalityObservabilitySnapshot> for UCardinalityObservabilitySnapshot {
+    fn from(snapshot: tsink_core::CardinalityObservabilitySnapshot) -> Self {
+        Self {
+            series_count: snapshot.series_count,
+            pending_new_series: snapshot.pending_new_series,
+            committed_in_window: snapshot.committed_in_window,
+            current_window_start: snapshot.current_window_start,
+            admitted_new_series_total: snapshot.admitted_new_series_total,
+            committed_new_series_total: snapshot.committed_new_series_total,
+            creation_rate_rejections_total: snapshot.creation_rate_rejections_total,
         }
     }
 }
@@ -763,6 +894,14 @@ impl From<tsink_core::MemoryObservabilitySnapshot> for UMemoryObservabilitySnaps
             persisted_index_bytes: usize_to_u64(snapshot.persisted_index_bytes),
             persisted_mmap_bytes: usize_to_u64(snapshot.persisted_mmap_bytes),
             tombstone_bytes: usize_to_u64(snapshot.tombstone_bytes),
+            wal_series_definition_cache_bytes: usize_to_u64(
+                snapshot.wal_series_definition_cache_bytes,
+            ),
+            write_transient_bytes: usize_to_u64(snapshot.write_transient_bytes),
+            peak_write_transient_bytes: usize_to_u64(snapshot.peak_write_transient_bytes),
+            write_transient_reservations_total: snapshot.write_transient_reservations_total,
+            write_transient_rejections_total: snapshot.write_transient_rejections_total,
+            write_transient_bytes_estimated: snapshot.write_transient_bytes_estimated,
             excluded_persisted_mmap_bytes: usize_to_u64(snapshot.excluded_persisted_mmap_bytes),
             pressure: UMemoryPressureSnapshot {
                 level: snapshot.pressure.level.map(Into::into),
@@ -782,6 +921,7 @@ impl From<tsink_core::WalObservabilitySnapshot> for UWalObservabilitySnapshot {
             enabled: snapshot.enabled,
             sync_mode: snapshot.sync_mode,
             acknowledged_writes_durable: snapshot.acknowledged_writes_durable,
+            write_buffer_capacity_bytes: snapshot.write_buffer_capacity_bytes,
             size_bytes: snapshot.size_bytes,
             segment_count: snapshot.segment_count,
             active_segment: snapshot.active_segment,
@@ -843,6 +983,10 @@ impl From<tsink_core::FlushObservabilitySnapshot> for UFlushObservabilitySnapsho
             persist_success_total: snapshot.persist_success_total,
             persist_noop_total: snapshot.persist_noop_total,
             persist_errors_total: snapshot.persist_errors_total,
+            persist_inspected_chunks_total: snapshot.persist_inspected_chunks_total,
+            persist_selected_input_bytes_total: snapshot.persist_selected_input_bytes_total,
+            persist_item_limit_hits_total: snapshot.persist_item_limit_hits_total,
+            persist_byte_limit_hits_total: snapshot.persist_byte_limit_hits_total,
             persisted_series_total: snapshot.persisted_series_total,
             persisted_chunks_total: snapshot.persisted_chunks_total,
             persisted_points_total: snapshot.persisted_points_total,
@@ -921,6 +1065,91 @@ impl From<tsink_core::QueryObservabilitySnapshot> for UQueryObservabilitySnapsho
     }
 }
 
+impl From<tsink_core::QueryWorkLimits> for UQueryWorkLimits {
+    fn from(limits: tsink_core::QueryWorkLimits) -> Self {
+        Self {
+            max_series_matched: limits.max_series_matched,
+            max_samples_scanned: limits.max_samples_scanned,
+            max_samples_returned: limits.max_samples_returned,
+            max_returned_bytes: limits.max_returned_bytes,
+            max_pattern_expansion: limits.max_pattern_expansion,
+            max_steps: limits.max_steps,
+            max_intermediate_vector_size: limits.max_intermediate_vector_size,
+            max_memory_bytes: limits.max_memory_bytes,
+            max_wall_time_nanos: limits
+                .max_wall_time
+                .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl From<UQueryWorkLimits> for tsink_core::QueryWorkLimits {
+    fn from(limits: UQueryWorkLimits) -> Self {
+        Self {
+            max_series_matched: limits.max_series_matched,
+            max_samples_scanned: limits.max_samples_scanned,
+            max_samples_returned: limits.max_samples_returned,
+            max_returned_bytes: limits.max_returned_bytes,
+            max_pattern_expansion: limits.max_pattern_expansion,
+            max_steps: limits.max_steps,
+            max_intermediate_vector_size: limits.max_intermediate_vector_size,
+            max_memory_bytes: limits.max_memory_bytes,
+            max_wall_time: limits
+                .max_wall_time_nanos
+                .map(std::time::Duration::from_nanos),
+        }
+    }
+}
+
+impl From<tsink_core::QueryBudgetLimits> for UQueryBudgetLimits {
+    fn from(limits: tsink_core::QueryBudgetLimits) -> Self {
+        Self {
+            max_concurrent_queries: limits.max_concurrent_queries,
+            max_shared_memory_bytes: limits.max_shared_memory_bytes,
+            per_query: limits.per_query.into(),
+        }
+    }
+}
+
+impl From<UQueryBudgetLimits> for tsink_core::QueryBudgetLimits {
+    fn from(limits: UQueryBudgetLimits) -> Self {
+        Self {
+            max_concurrent_queries: limits.max_concurrent_queries,
+            max_shared_memory_bytes: limits.max_shared_memory_bytes,
+            per_query: limits.per_query.into(),
+        }
+    }
+}
+
+impl From<tsink_core::QueryBudgetSnapshot> for UQueryBudgetSnapshot {
+    fn from(snapshot: tsink_core::QueryBudgetSnapshot) -> Self {
+        Self {
+            limits: snapshot.limits.into(),
+            active_queries: snapshot.active_queries,
+            peak_active_queries: snapshot.peak_active_queries,
+            shared_reserved_memory_bytes: snapshot.shared_reserved_memory_bytes,
+            peak_shared_reserved_memory_bytes: snapshot.peak_shared_reserved_memory_bytes,
+            queries_started_total: snapshot.queries_started_total,
+            queries_completed_total: snapshot.queries_completed_total,
+            limit_rejections_total: snapshot.limit_rejections_total,
+            concurrency_rejections_total: snapshot.concurrency_rejections_total,
+            shared_memory_rejections_total: snapshot.shared_memory_rejections_total,
+            per_query_memory_rejections_total: snapshot.per_query_memory_rejections_total,
+            series_matched_rejections_total: snapshot.series_matched_rejections_total,
+            samples_scanned_rejections_total: snapshot.samples_scanned_rejections_total,
+            samples_returned_rejections_total: snapshot.samples_returned_rejections_total,
+            returned_bytes_rejections_total: snapshot.returned_bytes_rejections_total,
+            pattern_expansion_rejections_total: snapshot.pattern_expansion_rejections_total,
+            steps_rejections_total: snapshot.steps_rejections_total,
+            intermediate_vector_size_rejections_total: snapshot
+                .intermediate_vector_size_rejections_total,
+            cancellations_total: snapshot.cancellations_total,
+            deadline_exceeded_total: snapshot.deadline_exceeded_total,
+            accounting_invariant_violations_total: snapshot.accounting_invariant_violations_total,
+        }
+    }
+}
+
 impl From<URollupPolicy> for tsink_core::RollupPolicy {
     fn from(policy: URollupPolicy) -> Self {
         tsink_core::RollupPolicy {
@@ -955,6 +1184,7 @@ impl From<tsink_core::RollupPolicyStatus> for URollupPolicyStatus {
             materialized_series: status.materialized_series,
             materialized_through: status.materialized_through,
             lag: status.lag,
+            source_traversal_complete: status.source_traversal_complete,
             last_run_started_at_ms: status.last_run_started_at_ms,
             last_run_completed_at_ms: status.last_run_completed_at_ms,
             last_run_duration_nanos: status.last_run_duration_nanos,
@@ -973,6 +1203,9 @@ impl From<tsink_core::RollupObservabilitySnapshot> for URollupObservabilitySnaps
             buckets_materialized_total: snapshot.buckets_materialized_total,
             points_materialized_total: snapshot.points_materialized_total,
             last_run_duration_nanos: snapshot.last_run_duration_nanos,
+            source_traversal_complete: snapshot.source_traversal_complete,
+            continuation_policy_id: snapshot.continuation_policy_id,
+            continuation_after_series_id: snapshot.continuation_after_series_id,
             policies: snapshot.policies.into_iter().map(Into::into).collect(),
         }
     }
@@ -999,6 +1232,51 @@ impl From<tsink_core::RemoteStorageObservabilitySnapshot> for URemoteStorageObse
     }
 }
 
+impl From<tsink_core::BackgroundWorkerObservabilitySnapshot>
+    for UBackgroundWorkerObservabilitySnapshot
+{
+    fn from(snapshot: tsink_core::BackgroundWorkerObservabilitySnapshot) -> Self {
+        Self {
+            installed: snapshot.installed,
+            running: snapshot.running,
+            interval_nanos: snapshot.interval_nanos,
+            max_concurrency: snapshot.max_concurrency,
+            starts_total: snapshot.starts_total,
+            exits_total: snapshot.exits_total,
+            notifications_total: snapshot.notifications_total,
+            idle_waits_total: snapshot.idle_waits_total,
+            passes_started_total: snapshot.passes_started_total,
+            passes_completed_total: snapshot.passes_completed_total,
+            shutdown_joins_total: snapshot.shutdown_joins_total,
+        }
+    }
+}
+
+impl From<tsink_core::BackgroundWorkObservabilitySnapshot>
+    for UBackgroundWorkObservabilitySnapshot
+{
+    fn from(snapshot: tsink_core::BackgroundWorkObservabilitySnapshot) -> Self {
+        Self {
+            max_threads: snapshot.max_threads,
+            installed_threads: snapshot.installed_threads,
+            running_threads: snapshot.running_threads,
+            close_attempts_total: snapshot.close_attempts_total,
+            close_success_total: snapshot.close_success_total,
+            close_errors_total: snapshot.close_errors_total,
+            close_coordination_wait_nanos_total: snapshot.close_coordination_wait_nanos_total,
+            close_coordination_timeouts_total: snapshot.close_coordination_timeouts_total,
+            close_compaction_passes_total: snapshot.close_compaction_passes_total,
+            close_compaction_pass_limit: snapshot.close_compaction_pass_limit,
+            close_duration_nanos_total: snapshot.close_duration_nanos_total,
+            shutdown_join_wait_nanos_total: snapshot.shutdown_join_wait_nanos_total,
+            flush: snapshot.flush.into(),
+            compaction: snapshot.compaction.into(),
+            persisted_refresh: snapshot.persisted_refresh.into(),
+            rollup: snapshot.rollup.into(),
+        }
+    }
+}
+
 impl From<tsink_core::storage::StorageHealthSnapshot> for UStorageHealthSnapshot {
     fn from(snapshot: tsink_core::storage::StorageHealthSnapshot) -> Self {
         UStorageHealthSnapshot {
@@ -1017,15 +1295,19 @@ impl From<tsink_core::StorageObservabilitySnapshot> for UStorageObservabilitySna
     fn from(snapshot: tsink_core::StorageObservabilitySnapshot) -> Self {
         UStorageObservabilitySnapshot {
             limits: snapshot.limits.into(),
+            resource_configuration: snapshot.resource_configuration.into(),
             local_disk: snapshot.local_disk.map(Into::into),
             memory: snapshot.memory.into(),
+            cardinality: snapshot.cardinality.into(),
             wal: snapshot.wal.into(),
             retention: snapshot.retention.into(),
             flush: snapshot.flush.into(),
             compaction: snapshot.compaction.into(),
             query: snapshot.query.into(),
+            query_budget: snapshot.query_budget.into(),
             rollups: snapshot.rollups.into(),
             remote: snapshot.remote.into(),
+            background: snapshot.background.into(),
             health: snapshot.health.into(),
         }
     }
@@ -1107,6 +1389,27 @@ mod tests {
             UValue::Str { v } => assert_eq!(v, "hello"),
             _ => panic!("expected Str"),
         }
+    }
+
+    #[test]
+    fn memory_snapshot_conversion_preserves_wal_cache_and_transient_accounting() {
+        let snapshot = tsink_core::MemoryObservabilitySnapshot {
+            wal_series_definition_cache_bytes: 1_024,
+            write_transient_bytes: 2_048,
+            peak_write_transient_bytes: 4_096,
+            write_transient_reservations_total: 7,
+            write_transient_rejections_total: 3,
+            write_transient_bytes_estimated: true,
+            ..tsink_core::MemoryObservabilitySnapshot::default()
+        };
+
+        let converted: UMemoryObservabilitySnapshot = snapshot.into();
+        assert_eq!(converted.wal_series_definition_cache_bytes, 1_024);
+        assert_eq!(converted.write_transient_bytes, 2_048);
+        assert_eq!(converted.peak_write_transient_bytes, 4_096);
+        assert_eq!(converted.write_transient_reservations_total, 7);
+        assert_eq!(converted.write_transient_rejections_total, 3);
+        assert!(converted.write_transient_bytes_estimated);
     }
 
     #[test]
@@ -1245,5 +1548,22 @@ mod tests {
         let sel: tsink_core::SeriesSelection = usel.into();
         assert_eq!(sel.start, Some(100));
         assert_eq!(sel.end, None);
+    }
+
+    #[test]
+    fn flush_observability_conversion_preserves_bounded_persist_counters() {
+        let snapshot = tsink_core::FlushObservabilitySnapshot {
+            persist_inspected_chunks_total: 11,
+            persist_selected_input_bytes_total: 22,
+            persist_item_limit_hits_total: 33,
+            persist_byte_limit_hits_total: 44,
+            ..Default::default()
+        };
+
+        let converted = UFlushObservabilitySnapshot::from(snapshot);
+        assert_eq!(converted.persist_inspected_chunks_total, 11);
+        assert_eq!(converted.persist_selected_input_bytes_total, 22);
+        assert_eq!(converted.persist_item_limit_hits_total, 33);
+        assert_eq!(converted.persist_byte_limit_hits_total, 44);
     }
 }

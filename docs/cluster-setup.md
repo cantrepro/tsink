@@ -59,6 +59,11 @@ tsink-server \
 
 Each node bootstraps by contacting the seed list until the control plane accepts its join. Once all three nodes are active, shard ownership is distributed across them.
 
+`--data-path` is mandatory in cluster mode, including for `query`-role nodes. Give every process a
+stable, node-specific directory on persistent local storage. Startup rejects
+`--cluster-enabled` without it; there is no temporary-root fallback for control, audit, dedupe, or
+handoff files.
+
 ---
 
 ## CLI flags reference
@@ -67,7 +72,7 @@ All cluster flags are only meaningful when `--cluster-enabled` is set.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable cluster mode. |
+| `--cluster-enabled` | `false` | Enable cluster mode. Requires `--data-path`. |
 | `--cluster-node-id <ID>` | — | **Required.** Stable, unique identifier for this node (e.g. `node-1`). Must not be `"unknown"`. |
 | `--cluster-bind <HOST:PORT>` | — | **Required.** Internal RPC listen/advertise address. Peers connect here. |
 | `--cluster-node-role <ROLE>` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. See [node roles](#node-roles). |
@@ -315,6 +320,74 @@ Cluster membership and ring state are managed by an internal Raft-like consensus
 
 Peer liveness transitions: `unknown → healthy → suspect → dead`.
 
+Only nodes with committed membership status `Active` vote in the control quorum or may assert
+control leadership. Joining and Leaving peers can still receive replication while a membership
+change converges, but their responses do not count toward quorum and they cannot raise a receiver's
+term. If the recorded leader is no longer Active, it is ineligible and deterministic failover
+selects from the remaining Active voters.
+
+This strict receiver-local eligibility gate requires activation and leadership transfer not to
+outrun control-log catch-up: activate a Joining node only after it has caught up, and transfer
+leadership only after activation commits. A membership-certificate or joint-configuration proof
+for accepting a newly activated leader on a lagging voter remains Phase 2 work.
+
+An Active leader cannot leave itself directly. Move leadership to another Active voter first, then
+submit the former leader's leave through the new leader. This is a crash-safe near-term rule that
+keeps an eligible leader available to finish commit propagation.
+
+### Control persistence health
+
+The consensus log and control-state mirror share the server local-disk budget when `--data-path`
+is configured. A checkpoint stages both replacements in the `Cluster` category and publishes the
+schema-v2 log, including its authoritative `checkpointState`, before the mirror. A quota or
+filesystem-headroom rejection before consensus requires the candidate returns
+`413 write_disk_quota_exceeded` without publishing it. If quorum or a leader commit already makes
+the candidate required, failure before durable log publication is instead fenced HTTP 503
+`control_persistence_indeterminate`; status shows the detail while `pendingCheckpoint` remains
+null. Both failures set `X-Tsink-Write-Error-Code` and internal control responses mark them
+non-retryable.
+
+If the log replacement and its parent-directory sync succeed but the mirror cannot be published,
+membership and handoff mutations return HTTP 200 with
+`result: "committed_checkpoint_pending"`, `degraded: true`, and the committed log index and term.
+The mutation is committed, not safe to retry as though it failed. The node fences
+later control mutations until it can repair the mirror from the log. Check
+`data.cluster.control.persistence` in `/api/v1/status/tsdb` and
+`tsink_cluster_control_persistence_health` in `/metrics`; resolve disk quota or free-space pressure
+instead of deleting either control file. Startup uses a valid v2 log to attempt repair of a stale,
+missing, or invalid mirror; if repair fails, the runtime opens fenced with its checkpoint pending. A
+legacy v1 log still requires a valid mirror because it has no embedded checkpoint.
+
+Authoritative mirror repair may recreate a missing mirror or grow a stale mirror even at the
+logical quota: the schema-v2 log already proves that logical state. The repair still reserves its
+complete temporary peak against physical free space and filesystem headroom.
+
+If both files are durable but replacement finalization, owned-temp cleanup, or disk-accounting
+reconciliation fails, a membership or handoff mutation returns HTTP 200 with
+`result: "committed_cleanup_pending"` and `degraded: true`. Status reports `cleanupDebt` without
+setting a persistence fence solely for that condition. The next repair attempt retries cleanup and
+reconciliation before any separate fence repair; the committed mutation must not be retried as a
+rejection.
+
+If a command is already quorum-committed but a commit-notice response reveals a higher term that
+cannot yet be persisted, membership and handoff surfaces return HTTP 200 with
+`result: "committed_persistence_pending"`, the committed index and term, and `degraded: true`.
+Internal auto-join uses `accepted_persistence_pending`. The node adopts the higher term in memory,
+fences leadership, and retries durable term publication. The command is committed and must not be
+retried as a rejection.
+
+If leader establishment or repair encounters an existing fence before the requested membership,
+handoff, DR, or auto-join mutation runs, that request returns
+`503 control_persistence_indeterminate`; the degraded HTTP 200 applies only when the requested
+mutation itself committed and then left its mirror checkpoint, post-publication cleanup, or
+higher-term persistence pending.
+
+Control-log schema v1 is read and upgraded to schema v2 on first open. This is a downgrade
+boundary: a v1-only binary rejects the rewritten log. Preserve a compatible pre-upgrade copy of
+the data directory before deployment if binary rollback may be required; there is no automatic
+in-place downgrade. Schema v2 also persists `steppedDownTerm`, so a higher observed term continues
+to revoke local leadership after restart.
+
 ### Snapshots
 
 Snapshot and restore the control-plane state:
@@ -329,6 +402,23 @@ curl -X POST http://node-1:9201/api/v1/admin/cluster/snapshot
 # Restore from a cluster-wide snapshot
 curl -X POST http://node-1:9201/api/v1/admin/cluster/restore
 ```
+
+A control restore whose log replacement and parent-directory sync succeed but whose state mirror is
+still pending returns success with `checkpointPending: true`, `degraded: true`, and
+`checkpointDetail`. A cluster-wide restore reports the analogous `controlCheckpointPending`,
+`degraded`, and `controlCheckpointDetail` fields. If the pair is durable and only finalization or
+cleanup remains, control restore instead reports `cleanupDebt: true` and `cleanupDetail`; cluster
+restore uses `controlCleanupDebt` and `controlCleanupDetail`.
+
+Creating either a control recovery snapshot or a cluster snapshot returns HTTP 503
+`control_persistence_indeterminate` while control authority is fenced, a durable candidate is
+pending, or a mirror checkpoint needs repair. Cleanup-only debt does not block export because the
+durable log and mirror already agree on the authoritative checkpoint.
+
+Recovery snapshots carry `steppedDownTerm`; bundles written before that field existed default it to
+zero, and normal restore merges the live and restored revocation floors. Set
+`forceLocalLeader: true` only for an intentional recovery that must clear that floor, advance the
+term, and assign leadership to the local node.
 
 ---
 
@@ -407,7 +497,9 @@ To suppress duplicate internal retries, each receiving node tracks idempotency k
 sliding window. Current-format completions replay the original indexed result, counts, and
 acknowledgement; legacy markers that lack a stored result return
 `409 idempotency_result_unavailable` rather than inventing success. A completion-marker persistence
-failure returns `503 dedupe_persistence_failed` and discloses any already accepted components.
+failure returns `503 dedupe_persistence_failed` and discloses any already accepted components;
+shared disk quota or headroom rejection instead returns partial
+`413 write_disk_quota_exceeded` with the same progress disclosure.
 This is bounded duplicate suppression, not an end-to-end exactly-once guarantee; see
 [clustering internals](clustering-internals.md#idempotency-and-deduplication).
 
@@ -422,7 +514,17 @@ This is bounded duplicate suppression, not an end-to-end exactly-once guarantee;
 
 ## Cluster audit log
 
-All control-plane operations (joins, leaves, ring changes, handoffs) are written to an audit log queryable via the admin API.
+The server attempts to record every control-plane operation outcome (joins, leaves, ring changes,
+handoffs) in an audit log queryable via the admin API. Audit persistence happens after the operation;
+failure is logged but cannot roll back a mutation that already completed. The JSONL log is durable
+but is not cryptographically tamper-evident.
+When the server shared local-disk budget is configured, audit appends reserve `Cluster` bytes and
+retain typed quota/headroom classification in the server log. Expired/size-pruned records are
+rewritten through an exact bounded atomic compaction; failure after an already durable append is
+cleanup debt and does not turn that append into a false rejection. The TSDB status payload and
+Prometheus metrics expose cleanup debt and persistence fencing. An indeterminate append fences
+later audit appends so they cannot extend an uncertain JSONL tail; strict restart replay rejects an
+incomplete tail rather than silently truncating it.
 
 | Environment variable | Default | Description |
 |---|---|---|

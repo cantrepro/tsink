@@ -38,7 +38,6 @@ impl<'a> CatalogRefreshContext<'a> {
                 inventory: loaded.inventory,
                 loaded_segments,
                 removed_roots,
-                tombstones: loaded.tombstones,
             },
         ))
     }
@@ -53,8 +52,8 @@ impl ChunkStorage {
             PlannedPersistedCatalogRefresh::KnownDirty(planned) => {
                 let added_roots = planned.diff.added_roots.into_iter().collect::<Vec<_>>();
                 let removed_roots = planned.diff.removed_roots.into_iter().collect::<Vec<_>>();
-                let registry_catalog_sources = self
-                    .persisted_registry_catalog_sources_with_root_changes(
+                let registry_catalog_delta = self
+                    .persisted_registry_catalog_delta_for_root_changes(
                         &added_roots,
                         &removed_roots,
                     )?;
@@ -64,8 +63,13 @@ impl ChunkStorage {
                     removed_roots,
                     publication: PersistedCatalogPublication::PersistedState {
                         published_segment_roots: added_roots,
+                        refresh_tombstones: false,
                     },
-                    registry_catalog_sources: Some(registry_catalog_sources),
+                    registry_catalog_update: Some(
+                        registry_catalog::PersistedRegistryCatalogUpdate::Delta(
+                            registry_catalog_delta,
+                        ),
+                    ),
                 })
             }
             PlannedPersistedCatalogRefresh::Inventory(planned) => Ok(PersistedCatalogTransition {
@@ -74,11 +78,13 @@ impl ChunkStorage {
                 removed_roots: planned.removed_roots,
                 publication: PersistedCatalogPublication::Inventory {
                     inventory: planned.inventory.clone(),
-                    tombstones: Some(planned.tombstones),
+                    refresh_tombstones: true,
                 },
-                registry_catalog_sources: Some(registry_catalog::inventory_sources(
-                    &planned.inventory,
-                )),
+                registry_catalog_update: Some(
+                    registry_catalog::PersistedRegistryCatalogUpdate::Complete(
+                        registry_catalog::inventory_sources(&planned.inventory),
+                    ),
+                ),
             }),
         }
     }

@@ -49,6 +49,26 @@ struct PersistedVisibleStateInstall {
     next_segment_id: Option<u64>,
 }
 
+#[derive(Default)]
+struct PersistedIndexAccountingScope {
+    roots: BTreeSet<PathBuf>,
+    series_ids: BTreeSet<SeriesId>,
+    metrics: BTreeSet<String>,
+    label_names: BTreeSet<String>,
+    labels: BTreeSet<(String, String)>,
+}
+
+impl PersistedIndexAccountingScope {
+    fn include_series_definition(&mut self, metric: &str, labels: &[Label]) {
+        self.metrics.insert(metric.to_string());
+        for label in labels {
+            self.label_names.insert(label.name.clone());
+            self.labels
+                .insert((label.name.clone(), label.value.clone()));
+        }
+    }
+}
+
 impl ChunkStorage {
     pub(in super::super) fn add_persisted_segments_from_loaded(
         &self,

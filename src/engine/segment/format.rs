@@ -6,8 +6,9 @@ use roaring::RoaringTreemap;
 
 use crate::engine::binio::{
     append_i64, append_u16, append_u32, append_u64, append_u8, checksum32,
-    decode_optional_zstd_framed_file, encode_optional_zstd_framed_file, read_array, read_bytes,
-    read_i64, read_u16, read_u32, read_u32_at, read_u64, read_u8, read_u8_at, write_u64_at,
+    decode_optional_zstd_framed_file_with_limit, decompress_zstd_exact_bounded,
+    encode_optional_zstd_framed_file, read_array, read_bytes, read_i64, read_u16, read_u32,
+    read_u32_at, read_u64, read_u8, read_u8_at, write_u64_at, MAX_DECODED_FRAMED_FILE_BYTES,
 };
 use crate::engine::chunk::{Chunk, ChunkHeader, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::engine::durability::WalHighWatermark;
@@ -20,11 +21,11 @@ use super::types::{PersistedSeries, SegmentManifest};
 
 const MANIFEST_MAGIC: [u8; 4] = *b"TSM2";
 const CHUNKS_MAGIC: [u8; 4] = *b"CHK2";
-const CHUNK_INDEX_MAGIC: [u8; 4] = *b"CID2";
-const SERIES_MAGIC: [u8; 4] = *b"SRS2";
-const POSTINGS_MAGIC: [u8; 4] = *b"PST2";
+pub(super) const CHUNK_INDEX_MAGIC: [u8; 4] = *b"CID2";
+pub(super) const SERIES_MAGIC: [u8; 4] = *b"SRS2";
+pub(super) const POSTINGS_MAGIC: [u8; 4] = *b"PST2";
 
-const FORMAT_VERSION: u16 = 2;
+pub(super) const FORMAT_VERSION: u16 = 2;
 pub(super) const FILE_KIND_CHUNKS: u8 = 1;
 pub(super) const FILE_KIND_CHUNK_INDEX: u8 = 2;
 pub(super) const FILE_KIND_SERIES: u8 = 3;
@@ -37,14 +38,25 @@ const SERIES_FLAG_LEGACY_VALUE_FAMILY: u16 = 0b0000_0001;
 pub(crate) const CHUNK_FLAG_PAYLOAD_ZSTD: u8 = 0b0000_0001;
 const CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES: usize = 4;
 const CHUNK_PAYLOAD_ZSTD_LEVEL_FAST: i32 = 1;
+/// Last-resort format ceiling for one decoded chunk payload.
+pub(crate) const MAX_DECODED_CHUNK_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum raw size accepted for one `chunks.bin` file before any record decoding or allocation.
+pub(crate) const MAX_SEGMENT_CHUNKS_FILE_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const MAX_SEGMENT_MANIFEST_FILE_BYTES: usize = 1024 * 1024;
 
 pub(super) const CHUNKS_HEADER_LEN: usize = 16;
 const CHUNK_INDEX_HEADER_LEN: usize = 24;
+const CHUNK_INDEX_ENTRY_LEN: usize = 42;
+const CHUNK_INDEX_SERIES_RANGE_LEN: usize = 24;
 const SERIES_HEADER_LEN: usize = 28;
+const SERIES_ENTRY_LEN: usize = 24;
+const SERIES_LABEL_PAIR_LEN: usize = 8;
 pub(super) const POSTINGS_HEADER_LEN: usize = 16;
+const POSTINGS_ENTRY_HEADER_LEN: usize = 20;
 const MANIFEST_HEADER_LEN: usize = 80;
 const MANIFEST_FILE_ENTRY_LEN: usize = 20;
 pub(super) const MANIFEST_FILE_ENTRY_COUNT: usize = 4;
+const MIN_CHUNK_RECORD_TOTAL_LEN: usize = 46;
 
 type BuildChunksAndIndexOutput = (Vec<u8>, ChunkIndex, usize, usize, Option<i64>, Option<i64>);
 type BuildSeriesFileOutput = (Vec<u8>, usize);
@@ -109,6 +121,73 @@ pub(super) struct BuiltSegmentSeriesData {
     pub(super) entries: Vec<SegmentSeriesEntry>,
 }
 
+fn persisted_count(raw: u64, context: &str) -> Result<usize> {
+    usize::try_from(raw).map_err(|_| {
+        TsinkError::DataCorruption(format!("{context} count {raw} does not fit this platform"))
+    })
+}
+
+fn persisted_offset(raw: u64, context: &str) -> Result<usize> {
+    usize::try_from(raw).map_err(|_| {
+        TsinkError::DataCorruption(format!("{context} offset {raw} does not fit this platform"))
+    })
+}
+
+fn checked_record_bytes(count: usize, record_len: usize, context: &str) -> Result<usize> {
+    count
+        .checked_mul(record_len)
+        .ok_or_else(|| TsinkError::DataCorruption(format!("{context} byte length overflow")))
+}
+
+fn ensure_fixed_records_fit(
+    bytes_len: usize,
+    pos: usize,
+    count: usize,
+    record_len: usize,
+    context: &str,
+) -> Result<()> {
+    let records_len = checked_record_bytes(count, record_len, context)?;
+    let end = pos
+        .checked_add(records_len)
+        .ok_or_else(|| TsinkError::DataCorruption(format!("{context} end offset overflow")))?;
+    if end > bytes_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "{context} declares {count} records requiring {records_len} bytes, but only {} remain",
+            bytes_len.saturating_sub(pos)
+        )));
+    }
+    Ok(())
+}
+
+fn try_vec_with_capacity<T>(count: usize, context: &str) -> Result<Vec<T>> {
+    let allocation_bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| TsinkError::DataCorruption(format!("{context} allocation overflow")))?;
+    if allocation_bytes > MAX_DECODED_FRAMED_FILE_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "{context} allocation {allocation_bytes} exceeds the format safety limit {MAX_DECODED_FRAMED_FILE_BYTES}"
+        )));
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|err| {
+        TsinkError::Other(format!(
+            "failed to reserve {count} entries while decoding {context}: {err}"
+        ))
+    })?;
+    Ok(values)
+}
+
+fn ensure_chunks_file_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_SEGMENT_CHUNKS_FILE_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunks.bin size {} exceeds the format safety limit {}",
+            bytes.len(),
+            MAX_SEGMENT_CHUNKS_FILE_BYTES
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn build_chunks_and_index<T>(
     level: u8,
     chunks_by_series: &HashMap<SeriesId, Vec<T>>,
@@ -170,7 +249,12 @@ where
             let record_start = bytes.len();
             append_chunk_record(&mut bytes, chunk)?;
             let record_len =
-                u32::try_from(bytes.len().saturating_sub(record_start)).map_err(|_| {
+                u32::try_from(bytes.len().checked_sub(record_start).ok_or_else(|| {
+                    TsinkError::InvalidConfiguration(
+                        "chunk record length underflow in chunks.bin".to_string(),
+                    )
+                })?)
+                .map_err(|_| {
                     TsinkError::InvalidConfiguration(
                         "chunk record length exceeds u32 in chunks.bin".to_string(),
                     )
@@ -216,9 +300,12 @@ fn append_chunk_record(out: &mut Vec<u8>, chunk: &Chunk) -> Result<()> {
     let payload_crc32 = checksum32(&payload);
 
     let record_len = 4usize
-        .saturating_add(header_body.len())
-        .saturating_add(payload.len())
-        .saturating_add(4);
+        .checked_add(header_body.len())
+        .and_then(|len| len.checked_add(payload.len()))
+        .and_then(|len| len.checked_add(4))
+        .ok_or_else(|| {
+            TsinkError::InvalidConfiguration("chunk record length overflow".to_string())
+        })?;
 
     let record_len_u32 = u32::try_from(record_len).map_err(|_| {
         TsinkError::InvalidConfiguration("chunk record exceeds u32 length".to_string())
@@ -382,12 +469,23 @@ pub(super) fn build_series_file(
     }
 
     let series_entry_offset = bytes.len();
-    let pairs_offset_base = series_entry_offset + series_data.entries.len().saturating_mul(24);
+    let pairs_offset_base = series_data
+        .entries
+        .len()
+        .checked_mul(SERIES_ENTRY_LEN)
+        .and_then(|entries_len| series_entry_offset.checked_add(entries_len))
+        .ok_or_else(|| {
+            TsinkError::InvalidConfiguration("series entry table length overflow".to_string())
+        })?;
 
     let mut pairs_bytes = Vec::new();
 
     for series in &series_data.entries {
-        let pairs_offset = pairs_offset_base + pairs_bytes.len();
+        let pairs_offset = pairs_offset_base
+            .checked_add(pairs_bytes.len())
+            .ok_or_else(|| {
+                TsinkError::InvalidConfiguration("series label-pair offset overflow".to_string())
+            })?;
 
         let label_pair_count = u16::try_from(series.label_pairs.len()).map_err(|_| {
             TsinkError::InvalidConfiguration("series label pair count exceeds u16".to_string())
@@ -502,13 +600,20 @@ fn append_postings_entry(
         .serialize_into(&mut std::io::Cursor::new(&mut payload))
         .map_err(|err| TsinkError::Other(format!("failed to encode posting list: {err}")))?;
 
+    let series_count = u32::try_from(series_ids.len()).map_err(|_| {
+        TsinkError::InvalidConfiguration("posting list cardinality exceeds u32".to_string())
+    })?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        TsinkError::InvalidConfiguration("encoded posting payload exceeds u32".to_string())
+    })?;
+
     append_u8(bytes, kind);
     append_u8(bytes, 0u8);
     append_u16(bytes, 0u16);
     append_u32(bytes, primary_id);
     append_u32(bytes, secondary_id);
-    append_u32(bytes, series_ids.len().min(u64::from(u32::MAX)) as u32);
-    append_u32(bytes, payload.len().min(u32::MAX as usize) as u32);
+    append_u32(bytes, series_count);
+    append_u32(bytes, payload_len);
     bytes.extend_from_slice(&payload);
     Ok(())
 }
@@ -612,6 +717,12 @@ pub(super) fn build_manifest_file(
 }
 
 pub(super) fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
+    if bytes.len() > MAX_SEGMENT_MANIFEST_FILE_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "manifest.bin size {} exceeds the format safety limit {MAX_SEGMENT_MANIFEST_FILE_BYTES}",
+            bytes.len()
+        )));
+    }
     if bytes.len() < MANIFEST_HEADER_LEN + (MANIFEST_FILE_ENTRY_LEN * MANIFEST_FILE_ENTRY_COUNT) + 4
     {
         return Err(TsinkError::DataCorruption(
@@ -649,12 +760,14 @@ pub(super) fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
     let min_ts_raw = read_i64(bytes, &mut pos)?;
     let max_ts_raw = read_i64(bytes, &mut pos)?;
     let _created_unix_ns = read_i64(bytes, &mut pos)?;
-    let series_count = read_u64(bytes, &mut pos)? as usize;
-    let chunk_count = read_u64(bytes, &mut pos)? as usize;
-    let point_count = read_u64(bytes, &mut pos)? as usize;
+    let series_count = persisted_count(read_u64(bytes, &mut pos)?, "manifest series")?;
+    let chunk_count = persisted_count(read_u64(bytes, &mut pos)?, "manifest chunk")?;
+    let point_count = persisted_count(read_u64(bytes, &mut pos)?, "manifest point")?;
     let wal_highwater_segment = read_u64(bytes, &mut pos)?;
     let wal_highwater_frame = read_u64(bytes, &mut pos)?;
-    let file_entry_count = read_u32(bytes, &mut pos)? as usize;
+    let file_entry_count = usize::try_from(read_u32(bytes, &mut pos)?).map_err(|_| {
+        TsinkError::DataCorruption("manifest file-entry count does not fit usize".to_string())
+    })?;
     let _reserved1 = read_u32(bytes, &mut pos)?;
 
     if file_entry_count != MANIFEST_FILE_ENTRY_COUNT {
@@ -678,7 +791,7 @@ pub(super) fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
         });
     }
 
-    if pos + 4 != bytes.len() {
+    if pos.checked_add(4) != Some(bytes.len()) {
         return Err(TsinkError::DataCorruption(
             "manifest has unexpected trailing bytes".to_string(),
         ));
@@ -755,8 +868,20 @@ pub(super) fn verify_file_manifest_entry(
 }
 
 pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
-    let bytes =
-        decode_optional_zstd_framed_file(bytes, SERIES_MAGIC, FORMAT_VERSION, "series.bin")?;
+    parse_series_file_with_decoded_limit(bytes, MAX_DECODED_FRAMED_FILE_BYTES)
+}
+
+pub(super) fn parse_series_file_with_decoded_limit(
+    bytes: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<ParsedSeriesFile> {
+    let bytes = decode_optional_zstd_framed_file_with_limit(
+        bytes,
+        SERIES_MAGIC,
+        FORMAT_VERSION,
+        "series.bin",
+        max_decoded_bytes.min(MAX_DECODED_FRAMED_FILE_BYTES),
+    )?;
     if bytes.len() < SERIES_HEADER_LEN {
         return Err(TsinkError::DataCorruption(
             "series.bin is too short".to_string(),
@@ -787,13 +912,42 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
     let metric_count = read_u32(&bytes, &mut pos)? as usize;
     let label_name_count = read_u32(&bytes, &mut pos)? as usize;
     let label_value_count = read_u32(&bytes, &mut pos)? as usize;
-    let series_count = read_u64(&bytes, &mut pos)? as usize;
+    let series_count = persisted_count(read_u64(&bytes, &mut pos)?, "series.bin series")?;
+
+    let dictionary_count = metric_count
+        .checked_add(label_name_count)
+        .and_then(|count| count.checked_add(label_value_count))
+        .ok_or_else(|| {
+            TsinkError::DataCorruption("series.bin dictionary count overflow".to_string())
+        })?;
+    let minimum_dictionary_bytes =
+        checked_record_bytes(dictionary_count, 8, "series.bin dictionary headers")?;
+    let minimum_series_bytes =
+        checked_record_bytes(series_count, SERIES_ENTRY_LEN, "series.bin entries")?;
+    let minimum_remaining = minimum_dictionary_bytes
+        .checked_add(minimum_series_bytes)
+        .ok_or_else(|| {
+            TsinkError::DataCorruption("series.bin minimum length overflow".to_string())
+        })?;
+    if minimum_remaining > bytes.len().saturating_sub(pos) {
+        return Err(TsinkError::DataCorruption(format!(
+            "series.bin declared counts require at least {minimum_remaining} bytes, but only {} remain",
+            bytes.len().saturating_sub(pos)
+        )));
+    }
 
     let metrics = parse_dictionary(&bytes, &mut pos, metric_count)?;
     let label_names = parse_dictionary(&bytes, &mut pos, label_name_count)?;
     let label_values = parse_dictionary(&bytes, &mut pos, label_value_count)?;
 
-    let mut entries_stub = Vec::with_capacity(series_count);
+    ensure_fixed_records_fit(
+        bytes.len(),
+        pos,
+        series_count,
+        SERIES_ENTRY_LEN,
+        "series.bin entry table",
+    )?;
+    let mut entries_stub = try_vec_with_capacity(series_count, "series.bin entry table")?;
     for _ in 0..series_count {
         let series_id = read_u64(&bytes, &mut pos)?;
         let lane = decode_lane(read_u8(&bytes, &mut pos)?)?;
@@ -806,7 +960,7 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
             };
         let label_pair_count = read_u16(&bytes, &mut pos)? as usize;
         let metric_id = read_u32(&bytes, &mut pos)?;
-        let pair_offset = read_u64(&bytes, &mut pos)? as usize;
+        let pair_offset = persisted_offset(read_u64(&bytes, &mut pos)?, "series.bin label-pair")?;
 
         entries_stub.push((
             series_id,
@@ -818,21 +972,39 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
         ));
     }
 
-    let mut entries = Vec::with_capacity(entries_stub.len());
+    let mut entries = try_vec_with_capacity(entries_stub.len(), "series.bin decoded entries")?;
+    let mut expected_pair_offset = pos;
     for (series_id, metric_id, lane, value_family, pair_count, pair_offset) in entries_stub {
+        if pair_offset != expected_pair_offset {
+            return Err(TsinkError::DataCorruption(format!(
+                "series label-pair offset {pair_offset} is not canonical; expected {expected_pair_offset}"
+            )));
+        }
+        let pair_bytes =
+            checked_record_bytes(pair_count, SERIES_LABEL_PAIR_LEN, "series label-pair block")?;
+        let pair_end = pair_offset.checked_add(pair_bytes).ok_or_else(|| {
+            TsinkError::DataCorruption("series label-pair end offset overflow".to_string())
+        })?;
+        if pair_end > bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "series label pair block exceeds file size".to_string(),
+            ));
+        }
+
         let mut pair_pos = pair_offset;
-        let mut label_pairs = Vec::with_capacity(pair_count);
+        let mut label_pairs = try_vec_with_capacity(pair_count, "series.bin label-pair block")?;
         for _ in 0..pair_count {
             let name_id = read_u32(&bytes, &mut pair_pos)?;
             let value_id = read_u32(&bytes, &mut pair_pos)?;
             label_pairs.push(LabelPairId { name_id, value_id });
         }
 
-        if pair_pos > bytes.len() {
+        if pair_pos != pair_end {
             return Err(TsinkError::DataCorruption(
-                "series label pair block exceeds file size".to_string(),
+                "series label pair block length mismatch".to_string(),
             ));
         }
+        expected_pair_offset = pair_end;
 
         entries.push(ParsedSeriesEntry {
             series_id,
@@ -841,6 +1013,12 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
             value_family,
             label_pairs,
         });
+    }
+
+    if expected_pair_offset != bytes.len() {
+        return Err(TsinkError::DataCorruption(
+            "series.bin has trailing or unreferenced label-pair bytes".to_string(),
+        ));
     }
 
     Ok(ParsedSeriesFile {
@@ -852,7 +1030,8 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
 }
 
 fn parse_dictionary(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<String>> {
-    let mut values = Vec::with_capacity(count);
+    ensure_fixed_records_fit(bytes.len(), *pos, count, 8, "series dictionary headers")?;
+    let mut values = try_vec_with_capacity(count, "series dictionary")?;
     for expected_id in 0..count {
         let id = read_u32(bytes, pos)? as usize;
         if id != expected_id {
@@ -871,7 +1050,7 @@ fn parse_dictionary(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<S
 }
 
 pub(super) fn decode_persisted_series(parsed: &ParsedSeriesFile) -> Result<Vec<PersistedSeries>> {
-    let mut out = Vec::with_capacity(parsed.entries.len());
+    let mut out = try_vec_with_capacity(parsed.entries.len(), "decoded persisted series")?;
 
     for entry in &parsed.entries {
         let Some(metric) = parsed.metrics.get(entry.metric_id as usize) else {
@@ -883,7 +1062,8 @@ pub(super) fn decode_persisted_series(parsed: &ParsedSeriesFile) -> Result<Vec<P
 
         let _lane = entry.lane;
 
-        let mut labels = Vec::with_capacity(entry.label_pairs.len());
+        let mut labels =
+            try_vec_with_capacity(entry.label_pairs.len(), "decoded persisted series labels")?;
         for pair in &entry.label_pairs {
             let Some(name) = parsed.label_names.get(pair.name_id as usize) else {
                 return Err(TsinkError::DataCorruption(format!(
@@ -916,8 +1096,21 @@ pub(super) fn parse_postings_file(
     bytes: &[u8],
     parsed_series: &ParsedSeriesFile,
 ) -> Result<SegmentPostingsIndex> {
-    let bytes =
-        decode_optional_zstd_framed_file(bytes, POSTINGS_MAGIC, FORMAT_VERSION, "postings.bin")?;
+    parse_postings_file_with_decoded_limit(bytes, parsed_series, MAX_DECODED_FRAMED_FILE_BYTES)
+}
+
+pub(super) fn parse_postings_file_with_decoded_limit(
+    bytes: &[u8],
+    parsed_series: &ParsedSeriesFile,
+    max_decoded_bytes: usize,
+) -> Result<SegmentPostingsIndex> {
+    let bytes = decode_optional_zstd_framed_file_with_limit(
+        bytes,
+        POSTINGS_MAGIC,
+        FORMAT_VERSION,
+        "postings.bin",
+        max_decoded_bytes.min(MAX_DECODED_FRAMED_FILE_BYTES),
+    )?;
     if bytes.len() < POSTINGS_HEADER_LEN {
         return Err(TsinkError::DataCorruption(
             "postings.bin is too short".to_string(),
@@ -940,7 +1133,14 @@ pub(super) fn parse_postings_file(
     }
 
     let _flags = read_u16(&bytes, &mut pos)?;
-    let postings_count = read_u64(&bytes, &mut pos)? as usize;
+    let postings_count = persisted_count(read_u64(&bytes, &mut pos)?, "postings.bin entry")?;
+    ensure_fixed_records_fit(
+        bytes.len(),
+        pos,
+        postings_count,
+        POSTINGS_ENTRY_HEADER_LEN,
+        "postings.bin entry headers",
+    )?;
     let mut postings = SegmentPostingsIndex::from_series_postings(
         parsed_series
             .entries
@@ -956,16 +1156,35 @@ pub(super) fn parse_postings_file(
         let primary_id = read_u32(&bytes, &mut pos)?;
         let secondary_id = read_u32(&bytes, &mut pos)?;
         let series_count = read_u32(&bytes, &mut pos)? as usize;
+        if series_count > parsed_series.entries.len() {
+            return Err(TsinkError::DataCorruption(format!(
+                "posting list declares {series_count} series, exceeding the segment series count {}",
+                parsed_series.entries.len()
+            )));
+        }
         let encoded_len = read_u32(&bytes, &mut pos)? as usize;
         let payload = read_bytes(&bytes, &mut pos, encoded_len)?;
 
-        let bitmap = RoaringTreemap::deserialize_from(&mut std::io::Cursor::new(payload)).map_err(
-            |err| {
-                TsinkError::DataCorruption(format!(
-                    "failed to decode roaring posting payload: {err}"
-                ))
-            },
+        let mut bitmap_header_pos = 0usize;
+        let tree_part_count = persisted_count(
+            read_u64(payload, &mut bitmap_header_pos)?,
+            "roaring treemap part",
         )?;
+        if tree_part_count > series_count {
+            return Err(TsinkError::DataCorruption(format!(
+                "roaring posting declares {tree_part_count} high-key parts for {series_count} series"
+            )));
+        }
+
+        let mut cursor = std::io::Cursor::new(payload);
+        let bitmap = RoaringTreemap::deserialize_from(&mut cursor).map_err(|err| {
+            TsinkError::DataCorruption(format!("failed to decode roaring posting payload: {err}"))
+        })?;
+        if usize::try_from(cursor.position()).ok() != Some(payload.len()) {
+            return Err(TsinkError::DataCorruption(
+                "roaring posting payload has trailing bytes".to_string(),
+            ));
+        }
         if bitmap.len() != series_count as u64 {
             return Err(TsinkError::DataCorruption(format!(
                 "posting list cardinality mismatch: expected {series_count}, decoded {}",
@@ -1040,11 +1259,19 @@ pub(super) fn parse_postings_file(
 }
 
 pub(super) fn parse_chunk_index_file(bytes: &[u8]) -> Result<ChunkIndex> {
-    let bytes = decode_optional_zstd_framed_file(
+    parse_chunk_index_file_with_decoded_limit(bytes, MAX_DECODED_FRAMED_FILE_BYTES)
+}
+
+pub(super) fn parse_chunk_index_file_with_decoded_limit(
+    bytes: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<ChunkIndex> {
+    let bytes = decode_optional_zstd_framed_file_with_limit(
         bytes,
         CHUNK_INDEX_MAGIC,
         FORMAT_VERSION,
         "chunk_index.bin",
+        max_decoded_bytes.min(MAX_DECODED_FRAMED_FILE_BYTES),
     )?;
     if bytes.len() < CHUNK_INDEX_HEADER_LEN {
         return Err(TsinkError::DataCorruption(
@@ -1068,10 +1295,34 @@ pub(super) fn parse_chunk_index_file(bytes: &[u8]) -> Result<ChunkIndex> {
     }
 
     let _flags = read_u16(&bytes, &mut pos)?;
-    let entry_count = read_u64(&bytes, &mut pos)? as usize;
-    let series_table_count = read_u64(&bytes, &mut pos)? as usize;
+    let entry_count = persisted_count(read_u64(&bytes, &mut pos)?, "chunk_index.bin entry")?;
+    let series_table_count =
+        persisted_count(read_u64(&bytes, &mut pos)?, "chunk_index.bin series-range")?;
 
-    let mut index = ChunkIndex::default();
+    let entry_bytes = checked_record_bytes(
+        entry_count,
+        CHUNK_INDEX_ENTRY_LEN,
+        "chunk_index.bin entries",
+    )?;
+    let series_table_bytes = checked_record_bytes(
+        series_table_count,
+        CHUNK_INDEX_SERIES_RANGE_LEN,
+        "chunk_index.bin series ranges",
+    )?;
+    let expected_len = CHUNK_INDEX_HEADER_LEN
+        .checked_add(entry_bytes)
+        .and_then(|len| len.checked_add(series_table_bytes))
+        .ok_or_else(|| TsinkError::DataCorruption("chunk_index.bin length overflow".to_string()))?;
+    if expected_len != bytes.len() {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk_index.bin declared tables require {expected_len} bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    let mut index = ChunkIndex {
+        entries: try_vec_with_capacity(entry_count, "chunk_index.bin entries")?,
+    };
 
     for _ in 0..entry_count {
         let series_id = read_u64(&bytes, &mut pos)?;
@@ -1102,7 +1353,8 @@ pub(super) fn parse_chunk_index_file(bytes: &[u8]) -> Result<ChunkIndex> {
     let mut prev_series = 0u64;
     for idx in 0..series_table_count {
         let series_id = read_u64(&bytes, &mut pos)?;
-        let first_entry = read_u64(&bytes, &mut pos)? as usize;
+        let first_entry =
+            persisted_offset(read_u64(&bytes, &mut pos)?, "chunk_index.bin first-entry")?;
         let count = read_u32(&bytes, &mut pos)? as usize;
         let _reserved = read_u32(&bytes, &mut pos)?;
 
@@ -1113,7 +1365,10 @@ pub(super) fn parse_chunk_index_file(bytes: &[u8]) -> Result<ChunkIndex> {
         }
         prev_series = series_id;
 
-        if first_entry.saturating_add(count) > entry_count {
+        if first_entry
+            .checked_add(count)
+            .is_none_or(|end| end > entry_count)
+        {
             return Err(TsinkError::DataCorruption(
                 "chunk index series range points outside entry table".to_string(),
             ));
@@ -1129,7 +1384,134 @@ pub(super) fn parse_chunk_index_file(bytes: &[u8]) -> Result<ChunkIndex> {
     Ok(index)
 }
 
+fn preflight_chunks_file_decode(bytes: &[u8], chunk_count: usize, mut pos: usize) -> Result<usize> {
+    let mut total_decoded_payload_bytes = 0usize;
+
+    for _ in 0..chunk_count {
+        let record_len = read_u32(bytes, &mut pos)? as usize;
+        if record_len < MIN_CHUNK_RECORD_TOTAL_LEN - 4 {
+            return Err(TsinkError::DataCorruption(
+                "chunk record is shorter than its fixed fields".to_string(),
+            ));
+        }
+        let record_end = pos.checked_add(record_len).ok_or_else(|| {
+            TsinkError::DataCorruption("chunk record end offset overflow".to_string())
+        })?;
+        if record_end > bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "chunk record exceeds chunks.bin length".to_string(),
+            ));
+        }
+
+        let header_crc32 = read_u32(bytes, &mut pos)?;
+        let header_start = pos;
+        let _series_id = read_u64(bytes, &mut pos)?;
+        let _lane = decode_lane(read_u8(bytes, &mut pos)?)?;
+        let _ts_codec = decode_ts_codec(read_u8(bytes, &mut pos)?)?;
+        let _value_codec = decode_value_codec(read_u8(bytes, &mut pos)?)?;
+        let chunk_flags = read_u8(bytes, &mut pos)?;
+        let _point_count = read_u16(bytes, &mut pos)?;
+        let _min_ts = read_i64(bytes, &mut pos)?;
+        let _max_ts = read_i64(bytes, &mut pos)?;
+        let payload_len = read_u32(bytes, &mut pos)? as usize;
+
+        if checksum32(&bytes[header_start..pos]) != header_crc32 {
+            return Err(TsinkError::DataCorruption(
+                "chunk header crc mismatch".to_string(),
+            ));
+        }
+        validate_chunk_payload_flags(chunk_flags)?;
+
+        let payload = read_bytes(bytes, &mut pos, payload_len)?;
+        let payload_crc32 = read_u32(bytes, &mut pos)?;
+        if checksum32(payload) != payload_crc32 {
+            return Err(TsinkError::DataCorruption(
+                "chunk payload crc mismatch".to_string(),
+            ));
+        }
+        if pos != record_end {
+            return Err(TsinkError::DataCorruption(
+                "chunk record length mismatch".to_string(),
+            ));
+        }
+
+        let decoded_len = if chunk_payload_uses_zstd(chunk_flags)? {
+            if payload.len() < CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES {
+                return Err(TsinkError::DataCorruption(
+                    "compressed chunk payload missing original length prefix".to_string(),
+                ));
+            }
+            usize::try_from(read_u32_at(payload, 0)?).map_err(|_| {
+                TsinkError::DataCorruption(
+                    "compressed chunk decoded length does not fit this platform".to_string(),
+                )
+            })?
+        } else {
+            payload.len()
+        };
+        if decoded_len > MAX_DECODED_CHUNK_PAYLOAD_BYTES {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunk payload decoded size {decoded_len} exceeds the format safety limit {MAX_DECODED_CHUNK_PAYLOAD_BYTES}"
+            )));
+        }
+        total_decoded_payload_bytes = total_decoded_payload_bytes
+            .checked_add(decoded_len)
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(
+                    "chunks.bin aggregate decoded payload length overflow".to_string(),
+                )
+            })?;
+        if total_decoded_payload_bytes > MAX_SEGMENT_CHUNKS_FILE_BYTES {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunks.bin aggregate decoded payload size {total_decoded_payload_bytes} exceeds the format safety limit {MAX_SEGMENT_CHUNKS_FILE_BYTES}"
+            )));
+        }
+    }
+
+    if pos != bytes.len() {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin has trailing bytes".to_string(),
+        ));
+    }
+    Ok(total_decoded_payload_bytes)
+}
+
+/// Validates chunk-file framing without decompressing payloads and returns the aggregate decoded
+/// payload bytes declared by all records.
+pub(crate) fn decoded_chunks_file_payload_bytes(bytes: &[u8]) -> Result<usize> {
+    ensure_chunks_file_size(bytes)?;
+    if bytes.len() < CHUNKS_HEADER_LEN {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin is too short".to_string(),
+        ));
+    }
+
+    let mut pos = 0usize;
+    if read_array::<4>(bytes, &mut pos)? != CHUNKS_MAGIC {
+        return Err(TsinkError::DataCorruption(
+            "chunks.bin magic mismatch".to_string(),
+        ));
+    }
+    let version = read_u16(bytes, &mut pos)?;
+    if version != FORMAT_VERSION {
+        return Err(TsinkError::DataCorruption(format!(
+            "unsupported chunks.bin version {version}"
+        )));
+    }
+    let _flags = read_u16(bytes, &mut pos)?;
+    let chunk_count = persisted_count(read_u64(bytes, &mut pos)?, "chunks.bin chunk")?;
+    ensure_fixed_records_fit(
+        bytes.len(),
+        pos,
+        chunk_count,
+        MIN_CHUNK_RECORD_TOTAL_LEN,
+        "chunks.bin minimum chunk records",
+    )?;
+    preflight_chunks_file_decode(bytes, chunk_count, pos)
+}
+
 pub(super) fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecordMeta>> {
+    ensure_chunks_file_size(bytes)?;
     if bytes.len() < CHUNKS_HEADER_LEN {
         return Err(TsinkError::DataCorruption(
             "chunks.bin is too short".to_string(),
@@ -1152,14 +1534,24 @@ pub(super) fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecor
     }
 
     let _flags = read_u16(bytes, &mut pos)?;
-    let chunk_count = read_u64(bytes, &mut pos)? as usize;
+    let chunk_count = persisted_count(read_u64(bytes, &mut pos)?, "chunks.bin chunk")?;
+    ensure_fixed_records_fit(
+        bytes.len(),
+        pos,
+        chunk_count,
+        MIN_CHUNK_RECORD_TOTAL_LEN,
+        "chunks.bin minimum chunk records",
+    )?;
+    let _decoded_payload_bytes = preflight_chunks_file_decode(bytes, chunk_count, pos)?;
 
     let mut records = BTreeMap::new();
 
     for _ in 0..chunk_count {
         let record_offset = pos as u64;
         let record_len = read_u32(bytes, &mut pos)? as usize;
-        let record_end = pos.saturating_add(record_len);
+        let record_end = pos.checked_add(record_len).ok_or_else(|| {
+            TsinkError::DataCorruption("chunk record end offset overflow".to_string())
+        })?;
         if record_end > bytes.len() {
             return Err(TsinkError::DataCorruption(
                 "chunk record exceeds chunks.bin length".to_string(),
@@ -1201,9 +1593,12 @@ pub(super) fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecor
             ));
         }
 
-        let total_len = u32::try_from(4usize.saturating_add(record_len)).map_err(|_| {
-            TsinkError::InvalidConfiguration("chunk record total length exceeds u32".to_string())
-        })?;
+        let total_len = record_len
+            .checked_add(4)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                TsinkError::DataCorruption("chunk record total length exceeds u32".to_string())
+            })?;
 
         records.insert(
             record_offset,
@@ -1222,6 +1617,7 @@ pub(super) fn parse_chunks_file(bytes: &[u8]) -> Result<BTreeMap<u64, ChunkRecor
                     },
                     points: Vec::new(),
                     encoded_payload: payload,
+                    wal_lowwater: WalHighWatermark::default(),
                     wal_highwater: WalHighWatermark::default(),
                 },
             },
@@ -1241,6 +1637,7 @@ pub(super) fn validate_chunk_index_against_chunks_file(
     bytes: &[u8],
     index: &ChunkIndex,
 ) -> Result<()> {
+    ensure_chunks_file_size(bytes)?;
     if bytes.len() < CHUNKS_HEADER_LEN {
         return Err(TsinkError::DataCorruption(
             "chunks.bin is too short".to_string(),
@@ -1263,7 +1660,15 @@ pub(super) fn validate_chunk_index_against_chunks_file(
     }
 
     let _flags = read_u16(bytes, &mut pos)?;
-    let chunk_count = read_u64(bytes, &mut pos)? as usize;
+    let chunk_count = persisted_count(read_u64(bytes, &mut pos)?, "chunks.bin chunk")?;
+    ensure_fixed_records_fit(
+        bytes.len(),
+        pos,
+        chunk_count,
+        MIN_CHUNK_RECORD_TOTAL_LEN,
+        "chunks.bin minimum chunk records",
+    )?;
+    let _decoded_payload_bytes = preflight_chunks_file_decode(bytes, chunk_count, pos)?;
 
     if chunk_count != index.entries.len() {
         return Err(TsinkError::DataCorruption(format!(
@@ -1296,16 +1701,21 @@ pub(super) fn validate_chunk_index_against_chunks_file(
         };
 
         let record_len = read_u32(bytes, &mut pos)? as usize;
-        let record_end = pos.saturating_add(record_len);
+        let record_end = pos.checked_add(record_len).ok_or_else(|| {
+            TsinkError::DataCorruption("chunk record end offset overflow".to_string())
+        })?;
         if record_end > bytes.len() {
             return Err(TsinkError::DataCorruption(
                 "chunk record exceeds chunks.bin length".to_string(),
             ));
         }
 
-        let total_len = u32::try_from(record_len.saturating_add(4)).map_err(|_| {
-            TsinkError::DataCorruption("chunk record total length exceeds u32".to_string())
-        })?;
+        let total_len = record_len
+            .checked_add(4)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                TsinkError::DataCorruption("chunk record total length exceeds u32".to_string())
+            })?;
         if total_len != entry.chunk_len {
             return Err(TsinkError::DataCorruption(format!(
                 "chunk length mismatch at offset {}: index {}, chunk {}",
@@ -1448,6 +1858,12 @@ pub(super) fn hash64(bytes: &[u8]) -> u64 {
 }
 
 fn encode_chunk_payload_for_storage(payload: &[u8]) -> Result<(u8, Vec<u8>)> {
+    if payload.len() > MAX_DECODED_CHUNK_PAYLOAD_BYTES {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "chunk payload size {} exceeds the format safety limit {MAX_DECODED_CHUNK_PAYLOAD_BYTES}",
+            payload.len()
+        )));
+    }
     let compressed =
         zstd::bulk::compress(payload, CHUNK_PAYLOAD_ZSTD_LEVEL_FAST).map_err(|err| {
             TsinkError::Compression(format!("zstd compress chunk payload failed: {err}"))
@@ -1455,9 +1871,12 @@ fn encode_chunk_payload_for_storage(payload: &[u8]) -> Result<(u8, Vec<u8>)> {
 
     let original_len = u32::try_from(payload.len())
         .map_err(|_| TsinkError::InvalidConfiguration("chunk payload too large".to_string()))?;
-    let mut wrapped = Vec::with_capacity(
-        CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES.saturating_add(compressed.len()),
-    );
+    let wrapped_len = CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES
+        .checked_add(compressed.len())
+        .ok_or_else(|| {
+            TsinkError::InvalidConfiguration("compressed chunk payload length overflow".to_string())
+        })?;
+    let mut wrapped = Vec::with_capacity(wrapped_len);
     append_u32(&mut wrapped, original_len);
     wrapped.extend_from_slice(&compressed);
 
@@ -1483,26 +1902,26 @@ pub(crate) fn chunk_payload_uses_zstd(chunk_flags: u8) -> Result<bool> {
 }
 
 pub(crate) fn decompress_chunk_payload_zstd(payload: &[u8]) -> Result<Vec<u8>> {
+    decompress_chunk_payload_zstd_with_limit(payload, MAX_DECODED_CHUNK_PAYLOAD_BYTES)
+}
+
+fn decompress_chunk_payload_zstd_with_limit(
+    payload: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>> {
     if payload.len() < CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES {
         return Err(TsinkError::DataCorruption(
             "compressed chunk payload missing original length prefix".to_string(),
         ));
     }
 
-    let expected_len = usize::try_from(read_u32_at(payload, 0)?).unwrap_or(usize::MAX);
-    let compressed = &payload[CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES..];
-    let decoded = zstd::bulk::decompress(compressed, expected_len).map_err(|err| {
-        TsinkError::Compression(format!("zstd decompress chunk payload failed: {err}"))
+    let expected_len = usize::try_from(read_u32_at(payload, 0)?).map_err(|_| {
+        TsinkError::DataCorruption(
+            "compressed chunk decoded length does not fit this platform".to_string(),
+        )
     })?;
-
-    if decoded.len() != expected_len {
-        return Err(TsinkError::DataCorruption(format!(
-            "chunk payload decompressed length mismatch: expected {expected_len}, got {}",
-            decoded.len()
-        )));
-    }
-
-    Ok(decoded)
+    let compressed = &payload[CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES..];
+    decompress_zstd_exact_bounded(compressed, expected_len, max_decoded_bytes, "chunk payload")
 }
 
 fn decode_chunk_payload_from_storage(payload: &[u8], chunk_flags: u8) -> Result<Vec<u8>> {
@@ -1517,13 +1936,18 @@ pub(crate) fn chunk_payload_from_record<'a>(
     chunk_offset: u64,
     chunk_len: u32,
 ) -> Result<Cow<'a, [u8]>> {
+    ensure_chunks_file_size(bytes)?;
     let offset = usize::try_from(chunk_offset).map_err(|_| {
         TsinkError::DataCorruption(format!("chunk offset {chunk_offset} exceeds usize"))
     })?;
     let record_len = usize::try_from(chunk_len).map_err(|_| {
         TsinkError::DataCorruption(format!("chunk length {chunk_len} exceeds usize"))
     })?;
-    let record_end = offset.saturating_add(record_len);
+    let record_end = offset.checked_add(record_len).ok_or_else(|| {
+        TsinkError::DataCorruption(format!(
+            "chunk at offset {chunk_offset} has an overflowing record length {chunk_len}"
+        ))
+    })?;
     if record_end > bytes.len() {
         return Err(TsinkError::DataCorruption(format!(
             "chunk at offset {} length {} exceeds mapped file size {}",
@@ -1540,20 +1964,28 @@ pub(crate) fn chunk_payload_from_record<'a>(
         ));
     }
 
-    let body_len = usize::try_from(read_u32_at(record, 0)?).unwrap_or(usize::MAX);
-    if body_len.saturating_add(4) != record.len() {
+    let body_len = usize::try_from(read_u32_at(record, 0)?).map_err(|_| {
+        TsinkError::DataCorruption("chunk record body length does not fit usize".to_string())
+    })?;
+    if body_len.checked_add(4) != Some(record.len()) {
         return Err(TsinkError::DataCorruption(format!(
             "chunk record length mismatch at offset {}",
             chunk_offset
         )));
     }
 
-    let payload_len = usize::try_from(read_u32_at(record, 38)?).unwrap_or(usize::MAX);
+    let payload_len = usize::try_from(read_u32_at(record, 38)?).map_err(|_| {
+        TsinkError::DataCorruption("chunk payload length does not fit usize".to_string())
+    })?;
     let payload_start = 42usize;
-    let payload_end = payload_start.saturating_add(payload_len);
+    let payload_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+        TsinkError::DataCorruption(format!(
+            "chunk payload length overflow at offset {chunk_offset}"
+        ))
+    })?;
     let chunk_flags = read_u8_at(record, 19)?;
 
-    if payload_end.saturating_add(4) != record.len() {
+    if payload_end.checked_add(4) != Some(record.len()) {
         return Err(TsinkError::DataCorruption(format!(
             "chunk payload length mismatch at offset {}",
             chunk_offset
@@ -1566,4 +1998,96 @@ pub(crate) fn chunk_payload_from_record<'a>(
     }
 
     Ok(Cow::Borrowed(payload))
+}
+
+#[cfg(test)]
+mod decode_limit_tests {
+    use super::*;
+
+    fn compressed_chunk_payload(body: &[u8], declared_len: u32) -> Vec<u8> {
+        let compressed = zstd::bulk::compress(body, 1).unwrap();
+        let mut payload = Vec::new();
+        append_u32(&mut payload, declared_len);
+        payload.extend_from_slice(&compressed);
+        payload
+    }
+
+    #[test]
+    fn chunk_zstd_decode_accepts_exact_limit_and_rejects_n_plus_one() {
+        let body = vec![11u8; 128];
+        let payload = compressed_chunk_payload(&body, body.len() as u32);
+        assert_eq!(
+            decompress_chunk_payload_zstd_with_limit(&payload, body.len()).unwrap(),
+            body
+        );
+
+        let err = decompress_chunk_payload_zstd_with_limit(&payload, body.len() - 1).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(message)
+            if message.contains("decoded size 128 exceeds the format safety limit 127")));
+    }
+
+    #[test]
+    fn chunk_zstd_decode_rejects_huge_declaration_mismatch_and_truncation() {
+        let mut huge = Vec::new();
+        append_u32(&mut huge, u32::MAX);
+        huge.push(0);
+        let err = decompress_chunk_payload_zstd_with_limit(&huge, 1024).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(message)
+            if message.contains("exceeds the format safety limit 1024")));
+
+        let mismatch = compressed_chunk_payload(&[4u8; 32], 31);
+        let err = decompress_chunk_payload_zstd_with_limit(&mismatch, 1024).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(message)
+            if message.contains("exceeds declared length 31")));
+
+        let mut truncated = compressed_chunk_payload(&[4u8; 32], 32);
+        truncated.truncate(truncated.len() - 2);
+        assert!(matches!(
+            decompress_chunk_payload_zstd_with_limit(&truncated, 1024).unwrap_err(),
+            TsinkError::Compression(_) | TsinkError::DataCorruption(_)
+        ));
+    }
+
+    #[test]
+    fn series_parser_rejects_impossible_counts_before_capacity_reservation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SERIES_MAGIC);
+        append_u16(&mut bytes, FORMAT_VERSION);
+        append_u16(&mut bytes, SERIES_FLAG_VALUE_FAMILY);
+        append_u32(&mut bytes, u32::MAX);
+        append_u32(&mut bytes, 0);
+        append_u32(&mut bytes, 0);
+        append_u64(&mut bytes, 0);
+
+        let err = parse_series_file(&bytes).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(message)
+            if message.contains("declared counts require at least")));
+    }
+
+    #[test]
+    fn chunk_index_parser_rejects_huge_and_truncated_declared_tables() {
+        for entry_count in [u64::MAX, 1] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&CHUNK_INDEX_MAGIC);
+            append_u16(&mut bytes, FORMAT_VERSION);
+            append_u16(&mut bytes, 0);
+            append_u64(&mut bytes, entry_count);
+            append_u64(&mut bytes, 0);
+
+            let err = parse_chunk_index_file(&bytes).unwrap_err();
+            assert!(matches!(err, TsinkError::DataCorruption(_)));
+        }
+    }
+
+    #[test]
+    fn chunks_parser_rejects_huge_declared_record_count_before_iteration() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHUNKS_MAGIC);
+        append_u16(&mut bytes, FORMAT_VERSION);
+        append_u16(&mut bytes, 0);
+        append_u64(&mut bytes, u64::MAX);
+
+        let err = parse_chunks_file(&bytes).unwrap_err();
+        assert!(matches!(err, TsinkError::DataCorruption(_)));
+    }
 }

@@ -162,12 +162,40 @@ impl ChunkStorage {
         options: ChunkStorageOptions,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
     ) -> Result<Self> {
+        Self::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+            chunk_point_cap,
+            wal,
+            numeric_lane_path,
+            blob_lane_path,
+            next_segment_id,
+            options,
+            local_disk_budget,
+            crate::QueryBudgetLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_data_path_and_options_and_disk_budget_and_query_budget(
+        chunk_point_cap: usize,
+        wal: Option<FramedWal>,
+        numeric_lane_path: Option<PathBuf>,
+        blob_lane_path: Option<PathBuf>,
+        next_segment_id: u64,
+        options: ChunkStorageOptions,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        query_budget_limits: crate::QueryBudgetLimits,
+    ) -> Result<Self> {
+        query_budget_limits
+            .validate()
+            .map_err(crate::QueryBudgetError::from)?;
         let resources = Self::prepare_construction_resources(
             chunk_point_cap,
             numeric_lane_path.as_ref(),
             blob_lane_path.as_ref(),
             next_segment_id,
             local_disk_budget.clone(),
+            options.maintenance_max_items_per_pass,
+            options.maintenance_max_bytes_per_pass,
         )?;
         let storage_state = StorageStateAssembly::build(
             chunk_point_cap,
@@ -175,9 +203,10 @@ impl ChunkStorage {
             blob_lane_path,
             wal,
             &options,
+            query_budget_limits,
             local_disk_budget,
             resources,
-        );
+        )?;
         let StorageStateAssembly {
             catalog,
             chunks,
@@ -188,6 +217,7 @@ impl ChunkStorage {
             coordination,
             background,
             rollups,
+            query_budget,
             observability,
         } = storage_state;
 
@@ -201,6 +231,11 @@ impl ChunkStorage {
             coordination,
             background,
             rollups,
+            query_budget,
+            resource_configuration: RwLock::new(ResourceConfigurationSnapshot {
+                schema_version: crate::RESOURCE_CONFIGURATION_SCHEMA_VERSION,
+                ..ResourceConfigurationSnapshot::default()
+            }),
             observability,
             #[cfg(test)]
             current_time_override: AtomicI64::new(

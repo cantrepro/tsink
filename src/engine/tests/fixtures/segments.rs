@@ -27,6 +27,7 @@ pub(in crate::engine::storage_engine::tests) fn make_persisted_numeric_chunk(
         },
         points: chunk_points,
         encoded_payload: encoded.payload,
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     }
 }

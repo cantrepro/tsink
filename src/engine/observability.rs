@@ -14,6 +14,7 @@ struct WalRuntimeSnapshot {
     enabled: bool,
     sync_mode: &'static str,
     acknowledged_writes_durable: bool,
+    write_buffer_capacity_bytes: u64,
     size_bytes: u64,
     segment_count: u64,
     active_segment: u64,
@@ -33,6 +34,8 @@ impl WalRuntimeSnapshot {
                     enabled: true,
                     sync_mode: wal.sync_mode().as_str(),
                     acknowledged_writes_durable: wal.sync_mode().acknowledged_writes_are_durable(),
+                    write_buffer_capacity_bytes: u64::try_from(wal.write_buffer_capacity_bytes())
+                        .unwrap_or(u64::MAX),
                     size_bytes: wal.total_size_bytes().unwrap_or(0),
                     segment_count: wal.segment_count().unwrap_or(0),
                     active_segment: wal.active_segment(),
@@ -46,6 +49,7 @@ impl WalRuntimeSnapshot {
                 enabled: false,
                 sync_mode: "disabled",
                 acknowledged_writes_durable: false,
+                write_buffer_capacity_bytes: 0,
                 size_bytes: 0,
                 segment_count: 0,
                 active_segment: 0,
@@ -78,6 +82,7 @@ impl From<WalSnapshotView<'_>> for WalObservabilitySnapshot {
             enabled: value.runtime.enabled,
             sync_mode: value.runtime.sync_mode.to_string(),
             acknowledged_writes_durable: value.runtime.acknowledged_writes_durable,
+            write_buffer_capacity_bytes: value.runtime.write_buffer_capacity_bytes,
             size_bytes: value.runtime.size_bytes,
             segment_count: value.runtime.segment_count,
             active_segment: value.runtime.active_segment,
@@ -162,6 +167,18 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
                 .load(Ordering::Relaxed),
             active_flush_runs_total: counters.active_flush_runs_total.load(Ordering::Relaxed),
             active_flush_errors_total: counters.active_flush_errors_total.load(Ordering::Relaxed),
+            active_flush_inspected_series_total: counters
+                .active_flush_inspected_series_total
+                .load(Ordering::Relaxed),
+            active_flush_selected_input_bytes_total: counters
+                .active_flush_selected_input_bytes_total
+                .load(Ordering::Relaxed),
+            active_flush_item_limit_hits_total: counters
+                .active_flush_item_limit_hits_total
+                .load(Ordering::Relaxed),
+            active_flush_byte_limit_skips_total: counters
+                .active_flush_byte_limit_skips_total
+                .load(Ordering::Relaxed),
             active_flushed_series_total: counters
                 .active_flushed_series_total
                 .load(Ordering::Relaxed),
@@ -175,6 +192,18 @@ impl From<&FlushObservabilityCounters> for FlushObservabilitySnapshot {
             persist_success_total: counters.persist_success_total.load(Ordering::Relaxed),
             persist_noop_total: counters.persist_noop_total.load(Ordering::Relaxed),
             persist_errors_total: counters.persist_errors_total.load(Ordering::Relaxed),
+            persist_inspected_chunks_total: counters
+                .persist_inspected_chunks_total
+                .load(Ordering::Relaxed),
+            persist_selected_input_bytes_total: counters
+                .persist_selected_input_bytes_total
+                .load(Ordering::Relaxed),
+            persist_item_limit_hits_total: counters
+                .persist_item_limit_hits_total
+                .load(Ordering::Relaxed),
+            persist_byte_limit_hits_total: counters
+                .persist_byte_limit_hits_total
+                .load(Ordering::Relaxed),
             persisted_series_total: counters.persisted_series_total.load(Ordering::Relaxed),
             persisted_chunks_total: counters.persisted_chunks_total.load(Ordering::Relaxed),
             persisted_points_total: counters.persisted_points_total.load(Ordering::Relaxed),
@@ -208,6 +237,24 @@ impl From<&CompactionObservabilityCounters> for CompactionObservabilitySnapshot 
             output_chunks_total: counters.output_chunks_total.load(Ordering::Relaxed),
             source_points_total: counters.source_points_total.load(Ordering::Relaxed),
             output_points_total: counters.output_points_total.load(Ordering::Relaxed),
+            planning_directory_entries_inspected_total: counters
+                .planning_directory_entries_inspected_total
+                .load(Ordering::Relaxed),
+            planning_manifests_inspected_total: counters
+                .planning_manifests_inspected_total
+                .load(Ordering::Relaxed),
+            planning_candidates_observed_total: counters
+                .planning_candidates_observed_total
+                .load(Ordering::Relaxed),
+            planning_source_bytes_total: counters
+                .planning_source_bytes_total
+                .load(Ordering::Relaxed),
+            planning_backlog_observed_total: counters
+                .planning_backlog_observed_total
+                .load(Ordering::Relaxed),
+            planning_budget_exhaustions_total: counters
+                .planning_budget_exhaustions_total
+                .load(Ordering::Relaxed),
             duration_nanos_total: counters.duration_nanos_total.load(Ordering::Relaxed),
         }
     }
@@ -309,6 +356,9 @@ impl From<&RollupObservabilityCounters> for RollupObservabilitySnapshot {
             buckets_materialized_total: counters.buckets_materialized_total.load(Ordering::Relaxed),
             points_materialized_total: counters.points_materialized_total.load(Ordering::Relaxed),
             last_run_duration_nanos: counters.last_run_duration_nanos.load(Ordering::Relaxed),
+            source_traversal_complete: false,
+            continuation_policy_id: None,
+            continuation_after_series_id: None,
             policies: Vec::new(),
         }
     }
@@ -357,14 +407,30 @@ impl ChunkStorage {
                 .load(Ordering::Relaxed);
             (ts > 0).then_some(ts)
         };
+        let creation_rate = self
+            .catalog
+            .series_creation_rate_limiter
+            .snapshot(self.current_timestamp_units());
         StorageObservabilitySnapshot {
             limits: self.effective_storage_limits(),
+            resource_configuration: self.resource_configuration_snapshot(),
             local_disk: self
                 .persisted
                 .local_disk_budget
                 .as_ref()
                 .map(|budget| budget.snapshot()),
             memory: self.memory_observability_snapshot(),
+            cardinality: CardinalityObservabilitySnapshot {
+                series_count: u64::try_from(self.catalog.registry.read().series_count())
+                    .unwrap_or(u64::MAX),
+                pending_new_series: u64::try_from(creation_rate.pending).unwrap_or(u64::MAX),
+                committed_in_window: u64::try_from(creation_rate.committed_in_window)
+                    .unwrap_or(u64::MAX),
+                current_window_start: creation_rate.window_start,
+                admitted_new_series_total: creation_rate.admitted_total,
+                committed_new_series_total: creation_rate.committed_total,
+                creation_rate_rejections_total: creation_rate.rejections_total,
+            },
             wal: WalObservabilitySnapshot::from(WalSnapshotView {
                 counters: &self.observability.wal,
                 runtime: WalRuntimeSnapshot::from_wal(self.persisted.wal.as_ref()),
@@ -378,6 +444,7 @@ impl ChunkStorage {
             flush: FlushObservabilitySnapshot::from(&self.observability.flush),
             compaction: CompactionObservabilitySnapshot::from(&self.observability.compaction),
             query: QueryObservabilitySnapshot::from(&self.observability.query),
+            query_budget: self.query_budget.snapshot(),
             rollups: self.rollup_observability_snapshot(),
             remote: RemoteStorageObservabilitySnapshot {
                 enabled: self.persisted.tiered_storage.is_some(),
@@ -418,6 +485,7 @@ impl ChunkStorage {
                     .is_some_and(|retry_at| retry_at > now_unix_ms),
                 last_refresh_error: self.observability.remote.last_refresh_error.read().clone(),
             },
+            background: self.background.observability_snapshot(),
             health: StorageHealthSnapshot {
                 background_errors_total: self
                     .observability

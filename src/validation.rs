@@ -17,6 +17,13 @@ pub(crate) fn validate_metric(metric: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_labels(labels: &[Label]) -> Result<()> {
+    if labels.len() > crate::label::MAX_SUPPORTED_LABELS_PER_SERIES {
+        return Err(TsinkError::InvalidLabel(format!(
+            "series has {} labels, exceeding the storage-format limit {}",
+            labels.len(),
+            crate::label::MAX_SUPPORTED_LABELS_PER_SERIES
+        )));
+    }
     let mut seen_names = HashSet::with_capacity(labels.len());
     for label in labels {
         if !seen_names.insert(label.name.as_str()) {
@@ -41,6 +48,34 @@ pub(crate) fn validate_labels(labels: &[Label]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_series_identity(
+    metric: &str,
+    labels: &[Label],
+    max_labels_per_series: usize,
+    max_identity_bytes: usize,
+) -> Result<()> {
+    validate_metric(metric)?;
+    if labels.len() > max_labels_per_series {
+        return Err(TsinkError::InvalidLabel(format!(
+            "series has {} labels, exceeding the configured limit {max_labels_per_series}",
+            labels.len()
+        )));
+    }
+
+    let identity_bytes = labels.iter().fold(metric.len(), |bytes, label| {
+        bytes
+            .saturating_add(label.name.len())
+            .saturating_add(label.value.len())
+    });
+    if identity_bytes > max_identity_bytes {
+        return Err(TsinkError::InvalidLabel(format!(
+            "series identity is {identity_bytes} bytes, exceeding the configured limit {max_identity_bytes}"
+        )));
+    }
+
+    validate_labels(labels)
 }
 
 pub(crate) fn canonicalize_labels(labels: &[Label]) -> Result<Vec<Label>> {

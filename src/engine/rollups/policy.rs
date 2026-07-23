@@ -1,4 +1,6 @@
-use super::runtime::pending_delete_blocks_rollup_candidate;
+use super::runtime::{
+    ensure_rollup_policies_within_limits, pending_delete_blocks_rollup_candidate,
+};
 use super::*;
 
 pub(super) fn normalize_policy(mut policy: RollupPolicy) -> Result<RollupPolicy> {
@@ -36,8 +38,32 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
     let Some(path) = path else {
         return Ok(Vec::new());
     };
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+                || !metadata.file_type().is_file()
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "rollup policies path is link-like or not a regular file: {}",
+                    path.display()
+                )));
+            }
+            if metadata.len() > ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64 {
+                return Err(TsinkError::DataCorruption(format!(
+                    "rollup policies file size {} exceeds the bounded decode limit {ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES}",
+                    metadata.len()
+                )));
+            }
+            let mut file = fs::File::open(path)?;
+            crate::engine::binio::read_to_end_bounded(
+                &mut file,
+                ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES,
+                usize::try_from(metadata.len())
+                    .unwrap_or(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES)
+                    .min(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES),
+                "rollup policies snapshot",
+            )?
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
             return Err(TsinkError::IoWithPath {
@@ -54,6 +80,7 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
             path.display()
         )));
     }
+    ensure_rollup_policies_within_limits(&file.policies)?;
 
     file.policies
         .into_iter()
@@ -62,30 +89,13 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
 }
 
 pub(super) fn encode_rollup_policies(policies: &[RollupPolicy]) -> Result<Vec<u8>> {
+    ensure_rollup_policies_within_limits(policies)?;
     let payload = PersistedRollupPoliciesFile {
         magic: ROLLUP_POLICIES_MAGIC.to_string(),
         version: ROLLUP_SCHEMA_VERSION,
         policies: policies.to_vec(),
     };
     Ok(serde_json::to_vec_pretty(&payload)?)
-}
-
-pub(super) fn persist_encoded_rollup_policies_budgeted(
-    path: &Path,
-    encoded: &[u8],
-    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-    reservation_kind: crate::DiskReservationKind,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_file_atomically_and_sync_parent_budgeted(
-        path,
-        encoded,
-        local_disk_budget,
-        crate::DiskCategory::Rollups,
-        reservation_kind,
-    )
 }
 
 impl RollupQuerySelectionContext<'_> {
@@ -170,9 +180,11 @@ impl RollupQuerySelectionContext<'_> {
             .fetch_add(saturating_u64_from_usize(points_read), Ordering::Relaxed);
     }
 
-    fn rollup_observability_snapshot(self) -> RollupObservabilitySnapshot {
+    fn rollup_observability_snapshot(
+        self,
+        progress: RollupTraversalProgress,
+    ) -> RollupObservabilitySnapshot {
         let policies = self.store.policies_snapshot();
-        let checkpoints = self.store.checkpoints_snapshot();
         let policy_stats = self.store.policy_stats_snapshot();
         let max_observed = self
             .source_reads
@@ -182,38 +194,21 @@ impl RollupQuerySelectionContext<'_> {
         let policies = policies
             .into_iter()
             .map(|policy| {
-                let matched_sources = self
-                    .source_reads
-                    .matching_rollup_sources_best_effort(&policy);
-                let mut min_through = None::<i64>;
-                let mut materialized_series = 0u64;
-                if let Some(entries) = checkpoints.get(&policy.id) {
-                    for source in &matched_sources {
-                        if let Some(materialized_through) = entries.get(&source.source_key).copied()
-                        {
-                            materialized_series = materialized_series.saturating_add(1);
-                            min_through = Some(
-                                min_through
-                                    .map(|current| current.min(materialized_through))
-                                    .unwrap_or(materialized_through),
-                            );
-                        }
-                    }
-                }
                 let runtime = policy_stats.get(&policy.id).cloned().unwrap_or_default();
+                let materialized_through = runtime
+                    .source_traversal_complete
+                    .then_some(runtime.materialized_through)
+                    .flatten();
 
                 RollupPolicyStatus {
                     policy,
-                    matched_series: u64::try_from(matched_sources.len()).unwrap_or(u64::MAX),
-                    materialized_series,
-                    materialized_through: runtime.materialized_through.or(min_through),
-                    lag: runtime
-                        .materialized_through
-                        .or(min_through)
-                        .and_then(|through| {
-                            (max_observed != i64::MIN)
-                                .then_some(max_observed.saturating_sub(through))
-                        }),
+                    matched_series: runtime.matched_series,
+                    materialized_series: runtime.materialized_series,
+                    materialized_through,
+                    lag: materialized_through.and_then(|through| {
+                        (max_observed != i64::MIN).then_some(max_observed.saturating_sub(through))
+                    }),
+                    source_traversal_complete: runtime.source_traversal_complete,
                     last_run_started_at_ms: runtime.last_run_started_at_ms,
                     last_run_completed_at_ms: runtime.last_run_completed_at_ms,
                     last_run_duration_nanos: runtime.last_run_duration_nanos,
@@ -251,6 +246,9 @@ impl RollupQuerySelectionContext<'_> {
                 .rollup_observability
                 .last_run_duration_nanos
                 .load(Ordering::Relaxed),
+            source_traversal_complete: progress.complete,
+            continuation_policy_id: progress.continuation_policy_id,
+            continuation_after_series_id: progress.continuation_after_series_id,
             policies,
         }
     }
@@ -268,6 +266,7 @@ impl ChunkStorage {
                 "rollup policies require persistent storage (data_path)".to_string(),
             ));
         }
+        ensure_rollup_policies_within_limits(&policies)?;
 
         let mut normalized = Vec::with_capacity(policies.len());
         let mut ids = BTreeSet::new();
@@ -283,18 +282,43 @@ impl ChunkStorage {
         }
         normalized.sort_by(|left, right| left.id.cmp(&right.id));
 
+        let write_permits = self
+            .runtime
+            .write_limiter
+            .acquire_all(self.runtime.write_timeout)?;
+        let write_permit = write_permits
+            .first()
+            .expect("the write limiter always owns at least one permit");
+        self.ensure_open()?;
         let _run_guard = self.rollup_run_coordination_context().run_lock.lock();
-        let snapshot = state_store.next_snapshot_for_policies(normalized);
-        state_store.persist_snapshot(&snapshot)?;
+        let snapshot = state_store.next_snapshot_for_policies(normalized)?;
+        let persistence = state_store.persist_snapshot(&snapshot)?;
+        let cleanup_debt = persistence.into_cleanup_debt();
         state_store.install_snapshot(snapshot);
-        if let Err(err) = self.run_rollup_pipeline_once_locked() {
-            // The policy/state snapshot is already durable and visible. Returning Err here would
-            // tell callers the apply was rejected even though retrying or reopening observes the
-            // new policy set. Keep the committed result authoritative and expose initial
-            // materialization degradation through per-policy status instead.
-            state_store.record_rollup_pipeline_error(&err);
+        let progress = match self.run_rollup_pipeline_once_locked(write_permit) {
+            Ok(progress) => progress,
+            Err(err) => {
+                // The policy/state snapshot is already durable and visible. Returning Err here
+                // would tell callers the apply was rejected even though retrying or reopening
+                // observes the new policy set. Keep the committed result authoritative and expose
+                // initial materialization degradation through per-policy status instead.
+                state_store.record_rollup_pipeline_error(&err);
+                self.rollup_traversal_progress()
+            }
+        };
+        if let Some(error) = cleanup_debt {
+            tracing::warn!(
+                error = %error,
+                "committed rollup policy update left conservatively-accounted postcommit cleanup debt"
+            );
+            state_store.record_rollup_pipeline_error(&TsinkError::Other(format!(
+                "postcommit rollup snapshot cleanup debt: {error}"
+            )));
         }
-        Ok(self.rollup_observability_snapshot())
+        drop(_run_guard);
+        drop(write_permits);
+        self.enforce_post_commit_memory_budget_best_effort();
+        Ok(self.rollup_observability_snapshot_with_progress(progress))
     }
 
     pub(in crate::engine) fn rollup_query_candidate(
@@ -316,8 +340,15 @@ impl ChunkStorage {
     }
 
     pub(in crate::engine) fn rollup_observability_snapshot(&self) -> RollupObservabilitySnapshot {
+        self.rollup_observability_snapshot_with_progress(self.rollup_traversal_progress())
+    }
+
+    pub(in crate::engine) fn rollup_observability_snapshot_with_progress(
+        &self,
+        progress: RollupTraversalProgress,
+    ) -> RollupObservabilitySnapshot {
         self.rollup_query_selection_context()
-            .rollup_observability_snapshot()
+            .rollup_observability_snapshot(progress)
     }
 
     #[cfg(test)]

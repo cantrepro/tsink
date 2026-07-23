@@ -1,6 +1,12 @@
 use super::replay::WalReplayContext;
 use super::*;
 
+// `BTreeMap` does not expose allocation capacity. Model one root allocation plus portable
+// per-entry bookkeeping so the retained cache remains a conservative, inspectable budget
+// component without depending on the standard library's private node layout.
+const WAL_CACHE_BTREE_ROOT_ALLOWANCE_BYTES: usize = 2 * 1024;
+const WAL_CACHE_BTREE_BOOKKEEPING_WORDS_PER_ENTRY: usize = 4;
+
 #[derive(Debug, Clone)]
 pub(super) enum CachedSeriesDefinitionFrame {
     SeriesDefinition(SeriesDefinitionFrame),
@@ -17,6 +23,78 @@ pub(super) struct CachedSeriesDefinitionIndex {
 }
 
 impl CachedSeriesDefinitionIndex {
+    fn definition_heap_bytes(definition: &SeriesDefinitionFrame) -> usize {
+        definition
+            .metric
+            .capacity()
+            .saturating_add(
+                definition
+                    .labels
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Label>()),
+            )
+            .saturating_add(definition.labels.iter().fold(0usize, |bytes, label| {
+                bytes
+                    .saturating_add(label.name.capacity())
+                    .saturating_add(label.value.capacity())
+            }))
+    }
+
+    fn definition_map_memory_usage_bytes(
+        definitions: &BTreeMap<SeriesId, SeriesDefinitionFrame>,
+    ) -> usize {
+        if definitions.is_empty() {
+            return 0;
+        }
+
+        let entry_bytes = std::mem::size_of::<(SeriesId, SeriesDefinitionFrame)>().saturating_add(
+            WAL_CACHE_BTREE_BOOKKEEPING_WORDS_PER_ENTRY
+                .saturating_mul(std::mem::size_of::<usize>()),
+        );
+        WAL_CACHE_BTREE_ROOT_ALLOWANCE_BYTES.saturating_add(definitions.values().fold(
+            0usize,
+            |bytes, definition| {
+                bytes
+                    .saturating_add(entry_bytes)
+                    .saturating_add(Self::definition_heap_bytes(definition))
+            },
+        ))
+    }
+
+    fn series_id_set_memory_usage_bytes(series_ids: &BTreeSet<SeriesId>) -> usize {
+        if series_ids.is_empty() {
+            return 0;
+        }
+
+        let entry_bytes = std::mem::size_of::<SeriesId>().saturating_add(
+            WAL_CACHE_BTREE_BOOKKEEPING_WORDS_PER_ENTRY
+                .saturating_mul(std::mem::size_of::<usize>()),
+        );
+        WAL_CACHE_BTREE_ROOT_ALLOWANCE_BYTES
+            .saturating_add(series_ids.len().saturating_mul(entry_bytes))
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        let buffered_bytes = self
+            .buffered_frames
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CachedSeriesDefinitionFrame>())
+            .saturating_add(self.buffered_frames.iter().fold(0usize, |bytes, frame| {
+                bytes.saturating_add(match frame {
+                    CachedSeriesDefinitionFrame::SeriesDefinition(definition) => {
+                        Self::definition_heap_bytes(definition)
+                    }
+                    CachedSeriesDefinitionFrame::Samples(series_ids) => {
+                        Self::series_id_set_memory_usage_bytes(series_ids)
+                    }
+                })
+            }));
+
+        Self::definition_map_memory_usage_bytes(&self.committed)
+            .saturating_add(Self::definition_map_memory_usage_bytes(&self.pending))
+            .saturating_add(buffered_bytes)
+    }
+
     pub(super) fn overlay_uninitialized_pending_from(&mut self, other: &Self) {
         for definition in other.pending.values() {
             self.pending
@@ -80,6 +158,12 @@ impl CachedSeriesDefinitionIndex {
 }
 
 impl FramedWal {
+    pub(crate) fn cached_series_definition_index_memory_usage_bytes(&self) -> usize {
+        self.cached_series_definition_index
+            .lock()
+            .memory_usage_bytes()
+    }
+
     pub(crate) fn committed_series_definitions_snapshot(
         &self,
     ) -> Result<Vec<SeriesDefinitionFrame>> {
@@ -165,9 +249,9 @@ impl FramedWal {
 
     pub(super) fn clear_cached_series_definition_index_if_initialized(&self) {
         let mut index = self.cached_series_definition_index.lock();
-        if index.initialized || index.building {
-            index.clear_for_reset();
-        }
+        // An uninitialized index can still retain pending definitions appended before its first
+        // snapshot. Reset invalidates those definitions too and must release their memory.
+        index.clear_for_reset();
     }
 
     pub(crate) fn prime_committed_series_definitions_snapshot<I>(&self, definitions: I)
@@ -179,15 +263,31 @@ impl FramedWal {
         self.cached_series_definition_index_ready.notify_all();
     }
 
-    pub(crate) fn record_committed_series_definitions_if_initialized<I>(&self, definitions: I)
+    pub(in crate::engine) fn record_replayed_series_definition_if_initialized(
+        &self,
+        definition: SeriesDefinitionFrame,
+    ) {
+        self.apply_cached_series_definition_frame_if_initialized(
+            CachedSeriesDefinitionFrame::SeriesDefinition(definition),
+        );
+    }
+
+    pub(in crate::engine) fn record_replayed_samples_if_initialized<I>(&self, series_ids: I)
     where
-        I: IntoIterator<Item = SeriesDefinitionFrame>,
+        I: IntoIterator<Item = SeriesId>,
     {
         let mut index = self.cached_series_definition_index.lock();
         if !index.initialized {
             return;
         }
-        index.extend_committed(definitions);
+        for series_id in series_ids {
+            if let Some(definition) = index.pending.remove(&series_id) {
+                index.committed.insert(series_id, definition);
+            }
+        }
+        // A samples frame closes the preceding logical write. Definitions not referenced by
+        // that frame were never committed and must not leak into a later write.
+        index.pending.clear();
     }
 
     pub(in crate::engine) fn set_configured_replay_mode(&self, replay_mode: WalReplayMode) {

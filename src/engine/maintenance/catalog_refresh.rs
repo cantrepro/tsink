@@ -2,10 +2,12 @@ use super::super::tiering::{self, PersistedSegmentTier, SegmentInventory, Segmen
 use super::super::{ChunkStorage, HashSet, PathBuf, Result, StorageRuntimeMode};
 use super::*;
 
+mod bounded_scan;
 mod context;
 mod pipeline;
 mod publication;
 
+pub(in crate::engine::storage_engine) use self::bounded_scan::BackgroundCatalogRefreshCursor;
 use self::context::CatalogRefreshContext;
 
 impl ChunkStorage {
@@ -52,9 +54,13 @@ impl ChunkStorage {
             removed_roots: Vec::new(),
             publication: PersistedCatalogPublication::Inventory {
                 inventory: inventory.clone(),
-                tombstones: None,
+                refresh_tombstones: false,
             },
-            registry_catalog_sources: Some(registry_catalog::inventory_sources(&inventory)),
+            registry_catalog_update: Some(
+                registry_catalog::PersistedRegistryCatalogUpdate::Complete(
+                    registry_catalog::inventory_sources(&inventory),
+                ),
+            ),
         };
         let publication = self.begin_persisted_catalog_publication();
         match publication.publish_transition(transition)? {
@@ -118,6 +124,9 @@ impl ChunkStorage {
 
     pub(in super::super) fn apply_known_dirty_persisted_refresh_if_pending(&self) -> Result<bool> {
         let ctx = self.catalog_refresh_context();
+        if ctx.has_known_persisted_segment_changes() {
+            self.reset_bounded_unknown_dirty_catalog_refresh();
+        }
         let Some(planned) = self.plan_known_dirty_catalog_refresh()? else {
             return Ok(false);
         };
@@ -148,10 +157,34 @@ impl ChunkStorage {
         }
 
         let _compaction_guard = self.compaction_gate();
+        if let Some(data_path) = self
+            .persisted
+            .series_index_path
+            .as_deref()
+            .and_then(Path::parent)
+        {
+            super::ensure_no_pending_post_flush_replacement(data_path)?;
+        }
         if self.apply_known_dirty_persisted_refresh_if_pending()? {
             return Ok(());
         }
 
+        let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
+            || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
+        if finite_maintenance
+            && self.persisted.tiered_storage.is_none()
+            && self.coordination.lifecycle.load(Ordering::Acquire) == STORAGE_OPEN
+        {
+            if self.refresh_unknown_dirty_catalog_bounded()? {
+                let ctx = self.catalog_refresh_context();
+                ctx.set_persisted_index_dirty(ctx.has_known_persisted_segment_changes());
+            }
+            return Ok(());
+        }
+
+        // ExpertUnlimited preserves the explicit complete-snapshot behavior. Tiered mode also
+        // remains here because its local/shared segment catalogs are still monolithic.
+        self.reset_bounded_unknown_dirty_catalog_refresh();
         let loaded = self.load_scanned_catalog_refresh()?;
         let planned = self
             .catalog_refresh_context()

@@ -43,9 +43,17 @@ fn chunk_storage_at_time(now: i64, retention_window: i64) -> ChunkStorage {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -343,9 +351,17 @@ fn retention_sweep_reload_failure_keeps_existing_persisted_data_visible() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -515,6 +531,405 @@ fn retention_sweeper_rewrites_mixed_age_segments_and_persists_pruned_state_acros
 }
 
 #[test]
+fn flush_reclaims_fully_expired_segments_before_mixed_age_rewrite() {
+    const DISK_LIMIT: u64 = 16 * 1024 * 1024;
+    const CLEANUP_HEADROOM: u64 = 16 * 1024;
+
+    fn noisy_value(index: u64) -> f64 {
+        let mixed = index
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        f64::from_bits(0x3ff0_0000_0000_0000 | (mixed & 0x000f_ffff_ffff_ffff))
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let local_disk_budget = crate::LocalDiskBudget::open(
+        data_path,
+        crate::LocalDiskLimits {
+            max_bytes: Some(DISK_LIMIT),
+            filesystem_free_headroom_bytes: 0,
+            maintenance_temp_reserve_bytes: 0,
+        },
+    )
+    .unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+        u16::MAX as usize,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_window: 50_000,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
+            max_future_skew_window: None,
+            retention_enforced: true,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 2,
+            write_timeout: Duration::from_secs(1),
+            memory_budget_bytes: u64::MAX,
+            cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            current_time_override: Some(50_000),
+        },
+        Some(Arc::clone(&local_disk_budget)),
+    )
+    .unwrap();
+
+    let expired_rows = (1_i64..=50_000)
+        .map(|timestamp| {
+            Row::new(
+                "retention_capacity_reclaim",
+                DataPoint::new(timestamp, noisy_value(timestamp as u64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&expired_rows).unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+    let expired_segment_bytes = crate::disk_budget::measured_path_bytes(&lane_path).unwrap();
+
+    storage.set_current_time_override(160_000);
+    let mixed_age_rows = (140_001_i64..=160_000)
+        .map(|timestamp| {
+            Row::new(
+                "retention_capacity_reclaim",
+                DataPoint::new(timestamp, noisy_value(timestamp as u64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&mixed_age_rows).unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+    storage.set_current_time_override(200_000);
+    let fresh_rows = (180_001_i64..=190_000)
+        .map(|timestamp| {
+            Row::new(
+                "retention_capacity_reclaim",
+                DataPoint::new(timestamp, noisy_value(timestamp as u64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&fresh_rows).unwrap();
+    storage.flush_all_active().unwrap();
+
+    let accounted = local_disk_budget.reconcile().unwrap().accounted_bytes;
+    assert!(
+        accounted.saturating_add(CLEANUP_HEADROOM) < DISK_LIMIT,
+        "test fixture must leave room for a controlled external pressure file"
+    );
+    let pressure_path = data_path.join("external-pressure.bin");
+    let pressure_file = std::fs::File::create(&pressure_path).unwrap();
+    pressure_file
+        .set_len(DISK_LIMIT - accounted - CLEANUP_HEADROOM)
+        .unwrap();
+    pressure_file.sync_all().unwrap();
+    drop(pressure_file);
+    let pressured = local_disk_budget.reconcile().unwrap();
+    assert_eq!(DISK_LIMIT - pressured.accounted_bytes, CLEANUP_HEADROOM);
+    assert!(
+        expired_segment_bytes > CLEANUP_HEADROOM,
+        "expired fixture must reclaim materially more than cleanup metadata needs"
+    );
+
+    let rejections_before = pressured.rejections_total;
+    let outcome = storage.persist_segment_with_outcome().unwrap();
+    assert!(outcome.persisted);
+
+    let after = local_disk_budget.snapshot();
+    assert!(after.rejections_total > rejections_before);
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert!(
+        pressure_path.exists(),
+        "external files must never be reclaimed"
+    );
+    assert!(
+        storage
+            .observability_snapshot()
+            .flush
+            .expired_segments_total
+            >= 1
+    );
+    let persisted = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(persisted.len(), 2);
+    let mut persisted_ranges = persisted
+        .iter()
+        .map(|segment| (segment.manifest.min_ts, segment.manifest.max_ts))
+        .collect::<Vec<_>>();
+    persisted_ranges.sort_unstable();
+    assert_eq!(
+        persisted_ranges,
+        vec![
+            (Some(140_001), Some(160_000)),
+            (Some(180_001), Some(190_000))
+        ]
+    );
+
+    storage.set_current_time_override(210_000);
+    let later_rows = (200_001_i64..=209_000)
+        .map(|timestamp| {
+            Row::new(
+                "retention_capacity_reclaim",
+                DataPoint::new(timestamp, noisy_value(timestamp as u64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&later_rows).unwrap();
+    storage.flush_all_active().unwrap();
+
+    let before_second_pressure = local_disk_budget.reconcile().unwrap();
+    let target_accounted = DISK_LIMIT - CLEANUP_HEADROOM;
+    assert!(before_second_pressure.accounted_bytes < target_accounted);
+    let pressure_len = std::fs::metadata(&pressure_path).unwrap().len();
+    let pressure_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pressure_path)
+        .unwrap();
+    pressure_file
+        .set_len(pressure_len + target_accounted - before_second_pressure.accounted_bytes)
+        .unwrap();
+    pressure_file.sync_all().unwrap();
+    drop(pressure_file);
+    let second_pressure = local_disk_budget.reconcile().unwrap();
+    assert_eq!(second_pressure.accounted_bytes, target_accounted);
+
+    let error = storage.persist_segment_with_outcome().unwrap_err();
+    assert!(matches!(
+        error,
+        TsinkError::InsufficientCompactionHeadroom { .. }
+    ));
+    let after_failed_retry = local_disk_budget.snapshot();
+    assert_eq!(
+        after_failed_retry.rejections_total,
+        second_pressure.rejections_total + 1,
+        "a mixed-age rewrite must not replace the original typed flush rejection"
+    );
+    assert_eq!(after_failed_retry.active_reservations, 0);
+    assert_eq!(after_failed_retry.reserved_bytes, 0);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 2);
+
+    std::fs::remove_file(pressure_path).unwrap();
+    local_disk_budget.reconcile().unwrap();
+    storage.close().unwrap();
+    drop(storage);
+    drop(local_disk_budget);
+
+    let recovered_segments = load_segment_indexes(&lane_path).unwrap().indexed_segments;
+    assert!(recovered_segments.iter().all(|segment| {
+        segment.manifest.min_ts != Some(1) && segment.manifest.max_ts != Some(50_000)
+    }));
+
+    let reopened = builder_at_time(210_000)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
+        .with_data_path(data_path)
+        .with_retention(Duration::from_secs(50_000))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(u16::MAX as usize)
+        .with_wal_enabled(false)
+        .with_local_disk_limit(DISK_LIMIT)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let recovered = reopened
+        .select("retention_capacity_reclaim", &[], 0, 210_001)
+        .unwrap();
+    assert_eq!(recovered.len(), 19_001);
+    assert_eq!(
+        recovered.first().map(|point| point.timestamp),
+        Some(160_000)
+    );
+    assert_eq!(recovered.last().map(|point| point.timestamp), Some(209_000));
+    reopened.close().unwrap();
+}
+
+#[test]
+fn wal_admission_reclaims_fully_expired_segments_before_rejecting_write() {
+    const DISK_LIMIT: u64 = 16 * 1024 * 1024;
+    // Fully-expired cleanup now publishes a durable replacement marker before retiring the
+    // segment. Leave room for its payload plus the marker-directory and marker-entry allowances.
+    const CLEANUP_HEADROOM: u64 = 16 * 1024;
+
+    fn noisy_value(index: u64) -> f64 {
+        let mixed = index
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        f64::from_bits(0x3ff0_0000_0000_0000 | (mixed & 0x000f_ffff_ffff_ffff))
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let local_disk_budget = crate::LocalDiskBudget::open(
+        data_path,
+        crate::LocalDiskLimits {
+            max_bytes: Some(DISK_LIMIT),
+            filesystem_free_headroom_bytes: 0,
+            maintenance_temp_reserve_bytes: 0,
+        },
+    )
+    .unwrap();
+    let wal = FramedWal::open_with_buffer_size_and_disk_budget(
+        data_path.join(WAL_DIR_NAME),
+        WalSyncMode::PerAppend,
+        4096,
+        Some(Arc::clone(&local_disk_budget)),
+    )
+    .unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+        u16::MAX as usize,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_window: 20_000,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
+            max_future_skew_window: None,
+            retention_enforced: true,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 2,
+            write_timeout: Duration::from_secs(1),
+            memory_budget_bytes: u64::MAX,
+            cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: None,
+            current_time_override: Some(20_000),
+        },
+        Some(Arc::clone(&local_disk_budget)),
+    )
+    .unwrap();
+
+    let expired_rows = (1_i64..=20_000)
+        .map(|timestamp| {
+            Row::new(
+                "wal_capacity_expired",
+                DataPoint::new(timestamp, noisy_value(timestamp as u64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&expired_rows).unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 1);
+
+    storage.set_current_time_override(50_000);
+    let accounted = local_disk_budget.reconcile().unwrap().accounted_bytes;
+    assert!(accounted.saturating_add(CLEANUP_HEADROOM) < DISK_LIMIT);
+    let pressure_path = data_path.join("external-wal-pressure.bin");
+    let pressure_file = std::fs::File::create(&pressure_path).unwrap();
+    pressure_file
+        .set_len(DISK_LIMIT - accounted - CLEANUP_HEADROOM)
+        .unwrap();
+    pressure_file.sync_all().unwrap();
+    drop(pressure_file);
+    let pressured = local_disk_budget.reconcile().unwrap();
+    assert_eq!(DISK_LIMIT - pressured.accounted_bytes, CLEANUP_HEADROOM);
+
+    let fresh_rows = (0..512)
+        .map(|index| {
+            Row::with_labels(
+                "wal_capacity_fresh",
+                vec![Label::new(
+                    "series",
+                    format!("series-{index:04}-{}", "x".repeat(32)),
+                )],
+                DataPoint::new(50_000, noisy_value(index)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let rejections_before = pressured.rejections_total;
+    storage.insert_rows(&fresh_rows).unwrap();
+
+    let after = local_disk_budget.snapshot();
+    assert!(after.rejections_total > rejections_before);
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert!(
+        pressure_path.exists(),
+        "external files must not be reclaimed"
+    );
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert_eq!(
+        storage
+            .select_all("wal_capacity_fresh", 49_999, 50_001)
+            .unwrap()
+            .len(),
+        fresh_rows.len()
+    );
+
+    std::fs::remove_file(&pressure_path).unwrap();
+    local_disk_budget.reconcile().unwrap();
+    storage.close().unwrap();
+    drop(storage);
+    drop(local_disk_budget);
+
+    let reopened = builder_at_time(50_000)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
+        .with_data_path(data_path)
+        .with_retention(Duration::from_secs(20_000))
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(u16::MAX as usize)
+        .with_local_disk_limit(DISK_LIMIT)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    assert!(reopened
+        .select("wal_capacity_expired", &[], 0, 50_001)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        reopened
+            .select_all("wal_capacity_fresh", 49_999, 50_001)
+            .unwrap()
+            .len(),
+        fresh_rows.len()
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn retention_pruned_restart_does_not_reuse_tombstoned_series_ids() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path();
@@ -610,9 +1025,17 @@ fn retention_sweeper_uses_repaired_recency_after_deleting_anchor() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -791,9 +1214,17 @@ fn tiered_retention_uses_repaired_recency_after_deleting_anchor() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -811,6 +1242,7 @@ fn tiered_retention_uses_repaired_recency_after_deleting_anchor() {
         },
     )
     .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
     let now = current_unix_seconds();
     storage.set_current_time_override(now);
     let warm_candidate = now - 12;
@@ -1354,6 +1786,53 @@ fn tiered_retention_rejects_preexisting_corrupted_destination_and_keeps_source_s
     assert!(
         warm_root.exists(),
         "mismatched destination should remain visible"
+    );
+}
+
+#[test]
+fn tiered_move_rejects_extra_source_entries_before_creating_destination_state() {
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let lane_path = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("tiered_extra_source_metric", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    write_numeric_segment(
+        &lane_path,
+        &registry,
+        series_id,
+        2,
+        1,
+        &[(60, 60.0), (61, 61.0)],
+    );
+
+    let source_root = lane_path
+        .join("segments")
+        .join("L2")
+        .join("seg-0000000000000001");
+    std::fs::write(source_root.join("injected-extra"), b"must-not-copy").unwrap();
+    let destination_root = object_store_dir
+        .path()
+        .join("warm")
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments")
+        .join("L2")
+        .join("seg-0000000000000001");
+
+    let err = super::super::tiering::move_segment_to_tier(&source_root, &destination_root)
+        .expect_err("an extra source entry must fail the exact copy preflight");
+    let message = err.to_string();
+    assert!(
+        message.contains("5-entry global work bound") || message.contains("unexpected entry"),
+        "unexpected error: {message}"
+    );
+    assert!(!destination_root.exists());
+    assert!(!destination_root.parent().unwrap().exists());
+    assert_eq!(
+        std::fs::read(source_root.join("injected-extra")).unwrap(),
+        b"must-not-copy"
     );
 }
 

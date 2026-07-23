@@ -71,6 +71,27 @@ All metrics use the `tsink_` prefix. The sections below enumerate every metric g
 |---|---|---|
 | `tsink_uptime_seconds` | gauge | Server uptime in seconds |
 | `tsink_series_total` | gauge | Number of known metric series |
+| `tsink_series_creation_pending` | gauge | New-series reservations awaiting write publication |
+| `tsink_series_creation_committed_in_window` | gauge | New series committed in the current fixed creation-rate window |
+| `tsink_series_creation_window_initialized` | gauge | Whether a creation-rate window has been initialized |
+| `tsink_series_creation_window_start` | gauge | Start of the current window in configured storage timestamp units, or zero when uninitialized |
+| `tsink_series_creation_admitted_total` | counter | New-series reservations admitted since the storage instance opened |
+| `tsink_series_creation_committed_total` | counter | New series successfully published since the storage instance opened |
+| `tsink_series_creation_rejections_total` | counter | Fixed-window new-series admission rejections |
+
+### Background workers
+
+The `worker` label has exactly four values (`flush`, `compaction`, `persisted_refresh`, and
+`rollup`); the `event` and `state` label sets are also fixed in code.
+
+| Metric | Type | Description |
+|---|---|---|
+| `tsink_background_threads{state=...}` | gauge | Per-instance thread limit plus currently installed and running totals |
+| `tsink_background_worker_state{worker=...,state=...}` | gauge | Installed/running state, fixed max concurrency, and effective interval in nanoseconds |
+| `tsink_background_worker_events_total{worker=...,event=...}` | counter | Starts, exits, notifications, idle parks, passes started/completed, and shutdown joins |
+
+The persisted-refresh worker also serializes retention/tiering and remote catalog refresh. These
+metrics expose concurrency and cadence; they are not a CPU quota or a per-pass work-unit limit.
 
 ### Memory
 
@@ -85,6 +106,11 @@ All metrics use the `tsink_` prefix. The sections below enumerate every metric g
 | `tsink_memory_persisted_index_bytes` | gauge | Budget bytes used by persisted chunk refs and timestamp indexes |
 | `tsink_memory_persisted_mmap_bytes` | gauge | Budgeted virtual mapped file length; not resident bytes |
 | `tsink_memory_tombstone_bytes` | gauge | Budget bytes used by tombstone state |
+| `tsink_memory_wal_series_definition_cache_bytes` | gauge | Modeled budget bytes retained by the WAL series-definition cache |
+| `tsink_memory_write_transient_bytes` | gauge | Current modeled foreground-write and startup-replay scratch reservation |
+| `tsink_memory_write_transient_peak_bytes` | gauge | Peak concurrent modeled write/replay scratch reservation |
+| `tsink_memory_write_transient_reservations_total` | counter | Write/replay scratch leases admitted by the storage-memory budget |
+| `tsink_memory_write_transient_rejections_total` | counter | Write/replay scratch leases rejected by the storage-memory budget |
 | `tsink_memory_pressure_level{level=...}` | gauge | One-hot modeled-memory pressure state: normal, approaching, backpressured, rejecting, or degraded |
 | `tsink_memory_backpressured_writers` | gauge | Writers currently waiting on modeled storage memory |
 | `tsink_memory_backpressure_events_total` | counter | Writes that entered modeled storage-memory backpressure |
@@ -131,6 +157,10 @@ The flush pipeline moves active (in-memory) chunks into persisted segments and m
 | `tsink_flush_pipeline_duration_nanoseconds_total` | counter | Flush pipeline runtime |
 | `tsink_flush_active_runs_total` | counter | Active chunk flush runs |
 | `tsink_flush_active_errors_total` | counter | Active chunk flush errors |
+| `tsink_flush_active_inspected_series_total` | counter | Active series inspected by cursor-bounded background flush passes |
+| `tsink_flush_active_selected_input_bytes_total` | counter | Modeled active-head input bytes selected by bounded background flush passes |
+| `tsink_flush_active_item_limit_hits_total` | counter | Background flush passes that consumed their item allowance |
+| `tsink_flush_active_byte_limit_skips_total` | counter | Active heads skipped because they did not fit the pass byte allowance |
 | `tsink_flush_active_series_total` | counter | Active series flushed into sealed chunks |
 | `tsink_flush_active_chunks_total` | counter | Active chunks flushed |
 | `tsink_flush_active_points_total` | counter | Active points flushed |
@@ -138,6 +168,10 @@ The flush pipeline moves active (in-memory) chunks into persisted segments and m
 | `tsink_flush_persist_success_total` | counter | Successful persist runs |
 | `tsink_flush_persist_noop_total` | counter | Persist runs with no new chunks |
 | `tsink_flush_persist_errors_total` | counter | Persist errors |
+| `tsink_flush_persist_inspected_chunks_total` | counter | Sealed chunks inspected by bounded background persistence windows |
+| `tsink_flush_persist_selected_input_bytes_total` | counter | Modeled sealed-chunk input bytes selected by bounded background persistence windows |
+| `tsink_flush_persist_item_limit_hits_total` | counter | Bounded background persistence windows that exhausted their item allowance |
+| `tsink_flush_persist_byte_limit_hits_total` | counter | Bounded background persistence windows stopped by their byte allowance |
 | `tsink_flush_persisted_series_total` | counter | Series persisted |
 | `tsink_flush_persisted_chunks_total` | counter | Chunks persisted |
 | `tsink_flush_persisted_points_total` | counter | Points persisted |
@@ -216,6 +250,30 @@ The flush pipeline moves active (in-memory) chunks into persisted segments and m
 | `tsink_remote_storage_catalog_refresh_errors_total` | counter | Remote catalog refresh errors |
 | `tsink_remote_storage_catalog_refresh_consecutive_failures` | gauge | Consecutive catalog refresh failures |
 | `tsink_remote_storage_catalog_refresh_backoff_active` | gauge | `1` when retry backoff is active |
+
+### Offline restore disk
+
+When the dedicated offline restore root is configured, TSDB status exposes its independent
+snapshot as `data.offlineRestoreDisk`. Prometheus metrics deliberately contain no filesystem-path
+label:
+
+| Metric | Type | Description |
+|---|---|---|
+| `tsink_offline_restore_disk_accounted_bytes` | gauge | Reconciled logical bytes beneath the offline restore root |
+| `tsink_offline_restore_disk_reserved_bytes` | gauge | Bytes held by active restore or report reservations |
+| `tsink_offline_restore_disk_active_reservations` | gauge | Number of live reservations |
+| `tsink_offline_restore_disk_unknown_bytes` | gauge | Reconciled bytes not classified as tsink-owned state |
+| `tsink_offline_restore_disk_filesystem_available_bytes` | gauge | Best-effort bytes available to the server user |
+| `tsink_offline_restore_disk_filesystem_headroom_bytes` | gauge | Configured free-space floor |
+| `tsink_offline_restore_disk_limit_bytes` | gauge | Configured finite logical limit |
+| `tsink_offline_restore_disk_over_limit` | gauge | Whether reconciled use exceeds that logical limit |
+| `tsink_offline_restore_disk_rejections_total` | counter | Logical or physical admission rejections |
+| `tsink_offline_restore_disk_reconciliations_total` | counter | Successful exact root scans |
+| `tsink_offline_restore_disk_reservation_overruns_total` | counter | Reservations whose surviving growth exceeded their admitted peak; expected to remain zero |
+| `tsink_offline_restore_disk_category_bytes{category}` | gauge | Reconciled bytes by fixed disk category |
+
+The generic maintenance-reserved and maintenance-reserve gauges are also emitted for schema
+consistency; this offline coordinator configures the maintenance reserve to zero.
 
 ### Rollups
 
@@ -332,6 +390,28 @@ Write and read admission are tracked independently.
 | `tsink_read_admission_acquire_wait_nanoseconds_total` | counter | Wait time acquiring admission permits |
 | `tsink_read_admission_active_requests` | gauge | Active requests holding admission slots |
 
+#### Core query budget
+
+Public read admission is an HTTP/server guardrail. The core query budget is the storage-instance
+boundary beneath it and is also used by direct, async, PromQL, tenant-scoped, and distributed
+storage paths. Its labels are fixed in code; they do not contain query text, metric names, or tenant
+IDs.
+
+| Metric | Type | Description |
+|---|---|---|
+| `tsink_query_budget_active_queries` | gauge | Queries currently holding one core execution permit |
+| `tsink_query_budget_peak_active_queries` | gauge | Peak core permits held concurrently |
+| `tsink_query_budget_reserved_memory_bytes` | gauge | Modeled query memory currently reserved across live queries |
+| `tsink_query_budget_peak_reserved_memory_bytes` | gauge | Peak modeled query memory reserved across live queries |
+| `tsink_query_budget_queries_started_total` | counter | Core queries admitted since the storage instance opened |
+| `tsink_query_budget_queries_completed_total` | counter | Admitted core permits released on all exit paths |
+| `tsink_query_budget_limit_rejections_total` | counter | Core query-limit errors across all reasons |
+| `tsink_query_budget_limit_rejections_by_reason_total{reason}` | counter | Rejections by a fixed reason: concurrency, shared/per-query memory, matched/scanned/returned work, pattern expansion, steps, or intermediate-vector size |
+| `tsink_query_budget_cancellations_total` | counter | Query admission or execution attempts that observed cooperative cancellation |
+| `tsink_query_budget_deadline_exceeded_total` | counter | Query admission or execution attempts that observed their effective deadline |
+| `tsink_query_budget_accounting_invariant_violations_total` | counter | Internal permit or memory-release inconsistencies |
+| `tsink_query_budget_configured_limit{kind}` | gauge | Effective finite instance limit; an absent kind is unbounded |
+
 #### Per-tenant admission
 
 Tenant admission metrics carry a `tenant` label when multi-tenancy is enabled.
@@ -344,9 +424,23 @@ Edge sync ships writes queued on edge/source nodes upstream. Metrics are emitted
 |---|---|---|
 | `tsink_edge_sync_enabled{role}` | gauge | Source and accept mode enablement |
 | `tsink_edge_sync_queue{kind}` | gauge | Backlog entries, bytes, log size, oldest age, and retention window |
+| `tsink_edge_sync_queue_health{state}` | gauge | Persistence fencing, deferred cleanup, and aggregate degraded state |
 | `tsink_edge_sync_events_total{event}` | counter | Enqueue, replay, and retention-drop events |
 | `tsink_edge_sync_replayed_rows_total` | counter | Rows replayed upstream |
 | `tsink_edge_sync_accept_dedupe{...}` | gauge/counter | Accept-side idempotency window state |
+
+### Cluster — audit persistence
+
+| Metric | Type | Description |
+|---|---|---|
+| `tsink_cluster_audit_log{kind}` | gauge | Enablement, retained in-memory records, and durable log bytes |
+| `tsink_cluster_audit_health{state}` | gauge | Persistence fencing, deferred cleanup, and aggregate degraded state |
+
+The TSDB status payload includes the corresponding `cluster.audit` object. An indeterminate append
+sets `persistenceFenced` and rejects later audit appends, preventing writes from being concatenated
+onto an uncertain JSONL tail. Restart performs strict replay and refuses an incomplete tail rather
+than silently truncating it. A post-record compaction failure sets `cleanupPending`; the next append
+retries that cleanup without reclassifying the already-durable audit record.
 
 ### Cluster — write routing
 
@@ -455,6 +549,25 @@ Edge sync ships writes queued on edge/source nodes upstream. Metrics are emitted
 | `tsink_cluster_control_peer_last_success_unix_ms{node_id}` | gauge | Last successful heartbeat per peer |
 | `tsink_cluster_control_peer_last_failure_unix_ms{node_id}` | gauge | Last failed attempt per peer |
 | `tsink_cluster_control_peer_consecutive_failures{node_id}` | gauge | Consecutive failures per peer |
+| `tsink_cluster_control_persistence_health{state}` | gauge | Fixed-cardinality Boolean flags for `fenced`, `checkpoint_pending`, `cleanup_debt`, and aggregate `degraded` |
+| `tsink_cluster_control_persistence_pending_checkpoint_index` | gauge | Durable control-log index whose state mirror is pending repair, or `0` when none is pending |
+| `tsink_cluster_control_persistence_pending_checkpoint_term` | gauge | Durable control-log term whose state mirror is pending repair, or `0` when none is pending |
+
+The corresponding TSDB status object is `data.cluster.control.persistence`, with `fenced`,
+`pendingCheckpoint`, `cleanupDebt`, `detail`, and `degraded`. `checkpoint_pending=1` means the
+schema-v2 log replacement and parent-directory sync completed, making its embedded checkpoint
+authoritative, but publication or repair of the control-state mirror is pending; it also sets
+`fenced=1`. `fenced=1` with `checkpoint_pending=0` can instead mean a consensus-required candidate
+or higher term is still awaiting unambiguous durable log publication; this includes a higher term
+learned from a commit-notice response after the command itself reached quorum. `pendingCheckpoint`
+is then null and `detail` carries the reason. That post-commit case is surfaced to the caller as
+successful degraded `committed_persistence_pending`, while leadership remains fenced. Resolve the
+underlying disk quota, filesystem-headroom, or I/O problem. Later control mutations attempt
+authoritative repair before proceeding and remain fenced if repair cannot complete. `cleanup_debt`
+means both pair members are durable but grouped
+finalization, owned-temporary cleanup, or exact accounting reconciliation remains. It is reported
+separately, contributes to `degraded`, and does not set `fenced` by itself. Cleanup and
+reconciliation are retried before any separate fence repair.
 
 ### Security & RBAC
 
@@ -475,8 +588,12 @@ Edge sync ships writes queued on edge/source nodes upstream. Metrics are emitted
 
 | Metric | Type | Description |
 |---|---|---|
-| `tsink_usage_ledger_records_total` | gauge | Durable or in-memory tenant usage ledger records |
+| `tsink_usage_ledger_records_total` | counter | Cumulative durable or in-memory tenant usage ledger records |
+| `tsink_usage_ledger_retained_records` | gauge | Recent records currently retained for raw and bucketed reads |
+| `tsink_usage_ledger_earliest_retained_sequence` | gauge | Earliest raw sequence available for bounded reads, or `0` when empty |
+| `tsink_usage_ledger_recent_record_limit` | gauge | Configured in-memory recent-record bound |
 | `tsink_usage_ledger_tenants_total` | gauge | Distinct tenants in the usage ledger |
+| `tsink_usage_ledger_tenant_limit` | gauge | Configured exact-summary tenant bound |
 | `tsink_usage_ledger_storage_reconciliations_total` | counter | Storage reconciliation snapshots recorded |
 | `tsink_usage_ledger_record_failures_total` | counter | Usage-ledger append attempts that did not complete successfully |
 | `tsink_usage_ledger_durable` | gauge | `1` when the ledger is backed by a durable on-disk store |
@@ -497,10 +614,15 @@ The following metrics are good starting points for alerts:
 | Memory pressure | `tsink_memory_used_bytes / tsink_memory_budget_bytes` | > 0.90 when a finite budget is configured; this is modeled engine memory, not RSS |
 | Write admission rejections | `tsink_write_admission_rejections_total` | Rate sustained > 0 |
 | Read admission rejections | `tsink_read_admission_rejections_total` | Rate sustained > 0 |
+| Core query-budget rejections | `tsink_query_budget_limit_rejections_total` | Alert on sustained rate; split by `reason` before changing a limit |
+| Query-budget accounting invariant | `tsink_query_budget_accounting_invariant_violations_total` | Any increase |
 | Object-store inaccessible | `tsink_remote_storage_accessible` | == 0 for 2 minutes |
 | Remote catalog backoff | `tsink_remote_storage_catalog_refresh_consecutive_failures` | > 3 |
 | Dead cluster peers | `tsink_cluster_control_dead_peers` | > 0 |
 | Leader stale | `tsink_cluster_control_leader_stale` | == 1 for 1 minute |
+| Control persistence fenced | `tsink_cluster_control_persistence_health{state="fenced"}` | == 1 |
+| Control checkpoint repair pending | `tsink_cluster_control_persistence_health{state="checkpoint_pending"}` | == 1 |
+| Control cleanup debt | `tsink_cluster_control_persistence_health{state="cleanup_debt"}` | == 1 for 5 minutes |
 | Hinted handoff stalled | `tsink_cluster_outbox_stalled_peers` | > 0 |
 | Secret rotation failure | `tsink_secret_rotation_failures_total` | Any increase |
 | Rollup lag | `tsink_rollup_policy_status{kind="lag"}` | > acceptable lag threshold |

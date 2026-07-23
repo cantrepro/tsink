@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -39,6 +39,8 @@ struct StagedShardIngest {
     materialized_series_ids: BTreeSet<SeriesId>,
     observed_series_timestamps: Vec<(SeriesId, i64)>,
     active_delta: MemoryDeltaBytes,
+    active_wal_lows_before: Vec<WalHighWatermark>,
+    active_wal_lows_after: Vec<WalHighWatermark>,
 }
 
 impl<'a> WriteSeriesValidationContext<'a> {
@@ -383,6 +385,17 @@ impl<'a> WriteApplyShardMutationContext<'a> {
 
         let mut materialized_series_ids = BTreeSet::new();
         let mut observed_series_timestamps = Vec::new();
+        // Add the staged floors before publishing any state. Old floors remain indexed until
+        // every finalized chunk is in the pending sealed index, so a concurrent persistence
+        // snapshot always sees at least one conservative replay floor during each handoff.
+        {
+            let mut active_wal_index = self.chunks.active_wal_index.lock();
+            for staged in &staged_shards {
+                for lowwater in &staged.active_wal_lows_after {
+                    active_wal_index.add(*lowwater);
+                }
+            }
+        }
         for ((shard_idx, _, active), staged) in shard_guards.iter_mut().zip(staged_shards) {
             let StagedShardIngest {
                 active_states,
@@ -390,6 +403,8 @@ impl<'a> WriteApplyShardMutationContext<'a> {
                 materialized_series_ids: staged_materialized,
                 observed_series_timestamps: staged_timestamps,
                 active_delta,
+                active_wal_lows_before,
+                active_wal_lows_after: _,
             } = staged;
 
             for (series_id, state) in active_states {
@@ -403,6 +418,10 @@ impl<'a> WriteApplyShardMutationContext<'a> {
             memory.account_shard_delta(*shard_idx, active_delta);
             materialized_series_ids.extend(staged_materialized);
             observed_series_timestamps.extend(staged_timestamps);
+            let mut active_wal_index = self.chunks.active_wal_index.lock();
+            for lowwater in active_wal_lows_before {
+                active_wal_index.remove(lowwater);
+            }
         }
         drop(shard_guards);
 
@@ -415,7 +434,7 @@ impl<'a> WriteApplyShardMutationContext<'a> {
     fn stage_pending_points_for_shard(
         self,
         memory: WriteApplyMemoryAccountingContext<'a>,
-        active: &HashMap<SeriesId, ActiveSeriesState>,
+        active: &BTreeMap<SeriesId, ActiveSeriesState>,
         shard_points: Vec<PendingPoint>,
     ) -> Result<StagedShardIngest> {
         let mut active_states = BTreeMap::<SeriesId, ActiveSeriesState>::new();
@@ -456,7 +475,13 @@ impl<'a> WriteApplyShardMutationContext<'a> {
         }
 
         let mut active_delta = MemoryDeltaBytes::default();
+        let mut active_wal_lows_before = Vec::new();
+        let mut active_wal_lows_after = Vec::new();
         for (series_id, state) in &active_states {
+            if let Some(previous) = active.get(series_id) {
+                active_wal_lows_before.extend(previous.wal_lowwaters());
+            }
+            active_wal_lows_after.extend(state.wal_lowwaters());
             let state_bytes_before = active
                 .get(series_id)
                 .map(|state| memory.active_state_bytes(state))
@@ -470,6 +495,8 @@ impl<'a> WriteApplyShardMutationContext<'a> {
             materialized_series_ids,
             observed_series_timestamps,
             active_delta,
+            active_wal_lows_before,
+            active_wal_lows_after,
         })
     }
 }
@@ -668,6 +695,9 @@ impl<'a> WriteCommitWalCompletionContext<'a> {
                     );
                 }
             }
+            // The logical publication moves owned definitions into the retained cache. Charge the
+            // resulting cache before the write's transient lease is reduced or released.
+            self.sync_wal_series_definition_cache_memory_usage();
         }
 
         acknowledgement

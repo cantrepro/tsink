@@ -17,6 +17,29 @@ fn new_raw_numeric_storage(lane_path: std::path::PathBuf, next_segment_id: u64) 
     .unwrap()
 }
 
+fn bounded_catalog_refresh_storage(
+    lane_path: &std::path::Path,
+    next_segment_id: u64,
+    max_items: usize,
+    max_bytes: u64,
+) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(lane_path.to_path_buf()),
+        None,
+        next_segment_id,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            maintenance_max_items_per_pass: max_items,
+            maintenance_max_bytes_per_pass: max_bytes,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap()
+}
+
 fn write_numeric_segment_to_path(
     lane_path: &std::path::Path,
     registry: &SeriesRegistry,
@@ -33,6 +56,69 @@ fn write_numeric_segment_to_path(
     let writer = SegmentWriter::new(lane_path, level, segment_id).unwrap();
     writer.write_segment(registry, &chunks).unwrap();
     writer.layout().root.clone()
+}
+
+fn bounded_retention_page_storage(
+    lane_path: &std::path::Path,
+    next_segment_id: u64,
+    max_items: usize,
+) -> ChunkStorage {
+    bounded_retention_page_storage_with_bytes(
+        lane_path,
+        next_segment_id,
+        max_items,
+        256 * 1024 * 1024,
+    )
+}
+
+fn bounded_retention_page_storage_with_bytes(
+    lane_path: &std::path::Path,
+    next_segment_id: u64,
+    max_items: usize,
+    max_bytes: u64,
+) -> ChunkStorage {
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(lane_path.to_path_buf()),
+        None,
+        next_segment_id,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_window: 10,
+            retention_enforced: true,
+            maintenance_max_items_per_pass: max_items,
+            maintenance_max_bytes_per_pass: max_bytes,
+            background_threads_enabled: false,
+            #[cfg(test)]
+            current_time_override: Some(100),
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(lane_path).unwrap(), false)
+        .unwrap();
+    storage
+}
+
+fn modeled_retention_rewrite_candidate_bytes(root: &std::path::Path) -> u64 {
+    let fingerprint = crate::engine::segment::read_segment_manifest_fingerprint(root).unwrap();
+    let descriptor = std::mem::size_of::<super::super::tiering::SegmentInventoryEntry>()
+        .saturating_add(root.as_os_str().as_encoded_bytes().len());
+    fingerprint.files.iter().fold(
+        u64::try_from(descriptor)
+            .unwrap()
+            .saturating_add(std::fs::metadata(root.join("manifest.bin")).unwrap().len()),
+        |total, file| total.saturating_add(file.file_len),
+    )
+}
+
+fn mark_post_flush_maintenance_pending(storage: &ChunkStorage) {
+    storage
+        .coordination
+        .post_flush_maintenance_pending
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 fn incremental_segment_paths(snapshot_path: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -102,9 +188,17 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: Duration::from_millis(25),
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -186,9 +280,17 @@ fn background_compaction_refreshes_persisted_index_in_background() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: Duration::from_millis(25),
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: true,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -314,6 +416,8 @@ fn flush_pipeline_reconciles_known_dirty_compaction_changes_before_checkpointing
         ChunkStorageOptions {
             retention_enforced: false,
             compaction_interval: Duration::from_millis(25),
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: true,
             ..ChunkStorageOptions::default()
         },
@@ -835,6 +939,114 @@ fn background_flush_persists_current_partial_head_and_resets_wal() {
 }
 
 #[test]
+fn timed_flush_defers_young_wal_backed_current_head_until_half_initial_block() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let labels = vec![Label::new("host", "fill-aware")];
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2_048,
+        Some(wal),
+        Some(lane_path),
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            wal_size_limit_bytes: 64 * 1024 * 1024,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    let rows = (0..31)
+        .map(|timestamp| {
+            Row::with_labels(
+                "fill_aware_background_flush",
+                labels.clone(),
+                DataPoint::new(timestamp, timestamp as f64),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("fill_aware_background_flush", &labels)
+        .unwrap()
+        .series_id;
+
+    storage.background_flush_pipeline_once().unwrap();
+    assert_eq!(
+        storage
+            .active_shard(series_id)
+            .read()
+            .get(&series_id)
+            .map_or(0, |state| state.point_count()),
+        31,
+        "a healthy WAL-backed timed pass must not turn a very young current head into a tiny segment",
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .chunk_refs
+            .get(&series_id)
+            .map_or(0, |chunks| chunks.len()),
+        0,
+    );
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "fill_aware_background_flush",
+            labels.clone(),
+            DataPoint::new(31, 31.0),
+        )])
+        .unwrap();
+    storage.background_flush_pipeline_once().unwrap();
+
+    assert_eq!(
+        storage
+            .active_shard(series_id)
+            .read()
+            .get(&series_id)
+            .map_or(0, |state| state.point_count()),
+        0,
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .chunk_refs
+            .get(&series_id)
+            .map_or(0, |chunks| chunks.len()),
+        1,
+    );
+    assert_eq!(
+        storage
+            .select("fill_aware_background_flush", &labels, 0, 32)
+            .unwrap()
+            .len(),
+        32,
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .total_size_bytes()
+            .unwrap(),
+        0,
+    );
+    storage.close().unwrap();
+}
+
+#[test]
 fn background_flush_persists_sealed_and_live_series_together() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
@@ -1013,6 +1225,7 @@ fn background_flush_publishes_current_heads_to_compute_only_readers() {
         },
     )
     .unwrap();
+    install_shared_object_store_writer_lock_for_test(&writer, object_store_dir.path());
     let reader = ChunkStorage::new_with_data_path_and_options(
         8,
         None,
@@ -1118,6 +1331,734 @@ fn flush_pipeline_persists_large_sealed_snapshot_without_chunk_clones() {
     let selected = storage.select(metric, &sample_labels, 0, 10_000).unwrap();
     assert_eq!(selected.len(), points_per_series);
 
+    storage.close().unwrap();
+}
+
+#[test]
+fn bounded_background_persistence_resumes_and_restart_replays_only_the_suffix() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 2;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    let metric = "bounded_partial_persist_restart";
+    let labels = vec![Label::new("host", "a")];
+
+    for ts in 1..=5 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(ts, ts as f64),
+            )])
+            .unwrap();
+    }
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 5);
+
+    let first = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert_eq!(first.chunks, 2);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 3);
+    let first_segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(first_segments.len(), 1);
+    assert_eq!(first_segments[0].manifest.chunk_count, 2);
+    let first_deferred_floor = storage
+        .chunks
+        .pending_sealed_chunks
+        .read()
+        .by_wal
+        .iter()
+        .next()
+        .unwrap()
+        .wal_lowwater;
+    assert!(first_segments[0].manifest.wal_highwater < first_deferred_floor);
+
+    let second = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert_eq!(second.chunks, 2);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 2);
+
+    // Model an abrupt process exit: keep the last chunk only in WAL and prove that the maximum
+    // segment replay high-water mark neither skips it nor duplicates the persisted prefix.
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &labels, 0, 10).unwrap(),
+        (1..=5)
+            .map(|ts| DataPoint::new(ts, ts as f64))
+            .collect::<Vec<_>>()
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn bounded_persistence_evicts_only_its_exact_selection_from_a_large_backlog() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const BACKLOG_CHUNKS: usize = 256;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    options.memory_budget_bytes = 256 * 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        Some(wal),
+        Some(lane_path),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    let metric = "bounded_exact_sealed_eviction";
+    let labels = vec![Label::new("host", "a")];
+
+    for ts in 0..=BACKLOG_CHUNKS {
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(ts as i64, ts as f64),
+            )])
+            .unwrap();
+    }
+
+    let sealed_chunk_count = || {
+        storage
+            .chunks
+            .sealed_chunks
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .values()
+                    .map(|chunks| chunks.len())
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+    };
+    assert_eq!(sealed_chunk_count(), BACKLOG_CHUNKS + 1);
+
+    let selected_location = storage
+        .chunks
+        .pending_sealed_chunks
+        .read()
+        .by_sequence
+        .first_key_value()
+        .map(|(_, location)| *location)
+        .unwrap();
+    let selected_chunk_bytes = {
+        let sealed = storage.chunks.sealed_chunks[selected_location.shard_idx].read();
+        let chunk = sealed
+            .get(&selected_location.series_id)
+            .and_then(|chunks| chunks.get(&selected_location.sealed_key))
+            .unwrap();
+        ChunkStorage::chunk_memory_usage_bytes(chunk)
+    };
+    let selected_shard_bytes_before = storage.memory.used_bytes_by_shard
+        [selected_location.shard_idx]
+        .load(Ordering::Acquire) as usize;
+    let eviction_inspections = Arc::new(AtomicUsize::new(0));
+    storage.set_exact_sealed_eviction_inspect_hook({
+        let eviction_inspections = Arc::clone(&eviction_inspections);
+        move || {
+            eviction_inspections.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let outcome = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(outcome.chunks, 1);
+    assert_eq!(eviction_inspections.load(Ordering::Relaxed), 1);
+    assert_eq!(sealed_chunk_count(), BACKLOG_CHUNKS);
+    assert_eq!(
+        storage.chunks.pending_sealed_chunks.read().len(),
+        BACKLOG_CHUNKS
+    );
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .flush
+            .evicted_sealed_chunks_total,
+        1
+    );
+    let selected_shard_bytes_after = storage.memory.used_bytes_by_shard[selected_location.shard_idx]
+        .load(Ordering::Acquire) as usize;
+    assert_eq!(
+        selected_shard_bytes_before.saturating_sub(selected_shard_bytes_after),
+        selected_chunk_bytes,
+        "exact eviction must debit the selected chunk from its owning shard"
+    );
+
+    let expected = (0..=BACKLOG_CHUNKS)
+        .map(|ts| DataPoint::new(ts as i64, ts as f64))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        storage
+            .select(metric, &labels, 0, BACKLOG_CHUNKS as i64 + 1)
+            .unwrap(),
+        expected,
+        "persisted publication must replace the evicted in-memory chunk without a query gap"
+    );
+
+    storage.clear_exact_sealed_eviction_inspect_hook();
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened
+            .select(metric, &labels, 0, BACKLOG_CHUNKS as i64 + 1)
+            .unwrap(),
+        expected,
+        "restart must load the selected prefix once and replay every deferred chunk"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn bounded_non_tiered_flush_accounts_one_root_without_scanning_a_large_persisted_backlog() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const BACKLOG_SEGMENTS: usize = 64;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    options.memory_budget_bytes = 256 * 1024 * 1024;
+    let storage =
+        ChunkStorage::new_with_data_path_and_options(1, None, Some(lane_path), None, 1, options)
+            .unwrap();
+
+    for ts in 0..BACKLOG_SEGMENTS {
+        storage
+            .insert_rows(&[Row::new(
+                "bounded_catalog_delta_backlog",
+                DataPoint::new(ts as i64, ts as f64),
+            )])
+            .unwrap();
+        let outcome = storage
+            .persist_segment_background_bounded_with_outcome()
+            .unwrap();
+        assert!(outcome.persisted);
+        assert_eq!(outcome.chunks, 1);
+    }
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        BACKLOG_SEGMENTS
+    );
+
+    let accounting_inspections = Arc::new(AtomicUsize::new(0));
+    storage.set_persisted_index_accounting_inspect_hook({
+        let accounting_inspections = Arc::clone(&accounting_inspections);
+        move || {
+            accounting_inspections.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let catalog_inventory_inspections = Arc::new(AtomicUsize::new(0));
+    storage.set_persisted_catalog_inventory_entry_hook({
+        let catalog_inventory_inspections = Arc::clone(&catalog_inventory_inspections);
+        move || {
+            catalog_inventory_inspections.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    storage
+        .insert_rows(&[Row::new(
+            "bounded_catalog_delta_backlog",
+            DataPoint::new(BACKLOG_SEGMENTS as i64, BACKLOG_SEGMENTS as f64),
+        )])
+        .unwrap();
+    let outcome = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(outcome.chunks, 1);
+    assert_eq!(
+        accounting_inspections.load(Ordering::Relaxed),
+        2,
+        "accounting should inspect the one changed root before and after publication"
+    );
+    assert_eq!(
+        catalog_inventory_inspections.load(Ordering::Relaxed),
+        0,
+        "a non-tiered flush should not rebuild the persisted segment inventory"
+    );
+    assert_eq!(
+        storage.observability_snapshot().flush.hot_segments_visible,
+        (BACKLOG_SEGMENTS + 1) as u64
+    );
+
+    storage.clear_persisted_catalog_inventory_entry_hook();
+    accounting_inspections.store(0, Ordering::Relaxed);
+    let removed_root = storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .keys()
+        .next()
+        .cloned()
+        .unwrap();
+    assert!(storage
+        .remove_persisted_segment_roots(&[removed_root])
+        .unwrap());
+    assert_eq!(
+        accounting_inspections.load(Ordering::Relaxed),
+        2,
+        "root removal accounting should inspect only the removed root before and after mutation"
+    );
+    storage.clear_persisted_index_accounting_inspect_hook();
+    assert_engine_memory_usage_reconciled(&storage);
+    storage.close().unwrap();
+}
+
+#[test]
+fn bounded_persistence_requires_a_replay_closed_wal_window_before_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    let metric = "bounded_replay_closed_window";
+    let older_labels = vec![Label::new("host", "older-active")];
+    let later_labels = vec![Label::new("host", "later-sealed")];
+
+    // The older series owns the first WAL frame but remains active. The later series fills and
+    // seals first, so publishing it would require a scalar WAL checkpoint that skips the active
+    // head. A bounded pass must leave every segment and pending chunk untouched.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            older_labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            later_labels.clone(),
+            DataPoint::new(10, 10.0),
+        )])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            later_labels.clone(),
+            DataPoint::new(11, 11.0),
+        )])
+        .unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    let blocked_by_active = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(!blocked_by_active.persisted);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    // Seal the older head. Sequence order remains later-sealed then older-active, while WAL
+    // order is the opposite. With one item available, the sequence prefix cannot close the WAL
+    // replay interval and must fail explicitly without publishing a partial segment.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            older_labels.clone(),
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 2);
+    let dependency_error = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap_err();
+    assert!(matches!(
+        dependency_error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "sealed chunk persistence",
+            item_limit: 1,
+            selected_items: 1,
+            ..
+        }
+    ));
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 2);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    let foreground = storage.persist_segment_with_outcome().unwrap();
+    assert!(foreground.persisted);
+    assert_eq!(foreground.chunks, 2);
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &older_labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+    );
+    assert_eq!(
+        reopened.select(metric, &later_labels, 0, 20).unwrap(),
+        vec![DataPoint::new(10, 10.0), DataPoint::new(11, 11.0)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn bounded_persistence_rejects_a_partial_single_wal_write_without_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    let metric = "bounded_single_wal_dependency";
+    let left_labels = vec![Label::new("host", "left")];
+    let right_labels = vec![Label::new("host", "right")];
+
+    // Both chunks originate from one WAL append. Selecting only one would advance a scalar
+    // replay watermark through the other chunk, so bounded persistence must not publish either.
+    storage
+        .insert_rows(&[
+            Row::with_labels(metric, left_labels.clone(), DataPoint::new(1, 1.0)),
+            Row::with_labels(metric, right_labels.clone(), DataPoint::new(2, 2.0)),
+        ])
+        .unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 2);
+    let dependency_error = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap_err();
+    assert!(matches!(
+        dependency_error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "sealed chunk persistence",
+            item_limit: 1,
+            selected_items: 1,
+            ..
+        }
+    ));
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 2);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &left_labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    assert_eq!(
+        reopened.select(metric, &right_labels, 0, 10).unwrap(),
+        vec![DataPoint::new(2, 2.0)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn bounded_persistence_defers_a_dependency_that_only_exceeds_the_shared_remainder() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 2;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[
+            Row::new("bounded_shared_remainder_a", DataPoint::new(1, 1.0)),
+            Row::new("bounded_shared_remainder_b", DataPoint::new(2, 2.0)),
+        ])
+        .unwrap();
+
+    // Model one of the two configured item slots having already been consumed by active
+    // finalization. The same-WAL-frame pair cannot fit the remainder, but does fit the next full
+    // pass, so this attempt must be a retryable no-op rather than a fail-fast policy error.
+    let deferred = storage
+        .persist_segment_background_bounded_with_limits(1, 1024 * 1024)
+        .unwrap();
+    assert!(!deferred.persisted);
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 2);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    let persisted = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(persisted.persisted);
+    assert_eq!(persisted.chunks, 2);
+    assert!(storage.chunks.pending_sealed_chunks.read().is_empty());
+    storage.close().unwrap();
+}
+
+#[test]
+fn bounded_partial_persistence_restarts_exactly_across_numeric_and_blob_lanes() {
+    let temp_dir = TempDir::new().unwrap();
+    let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 2;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        Some(wal),
+        Some(numeric_lane_path.clone()),
+        Some(blob_lane_path.clone()),
+        1,
+        options,
+    )
+    .unwrap();
+    let metric = "bounded_mixed_lane_restart";
+    let numeric_labels = vec![Label::new("kind", "numeric")];
+    let blob_labels = vec![Label::new("kind", "blob")];
+
+    // Separate appends give the bounded sequence prefix two replay-closed windows spanning both
+    // lane families, followed by one WAL-only numeric suffix.
+    for row in [
+        Row::with_labels(metric, numeric_labels.clone(), DataPoint::new(1, 1.0)),
+        Row::with_labels(metric, blob_labels.clone(), DataPoint::new(2, "two")),
+        Row::with_labels(metric, numeric_labels.clone(), DataPoint::new(3, 3.0)),
+        Row::with_labels(metric, blob_labels.clone(), DataPoint::new(4, "four")),
+        Row::with_labels(metric, numeric_labels.clone(), DataPoint::new(5, 5.0)),
+    ] {
+        storage.insert_rows(&[row]).unwrap();
+    }
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 5);
+
+    for expected_pending in [3, 1] {
+        let outcome = storage
+            .persist_segment_background_bounded_with_outcome()
+            .unwrap();
+        assert!(outcome.persisted);
+        assert_eq!(outcome.chunks, 2);
+        assert_eq!(
+            storage.chunks.pending_sealed_chunks.read().len(),
+            expected_pending
+        );
+
+        let deferred_floor = storage
+            .chunks
+            .pending_sealed_chunks
+            .read()
+            .by_wal
+            .iter()
+            .next()
+            .unwrap()
+            .wal_lowwater;
+        for lane_path in [&numeric_lane_path, &blob_lane_path] {
+            let segments = load_segments_for_level(lane_path, 0).unwrap();
+            assert!(
+                segments
+                    .iter()
+                    .all(|segment| segment.manifest.wal_highwater < deferred_floor),
+                "each visible lane checkpoint must remain before the deferred WAL suffix",
+            );
+        }
+    }
+    assert_eq!(
+        load_segments_for_level(&numeric_lane_path, 0)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        load_segments_for_level(&blob_lane_path, 0).unwrap().len(),
+        2
+    );
+
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &numeric_labels, 0, 10).unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(3, 3.0),
+            DataPoint::new(5, 5.0),
+        ]
+    );
+    assert_eq!(
+        reopened.select(metric, &blob_labels, 0, 10).unwrap(),
+        vec![DataPoint::new(2, "two"), DataPoint::new(4, "four")]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn bounded_background_persistence_honors_byte_limit_without_losing_foreground_progress() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 8;
+    options.maintenance_max_bytes_per_pass = 1;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "bounded_partial_persist_bytes",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+
+    let bounded_error = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap_err();
+    assert!(matches!(
+        bounded_error,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "sealed chunk persistence",
+            limit: 1,
+            required,
+        } if required > 1
+    ));
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    let foreground = storage.persist_segment_with_outcome().unwrap();
+    assert!(foreground.persisted);
+    assert_eq!(foreground.chunks, 1);
+    assert!(storage.chunks.pending_sealed_chunks.read().is_empty());
+    storage.close().unwrap();
+}
+
+#[test]
+fn bounded_background_pipeline_shares_one_item_allowance_across_flush_and_persist() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "bounded_pipeline_shared_allowance",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.background_flush_pipeline_once().unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+
+    storage.background_flush_pipeline_once().unwrap();
+    assert!(storage.chunks.pending_sealed_chunks.read().is_empty());
+    let segments = load_segments_for_level(&lane_path, 0).unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].manifest.chunk_count, 1);
     storage.close().unwrap();
 }
 
@@ -1383,6 +2324,15 @@ fn dirty_known_diff_refresh_skips_full_inventory_scans_at_large_segment_counts()
     storage
         .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
         .unwrap();
+    storage.persist_series_registry_index().unwrap();
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let registry_catalog_store =
+        super::super::registry_catalog::catalog_store_path(&checkpoint_path);
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        257,
+        "the native catalog should contain one manifest plus one file per segment"
+    );
 
     let full_scans = Arc::new(AtomicUsize::new(0));
     storage.set_full_inventory_scan_hook({
@@ -1454,6 +2404,31 @@ fn dirty_known_diff_refresh_skips_full_inventory_scans_at_large_segment_counts()
     assert_eq!(points.len(), 256);
     assert!(!points.contains(&DataPoint::new(1, 1.0)));
     assert!(points.contains(&DataPoint::new(10_000, 10_000.0)));
+    assert!(
+        !super::super::registry_catalog::catalog_path(&checkpoint_path).exists(),
+        "bounded delta publication must retire the stale monolithic compatibility snapshot"
+    );
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store)
+            .unwrap()
+            .count(),
+        257,
+        "one remove plus one add must keep the native catalog namespace proportional to live segments"
+    );
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    let validated = super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .expect("the incrementally updated registry catalog should remain exact");
+    assert!(validated.incremental_store);
+    assert!(
+        validated.series_fingerprint.is_none(),
+        "a root delta must conservatively invalidate the aggregate series fingerprint"
+    );
 
     storage.clear_full_inventory_scan_hook();
     storage.close().unwrap();
@@ -1711,9 +2686,17 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -1866,9 +2849,17 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -2128,7 +3119,285 @@ fn dirty_reconcile_writes_incremental_registry_sidecar_without_rewriting_checkpo
 }
 
 #[test]
-fn repeated_small_flushes_append_incremental_registry_segments_and_restart_recovers() {
+fn unknown_dirty_catalog_refresh_pages_without_publishing_a_false_complete_inventory() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = bounded_catalog_refresh_storage(&lane_path, 4, 1, 256 * 1024 * 1024);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "paged")];
+    let series_id = registry
+        .resolve_or_insert("paged_unknown_dirty_catalog", &labels)
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=3 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+
+    let scans = Arc::new(AtomicUsize::new(0));
+    storage.set_full_inventory_scan_hook({
+        let scans = Arc::clone(&scans);
+        move || {
+            scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .is_empty(),
+        "opening the first scan level must not claim that an empty partial page is complete"
+    );
+
+    let mut calls = 1usize;
+    while storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst)
+    {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        calls += 1;
+        assert!(
+            calls < 64,
+            "bounded catalog cursor failed to reach a terminal page"
+        );
+    }
+
+    assert!(
+        calls >= 12,
+        "one-item pages should require explicit level, entry, manifest, apply, and terminal passes"
+    );
+    assert_eq!(scans.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        3
+    );
+    assert_eq!(
+        storage
+            .select("paged_unknown_dirty_catalog", &labels, 0, 10)
+            .unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0),
+        ]
+    );
+    storage.clear_full_inventory_scan_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn unknown_dirty_catalog_failed_page_retries_its_exact_root_delta() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = bounded_catalog_refresh_storage(&lane_path, 2, 1_024, 256 * 1024 * 1024);
+    storage.persist_series_registry_index().unwrap();
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "retry")];
+    let series_id = registry
+        .resolve_or_insert("paged_unknown_dirty_retry", &labels)
+        .unwrap()
+        .series_id;
+    let root = write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    storage.set_catalog_transition_post_index_mutation_hook({
+        let fail_once = Arc::clone(&fail_once);
+        move || {
+            if fail_once.swap(false, Ordering::SeqCst) {
+                Err(TsinkError::Other(
+                    "injected bounded catalog page failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    let err = storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("injected bounded catalog page failure"));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+
+    for _ in 0..8 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+    }
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert_eq!(
+        storage
+            .select("paged_unknown_dirty_retry", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+
+    storage.clear_catalog_transition_post_index_mutation_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn unknown_dirty_catalog_cursor_is_discarded_on_restart_and_startup_recovers_exactly() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "restart")];
+    let series_id = registry
+        .resolve_or_insert("paged_unknown_dirty_restart", &labels)
+        .unwrap()
+        .series_id;
+    let storage = bounded_catalog_refresh_storage(&lane_path, 3, 1, 256 * 1024 * 1024);
+    for segment_id in 1..=2 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    drop(storage);
+
+    let reopened = open_raw_numeric_storage_from_data_path(temp_dir.path());
+    assert_eq!(
+        reopened
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        2
+    );
+    assert_eq!(
+        reopened
+            .select("paged_unknown_dirty_restart", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn unknown_dirty_catalog_rejects_an_oversized_scan_dependency() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = bounded_catalog_refresh_storage(&lane_path, 1, 1, 4_095);
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    let err = storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "unknown-dirty persisted catalog scan",
+            limit: 4_095,
+            required: 4_096,
+        }
+    ));
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    drop(storage);
+}
+
+#[test]
+fn repeated_small_flushes_compact_active_registry_generation_and_restart_recovers() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
@@ -2195,10 +3464,11 @@ fn repeated_small_flushes_append_incremental_registry_segments_and_restart_recov
 
     assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
     let segment_paths = incremental_segment_paths(&checkpoint_path);
-    assert_eq!(segment_paths.len(), 2);
-    assert_eq!(
+    assert_eq!(segment_paths.len(), 1);
+    assert_ne!(
         std::fs::read(&segment_paths[0]).unwrap(),
-        first_segment_bytes
+        first_segment_bytes,
+        "the bounded active generation should be atomically replaced with the merged registry"
     );
 
     let incremental = SeriesRegistry::load_incremental_state(&checkpoint_path)
@@ -2364,9 +3634,17 @@ fn flush_pipeline_completes_while_another_writer_permit_is_held() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -2451,7 +3729,7 @@ fn flush_stage_keeps_staged_segments_and_wal_behind_visibility_publish_boundary(
         ChunkStorage::new_with_data_path_and_options(
             2,
             Some(wal),
-            Some(lane_path),
+            Some(lane_path.clone()),
             None,
             1,
             ChunkStorageOptions {
@@ -2558,7 +3836,160 @@ fn flush_stage_keeps_staged_segments_and_wal_behind_visibility_publish_boundary(
 }
 
 #[test]
-fn flush_snapshot_waits_for_active_to_sealed_publication() {
+fn flush_staging_holds_compaction_gate_until_catalog_publication() {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(lane_path),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    // Leave three durable L0 roots in place. The staged fourth root makes the concurrent
+    // compaction pass eligible to consume every source, including the not-yet-visible flush root.
+    for batch in 0..3_i64 {
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "flush_compaction_fence",
+                    labels.clone(),
+                    DataPoint::new(batch * 2 + 1, (batch * 2 + 1) as f64),
+                ),
+                Row::with_labels(
+                    "flush_compaction_fence",
+                    labels.clone(),
+                    DataPoint::new(batch * 2 + 2, (batch * 2 + 2) as f64),
+                ),
+            ])
+            .unwrap();
+        storage.flush_pipeline_once().unwrap();
+    }
+
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "flush_compaction_fence",
+                labels.clone(),
+                DataPoint::new(7, 7.0),
+            ),
+            Row::with_labels(
+                "flush_compaction_fence",
+                labels.clone(),
+                DataPoint::new(8, 8.0),
+            ),
+        ])
+        .unwrap();
+
+    let (staged_tx, staged_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    storage.set_persist_post_publish_hook({
+        let release_rx = Arc::clone(&release_rx);
+        move |roots| {
+            staged_tx.send(roots.to_vec()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    });
+
+    let flush_storage = Arc::clone(&storage);
+    let (flush_tx, flush_rx) = mpsc::channel();
+    let flush_thread = thread::spawn(move || {
+        flush_tx.send(flush_storage.flush_pipeline_once()).unwrap();
+    });
+
+    let staged_roots = staged_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("flush did not reach the staged segment hook");
+    assert_eq!(staged_roots.len(), 1);
+    assert!(staged_roots[0].exists());
+
+    let compaction_storage = Arc::clone(&storage);
+    let (compaction_attempted_tx, compaction_attempted_rx) = mpsc::channel();
+    let (compaction_acquired_tx, compaction_acquired_rx) = mpsc::channel();
+    let compaction_thread = thread::spawn(move || {
+        compaction_attempted_tx.send(()).unwrap();
+        let _compaction_guard = compaction_storage.compaction_gate();
+        compaction_acquired_tx.send(()).unwrap();
+        ChunkStorage::compact_compactors_with_changes(
+            compaction_storage
+                .persisted
+                .series_index_path
+                .as_deref()
+                .and_then(Path::parent),
+            compaction_storage.persisted.numeric_compactor.as_ref(),
+            compaction_storage.persisted.blob_compactor.as_ref(),
+            Some(compaction_storage.visibility.tombstones.as_ref()),
+            Some(compaction_storage.observability.as_ref()),
+            |changes| {
+                compaction_storage
+                    .persisted
+                    .pending_persisted_segment_diff
+                    .lock()
+                    .merge(changes);
+                compaction_storage
+                    .persisted
+                    .persisted_index_dirty
+                    .store(true, Ordering::SeqCst);
+            },
+        )
+    });
+
+    compaction_attempted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("compaction thread did not attempt the gate");
+    let compaction_acquired_while_staged = compaction_acquired_rx
+        .recv_timeout(Duration::from_millis(200))
+        .is_ok();
+
+    release_tx.send(()).unwrap();
+    let flush_result = flush_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("flush did not finish after releasing the staged segment hook");
+    flush_thread.join().unwrap();
+    if !compaction_acquired_while_staged {
+        compaction_acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("compaction did not acquire the gate after flush publication");
+    }
+    let compaction_result = compaction_thread.join().unwrap();
+
+    assert!(
+        !compaction_acquired_while_staged,
+        "compaction must not inspect a staged flush root before catalog publication",
+    );
+    assert!(flush_result.is_ok());
+    assert!(compaction_result.unwrap());
+
+    storage.refresh_dirty_persisted_segments_claimed().unwrap();
+    assert_eq!(
+        storage
+            .select("flush_compaction_fence", &labels, 0, 10)
+            .unwrap()
+            .len(),
+        8,
+    );
+
+    storage.clear_persist_post_publish_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn flush_snapshot_defers_active_to_sealed_handoff_without_advancing_wal() {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2573,7 +4004,7 @@ fn flush_snapshot_waits_for_active_to_sealed_publication() {
         ChunkStorage::new_with_data_path_and_options(
             2,
             Some(wal),
-            Some(lane_path),
+            Some(lane_path.clone()),
             None,
             1,
             options,
@@ -2617,28 +4048,31 @@ fn flush_snapshot_waits_for_active_to_sealed_publication() {
         .recv_timeout(Duration::from_secs(2))
         .expect("write did not reach the active-to-sealed publish boundary");
 
-    let flush_storage = Arc::clone(&storage);
-    let (flush_tx, flush_rx) = mpsc::channel();
-    let flush_thread = thread::spawn(move || {
-        flush_tx
-            .send(flush_storage.persist_segment_with_outcome())
-            .unwrap();
-    });
-
-    assert!(
-        flush_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "flush snapshot should wait while the finalized chunk is between active mutation and sealed publication",
+    let durable_before = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .current_durable_highwater();
+    let deferred = storage.persist_segment_with_outcome().unwrap();
+    assert!(!deferred.persisted);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert_eq!(
+        storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .current_durable_highwater(),
+        durable_before,
+        "a handoff no-op must not advance WAL durability",
     );
 
     publish_release_tx.send(()).unwrap();
 
     writer_thread.join().unwrap().unwrap();
-    let outcome = flush_rx
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .unwrap();
-    flush_thread.join().unwrap();
     storage.clear_ingest_pre_sealed_chunk_publish_hook();
+    let outcome = storage.persist_segment_with_outcome().unwrap();
 
     assert!(outcome.persisted);
     assert_eq!(outcome.series, 1);
@@ -2869,9 +4303,17 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -2893,6 +4335,14 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
         let full_scans = Arc::clone(&full_scans);
         move || {
             full_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let catalog_publications = Arc::new(AtomicUsize::new(0));
+    storage.set_catalog_transition_post_catalog_publication_hook({
+        let catalog_publications = Arc::clone(&catalog_publications);
+        move || {
+            catalog_publications.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     });
 
@@ -2933,8 +4383,354 @@ fn flush_pipeline_runs_steady_state_post_flush_maintenance_without_full_inventor
         0,
         "steady-state post-flush maintenance should reuse the persisted catalog instead of rescanning the segment tree",
     );
+    assert_eq!(
+        catalog_publications.load(Ordering::SeqCst),
+        1,
+        "the flush should publish once without a redundant no-op catalog rewrite",
+    );
 
     storage.clear_full_inventory_scan_hook();
+    storage.clear_catalog_transition_post_catalog_publication_hook();
+}
+
+#[test]
+fn background_retention_page_expires_only_one_bounded_inventory_page_per_wake() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_retention_page", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=7 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(1, segment_id as f64)],
+        );
+    }
+    let storage = bounded_retention_page_storage(&lane_path, 8, 3);
+    storage.persist_series_registry_index().unwrap();
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let registry_catalog_store =
+        super::super::registry_catalog::catalog_store_path(&checkpoint_path);
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        8
+    );
+    let inspected = Arc::new(AtomicUsize::new(0));
+    storage.set_background_retention_inspect_hook({
+        let inspected = Arc::clone(&inspected);
+        move || {
+            inspected.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    mark_post_flush_maintenance_pending(&storage);
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        4
+    );
+    assert_eq!(inspected.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        5,
+        "the first page should remove exactly three catalog entry files"
+    );
+    assert!(storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        1
+    );
+    assert_eq!(inspected.load(Ordering::SeqCst), 6);
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        2,
+        "the second page should remove exactly three more catalog entry files"
+    );
+    assert!(storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    assert_eq!(inspected.load(Ordering::SeqCst), 7);
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        1,
+        "an empty inventory retains only the bounded catalog manifest"
+    );
+    assert!(
+        !super::super::registry_catalog::catalog_path(&checkpoint_path).exists(),
+        "the first bounded page should retire the stale complete JSON snapshot"
+    );
+    assert!(!storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+
+    storage.clear_background_retention_inspect_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn background_retention_page_respects_modeled_source_byte_limit_for_rewrites() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_retention_bytes", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let first_root = write_numeric_segment_to_path(
+        &lane_path,
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(80, 1.0), (95, 2.0)],
+    );
+    let second_root = write_numeric_segment_to_path(
+        &lane_path,
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(80, 3.0), (95, 4.0)],
+    );
+    let one_source_bytes = modeled_retention_rewrite_candidate_bytes(&first_root)
+        .max(modeled_retention_rewrite_candidate_bytes(&second_root));
+    let storage = bounded_retention_page_storage_with_bytes(&lane_path, 3, 10, one_source_bytes);
+
+    mark_post_flush_maintenance_pending(&storage);
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert!(!first_root.exists());
+    assert!(second_root.exists());
+    assert!(storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(std::sync::atomic::Ordering::Acquire));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn background_retention_exact_page_multiple_needs_terminal_empty_page_before_clean_claim() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_retention_clean", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=6 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(95, segment_id as f64)],
+        );
+    }
+    let storage = bounded_retention_page_storage(&lane_path, 7, 2);
+    let inspected = Arc::new(AtomicUsize::new(0));
+    storage.set_background_retention_inspect_hook({
+        let inspected = Arc::clone(&inspected);
+        move || {
+            inspected.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    mark_post_flush_maintenance_pending(&storage);
+    for expected_inspections in [2, 4, 6] {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        assert_eq!(inspected.load(Ordering::SeqCst), expected_inspections);
+        assert!(storage
+            .coordination
+            .post_flush_maintenance_pending
+            .load(Ordering::Acquire));
+    }
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(inspected.load(Ordering::SeqCst), 6);
+    assert!(!storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        6,
+        "a clean bounded cycle must not publish a partial inventory as a full no-op"
+    );
+
+    storage.clear_background_retention_inspect_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn background_retention_publication_error_retries_cursor_then_reaches_later_segments() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_retention_retry", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=5 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(1, segment_id as f64)],
+        );
+    }
+    let storage = bounded_retention_page_storage(&lane_path, 6, 2);
+    storage.persist_series_registry_index().unwrap();
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let registry_catalog_store =
+        super::super::registry_catalog::catalog_store_path(&checkpoint_path);
+    let fail_once = Arc::new(AtomicBool::new(true));
+    storage.set_catalog_transition_post_index_mutation_hook({
+        let fail_once = Arc::clone(&fail_once);
+        move || {
+            if fail_once.swap(false, Ordering::SeqCst) {
+                Err(TsinkError::Other(
+                    "injected bounded retention publication failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    });
+
+    mark_post_flush_maintenance_pending(&storage);
+    let err = storage.run_post_flush_maintenance_if_pending().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("injected bounded retention publication failure"));
+    assert!(storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        6,
+        "failure before sidecar publication must retain the original five entries"
+    );
+    assert!(storage
+        .coordination
+        .background_retention_maintenance_cursor
+        .lock()
+        .after_root
+        .is_none());
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        3,
+        "retry must finish the durable failed page before the dirty catalog is refreshed"
+    );
+    assert_eq!(
+        std::fs::read_dir(&registry_catalog_store).unwrap().count(),
+        4,
+        "retry must reconstruct and remove both source keys after index mutation"
+    );
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+    assert!(storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire));
+
+    let mut continuation_passes = 0usize;
+    while storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .len()
+        > 1
+    {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        continuation_passes += 1;
+        assert!(
+            continuation_passes < 64,
+            "bounded catalog reconciliation failed to resume retention after publication recovery"
+        );
+    }
+    assert!(
+        continuation_passes > 1,
+        "unknown-dirty catalog recovery should retain its finite continuation boundary"
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        1,
+        "the cursor retry must not starve segments after the recovered page"
+    );
+
+    storage.clear_catalog_transition_post_index_mutation_hook();
+    storage.close().unwrap();
 }
 
 #[test]
@@ -2985,9 +4781,17 @@ fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_s
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3121,9 +4925,17 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3142,6 +4954,7 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
         )
         .unwrap(),
     );
+    install_shared_object_store_writer_lock_for_test(storage.as_ref(), object_store_dir.path());
     storage
         .apply_loaded_segment_indexes(load_segment_indexes(&hot_lane).unwrap(), false)
         .unwrap();
@@ -3278,9 +5091,17 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
             write_timeout: Duration::from_secs(1),
             memory_budget_bytes: u64::MAX,
             cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
             wal_size_limit_bytes: u64::MAX,
             admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
             background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
@@ -3292,6 +5113,7 @@ fn background_post_flush_maintenance_syncs_registry_catalog_after_tier_move() {
         },
     )
     .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
     storage
         .apply_loaded_segment_indexes(load_segment_indexes(&hot_lane).unwrap(), false)
         .unwrap();
@@ -3373,9 +5195,17 @@ fn flush_pipeline_returns_while_background_post_flush_maintenance_is_staged() {
                 write_timeout: Duration::from_secs(1),
                 memory_budget_bytes: u64::MAX,
                 cardinality_limit: usize::MAX,
+                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+                max_new_series_per_window: None,
+                new_series_window_units: 1,
+                new_series_window_nanos: 60_000_000_000,
+                write_batch_limits: Default::default(),
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+                maintenance_max_items_per_pass: 1_024,
+                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
                 metadata_shard_count: None,
@@ -3394,6 +5224,7 @@ fn flush_pipeline_returns_while_background_post_flush_maintenance_is_staged() {
         )
         .unwrap(),
     );
+    install_shared_object_store_writer_lock_for_test(storage.as_ref(), object_store_dir.path());
     storage
         .apply_loaded_segment_indexes(load_segment_indexes(&hot_lane).unwrap(), false)
         .unwrap();

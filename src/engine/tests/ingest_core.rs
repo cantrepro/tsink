@@ -967,6 +967,7 @@ fn select_sorts_manual_unsorted_chunk_without_payload() {
                 },
             ],
             encoded_payload: Vec::new(),
+            wal_lowwater: WalHighWatermark::default(),
             wal_highwater: WalHighWatermark::default(),
         },
     );

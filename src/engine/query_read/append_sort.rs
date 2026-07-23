@@ -10,15 +10,23 @@ impl ChunkStorage {
         end: i64,
         snapshot: SeriesReadSnapshot,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
     ) -> Result<PersistedTierFetchStats> {
+        let mut working_reservation = reserve_query_read_working_set(
+            execution,
+            &snapshot,
+            snapshot.analysis.estimated_points,
+        )?;
         let SeriesReadSnapshot {
             persisted,
             sealed_chunks,
             active_points,
             analysis,
+            query_reservation: _source_snapshot_reservation,
         } = snapshot;
 
         out.clear();
+        out.reserve(analysis.estimated_points);
         let persisted_stats = decode_append_sort_sources_into(
             &persisted,
             &sealed_chunks,
@@ -26,8 +34,12 @@ impl ChunkStorage {
             start,
             end,
             out,
+            execution,
         )?;
         self.finalize_append_sort_points(series_id, analysis, out);
+        if let Some(reservation) = working_reservation.as_mut() {
+            reservation.resize(modeled_points_bytes(out))?;
+        }
         Ok(persisted_stats)
     }
 
@@ -38,6 +50,7 @@ impl ChunkStorage {
         end: i64,
         snapshot: SeriesReadSnapshot,
         pagination: RawSeriesPagination,
+        execution: Option<&QueryExecution>,
     ) -> Result<RawSeriesScanPage> {
         let mut points = Vec::new();
         let stats = self.execute_series_read_append_sort_path(
@@ -46,6 +59,7 @@ impl ChunkStorage {
             end,
             snapshot,
             &mut points,
+            execution,
         )?;
         let total_rows = points.len();
         let rows_consumed = pagination.rows_consumed(total_rows);
@@ -94,10 +108,15 @@ fn decode_append_sort_sources_into(
     start: i64,
     end: i64,
     out: &mut Vec<DataPoint>,
+    execution: Option<&QueryExecution>,
 ) -> Result<PersistedTierFetchStats> {
     let mut persisted_stats = PersistedTierFetchStats::default();
 
     for chunk_ref in &persisted.chunks {
+        if let Some(execution) = execution {
+            execution.checkpoint()?;
+            execution.charge_samples_scanned(u64::from(chunk_ref.point_count))?;
+        }
         let decode_started = Instant::now();
         let payload = persisted_chunk_payload(&persisted.segment_maps, chunk_ref)?;
         decode_encoded_chunk_payload_in_range_into(
@@ -119,6 +138,10 @@ fn decode_append_sort_sources_into(
     }
 
     for chunk in sealed_chunks {
+        if let Some(execution) = execution {
+            execution.checkpoint()?;
+            execution.charge_samples_scanned(u64::from(chunk.header.point_count))?;
+        }
         decode_chunk_points_in_range_into(chunk, start, end, out)?;
     }
 

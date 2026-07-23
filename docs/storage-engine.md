@@ -21,7 +21,8 @@ This document describes the internal architecture of the tsink storage engine: h
 13. [Tiered Storage](#tiered-storage)
 14. [Tombstones and Deletion](#tombstones-and-deletion)
 15. [Memory Budget and Backpressure](#memory-budget-and-backpressure)
-16. [Directory Layout](#directory-layout)
+16. [Close and Shutdown](#close-and-shutdown)
+17. [Directory Layout](#directory-layout)
 
 ---
 
@@ -75,6 +76,7 @@ A non-empty call to `insert_rows` is processed through a five-stage ingest pipel
 ```
 insert_rows(rows)
     │
+    ├─ 0. Admit       — check row/input limits and atomically reserve modeled transient memory
     ├─ 1. Resolve     — validate metrics/labels; look up or provisionally create series IDs
     ├─ 2. Prepare     — validate lanes, value families, retention/partitions, and admission;
     │                  encode the candidate WAL payloads
@@ -87,9 +89,12 @@ All five phases run inside registry write-transaction shard locks scoped to the 
 batch. These locks keep provisional series identity, staged WAL state, and in-memory application
 inside one intended write boundary. They are fine-grained shards rather than one global mutex.
 
-For a non-empty batch, a write permit is acquired from a semaphore bounded by `max_writers` before
-entering stage 1. If the memory budget is exhausted, admission control parks the writer until
-flushing reclaims budget.
+For a non-empty batch, row-count and modeled-input-byte checks run before tsink clones an identity
+or value. Admission then reserves the conservative peak for coexisting preparation structures, WAL
+encoding, indexed outcomes, and retained-growth overlap. A write permit is acquired from a semaphore
+bounded by `max_writers` before entering stage 1. If the memory budget is exhausted, admission
+control parks the writer until flushing reclaims budget. The cloneable lease is shared by retry and
+best-effort sub-operations and its final `Drop` releases it on every exit path.
 
 Both public insert methods return one batch error, rather than per-row outcomes, when the input is
 rejected; none of those rows is accepted. Apply stages fallible active-state rotations and chunk
@@ -161,6 +166,11 @@ A separate file `wal.published` records the highest `(segment, frame)` pair that
 | `Salvage` | Skips corrupted frames whose boundaries are intact; quarantines the corrupt segment and continues from the next. |
 
 On open, if the last active segment is found corrupt, it is quarantined (left in place) and a fresh segment is started.
+
+Lifecycle replay does not collect the WAL into one pending write. It reserves each bounded frame
+before payload allocation, applies definitions singly, and decodes one sample batch at a time under
+that same lease. Decoded sample scratch has an intrinsic 256 MiB modeled ceiling in addition to
+optional configured write-batch limits.
 
 ---
 
@@ -235,6 +245,34 @@ The encoder tries all three codecs (skipping `FixedStepRle` if the series is not
 
 When a segment file is written, each chunk payload is optionally recompressed with **zstd level 1** (`CHUNK_FLAG_PAYLOAD_ZSTD` flag in the chunk record). This second compression pass is applied per-chunk and its output is accepted only when it is smaller than the raw encoded payload.
 
+Persisted decode has format-level safety ceilings in addition to configurable resource budgets.
+Decoded `series`, `postings`, `chunk_index`, and registry checkpoint files are limited to 256 MiB;
+one decoded chunk payload and one modeled full-chunk decode peak are also limited to 256 MiB.
+`chunks.bin` is limited to 1 GiB, including the aggregate decoded payload retained by a full segment
+load, and a chunk remains limited to 65,535 points by its `u16` header field. Writers reject output
+above the same compression-input ceilings.
+
+Before reserving count-driven vectors, readers prove fixed-width tables and label-pair blocks fit in
+the bounded file. Zstd output is decoded through a fixed 16 KiB transfer buffer into one preflighted
+destination, stops if actual output exceeds the declared length, and requires the final length to
+match exactly. Uncompressed framed metadata is borrowed from the already bounded input instead of
+being copied. A full segment load reads and releases its metadata inputs one file at a time, then
+moves decoded chunk payloads into their final series groups instead of cloning them. These are
+corruption and allocation-amplification guards, not a claim that the process
+uses at most those values; resource profiles may enforce lower limits and other simultaneously
+retained structures still contribute to memory use.
+
+The version-2 byte layout did not change. Existing files within these ceilings remain readable; a
+previously representable oversized file is now rejected explicitly rather than being allowed to
+drive an unchecked allocation.
+
+Before persistent startup materializes its registry, inventory, or loaded segment indexes, a
+single conservative admission ledger covers the base registry plus all incremental files and every
+numeric/blob/tier segment. It charges physical mapping lengths and expanded decoded/index state,
+and uses the lower of the configured startup budget and the format ceiling for individual metadata
+decodes. Admission is completed before corrupt-segment quarantine or compaction recovery mutates
+durable names; `MemoryBudgetExceeded.required` reports the next exact modeled threshold.
+
 ### Block-level timestamp search index
 
 To support sub-chunk time range seeks without decompressing the whole payload, the encoder builds an in-memory **search index** over 64-point anchor blocks:
@@ -250,12 +288,35 @@ Queries use the search index to identify the candidate block and then decompress
 
 A background thread runs the flush pipeline on a configurable interval (default **250 ms**):
 
-1. **Snapshot sealed chunks** — collect all sealed chunks whose sequence numbers exceed the persisted watermark for each series.
-2. **Write segment files** — group chunks by lane and write a new L0 segment directory using `SegmentWriter`.
-3. **Advance WAL high-watermark** — update `wal.published` to the maximum `wal_highwater` across all flushed chunks.
-4. **Trim WAL** — delete WAL segments entirely behind the new high-watermark.
-5. **Publish persisted catalog** — atomically swap the in-memory persisted index to include the new segment, making it visible to queries.
-6. **Release memory** — update persisted watermarks so sealed chunks can be evicted to free memory budget.
+For WAL-backed, non-tiered storage under normal memory and WAL pressure, the timed selector defers
+the current partition head until it contains at least half of its currently allocated point block.
+Older/non-current and already-sealed chunks remain immediately eligible. No-WAL storage, tiered
+publication, retained-memory pressure, and finite-WAL pressure admit younger current heads; an
+explicit flush and close always drain them. This fill-aware rule keeps the WAL as the durable copy
+of low-rate recent points without fragmenting the persisted index every 250 ms.
+
+1. **Select replay-closed work** — bounded background passes take a global sealed-chunk sequence prefix subject to item and modeled-byte limits. With a WAL, the selected maximum frame must be strictly before every deferred sealed/active floor.
+2. **Write and verify segment files** — group selected chunks by lane, atomically publish new L0 directories, then load and validate their indexes.
+3. **Persist recovery metadata** — persist the selected registry delta required to decode the new roots. A bounded pass does not rebuild the complete registry catalog; the serialized persisted-refresh owner later applies the exact root delta to its per-segment sidecar.
+4. **Publish persisted visibility** — under the catalog visibility fence, install the verified indexes and make the roots query-visible as one transition.
+5. **Release sealed memory** — only after successful visibility publication, advance persisted chunk watermarks, remove pending locators, and evict covered sealed chunks.
+6. **Advance durability and trim safely** — mark the selected replay-closed WAL high-water mark durable, then reset/trim only when no newer committed write makes that reset unsafe.
+
+Any failure before step 4 rolls back the staged roots and leaves WAL durability and the pending
+sealed prefix unchanged for retry. Lowering a segment checkpoint below selected data would duplicate
+it on replay, while advancing through a deferred floor would skip unpersisted data; the closure test
+rejects both outcomes.
+
+For non-tiered storage, step 4 accounts the exact added/removed roots and updates segment counters
+without rebuilding the live segment inventory. Registry validation state lives in
+`series_index.catalog.d/`: one bounded manifest plus one fingerprint entry per segment.
+A root-changing maintenance page first publishes its bounded intent in the manifest, applies only
+the named removes/upserts, and then marks that intent complete. The aggregate series fingerprint is
+cleared before mutation, so an interrupted page cannot falsely enable the registry fast path;
+retry replays the same intent idempotently. Complete foreground/startup checkpoints rebuild that
+fingerprint and retain the v2 JSON compatibility snapshot. Tiered storage still publishes complete
+local and shared segment-catalog snapshots; that monolithic catalog format remains proportional to
+the live catalog.
 
 ---
 
@@ -371,7 +432,16 @@ The registry is split across **64 shards** (hash-partitioned by metric+label key
 
 ### Persistence
 
-The registry is checkpointed to `series_index.bin` (magic `RIDX`, version 2). Incremental changes since the last full checkpoint are appended to `series_index.delta.bin` or sharded files under `series_index.delta.d/`. On startup the base checkpoint is loaded first, then delta files are replayed in order.
+The registry is checkpointed to `series_index.bin` (magic `RIDX`, version 2). Startup remains
+compatible with the legacy `series_index.delta.bin` sidecar and immutable
+`series_index.delta.d/delta-<nonce>.bin` files. New incremental publications use a checksummed
+`RJNL` wrapper: small registry subsets are merged into `journal-active.bin` up to 1,024 series and
+4 MiB of stored/decoded payload, then the active file is parent-synced under an immutable
+`journal-<nonce>.bin` name before a replacement active generation is published. A crash between
+those two publications leaves the sealed generation replayable, and a torn or checksum-invalid
+managed journal fails closed. On startup the base checkpoint is loaded first, then all recognized
+legacy and journal generations are merged by stable series ID; unknown directory entries are never
+treated as registry data or removed by rollover/checkpoint cleanup.
 
 Series IDs are `u64` values assigned from a monotonically increasing counter (backed by an `AtomicU64`).
 
@@ -414,6 +484,17 @@ Segment chunk files are opened as read-only memory maps (`PlatformMmap` backed b
 
 Points from multiple sources are merged and de-duplicated when necessary. Rollup materialization is checked before falling back to raw scan; if a matching rollup policy covers the query's resolution, the materialized downsampled series is used instead.
 
+Rollup maintenance source reads use the same `QueryExecution` accounting as foreground reads. They
+inherit every finite instance scan, result, intermediate-memory, concurrency, and deadline limit;
+the finite maintenance byte ceiling can only tighten that envelope. Snapshot and append-sort
+working sets reserve before allocation, so a source that cannot fit returns a structured query
+limit error instead of a partial vector. Background rollup treats that error as source-local and
+continues later sources in its admitted postings page. Finite explicit rollup triggers share the
+same seek cursor and process one item/byte-bounded page; their snapshot reports whether another
+call is required and the next policy/series position. Building status uses accumulated traversal
+counters instead of a fresh full source scan. `ExpertUnlimited` retains its explicit unbounded
+full-cycle manual behavior unless the query or maintenance controls are overridden.
+
 ---
 
 ## Tiered Storage
@@ -432,24 +513,63 @@ After flushing a new segment, the post-flush maintenance policy plan (`PostFlush
 - **Rewrite** — re-encode a segment before moving (e.g., apply pending tombstones).
 - **Expire** — delete segments whose `max_ts` has aged out of the retention window.
 
+The persisted-refresh worker evaluates one root-ordered inventory page per wake. Each inspected
+descriptor consumes the maintenance item/byte allowance; every selected rewrite, move, or expiry
+also charges the logical source bytes declared by the segment manifest. A page publishes only its exact root delta,
+and its cursor advances only after the two-phase replacement finishes. A publication error therefore
+retries the same cursor, while new roots behind the cursor are picked up after the finite cycle wraps.
+Lifecycle startup, close, and capacity-reclamation sweeps remain complete strict scans.
+
+Moves, rewrites, and expiry are published through the two-phase post-flush replacement protocol in
+[ADR 0004](adr/0004-post-flush-segment-replacement.md). `Prepared` is rollback-safe; `Committing`
+keeps outputs and converges source retirement. A pending marker fences compaction, snapshot export,
+and inventory scans until runtime or startup recovery completes.
+
 A `segment_catalog.bin` file on the object store serves as the authoritative inventory of remote segments so the local node can rebuild its view on startup or after a remote catalog refresh (default every **5 seconds**).
+
+The ordinary local registry sidecar is incremental: a root/action page touches only its bounded
+manifest intent and the named segment entry files. Its namespace is capped at 16,382 live entries,
+its serialized pending intent at 16 MiB, its manifest/entry decodes at 17 MiB/16 KiB, and complete
+checkpoints prune recognized stale entries. Legacy v2 JSON remains readable behind a 64 MiB decode
+ceiling and is migrated by the next startup/complete checkpoint.
+
+A finite non-tiered unknown-dirty runtime refresh scans in charged lane/level pages and retains a
+deduplicated snapshot within the maintenance byte ceiling and fixed 16,384-entry namespace. It
+publishes no partial inventory. Once scanning reaches its terminal probe, stable add and prune
+cursors publish exact root deltas; failure retries the same intent, visibility changes restart the
+cycle, and startup recovery discards an interrupted cursor and hydrates strictly from disk. The
+tiered local/shared segment catalog remains a monolithic crash-safe snapshot. Tiered publication,
+`ExpertUnlimited`, startup, and close therefore retain complete-inventory behavior.
+
+The object-store root has a single-writer invariant. One read-write engine holds
+`.tsink-writer.lock` for its lifetime and revalidates that pathname's file identity before shared
+tier or catalog mutation; a second read-write engine is rejected even when it uses a different
+local data path. Compute-only engines do not take the writer lease and may share the root. See
+[ADR 0005](adr/0005-cross-filesystem-tombstone-transactions.md) for the lease and delete-publication
+protocol.
 
 ---
 
 ## Tombstones and Deletion
 
-Deleting a series or a time range writes a `TombstoneRange { start, end }` record to `tombstones.json` (version 1 format) or the sharded `tombstones.store/` store (version 2, 256 shards). Tombstones are **not** applied inline at write time; instead:
+Deleting a series or a time range writes a `TombstoneRange { start, end }` record to `tombstones.json` (version 1 format) or the sharded `tombstones.store/` store (version 2, 256 shards). A local two-phase coordinator makes multi-lane publication crash recoverable. With tiered storage, one complete remote manifest is published first as the compute-only visibility anchor; the API does not acknowledge the delete as committed before that anchor is durable. Tombstones are **not** applied inline at write time; instead:
 
 - **Query path** — active and sealed chunks are filtered at read time against the in-memory tombstone map.
 - **Compaction path** — tombstone ranges are applied during the merge step so compacted output segments no longer contain deleted data.
 
-This design keeps the write path unaffected by deletions while ensuring deleted data is eventually reclaimed during compaction.
+Catalog refresh publishes recovered tombstones before segment changes, and compaction reads the
+current authoritative tombstone map. This keeps deleted samples hidden during retries and ensures
+they are eventually reclaimed. The full protocol is specified in
+[ADR 0005](adr/0005-cross-filesystem-tombstone-transactions.md).
 
 ---
 
 ## Memory Budget and Backpressure
 
-The engine tracks two memory categories: active builder bytes and sealed chunk bytes. Both are accounted through `MemoryDeltaBytes` deltas applied atomically to a per-shard counter.
+The modeled storage budget covers active and sealed chunks, registry and metadata state, persisted
+indexes and mapping lengths, tombstones, and conservative transient write/replay reservations.
+Retained components use incremental deltas; transient leases use one shared atomic current counter
+so concurrent writers cannot all pass a stale budget check.
 
 When the total exceeds `memory_budget_bytes`:
 
@@ -458,6 +578,42 @@ When the total exceeds `memory_budget_bytes`:
 3. If the budget is still exhausted after the write timeout (default **30 s**), the write returns an error.
 
 A separate `cardinality_limit` caps the number of unique series that can be registered. Writes that would exceed the limit are rejected.
+
+The caller-owned input slice and the fixed WAL `BufWriter` remain outside this budget. Effective
+limits report the writer-buffer capacity, while memory observability reports current/peak transient
+bytes, admitted leases, rejected leases, and the named excluded categories. This is modeled engine
+memory, not a process-RSS cap.
+
+---
+
+## Close and Shutdown
+
+`Storage::close()` first changes the lifecycle from `OPEN` to `CLOSING` and unparks every owned
+worker. It then takes the shared maintenance gate, drains every writer permit, takes the rollup
+transaction fence, and preflights the compaction gate. The maintenance, writer-drain, and
+compaction waits each use the configured `write_timeout`; a contended lifecycle gate returns
+`LifecycleTimeout`, restores `OPEN`, and leaves WAL and in-memory state intact for retry.
+
+After quiescence, close finalizes every active partition head, persists and verifies all pending
+sealed chunks, completes retention, runs at most 128 compaction settling passes, refreshes dirty
+persisted state, and checkpoints tombstone and series-registry recovery metadata. It changes the
+lifecycle to `CLOSED` only after those durability stages succeed. Owned workers are then joined in
+the order compaction, flush, persisted refresh, and rollup; the data-path process lease is released
+after the last join.
+
+This procedure bounds the outer lifecycle waits and compaction pass count, but it is not a portable
+wall-clock deadline. Complete drains scale with the accepted state captured after writer
+quiescence, and close intentionally completes unknown-dirty catalog reconciliation rather than
+resuming the finite background cursor.
+Inner publication locks are not individually timed; production mutators are fenced by the outer
+drain, while a concurrent query can briefly retain the visibility read fence during its bounded
+source snapshot.
+More importantly, blocking file writes, `fsync`, directory sync, rename, and removal cannot be
+cancelled safely after they enter the kernel. Returning early could claim failure while durability
+actually commits later, or release the data-path lease over an in-flight mutation. Close therefore
+waits for an entered filesystem operation and reports its actual error. The background
+observability snapshot reports close outcomes, coordination waits/timeouts, compaction passes,
+whole-call duration, and join duration.
 
 ---
 

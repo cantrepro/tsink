@@ -4,6 +4,8 @@ use super::super::super::{
     SeriesDefinitionFrame, SeriesId, SeriesResolution, SeriesValueFamily, TsinkError, Value,
     ValueLane, WalHighWatermark,
 };
+use crate::engine::series::SeriesCreationRateReservation;
+use crate::engine::storage_engine::WriteTransientMemoryReservation;
 use crate::engine::wal::LogicalWalWrite;
 use crate::WriteAcknowledgement;
 
@@ -30,6 +32,8 @@ pub(super) struct ResolvedWrite {
     pub(super) pending_points: Vec<PendingPoint>,
     pub(super) new_series_defs: Vec<SeriesDefinitionFrame>,
     pub(super) created_series: Vec<SeriesResolution>,
+    pub(super) series_creation_rate_reservation: Option<SeriesCreationRateReservation>,
+    pub(super) transient_memory: WriteTransientMemoryReservation,
 }
 
 #[derive(Debug)]
@@ -54,6 +58,8 @@ pub(super) struct StagedWrite<'a> {
 pub(super) struct AppliedWrite<'a> {
     pub(super) prepared_wal: Option<PreparedWalWrite>,
     pub(super) staged_wal: Option<StagedWalWrite<'a>>,
+    pub(super) series_creation_rate_reservation: Option<SeriesCreationRateReservation>,
+    pub(super) transient_memory: WriteTransientMemoryReservation,
 }
 
 pub(super) struct CommittedWrite {

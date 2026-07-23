@@ -73,6 +73,18 @@ impl ChunkStorage {
         );
     }
 
+    pub(in super::super) fn set_metadata_visibility_refresh_post_preflight_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(
+            &self
+                .persist_test_hooks
+                .metadata_visibility_refresh_post_preflight_hook,
+            hook,
+        );
+    }
+
     pub(in super::super) fn set_metadata_time_range_summary_hook<F>(&self, hook: F)
     where
         F: Fn() + Send + Sync + 'static,
@@ -145,6 +157,14 @@ impl ChunkStorage {
 
     pub(in super::super) fn clear_metadata_live_series_pre_prune_hook(&self) {
         super::clear_commit_hook(&self.persist_test_hooks.metadata_live_series_pre_prune_hook);
+    }
+
+    pub(in super::super) fn clear_metadata_visibility_refresh_post_preflight_hook(&self) {
+        super::clear_commit_hook(
+            &self
+                .persist_test_hooks
+                .metadata_visibility_refresh_post_preflight_hook,
+        );
     }
 
     pub(in super::super) fn clear_metadata_time_range_summary_hook(&self) {
@@ -243,6 +263,14 @@ impl ChunkStorage {
 
     pub(in super::super) fn invoke_metadata_time_range_summary_hook(&self) {
         super::invoke_commit_hook(&self.persist_test_hooks.metadata_time_range_summary_hook);
+    }
+
+    pub(in super::super) fn invoke_metadata_visibility_refresh_post_preflight_hook(&self) {
+        super::invoke_commit_hook(
+            &self
+                .persist_test_hooks
+                .metadata_visibility_refresh_post_preflight_hook,
+        );
     }
 
     pub(in super::super) fn invoke_metadata_time_range_segment_prune_hook(&self) {

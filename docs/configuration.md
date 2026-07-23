@@ -4,9 +4,12 @@ Complete listing of every configuration knob in tsink — the embedded library A
 
 Sections are ordered from most commonly used to most advanced.
 
-The individual memory, cardinality, WAL, disk, and concurrency controls below are not a complete
-resource profile. Their exact enforcement scope, effective post-build inspection API, and remaining
-gaps are documented in [Resource limits and profiles](resource-limits.md).
+`StorageBuilder::new()` selects the finite `Embedded` resource profile. Individual memory,
+cardinality, WAL, disk, query, async, and maintenance controls below become sparse overrides; they
+win even if `with_resource_profile(...)` is called later. The server selects the finite `Server`
+profile by default. Exact enforcement scope, versioned post-build inspection, provisional profile
+values, and migration guidance are documented in
+[Resource limits and profiles](resource-limits.md).
 
 ---
 
@@ -45,8 +48,10 @@ see the [embedded library guide](embedded-library.md) and
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
+| `with_resource_profile(profile)` | `ResourceProfile` | `Embedded` | Select `Test`, `Embedded`, `Edge`, `Server`, `Custom(ResourceLimits)`, or the legacy-migration `ExpertUnlimited` base. Existing low-level overrides are preserved. |
+| `clear_resource_limit_override(field)` / `clear_resource_limit_overrides()` | `ResourceLimitOverride` | — | Clear one override group or all groups and restore values from the selected base. |
 | `with_data_path(path)` | `PathBuf` | *(none)* | Root directory for all on-disk data (WAL, segments, metadata). Required for durable storage. |
-| `with_object_store_path(path)` | `PathBuf` | *(none)* | Root directory for tiered segment lanes (`hot/`, `warm/`, `cold/`). Required for tiered storage. |
+| `with_object_store_path(path)` | `PathBuf` | *(none)* | Root directory for tiered segment lanes (`hot/`, `warm/`, `cold/`). Required for tiered storage. At most one `ReadWrite` process may own a root; `ComputeOnly` readers may share it. |
 | `with_runtime_mode(mode)` | `StorageRuntimeMode` | `ReadWrite` | `ReadWrite` — full local instance. `ComputeOnly` — query node that reads from object store without persisting locally. |
 | `with_timestamp_precision(p)` | `TimestampPrecision` | `Nanoseconds` | Interpretation of raw integer timestamps: `Seconds`, `Milliseconds`, `Microseconds`, or `Nanoseconds`. Must match the precision of all ingested data. |
 
@@ -80,15 +85,18 @@ see the [embedded library guide](embedded-library.md) and
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
-| `with_memory_limit(n)` | `usize` | `usize::MAX` (no explicit limit) | Budget for the engine's accounted storage memory. This is not a hard total-process RSS cap; inspect `observability_snapshot()` for accounted and excluded categories. |
-| `with_cardinality_limit(n)` | `usize` | `usize::MAX` (unlimited) | Hard cap on the total number of unique series. Writes that would create a new series beyond this limit are rejected with a cardinality error. |
+| `with_memory_limit(n)` | `usize` | `512 MiB` (`Embedded`) | Budget for the engine's accounted storage memory. This is not a hard total-process RSS cap; inspect `observability_snapshot()` for accounted and excluded categories. |
+| `with_cardinality_limit(n)` | `usize` | `1,000,000` (`Embedded`) | Hard cap on the total number of unique series. Writes that would create a new series beyond this limit are rejected with a cardinality error. |
+| `with_max_labels_per_series(n)` | `usize` | `128` | Maximum labels in a submitted series identity. Values above the 65,535-label storage-format maximum fail during build. |
+| `with_max_series_identity_bytes(n)` | `usize` | `65536` | Maximum cumulative UTF-8 bytes in the metric name and all label names and values. |
+| `with_series_creation_rate_limit(n, window)` | `usize`, `Duration` | *(unset)* | Maximum successfully published new series in a fixed storage-clock window. Concurrent in-flight reservations count; failed writes release them. |
 
 ### WAL
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
 | `with_wal_enabled(bool)` | `bool` | `true` | Enable or disable the write-ahead log. Disabling removes write-time WAL recovery guarantees. |
-| `with_wal_size_limit(n)` | `usize` | `usize::MAX` (no explicit limit) | Maximum projected on-disk WAL size. A batch that would exceed the limit is rejected; WAL space is reclaimed after persisted state makes older records unnecessary. |
+| `with_wal_size_limit(n)` | `usize` | `512 MiB` (`Embedded`) | Maximum projected on-disk WAL size. A batch that would exceed the limit is rejected; WAL space is reclaimed after persisted state makes older records unnecessary. |
 | `with_wal_buffer_size(n)` | `usize` | `4096` | I/O buffer size for WAL writes. Larger buffers reduce syscall overhead on high-throughput workloads. |
 | `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` synchronizes each non-empty batch. `Periodic(duration)` checks the elapsed interval during a later append; it has no autonomous timer, so successful writes may be `Appended` until another write or lifecycle action synchronizes them. |
 | `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. |
@@ -98,6 +106,8 @@ see the [embedded library guide](embedded-library.md) and
 | Builder method | Type | Default | Description |
 |---|---|---|---|
 | `with_background_fail_fast(bool)` | `bool` | `true` | When `true`, a failure in any background worker (flush, compaction, remote segment refresh) immediately fences all further writes with an error. When `false`, the error is logged but writes continue. |
+| `with_maintenance_max_items_per_pass(n)` | `usize` | `100,000` (`Embedded`) | Maximum logical inventory items selected by one bounded maintenance pass, including retention/tiering roots inspected in one worker wake. A finite cap must cover the effective write-batch row limit. |
+| `with_maintenance_max_bytes_per_pass(n)` | `u64` | `512 MiB` (`Embedded`) | Maximum modeled source bytes selected by one bounded maintenance pass. Retention/tiering charges descriptor bytes and manifest-declared source bytes for every selected replacement action. A finite cap must be at least the effective accounted-memory limit so one admitted sealed chunk cannot be stranded. |
 
 ### Cluster / metadata sharding
 
@@ -129,11 +139,15 @@ tsink-server --help
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-path <PATH>` | *(none)* | Persist data under PATH. Without this flag, storage is purely in-memory. |
-| `--object-store-path <PATH>` | *(none)* | Object-store root for tiered segment lanes (`hot/`, `warm/`, `cold/`). Must not overlap `--data-path`. |
-| `--local-disk-limit <BYTES>` | *(unlimited)* | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
-| `--filesystem-free-headroom <BYTES>` | `0` | Filesystem free space that budget-integrated writes must leave available. |
-| `--maintenance-temp-reserve <BYTES>` | `0` | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
+| `--resource-profile <PROFILE>` | `server` | Core base profile: `test`, `embedded`, `edge`, `server`, or `expert-unlimited`. Explicit low-level flags override the selected base. |
+| `--data-path <PATH>` | *(none)* | Persist data under PATH. Required by `--cluster-enabled`; without it, only non-cluster storage can run purely in memory. |
+| `--object-store-path <PATH>` | *(none)* | Object-store root for tiered segment lanes (`hot/`, `warm/`, `cold/`). Must not overlap `--data-path`; at most one read-write process may own the root. |
+| `--local-disk-limit <BYTES>` | `256 GiB` (`Server`, when persistent) | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
+| `--filesystem-free-headroom <BYTES>` | `2 GiB` (`Server`, when persistent) | Filesystem free space that budget-integrated writes must leave available. |
+| `--maintenance-temp-reserve <BYTES>` | `16 GiB` (`Server`, when persistent) | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
+| `--offline-restore-root <PATH>` | *(none)* | Dedicated parent directory for bounded offline restore targets. Must be paired with `--offline-restore-disk-limit`, isolated from the live data and object-store roots, and a strict descendant of `--admin-path-prefix` when that prefix is set. |
+| `--offline-restore-disk-limit <BYTES>` | *(none)* | Finite logical limit shared by restore staging, restored targets, and cluster restore reports beneath `--offline-restore-root`. |
+| `--offline-restore-filesystem-free-headroom <BYTES>` | `0` | Filesystem free space that offline restore work must leave available. Requires the other two offline-restore flags. |
 | `--timestamp-precision <PRECISION>` | `ms` | Units for raw timestamps: `s`, `ms`, `us`, `ns`. |
 | `--retention <DURATION>` | `14d` | Data retention window (e.g. `7d`, `24h`, `90d`). |
 | `--hot-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which local segments move to the warm object-store tier. |
@@ -145,30 +159,74 @@ tsink-server --help
 | `--wal-sync-mode <MODE>` | `per-append` | `per-append` (synchronize each non-empty write) or `periodic` (append-driven interval, higher throughput). |
 | `--chunk-points <N>` | `2048` | Target data points per chunk (1–65535). |
 
-The three disk values accept an integer byte count or a case-insensitive binary `K`, `M`, `G`, or
-`T` suffix (for example, `512M` or `1.5G`). Setting `--local-disk-limit`, a non-zero
+Usage accounting has a separate finite memory/startup/read envelope:
+
+| Flag | Default | Description |
+|---|---:|---|
+| `--usage-ledger-recent-records <N>` | `8192` | Recent sequence-ordered records retained for raw export and time-bucket reports. Exact all-time summaries are stored separately. |
+| `--usage-ledger-max-tenants <N>` | `4096` | Maximum tenant keys in exact all-time summaries; an N+1 tenant record is rejected before ledger publication. |
+| `--usage-ledger-max-record-bytes <BYTES>` | `64K` | Maximum canonical JSON bytes in one record. |
+| `--usage-ledger-max-frame-bytes <BYTES>` | `8M` | Maximum JSON bytes in one single-record or atomic batch frame. |
+| `--usage-ledger-max-line-bytes <BYTES>` | `8388609` | Maximum frame plus line terminator read during startup. Must exceed the frame limit. |
+| `--usage-ledger-max-batch-records <N>` | `4096` | Maximum records in one atomic batch frame. |
+| `--usage-ledger-startup-scratch-bytes <BYTES>` | `32M` | Startup parsing envelope. Validation requires space for the line, decoded frame, and configured batch slots. |
+| `--usage-ledger-max-sequence-ranges <N>` | `4096` | Maximum disjoint legacy sequence ranges used for bounded duplicate validation. |
+| `--usage-report-default-records <N>` | `1000` | Default records aggregated by a time-filtered or bucketed report page. |
+| `--usage-report-max-records <N>` | `4096` | Maximum records aggregated by one report page. |
+| `--usage-report-max-response-bytes <BYTES>` | `4M` | Maximum encoded report response; overflow is a structured HTTP 413. |
+| `--usage-export-default-records <N>` | `1000` | Default raw records returned per export page. |
+| `--usage-export-max-records <N>` | `4096` | Maximum raw records returned per export page. |
+| `--usage-export-max-response-bytes <BYTES>` | `4M` | Maximum NDJSON bytes returned per export page. |
+
+All usage limits must be nonzero. The frame must fit a record, the line must fit a frame plus its
+newline, the atomic batch bound must cover the tenant bound, and the export byte maximum must fit
+one maximum-size record. Default page sizes cannot exceed their maxima, and the startup scratch
+value must satisfy the line/frame/batch relationship checked at startup. These effective values are
+returned in the usage journal under `limits`. They remain finite when the core resource profile is
+`ExpertUnlimited`; the server has no unlimited usage-ledger flag or zero sentinel.
+
+Disk values accept an integer byte count or a case-insensitive binary `K`, `M`, `G`, or `T` suffix
+(for example, `512M` or `1.5G`). Setting `--local-disk-limit`, a non-zero
 `--filesystem-free-headroom`, or a non-zero `--maintenance-temp-reserve` requires `--data-path`.
+Experimental cluster mode also requires `--data-path`, even when all three disk limits retain their
+defaults and even for a `query`-role node. There is no unleased temporary-root fallback for cluster
+persistence. Data-path-free operation is limited to non-cluster in-memory storage.
+Each read-write tiered engine also holds `<object-store-path>/.tsink-writer.lock` for its lifetime,
+independent of its local data-path lease. This prevents two distinct local stores from publishing
+incompatible shared tombstone or segment-catalog histories. Compute-only mode is exempt because it
+does not recover or mutate shared state.
 The maintenance reserve is unavailable to normal growth; maintenance may use it while still leaving
 the configured filesystem headroom. The headroom plus reserve must fit in the supported 64-bit byte
 range.
 
 Quota-aware admission currently covers core storage, metric metadata, exemplars, rules, the usage
-ledger, managed control-plane state, and the experimental hinted-handoff outbox. Cluster control
-state and log, cluster audit, deduplication files, and edge queues do not yet reserve against this
-budget. External snapshot destinations and external restore staging or target directories are also
-outside it.
-Snapshot destinations inside the managed root are rejected, as are online restore targets that
-overlap the live `--data-path`; describing external destinations as unbudgeted does not permit a
-restore over or inside the running server's data tree. Files beneath `--data-path` can still appear
+ledger, managed control-plane state, the experimental hinted-handoff outbox, cluster deduplication
+markers, the cluster audit log, the paired cluster control state and consensus log, and both the
+edge source queue and standalone edge-accept deduplication markers. The control pair stages both
+complete replacements under one `Cluster` reservation and publishes the authoritative log first.
+External snapshot destinations remain outside the shared live-data budget. Restore is fail-closed
+unless the paired offline-root and finite-limit flags are configured. The server holds a distinct
+cross-process lease on that root and uses one coordinator for standalone restore, both internal
+restore routes, cluster node targets, and the post-restore report. Targets must be strict
+descendants; the offline root must not overlap `--data-path` or `--object-store-path`. Snapshot
+destinations inside the offline root are rejected so export bytes cannot consume its separately
+bounded capacity. Online restore targets that overlap the live `--data-path` are also rejected.
+Files beneath `--data-path` can still appear
 in reconciled usage, but that accounting does not make excluded writers quota-safe.
 
 ### 2.3 Memory & cardinality
 
 | Flag | Default | Description |
 |---|---|---|
-| `--memory-limit <BYTES>` | *(unlimited)* | Global in-memory chunk budget, in bytes. Supports suffixes such as `1G`, `512M`. |
-| `--cardinality-limit <N>` | *(unlimited)* | Maximum number of unique series. New series are rejected once the limit is reached. |
-| `--max-writers <N>` | *(CPU count)* | Concurrent writer threads. |
+| `--memory-limit <BYTES>` | `2 GiB` (`Server`) | Global accounted storage-memory budget, in bytes. Supports suffixes such as `1G`, `512M`. |
+| `--maintenance-max-items-per-pass <N>` | `500,000` (`Server`) | Maximum logical items selected by one bounded maintenance pass. A finite override must be at least the effective write-batch row limit. |
+| `--maintenance-max-bytes-per-pass <BYTES>` | `2 GiB` (`Server`) | Maximum modeled bytes selected by one bounded maintenance pass. A finite override must be at least `--memory-limit`; raise both together when increasing memory. |
+| `--cardinality-limit <N>` | `10,000,000` (`Server`) | Maximum number of unique series. New series are rejected once the limit is reached. |
+| `--max-labels-per-series <N>` | `128` (core default) | Maximum labels in each submitted series identity. |
+| `--max-series-identity-bytes <BYTES>` | `65536` (core default) | Maximum cumulative metric and label UTF-8 bytes in one identity. |
+| `--max-new-series-per-window <N>` | `1,000,000` per profile window (`Server`) | Maximum new series that may publish per creation-rate window. Supplying this low-level override requires `--new-series-window`. |
+| `--new-series-window <DURATION>` | `60s` (`Server`) | Fixed storage-clock window for new-series admission. Supplying this low-level override requires `--max-new-series-per-window`. |
+| `--max-writers <N>` | `16` (`Server`) | Concurrent writer permits. |
 
 ### 2.4 Security & auth
 
@@ -191,7 +249,7 @@ Cluster mode is an experimental advanced capability, not part of tsink's primary
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable experimental cluster mode. |
+| `--cluster-enabled` | `false` | Enable experimental cluster mode. Requires `--data-path`. |
 | `--cluster-node-id <ID>` | *(required)* | Stable, unique identifier for this node. Must not change after initial startup. |
 | `--cluster-bind <HOST:PORT>` | *(none)* | Internal RPC bind/advertise address. Peers will connect to this address. |
 | `--cluster-node-role <ROLE>` | `hybrid` | `storage` — data only; `query` — query fan-out only; `hybrid` — both. |
@@ -354,6 +412,21 @@ Rebalance migrates shard ownership when nodes are added or removed.
 ### 6.7 Control plane (Raft)
 
 The control plane uses a Raft-based consensus protocol to manage cluster membership and shard assignments.
+
+Its on-disk consensus log uses schema v2 with a required authoritative `checkpointState` and
+restart-durable `steppedDownTerm`; the separate control-state file remains a repairable schema-v1
+mirror. Both files use the shared local-disk settings from section 2.2 and are charged to `Cluster`;
+there is no separate control-plane quota flag. Legacy v1 logs are rewritten to v2 on open, which
+creates a storage-format downgrade boundary for older binaries. A typed disk rejection is
+definitive only before consensus requires the candidate; a required candidate that cannot yet be
+made durable is retained behind the persistence fence until repair.
+
+Only committed `Active` members vote or assert leadership. Activation must follow control-log
+catch-up, and leadership transfer must follow committed activation; proof of newly activated
+leader eligibility to a lagging voter remains incomplete Phase 2 work. Authoritative repair may
+recreate or grow the mirror at the logical quota because the log already holds authority, while
+the complete temporary peak still observes physical-space and filesystem-headroom limits.
+An Active leader must transfer leadership before its own leave can be committed.
 
 | Variable | Default | Description |
 |---|---|---|

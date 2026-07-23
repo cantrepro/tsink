@@ -36,6 +36,19 @@ struct TombstoneMemoryMeasurementContext<'a> {
     tombstones: &'a RwLock<crate::engine::tombstone::TombstoneMap>,
 }
 
+#[derive(Clone, Copy)]
+struct WalMemoryMeasurementContext<'a> {
+    wal: Option<&'a crate::engine::wal::FramedWal>,
+}
+
+impl WalMemoryMeasurementContext<'_> {
+    fn series_definition_cache_memory_usage_bytes(self) -> usize {
+        self.wal
+            .map(crate::engine::wal::FramedWal::cached_series_definition_index_memory_usage_bytes)
+            .unwrap_or(0)
+    }
+}
+
 impl<'a> TombstoneMemoryMeasurementContext<'a> {
     fn tombstone_memory_usage_bytes(self) -> usize {
         let tombstones = self.tombstones.read();
@@ -113,6 +126,9 @@ pub(super) struct MemoryAccountingContext<'a> {
     persisted_index_used_bytes: &'a AtomicU64,
     persisted_mmap_used_bytes: &'a AtomicU64,
     tombstone_used_bytes: &'a AtomicU64,
+    tombstone_staged_bytes: &'a AtomicU64,
+    wal_series_definition_cache_used_bytes: &'a AtomicU64,
+    write_transient: &'a Arc<WriteTransientMemoryAccounting>,
     shared_used_bytes: &'a AtomicU64,
     chunks: ChunkContext<'a>,
     registry_memory: RegistryMemoryContext<'a>,
@@ -122,6 +138,7 @@ pub(super) struct MemoryAccountingContext<'a> {
     persisted_sealed: PersistedSealedBudgetContext<'a>,
     lifecycle: LifecyclePublicationContext<'a>,
     tombstones: TombstoneMemoryMeasurementContext<'a>,
+    wal: WalMemoryMeasurementContext<'a>,
 }
 
 impl<'a> MemoryAccountingContext<'a> {
@@ -139,6 +156,8 @@ impl<'a> MemoryAccountingContext<'a> {
 
     pub(super) fn used_value(self) -> usize {
         Self::tracked_bytes(self.used_bytes)
+            .saturating_add(Self::tracked_bytes(self.tombstone_staged_bytes))
+            .saturating_add(self.write_transient.current_bytes())
     }
 
     pub(super) fn component_value(component: &AtomicU64) -> usize {
@@ -183,12 +202,15 @@ impl<'a> MemoryAccountingContext<'a> {
         let persisted_index_used = self.lifecycle.measured_persisted_index_memory_usage_bytes();
         let persisted_mmap_used = self.lifecycle.measured_persisted_mmap_memory_usage_bytes();
         let tombstone_used = self.tombstones.tombstone_memory_usage_bytes();
+        let wal_series_definition_cache_used =
+            self.wal.series_definition_cache_memory_usage_bytes();
 
         let shared_used = registry_used
             .saturating_add(metadata_used)
             .saturating_add(persisted_index_used)
             .saturating_add(persisted_mmap_used)
-            .saturating_add(tombstone_used);
+            .saturating_add(tombstone_used)
+            .saturating_add(wal_series_definition_cache_used);
         let used = active_and_sealed_used.saturating_add(shared_used);
 
         Self::store_tracked_bytes(self.registry_used_bytes, registry_used);
@@ -196,9 +218,14 @@ impl<'a> MemoryAccountingContext<'a> {
         Self::store_tracked_bytes(self.persisted_index_used_bytes, persisted_index_used);
         Self::store_tracked_bytes(self.persisted_mmap_used_bytes, persisted_mmap_used);
         Self::store_tracked_bytes(self.tombstone_used_bytes, tombstone_used);
+        Self::store_tracked_bytes(
+            self.wal_series_definition_cache_used_bytes,
+            wal_series_definition_cache_used,
+        );
         Self::store_tracked_bytes(self.shared_used_bytes, shared_used);
         Self::store_tracked_bytes(self.used_bytes, used);
-        used
+        used.saturating_add(Self::tracked_bytes(self.tombstone_staged_bytes))
+            .saturating_add(self.write_transient.current_bytes())
     }
 }
 
@@ -213,6 +240,11 @@ impl ChunkStorage {
             persisted_index_used_bytes: &self.memory.persisted_index_used_bytes,
             persisted_mmap_used_bytes: &self.memory.persisted_mmap_used_bytes,
             tombstone_used_bytes: &self.memory.tombstone_used_bytes,
+            tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
+            wal_series_definition_cache_used_bytes: &self
+                .memory
+                .wal_series_definition_cache_used_bytes,
+            write_transient: &self.memory.write_transient,
             shared_used_bytes: &self.memory.shared_used_bytes,
             chunks: self.chunk_context(),
             registry_memory: self.registry_memory_context(),
@@ -226,6 +258,9 @@ impl ChunkStorage {
             lifecycle: self.lifecycle_publication_context(),
             tombstones: TombstoneMemoryMeasurementContext {
                 tombstones: &self.visibility.tombstones,
+            },
+            wal: WalMemoryMeasurementContext {
+                wal: self.persisted.wal.as_ref(),
             },
         }
     }

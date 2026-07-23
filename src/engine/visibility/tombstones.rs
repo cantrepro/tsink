@@ -1,10 +1,11 @@
 use super::super::tiering::{PersistedSegmentTier, SegmentLaneFamily};
 use super::*;
 use crate::engine::tombstone::TOMBSTONES_FILE_NAME;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct TombstoneIndexContext<'a> {
+    pub(in crate::engine::storage_engine) data_path: Option<&'a Path>,
     pub(in crate::engine::storage_engine) numeric_lane_path: Option<&'a Path>,
     pub(in crate::engine::storage_engine) blob_lane_path: Option<&'a Path>,
     pub(in crate::engine::storage_engine) tiered_storage:
@@ -15,47 +16,148 @@ pub(in crate::engine::storage_engine) struct TombstoneIndexContext<'a> {
 }
 
 impl<'a> TombstoneIndexContext<'a> {
-    fn tombstone_index_paths(self, include_tiered_storage: bool) -> Vec<PathBuf> {
-        let mut paths = BTreeSet::new();
+    fn tombstone_index_lanes(self, include_tiered_storage: bool) -> Vec<tombstone::TombstoneLane> {
+        let mut lanes = Vec::new();
         if let Some(path) = self.numeric_lane_path {
-            paths.insert(path.join(TOMBSTONES_FILE_NAME));
+            lanes.push(tombstone::TombstoneLane {
+                role: tombstone::TombstoneLaneRole::LocalNumeric,
+                namespace_root: self
+                    .data_path
+                    .or_else(|| path.parent())
+                    .unwrap_or(path)
+                    .to_path_buf(),
+                manifest_path: path.join(TOMBSTONES_FILE_NAME),
+            });
         }
         if let Some(path) = self.blob_lane_path {
-            paths.insert(path.join(TOMBSTONES_FILE_NAME));
+            lanes.push(tombstone::TombstoneLane {
+                role: tombstone::TombstoneLaneRole::LocalBlob,
+                namespace_root: self
+                    .data_path
+                    .or_else(|| path.parent())
+                    .unwrap_or(path)
+                    .to_path_buf(),
+                manifest_path: path.join(TOMBSTONES_FILE_NAME),
+            });
         }
         if include_tiered_storage {
             if let Some(config) = self.tiered_storage {
-                for lane in [SegmentLaneFamily::Numeric, SegmentLaneFamily::Blob] {
-                    for tier in [
+                for (tier, numeric_role, blob_role) in [
+                    (
                         PersistedSegmentTier::Hot,
+                        tombstone::TombstoneLaneRole::HotNumeric,
+                        tombstone::TombstoneLaneRole::HotBlob,
+                    ),
+                    (
                         PersistedSegmentTier::Warm,
+                        tombstone::TombstoneLaneRole::WarmNumeric,
+                        tombstone::TombstoneLaneRole::WarmBlob,
+                    ),
+                    (
                         PersistedSegmentTier::Cold,
-                    ] {
-                        paths.insert(config.lane_path(lane, tier).join(TOMBSTONES_FILE_NAME));
-                    }
+                        tombstone::TombstoneLaneRole::ColdNumeric,
+                        tombstone::TombstoneLaneRole::ColdBlob,
+                    ),
+                ] {
+                    lanes.push(tombstone::TombstoneLane {
+                        role: numeric_role,
+                        namespace_root: config.object_store_root.clone(),
+                        manifest_path: config
+                            .lane_path(SegmentLaneFamily::Numeric, tier)
+                            .join(TOMBSTONES_FILE_NAME),
+                    });
+                    lanes.push(tombstone::TombstoneLane {
+                        role: blob_role,
+                        namespace_root: config.object_store_root.clone(),
+                        manifest_path: config
+                            .lane_path(SegmentLaneFamily::Blob, tier)
+                            .join(TOMBSTONES_FILE_NAME),
+                    });
                 }
             }
         }
-        paths.into_iter().collect()
+        lanes
     }
 
-    fn tombstone_index_load_paths(self) -> Vec<PathBuf> {
-        self.tombstone_index_paths(true)
+    fn tombstone_index_load_lanes(self) -> Vec<tombstone::TombstoneLane> {
+        self.tombstone_index_lanes(true)
     }
 
-    fn tombstone_index_persist_paths(self) -> Vec<PathBuf> {
-        self.tombstone_index_paths(self.runtime_mode != StorageRuntimeMode::ComputeOnly)
+    fn tombstone_index_persist_lanes(self) -> Vec<tombstone::TombstoneLane> {
+        self.tombstone_index_lanes(self.runtime_mode != StorageRuntimeMode::ComputeOnly)
     }
 
-    pub(in crate::engine::storage_engine) fn read_tombstones_index(self) -> Result<TombstoneMap> {
+    fn transaction_data_path(self) -> Result<&'a Path> {
+        self.data_path.ok_or_else(|| {
+            TsinkError::InvalidConfiguration(
+                "durable tombstone publication requires a process-leased data path".to_string(),
+            )
+        })
+    }
+
+    fn has_durable_tombstone_state(self) -> Result<bool> {
+        if let Some(data_path) = self.data_path {
+            let coordinator = data_path
+                .join(tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
+                .join(tombstone::TOMBSTONE_TRANSACTION_FILE_NAME);
+            if crate::engine::fs_utils::path_exists_no_follow(&coordinator)? {
+                return Ok(true);
+            }
+        }
+        for lane in self.tombstone_index_persist_lanes() {
+            if crate::engine::fs_utils::path_exists_no_follow(&lane.manifest_path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(in crate::engine::storage_engine) fn recover_pending_transaction(
+        self,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
+    ) -> Result<tombstone::TombstoneRecoveryOutcome> {
+        let lanes = self.tombstone_index_persist_lanes();
+        if lanes.is_empty() {
+            return Ok(tombstone::TombstoneRecoveryOutcome::NoTransaction);
+        }
+        tombstone::recover_tombstone_transaction_with_memory_admission(
+            self.transaction_data_path()?,
+            &lanes,
+            self.local_disk_budget,
+            |bytes| reservation.resize(bytes),
+        )
+    }
+
+    pub(in crate::engine::storage_engine) fn read_tombstones_index(
+        self,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
+    ) -> Result<TombstoneMap> {
         let mut merged = TombstoneMap::new();
-        for path in self.tombstone_index_load_paths() {
-            let loaded = tombstone::load_tombstones(&path)?;
+        let lanes = tombstone::normalize_tombstone_lanes(&self.tombstone_index_load_lanes())?;
+        if lanes.is_empty() {
+            return Ok(merged);
+        }
+        tombstone::validate_tombstone_lanes(&lanes)?;
+        for lane in lanes {
+            let live = ChunkStorage::tombstone_map_memory_usage_bytes(&merged);
+            let loaded = tombstone::load_tombstones_with_memory_admission(
+                &lane.manifest_path,
+                |lane_peak| reservation.resize(live.saturating_add(lane_peak)),
+            )?;
+            let loaded_bytes = ChunkStorage::tombstone_map_memory_usage_bytes(&loaded);
+            // HashMap growth can temporarily retain its predecessor allocation. Keep an extra
+            // decoded-map charge until the merged map has reached its measured final capacity.
+            reservation.resize(
+                live.saturating_mul(3)
+                    .saturating_add(loaded_bytes.saturating_mul(2))
+                    .saturating_add(4096),
+            )?;
             for (series_id, ranges) in loaded {
                 for range in ranges {
                     tombstone::merge_tombstone_range(merged.entry(series_id).or_default(), range);
                 }
             }
+            reservation.resize(ChunkStorage::tombstone_map_memory_usage_bytes(&merged))?;
         }
         Ok(merged)
     }
@@ -63,41 +165,72 @@ impl<'a> TombstoneIndexContext<'a> {
     pub(in crate::engine::storage_engine) fn persist_tombstones_index_updates(
         self,
         updates: &TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
     ) -> tombstone::TombstonePersistenceResult<()> {
         if updates.is_empty() {
             return Ok(());
         }
-        tombstone::persist_tombstone_updates_across_paths_with_disk_budget_outcome(
-            &self.tombstone_index_persist_paths(),
+        let lanes = self.tombstone_index_persist_lanes();
+        if lanes.is_empty() {
+            return Ok(());
+        }
+        tombstone::persist_tombstone_updates_across_paths_with_disk_budget_outcome_and_memory_admission(
+            self.transaction_data_path()
+                .map_err(tombstone::TombstonePersistenceError::definitively_clean)?,
+            &lanes,
             updates,
             self.local_disk_budget,
+            |bytes| reservation.ensure(bytes),
+        )
+    }
+
+    pub(in crate::engine::storage_engine) fn transaction_probe_memory_upper_bound(
+        self,
+    ) -> Result<usize> {
+        tombstone::tombstone_transaction_probe_memory_upper_bound(
+            &self.tombstone_index_persist_lanes(),
+        )
+    }
+
+    pub(in crate::engine::storage_engine) fn transaction_staging_memory_upper_bound(
+        self,
+        updates: &TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
+    ) -> Result<usize> {
+        tombstone::tombstone_transaction_staging_memory_upper_bound_with_admission(
+            &self.tombstone_index_persist_lanes(),
+            updates,
+            |bytes| reservation.ensure(bytes),
         )
     }
 
     pub(in crate::engine::storage_engine) fn persist_tombstones_index_snapshot_for_recovery(
         self,
         snapshot: &TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
     ) -> Result<()> {
-        self.persist_tombstones_index_snapshot_with_kind(
-            snapshot,
-            crate::DiskReservationKind::Recovery,
-        )
-    }
-
-    fn persist_tombstones_index_snapshot_with_kind(
-        self,
-        snapshot: &TombstoneMap,
-        reservation_kind: crate::DiskReservationKind,
-    ) -> Result<()> {
-        for path in self.tombstone_index_persist_paths() {
-            tombstone::persist_tombstones_with_disk_budget_and_kind(
-                &path,
-                snapshot,
-                self.local_disk_budget,
-                reservation_kind,
-            )?;
+        let lanes = self.tombstone_index_persist_lanes();
+        if lanes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        match tombstone::persist_tombstone_snapshot_transactionally_with_memory_admission(
+            self.transaction_data_path()?,
+            &lanes,
+            snapshot,
+            self.local_disk_budget,
+            |bytes| reservation.ensure(bytes),
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_committed() => {
+                let error = error.into_tsink_error();
+                tracing::warn!(
+                    error = %error,
+                    "Committed tombstone recovery snapshot left durable coordinator recovery debt"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.into_tsink_error()),
+        }
     }
 
     pub(in crate::engine::storage_engine) fn ensure_delete_tombstone_persistence_supported(
@@ -169,21 +302,85 @@ impl<'a> TombstonePublicationContext<'a> {
             .is_some_and(|ranges| tombstone::timestamp_is_tombstoned(timestamp, ranges))
     }
 
+    pub(in crate::engine::storage_engine) fn admit_loaded_tombstone_publication(
+        self,
+        storage: &ChunkStorage,
+        merged: &TombstoneMap,
+        transition_visibility_headroom: usize,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
+    ) -> Result<()> {
+        let merged_bytes = ChunkStorage::tombstone_map_memory_usage_bytes(merged);
+        let changed_count = {
+            let current = self.tombstones.read();
+            current
+                .keys()
+                .chain(merged.keys())
+                .filter(|series_id| current.get(series_id) != merged.get(series_id))
+                .count()
+        };
+        if changed_count == 0 {
+            return reservation.ensure(merged_bytes.saturating_add(transition_visibility_headroom));
+        }
+        let changed_set_upper_bound = changed_count.saturating_mul(128).saturating_add(4096);
+        reservation.ensure(
+            merged_bytes
+                .saturating_add(changed_set_upper_bound)
+                .saturating_add(transition_visibility_headroom),
+        )?;
+        let changed_series_ids = {
+            let current = self.tombstones.read();
+            current
+                .keys()
+                .chain(merged.keys())
+                .filter(|series_id| current.get(series_id) != merged.get(series_id))
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        let visibility_staging =
+            storage.series_visibility_refresh_staging_upper_bound(changed_series_ids.iter());
+        reservation.ensure(
+            merged_bytes
+                .saturating_add(changed_set_upper_bound)
+                .saturating_add(visibility_staging)
+                .saturating_add(transition_visibility_headroom),
+        )?;
+        self.reserve_series_ids_referenced_by_tombstones(merged)
+    }
+
     pub(in crate::engine::storage_engine) fn replace_loaded_tombstones_index(
         self,
         storage: &ChunkStorage,
         merged: TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
     ) -> Result<()> {
         let _visibility_guard = storage.visibility_write_fence();
-        self.replace_loaded_tombstones_index_locked(storage, merged)
+        self.replace_loaded_tombstones_index_locked(storage, merged, reservation)
     }
 
     pub(in crate::engine::storage_engine) fn replace_loaded_tombstones_index_locked(
         self,
         storage: &ChunkStorage,
         merged: TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
     ) -> Result<()> {
-        self.reserve_series_ids_referenced_by_tombstones(&merged)?;
+        let merged_bytes = ChunkStorage::tombstone_map_memory_usage_bytes(&merged);
+        let changed_count = {
+            let current = self.tombstones.read();
+            current
+                .keys()
+                .chain(merged.keys())
+                .filter(|series_id| current.get(series_id) != merged.get(series_id))
+                .count()
+        };
+        if changed_count == 0 {
+            return Ok(());
+        }
+        let changed_set_upper_bound = changed_count.saturating_mul(128).saturating_add(4096);
+        reservation.ensure(
+            merged_bytes
+                .saturating_add(changed_set_upper_bound)
+                .saturating_add(4096),
+        )?;
 
         let changed_series_ids = {
             let current = self.tombstones.read();
@@ -194,9 +391,17 @@ impl<'a> TombstonePublicationContext<'a> {
                 .copied()
                 .collect::<BTreeSet<_>>()
         };
-        if changed_series_ids.is_empty() {
-            return Ok(());
-        }
+        let visibility_staging =
+            storage.series_visibility_refresh_staging_upper_bound(changed_series_ids.iter());
+        reservation.ensure(
+            merged_bytes
+                .saturating_add(changed_set_upper_bound)
+                .saturating_add(visibility_staging),
+        )?;
+
+        // The registry and visible tombstone/cache state remain untouched until every
+        // publication allocation has passed admission.
+        self.reserve_series_ids_referenced_by_tombstones(&merged)?;
 
         let mut tombstones = self.tombstones.write();
         storage.with_included_memory_delta(
@@ -208,7 +413,27 @@ impl<'a> TombstonePublicationContext<'a> {
         drop(tombstones);
         #[cfg(test)]
         storage.invoke_tombstone_post_swap_pre_visibility_hook();
-        storage.refresh_series_visible_timestamp_cache_locked(changed_series_ids)?;
+        #[cfg(test)]
+        let refresh_result = storage
+            .invoke_tombstone_post_commit_error_hook()
+            .and_then(|()| {
+                storage.refresh_series_visible_timestamp_cache_locked(
+                    changed_series_ids.iter().copied(),
+                )
+            });
+        #[cfg(not(test))]
+        let refresh_result = storage
+            .refresh_series_visible_timestamp_cache_locked(changed_series_ids.iter().copied());
+        if let Err(err) = refresh_result {
+            // The authoritative map has already swapped. Clear every affected summary before
+            // returning success so readers rebuild from the new tombstone state; a retry may see
+            // no map diff and therefore cannot be relied on to repair stale cache entries.
+            storage.clear_series_visible_timestamp_cache(changed_series_ids.iter().copied());
+            tracing::warn!(
+                error = %err,
+                "Tombstone reload deferred series visibility summary rebuild"
+            );
+        }
         storage.bump_visibility_state_generation();
         Ok(())
     }
@@ -220,13 +445,45 @@ impl<'a> TombstonePublicationContext<'a> {
         storage: &ChunkStorage,
         index: TombstoneIndexContext<'a>,
         updates: TombstoneMap,
+        reservation: &mut super::super::maintenance::TombstoneMemoryReservation<'_>,
     ) -> tombstone::TombstonePersistenceResult<()> {
+        let update_bytes = ChunkStorage::tombstone_map_memory_usage_bytes(&updates);
+        let visibility_staging =
+            storage.series_visibility_refresh_staging_upper_bound(updates.keys());
+        let changed_set_upper_bound = updates.len().saturating_mul(128).saturating_add(4096);
+        let live_rehash_headroom = {
+            let current = self.tombstones.read();
+            ChunkStorage::tombstone_map_memory_usage_bytes(&current)
+                .saturating_mul(2)
+                .saturating_add(update_bytes.saturating_mul(2))
+        };
+        reservation
+            .ensure(
+                update_bytes
+                    .saturating_add(visibility_staging)
+                    .saturating_add(changed_set_upper_bound)
+                    .saturating_add(live_rehash_headroom),
+            )
+            .map_err(tombstone::TombstonePersistenceError::definitively_clean)?;
         // Reserve the registry high-water mark before the durable commit boundary. The only
         // possible failure is series-id exhaustion; reporting that after manifest publication
         // would incorrectly present an effective delete as rejected.
         self.reserve_series_ids_referenced_by_tombstones(&updates)
             .map_err(tombstone::TombstonePersistenceError::definitively_clean)?;
-        index.persist_tombstones_index_updates(&updates)?;
+        storage
+            .validate_shared_object_store_writer_lock()
+            .map_err(tombstone::TombstonePersistenceError::definitively_clean)?;
+        match index.persist_tombstones_index_updates(&updates, reservation) {
+            Ok(()) => {}
+            Err(error) if error.is_committed() => {
+                let error = error.into_tsink_error();
+                tracing::warn!(
+                    error = %error,
+                    "Committed tombstone transaction left durable coordinator recovery debt"
+                );
+            }
+            Err(error) => return Err(error),
+        }
         self.apply_tombstone_updates_locked(storage, updates)
             .map_err(tombstone::TombstonePersistenceError::indeterminate)
     }
@@ -282,10 +539,32 @@ impl<'a> TombstonePublicationContext<'a> {
 }
 
 impl ChunkStorage {
+    pub(in crate::engine::storage_engine) fn recover_and_reload_tombstones_locked(
+        &self,
+    ) -> Result<bool> {
+        self.validate_shared_object_store_writer_lock()?;
+        let index = self.tombstone_index_context();
+        self.refresh_memory_usage();
+        let mut reservation = self.tombstone_memory_reservation();
+        let recovery = index.recover_pending_transaction(&mut reservation)?;
+        if !recovery.requires_authoritative_reload() {
+            return Ok(false);
+        }
+        let merged = index.read_tombstones_index(&mut reservation)?;
+        self.tombstone_publication_context()
+            .replace_loaded_tombstones_index_locked(self, merged, &mut reservation)?;
+        Ok(true)
+    }
+
     pub(in crate::engine::storage_engine) fn tombstone_index_context(
         &self,
     ) -> TombstoneIndexContext<'_> {
         TombstoneIndexContext {
+            data_path: self
+                .persisted
+                .series_index_path
+                .as_deref()
+                .and_then(Path::parent),
             numeric_lane_path: self.persisted.numeric_lane_path.as_deref(),
             blob_lane_path: self.persisted.blob_lane_path.as_deref(),
             tiered_storage: self.persisted.tiered_storage.as_ref(),
@@ -313,18 +592,53 @@ impl ChunkStorage {
     }
 
     pub(in crate::engine::storage_engine) fn load_tombstones_index(&self) -> Result<()> {
-        let merged = self.tombstone_index_context().read_tombstones_index()?;
+        self.refresh_memory_usage();
+        let mut reservation = self.tombstone_memory_reservation();
+        let merged = self
+            .tombstone_index_context()
+            .read_tombstones_index(&mut reservation)?;
         self.tombstone_publication_context()
-            .replace_loaded_tombstones_index(self, merged)
+            .replace_loaded_tombstones_index(self, merged, &mut reservation)?;
+        drop(reservation);
+        Ok(())
     }
 
-    pub(in crate::engine::storage_engine) fn persist_tombstones_index_for_recovery(
+    /// Persists the full tombstone snapshot while the caller holds `rollups.run_lock`.
+    pub(in crate::engine::storage_engine) fn persist_tombstones_index_for_recovery_locked(
         &self,
     ) -> Result<()> {
-        self.tombstone_index_context()
-            .persist_tombstones_index_snapshot_for_recovery(
-                &self.tombstone_read_context().snapshot(),
-            )
+        let _visibility_guard = self.visibility_write_fence();
+        let index = self.tombstone_index_context();
+        let live_is_empty = self
+            .tombstone_read_context()
+            .with_tombstones(|current| current.is_empty());
+        // A brand-new/never-deleted store has nothing to recover or snapshot. Avoid imposing the
+        // bounded recovery scanner's fixed scratch floor during close after callers deliberately
+        // tighten the live memory budget below that floor.
+        if live_is_empty && !index.has_durable_tombstone_state()? {
+            return Ok(());
+        }
+        self.validate_shared_object_store_writer_lock()?;
+        self.recover_and_reload_tombstones_locked()?;
+        self.refresh_memory_usage();
+        let index = self.tombstone_index_context();
+        let probe = index.transaction_probe_memory_upper_bound()?;
+        let live_bytes = self
+            .tombstone_read_context()
+            .with_tombstones(ChunkStorage::tombstone_map_memory_usage_bytes);
+        let initial_reservation = probe
+            .saturating_add(live_bytes.saturating_mul(3))
+            .saturating_add(16 * 1024);
+        let mut memory_reservation = self.tombstone_memory_reservation();
+        memory_reservation.resize(initial_reservation)?;
+        let snapshot = self.tombstone_read_context().snapshot();
+        let transaction_staging =
+            index.transaction_staging_memory_upper_bound(&snapshot, &mut memory_reservation)?;
+        memory_reservation.resize(initial_reservation.max(transaction_staging))?;
+        let result = index
+            .persist_tombstones_index_snapshot_for_recovery(&snapshot, &mut memory_reservation);
+        drop(memory_reservation);
+        result
     }
 
     pub(in crate::engine::storage_engine) fn timestamp_survives_tombstones(

@@ -9,6 +9,16 @@ mod memory_accounting;
 mod post_flush;
 mod registry_persistence;
 
+pub(in crate::engine::storage_engine) use self::catalog_refresh::BackgroundCatalogRefreshCursor;
+pub(in crate::engine::storage_engine) use self::memory_accounting::{
+    TombstoneMemoryReservation, WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
+};
+
+pub(in crate::engine::storage_engine) use self::post_flush::recovery::{
+    ensure_no_pending_post_flush_replacement, finalize_pending_post_flush_replacements_for_startup,
+    is_post_flush_replacement_marker_name, POST_FLUSH_REPLACEMENT_DIR_NAME,
+};
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -38,7 +48,6 @@ impl Drop for PersistedRefreshClaim<'_> {
 pub(super) struct LoadedInventoryCatalogRefresh {
     visibility_fence: PersistedCatalogVisibilityFence,
     visible_roots: BTreeSet<PathBuf>,
-    tombstones: crate::engine::tombstone::TombstoneMap,
     inventory: SegmentInventory,
 }
 
@@ -63,7 +72,6 @@ pub(super) struct PlannedInventoryCatalogRefresh {
     inventory: SegmentInventory,
     loaded_segments: Vec<IndexedSegment>,
     removed_roots: Vec<PathBuf>,
-    tombstones: crate::engine::tombstone::TombstoneMap,
 }
 
 pub(super) enum PlannedPersistedCatalogRefresh {
@@ -74,10 +82,11 @@ pub(super) enum PlannedPersistedCatalogRefresh {
 pub(super) enum PersistedCatalogPublication {
     PersistedState {
         published_segment_roots: Vec<PathBuf>,
+        refresh_tombstones: bool,
     },
     Inventory {
         inventory: SegmentInventory,
-        tombstones: Option<crate::engine::tombstone::TombstoneMap>,
+        refresh_tombstones: bool,
     },
 }
 
@@ -86,8 +95,7 @@ pub(super) struct PersistedCatalogTransition {
     pub(super) loaded_segments: Vec<IndexedSegment>,
     pub(super) removed_roots: Vec<PathBuf>,
     pub(super) publication: PersistedCatalogPublication,
-    pub(super) registry_catalog_sources:
-        Option<Vec<registry_catalog::PersistedRegistryCatalogSource>>,
+    pub(super) registry_catalog_update: Option<registry_catalog::PersistedRegistryCatalogUpdate>,
 }
 
 impl PlannedPersistedCatalogRefresh {
@@ -124,13 +132,24 @@ struct RetiredPostFlushRoot {
 }
 
 struct StagedPostFlushMaintenance {
-    final_inventory: SegmentInventory,
+    publication: StagedPostFlushPublication,
     promotions: Vec<StagedSegmentPromotion>,
     staging_cleanup_paths: Vec<PathBuf>,
     loaded_segments: Vec<IndexedSegment>,
     removed_roots: Vec<PathBuf>,
     retired_roots: Vec<RetiredPostFlushRoot>,
     tier_moves: usize,
+}
+
+enum StagedPostFlushPublication {
+    CompleteInventory(SegmentInventory),
+    PersistedStateDelta { published_roots: Vec<PathBuf> },
+}
+
+#[derive(Clone, Copy)]
+enum PostFlushMaintenanceStageScope {
+    CompleteInventory,
+    SelectedPage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

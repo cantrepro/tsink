@@ -16,6 +16,7 @@ use self::timestamps::{
 };
 use self::values::{
     choose_best_value_codec, decode_values, decode_values_in_index_range, infer_value_family,
+    modeled_decoded_value_heap_bytes,
 };
 #[cfg(test)]
 use self::values::{decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor};
@@ -30,6 +31,8 @@ pub struct EncodedChunk {
 }
 
 const TIMESTAMP_SEARCH_BLOCK_POINTS: usize = 64;
+pub(in crate::engine) const MAX_FORMAT_CHUNK_POINTS: usize = u16::MAX as usize;
+pub(in crate::engine) const MAX_DECODED_CHUNK_PEAK_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimestampSearchIndex {
@@ -168,6 +171,78 @@ impl EncodablePoint for ChunkPoint {
 pub struct Encoder;
 
 impl Encoder {
+    fn ensure_format_point_count(point_count: usize) -> Result<()> {
+        if point_count > MAX_FORMAT_CHUNK_POINTS {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunk point count {point_count} exceeds the format safety limit {MAX_FORMAT_CHUNK_POINTS}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_decoded_chunk_peak_within_format_limit(
+        lane: ValueLane,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        value_payload: &[u8],
+        encoded_payload_bytes: usize,
+    ) -> Result<()> {
+        Self::ensure_decoded_chunk_peak_within_limit(
+            lane,
+            value_codec,
+            point_count,
+            value_payload,
+            encoded_payload_bytes,
+            MAX_DECODED_CHUNK_PEAK_BYTES,
+        )
+    }
+
+    fn ensure_decoded_chunk_peak_within_limit(
+        lane: ValueLane,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        value_payload: &[u8],
+        encoded_payload_bytes: usize,
+        max_decoded_peak_bytes: usize,
+    ) -> Result<()> {
+        Self::ensure_format_point_count(point_count)?;
+        let modeled =
+            Self::modeled_decoded_chunk_peak_bytes(lane, value_codec, point_count, value_payload)
+                .map_err(|err| {
+                TsinkError::DataCorruption(format!(
+                    "chunk decoded-size model overflow or invalid payload: {err}"
+                ))
+            })?;
+        let peak = modeled.checked_add(encoded_payload_bytes).ok_or_else(|| {
+            TsinkError::DataCorruption("chunk decoded peak byte length overflow".to_string())
+        })?;
+        if peak > max_decoded_peak_bytes {
+            return Err(TsinkError::DataCorruption(format!(
+                "chunk decoded peak {peak} exceeds the format safety limit {max_decoded_peak_bytes}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(in crate::engine) fn modeled_decoded_chunk_peak_bytes(
+        lane: ValueLane,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        value_payload: &[u8],
+    ) -> Result<usize> {
+        let per_point = std::mem::size_of::<i64>()
+            .checked_add(std::mem::size_of::<Value>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ChunkPoint>()))
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let structures = point_count
+            .checked_mul(per_point)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let heap = modeled_decoded_value_heap_bytes(value_codec, lane, value_payload, point_count)?;
+        structures
+            .checked_add(heap)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)
+    }
+
     pub fn choose_lane(points: &[DataPoint]) -> ValueLane {
         if points.iter().any(|point| {
             matches!(
@@ -277,14 +352,48 @@ impl Encoder {
                 "cannot encode empty chunk".to_string(),
             ));
         }
+        if points.len() > MAX_FORMAT_CHUNK_POINTS {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "chunk point count {} exceeds the storage-format limit {MAX_FORMAT_CHUNK_POINTS}",
+                points.len()
+            )));
+        }
 
         let (ts_codec, ts_payload) = choose_best_timestamp_codec(points)?;
         let (value_codec, value_payload) = choose_best_value_codec(points, lane)?;
 
-        let mut payload = Vec::with_capacity(8 + ts_payload.len() + value_payload.len());
-        payload.extend_from_slice(&(ts_payload.len() as u32).to_le_bytes());
+        let ts_len = u32::try_from(ts_payload.len()).map_err(|_| {
+            TsinkError::InvalidConfiguration(
+                "encoded timestamp payload exceeds u32 length".to_string(),
+            )
+        })?;
+        let value_len = u32::try_from(value_payload.len()).map_err(|_| {
+            TsinkError::InvalidConfiguration("encoded value payload exceeds u32 length".to_string())
+        })?;
+        let payload_capacity = 8usize
+            .checked_add(ts_payload.len())
+            .and_then(|len| len.checked_add(value_payload.len()))
+            .ok_or_else(|| {
+                TsinkError::InvalidConfiguration(
+                    "encoded chunk payload length overflow".to_string(),
+                )
+            })?;
+        Self::ensure_decoded_chunk_peak_within_format_limit(
+            lane,
+            value_codec,
+            points.len(),
+            &value_payload,
+            payload_capacity,
+        )
+        .map_err(|err| {
+            TsinkError::InvalidConfiguration(format!(
+                "encoded chunk exceeds the storage-format decoded-size limit: {err}"
+            ))
+        })?;
+        let mut payload = Vec::with_capacity(payload_capacity);
+        payload.extend_from_slice(&ts_len.to_le_bytes());
         payload.extend_from_slice(&ts_payload);
-        payload.extend_from_slice(&(value_payload.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&value_len.to_le_bytes());
         payload.extend_from_slice(&value_payload);
 
         Ok(EncodedChunk {
@@ -313,6 +422,7 @@ impl Encoder {
         point_count: usize,
         payload: &[u8],
     ) -> Result<Vec<ChunkPoint>> {
+        Self::ensure_format_point_count(point_count)?;
         if point_count == 0 {
             return Ok(Vec::new());
         }
@@ -328,6 +438,14 @@ impl Encoder {
                 "encoded chunk payload has trailing bytes".to_string(),
             ));
         }
+
+        Self::ensure_decoded_chunk_peak_within_format_limit(
+            lane,
+            value_codec,
+            point_count,
+            value_payload,
+            payload.len(),
+        )?;
 
         let timestamps = decode_timestamps(ts_codec, ts_payload, point_count)?;
         let values = decode_values(value_codec, lane, value_payload, point_count)?;
@@ -350,6 +468,7 @@ impl Encoder {
         point_count: usize,
         payload: &[u8],
     ) -> Result<Vec<i64>> {
+        Self::ensure_format_point_count(point_count)?;
         if point_count == 0 {
             return Ok(Vec::new());
         }
@@ -379,6 +498,7 @@ impl Encoder {
         point_count: usize,
         payload: &[u8],
     ) -> Result<TimestampSearchIndex> {
+        Self::ensure_format_point_count(point_count)?;
         let ts_payload = Self::timestamp_payload_from_chunk_payload(payload)?;
         build_timestamp_search_index(ts_codec, point_count, ts_payload)
     }
@@ -392,6 +512,7 @@ impl Encoder {
         start: i64,
         end: i64,
     ) -> Result<Vec<ChunkPoint>> {
+        Self::ensure_format_point_count(point_count)?;
         if point_count == 0 || start >= end {
             return Ok(Vec::new());
         }
@@ -407,6 +528,14 @@ impl Encoder {
                 "encoded chunk payload has trailing bytes".to_string(),
             ));
         }
+
+        Self::ensure_decoded_chunk_peak_within_format_limit(
+            lane,
+            value_codec,
+            point_count,
+            value_payload,
+            payload.len(),
+        )?;
 
         let timestamps = decode_timestamps(ts_codec, ts_payload, point_count)?;
         let first = timestamps.partition_point(|ts| *ts < start);

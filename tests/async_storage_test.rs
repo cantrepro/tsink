@@ -6,10 +6,11 @@ use tokio::sync::Notify;
 
 use tempfile::TempDir;
 use tsink::{
-    Aggregation, AsyncStorage, AsyncStorageBuilder, BatchWriteResult, DataPoint, Label,
-    QueryOptions, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus, Storage,
-    StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement, WriteMode,
-    WriteRejectionCategory,
+    Aggregation, AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder, BatchWriteResult,
+    DataPoint, Label, QueryBudget, QueryBudgetLimits, QueryExecution, QueryOptions,
+    QueryWorkLimits, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus, Storage,
+    StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement,
+    WriteBatchLimits, WriteMode, WriteRejectionCategory,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33,11 +34,52 @@ async fn basic_insert_and_select_roundtrip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_list_metrics_shares_one_query_slot_and_releases_all_resources() -> Result<()> {
+    let storage = AsyncStorageBuilder::new()
+        .with_query_budget_limits(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(8),
+                max_returned_bytes: Some(1024 * 1024),
+                max_intermediate_vector_size: Some(8),
+                max_memory_bytes: Some(1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .build()?;
+    storage
+        .insert_rows(vec![Row::with_labels(
+            "async_metadata",
+            vec![Label::new("host", "a")],
+            DataPoint::new(1, 1.0),
+        )])
+        .await?;
+
+    assert_eq!(storage.list_metrics().await?.len(), 1);
+    let snapshot = storage.inner().query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn effective_storage_limits_match_the_built_backend() -> Result<()> {
     let storage = AsyncStorageBuilder::new()
         .with_wal_enabled(false)
         .with_memory_limit(8 * 1024 * 1024)
         .with_cardinality_limit(512)
+        .with_max_labels_per_series(9)
+        .with_max_series_identity_bytes(2_048)
+        .with_series_creation_rate_limit(13, Duration::from_secs(2))
+        .with_write_batch_limits(WriteBatchLimits {
+            max_rows: Some(17),
+            max_modeled_input_bytes: Some(4_096),
+        })
         .with_max_writers(2)
         .with_write_timeout(Duration::from_millis(23))
         .with_max_active_partition_heads_per_series(3)
@@ -49,12 +91,54 @@ async fn effective_storage_limits_match_the_built_backend() -> Result<()> {
     assert!(!limits.wal_enabled);
     assert_eq!(limits.accounted_memory_bytes, Some(8 * 1024 * 1024));
     assert_eq!(limits.cardinality, Some(512));
+    assert_eq!(limits.max_labels_per_series, Some(9));
+    assert_eq!(limits.max_series_identity_bytes, Some(2_048));
+    assert_eq!(limits.max_new_series_per_window, Some(13));
+    assert_eq!(limits.new_series_window_nanos, Some(2_000_000_000));
+    assert_eq!(limits.max_write_batch_rows, Some(17));
+    assert_eq!(limits.max_write_batch_input_bytes, Some(4_096));
     assert_eq!(limits.wal_bytes, None);
     assert_eq!(limits.local_disk_bytes, None);
     assert!(storage.observability_snapshot().local_disk.is_none());
     assert_eq!(limits.max_concurrent_writers, Some(2));
     assert_eq!(limits.write_timeout_nanos, Some(23_000_000));
     assert_eq!(limits.max_active_partition_heads_per_series, Some(3));
+
+    storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_best_effort_cannot_bypass_top_level_write_batch_limit() -> Result<()> {
+    let storage = AsyncStorageBuilder::new()
+        .with_write_batch_limits(WriteBatchLimits {
+            max_rows: Some(2),
+            max_modeled_input_bytes: None,
+        })
+        .build()?;
+
+    let err = storage
+        .write_batch(
+            vec![
+                Row::new("async_batch_limit", DataPoint::new(1, 1.0)),
+                Row::new("async_batch_limit", DataPoint::new(2, 2.0)),
+                Row::new("async_batch_limit", DataPoint::new(3, 3.0)),
+            ],
+            WriteMode::BestEffort,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TsinkError::WriteBatchRowLimitExceeded {
+            limit: 2,
+            submitted: 3
+        }
+    ));
+    assert!(storage
+        .select("async_batch_limit", vec![], 0, 4)
+        .await?
+        .is_empty());
 
     storage.close().await?;
     Ok(())
@@ -717,6 +801,263 @@ async fn canceled_write_batch_still_commits_after_queue_accept() -> Result<()> {
 
     assert_eq!(storage.insert_calls.load(Ordering::SeqCst), 1);
     assert_eq!(storage.inserted.lock().len(), 2);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_queue_bytes_admit_n_reject_n_plus_one_and_drain_through_close() -> Result<()> {
+    let storage = Arc::new(BlockingInsertStorage::new());
+    storage.block_inserts.store(true, Ordering::SeqCst);
+
+    let exact_rows = vec![Row::new("q", DataPoint::new(2, 2.0))];
+    let exact_bytes = tsink::modeled_write_batch_input_bytes(&exact_rows)?;
+    let oversized_rows = vec![Row::new("qq", DataPoint::new(3, 3.0))];
+    assert_eq!(
+        tsink::modeled_write_batch_input_bytes(&oversized_rows)?,
+        exact_bytes + 1
+    );
+
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            queue_capacity: 8,
+            write_queue_byte_capacity: exact_bytes,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+
+    let first_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move {
+            async_storage
+                .insert_rows(vec![Row::new("q", DataPoint::new(1, 1.0))])
+                .await
+        }
+    });
+    storage.insert_started.notified().await;
+
+    let exact_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move { async_storage.insert_rows(exact_rows).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if async_storage
+                .async_runtime_snapshot()
+                .current_write_queue_bytes
+                == exact_bytes
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the exact-size write must wait in the queue");
+
+    let error = async_storage
+        .insert_rows(oversized_rows)
+        .await
+        .expect_err("N+1 queued bytes must be rejected before enqueue");
+    assert!(matches!(
+        error,
+        TsinkError::AsyncQueueByteLimitExceeded {
+            queue: "write",
+            limit,
+            current,
+            requested,
+        } if limit == exact_bytes && current == exact_bytes && requested == exact_bytes + 1
+    ));
+
+    let close_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move { async_storage.close().await }
+    });
+
+    storage.block_inserts.store(false, Ordering::SeqCst);
+    *storage.release_flag.lock() = true;
+    storage.release_insert.notify_all();
+
+    first_task.await.expect("first write task must join")?;
+    exact_task.await.expect("exact-size write task must join")?;
+    close_task.await.expect("close task must join")?;
+
+    let snapshot = async_storage.async_runtime_snapshot();
+    assert_eq!(snapshot.write_queue_byte_capacity, exact_bytes);
+    assert_eq!(snapshot.peak_write_queue_bytes, exact_bytes);
+    assert_eq!(snapshot.current_write_queue_bytes, 0);
+    assert_eq!(snapshot.write_queue_depth, 0);
+    assert_eq!(snapshot.write_queue_byte_rejections_total, 1);
+    assert_eq!(snapshot.write_workers, 1);
+    Ok(())
+}
+
+struct CancellableReadStorage {
+    query_budget: QueryBudget,
+    select_calls: AtomicUsize,
+    read_started: Notify,
+    read_finished: Notify,
+}
+
+impl CancellableReadStorage {
+    fn new() -> Self {
+        Self {
+            query_budget: QueryBudget::new(Default::default()).unwrap(),
+            select_calls: AtomicUsize::new(0),
+            read_started: Notify::new(),
+            read_finished: Notify::new(),
+        }
+    }
+}
+
+impl Storage for CancellableReadStorage {
+    fn query_budget(&self) -> Option<QueryBudget> {
+        Some(self.query_budget.clone())
+    }
+
+    fn insert_rows(&self, _rows: &[Row]) -> Result<()> {
+        Ok(())
+    }
+
+    fn select(
+        &self,
+        _metric: &str,
+        _labels: &[Label],
+        _start: i64,
+        _end: i64,
+    ) -> Result<Vec<DataPoint>> {
+        Err(TsinkError::Other(
+            "async reader did not propagate its query execution".to_string(),
+        ))
+    }
+
+    fn select_with_execution(
+        &self,
+        _metric: &str,
+        _labels: &[Label],
+        _start: i64,
+        _end: i64,
+        execution: &QueryExecution,
+    ) -> Result<Vec<DataPoint>> {
+        self.select_calls.fetch_add(1, Ordering::SeqCst);
+        self.read_started.notify_one();
+        loop {
+            if let Err(error) = execution.checkpoint() {
+                self.read_finished.notify_one();
+                return Err(error.into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn select_with_options(&self, _metric: &str, _opts: QueryOptions) -> Result<Vec<DataPoint>> {
+        Ok(Vec::new())
+    }
+
+    fn select_all(
+        &self,
+        _metric: &str,
+        _start: i64,
+        _end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        Ok(Vec::new())
+    }
+
+    fn list_metrics(&self) -> Result<Vec<tsink::MetricSeries>> {
+        Ok(Vec::new())
+    }
+
+    fn close(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_read_futures_cancel_running_work_and_release_queued_bytes() -> Result<()> {
+    const EXACT_BYTES: usize = 4;
+    let storage = Arc::new(CancellableReadStorage::new());
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            queue_capacity: 8,
+            read_queue_byte_capacity: EXACT_BYTES,
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+
+    let running_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move { async_storage.select("hold", vec![], 0, 1).await }
+    });
+    storage.read_started.notified().await;
+
+    let queued_task = tokio::spawn({
+        let async_storage = async_storage.clone();
+        async move { async_storage.select("read", vec![], 0, 1).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if async_storage
+                .async_runtime_snapshot()
+                .current_read_queue_bytes
+                == EXACT_BYTES
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the exact-size read must wait behind the running read");
+
+    let error = async_storage
+        .select("reads", vec![], 0, 1)
+        .await
+        .expect_err("N+1 queued read bytes must be rejected");
+    assert!(matches!(
+        error,
+        TsinkError::AsyncQueueByteLimitExceeded {
+            queue: "read",
+            limit: EXACT_BYTES,
+            current: EXACT_BYTES,
+            requested: 5,
+        }
+    ));
+
+    queued_task.abort();
+    let _ = queued_task.await;
+    running_task.abort();
+    let _ = running_task.await;
+
+    tokio::time::timeout(Duration::from_secs(2), storage.read_finished.notified())
+        .await
+        .expect("dropping the running future must cancel its query execution");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = async_storage.async_runtime_snapshot();
+            if snapshot.current_read_queue_bytes == 0 && snapshot.read_queue_depth == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the canceled queued command must be drained and released");
+
+    let query_snapshot = storage.query_budget.snapshot();
+    assert_eq!(query_snapshot.active_queries, 0);
+    assert_eq!(query_snapshot.cancellations_total, 1);
+    assert_eq!(storage.select_calls.load(Ordering::SeqCst), 1);
+
+    let snapshot = async_storage.async_runtime_snapshot();
+    assert_eq!(snapshot.read_queue_byte_capacity, EXACT_BYTES);
+    assert_eq!(snapshot.peak_read_queue_bytes, EXACT_BYTES);
+    assert_eq!(snapshot.current_read_queue_bytes, 0);
+    assert_eq!(snapshot.read_queue_byte_rejections_total, 1);
+    assert_eq!(snapshot.read_workers, 1);
 
     async_storage.close().await?;
     Ok(())

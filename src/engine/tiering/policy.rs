@@ -81,31 +81,42 @@ impl RetentionTierPolicy {
         let mut plan = PostFlushMaintenancePolicyPlan::default();
 
         for entry in inventory.entries() {
-            let Some(desired_tier) = self.desired_tier_for_manifest(&entry.manifest) else {
-                plan.expired_actions.push(entry.clone());
-                continue;
-            };
-
-            if self.requires_retention_rewrite(&entry.manifest) {
-                plan.rewrite_actions.push(entry.clone());
-                continue;
+            if let Some(action) = self.post_flush_maintenance_action(entry) {
+                plan.push(entry, action);
             }
-
-            if !self.tier_moves_enabled
-                || desired_tier == PersistedSegmentTier::Hot
-                || desired_tier <= entry.tier
-            {
-                continue;
-            }
-
-            plan.move_actions.push(SegmentTierMoveAction {
-                entry: entry.clone(),
-                target_tier: desired_tier,
-            });
         }
 
         plan
     }
+
+    pub(in crate::engine::storage_engine) fn post_flush_maintenance_action(
+        self,
+        entry: &SegmentInventoryEntry,
+    ) -> Option<PostFlushMaintenanceAction> {
+        let Some(desired_tier) = self.desired_tier_for_manifest(&entry.manifest) else {
+            return Some(PostFlushMaintenanceAction::Expire);
+        };
+
+        if self.requires_retention_rewrite(&entry.manifest) {
+            return Some(PostFlushMaintenanceAction::Rewrite);
+        }
+
+        if !self.tier_moves_enabled
+            || desired_tier == PersistedSegmentTier::Hot
+            || desired_tier <= entry.tier
+        {
+            return None;
+        }
+
+        Some(PostFlushMaintenanceAction::Move(desired_tier))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::engine::storage_engine) enum PostFlushMaintenanceAction {
+    Rewrite,
+    Move(PersistedSegmentTier),
+    Expire,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -120,6 +131,38 @@ impl PostFlushMaintenancePolicyPlan {
         self.rewrite_actions.is_empty()
             && self.move_actions.is_empty()
             && self.expired_actions.is_empty()
+    }
+
+    pub(in crate::engine::storage_engine) fn push(
+        &mut self,
+        entry: &SegmentInventoryEntry,
+        action: PostFlushMaintenanceAction,
+    ) {
+        match action {
+            PostFlushMaintenanceAction::Rewrite => self.rewrite_actions.push(entry.clone()),
+            PostFlushMaintenanceAction::Move(target_tier) => {
+                self.move_actions.push(SegmentTierMoveAction {
+                    entry: entry.clone(),
+                    target_tier,
+                });
+            }
+            PostFlushMaintenanceAction::Expire => self.expired_actions.push(entry.clone()),
+        }
+    }
+
+    pub(in crate::engine::storage_engine) fn action_count(&self) -> usize {
+        self.rewrite_actions
+            .len()
+            .saturating_add(self.move_actions.len())
+            .saturating_add(self.expired_actions.len())
+    }
+
+    pub(in crate::engine::storage_engine) fn source_entries(&self) -> Vec<SegmentInventoryEntry> {
+        let mut entries = Vec::with_capacity(self.action_count());
+        entries.extend(self.rewrite_actions.iter().cloned());
+        entries.extend(self.move_actions.iter().map(|action| action.entry.clone()));
+        entries.extend(self.expired_actions.iter().cloned());
+        entries
     }
 }
 

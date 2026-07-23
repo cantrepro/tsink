@@ -7,6 +7,7 @@ use roaring::RoaringTreemap;
 
 use crate::Label;
 
+mod creation_rate;
 mod dictionary;
 mod identity;
 mod persistence;
@@ -14,6 +15,8 @@ mod postings;
 #[cfg(test)]
 mod tests;
 mod value_family;
+
+pub(crate) use creation_rate::{SeriesCreationRateLimiter, SeriesCreationRateReservation};
 
 pub type SeriesId = u64;
 pub type DictionaryId = u32;
@@ -25,6 +28,15 @@ pub const REGISTRY_INCREMENTAL_FILE_NAME: &str = "series_index.delta.bin";
 pub const REGISTRY_INCREMENTAL_DIR_NAME: &str = "series_index.delta.d";
 const REGISTRY_INCREMENTAL_SEGMENT_PREFIX: &str = "delta-";
 const REGISTRY_INCREMENTAL_SEGMENT_SUFFIX: &str = ".bin";
+const REGISTRY_INCREMENTAL_JOURNAL_ACTIVE_FILE_NAME: &str = "journal-active.bin";
+const REGISTRY_INCREMENTAL_JOURNAL_SEGMENT_PREFIX: &str = "journal-";
+const REGISTRY_INCREMENTAL_JOURNAL_MAGIC: [u8; 4] = *b"RJNL";
+const REGISTRY_INCREMENTAL_JOURNAL_VERSION: u16 = 1;
+/// One active generation is compacted in place until either threshold is reached. A selected
+/// maintenance batch larger than either threshold remains valid as a dedicated generation and is
+/// sealed before the next append, so the limits bound merge work rather than reject valid writes.
+const REGISTRY_INCREMENTAL_JOURNAL_MAX_SERIES: usize = 1_024;
+const REGISTRY_INCREMENTAL_JOURNAL_MAX_STORED_BYTES: usize = 4 * 1024 * 1024;
 static REGISTRY_INCREMENTAL_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SERIES_REGISTRY_SHARD_COUNT: usize = 64;
 

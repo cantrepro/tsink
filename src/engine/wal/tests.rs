@@ -678,6 +678,38 @@ fn appending_series_definitions_tracks_pending_cache_before_first_snapshot_build
 }
 
 #[test]
+fn series_definition_cache_memory_model_tracks_pending_commit_and_reset() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    assert_eq!(wal.cached_series_definition_index_memory_usage_bytes(), 0);
+
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 42,
+        metric: "cache_memory_metric".to_string(),
+        labels: vec![Label::new("host", "cache-memory-value")],
+    })
+    .unwrap();
+    let pending_bytes = wal.cached_series_definition_index_memory_usage_bytes();
+    assert!(pending_bytes > "cache_memory_metric".len());
+
+    wal.append_samples(&[SamplesBatchFrame::from_points(
+        42,
+        ValueLane::Numeric,
+        &[ChunkPoint {
+            ts: 1,
+            value: Value::F64(1.0),
+        }],
+    )
+    .unwrap()])
+        .unwrap();
+    let committed_bytes = wal.cached_series_definition_index_memory_usage_bytes();
+    assert!(committed_bytes > "cache-memory-value".len());
+
+    wal.reset().unwrap();
+    assert_eq!(wal.cached_series_definition_index_memory_usage_bytes(), 0);
+}
+
+#[test]
 fn cached_series_definition_rebuild_overlays_pending_definitions_before_buffered_samples() {
     let definition = SeriesDefinitionFrame {
         series_id: 17,

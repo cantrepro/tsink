@@ -3,48 +3,90 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::storage::SeriesSelection;
+use crate::QueryExecution;
 
-use super::{elapsed_nanos_u64, saturating_u64_from_usize, ChunkStorage, MetricSeries, Result};
+use super::metadata_context::MetadataListMaterialization;
+use super::{
+    elapsed_nanos_u64, modeled_vec_capacity_bytes, saturating_u64_from_usize, ChunkStorage,
+    MetricSeries, Result, SeriesId,
+};
 
 const METADATA_LIST_PAGE_SIZE: usize = 4_096;
 
 impl ChunkStorage {
-    pub(in crate::engine::storage_engine) fn list_metrics_api(&self) -> Result<Vec<MetricSeries>> {
+    pub(in crate::engine::storage_engine) fn list_metrics_api(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
         let context = self.metadata_listing_context();
+        execution.checkpoint()?;
         self.ensure_open()?;
         self.request_background_persisted_refresh_if_needed();
         let generation_before = context.live_series_pruning_generation();
         let mut listed = Vec::new();
         let mut dead_series_ids = Vec::new();
+        // One page can transiently retain the source IDs plus either the missing-summary
+        // collection/normalized input or the live/dead retention partition. Three ID vectors are
+        // therefore the simultaneous high-water; cold-summary update/range staging is admitted
+        // separately, without charging these IDs twice.
+        let page_scratch_bytes =
+            modeled_vec_capacity_bytes::<SeriesId>(METADATA_LIST_PAGE_SIZE).saturating_mul(3);
+        let mut retained_identity_bytes = 0u64;
+        let mut reservation = execution.reserve_memory(page_scratch_bytes)?;
         let mut cursor = None;
 
         loop {
+            execution.checkpoint()?;
             let page = context.materialized_series_page_after(cursor, METADATA_LIST_PAGE_SIZE);
             if page.is_empty() {
                 break;
             }
 
             cursor = page.last().copied();
-            context.append_live_metric_series_page(&page, &mut listed, &mut dead_series_ids)?;
+            context.append_live_metric_series_page(
+                &page,
+                &mut MetadataListMaterialization {
+                    listed: &mut listed,
+                    dead_series_ids: &mut dead_series_ids,
+                    execution,
+                    page_scratch_bytes,
+                    retained_identity_bytes: &mut retained_identity_bytes,
+                    reservation: &mut reservation,
+                },
+            )?;
 
             if page.len() < METADATA_LIST_PAGE_SIZE {
                 break;
             }
         }
 
-        context
-            .prune_dead_materialized_series_ids_if_stable(dead_series_ids, Some(generation_before));
+        // Page scratch is no longer live during stable pruning. Retain only the returned
+        // identities and accumulated dead-ID buffer before reserving the one pruning companion
+        // vector, otherwise the same scratch capacity would be charged in both phases.
+        reservation.resize(
+            modeled_vec_capacity_bytes::<MetricSeries>(listed.capacity())
+                .saturating_add(retained_identity_bytes)
+                .saturating_add(modeled_vec_capacity_bytes::<SeriesId>(
+                    dead_series_ids.capacity(),
+                )),
+        )?;
+        context.prune_dead_materialized_series_ids_if_stable(
+            dead_series_ids,
+            Some(generation_before),
+            execution,
+        )?;
 
         Ok(listed)
     }
 
     pub(in crate::engine::storage_engine) fn list_metrics_with_wal_api(
         &self,
+        execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
         let context = self.metadata_listing_context();
         self.ensure_open()?;
         let mut series = self
-            .list_metrics_api()?
+            .list_metrics_api(execution)?
             .into_iter()
             .collect::<BTreeSet<_>>();
         for definition in context.wal_metric_series()? {
@@ -66,23 +108,26 @@ impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn select_series_api(
         &self,
         selection: &SeriesSelection,
+        execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
-        self.select_series_with_optional_scope_api(selection, None)
+        self.select_series_with_optional_scope_api(selection, None, execution)
     }
 
     pub(in crate::engine::storage_engine) fn select_series_in_shards_api(
         &self,
         selection: &SeriesSelection,
         scope: &crate::storage::MetadataShardScope,
+        execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
         let scope = scope.normalized()?;
-        self.select_series_with_optional_scope_api(selection, Some(scope))
+        self.select_series_with_optional_scope_api(selection, Some(scope), execution)
     }
 
     fn select_series_with_optional_scope_api(
         &self,
         selection: &SeriesSelection,
         scope: Option<crate::storage::MetadataShardScope>,
+        execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
         self.observability
             .query
@@ -91,6 +136,7 @@ impl ChunkStorage {
         let started = Instant::now();
 
         let result = (|| -> Result<Vec<MetricSeries>> {
+            execution.checkpoint()?;
             self.ensure_open()?;
             self.request_background_persisted_refresh_if_needed();
             if let Some((start, end)) = selection.normalized_time_range()? {
@@ -98,10 +144,12 @@ impl ChunkStorage {
                 #[cfg(test)]
                 self.invoke_metadata_query_time_range_summary_hook();
             }
-            match scope.as_ref() {
-                Some(scope) => self.select_series_in_shards_impl(selection, scope),
-                None => self.select_series_impl(selection),
-            }
+            let series = match scope.as_ref() {
+                Some(scope) => self.select_series_in_shards_impl(selection, scope, execution),
+                None => self.select_series_impl_with_execution(selection, execution),
+            }?;
+            self.charge_series_query_result(execution, 0, 0, &series)?;
+            Ok(series)
         })();
 
         self.observability

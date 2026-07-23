@@ -71,14 +71,21 @@ from tsink import (
     WalSyncMode,
     WalReplayMode,
     StorageRuntimeMode,
+    ResourceProfile,
+    WriteBatchLimits,
 )
 
 builder = TsinkStorageBuilder()
+builder.with_resource_profile(ResourceProfile.EMBEDDED)
 builder.with_data_path("/var/lib/tsink")
 builder.with_retention(timedelta(days=30))
 builder.with_timestamp_precision(TimestampPrecision.MILLISECONDS)
-builder.with_memory_limit(512 * 1024 * 1024)       # 512 MiB
+builder.with_memory_limit(1024 * 1024 * 1024)      # 1 GiB
 builder.with_cardinality_limit(1_000_000)
+builder.with_write_batch_limits(WriteBatchLimits(
+    max_rows=10_000,
+    max_modeled_input_bytes=8 * 1024 * 1024,
+))
 builder.with_wal_sync_mode(WalSyncMode.PERIODIC(interval=timedelta(seconds=1)))
 db = builder.build()
 ```
@@ -91,6 +98,7 @@ All methods return `None` and mutate the builder in place.
 
 | Method | Default | Description |
 |---|---|---|
+| `with_resource_profile(profile)` | `Embedded` | Select `Test`, `Embedded`, `Edge`, `Server`, or `ExpertUnlimited`. Rust `Custom(ResourceLimits)` is not yet constructible through UniFFI. |
 | `with_data_path(path)` | *none* | Directory for WAL, segments, and metadata. |
 | `with_object_store_path(path)` | *none* | Path (or object-store prefix) for warm/cold tier segments. |
 
@@ -120,8 +128,41 @@ All methods return `None` and mutate the builder in place.
 
 | Method | Default | Description |
 |---|---|---|
-| `with_memory_limit(bytes)` | unlimited | Memory budget; exceeding triggers backpressure. |
-| `with_cardinality_limit(series)` | unlimited | Maximum unique series count. |
+| `with_memory_limit(bytes)` | 512 MiB (`Embedded`) | Accounted storage-memory budget; exceeding triggers backpressure. |
+| `with_cardinality_limit(series)` | 1,000,000 (`Embedded`) | Maximum unique series count. |
+| `with_max_labels_per_series(labels)` | 128 | Maximum labels in a submitted series identity. |
+| `with_max_series_identity_bytes(bytes)` | 64 KiB | Maximum cumulative metric and label UTF-8 bytes in one identity. |
+| `with_series_creation_rate_limit(series, window)` | unset | Fixed-window limit for successfully published new series. |
+| `with_write_batch_limits(limits)` | both fields unset | Pre-clone top-level row and modeled logical-input-byte bounds. The row bound also caps best-effort outcomes. |
+
+#### Query budget
+
+`with_query_budget_limits(limits)` configures the shared core query boundary. Every optional field
+defaults to `None`, which means unbounded for that dimension; zero is not a valid finite value.
+
+```python
+from tsink import QueryBudgetLimits, QueryWorkLimits
+
+builder.with_query_budget_limits(QueryBudgetLimits(
+    max_concurrent_queries=8,
+    max_shared_memory_bytes=64 * 1024 * 1024,
+    per_query=QueryWorkLimits(
+        max_series_matched=100_000,
+        max_samples_scanned=5_000_000,
+        max_samples_returned=1_000_000,
+        max_returned_bytes=64 * 1024 * 1024,
+        max_pattern_expansion=250_000,
+        max_steps=20_000,
+        max_intermediate_vector_size=100_000,
+        max_memory_bytes=32 * 1024 * 1024,
+        max_wall_time_nanos=15_000_000_000,
+    ),
+))
+```
+
+The per-query fields can only be tightened by a request-specific core execution. Modeled query
+memory is separate from `with_memory_limit`; it covers tsink-owned query state and is not process
+RSS. See [Resource limits and profiles](resource-limits.md) for the exact accounting boundary.
 
 #### Concurrency
 
@@ -136,7 +177,7 @@ All methods return `None` and mutate the builder in place.
 |---|---|---|
 | `with_wal_enabled(bool)` | `True` | Enable/disable the write-ahead log. |
 | `with_wal_size_limit(bytes)` | unlimited | Maximum WAL size on disk. |
-| `with_wal_buffer_size(size)` | *default* | In-memory WAL buffer size. |
+| `with_wal_buffer_size(size)` | 4 KiB | Finite WAL `BufWriter` capacity; reported but outside the storage-memory budget. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | `WalSyncMode.PER_APPEND` synchronizes each non-empty write; `WalSyncMode.PERIODIC(interval)` uses an append-driven sync interval. |
 | `with_wal_replay_mode(mode)` | `Strict` | `WalReplayMode.STRICT` or `WalReplayMode.SALVAGE`. |
 
@@ -421,7 +462,12 @@ Trigger an immediate rollup run:
 
 ```python
 snapshot = db.trigger_rollup_run()
+while not snapshot.source_traversal_complete:
+    snapshot = db.trigger_rollup_run()
 ```
+
+Finite profiles process one configured item/byte-bounded source page per call. Explicit
+`EXPERT_UNLIMITED` drains the complete traversal in one call.
 
 ---
 
@@ -443,24 +489,48 @@ Inspect engine internals at runtime:
 ```python
 snap = db.observability_snapshot()
 limits = db.effective_storage_limits()
+resources = db.resource_configuration_snapshot()
 
+print(f"resource profile: {resources.selected_profile}")
+print(f"resource schema: {resources.schema_version}")
+print(f"low-level overrides: {resources.overrides}")
 print(f"accounted memory limit: {limits.accounted_memory_bytes}")
 print(f"accounted memory: {snap.memory.accounted_bytes} bytes")
 print(f"memory pressure: {snap.memory.pressure.level}")
+print(f"WAL definition cache: {snap.memory.wal_series_definition_cache_bytes} bytes")
+print(f"write scratch: current={snap.memory.write_transient_bytes}, "
+      f"peak={snap.memory.peak_write_transient_bytes}, "
+      f"admitted={snap.memory.write_transient_reservations_total}, "
+      f"rejected={snap.memory.write_transient_rejections_total}")
 print(f"excluded total known: {snap.memory.excluded_bytes_known}")
 print(f"WAL: {snap.wal.segment_count} segments, {snap.wal.size_bytes} bytes")
 print(f"compaction: {snap.compaction.runs_total} runs, {snap.compaction.errors_total} errors")
 print(f"queries: {snap.query.select_calls_total} selects")
+print(f"active query permits: {snap.query_budget.active_queries}")
+print(f"query limit errors: {snap.query_budget.limit_rejections_total}")
+print(f"background threads: {snap.background.running_threads}/{snap.background.max_threads}")
 
 if snap.health.degraded:
     print(f"engine degraded: {snap.health.last_background_error}")
 ```
 
-The snapshot covers effective storage limits, memory, WAL, retention, flush pipeline, compaction,
-queries, rollups, remote storage, and overall health. `snap.limits` contains the same effective
+The snapshot covers effective storage limits, the versioned resource configuration, memory, WAL,
+retention, flush pipeline, compaction,
+queries, the configured query budget and its fixed-reason counters, rollups, remote storage,
+instance-owned background workers, and overall health. `snap.query_budget.limits` preserves every
+optional builder value; `None` means that the core query layer enforces no finite value for that
+dimension.
+`snap.background` exposes the four fixed worker slots' cadence, lifecycle, idle-wait, pass, and
+shutdown-join counters. `snap.limits` contains the same effective
 storage-side controls as `db.effective_storage_limits()`. An optional value of `None` means the
 built-in backend has no finite limit for that field; the memory value is not a process-RSS cap. See
 [Resource limits and profiles](resource-limits.md) for the current accounting boundary.
+`snap.resource_configuration` is the same typed record returned by
+`db.resource_configuration_snapshot()`; it includes the selected profile, resolved limits, and
+stable snake-case override names.
+`wal_series_definition_cache_bytes` is retained accounted memory. The transient fields are
+conservative current/peak write and startup-replay reservations; `write_transient_bytes_estimated`
+distinguishes that model from allocator sampling.
 
 ---
 
@@ -569,7 +639,9 @@ message and is one of these variants:
 | `InvalidInput` | Bad metric name, label, or unsupported operation. |
 | `IoError` | File-system or disk I/O failure. |
 | `DataCorruption` | Checksum mismatch or parse error. |
-| `ResourceExhausted` | Memory budget, cardinality limit, or WAL size limit exceeded. |
+| `ResourceExhausted` | Storage memory, query work/memory/concurrency, total/creation-rate cardinality, WAL, disk, or write-admission capacity was exhausted. |
+| `Cancelled` | A query observed cooperative cancellation. |
+| `DeadlineExceeded` | A query observed its effective wall-time deadline. |
 | `Other` | Lock poisoning, channel errors, WAL issues, etc. |
 
 ```python

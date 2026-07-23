@@ -9,10 +9,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
-    DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, MetricSeries,
-    NativeHistogram, QueryOptions, Row, RowWriteStatus, SeriesMatcher, SeriesSelection, Storage,
-    StorageBuilder, TimestampPrecision, TsinkError, Value, WalSyncMode, WriteAcknowledgement,
-    WriteMode, WriteRejection, WriteRejectionCategory, MAX_WRITE_REJECTION_MESSAGE_BYTES,
+    DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, LocalDiskBudget,
+    LocalDiskLimits, MetricSeries, NativeHistogram, QueryOptions, Row, RowWriteStatus,
+    SeriesMatcher, SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, Value,
+    WalSyncMode, WriteAcknowledgement, WriteMode, WriteRejection, WriteRejectionCategory,
+    MAX_WRITE_REJECTION_MESSAGE_BYTES,
 };
 
 fn sample_histogram() -> NativeHistogram {
@@ -36,6 +37,13 @@ fn sample_histogram() -> NativeHistogram {
     }
 }
 
+fn restore_entry_allowance_for(root: &std::path::Path) -> u64 {
+    let budget = LocalDiskBudget::open(root, LocalDiskLimits::default()).unwrap();
+    budget
+        .snapshot_restore_entry_staging_allowance_bytes()
+        .unwrap()
+}
+
 #[test]
 fn effective_storage_limits_distinguish_unbounded_defaults() {
     let storage = StorageBuilder::new()
@@ -49,6 +57,16 @@ fn effective_storage_limits_distinguish_unbounded_defaults() {
     assert!(!limits.wal_enabled);
     assert_eq!(limits.accounted_memory_bytes, None);
     assert_eq!(limits.cardinality, None);
+    assert_eq!(
+        limits.max_labels_per_series,
+        Some(tsink::DEFAULT_MAX_LABELS_PER_SERIES as u64)
+    );
+    assert_eq!(
+        limits.max_series_identity_bytes,
+        Some(tsink::DEFAULT_MAX_SERIES_IDENTITY_BYTES as u64)
+    );
+    assert_eq!(limits.max_new_series_per_window, None);
+    assert_eq!(limits.new_series_window_nanos, None);
     assert_eq!(limits.wal_bytes, None);
     assert_eq!(limits.local_disk_bytes, None);
     assert_eq!(limits.filesystem_free_headroom_bytes, None);
@@ -70,6 +88,9 @@ fn effective_storage_limits_report_configured_persistent_controls() {
         .with_data_path(temp_dir.path())
         .with_memory_limit(16 * 1024 * 1024)
         .with_cardinality_limit(1_024)
+        .with_max_labels_per_series(7)
+        .with_max_series_identity_bytes(4_096)
+        .with_series_creation_rate_limit(11, Duration::from_secs(2))
         .with_wal_size_limit(4 * 1024 * 1024)
         .with_local_disk_limit(64 * 1024 * 1024)
         .with_filesystem_free_headroom(1024 * 1024)
@@ -88,12 +109,30 @@ fn effective_storage_limits_report_configured_persistent_controls() {
             wal_enabled: true,
             accounted_memory_bytes: Some(16 * 1024 * 1024),
             cardinality: Some(1_024),
+            max_labels_per_series: Some(7),
+            max_series_identity_bytes: Some(4_096),
+            max_new_series_per_window: Some(11),
+            new_series_window_nanos: Some(2_000_000_000),
+            max_write_batch_rows: Some(100_000),
+            max_write_batch_input_bytes: Some(64 * 1024 * 1024),
             wal_bytes: Some(4 * 1024 * 1024),
+            wal_write_buffer_bytes: Some(4 * 1024),
             local_disk_bytes: Some(64 * 1024 * 1024),
             filesystem_free_headroom_bytes: Some(1024 * 1024),
             maintenance_temp_reserve_bytes: Some(2 * 1024 * 1024),
             max_concurrent_writers: Some(3),
             write_timeout_nanos: Some(17),
+            max_background_threads: Some(4),
+            max_flush_concurrency: Some(1),
+            max_compaction_concurrency: Some(1),
+            max_retention_tiering_concurrency: Some(0),
+            max_remote_catalog_refresh_concurrency: Some(0),
+            max_remote_tier_fetch_concurrency: Some(0),
+            max_rollup_concurrency: Some(1),
+            flush_interval_nanos: Some(250_000_000),
+            compaction_interval_nanos: Some(5_000_000_000),
+            persisted_refresh_poll_interval_nanos: Some(250_000_000),
+            rollup_interval_nanos: Some(5_000_000_000),
             max_active_partition_heads_per_series: Some(4),
         }
     );
@@ -110,6 +149,46 @@ fn effective_storage_limits_report_configured_persistent_controls() {
         local_disk.limits.maintenance_temp_reserve_bytes,
         2 * 1024 * 1024
     );
+
+    let background = storage.observability_snapshot().background;
+    assert_eq!(background.max_threads, 4);
+    assert_eq!(background.installed_threads, 4);
+    assert_eq!(background.flush.interval_nanos, Some(250_000_000));
+    assert_eq!(background.compaction.interval_nanos, Some(5_000_000_000));
+    assert_eq!(
+        background.persisted_refresh.interval_nanos,
+        Some(250_000_000)
+    );
+    assert_eq!(background.rollup.interval_nanos, Some(5_000_000_000));
+
+    storage.close().unwrap();
+
+    let background = storage.observability_snapshot().background;
+    assert_eq!(background.installed_threads, 0);
+    assert_eq!(background.running_threads, 0);
+    for worker in [
+        background.flush,
+        background.compaction,
+        background.persisted_refresh,
+        background.rollup,
+    ] {
+        assert_eq!(worker.starts_total, worker.exits_total);
+        assert_eq!(worker.passes_started_total, worker.passes_completed_total);
+        assert_eq!(worker.shutdown_joins_total, 1);
+    }
+}
+
+#[test]
+fn creation_rate_window_reports_timestamp_precision_rounding() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_series_creation_rate_limit(1, Duration::from_nanos(1))
+        .build()
+        .unwrap();
+
+    let limits = storage.effective_storage_limits();
+    assert_eq!(limits.max_new_series_per_window, Some(1));
+    assert_eq!(limits.new_series_window_nanos, Some(1_000_000_000));
 
     storage.close().unwrap();
 }
@@ -518,6 +597,415 @@ fn test_restore_rejects_symlink_snapshot_path() {
     let err = StorageBuilder::restore_from_snapshot(&snapshot_link, &restore_path).unwrap_err();
 
     assert!(matches!(err, TsinkError::InvalidConfiguration(_)));
+}
+
+#[test]
+fn unbudgeted_restore_rejects_resolved_overlap_in_both_directions_before_staging() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let source_ancestor = temp_dir.path().join("source-ancestor");
+    fs::create_dir_all(&source_ancestor).unwrap();
+    fs::write(source_ancestor.join("payload"), b"source").unwrap();
+    let descendant_target = source_ancestor.join("missing/target");
+    let descendant_err =
+        StorageBuilder::restore_from_snapshot(&source_ancestor, &descendant_target).unwrap_err();
+    assert!(matches!(
+        descendant_err,
+        TsinkError::InvalidConfiguration(_)
+    ));
+    assert!(!source_ancestor.join("missing").exists());
+
+    let target_ancestor = temp_dir.path().join("target-ancestor");
+    let nested_source = target_ancestor.join("snapshot");
+    fs::create_dir_all(&nested_source).unwrap();
+    fs::write(target_ancestor.join("sentinel"), b"keep").unwrap();
+    fs::write(nested_source.join("payload"), b"nested").unwrap();
+    let ancestor_err =
+        StorageBuilder::restore_from_snapshot(&nested_source, &target_ancestor).unwrap_err();
+    assert!(matches!(ancestor_err, TsinkError::InvalidConfiguration(_)));
+    assert_eq!(fs::read(target_ancestor.join("sentinel")).unwrap(), b"keep");
+    assert_eq!(fs::read(nested_source.join("payload")).unwrap(), b"nested");
+    assert!(fs::read_dir(temp_dir.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn unbudgeted_restore_rejects_excessive_snapshot_depth_before_destination_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("deep-snapshot");
+    let target_path = temp_dir.path().join("missing-parent/target");
+    let mut deepest = snapshot_path.clone();
+    for depth in 0..=tsink::MAX_SNAPSHOT_RESTORE_DEPTH {
+        deepest.push(format!("d{depth}"));
+    }
+    fs::create_dir_all(&deepest).unwrap();
+
+    let err = StorageBuilder::restore_from_snapshot(&snapshot_path, &target_path).unwrap_err();
+
+    assert!(matches!(
+        err,
+        TsinkError::InvalidConfiguration(message)
+            if message.contains("directory depth") && message.contains("exceeds limit")
+    ));
+    assert!(!temp_dir.path().join("missing-parent").exists());
+    assert!(fs::read_dir(temp_dir.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-tsink-restore-")));
+}
+
+#[cfg(unix)]
+#[test]
+fn unbudgeted_restore_rejects_overlap_through_intermediate_symlink_aliases() {
+    let temp_dir = TempDir::new().unwrap();
+    let real_root = temp_dir.path().join("real-root");
+    let root_alias = temp_dir.path().join("root-alias");
+    let source = real_root.join("container/snapshot");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload"), b"source").unwrap();
+    symlink(&real_root, &root_alias).unwrap();
+
+    let descendant_alias = root_alias.join("container/snapshot/missing/target");
+    let descendant_err =
+        StorageBuilder::restore_from_snapshot(&source, &descendant_alias).unwrap_err();
+    assert!(matches!(
+        descendant_err,
+        TsinkError::InvalidConfiguration(_)
+    ));
+    assert!(!source.join("missing").exists());
+
+    let aliased_source = root_alias.join("container/snapshot");
+    let ancestor_target = real_root.join("container");
+    let ancestor_err =
+        StorageBuilder::restore_from_snapshot(&aliased_source, &ancestor_target).unwrap_err();
+    assert!(matches!(ancestor_err, TsinkError::InvalidConfiguration(_)));
+    assert_eq!(fs::read(source.join("payload")).unwrap(), b"source");
+    assert!(fs::read_dir(&real_root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-tsink-restore-")));
+}
+
+#[test]
+fn budgeted_restore_rejects_quota_before_destination_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    let target_path = budget_root.join("missing-parent/target");
+    fs::create_dir_all(&snapshot_path).unwrap();
+    fs::write(snapshot_path.join("payload"), b"12345").unwrap();
+    let entry_allowance = restore_entry_allowance_for(&budget_root);
+    let budget = LocalDiskBudget::open(
+        &budget_root,
+        LocalDiskLimits {
+            max_bytes: Some(4),
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+
+    let err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &target_path,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        TsinkError::DiskQuotaExceeded { requested, .. }
+            if requested
+                == 5 + 3 * entry_allowance
+    ));
+    assert!(!budget_root.join("missing-parent").exists());
+    assert_eq!(fs::read(snapshot_path.join("payload")).unwrap(), b"12345");
+    let accounting = budget.snapshot();
+    assert_eq!(accounting.accounted_bytes, 0);
+    assert_eq!(accounting.active_reservations, 0);
+    assert_eq!(accounting.reserved_bytes, 0);
+    assert_eq!(accounting.rejections_total, 1);
+}
+
+#[test]
+fn budgeted_restore_reserves_entry_allowance_for_empty_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    let target_path = budget_root.join("target");
+    fs::create_dir_all(&snapshot_path).unwrap();
+    fs::write(snapshot_path.join("empty"), b"").unwrap();
+    let required = 2 * restore_entry_allowance_for(&budget_root);
+    let budget = LocalDiskBudget::open(
+        &budget_root,
+        LocalDiskLimits {
+            max_bytes: Some(required - 1),
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+
+    let err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &target_path,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        TsinkError::DiskQuotaExceeded {
+            requested,
+            limit,
+            used: 0,
+            reserved: 0,
+            ..
+        } if requested == required && limit == required - 1
+    ));
+    assert!(!target_path.exists());
+    assert_eq!(budget.snapshot().accounted_bytes, 0);
+    assert_eq!(budget.snapshot().active_reservations, 0);
+}
+
+#[test]
+fn budgeted_restore_reserves_allowance_for_every_missing_target_parent() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    let target_path = budget_root.join("one/two/three/target");
+    fs::create_dir_all(&snapshot_path).unwrap();
+    let entry_allowance = restore_entry_allowance_for(&budget_root);
+    let required = 4 * entry_allowance; // snapshot root plus three missing target parents
+    let budget = LocalDiskBudget::open(
+        &budget_root,
+        LocalDiskLimits {
+            max_bytes: Some(required - 1),
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+
+    let err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &target_path,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        TsinkError::DiskQuotaExceeded {
+            requested,
+            limit,
+            used: 0,
+            reserved: 0,
+        } if requested == required && limit == required - 1
+    ));
+    assert!(!budget_root.join("one").exists());
+    assert_eq!(budget.snapshot().active_reservations, 0);
+}
+
+#[test]
+fn budgeted_restore_replaces_target_preserves_siblings_and_reopens_exactly() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    let target_path = budget_root.join("target");
+    fs::create_dir_all(snapshot_path.join("nested")).unwrap();
+    fs::write(snapshot_path.join("payload"), b"fresh").unwrap();
+    fs::write(snapshot_path.join("nested/more"), b"xy").unwrap();
+    fs::create_dir_all(&target_path).unwrap();
+    fs::write(target_path.join("old"), b"oldold").unwrap();
+    fs::write(budget_root.join("host-owned.bin"), b"host").unwrap();
+
+    // Existing bytes (10) plus 7 logical staging bytes and four entry allowances fit exactly.
+    let staging_admission = 7 + 4 * restore_entry_allowance_for(&budget_root);
+    let limits = LocalDiskLimits {
+        max_bytes: Some(10 + staging_admission),
+        ..LocalDiskLimits::default()
+    };
+    let budget = LocalDiskBudget::open(&budget_root, limits).unwrap();
+    StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &target_path,
+        Arc::clone(&budget),
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(target_path.join("payload")).unwrap(), b"fresh");
+    assert_eq!(fs::read(target_path.join("nested/more")).unwrap(), b"xy");
+    assert!(!target_path.join("old").exists());
+    assert_eq!(
+        fs::read(budget_root.join("host-owned.bin")).unwrap(),
+        b"host"
+    );
+    assert!(fs::read_dir(&budget_root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-tsink-restore-")));
+
+    let accounting = budget.snapshot();
+    assert_eq!(accounting.accounted_bytes, 11);
+    assert_eq!(accounting.unknown_bytes, 11);
+    assert_eq!(accounting.active_reservations, 0);
+    assert_eq!(accounting.reserved_bytes, 0);
+    drop(budget);
+
+    let reopened = LocalDiskBudget::open(&budget_root, limits).unwrap();
+    let reopened_accounting = reopened.snapshot();
+    assert_eq!(reopened_accounting.accounted_bytes, 11);
+    assert_eq!(reopened_accounting.unknown_bytes, 11);
+    assert_eq!(reopened_accounting.active_reservations, 0);
+}
+
+#[test]
+fn budgeted_restore_rejects_target_escape_root_and_snapshot_overlap() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    fs::create_dir_all(&snapshot_path).unwrap();
+    fs::write(snapshot_path.join("payload"), b"data").unwrap();
+    fs::create_dir_all(budget_root.join("in-tree-snapshot")).unwrap();
+    fs::write(budget_root.join("in-tree-snapshot/payload"), b"managed").unwrap();
+    fs::write(budget_root.join("sentinel"), b"keep").unwrap();
+    let budget = LocalDiskBudget::open(&budget_root, LocalDiskLimits::default()).unwrap();
+
+    let outside_target = temp_dir.path().join("outside-target");
+    let outside_err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &outside_target,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+    assert!(matches!(outside_err, TsinkError::InvalidConfiguration(_)));
+    assert!(!outside_target.exists());
+
+    let root_err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &budget_root,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+    assert!(matches!(root_err, TsinkError::InvalidConfiguration(_)));
+
+    let overlap_target = budget_root.join("overlap-target");
+    let overlap_err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        budget_root.join("in-tree-snapshot"),
+        &overlap_target,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+    assert!(matches!(overlap_err, TsinkError::InvalidConfiguration(_)));
+    assert!(!overlap_target.exists());
+    assert_eq!(fs::read(budget_root.join("sentinel")).unwrap(), b"keep");
+    assert_eq!(budget.snapshot().active_reservations, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn budgeted_restore_rejects_snapshot_and_target_symlinks_before_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("external-snapshot");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    fs::create_dir_all(&snapshot_path).unwrap();
+    fs::write(snapshot_path.join("payload"), b"data").unwrap();
+    symlink(snapshot_path.join("payload"), snapshot_path.join("linked")).unwrap();
+    fs::create_dir_all(budget_root.join("real-parent")).unwrap();
+    symlink(
+        budget_root.join("real-parent"),
+        budget_root.join("linked-parent"),
+    )
+    .unwrap();
+    let budget = LocalDiskBudget::open(&budget_root, LocalDiskLimits::default()).unwrap();
+
+    let source_err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        budget_root.join("source-rejected/target"),
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+    assert!(matches!(source_err, TsinkError::InvalidConfiguration(_)));
+    assert!(!budget_root.join("source-rejected").exists());
+
+    fs::remove_file(snapshot_path.join("linked")).unwrap();
+    let linked_target = budget_root.join("linked-parent/target");
+    let target_err = StorageBuilder::restore_from_snapshot_with_disk_budget(
+        &snapshot_path,
+        &linked_target,
+        Arc::clone(&budget),
+    )
+    .unwrap_err();
+    assert!(matches!(target_err, TsinkError::InvalidConfiguration(_)));
+    assert!(!budget_root.join("real-parent/target").exists());
+    assert_eq!(budget.snapshot().active_reservations, 0);
+}
+
+#[test]
+fn concurrent_budgeted_restores_admit_only_the_final_available_bytes() {
+    let temp_dir = TempDir::new().unwrap();
+    let snapshot_a = temp_dir.path().join("snapshot-a");
+    let snapshot_b = temp_dir.path().join("snapshot-b");
+    let budget_root = temp_dir.path().join("restore-envelope");
+    fs::create_dir_all(&snapshot_a).unwrap();
+    fs::create_dir_all(&snapshot_b).unwrap();
+    fs::write(snapshot_a.join("payload"), b"aaaa").unwrap();
+    fs::write(snapshot_b.join("payload"), b"bbbb").unwrap();
+    let entry_allowance = restore_entry_allowance_for(&budget_root);
+    let budget = LocalDiskBudget::open(
+        &budget_root,
+        LocalDiskLimits {
+            max_bytes: Some(4 + 2 * entry_allowance),
+            ..LocalDiskLimits::default()
+        },
+    )
+    .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let handles = [
+        (snapshot_a, budget_root.join("target-a")),
+        (snapshot_b, budget_root.join("target-b")),
+    ]
+    .into_iter()
+    .map(|(snapshot, target)| {
+        let budget = Arc::clone(&budget);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            StorageBuilder::restore_from_snapshot_with_disk_budget(snapshot, target, budget)
+        })
+    })
+    .collect::<Vec<_>>();
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(TsinkError::DiskQuotaExceeded { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        [budget_root.join("target-a"), budget_root.join("target-b")]
+            .iter()
+            .filter(|target| target.exists())
+            .count(),
+        1
+    );
+    let accounting = budget.snapshot();
+    assert_eq!(accounting.accounted_bytes, 4);
+    assert_eq!(accounting.active_reservations, 0);
+    assert_eq!(accounting.reserved_bytes, 0);
+    assert_eq!(accounting.rejections_total, 1);
 }
 
 #[test]

@@ -183,3 +183,58 @@ fn active_missing_label_caches_do_not_block_unrelated_new_series_registration() 
     assert!(result.unwrap().created);
     writer.join().unwrap();
 }
+
+#[test]
+fn metric_postings_pages_seek_after_the_exclusive_cursor() {
+    let registry = SeriesRegistry::new();
+    let mut expected = Vec::new();
+    for host in 0..5 {
+        expected.push(
+            registry
+                .resolve_or_insert("cpu", &[Label::new("host", host.to_string())])
+                .unwrap()
+                .series_id,
+        );
+    }
+    registry
+        .resolve_or_insert("disk", &[Label::new("host", "unrelated")])
+        .unwrap();
+
+    let (first, more) = registry.series_ids_for_metric_after("cpu", None, 2);
+    assert_eq!(first, expected[..2]);
+    assert!(more);
+
+    let (second, more) = registry.series_ids_for_metric_after("cpu", first.last().copied(), 2);
+    assert_eq!(second, expected[2..4]);
+    assert!(more);
+
+    let (last, more) = registry.series_ids_for_metric_after("cpu", second.last().copied(), 2);
+    assert_eq!(last, expected[4..]);
+    assert!(!more);
+
+    let (finished, more) = registry.series_ids_for_metric_after("cpu", Some(u64::MAX), 2);
+    assert!(finished.is_empty());
+    assert!(!more);
+
+    let exact = (0..4)
+        .map(|host| {
+            registry
+                .resolve_or_insert("memory", &[Label::new("host", host.to_string())])
+                .unwrap()
+                .series_id
+        })
+        .collect::<Vec<_>>();
+    let (first, more) = registry.series_ids_for_metric_after("memory", None, 2);
+    assert_eq!(first, exact[..2]);
+    assert!(more);
+    let (second, more) = registry.series_ids_for_metric_after("memory", first.last().copied(), 2);
+    assert_eq!(second, exact[2..]);
+    assert!(
+        more,
+        "a full page must not peek past the configured posting-inspection limit"
+    );
+    let (terminal, more) =
+        registry.series_ids_for_metric_after("memory", second.last().copied(), 2);
+    assert!(terminal.is_empty());
+    assert!(!more);
+}

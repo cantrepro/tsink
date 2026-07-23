@@ -1,11 +1,11 @@
 # ADR 0002: Resource profiles and shared budget model
 
-- Status: Accepted for staged implementation
+- Status: Implemented with provisional constants pending final qualification
 - Date: 2026-07-22
 
 ## Context
 
-`StorageBuilder` currently exposes individual write-side controls for accounted storage memory,
+Before this decision, `StorageBuilder` exposed individual write-side controls for accounted storage memory,
 cardinality, WAL bytes, writer concurrency, write timeout, and active partition heads. Several of
 those controls default to `usize::MAX`, and the built-in engine has no complete local-disk budget or
 shared embedded-query budget. Server adapters add their own finite request and fan-out guardrails,
@@ -21,7 +21,7 @@ unrelated one-off limits.
 
 ### Profile shape
 
-The completed public design will expose these named profiles:
+The public design exposes these named profiles:
 
 - `Test` — small deterministic budgets suitable for temporary databases and CI;
 - `Embedded` — the default for an in-process application;
@@ -30,14 +30,15 @@ The completed public design will expose these named profiles:
 - `Custom(ResourceLimits)` — a fully specified set of limits;
 - an explicitly named expert-only unlimited configuration.
 
-Named profiles will not be added as nominal labels with unenforced fields. They become public only
-when their memory, local-disk, WAL, cardinality, query, and concurrency values are finite and the
-engine can report the effective values after build. Until then the existing default behavior stays
-documented as legacy/unbounded rather than being relabeled as `Embedded`.
+Named profiles are not nominal labels: memory, local-disk, WAL, cardinality, write, query, async
+queue, worker, identity, and maintenance values are finite, validated, and inspectable after build.
+`StorageBuilder::new()` now selects `Embedded`; `ExpertUnlimited` is the explicit legacy migration
+base.
 
-Profile numbers will be selected from reproducible measurements and tiny-limit boundary tests, not
-from unreferenced estimates. The measurements, platform, workload, and accounted scope will be
-recorded alongside the chosen values.
+The initial profile numbers are conservative and explicitly provisional. They are not throughput or
+maximum-capacity claims. The available high-cardinality run and tiny-limit boundary tests are
+recorded in `docs/resource-profile-measurements.md`; constants remain subject to the final clean
+Test/Embedded/Edge/Server workload matrix before release qualification.
 
 ### Limit representation
 
@@ -127,6 +128,25 @@ silently truncates because it reached a profile budget.
 This sequence is an implementation dependency graph, not permission to mark Phase 2 complete
 piecemeal. Phase 2 remains incomplete until every named profile is finite and the acceptance tests
 in `GOAL.md` pass.
+
+## Implemented API and migration
+
+`ResourceLimits` contains concrete finite values, including complete `WriteBatchLimits` and
+`QueryBudgetLimits`; `Custom` rejects missing/zero nested fields and invalid disk, WAL, memory,
+identity, async, or fixed-worker relationships. Internal `usize::MAX` sentinels remain confined to
+the `ExpertUnlimited` compatibility conversion and low-level legacy APIs.
+
+The builder retains `ResourceProfile` separately from a set of `ResourceLimitOverride` values.
+`with_resource_profile` reapplies only non-overridden fields. Callers can clear one override or all
+overrides explicitly. The versioned `ResourceConfigurationSnapshot` reports the stable profile
+name, resolved storage/query/async/maintenance values, and sorted override provenance. Core storage,
+the async facade, UniFFI/Python, and server `data.resourceConfiguration` expose the same contract;
+`EffectiveStorageLimits` remains the narrower compatibility projection.
+
+New embedded builders select `Embedded`. New server construction selects `Server` unless
+`--resource-profile` or programmatic `ServerConfig::resource_profile` says otherwise. Existing
+deployments requiring the old unbounded storage/query behavior must opt into `ExpertUnlimited` and
+should then migrate one finite category at a time.
 
 ## Consequences
 

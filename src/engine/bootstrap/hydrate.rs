@@ -14,9 +14,10 @@ impl StartupHydrationPhase {
         next_segment_id: u64,
         wal: Option<FramedWal>,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        query_budget_limits: crate::QueryBudgetLimits,
     ) -> Result<Arc<ChunkStorage>> {
         Ok(Arc::new(
-            ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+            ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
                 chunk_points,
                 wal,
                 paths.numeric_lane_path.clone(),
@@ -24,6 +25,7 @@ impl StartupHydrationPhase {
                 next_segment_id,
                 storage_options,
                 local_disk_budget,
+                query_budget_limits,
             )?,
         ))
     }
@@ -33,6 +35,7 @@ impl StartupHydrationPhase {
         builder: &StorageBuilder,
         recovered: StartupRecoveryState,
         data_path_process_lock: Option<DataPathProcessLock>,
+        shared_object_store_process_lock: Option<SharedObjectStoreProcessLock>,
     ) -> Result<()> {
         let StartupRecoveryState {
             registry,
@@ -44,6 +47,9 @@ impl StartupHydrationPhase {
         storage.load_tombstones_index()?;
         if let Some(data_path_process_lock) = data_path_process_lock {
             storage.install_data_path_process_lock(data_path_process_lock);
+        }
+        if let Some(shared_object_store_process_lock) = shared_object_store_process_lock {
+            storage.install_shared_object_store_process_lock(shared_object_store_process_lock);
         }
         if let Some(loaded_registry) = registry.persisted_registry {
             storage.replace_registry_from_persisted_state(

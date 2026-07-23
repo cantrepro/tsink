@@ -5,10 +5,17 @@ use parking_lot::Mutex;
 
 use crate::db::TsinkDB;
 use crate::enums::{
-    URemoteSegmentCachePolicy, UStorageRuntimeMode, UTimestampPrecision, UWalReplayMode,
-    UWalSyncMode,
+    URemoteSegmentCachePolicy, UResourceProfile, UStorageRuntimeMode, UTimestampPrecision,
+    UWalReplayMode, UWalSyncMode,
 };
 use crate::error::{Result, TsinkUniFFIError};
+use crate::types::{UQueryBudgetLimits, UWriteBatchLimits};
+
+fn checked_usize(field: &str, value: u64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| TsinkUniFFIError::InvalidInput {
+        msg: format!("{field} value {value} does not fit this platform's usize"),
+    })
+}
 
 #[derive(uniffi::Object)]
 pub struct TsinkStorageBuilder {
@@ -40,6 +47,10 @@ impl TsinkStorageBuilder {
 
     pub fn with_data_path(&self, path: String) -> Result<()> {
         self.with_builder(|b| b.with_data_path(path))
+    }
+
+    pub fn with_resource_profile(&self, profile: UResourceProfile) -> Result<()> {
+        self.with_builder(|b| b.with_resource_profile(profile.into()))
     }
 
     pub fn with_object_store_path(&self, path: String) -> Result<()> {
@@ -113,6 +124,42 @@ impl TsinkStorageBuilder {
         self.with_builder(|b| b.with_cardinality_limit(series as usize))
     }
 
+    pub fn with_max_labels_per_series(&self, labels: u64) -> Result<()> {
+        let labels = checked_usize("max_labels_per_series", labels)?;
+        self.with_builder(|b| b.with_max_labels_per_series(labels))
+    }
+
+    pub fn with_max_series_identity_bytes(&self, bytes: u64) -> Result<()> {
+        let bytes = checked_usize("max_series_identity_bytes", bytes)?;
+        self.with_builder(|b| b.with_max_series_identity_bytes(bytes))
+    }
+
+    pub fn with_series_creation_rate_limit(
+        &self,
+        max_new_series: u64,
+        window: Duration,
+    ) -> Result<()> {
+        let max_new_series = checked_usize("max_new_series_per_window", max_new_series)?;
+        self.with_builder(|b| b.with_series_creation_rate_limit(max_new_series, window))
+    }
+
+    pub fn with_write_batch_limits(&self, limits: UWriteBatchLimits) -> Result<()> {
+        let max_rows = limits
+            .max_rows
+            .map(|value| checked_usize("max_write_batch_rows", value))
+            .transpose()?;
+        let max_modeled_input_bytes = limits
+            .max_modeled_input_bytes
+            .map(|value| checked_usize("max_write_batch_input_bytes", value))
+            .transpose()?;
+        self.with_builder(|b| {
+            b.with_write_batch_limits(tsink_core::WriteBatchLimits {
+                max_rows,
+                max_modeled_input_bytes,
+            })
+        })
+    }
+
     pub fn with_wal_enabled(&self, enabled: bool) -> Result<()> {
         self.with_builder(|b| b.with_wal_enabled(enabled))
     }
@@ -149,8 +196,25 @@ impl TsinkStorageBuilder {
         self.with_builder(|b| b.with_background_fail_fast(enabled))
     }
 
+    pub fn with_maintenance_max_items_per_pass(&self, max_items: u64) -> Result<()> {
+        let max_items = checked_usize("maintenance_max_items_per_pass", max_items)?;
+        self.with_builder(|b| b.with_maintenance_max_items_per_pass(max_items))
+    }
+
+    pub fn with_maintenance_max_bytes_per_pass(&self, max_bytes: u64) -> Result<()> {
+        self.with_builder(|b| b.with_maintenance_max_bytes_per_pass(max_bytes))
+    }
+
+    pub fn clear_resource_limit_overrides(&self) -> Result<()> {
+        self.with_builder(tsink_core::StorageBuilder::clear_resource_limit_overrides)
+    }
+
     pub fn with_metadata_shard_count(&self, shard_count: u32) -> Result<()> {
         self.with_builder(|b| b.with_metadata_shard_count(shard_count))
+    }
+
+    pub fn with_query_budget_limits(&self, limits: UQueryBudgetLimits) -> Result<()> {
+        self.with_builder(|b| b.with_query_budget_limits(limits.into()))
     }
 
     pub fn build(&self) -> Result<Arc<TsinkDB>> {
@@ -193,6 +257,114 @@ mod tests {
 
         let result = builder.with_wal_enabled(false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resource_profile_and_override_provenance_are_forwarded() {
+        let builder = TsinkStorageBuilder::new();
+        builder.with_memory_limit(123_456).unwrap();
+        builder
+            .with_resource_profile(UResourceProfile::Edge)
+            .unwrap();
+
+        let db = builder.build().unwrap();
+        let snapshot = db.resource_configuration_snapshot();
+        assert!(matches!(
+            snapshot.selected_profile,
+            crate::enums::UResourceProfileName::Edge
+        ));
+        assert_eq!(
+            snapshot.resolved_limits.storage.accounted_memory_bytes,
+            Some(123_456)
+        );
+        assert_eq!(snapshot.overrides, vec!["accounted_memory".to_string()]);
+        assert_eq!(
+            db.observability_snapshot()
+                .resource_configuration
+                .schema_version,
+            snapshot.schema_version
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn cardinality_controls_are_forwarded_and_observable() {
+        let builder = TsinkStorageBuilder::new();
+        builder.with_max_labels_per_series(7).unwrap();
+        builder.with_max_series_identity_bytes(2_048).unwrap();
+        builder
+            .with_series_creation_rate_limit(11, Duration::from_secs(2))
+            .unwrap();
+
+        let db = builder.build().unwrap();
+        let limits = db.effective_storage_limits();
+        assert_eq!(limits.max_labels_per_series, Some(7));
+        assert_eq!(limits.max_series_identity_bytes, Some(2_048));
+        assert_eq!(limits.max_new_series_per_window, Some(11));
+        assert_eq!(limits.new_series_window_nanos, Some(2_000_000_000));
+        let cardinality = db.observability_snapshot().cardinality;
+        assert_eq!(cardinality.series_count, 0);
+        assert_eq!(cardinality.pending_new_series, 0);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn write_batch_controls_are_forwarded_and_observable() {
+        let builder = TsinkStorageBuilder::new();
+        builder
+            .with_write_batch_limits(UWriteBatchLimits {
+                max_rows: Some(23),
+                max_modeled_input_bytes: Some(8_192),
+            })
+            .unwrap();
+
+        let db = builder.build().unwrap();
+        let limits = db.effective_storage_limits();
+        assert_eq!(limits.max_write_batch_rows, Some(23));
+        assert_eq!(limits.max_write_batch_input_bytes, Some(8_192));
+        let memory = db.observability_snapshot().memory;
+        assert_eq!(memory.wal_series_definition_cache_bytes, 0);
+        assert_eq!(memory.write_transient_bytes, 0);
+        assert!(memory.write_transient_bytes_estimated);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn query_budget_controls_are_forwarded_and_observable() {
+        let builder = TsinkStorageBuilder::new();
+        builder
+            .with_query_budget_limits(UQueryBudgetLimits {
+                max_concurrent_queries: Some(2),
+                max_shared_memory_bytes: Some(8_192),
+                per_query: crate::types::UQueryWorkLimits {
+                    max_series_matched: Some(3),
+                    max_samples_scanned: Some(4),
+                    max_samples_returned: Some(5),
+                    max_returned_bytes: Some(6_144),
+                    max_pattern_expansion: Some(7),
+                    max_steps: Some(8),
+                    max_intermediate_vector_size: Some(9),
+                    max_memory_bytes: Some(4_096),
+                    max_wall_time_nanos: Some(10_000_000),
+                },
+            })
+            .unwrap();
+
+        let db = builder.build().unwrap();
+        let budget = db.observability_snapshot().query_budget;
+        assert_eq!(budget.limits.max_concurrent_queries, Some(2));
+        assert_eq!(budget.limits.max_shared_memory_bytes, Some(8_192));
+        assert_eq!(budget.limits.per_query.max_steps, Some(8));
+        assert_eq!(budget.limits.per_query.max_memory_bytes, Some(4_096));
+        assert_eq!(
+            budget.limits.per_query.max_wall_time_nanos,
+            Some(10_000_000)
+        );
+        assert_eq!(budget.active_queries, 0);
+
+        db.close().unwrap();
     }
 }
 

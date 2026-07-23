@@ -52,6 +52,9 @@ const DEFAULT_WAL_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const FRAME_MAGIC: [u8; 4] = *b"TSFR";
 const FRAME_HEADER_LEN: usize = 24;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Format-level safety ceiling for one decoded replay batch. Live write limits remain optional for
+/// compatibility, but a compressed constant-RLE frame must never expand without a finite bound.
+pub(in crate::engine) const MAX_WAL_REPLAY_DECODED_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const PUBLISHED_HIGHWATER_MAGIC: [u8; 4] = *b"TSHW";
 const PUBLISHED_HIGHWATER_RECORD_LEN: usize = 24;
 
@@ -83,6 +86,15 @@ pub struct SamplesBatchFrame {
 }
 
 impl SamplesBatchFrame {
+    pub(in crate::engine) fn modeled_decoded_points_peak_bytes(&self) -> Result<usize> {
+        Encoder::modeled_decoded_chunk_peak_bytes(
+            self.lane,
+            self.value_codec,
+            usize::from(self.point_count),
+            &self.value_payload,
+        )
+    }
+
     pub fn from_points(
         series_id: SeriesId,
         lane: ValueLane,

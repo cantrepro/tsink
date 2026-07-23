@@ -9,6 +9,7 @@ use super::{
     Chunk, ChunkStorage, PersistedChunkRef, PersistedIndexState, Result, SealedChunkKey, SeriesId,
     SeriesVisibilitySummary, TimeRangeFilterContext,
 };
+use crate::QueryExecution;
 
 enum SeriesVisibilitySummaryDecision {
     Match,
@@ -60,6 +61,7 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
         tombstone_ranges: Option<&[tombstone::TombstoneRange]>,
+        execution: &QueryExecution,
     ) -> Result<bool> {
         if chunk.header.max_ts < start || chunk.header.min_ts >= end {
             return Ok(false);
@@ -78,6 +80,8 @@ impl TimeRangeFilterContext<'_> {
             }
         }
 
+        execution.checkpoint()?;
+        execution.charge_samples_scanned(u64::from(chunk.header.point_count))?;
         Ok(ChunkStorage::latest_visible_timestamp_in_chunk(
             chunk,
             tombstone_ranges,
@@ -94,6 +98,7 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
         tombstone_ranges: Option<&[tombstone::TombstoneRange]>,
+        execution: &QueryExecution,
     ) -> Result<bool> {
         if chunk_ref.max_ts < start || chunk_ref.min_ts >= end {
             return Ok(false);
@@ -112,6 +117,8 @@ impl TimeRangeFilterContext<'_> {
             }
         }
 
+        execution.checkpoint()?;
+        execution.charge_samples_scanned(u64::from(chunk_ref.point_count))?;
         Ok(self
             .ops
             .latest_visible_timestamp_in_persisted_chunk(
@@ -129,7 +136,9 @@ impl TimeRangeFilterContext<'_> {
         series_id: SeriesId,
         start: i64,
         end: i64,
+        execution: &QueryExecution,
     ) -> Result<bool> {
+        execution.checkpoint()?;
         let _visibility_guard = self.visibility_read_fence();
         let tombstones = self.tombstones.read();
         let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
@@ -138,6 +147,7 @@ impl TimeRangeFilterContext<'_> {
         if let Some(chunks) = sealed.get(&series_id) {
             let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
             for (_, chunk) in chunks.range(..end_bound) {
+                execution.checkpoint()?;
                 if chunk.header.max_ts < start {
                     continue;
                 }
@@ -146,19 +156,27 @@ impl TimeRangeFilterContext<'_> {
                     start,
                     end,
                     tombstone_ranges,
+                    execution,
                 )? {
                     return Ok(true);
                 }
             }
         }
 
-        Ok(active.get(&series_id).is_some_and(|state| {
-            state.points_in_partition_order().any(|point| {
-                point.ts >= start
-                    && point.ts < end
-                    && ChunkStorage::timestamp_survives_tombstones(point.ts, tombstone_ranges)
-            })
-        }))
+        let Some(state) = active.get(&series_id) else {
+            return Ok(false);
+        };
+        for point in state.points_in_partition_order() {
+            execution.checkpoint()?;
+            execution.charge_samples_scanned(1)?;
+            if point.ts >= start
+                && point.ts < end
+                && ChunkStorage::timestamp_survives_tombstones(point.ts, tombstone_ranges)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn prune_series_postings_without_persisted_segment_overlap_in_time_range(
@@ -167,9 +185,11 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
-    ) -> PersistedTimeRangePruneResult {
+        execution: &QueryExecution,
+    ) -> Result<PersistedTimeRangePruneResult> {
+        execution.checkpoint()?;
         if series_ids.is_empty() {
-            return PersistedTimeRangePruneResult::default();
+            return Ok(PersistedTimeRangePruneResult::default());
         }
 
         let persisted_index = self.persisted_index.read();
@@ -191,13 +211,14 @@ impl TimeRangeFilterContext<'_> {
             plan,
         );
         drop(persisted_index);
+        execution.checkpoint()?;
 
         #[cfg(test)]
         if consulted_segments {
             self.ops.invoke_metadata_time_range_segment_prune_hook();
         }
 
-        result
+        Ok(result)
     }
 
     fn series_has_visible_persisted_chunk_refs_in_time_range(
@@ -206,7 +227,9 @@ impl TimeRangeFilterContext<'_> {
         chunk_refs: &[PersistedChunkRef],
         start: i64,
         end: i64,
+        execution: &QueryExecution,
     ) -> Result<bool> {
+        execution.checkpoint()?;
         let persisted_index = self.persisted_index.read();
         #[cfg(test)]
         if !chunk_refs.is_empty() {
@@ -217,12 +240,14 @@ impl TimeRangeFilterContext<'_> {
         let tombstones = self.tombstones.read();
         let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
         for chunk_ref in chunk_refs {
+            execution.checkpoint()?;
             if self.persisted_chunk_has_visible_timestamp_in_time_range(
                 &persisted_index,
                 chunk_ref,
                 start,
                 end,
                 tombstone_ranges,
+                execution,
             )? {
                 return Ok(true);
             }
@@ -237,7 +262,9 @@ impl TimeRangeFilterContext<'_> {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
+        execution.checkpoint()?;
         if series_ids.is_empty() {
             return Ok(series_ids);
         }
@@ -256,9 +283,14 @@ impl TimeRangeFilterContext<'_> {
 
         let mut filtered = RoaringTreemap::new();
         let mut exact_scan_series_ids = RoaringTreemap::new();
+        let mut control_error = None;
         self.visibility_cache.with_visibility_cache_state(
             |summaries: &std::collections::HashMap<SeriesId, SeriesVisibilitySummary>, _, _| {
                 for series_id in series_ids {
+                    if let Err(error) = execution.checkpoint() {
+                        control_error = Some(error);
+                        break;
+                    }
                     let Some(summary) = summaries.get(&series_id) else {
                         continue;
                     };
@@ -278,13 +310,18 @@ impl TimeRangeFilterContext<'_> {
                 }
             },
         );
+        if let Some(error) = control_error {
+            return Err(error.into());
+        }
 
         let mut persisted_exact_scan_series_ids = RoaringTreemap::new();
         for series_id in exact_scan_series_ids {
+            execution.checkpoint()?;
             if self.series_has_visible_in_memory_data_in_time_range(
                 series_id,
                 effective_start,
                 end,
+                execution,
             )? {
                 filtered.insert(series_id);
             } else {
@@ -298,14 +335,17 @@ impl TimeRangeFilterContext<'_> {
                 effective_start,
                 end,
                 plan,
-            )
+                execution,
+            )?
             .exact_scan_chunk_refs
         {
+            execution.checkpoint()?;
             if self.series_has_visible_persisted_chunk_refs_in_time_range(
                 series_id,
                 &chunk_refs,
                 effective_start,
                 end,
+                execution,
             )? {
                 filtered.insert(series_id);
             }
@@ -321,9 +361,10 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
         self.time_range_filter_context()
-            .series_postings_with_data_in_time_range(series_ids, start, end, plan)
+            .series_postings_with_data_in_time_range(series_ids, start, end, plan, execution)
     }
 
     #[cfg(test)]
@@ -333,12 +374,16 @@ impl ChunkStorage {
         start: i64,
         end: i64,
     ) -> Result<Vec<SeriesId>> {
+        let budget = crate::QueryBudget::new(crate::QueryBudgetLimits::default())
+            .map_err(crate::QueryBudgetError::from)?;
+        let execution = budget.begin_query()?;
         Ok(self
             .series_postings_with_data_in_time_range(
                 series_ids.into_iter().collect(),
                 start,
                 end,
                 self.query_tier_plan(start, end),
+                &execution,
             )?
             .iter()
             .collect())

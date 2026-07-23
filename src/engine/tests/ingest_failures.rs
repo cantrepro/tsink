@@ -411,6 +411,7 @@ fn wal_append_failure_does_not_ingest_points_or_survive_reopen() {
 
     {
         let storage = StorageBuilder::new()
+            .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
             .with_data_path(temp_dir.path())
             .with_timestamp_precision(TimestampPrecision::Seconds)
             .with_chunk_points(2)
@@ -436,6 +437,7 @@ fn wal_append_failure_does_not_ingest_points_or_survive_reopen() {
     }
 
     let reopened = StorageBuilder::new()
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_data_path(temp_dir.path())
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(2)
@@ -1214,6 +1216,7 @@ fn incremental_persisted_segment_adoption_rejects_family_drift() {
         },
         points: conflicting_points,
         encoded_payload: encoded.payload,
+        wal_lowwater: WalHighWatermark::default(),
         wal_highwater: WalHighWatermark::default(),
     };
     let mut conflicting_chunks = HashMap::new();

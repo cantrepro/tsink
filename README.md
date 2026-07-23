@@ -94,7 +94,7 @@ paths you depend on and pin versions. In particular:
 
 | Area | Current status |
 |---|---|
-| Resource bounds | Individual builder knobs and [effective-limit inspection](docs/resource-limits.md) exist, but finite `Test`, `Embedded`, `Edge`, and `Server` profiles are **not shipped**. Memory, cardinality, and WAL quotas default to no explicit limit, and a complete hard disk/query/resource envelope is roadmap work. |
+| Resource bounds | Finite `Test`, `Embedded`, `Edge`, and `Server` profiles, deterministic sparse overrides, and [versioned effective-limit inspection](docs/resource-limits.md) are shipped. The embedded core defaults to `Embedded`, the server defaults to `Server`, and legacy unbounded storage/query behavior requires explicit `ExpertUnlimited`. Profile constants remain provisional pending the final clean measurement matrix, and modeled memory is not a hard process-RSS envelope. |
 | Test support | A dedicated `tsink-test` crate, public manual clock, and deterministic maintenance loop are **not shipped**. |
 | Prometheus and OTLP compatibility | Implementations exist, but generated capability matrices and a differential compatibility suite are **not shipped**. Do not interpret “PromQL” or a protocol endpoint as a claim of complete upstream compatibility. |
 | Write results | `write_batch` reports indexed structured outcomes with explicit `Atomic` or `BestEffort` policy; `insert_rows_with_result` retains the compatibility batch acknowledgement. Principal HTTP adapters expose acknowledgement and known partial/indeterminate effects. Server sidecars and experimental cluster routing are not one cross-component transaction. |

@@ -477,7 +477,12 @@ Query via `GET /api/v1/admin/security/audit`.
 
 ### 8.3 Cluster audit log
 
-A persistent JSONL file records cluster-level control-plane events. Every record is fsynced to disk on write.
+A persistent JSONL file records cluster-level control-plane events. Every successfully appended
+record is synchronized to disk. This best-effort audit happens after the operation outcome is known:
+an audit write failure is logged but does not roll back the operation. The file is neither signed nor
+hash-chained and therefore is not tamper-evident.
+With a configured shared local-disk budget, the append is admitted under the `Cluster` category;
+quota and physical-headroom failures remain typed in the server diagnostic.
 
 Default limits (all tunable via environment variables):
 
@@ -555,3 +560,13 @@ None of these headers should be forwarded by reverse proxies or load balancers. 
 | `--cluster-internal-mtls-ca-cert PATH` | Path | PEM CA bundle used to verify client certificates from peer nodes. |
 | `--cluster-internal-mtls-cert PATH` | Path | PEM client certificate presented by this node on outbound cluster connections. |
 | `--cluster-internal-mtls-key PATH` | Path | PEM private key for the cluster client certificate. |
+
+Filesystem restore is additionally fail-closed behind `--offline-restore-root` plus a finite
+`--offline-restore-disk-limit`. When an admin path prefix is configured, the offline root must be a
+strict descendant; it must also be disjoint from live data and object storage. The server holds a
+dedicated cross-process lock for the root through listener drain and shutdown, preventing two
+cooperating tsink processes from sharing one accounting envelope. Standalone, internal, and
+cluster restore targets are required to remain beneath it, while snapshot destinations are
+required to remain outside it. These are static path checks: as with the core restore API, the
+snapshot source must be trusted and immutable because portable path traversal cannot prevent a
+hostile concurrent namespace swap.

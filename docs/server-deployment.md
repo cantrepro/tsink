@@ -69,11 +69,15 @@ Use `--help` to print the full listing with types and defaults.
 
 | Flag | Default | Description |
 |---|---|---|
+| `--resource-profile PROFILE` | `server` | Core resource base: `test`, `embedded`, `edge`, `server`, or explicit migration profile `expert-unlimited`. |
 | `--data-path PATH` | *none* | Directory for WAL, segments, metadata, and rules. Required for persistent storage. |
 | `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. Must not overlap `--data-path`. |
-| `--local-disk-limit BYTES` | *unlimited* | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
-| `--filesystem-free-headroom BYTES` | `0` | Filesystem free space that budget-integrated writes must leave available. |
-| `--maintenance-temp-reserve BYTES` | `0` | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
+| `--local-disk-limit BYTES` | `256 GiB` (`Server`, when persistent) | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
+| `--filesystem-free-headroom BYTES` | `2 GiB` (`Server`, when persistent) | Filesystem free space that budget-integrated writes must leave available. |
+| `--maintenance-temp-reserve BYTES` | `16 GiB` (`Server`, when persistent) | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |
+| `--offline-restore-root PATH` | *none* | Dedicated parent for bounded offline restore targets. Requires a finite `--offline-restore-disk-limit`; must be isolated from live/object-store roots. |
+| `--offline-restore-disk-limit BYTES` | *none* | Finite logical limit for staging, restored targets, and restore reports beneath the offline root. |
+| `--offline-restore-filesystem-free-headroom BYTES` | `0` | Free-space floor for offline restore work. Requires the paired root and limit. |
 | `--wal-enabled BOOL` | `true` | Enable or disable the write-ahead log. |
 | `--wal-sync-mode MODE` | `per-append` | WAL durability policy: `per-append` synchronizes each non-empty write; `periodic` uses an append-driven interval for higher throughput. |
 | `--timestamp-precision PRECISION` | `ms` | Interpret ingested timestamps as `s`, `ms`, `us`, or `ns`. |
@@ -92,22 +96,31 @@ output; maintenance must still leave the filesystem headroom. The headroom plus 
 the supported 64-bit byte range.
 
 The shared budget's quota-aware writers are core storage, metric metadata, exemplars, rules, the
-usage ledger, managed control-plane state, and the experimental hinted-handoff outbox. It does not
-yet govern cluster control state and log, cluster audit, deduplication files, or edge queues.
-External snapshot destinations and external restore staging or target directories are also outside
-the budget. Snapshot destinations
-inside the managed root are rejected, and an online restore target may not overlap the live
-`--data-path`. Files beneath `--data-path` can still be included when usage is reconciled, but that
-does not provide admission guarantees for excluded writers.
+usage ledger, managed control-plane state, the experimental hinted-handoff outbox, cluster audit
+log, cluster deduplication markers, the paired cluster control state and consensus log, and both
+the edge source queue and standalone edge-accept deduplication markers. External snapshot
+destinations remain outside that live budget.
+
+Offline restore uses a second, independently leased coordinator. The root/limit pair is mandatory
+for every server restore; it governs staging, standalone and internal targets, local cluster-node
+targets, and the cluster restore report. The root must not overlap live data or object storage and,
+when `--admin-path-prefix` is set, must be its strict descendant. Snapshot destinations beneath the
+offline root are rejected. A restore target may neither equal the offline root nor overlap the live
+`--data-path`; cluster report paths are preflight-checked against the source manifest and every
+local snapshot source and target before any node is restored. Files beneath `--data-path` can still
+be included when usage is reconciled, but that does not provide admission guarantees for excluded
+writers.
 
 ### Memory and performance
 
 | Flag | Default | Description |
 |---|---|---|
-| `--memory-limit BYTES` | *unlimited* | Memory budget for in-memory data (e.g. `1G` or `1073741824`). Triggers admission backpressure when exceeded. |
-| `--cardinality-limit N` | *unlimited* | Maximum number of unique series. New series are rejected at the limit. |
+| `--memory-limit BYTES` | `2 GiB` (`Server`) | Accounted storage-memory budget (e.g. `1G` or `1073741824`). Triggers admission backpressure when exceeded; it is not a process-RSS cap. |
+| `--maintenance-max-items-per-pass N` | `500,000` (`Server`) | Maximum logical items selected by one bounded maintenance pass. A finite value must cover the effective write-batch row limit. |
+| `--maintenance-max-bytes-per-pass BYTES` | `2 GiB` (`Server`) | Maximum modeled bytes selected by one bounded maintenance pass. A finite value must cover the effective memory limit. |
+| `--cardinality-limit N` | `10,000,000` (`Server`) | Maximum number of unique series. New series are rejected at the limit. |
 | `--chunk-points N` | *engine default* | Target number of data points per in-memory chunk before sealing. |
-| `--max-writers N` | *CPU count* | Parallel writer threads for ingestion. |
+| `--max-writers N` | `16` (`Server`) | Parallel writer permits for ingestion. |
 
 ### TLS
 
@@ -143,8 +156,10 @@ TLS uses rustls — no OpenSSL is required.
 
 Edge sync lets an edge node queue accepted row batches locally and replay them to a central server,
 tolerating network partitions. Metadata and exemplar sidecars are not included in the source
-queue. Queue records are flushed to an append-only log but are not currently synchronized with
-`sync_data`/`sync_all`, so queue acceptance is not a crash-durable upload guarantee.
+queue. Queue Put, Ack, and expiry records are synchronized before their in-memory state changes, so
+a successful enqueue is crash-durable local queue state. It is not a durable-upload guarantee:
+configured pre-ack expiry may remove pending rows, and the source currently accepts any valid
+upstream acknowledgement, including `Volatile`.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -157,13 +172,17 @@ Edge sync and cluster mode are mutually exclusive.
 
 On successful replay, the source removes a queued entry only after the upstream returns a complete,
 validated canonical atomic result for every row and after the local queue acknowledgement record is
-successfully appended and flushed. Pending entries can also be expired without an upstream acknowledgement after
-`TSINK_EDGE_SYNC_PRE_ACK_RETENTION_SECS`; retention drops are exposed in status and metrics. The
-admin status snapshot exposes the last successful result as `lastUpstreamAcknowledgement`. Any
-valid upstream acknowledgement, including `Volatile`, currently completes replay; deployments that
-require crash-durable upstream acceptance must configure the upstream for durable WAL
-acknowledgement. There is not yet a source-side minimum-acknowledgement policy, and edge sync is not
-an end-to-end exactly-once protocol.
+successfully appended and synchronized. Pending entries can also be expired without an upstream
+acknowledgement after `TSINK_EDGE_SYNC_PRE_ACK_RETENTION_SECS`; retention drops are exposed in
+status and metrics. The admin status snapshot exposes the last successful result as
+`lastUpstreamAcknowledgement`. It also reports `persistenceFenced` when an indeterminate local
+append has stopped further queue mutation, and `cleanupPending` plus `lastCleanupError` when a
+durable record succeeded but log compaction must be retried. Those states set `degraded` and the
+corresponding `tsink_edge_sync_queue_health{state}` gauges. Any valid upstream acknowledgement,
+including `Volatile`, currently completes replay; deployments that require crash-durable upstream
+acceptance must configure the upstream for durable WAL acknowledgement. There is not yet a
+source-side minimum-acknowledgement policy, and edge sync is not an end-to-end exactly-once
+protocol.
 
 ### Cluster (experimental)
 
@@ -296,7 +315,7 @@ Admin endpoints are only served when `--enable-admin-api` is set and require the
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/admin/snapshot` | Create an atomic snapshot at an external destination; managed-root destinations are rejected. |
-| `POST` | `/api/v1/admin/restore` | Restore a snapshot to an external recovery target; targets overlapping the live data path are rejected. |
+| `POST` | `/api/v1/admin/restore` | Restore a snapshot beneath the configured, finitely bounded offline restore root; live-root overlap is rejected. |
 | `POST` | `/api/v1/admin/rollups/apply` | Replace persisted rollup policies. |
 | `POST` | `/api/v1/admin/rollups/run` | Run one synchronous rollup materialization pass. |
 | `GET` | `/api/v1/admin/rollups/status` | Rollup policy freshness and coverage. |
@@ -410,11 +429,11 @@ Exact paths are printed to stderr during startup.
 The server prints diagnostic lines to stderr during bootstrap that confirm path locations and configuration parameters:
 
 ```
-cluster control-state store initialized at /var/lib/tsink/control-state (schema v1)
-cluster control-log consensus initialized at /var/lib/tsink/control-log
-cluster audit log initialized at /var/lib/tsink/audit.log
-cluster dedupe marker store initialized at /var/lib/tsink/dedupe
-cluster hinted-handoff outbox initialized at /var/lib/tsink/outbox
+cluster control-state store initialized at /var/lib/tsink/cluster/control/node-a.control-state.json (schema v1)
+cluster control-log consensus initialized at /var/lib/tsink/cluster/control/node-a.control-log.json
+cluster audit log initialized at /var/lib/tsink/cluster/audit/node-a.audit.log
+cluster dedupe marker store initialized at /var/lib/tsink/cluster/dedupe/node-a.markers.log
+cluster hinted-handoff outbox initialized at /var/lib/tsink/cluster/outbox/node-a.outbox.log
 ```
 
 Before any listener binds, the server holds the canonical data-path process lease. Its
@@ -427,7 +446,8 @@ exactly 16 lowercase hexadecimal nonce digits; an ambiguous matching directory m
 instead of being deleted. A successful removal is synchronized and followed by accounting
 reconciliation, while a no-op orphan pass skips that rescan. The hinted-handoff outbox applies the
 same generated-temporary rule and also recognizes its one exact legacy `<outbox>.compact.tmp` path;
-it never treats lookalike operator files as owned cleanup candidates.
+the dedupe marker store recognizes only its exact legacy `<dedupe>.tmp` path in addition to the
+generated rule. Neither store treats lookalike operator files as owned cleanup candidates.
 
 The server performs one final idle-coordinator reconciliation after all persistent stores open. The
 TCP listener binds last. Once bound, status and metrics include files created during bootstrap and

@@ -346,6 +346,7 @@ pub fn status_reason(code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        410 => "Gone",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",

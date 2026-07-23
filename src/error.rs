@@ -5,6 +5,9 @@ pub type Result<T> = std::result::Result<T, TsinkError>;
 
 #[derive(Error, Debug)]
 pub enum TsinkError {
+    #[error(transparent)]
+    QueryBudget(#[from] crate::query_budget::QueryBudgetError),
+
     #[error("No data points found for metric '{metric}' in range [{start}, {end})")]
     NoDataPoints {
         metric: String,
@@ -36,8 +39,38 @@ pub enum TsinkError {
     #[error("Write timeout exceeded after {timeout_ms}ms with {workers} concurrent writers")]
     WriteTimeout { timeout_ms: u64, workers: usize },
 
+    #[error("Lifecycle operation '{operation}' timed out after {timeout_ms}ms")]
+    LifecycleTimeout {
+        operation: &'static str,
+        timeout_ms: u64,
+    },
+
     #[error("Memory budget exceeded: budget {budget} bytes, required at least {required} bytes")]
     MemoryBudgetExceeded { budget: usize, required: usize },
+
+    #[error("Write batch row limit exceeded: limit {limit}, submitted {submitted}")]
+    WriteBatchRowLimitExceeded { limit: usize, submitted: usize },
+
+    #[error(
+        "Write batch modeled-input limit exceeded: limit {limit} bytes, submitted at least {submitted} bytes"
+    )]
+    WriteBatchInputLimitExceeded { limit: usize, submitted: usize },
+
+    #[error("Write batch modeled-size calculation overflowed usize")]
+    WriteBatchSizeOverflow,
+
+    #[error(
+        "Async {queue} queue payload-byte limit exceeded: limit {limit}, current {current}, requested {requested}"
+    )]
+    AsyncQueueByteLimitExceeded {
+        queue: &'static str,
+        limit: usize,
+        current: usize,
+        requested: usize,
+    },
+
+    #[error("Async {queue} queue payload-size calculation overflowed usize")]
+    AsyncQueuePayloadSizeOverflow { queue: &'static str },
 
     #[error(
         "Series cardinality limit exceeded: limit {limit}, current {current}, requested {requested}"
@@ -48,8 +81,47 @@ pub enum TsinkError {
         requested: usize,
     },
 
+    #[error(
+        "Series creation-rate limit exceeded: limit {limit} per {window_nanos}ns, current {current}, requested {requested}"
+    )]
+    CardinalityCreationRateExceeded {
+        limit: usize,
+        current: usize,
+        requested: usize,
+        window_nanos: u64,
+    },
+
     #[error("WAL size limit exceeded: limit {limit} bytes, required at least {required} bytes")]
     WalSizeLimitExceeded { limit: u64, required: u64 },
+
+    #[error(
+        "Maintenance work item for {operation} exceeds the per-pass byte limit: limit {limit} bytes, required {required} bytes"
+    )]
+    MaintenanceWorkItemTooLarge {
+        operation: &'static str,
+        limit: u64,
+        required: u64,
+    },
+
+    #[error(
+        "Maintenance dependency window for {operation} cannot close within the per-pass limits: selected {selected_items} of {item_limit} items and {selected_bytes} of {byte_limit} bytes before a deferred WAL dependency"
+    )]
+    MaintenanceDependencyWindowExceeded {
+        operation: &'static str,
+        item_limit: usize,
+        byte_limit: u64,
+        selected_items: usize,
+        selected_bytes: u64,
+    },
+
+    #[error(
+        "Maintenance namespace for {operation} has reached its bounded entry limit: limit {limit}, required at least {required}"
+    )]
+    MaintenanceNamespaceLimitExceeded {
+        operation: &'static str,
+        limit: usize,
+        required: usize,
+    },
 
     #[error("Storage is shutting down")]
     StorageShuttingDown,

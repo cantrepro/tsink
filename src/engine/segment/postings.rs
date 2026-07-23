@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -46,6 +46,53 @@ impl SegmentPostingsIndex {
                 .saturating_add(label_name.capacity())
                 .saturating_add(label_value.capacity())
                 .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
+        }
+        for (label_name, series_ids) in self.missing_label_postings_cache.read().iter() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>())
+                .saturating_add(label_name.capacity())
+                .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
+        }
+        bytes
+    }
+
+    /// Measures only the postings entries that a bounded persisted-index mutation can change.
+    ///
+    /// `series_postings` is included because every series insertion/removal can change it. The
+    /// missing-label cache is also included in full: such a mutation invalidates the entire cache,
+    /// and clearing that cache already has work proportional to its entries. The remaining maps
+    /// are measured only at the exact metric/label keys named by the mutation.
+    pub(crate) fn scoped_memory_usage_bytes(
+        &self,
+        metrics: &BTreeSet<String>,
+        label_names: &BTreeSet<String>,
+        labels: &BTreeSet<(String, String)>,
+    ) -> usize {
+        let mut bytes = Self::bitmap_memory_usage_bytes(&self.series_postings);
+        for metric in metrics {
+            if let Some(series_ids) = self.metric_postings.get(metric) {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>())
+                    .saturating_add(metric.capacity())
+                    .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
+            }
+        }
+        for label_name in label_names {
+            if let Some(series_ids) = self.label_name_postings.get(label_name) {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>())
+                    .saturating_add(label_name.capacity())
+                    .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
+            }
+        }
+        for label in labels {
+            if let Some(series_ids) = self.label_postings.get(label) {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<((String, String), RoaringTreemap)>())
+                    .saturating_add(label.0.capacity())
+                    .saturating_add(label.1.capacity())
+                    .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
+            }
         }
         for (label_name, series_ids) in self.missing_label_postings_cache.read().iter() {
             bytes = bytes

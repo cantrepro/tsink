@@ -58,6 +58,35 @@ pub(super) fn reset_included_memory_component_bytes(
     }
 }
 
+/// Raises a retained component to an observed value without allowing an older concurrent
+/// observation to move it backwards. Callers that release the component use a quiescent full
+/// reconciliation instead.
+pub(super) fn grow_included_memory_component_to_bytes(
+    accounting_enabled: bool,
+    component: &AtomicU64,
+    shared_used_bytes: &AtomicU64,
+    used_bytes: &AtomicU64,
+    bytes: usize,
+) {
+    if !accounting_enabled {
+        return;
+    }
+
+    let target = saturating_u64_from_usize(bytes);
+    let mut current = component.load(Ordering::Acquire);
+    while target > current {
+        match component.compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                let delta = target.saturating_sub(current);
+                shared_used_bytes.fetch_add(delta, Ordering::AcqRel);
+                used_bytes.fetch_add(delta, Ordering::AcqRel);
+                return;
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub(super) fn with_included_memory_delta<T, R>(
     accounting_enabled: bool,
     component: &AtomicU64,
@@ -204,9 +233,20 @@ pub(in crate::engine::storage_engine) struct PersistedSealedBudgetContext<'a> {
         &'a [SealedChunkShard; IN_MEMORY_SHARD_COUNT],
     pub(in crate::engine::storage_engine) flush_metrics:
         &'a super::super::metrics::FlushObservabilityCounters,
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) exact_eviction_inspect_hook:
+        &'a RwLock<Option<Arc<IngestCommitHook>>>,
 }
 
 impl<'a> PersistedSealedBudgetContext<'a> {
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn invoke_exact_eviction_inspect_hook(self) {
+        let hook = self.exact_eviction_inspect_hook.read().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn sealed_chunk_is_present_in_persisted_chunks(
         persisted_chunks: Option<&[PersistedChunkRef]>,
         key: SealedChunkKey,
@@ -314,6 +354,8 @@ impl<'a> PersistedSealedBudgetContext<'a> {
 pub(in crate::engine::storage_engine) struct SealedChunkPublishContext<'a> {
     pub(in crate::engine::storage_engine) sealed_chunks:
         &'a [SealedChunkShard; IN_MEMORY_SHARD_COUNT],
+    pub(in crate::engine::storage_engine) pending_sealed_chunks:
+        &'a RwLock<PendingSealedChunkIndex>,
     pub(in crate::engine::storage_engine) next_chunk_sequence: &'a AtomicU64,
     pub(in crate::engine::storage_engine) memory: ShardMemoryAccountingContext<'a>,
     #[cfg(test)]
@@ -345,6 +387,23 @@ impl<'a> SealedChunkPublishContext<'a> {
             };
             let sequence = self.next_chunk_sequence.fetch_add(1, Ordering::SeqCst);
             let key = SealedChunkKey::from_chunk(&chunk, sequence);
+            let pending_key = PendingSealedChunkIndexKey {
+                wal_lowwater: chunk.wal_lowwater,
+                sequence,
+            };
+            let pending_location = PendingSealedChunkLocation {
+                shard_idx,
+                series_id,
+                sealed_key: key,
+                wal_lowwater: chunk.wal_lowwater,
+                wal_highwater: chunk.wal_highwater,
+                input_bytes: saturating_u64_from_usize(ChunkStorage::chunk_memory_usage_bytes(
+                    &chunk,
+                )),
+            };
+            self.pending_sealed_chunks
+                .write()
+                .insert(pending_key, pending_location);
             let replaced = sealed
                 .entry(series_id)
                 .or_default()

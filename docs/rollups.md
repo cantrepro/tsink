@@ -114,10 +114,14 @@ When a new set is applied:
 4. A modified policy (any field change) receives a new generation, clearing its checkpoint so it rematerialises from scratch.
 5. Policies that were removed have their checkpoints and pending state discarded; the synthetic materialised series are no longer queried. The underlying stored data is garbage-collected during subsequent compaction.
 6. The new policy set and updated state are atomically persisted to disk.
-7. A synchronous materialization pass runs immediately before the call returns.
-8. The current `RollupObservabilitySnapshot` is returned.
+7. One synchronous bounded source page runs immediately before the call returns. The page visits
+   one policy and is capped by both `maintenanceMaxItemsPerPass` and
+   `maintenanceMaxBytesPerPass`.
+8. The current `RollupObservabilitySnapshot` is returned with explicit traversal-completion and
+   continuation fields.
 
-**Idempotency**: submitting an identical policy set is a no-op beyond the disk persist and sync run.
+**Idempotency**: submitting an identical policy set preserves policy/checkpoint state, persists the
+set, and advances the bounded traversal by one page.
 
 ---
 
@@ -125,7 +129,9 @@ When a new set is applied:
 
 ### Background worker
 
-A background thread named `tsink-rollups` wakes every **5 seconds** and runs a full materialization pass across all active policies. The worker is also unparked immediately after:
+A background thread named `tsink-rollups` wakes every **5 seconds** and visits one policy plus one
+bounded, seeked source-postings page. Its shared in-memory cursor resumes on the next wake without
+rescanning earlier postings. The worker is also unparked immediately after:
 
 - Every committed write batch (to keep materialisation lag low).
 - Every committed tombstone (delete operation).
@@ -135,7 +141,14 @@ The worker is co-ordinated with the background maintenance gate shared by compac
 
 ### Forced run
 
-Call `trigger_rollup_run` (or `POST /api/v1/admin/rollups/run`) to block until a full pass completes and return the resulting snapshot. Useful after bulk imports or in CI.
+For finite profiles, `trigger_rollup_run` (or `POST /api/v1/admin/rollups/run`) synchronously
+advances the same traversal by one bounded page. Repeat while
+`sourceTraversalComplete == false`; `continuationPolicyId` and
+`continuationAfterSeriesId` expose progress. A page that contains exactly the configured maximum
+does not inspect item N+1, so one empty terminal call may be required to prove completion.
+
+`ExpertUnlimited` preserves the legacy explicit behavior: one manual call drains the complete
+policy/source cycle. Background wakes remain one page even under that profile.
 
 ---
 
@@ -181,6 +194,9 @@ pub struct RollupObservabilitySnapshot {
     pub buckets_materialized_total: u64,
     pub points_materialized_total: u64,
     pub last_run_duration_nanos: u64,
+    pub source_traversal_complete: bool,
+    pub continuation_policy_id: Option<String>,
+    pub continuation_after_series_id: Option<u64>,
     pub policies: Vec<RollupPolicyStatus>,
 }
 ```
@@ -194,6 +210,7 @@ pub struct RollupPolicyStatus {
     pub materialized_series: u64,     // source series with at least one checkpoint
     pub materialized_through: Option<i64>, // min checkpoint across all source series
     pub lag: Option<i64>,             // most-recent-point − materialized_through
+    pub source_traversal_complete: bool,
     pub last_run_started_at_ms: Option<u64>,
     pub last_run_completed_at_ms: Option<u64>,
     pub last_run_duration_nanos: u64,
@@ -201,9 +218,14 @@ pub struct RollupPolicyStatus {
 }
 ```
 
-`lag` is `None` until the policy has processed at least one series. A lag of zero means every committed point is covered by the materialisation. Lag grows when the worker has not yet processed recent writes (typically less than 5 seconds under normal operation).
+`matchedSeries` and `materializedSeries` accumulate across the current traversal and become exact
+when that policy's `sourceTraversalComplete` is true. The status path reads these bounded runtime
+counters; it does not enumerate every source merely to build a response. `materializedThrough` and
+`lag` remain `None` until the policy traversal is complete and every matched source has a
+checkpoint. A lag of zero then means every committed point is covered by the materialisation.
 
-A `rollups` field with the same shape is included in the engine's `observability_snapshot()` output, which is served at `/metrics` in Prometheus format as part of the server's self-instrumentation.
+A `rollups` field with the same shape is included in the engine's `observability_snapshot()`
+output. Prometheus exposes overall and per-policy `source_traversal_complete` gauges.
 
 ---
 
@@ -271,7 +293,9 @@ A range delete on a source series invalidates any policy whose materialised data
 
 ### `POST /api/v1/admin/rollups/apply`
 
-Atomically replace the active policy set with the submitted list. Runs a synchronous materialization pass before returning.
+Atomically replace the active policy set with the submitted list. Finite profiles run one bounded
+source page before returning; inspect the response continuation fields and call the run endpoint to
+finish the traversal.
 
 **Request body**: JSON array of policy objects.
 
@@ -299,7 +323,9 @@ Atomically replace the active policy set with the submitted list. Runs a synchro
 
 ### `POST /api/v1/admin/rollups/run`
 
-Trigger an immediate, synchronous materialization pass. Blocks until the pass completes.
+Advance the materialization traversal synchronously. Finite profiles process at most one bounded
+source page; repeat until `sourceTraversalComplete` is true. `ExpertUnlimited` drains the complete
+cycle in one call.
 
 **Request body**: empty.
 
@@ -349,8 +375,11 @@ let snapshot = storage.apply_rollup_policies(vec![
 
 println!("materialized {} buckets", snapshot.buckets_materialized_total);
 
-// Force a full materialization pass.
-let snapshot = storage.trigger_rollup_run()?;
+// Drain a finite-profile traversal one bounded page at a time.
+let mut snapshot = storage.trigger_rollup_run()?;
+while !snapshot.source_traversal_complete {
+    snapshot = storage.trigger_rollup_run()?;
+}
 
 // A downsampled select query will automatically use the materialised rollup.
 let points = storage.select_with_options(
@@ -395,6 +424,8 @@ snapshot = db.apply_rollup_policies([
 print(f"materialized {snapshot.buckets_materialized_total} buckets")
 
 snapshot = db.trigger_rollup_run()
+while not snapshot.source_traversal_complete:
+    snapshot = db.trigger_rollup_run()
 print(snapshot)
 ```
 

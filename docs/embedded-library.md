@@ -57,8 +57,12 @@ let storage = StorageBuilder::new()
     .with_data_path("/var/lib/tsink")
     .with_retention(Duration::from_secs(30 * 24 * 3600))   // 30 days
     .with_timestamp_precision(TimestampPrecision::Milliseconds)
-    .with_memory_limit(512 * 1024 * 1024)                  // 512 MiB
+    .with_memory_limit(1024 * 1024 * 1024)                 // 1 GiB
     .with_cardinality_limit(1_000_000)
+    .with_write_batch_limits(tsink::WriteBatchLimits {
+        max_rows: Some(10_000),
+        max_modeled_input_bytes: Some(8 * 1024 * 1024),
+    })
     .with_local_disk_limit(10 * 1024 * 1024 * 1024)        // 10 GiB data tree
     .with_filesystem_free_headroom(512 * 1024 * 1024)      // leave 512 MiB free
     .with_maintenance_temp_reserve(1024 * 1024 * 1024)     // reserve 1 GiB
@@ -99,8 +103,13 @@ let storage = StorageBuilder::new()
 
 | Method | Default | Description |
 |---|---|---|
-| `with_memory_limit(bytes)` | `usize::MAX` | Memory budget for in-memory data. Exceeding this triggers admission backpressure. |
-| `with_cardinality_limit(series)` | `usize::MAX` | Maximum number of unique series. New series are rejected once the limit is reached. |
+| `with_resource_profile(profile)` | `ResourceProfile::Embedded` | Select a finite standard/custom base or explicit `ExpertUnlimited` migration behavior. Low-level overrides win regardless of call order. |
+| `with_memory_limit(bytes)` | 512 MiB (`Embedded`) | Accounted storage-memory budget. Exceeding this triggers admission backpressure. |
+| `with_cardinality_limit(series)` | 1,000,000 (`Embedded`) | Maximum number of unique series. New series are rejected once the limit is reached. |
+| `with_max_labels_per_series(labels)` | 128 | Maximum labels accepted in a submitted series identity. |
+| `with_max_series_identity_bytes(bytes)` | 64 KiB | Maximum cumulative metric and label UTF-8 bytes in one identity. |
+| `with_series_creation_rate_limit(series, window)` | unset | Fixed-window admission limit for successfully published new series. |
+| `with_write_batch_limits(limits)` | both fields unset | Optional pre-clone row-count and modeled logical-input-byte bounds for foreground, rollup, and WAL-replay writes. |
 
 ### Concurrency
 
@@ -115,7 +124,7 @@ let storage = StorageBuilder::new()
 |---|---|---|
 | `with_wal_enabled(bool)` | `true` | Enable or disable the write-ahead log. Disabling trades durability for speed. |
 | `with_wal_size_limit(bytes)` | *unlimited* | Cap total WAL size on disk. Exceeding this returns `WalSizeLimitExceeded`. |
-| `with_wal_buffer_size(size)` | *default* | In-memory buffer size for WAL frame batching before flush. |
+| `with_wal_buffer_size(size)` | 4 KiB | Finite userspace `BufWriter` capacity. It is reported by effective limits and WAL observability but is outside the storage-memory budget. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | Durability policy — see [WAL sync modes](#wal-sync-modes). |
 | `with_wal_replay_mode(mode)` | `Strict` | Corruption handling during WAL replay — see [WAL replay modes](#wal-replay-modes). |
 
@@ -153,6 +162,13 @@ core, metric metadata, exemplars, rules, usage ledger, and managed control-plane
 | `with_runtime_mode(mode)` | `ReadWrite` | `ReadWrite` for local persistence, `ComputeOnly` for remote-only metadata. |
 | `with_background_fail_fast(bool)` | `true` | Halt the engine on unrecoverable background errors (compaction, flush). |
 | `with_metadata_shard_count(n)` | *auto* | Number of metadata shards for series routing. |
+
+Persistent instances own at most four named threads: flush, compaction, persisted refresh (which
+also serializes retention/tiering and remote-catalog refresh), and rollups. Their fixed concurrency
+bounds, effective cadences, idle parks, pass counters, and shutdown joins are available through
+`effective_storage_limits()` and `observability_snapshot().background`; see
+[Resource limits and profiles](resource-limits.md#background-work-boundary) for the exact contract
+and remaining per-pass CPU/work gaps.
 
 ---
 
@@ -217,7 +233,10 @@ for outcome in &result.outcomes {
 
 `Atomic` commits every row or none. `BestEffort` uses one atomic boundary per row in input order.
 Its optional batch acknowledgement is the weakest guarantee among accepted rows and is `None` when
-none were accepted. Rejection messages are diagnostic and bounded; match on the structured category.
+none were accepted. Both modes first admit the complete top-level submission, so `BestEffort`
+cannot bypass configured batch bounds one row at a time and `max_rows` also bounds its outcome
+vector. `modeled_write_batch_input_bytes(&rows)` returns the checked byte calculation used by
+`WriteBatchLimits`. Rejection messages are diagnostic and bounded; match on the structured category.
 
 ### Write acknowledgement
 
@@ -424,8 +443,14 @@ for status in &snapshot.policies {
 Trigger an immediate rollup run:
 
 ```rust
-let snapshot = storage.trigger_rollup_run()?;
+let mut snapshot = storage.trigger_rollup_run()?;
+while !snapshot.source_traversal_complete {
+    snapshot = storage.trigger_rollup_run()?;
+}
 ```
+
+Finite profiles process one configured item/byte-bounded source page per call. Explicit
+`ExpertUnlimited` drains the complete traversal in one call.
 
 ---
 
@@ -461,6 +486,8 @@ async fn main() -> tsink::Result<()> {
         .with_data_path("./tsink-data")
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
         .with_queue_capacity(2048)
+        .with_write_queue_byte_capacity(64 * 1024 * 1024)
+        .with_read_queue_byte_capacity(16 * 1024 * 1024)
         .with_read_workers(4)
         .build()?;
 
@@ -489,6 +516,8 @@ let async_storage = AsyncStorage::from_storage_with_options(
     sync_storage,
     AsyncRuntimeOptions {
         queue_capacity: 4096,
+        write_queue_byte_capacity: 64 * 1024 * 1024,
+        read_queue_byte_capacity: 16 * 1024 * 1024,
         read_workers: 8,
     },
 )?;
@@ -498,11 +527,15 @@ let async_storage = AsyncStorage::from_storage_with_options(
 
 | Option | Default | Description |
 |---|---|---|
-| `queue_capacity` | 1024 | Maximum in-flight requests per internal queue. |
+| `queue_capacity` | 1024 | Maximum commands waiting inside each internal channel. |
+| `write_queue_byte_capacity` | 64 MiB | Maximum modeled owned write-input bytes queued or held by senders waiting for the write channel. |
+| `read_queue_byte_capacity` | 16 MiB | Maximum modeled owned read-input bytes queued or held by senders waiting for the read channel. |
 | `read_workers` | cgroup CPU count | Number of dedicated reader threads. |
 
-All async methods mirror the sync API. The underlying `Arc<dyn Storage>` is accessible
-via `inner()` or recoverable with `into_inner()`.
+All async methods mirror the sync API. `async_runtime_snapshot()` reports queue depths, current and
+peak modeled bytes, rejections, configured caps, and worker counts. Dropping a read future
+cooperatively cancels built-in selector/scan work; an accepted write continues to execute. The
+underlying `Arc<dyn Storage>` is accessible via `inner()` or recoverable with `into_inner()`.
 
 ---
 
@@ -587,15 +620,24 @@ Inspect engine internals at runtime:
 
 ```rust
 let snap = storage.observability_snapshot();
+let resources = storage.resource_configuration_snapshot();
 
 println!("limits: {:?}", storage.effective_storage_limits());
 assert_eq!(snap.limits, storage.effective_storage_limits());
+assert_eq!(snap.resource_configuration, resources);
+println!("profile: {:?}; overrides: {:?}",
+    resources.selected_profile, resources.overrides);
 
 println!("memory: {} / {} bytes",
     snap.memory.accounted_bytes,
     snap.limits.accounted_memory_bytes.unwrap_or(usize::MAX as u64));
 
 println!("memory pressure: {:?}", snap.memory.pressure.level);
+println!("write scratch: current={} peak={} admitted={} rejected={}",
+    snap.memory.write_transient_bytes,
+    snap.memory.peak_write_transient_bytes,
+    snap.memory.write_transient_reservations_total,
+    snap.memory.write_transient_rejections_total);
 assert!(!snap.memory.excluded_bytes_known);
 
 println!("WAL: {} segments, {} bytes",
@@ -639,6 +681,10 @@ Key error variants to handle:
 |---|---|
 | `MemoryBudgetExceeded` | Write would push memory usage past the configured limit. |
 | `CardinalityLimitExceeded` | A new series would exceed the cardinality cap. |
+| `CardinalityCreationRateExceeded` | Publishing new series would exceed the configured fixed-window rate. |
+| `WriteBatchRowLimitExceeded` | A top-level foreground or replay batch exceeds `max_rows`. |
+| `WriteBatchInputLimitExceeded` | The checked logical input model exceeds `max_modeled_input_bytes`. |
+| `WriteBatchSizeOverflow` | Checked write or replay sizing cannot be represented by `usize`. |
 | `WalSizeLimitExceeded` | WAL on-disk size exceeds the configured limit. |
 | `DiskQuotaExceeded` | Normal local growth would exceed the logical data-directory envelope. |
 | `InsufficientCompactionHeadroom` | Maintenance output cannot fit inside the logical envelope. |

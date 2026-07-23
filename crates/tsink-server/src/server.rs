@@ -13,8 +13,8 @@ use crate::rbac::RbacRegistry;
 use crate::rules::RulesRuntime;
 use crate::security::SecurityManager;
 use crate::tenant;
-use crate::usage::UsageAccounting;
-use std::path::{Path, PathBuf};
+use crate::usage::{UsageAccounting, UsageLedgerLimits};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -25,7 +25,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tsink::promql::Engine;
 use tsink::{
-    LocalDiskBudget, LocalDiskLimits, Storage, StorageBuilder, StorageRuntimeMode,
+    LocalDiskBudget, LocalDiskLimits, ResourceProfile, Storage, StorageBuilder, StorageRuntimeMode,
     TimestampPrecision, WalSyncMode,
 };
 
@@ -56,6 +56,8 @@ pub struct ServerConfig {
     pub graphite_listen: Option<String>,
     pub graphite_tenant_id: String,
     pub data_path: Option<PathBuf>,
+    /// Core resource profile. `None` selects [`ResourceProfile::Server`].
+    pub resource_profile: Option<ResourceProfile>,
     pub object_store_path: Option<PathBuf>,
     pub wal_enabled: bool,
     pub timestamp_precision: TimestampPrecision,
@@ -66,10 +68,20 @@ pub struct ServerConfig {
     pub remote_segment_refresh_interval: Option<Duration>,
     pub mirror_hot_segments_to_object_store: bool,
     pub memory_limit: Option<usize>,
+    pub maintenance_max_items_per_pass: Option<usize>,
+    pub maintenance_max_bytes_per_pass: Option<u64>,
     pub local_disk_limit: Option<u64>,
     pub filesystem_free_headroom: u64,
     pub maintenance_temp_reserve: u64,
+    pub offline_restore_root: Option<PathBuf>,
+    pub offline_restore_disk_limit: Option<u64>,
+    pub offline_restore_filesystem_free_headroom: u64,
+    pub usage_ledger_limits: UsageLedgerLimits,
     pub cardinality_limit: Option<usize>,
+    pub max_labels_per_series: Option<usize>,
+    pub max_series_identity_bytes: Option<usize>,
+    pub max_new_series_per_window: Option<usize>,
+    pub new_series_window: Option<Duration>,
     pub chunk_points: Option<usize>,
     pub max_writers: Option<usize>,
     pub wal_sync_mode: Option<WalSyncMode>,
@@ -99,6 +111,7 @@ impl Default for ServerConfig {
             graphite_listen: None,
             graphite_tenant_id: tenant::DEFAULT_TENANT_ID.to_string(),
             data_path: None,
+            resource_profile: None,
             object_store_path: None,
             wal_enabled: true,
             timestamp_precision: TimestampPrecision::Milliseconds,
@@ -109,10 +122,20 @@ impl Default for ServerConfig {
             remote_segment_refresh_interval: None,
             mirror_hot_segments_to_object_store: false,
             memory_limit: None,
+            maintenance_max_items_per_pass: None,
+            maintenance_max_bytes_per_pass: None,
             local_disk_limit: None,
             filesystem_free_headroom: 0,
             maintenance_temp_reserve: 0,
+            offline_restore_root: None,
+            offline_restore_disk_limit: None,
+            offline_restore_filesystem_free_headroom: 0,
+            usage_ledger_limits: UsageLedgerLimits::default(),
             cardinality_limit: None,
+            max_labels_per_series: None,
+            max_series_identity_bytes: None,
+            max_new_series_per_window: None,
+            new_series_window: None,
             chunk_points: None,
             max_writers: None,
             wal_sync_mode: None,
@@ -148,6 +171,8 @@ impl ServerConfig {
         self.data_path = normalize_trimmed_optional_path("--data-path", self.data_path)?;
         self.object_store_path =
             normalize_trimmed_optional_path("--object-store-path", self.object_store_path)?;
+        self.offline_restore_root =
+            normalize_trimmed_optional_path("--offline-restore-root", self.offline_restore_root)?;
         self.tls_cert = normalize_trimmed_optional_path("--tls-cert", self.tls_cert)?;
         self.tls_key = normalize_trimmed_optional_path("--tls-key", self.tls_key)?;
         self.auth_token = normalize_optional_string("--auth-token", self.auth_token)?;
@@ -182,7 +207,10 @@ impl ServerConfig {
         self.validate_admin_config()?;
         self.validate_edge_sync_config()?;
         self.validate_storage_mode_config()?;
+        self.validate_cardinality_config()?;
         self.validate_local_disk_config()?;
+        self.validate_offline_restore_config()?;
+        self.usage_ledger_limits.validate()?;
         let _ = self.resolved_listener_tls_paths()?;
         self.cluster.validate()?;
         Ok(())
@@ -319,7 +347,38 @@ impl ServerConfig {
         Ok(())
     }
 
+    fn validate_cardinality_config(&self) -> Result<(), String> {
+        if self
+            .max_labels_per_series
+            .is_some_and(|limit| limit > tsink::MAX_SUPPORTED_LABELS_PER_SERIES)
+        {
+            return Err(format!(
+                "--max-labels-per-series must not exceed the storage-format limit {}",
+                tsink::MAX_SUPPORTED_LABELS_PER_SERIES
+            ));
+        }
+        match (self.max_new_series_per_window, self.new_series_window) {
+            (Some(_), None) => {
+                return Err("--max-new-series-per-window requires --new-series-window".to_string());
+            }
+            (None, Some(_)) => {
+                return Err("--new-series-window requires --max-new-series-per-window".to_string());
+            }
+            (Some(_), Some(window)) if window.is_zero() => {
+                return Err("--new-series-window must be greater than zero".to_string());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn validate_local_disk_config(&self) -> Result<(), String> {
+        if self.cluster.enabled && self.data_path.is_none() {
+            return Err(
+                "--cluster-enabled=true requires --data-path so durable cluster state has one leased, resource-bounded root"
+                    .to_string(),
+            );
+        }
         let requested = self.local_disk_limit.is_some()
             || self.filesystem_free_headroom > 0
             || self.maintenance_temp_reserve > 0;
@@ -339,6 +398,64 @@ impl ServerConfig {
         .map_err(|err| err.to_string())
     }
 
+    fn validate_offline_restore_config(&self) -> Result<(), String> {
+        let root = match (
+            self.offline_restore_root.as_deref(),
+            self.offline_restore_disk_limit,
+        ) {
+            (None, None) if self.offline_restore_filesystem_free_headroom == 0 => return Ok(()),
+            (None, _) => {
+                return Err(
+                    "offline restore disk limits require --offline-restore-root".to_string(),
+                )
+            }
+            (Some(_), None) => {
+                return Err(
+                    "--offline-restore-root requires --offline-restore-disk-limit so restore staging has a finite envelope"
+                        .to_string(),
+                )
+            }
+            (Some(root), Some(_)) => root,
+        };
+
+        LocalDiskLimits {
+            max_bytes: self.offline_restore_disk_limit,
+            filesystem_free_headroom_bytes: self.offline_restore_filesystem_free_headroom,
+            maintenance_temp_reserve_bytes: 0,
+        }
+        .validate()
+        .map_err(|err| format!("invalid offline restore disk limits: {err}"))?;
+
+        for (flag, other) in [
+            ("--data-path", self.data_path.as_deref()),
+            ("--object-store-path", self.object_store_path.as_deref()),
+        ] {
+            if let Some(other) = other {
+                if resolved_paths_overlap(root, other)? {
+                    return Err(format!(
+                        "--offline-restore-root {} must not overlap {flag} {}",
+                        root.display(),
+                        other.display()
+                    ));
+                }
+            }
+        }
+
+        if let Some(admin_path_prefix) = self.admin_path_prefix.as_deref() {
+            let resolved_root = resolve_config_path_allow_missing(root)?;
+            let resolved_prefix = resolve_config_path_allow_missing(admin_path_prefix)?;
+            if resolved_root == resolved_prefix || !resolved_root.starts_with(&resolved_prefix) {
+                return Err(format!(
+                    "--offline-restore-root {} must be a strict descendant of --admin-path-prefix {}",
+                    root.display(),
+                    admin_path_prefix.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn has_public_auth(&self) -> bool {
         self.auth_token
             .as_deref()
@@ -356,6 +473,79 @@ impl ServerConfig {
     fn has_rbac_auth(&self) -> bool {
         self.rbac_config_path.is_some()
     }
+}
+
+fn resolved_paths_overlap(left: &Path, right: &Path) -> Result<bool, String> {
+    let left_lexical = absolute_config_path_lexically_normalized(left)?;
+    let right_lexical = absolute_config_path_lexically_normalized(right)?;
+    if left_lexical.starts_with(&right_lexical) || right_lexical.starts_with(&left_lexical) {
+        return Ok(true);
+    }
+    let left = resolve_config_path_allow_missing(left)?;
+    let right = resolve_config_path_allow_missing(right)?;
+    Ok(left.starts_with(&right) || right.starts_with(&left))
+}
+
+fn absolute_config_path_lexically_normalized(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn resolve_config_path_allow_missing(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::canonicalize(&resolved) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to resolve configured path {}: {err}",
+                            resolved.display()
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn normalize_required_string(flag: &str, value: String) -> Result<String, String> {
@@ -410,6 +600,7 @@ struct ServerContext {
     usage_accounting: Arc<UsageAccounting>,
     managed_control_plane: Arc<ManagedControlPlane>,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    offline_restore_disk_budget: Option<Arc<LocalDiskBudget>>,
 }
 
 impl ServerContext {
@@ -428,6 +619,7 @@ impl ServerContext {
             usage_accounting: Some(self.usage_accounting.as_ref()),
             managed_control_plane: Some(self.managed_control_plane.as_ref()),
             local_disk_budget: self.local_disk_budget.as_deref(),
+            offline_restore_disk_budget: self.offline_restore_disk_budget.as_ref(),
         }
     }
 
@@ -527,7 +719,71 @@ struct BoundGraphiteListener {
 
 struct ServerPersistenceRoot {
     budget: Arc<LocalDiskBudget>,
-    _non_core_process_lease: Option<ServerDataPathProcessLease>,
+    _non_core_process_lease: Option<ServerPathProcessLease>,
+}
+
+struct ServerOfflineRestoreRoot {
+    budget: Arc<LocalDiskBudget>,
+    _process_lease: ServerPathProcessLease,
+}
+
+impl ServerOfflineRestoreRoot {
+    fn open(
+        config: &ServerConfig,
+        admin_path_prefix: Option<&Path>,
+    ) -> Result<Option<Self>, String> {
+        let Some(root) = config.offline_restore_root.as_deref() else {
+            return Ok(None);
+        };
+        let process_lease = ServerPathProcessLease::acquire(
+            root,
+            ".tsink-offline-restore.lock",
+            "offline restore root",
+        )?;
+        let limits = server_offline_restore_disk_limits(config);
+        let budget = LocalDiskBudget::open(root, limits)
+            .map_err(|err| format!("failed to open offline restore disk budget: {err}"))?;
+
+        for (description, other) in [
+            ("active data path", config.data_path.as_deref()),
+            ("object store path", config.object_store_path.as_deref()),
+        ] {
+            if let Some(other) = other {
+                if budget.overlaps(other).map_err(|err| {
+                    format!(
+                        "failed to validate offline restore root {} against {description} {}: {err}",
+                        budget.root().display(),
+                        other.display()
+                    )
+                })? {
+                    return Err(format!(
+                        "offline restore root {} must not overlap {description} {}",
+                        budget.root().display(),
+                        other.display()
+                    ));
+                }
+            }
+        }
+
+        if let Some(admin_path_prefix) = admin_path_prefix {
+            if budget.root() == admin_path_prefix || !budget.root().starts_with(admin_path_prefix) {
+                return Err(format!(
+                    "offline restore root {} must be a strict descendant of admin path prefix {}",
+                    budget.root().display(),
+                    admin_path_prefix.display()
+                ));
+            }
+        }
+
+        Ok(Some(Self {
+            budget,
+            _process_lease: process_lease,
+        }))
+    }
+
+    fn budget(&self) -> Arc<LocalDiskBudget> {
+        Arc::clone(&self.budget)
+    }
 }
 
 impl ServerPersistenceRoot {
@@ -549,7 +805,7 @@ impl ServerPersistenceRoot {
         // Read-write core storage owns the canonical `.tsink.lock`. Other server modes still
         // persist sidecars under data_path, so the server must hold that same lease itself.
         let non_core_process_lease = (config.storage_mode != StorageRuntimeMode::ReadWrite)
-            .then(|| ServerDataPathProcessLease::acquire(data_path))
+            .then(|| ServerPathProcessLease::acquire(data_path, ".tsink.lock", "data path"))
             .transpose()?;
         let budget = LocalDiskBudget::open(data_path, limits)
             .map_err(|err| format!("failed to open shared local disk budget: {err}"))?;
@@ -579,22 +835,22 @@ impl ServerPersistenceRoot {
     }
 }
 
-struct ServerDataPathProcessLease {
+struct ServerPathProcessLease {
     lock_file: std::fs::File,
 }
 
-impl ServerDataPathProcessLease {
-    fn acquire(data_path: &Path) -> Result<Self, String> {
+impl ServerPathProcessLease {
+    fn acquire(root: &Path, lock_file_name: &str, description: &str) -> Result<Self, String> {
         const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
         const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-        std::fs::create_dir_all(data_path).map_err(|err| {
+        std::fs::create_dir_all(root).map_err(|err| {
             format!(
-                "failed to create server data path {} before locking: {err}",
-                data_path.display()
+                "failed to create server {description} {} before locking: {err}",
+                root.display()
             )
         })?;
-        let lock_path = data_path.join(".tsink.lock");
+        let lock_path = root.join(lock_file_name);
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -603,7 +859,7 @@ impl ServerDataPathProcessLease {
             .open(&lock_path)
             .map_err(|err| {
                 format!(
-                    "failed to open server data-path lock {}: {err}",
+                    "failed to open server {description} lock {}: {err}",
                     lock_path.display()
                 )
             })?;
@@ -616,14 +872,14 @@ impl ServerDataPathProcessLease {
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(format!(
-                        "data path {} is already locked by another tsink process ({})",
-                        data_path.display(),
+                        "{description} {} is already locked by another tsink process ({})",
+                        root.display(),
                         lock_path.display()
                     ));
                 }
                 Err(std::fs::TryLockError::Error(err)) => {
                     return Err(format!(
-                        "failed to acquire server data-path lock {}: {err}",
+                        "failed to acquire server {description} lock {}: {err}",
                         lock_path.display()
                     ));
                 }
@@ -633,7 +889,7 @@ impl ServerDataPathProcessLease {
     }
 }
 
-impl Drop for ServerDataPathProcessLease {
+impl Drop for ServerPathProcessLease {
     fn drop(&mut self) {
         let _ = self.lock_file.unlock();
     }
@@ -648,6 +904,7 @@ struct ServerRuntime {
     storage: Arc<dyn Storage>,
     background_workers: BackgroundWorkers,
     persistence_root: Option<ServerPersistenceRoot>,
+    offline_restore_root: Option<ServerOfflineRestoreRoot>,
 }
 
 impl ServerRuntime {
@@ -658,15 +915,20 @@ impl ServerRuntime {
         admission::global_public_write_admission()?;
         admission::global_public_read_admission()?;
 
+        let admin_path_prefix = resolve_admin_path_prefix(config.admin_path_prefix.as_deref())?;
         let persistence_root = ServerPersistenceRoot::open(&config)?;
         let local_disk_budget = persistence_root.as_ref().map(ServerPersistenceRoot::budget);
+        let offline_restore_root =
+            ServerOfflineRestoreRoot::open(&config, admin_path_prefix.as_deref())?;
+        let offline_restore_disk_budget = offline_restore_root
+            .as_ref()
+            .map(ServerOfflineRestoreRoot::budget);
         let access_control = load_access_control(&config)?;
         // Acquire the core data-path lock before any cluster or sidecar writer can publish files
         // beneath the same root.
         let core_storage = build_core_storage_runtime(&config, local_disk_budget.clone())?;
         let mut cluster = bootstrap_cluster_runtime(&config, local_disk_budget.clone()).await?;
         let security = build_security_runtime(&config, &mut cluster)?;
-        let admin_path_prefix = resolve_admin_path_prefix(config.admin_path_prefix.as_deref())?;
         let storage = build_storage_runtime(
             &config,
             core_storage,
@@ -686,6 +948,7 @@ impl ServerRuntime {
             &storage,
             &cluster,
             local_disk_budget,
+            offline_restore_disk_budget,
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listeners = bind_listeners(&config, &app_context, &shutdown_rx).await?;
@@ -704,6 +967,7 @@ impl ServerRuntime {
             storage: Arc::clone(&storage.storage),
             background_workers,
             persistence_root,
+            offline_restore_root,
         })
     }
 
@@ -717,6 +981,7 @@ impl ServerRuntime {
             storage,
             background_workers,
             persistence_root,
+            offline_restore_root,
         } = self;
         let ListenerBootstrap {
             listener,
@@ -732,6 +997,7 @@ impl ServerRuntime {
         background_workers.shutdown().await;
         let close_result = close_storage_runtime(storage).await;
         drop(persistence_root);
+        drop(offline_restore_root);
         close_result
     }
 }
@@ -774,16 +1040,17 @@ async fn bootstrap_cluster_runtime(
             && config.cluster.node_role == cluster::config::ClusterNodeRole::Query
             && config.storage_mode == StorageRuntimeMode::ComputeOnly;
         let mut context = cluster::ClusterRequestContext::from_runtime(runtime)?;
-        let control_state_store = Arc::new(build_cluster_control_store(config, &context.runtime)?);
+        let control_state_store = Arc::new(build_cluster_control_store(
+            config,
+            &context.runtime,
+            local_disk_budget.clone(),
+        )?);
         let bootstrap_state = cluster::control::ControlState::from_runtime(
             &context.runtime.membership,
             &context.runtime.ring,
         );
-        let recovered_state = control_state_store.load_or_bootstrap(bootstrap_state)?;
-        recovered_state
-            .ensure_runtime_compatible(&context.runtime.membership, &context.runtime.ring)?;
         eprintln!(
-            "cluster control-state store initialized at {} (schema v{})",
+            "cluster control-state mirror opened at {} (schema v{})",
             control_state_store.path().display(),
             cluster::control::CONTROL_STATE_SCHEMA_VERSION
         );
@@ -793,8 +1060,11 @@ async fn bootstrap_cluster_runtime(
             config,
             &context.runtime,
             Arc::clone(&control_state_store),
-            recovered_state,
+            bootstrap_state,
         )?);
+        control_consensus
+            .current_state()
+            .ensure_runtime_compatible(&context.runtime.membership, &context.runtime.ring)?;
         eprintln!(
             "cluster control-log consensus initialized at {}",
             control_consensus.log_path().display()
@@ -819,14 +1089,22 @@ async fn bootstrap_cluster_runtime(
         }
         context.control_consensus = Some(Arc::clone(&control_consensus));
 
-        let audit_log = Arc::new(build_cluster_audit_log(config, &context.runtime)?);
+        let audit_log = Arc::new(build_cluster_audit_log(
+            config,
+            &context.runtime,
+            local_disk_budget.clone(),
+        )?);
         eprintln!(
             "cluster audit log initialized at {}",
             audit_log.path().display()
         );
         context.audit_log = Some(audit_log);
 
-        let dedupe_store = Arc::new(build_cluster_dedupe_store(config, &context.runtime)?);
+        let dedupe_store = Arc::new(build_cluster_dedupe_store(
+            config,
+            &context.runtime,
+            local_disk_budget.clone(),
+        )?);
         eprintln!(
             "cluster dedupe marker store initialized at {}",
             dedupe_store.marker_path().display()
@@ -881,8 +1159,11 @@ async fn bootstrap_cluster_runtime(
         ) {
             (Some(auth_token), Some(data_path)) => {
                 let dedupe_config = edge_sync::edge_sync_accept_dedupe_config()?;
-                let dedupe_store =
-                    edge_sync::open_edge_sync_accept_dedupe_store(data_path, dedupe_config)?;
+                let dedupe_store = edge_sync::open_edge_sync_accept_dedupe_store(
+                    data_path,
+                    dedupe_config,
+                    local_disk_budget.clone(),
+                )?;
                 Some((
                     Arc::new(edge_sync::edge_sync_accept_internal_api(auth_token)),
                     dedupe_store,
@@ -908,15 +1189,21 @@ async fn bootstrap_cluster_runtime(
             .edge_sync_source_id
             .clone()
             .unwrap_or_else(|| config.listen.clone());
-        Some(Arc::new(edge_sync::EdgeSyncSourceRuntime::open(
-            data_path,
-            edge_sync::EdgeSyncSourceBootstrap {
-                source_id,
-                upstream_endpoint,
-                shared_auth_token: auth_token,
-                tenant_mapping,
-            },
-        )?))
+        let bootstrap = edge_sync::EdgeSyncSourceBootstrap {
+            source_id,
+            upstream_endpoint,
+            shared_auth_token: auth_token,
+            tenant_mapping,
+        };
+        let source = match local_disk_budget.clone() {
+            Some(local_disk_budget) => edge_sync::EdgeSyncSourceRuntime::open_with_disk_budget(
+                data_path,
+                bootstrap,
+                Some(local_disk_budget),
+            )?,
+            None => edge_sync::EdgeSyncSourceRuntime::open(data_path, bootstrap)?,
+        };
+        Some(Arc::new(source))
     } else {
         None
     };
@@ -985,8 +1272,9 @@ fn build_storage_runtime(
         )
         .map_err(|err| format!("failed to open exemplar store: {err}"))?,
     );
-    let usage_accounting = UsageAccounting::open_with_disk_budget(
+    let usage_accounting = UsageAccounting::open_with_limits_and_disk_budget(
         config.data_path.as_deref(),
+        config.usage_ledger_limits,
         local_disk_budget.clone(),
     )
     .map_err(|err| format!("failed to open usage accounting store: {err}"))?;
@@ -1020,6 +1308,7 @@ fn build_storage_runtime(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_server_context(
     config: &ServerConfig,
     admin_path_prefix: Option<PathBuf>,
@@ -1028,6 +1317,7 @@ fn build_server_context(
     storage: &StorageBootstrap,
     cluster: &ClusterBootstrap,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    offline_restore_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> ServerContext {
     ServerContext {
         storage: Arc::clone(&storage.storage),
@@ -1053,6 +1343,7 @@ fn build_server_context(
         usage_accounting: Arc::clone(&storage.usage_accounting),
         managed_control_plane: Arc::clone(&storage.managed_control_plane),
         local_disk_budget,
+        offline_restore_disk_budget,
     }
 }
 
@@ -1765,10 +2056,33 @@ fn legacy_ingest_error_is_throttled(err: &str) -> bool {
 }
 
 fn server_local_disk_limits(config: &ServerConfig) -> LocalDiskLimits {
+    let profile = config.resource_profile.unwrap_or(ResourceProfile::Server);
+    // Profile disk limits are dormant without a persistent root. Explicit CLI limits remain
+    // visible so the existing missing-`--data-path` validation still catches mistakes.
+    let profile_limits = config
+        .data_path
+        .as_ref()
+        .and_then(|_| profile.finite_limits());
     LocalDiskLimits {
-        max_bytes: config.local_disk_limit,
-        filesystem_free_headroom_bytes: config.filesystem_free_headroom,
-        maintenance_temp_reserve_bytes: config.maintenance_temp_reserve,
+        max_bytes: config
+            .local_disk_limit
+            .or_else(|| profile_limits.map(|limits| limits.local_disk_bytes)),
+        filesystem_free_headroom_bytes: (config.filesystem_free_headroom > 0)
+            .then_some(config.filesystem_free_headroom)
+            .or_else(|| profile_limits.map(|limits| limits.filesystem_free_headroom_bytes))
+            .unwrap_or(0),
+        maintenance_temp_reserve_bytes: (config.maintenance_temp_reserve > 0)
+            .then_some(config.maintenance_temp_reserve)
+            .or_else(|| profile_limits.map(|limits| limits.maintenance_temp_reserve_bytes))
+            .unwrap_or(0),
+    }
+}
+
+fn server_offline_restore_disk_limits(config: &ServerConfig) -> LocalDiskLimits {
+    LocalDiskLimits {
+        max_bytes: config.offline_restore_disk_limit,
+        filesystem_free_headroom_bytes: config.offline_restore_filesystem_free_headroom,
+        maintenance_temp_reserve_bytes: 0,
     }
 }
 
@@ -1805,6 +2119,7 @@ fn build_storage_with_disk_budget(
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> tsink::Result<Arc<dyn Storage>> {
     let mut builder = StorageBuilder::new()
+        .with_resource_profile(config.resource_profile.unwrap_or(ResourceProfile::Server))
         .with_wal_enabled(
             config.wal_enabled && config.storage_mode != StorageRuntimeMode::ComputeOnly,
         )
@@ -1838,6 +2153,20 @@ fn build_storage_with_disk_budget(
             builder = builder.with_data_path(path);
             if let Some(local_disk_budget) = local_disk_budget {
                 builder = builder.with_shared_local_disk_budget(local_disk_budget);
+                if config.local_disk_limit.is_none() {
+                    builder = builder
+                        .clear_resource_limit_override(tsink::ResourceLimitOverride::LocalDisk);
+                }
+                if config.filesystem_free_headroom == 0 {
+                    builder = builder.clear_resource_limit_override(
+                        tsink::ResourceLimitOverride::FilesystemFreeHeadroom,
+                    );
+                }
+                if config.maintenance_temp_reserve == 0 {
+                    builder = builder.clear_resource_limit_override(
+                        tsink::ResourceLimitOverride::MaintenanceTempReserve,
+                    );
+                }
             }
         }
     }
@@ -1845,8 +2174,26 @@ fn build_storage_with_disk_budget(
     if let Some(limit) = config.memory_limit {
         builder = builder.with_memory_limit(limit);
     }
+    if let Some(limit) = config.maintenance_max_items_per_pass {
+        builder = builder.with_maintenance_max_items_per_pass(limit);
+    }
+    if let Some(limit) = config.maintenance_max_bytes_per_pass {
+        builder = builder.with_maintenance_max_bytes_per_pass(limit);
+    }
     if let Some(limit) = config.cardinality_limit {
         builder = builder.with_cardinality_limit(limit);
+    }
+    if let Some(limit) = config.max_labels_per_series {
+        builder = builder.with_max_labels_per_series(limit);
+    }
+    if let Some(limit) = config.max_series_identity_bytes {
+        builder = builder.with_max_series_identity_bytes(limit);
+    }
+    if let Some((limit, window)) = config
+        .max_new_series_per_window
+        .zip(config.new_series_window)
+    {
+        builder = builder.with_series_creation_rate_limit(limit, window);
     }
     if let Some(points) = config.chunk_points {
         builder = builder.with_chunk_points(points);
@@ -1867,6 +2214,7 @@ fn build_storage_with_disk_budget(
 fn build_cluster_dedupe_store(
     config: &ServerConfig,
     runtime: &cluster::ClusterRuntime,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<DedupeWindowStore, String> {
     let dedupe_config = cluster::dedupe::DedupeConfig::from_env()?;
     let base_path = config
@@ -1877,12 +2225,21 @@ fn build_cluster_dedupe_store(
         "{}.markers.log",
         sanitize_path_component(&runtime.membership.local_node_id)
     ));
-    DedupeWindowStore::open(marker_path, dedupe_config)
+    match local_disk_budget {
+        Some(local_disk_budget) => DedupeWindowStore::open_with_disk_budget(
+            marker_path,
+            dedupe_config,
+            Some(local_disk_budget),
+            tsink::DiskCategory::Cluster,
+        ),
+        None => DedupeWindowStore::open(marker_path, dedupe_config),
+    }
 }
 
 fn build_cluster_audit_log(
     config: &ServerConfig,
     runtime: &cluster::ClusterRuntime,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<ClusterAuditLog, String> {
     let audit_config = cluster::audit::ClusterAuditConfig::from_env()?;
     let base_path = config
@@ -1893,12 +2250,20 @@ fn build_cluster_audit_log(
         "{}.audit.log",
         sanitize_path_component(&runtime.membership.local_node_id)
     ));
-    ClusterAuditLog::open(audit_path, audit_config)
+    match local_disk_budget {
+        Some(local_disk_budget) => ClusterAuditLog::open_with_disk_budget(
+            audit_path,
+            audit_config,
+            Some(local_disk_budget),
+        ),
+        None => ClusterAuditLog::open(audit_path, audit_config),
+    }
 }
 
 fn build_cluster_control_store(
     config: &ServerConfig,
     runtime: &cluster::ClusterRuntime,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<cluster::control::ControlStateStore, String> {
     let base_path = config
         .data_path
@@ -1908,7 +2273,10 @@ fn build_cluster_control_store(
         "{}.control-state.json",
         sanitize_path_component(&runtime.membership.local_node_id)
     ));
-    cluster::control::ControlStateStore::open(control_state_path)
+    cluster::control::ControlStateStore::open_with_disk_budget(
+        control_state_path,
+        local_disk_budget,
+    )
 }
 
 fn build_cluster_outbox_store(
@@ -1939,7 +2307,7 @@ fn build_cluster_control_consensus(
     config: &ServerConfig,
     runtime: &cluster::ClusterRuntime,
     control_state_store: Arc<cluster::control::ControlStateStore>,
-    recovered_state: cluster::control::ControlState,
+    bootstrap_state: cluster::control::ControlState,
 ) -> Result<cluster::consensus::ControlConsensusRuntime, String> {
     let control_consensus_config = cluster::consensus::ControlConsensusConfig::from_env()?;
     let base_path = config
@@ -1953,7 +2321,7 @@ fn build_cluster_control_consensus(
     cluster::consensus::ControlConsensusRuntime::open(
         runtime.membership.clone(),
         control_state_store,
-        recovered_state,
+        bootstrap_state,
         control_log_path,
         control_consensus_config,
     )
@@ -1994,6 +2362,199 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tsink::{DataPoint, Label, QueryOptions, StorageBuilder, TsinkError};
+
+    #[test]
+    fn server_storage_selects_server_profile_unless_configured_otherwise() {
+        let storage = build_storage_with_disk_budget(&ServerConfig::default(), None).unwrap();
+        assert_eq!(
+            storage.resource_configuration_snapshot().selected_profile,
+            tsink::ResourceProfileName::Server
+        );
+        storage.close().unwrap();
+
+        let config = ServerConfig {
+            resource_profile: Some(ResourceProfile::ExpertUnlimited),
+            ..ServerConfig::default()
+        };
+        let storage = build_storage_with_disk_budget(&config, None).unwrap();
+        assert_eq!(
+            storage.resource_configuration_snapshot().selected_profile,
+            tsink::ResourceProfileName::ExpertUnlimited
+        );
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn cluster_mode_requires_a_leased_data_path() {
+        let config = ServerConfig {
+            cluster: cluster::config::ClusterConfig {
+                enabled: true,
+                ..cluster::config::ClusterConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("cluster mode without a data path must fail closed");
+        assert!(err.contains("--cluster-enabled=true requires --data-path"));
+    }
+
+    #[test]
+    fn cardinality_rate_configuration_requires_a_complete_nonzero_pair() {
+        let unsupported_label_count = ServerConfig {
+            max_labels_per_series: Some(tsink::MAX_SUPPORTED_LABELS_PER_SERIES + 1),
+            ..ServerConfig::default()
+        };
+        assert!(unsupported_label_count
+            .validate()
+            .unwrap_err()
+            .contains("storage-format limit"));
+
+        let missing_window = ServerConfig {
+            max_new_series_per_window: Some(10),
+            ..ServerConfig::default()
+        };
+        assert!(missing_window
+            .validate()
+            .unwrap_err()
+            .contains("--max-new-series-per-window requires --new-series-window"));
+
+        let missing_limit = ServerConfig {
+            new_series_window: Some(Duration::from_secs(1)),
+            ..ServerConfig::default()
+        };
+        assert!(missing_limit
+            .validate()
+            .unwrap_err()
+            .contains("--new-series-window requires --max-new-series-per-window"));
+
+        let zero_window = ServerConfig {
+            max_new_series_per_window: Some(10),
+            new_series_window: Some(Duration::ZERO),
+            ..ServerConfig::default()
+        };
+        assert!(zero_window
+            .validate()
+            .unwrap_err()
+            .contains("--new-series-window must be greater than zero"));
+
+        ServerConfig {
+            max_new_series_per_window: Some(10),
+            new_series_window: Some(Duration::from_secs(1)),
+            ..ServerConfig::default()
+        }
+        .validate()
+        .expect("complete cardinality-rate configuration should validate");
+    }
+
+    #[test]
+    fn offline_restore_config_requires_isolated_bounded_root() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let live_data_path = temp_dir.path().join("live-data");
+        let overlapping = ServerConfig {
+            data_path: Some(live_data_path.clone()),
+            offline_restore_root: Some(live_data_path.join("offline-restores")),
+            offline_restore_disk_limit: Some(1024),
+            ..ServerConfig::default()
+        };
+        let err = overlapping
+            .validate()
+            .expect_err("offline restore root beneath the live root must fail");
+        assert!(err.contains("must not overlap --data-path"), "{err}");
+
+        let admin_prefix = temp_dir.path().join("admin-root");
+        let outside_admin_prefix = ServerConfig {
+            admin_api_enabled: true,
+            admin_auth_token: Some("admin-secret".to_string()),
+            admin_path_prefix: Some(admin_prefix.clone()),
+            offline_restore_root: Some(temp_dir.path().join("outside-admin-root")),
+            offline_restore_disk_limit: Some(1024),
+            ..ServerConfig::default()
+        };
+        let err = outside_admin_prefix
+            .validate()
+            .expect_err("offline restore root outside the admin prefix must fail");
+        assert!(
+            err.contains("strict descendant of --admin-path-prefix"),
+            "{err}"
+        );
+
+        let valid = ServerConfig {
+            admin_api_enabled: true,
+            admin_auth_token: Some("admin-secret".to_string()),
+            admin_path_prefix: Some(admin_prefix.clone()),
+            data_path: Some(live_data_path),
+            offline_restore_root: Some(admin_prefix.join("offline-restores")),
+            offline_restore_disk_limit: Some(1024 * 1024),
+            offline_restore_filesystem_free_headroom: 17,
+            ..ServerConfig::default()
+        };
+        valid
+            .validate()
+            .expect("isolated offline restore root should validate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_restore_config_rejects_resolved_symlink_overlap() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let live_data_path = temp_dir.path().join("live-data");
+        std::fs::create_dir_all(&live_data_path).unwrap();
+        let live_alias = temp_dir.path().join("live-alias");
+        symlink(&live_data_path, &live_alias).unwrap();
+        let config = ServerConfig {
+            data_path: Some(live_data_path),
+            offline_restore_root: Some(live_alias.join("offline-restores")),
+            offline_restore_disk_limit: Some(1024),
+            ..ServerConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("resolved symlink overlap must fail closed");
+        assert!(err.contains("must not overlap --data-path"), "{err}");
+    }
+
+    #[test]
+    fn offline_restore_root_opens_one_dedicated_budget() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let root = temp_dir.path().join("offline-restores");
+        let config = ServerConfig {
+            offline_restore_root: Some(root.clone()),
+            offline_restore_disk_limit: Some(4096),
+            offline_restore_filesystem_free_headroom: 23,
+            ..ServerConfig::default()
+        };
+
+        let owner = ServerOfflineRestoreRoot::open(&config, None)
+            .expect("offline restore root should open")
+            .expect("offline restore owner should be configured");
+        let contention = match ServerOfflineRestoreRoot::open(&config, None) {
+            Ok(_) => panic!("a second server must not coordinate the same offline restore root"),
+            Err(err) => err,
+        };
+        assert!(
+            contention.contains("already locked by another tsink process"),
+            "{contention}"
+        );
+        let first = owner.budget();
+        let second = owner.budget();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.root(), std::fs::canonicalize(root).unwrap());
+        assert_eq!(first.limits().max_bytes, Some(4096));
+        assert_eq!(first.limits().filesystem_free_headroom_bytes, 23);
+        assert_eq!(first.limits().maintenance_temp_reserve_bytes, 0);
+        drop(first);
+        drop(second);
+        drop(owner);
+
+        assert!(ServerOfflineRestoreRoot::open(&config, None)
+            .expect("released offline restore lease should allow reopening")
+            .is_some());
+    }
 
     fn make_storage() -> Arc<dyn Storage> {
         StorageBuilder::new()
@@ -2046,6 +2607,7 @@ mod tests {
                     .expect("managed control plane should open in memory"),
             ),
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         }
     }
 
@@ -2515,6 +3077,7 @@ mod tests {
             usage_accounting,
             managed_control_plane,
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         };
 
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -2608,6 +3171,7 @@ mod tests {
             usage_accounting,
             managed_control_plane,
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         };
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_handle = tokio::spawn(async move {
@@ -3044,6 +3608,14 @@ mod tests {
             .expect("core storage should build");
         let storage = build_storage_runtime(&config, core_storage, None, local_disk_budget.clone())
             .expect("storage bootstrap should succeed");
+        let offline_restore_disk_budget = LocalDiskBudget::open(
+            temp_dir.path().join("offline-restores"),
+            LocalDiskLimits {
+                max_bytes: Some(1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("offline restore disk budget should open");
         let admin_path_prefix = Some(temp_dir.path().to_path_buf());
 
         let context = build_server_context(
@@ -3054,6 +3626,7 @@ mod tests {
             &storage,
             &cluster,
             local_disk_budget,
+            Some(Arc::clone(&offline_restore_disk_budget)),
         );
 
         assert_eq!(context.auth_token.as_deref(), Some("public-token"));
@@ -3076,6 +3649,12 @@ mod tests {
         assert!(app_context.rbac_registry.is_some());
         assert!(app_context.usage_accounting.is_some());
         assert!(app_context.managed_control_plane.is_some());
+        assert!(Arc::ptr_eq(
+            app_context
+                .offline_restore_disk_budget
+                .expect("offline restore disk budget should be threaded through"),
+            &offline_restore_disk_budget
+        ));
 
         let request_context = context.handler_request_context(crate::http::HttpRequest {
             method: "GET".to_string(),

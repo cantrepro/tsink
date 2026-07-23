@@ -229,6 +229,10 @@ Compute-only nodes require `object_store_path` to be set and `mirror_hot_segment
 
 | Field | Description |
 |-------|-------------|
+| `persist_inspected_chunks_total` | Sealed chunks inspected by bounded background persistence windows |
+| `persist_selected_input_bytes_total` | Modeled sealed-chunk input bytes selected by bounded background persistence windows |
+| `persist_item_limit_hits_total` | Bounded background persistence windows that exhausted their item allowance |
+| `persist_byte_limit_hits_total` | Bounded background persistence windows stopped by their byte allowance |
 | `tier_moves_total` | Successful tier move operations since startup |
 | `tier_move_errors_total` | Failed tier move operations |
 | `expired_segments_total` | Segments deleted by retention enforcement |

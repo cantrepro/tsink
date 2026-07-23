@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use tracing::warn;
 
 use super::super::tiering::{
-    build_segment_inventory_startup_recoverable, PersistedSegmentTier, SegmentInventory,
-    SegmentLaneFamily,
+    build_segment_inventory_startup_recoverable, preflight_segment_inventory_startup_memory,
+    PersistedSegmentTier, SegmentInventory, SegmentLaneFamily,
 };
 use super::planning::StartupPlan;
 use super::*;
@@ -34,6 +34,21 @@ impl StartupDiscoveryPhase {
         builder: &StorageBuilder,
         plan: &StartupPlan,
     ) -> Result<StartupDiscoveredState> {
+        let mut startup_memory = StartupMemoryAdmission::new(plan.startup_memory_budget());
+        // Complete every memory-sensitive, read-only admission before compaction recovery or
+        // segment quarantine can rename durable state. The process leases acquired by planning
+        // keep cooperating writers out while the admitted state is subsequently materialized.
+        let mut registry = StartupRegistryState::load(
+            plan.paths().series_index_path.as_deref(),
+            &mut startup_memory,
+        )?;
+        preflight_segment_inventory_startup_memory(
+            plan.paths().numeric_lane_path.as_deref(),
+            plan.paths().blob_lane_path.as_deref(),
+            plan.storage_options().tiered_storage.as_ref(),
+            |bytes| startup_memory.admit(bytes),
+        )?;
+
         finalize_pending_compaction_replacements_for_storage_paths(
             builder,
             plan.paths().numeric_lane_path.as_deref(),
@@ -41,8 +56,6 @@ impl StartupDiscoveryPhase {
             plan.storage_options().tiered_storage.as_ref(),
             plan.local_disk_budget(),
         )?;
-
-        let mut registry = StartupRegistryState::load(plan.paths().series_index_path.as_deref())?;
         let inventory = StartupInventoryState::discover(plan, &mut registry)?;
 
         Ok(StartupDiscoveredState {
@@ -53,13 +66,21 @@ impl StartupDiscoveryPhase {
 }
 
 impl StartupRegistryState {
-    fn load(series_index_path: Option<&Path>) -> Result<Self> {
+    fn load(
+        series_index_path: Option<&Path>,
+        startup_memory: &mut StartupMemoryAdmission,
+    ) -> Result<Self> {
         let (persisted_registry, force_registry_checkpoint_after_startup) = if let Some(
             index_path,
         ) = series_index_path
         {
-            match SeriesRegistry::load_persisted_state(index_path) {
+            match SeriesRegistry::load_persisted_state_with_startup_admission(
+                index_path,
+                startup_memory.budget_bytes(),
+                |bytes| startup_memory.admit(bytes),
+            ) {
                 Ok(registry) => (registry, false),
+                Err(err @ TsinkError::MemoryBudgetExceeded { .. }) => return Err(err),
                 Err(err) => {
                     warn!(
                         path = %index_path.display(),
@@ -168,10 +189,15 @@ fn finalize_pending_compaction_replacements_for_storage_paths(
     }
 
     for path in paths {
-        crate::engine::compactor::finalize_pending_compaction_replacements_with_disk_budget(
-            &path,
-            local_disk_budget,
-        )?;
+        loop {
+            let recovered = crate::engine::compactor::finalize_pending_compaction_replacements_with_disk_budget(
+                &path,
+                local_disk_budget,
+            )?;
+            if !recovered.stats.compacted {
+                break;
+            }
+        }
     }
 
     Ok(())

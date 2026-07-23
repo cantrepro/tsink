@@ -10,13 +10,15 @@ use crate::cluster::rpc::{
 use crate::tenant;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::{Label, Row, WriteAcknowledgement};
+use tsink::{DiskCategory, Label, LocalDiskBudget, Row, TsinkError, WriteAcknowledgement};
 
 pub const EDGE_SYNC_MAX_ENTRIES_ENV: &str = "TSINK_EDGE_SYNC_MAX_ENTRIES";
 pub const EDGE_SYNC_MAX_BYTES_ENV: &str = "TSINK_EDGE_SYNC_MAX_BYTES";
@@ -47,6 +49,85 @@ const DEFAULT_EDGE_SYNC_DEDUPE_WINDOW_SECS: u64 = 24 * 3600;
 const EDGE_SYNC_DIR_NAME: &str = "edge_sync";
 const EDGE_SYNC_QUEUE_FILE_NAME: &str = "queue.log";
 const EDGE_SYNC_DEDUPE_FILE_NAME: &str = "dedupe.log";
+
+#[cfg(test)]
+fn injected_append_failure_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<Mutex<BTreeSet<PathBuf>>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn injected_compaction_failure_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<Mutex<BTreeSet<PathBuf>>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) struct InjectedFailureGuard {
+    path: PathBuf,
+    kind: InjectedFailureKind,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum InjectedFailureKind {
+    Append,
+    Compaction,
+}
+
+#[cfg(test)]
+impl Drop for InjectedFailureGuard {
+    fn drop(&mut self) {
+        let paths = match self.kind {
+            InjectedFailureKind::Append => injected_append_failure_paths(),
+            InjectedFailureKind::Compaction => injected_compaction_failure_paths(),
+        };
+        paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_append_failure(path: &Path) -> InjectedFailureGuard {
+    injected_append_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    InjectedFailureGuard {
+        path: path.to_path_buf(),
+        kind: InjectedFailureKind::Append,
+    }
+}
+
+#[cfg(test)]
+fn inject_compaction_failure(path: &Path) -> InjectedFailureGuard {
+    injected_compaction_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    InjectedFailureGuard {
+        path: path.to_path_buf(),
+        kind: InjectedFailureKind::Compaction,
+    }
+}
+
+#[cfg(test)]
+fn append_failure_injected(path: &Path) -> bool {
+    injected_append_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(path)
+}
+
+#[cfg(test)]
+fn compaction_failure_injected(path: &Path) -> bool {
+    injected_compaction_failure_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,23 +329,141 @@ pub struct EdgeSyncRuntimeContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeSyncEnqueueError {
-    pub submitted_rows: usize,
-    pub queued_rows: usize,
-    pub message: String,
+pub enum EdgeSyncEnqueueCause {
+    InvalidIdempotencyKey {
+        message: String,
+    },
+    RecordTooLarge {
+        bytes: u64,
+        max_bytes: u64,
+    },
+    TotalEntriesLimit {
+        max_entries: usize,
+    },
+    TotalBytesLimit {
+        max_bytes: u64,
+        queued_bytes: u64,
+        record_bytes: u64,
+    },
+    IdExhausted,
+    DiskQuotaExceeded {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    InsufficientDiskSpace {
+        required: u64,
+        available: u64,
+    },
+    InsufficientCompactionHeadroom {
+        limit: u64,
+        used: u64,
+        reserved: u64,
+        requested: u64,
+    },
+    Persistence {
+        message: String,
+    },
+    PersistenceFenced {
+        message: String,
+    },
 }
 
-impl std::fmt::Display for EdgeSyncEnqueueError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "queued {} of {} rows before edge-sync enqueue failed: {}",
-            self.queued_rows, self.submitted_rows, self.message
+impl EdgeSyncEnqueueCause {
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Persistence { .. })
+    }
+
+    pub fn is_disk_resource_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::DiskQuotaExceeded { .. }
+                | Self::InsufficientDiskSpace { .. }
+                | Self::InsufficientCompactionHeadroom { .. }
         )
     }
 }
 
-impl std::error::Error for EdgeSyncEnqueueError {}
+impl std::fmt::Display for EdgeSyncEnqueueCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidIdempotencyKey { message } => {
+                write!(formatter, "invalid edge-sync idempotency key: {message}")
+            }
+            Self::RecordTooLarge { bytes, max_bytes } => write!(
+                formatter,
+                "edge sync record exceeds max size: {bytes} bytes > {max_bytes} bytes"
+            ),
+            Self::TotalEntriesLimit { max_entries } => write!(
+                formatter,
+                "edge sync queue entry limit reached: {max_entries}"
+            ),
+            Self::TotalBytesLimit {
+                max_bytes,
+                queued_bytes,
+                record_bytes,
+            } => write!(
+                formatter,
+                "edge sync queue byte limit reached: queued {queued_bytes} + record {record_bytes} > {max_bytes}"
+            ),
+            Self::IdExhausted => write!(formatter, "edge sync queue entry id space exhausted"),
+            Self::DiskQuotaExceeded {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => write!(
+                formatter,
+                "edge sync local disk quota exceeded: limit {limit} bytes, used {used} bytes, reserved {reserved} bytes, requested {requested} bytes"
+            ),
+            Self::InsufficientDiskSpace {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "edge sync local disk headroom exhausted: required {required} bytes, available {available} bytes"
+            ),
+            Self::InsufficientCompactionHeadroom {
+                limit,
+                used,
+                reserved,
+                requested,
+            } => write!(
+                formatter,
+                "edge sync maintenance headroom exhausted: limit {limit} bytes, used {used} bytes, reserved {reserved} bytes, requested {requested} bytes"
+            ),
+            Self::Persistence { message } => {
+                write!(formatter, "edge sync queue persistence failure: {message}")
+            }
+            Self::PersistenceFenced { message } => write!(
+                formatter,
+                "edge sync queue fenced after an indeterminate persistence failure: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EdgeSyncEnqueueCause {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSyncTypedEnqueueError {
+    pub submitted_rows: usize,
+    pub queued_rows: usize,
+    pub cause: EdgeSyncEnqueueCause,
+}
+
+impl std::fmt::Display for EdgeSyncTypedEnqueueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "queued {} of {} rows before edge-sync enqueue failed: {}",
+            self.queued_rows, self.submitted_rows, self.cause
+        )
+    }
+}
+
+impl std::error::Error for EdgeSyncTypedEnqueueError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeSyncQueueSnapshot {
@@ -272,6 +471,10 @@ pub struct EdgeSyncQueueSnapshot {
     pub queued_bytes: u64,
     pub log_bytes: u64,
     pub oldest_enqueued_unix_ms: Option<u64>,
+    pub persistence_fenced: bool,
+    pub persistence_fence_reason: Option<String>,
+    pub cleanup_pending: bool,
+    pub last_cleanup_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +511,10 @@ pub struct EdgeSyncSourceStatusSnapshot {
     pub last_enqueue_error: Option<String>,
     pub last_replay_error: Option<String>,
     pub last_upstream_acknowledgement: Option<WriteAcknowledgement>,
+    pub persistence_fenced: bool,
+    pub persistence_fence_reason: Option<String>,
+    pub cleanup_pending: bool,
+    pub last_cleanup_error: Option<String>,
     pub degraded: bool,
 }
 
@@ -346,6 +553,10 @@ impl Default for EdgeSyncSourceStatusSnapshot {
             last_enqueue_error: None,
             last_replay_error: None,
             last_upstream_acknowledgement: None,
+            persistence_fenced: false,
+            persistence_fence_reason: None,
+            cleanup_pending: false,
+            last_cleanup_error: None,
             degraded: false,
         }
     }
@@ -398,34 +609,58 @@ enum EdgeSyncLogRecord {
 struct EdgeSyncQueue {
     path: PathBuf,
     config: EdgeSyncQueueConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: Mutex<EdgeSyncQueueState>,
 }
 
 #[derive(Debug)]
 struct EdgeSyncQueueState {
     pending: BTreeMap<u64, EdgeSyncEntry>,
-    file: File,
     queued_bytes: u64,
     log_bytes: u64,
     log_records: u64,
-    next_id: u64,
+    next_id: Option<u64>,
+    persistence_fenced: Option<String>,
+    last_cleanup_error: Option<String>,
 }
 
 impl EdgeSyncSourceRuntime {
     pub fn open(base_data_path: &Path, bootstrap: EdgeSyncSourceBootstrap) -> Result<Self, String> {
-        let config = EdgeSyncQueueConfig::from_env()?;
-        Self::open_with_config(base_data_path, bootstrap, config)
+        Self::open_with_disk_budget(base_data_path, bootstrap, None)
     }
 
+    pub fn open_with_disk_budget(
+        base_data_path: &Path,
+        bootstrap: EdgeSyncSourceBootstrap,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
+        let config = EdgeSyncQueueConfig::from_env()?;
+        Self::open_with_config_and_disk_budget(base_data_path, bootstrap, config, local_disk_budget)
+    }
+
+    #[cfg(test)]
     fn open_with_config(
         base_data_path: &Path,
         bootstrap: EdgeSyncSourceBootstrap,
         config: EdgeSyncQueueConfig,
     ) -> Result<Self, String> {
+        Self::open_with_config_and_disk_budget(base_data_path, bootstrap, config, None)
+    }
+
+    fn open_with_config_and_disk_budget(
+        base_data_path: &Path,
+        bootstrap: EdgeSyncSourceBootstrap,
+        config: EdgeSyncQueueConfig,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         config.validate()?;
 
         let queue_path = edge_sync_dir(base_data_path).join(EDGE_SYNC_QUEUE_FILE_NAME);
-        let queue = Arc::new(EdgeSyncQueue::open(queue_path, config)?);
+        let queue = Arc::new(EdgeSyncQueue::open_with_disk_budget(
+            queue_path,
+            config,
+            local_disk_budget,
+        )?);
         let rpc_client = RpcClient::new(RpcClientConfig {
             timeout: Duration::from_millis(crate::cluster::rpc::DEFAULT_RPC_TIMEOUT_MS),
             max_retries: 0,
@@ -488,7 +723,7 @@ impl EdgeSyncSourceRuntime {
         })
     }
 
-    pub fn enqueue_rows(&self, rows: &[Row]) -> Result<usize, EdgeSyncEnqueueError> {
+    pub fn enqueue_rows_typed(&self, rows: &[Row]) -> Result<usize, EdgeSyncTypedEnqueueError> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -499,11 +734,11 @@ impl EdgeSyncSourceRuntime {
                 for chunk in mapped_rows.chunks(MAX_INTERNAL_INGEST_ROWS) {
                     if let Err(err) = self.queue.enqueue_rows(&self.source_id, chunk) {
                         self.enqueue_rejected_total.fetch_add(1, Ordering::Relaxed);
-                        self.set_last_enqueue_error(Some(err.clone()));
-                        return Err(EdgeSyncEnqueueError {
+                        self.set_last_enqueue_error(Some(err.to_string()));
+                        return Err(EdgeSyncTypedEnqueueError {
                             submitted_rows: rows.len(),
                             queued_rows,
-                            message: err,
+                            cause: err,
                         });
                     }
                     queued_rows = queued_rows.saturating_add(chunk.len());
@@ -515,10 +750,10 @@ impl EdgeSyncSourceRuntime {
             Err(err) => {
                 self.enqueue_rejected_total.fetch_add(1, Ordering::Relaxed);
                 self.set_last_enqueue_error(Some(err.clone()));
-                Err(EdgeSyncEnqueueError {
+                Err(EdgeSyncTypedEnqueueError {
                     submitted_rows: rows.len(),
                     queued_rows: 0,
-                    message: err,
+                    cause: EdgeSyncEnqueueCause::Persistence { message: err },
                 })
             }
         }
@@ -583,8 +818,14 @@ impl EdgeSyncSourceRuntime {
             last_enqueue_error: last_enqueue_error.clone(),
             last_replay_error: last_replay_error.clone(),
             last_upstream_acknowledgement,
-            degraded: queue.queued_entries > 0
-                && (last_enqueue_error.is_some() || last_replay_error.is_some()),
+            persistence_fenced: queue.persistence_fenced,
+            persistence_fence_reason: queue.persistence_fence_reason,
+            cleanup_pending: queue.cleanup_pending,
+            last_cleanup_error: queue.last_cleanup_error,
+            degraded: queue.persistence_fenced
+                || queue.cleanup_pending
+                || (queue.queued_entries > 0
+                    && (last_enqueue_error.is_some() || last_replay_error.is_some())),
         }
     }
 
@@ -721,55 +962,133 @@ impl EdgeSyncRuntimeContext {
 }
 
 impl EdgeSyncQueue {
+    #[cfg(test)]
     fn open(path: PathBuf, config: EdgeSyncQueueConfig) -> Result<Self, String> {
+        Self::open_with_disk_budget(path, config, None)
+    }
+
+    fn open_with_disk_budget(
+        path: PathBuf,
+        config: EdgeSyncQueueConfig,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed to create edge sync queue directory {}: {err}",
-                    parent.display()
-                )
-            })?;
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .create_dir_all_and_sync_parents(parent)
+                    .map_err(|err| {
+                        format!(
+                            "failed to create managed edge sync queue directory {}: {err}",
+                            parent.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .cleanup_atomic_write_temps(&path)
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean managed edge sync queue temporaries for {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                let legacy_compaction_temp = path.with_extension("tmp");
+                local_disk_budget
+                    .remove_managed_file_if_exists_and_sync_parent(
+                        &legacy_compaction_temp,
+                        DiskCategory::Temporary,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "failed to clean legacy edge sync compaction file {}: {err}",
+                            legacy_compaction_temp.display()
+                        )
+                    })?;
+                local_disk_budget
+                    .validate_managed_file_path(&path)
+                    .map_err(|err| {
+                        format!(
+                            "invalid managed edge sync queue path {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create edge sync queue directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+                let legacy_compaction_temp = path.with_extension("tmp");
+                match std::fs::remove_file(&legacy_compaction_temp) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to clean legacy edge sync compaction file {}: {err}",
+                            legacy_compaction_temp.display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !path.exists() {
+            if let Some(local_disk_budget) = local_disk_budget.as_ref() {
+                local_disk_budget
+                    .append_file_and_sync_parent(&path, &[], DiskCategory::EdgeSync)
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize managed edge sync queue log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            } else {
+                tsink::engine::fs_utils::write_file_atomically_and_sync_parent(&path, &[])
+                    .map_err(|err| {
+                        format!(
+                            "failed to initialize edge sync queue log {}: {err}",
+                            path.display()
+                        )
+                    })?;
+            }
         }
 
         let mut pending = BTreeMap::new();
-        let mut next_id = 1u64;
+        let mut next_id = Some(1u64);
         let mut log_records = 0u64;
-        if path.exists() {
-            load_existing_records(&path, &mut pending, &mut next_id, &mut log_records)?;
-        }
+        load_existing_records(&path, &mut pending, &mut next_id, &mut log_records)?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(|err| {
-                format!(
-                    "failed to open edge sync queue log {}: {err}",
-                    path.display()
-                )
-            })?;
         let mut queued_bytes = 0u64;
         for entry in pending.values_mut() {
             if entry.queue_bytes == 0 {
                 entry.queue_bytes = estimate_queue_bytes(entry);
             }
-            queued_bytes = queued_bytes.saturating_add(entry.queue_bytes);
+            queued_bytes = queued_bytes.checked_add(entry.queue_bytes).ok_or_else(|| {
+                format!(
+                    "edge sync queued byte accounting overflow while opening {}",
+                    path.display()
+                )
+            })?;
         }
-        let log_bytes = file
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or_default();
+        let log_bytes = std::fs::metadata(&path)
+            .map_err(|err| {
+                format!(
+                    "failed to inspect edge sync queue log {}: {err}",
+                    path.display()
+                )
+            })?
+            .len();
         let queue = Self {
             path,
             config,
+            local_disk_budget,
             state: Mutex::new(EdgeSyncQueueState {
                 pending,
-                file,
                 queued_bytes,
                 log_bytes,
                 log_records,
                 next_id,
+                persistence_fenced: None,
+                last_cleanup_error: None,
             }),
         };
         {
@@ -778,15 +1097,21 @@ impl EdgeSyncQueue {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.log_bytes > queue.config.max_log_bytes {
-                compact_locked(&queue.path, &mut state)?;
+                try_compact_after_durable_record_locked(
+                    &queue.path,
+                    queue.local_disk_budget.as_ref(),
+                    &mut state,
+                    "startup recovery",
+                );
             }
         }
         Ok(queue)
     }
 
-    fn enqueue_rows(&self, source_id: &str, rows: &[Row]) -> Result<(), String> {
+    fn enqueue_rows(&self, source_id: &str, rows: &[Row]) -> Result<(), EdgeSyncEnqueueCause> {
         let idempotency_key = build_edge_sync_idempotency_key(source_id, unix_timestamp_millis());
-        validate_idempotency_key(&idempotency_key)?;
+        validate_idempotency_key(&idempotency_key)
+            .map_err(|message| EdgeSyncEnqueueCause::InvalidIdempotencyKey { message })?;
 
         let mut entry = EdgeSyncEntry {
             id: 0,
@@ -802,42 +1127,78 @@ impl EdgeSyncQueue {
         entry.queue_bytes = estimate_queue_bytes(&entry);
 
         if entry.queue_bytes > self.config.max_record_bytes {
-            return Err(format!(
-                "edge sync record exceeds max size: {} bytes > {} bytes",
-                entry.queue_bytes, self.config.max_record_bytes
-            ));
+            return Err(EdgeSyncEnqueueCause::RecordTooLarge {
+                bytes: entry.queue_bytes,
+                max_bytes: self.config.max_record_bytes,
+            });
         }
 
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_queue_not_fenced(&state)
+            .map_err(|message| EdgeSyncEnqueueCause::PersistenceFenced { message })?;
         if state.pending.len() >= self.config.max_entries {
-            return Err(format!(
-                "edge sync queue entry limit reached: {}",
-                self.config.max_entries
-            ));
+            return Err(EdgeSyncEnqueueCause::TotalEntriesLimit {
+                max_entries: self.config.max_entries,
+            });
         }
-        if state.queued_bytes.saturating_add(entry.queue_bytes) > self.config.max_bytes {
-            return Err(format!(
-                "edge sync queue byte limit reached: queued {} + record {} > {}",
-                state.queued_bytes, entry.queue_bytes, self.config.max_bytes
-            ));
+        let next_queued_bytes = state
+            .queued_bytes
+            .checked_add(entry.queue_bytes)
+            .ok_or_else(|| EdgeSyncEnqueueCause::TotalBytesLimit {
+                max_bytes: self.config.max_bytes,
+                queued_bytes: state.queued_bytes,
+                record_bytes: entry.queue_bytes,
+            })?;
+        if next_queued_bytes > self.config.max_bytes {
+            return Err(EdgeSyncEnqueueCause::TotalBytesLimit {
+                max_bytes: self.config.max_bytes,
+                queued_bytes: state.queued_bytes,
+                record_bytes: entry.queue_bytes,
+            });
         }
 
-        entry.id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
-        append_log_record_locked(
+        entry.id = state.next_id.ok_or(EdgeSyncEnqueueCause::IdExhausted)?;
+        let next_id = entry.id.checked_add(1);
+        let encoded = encode_log_record(&EdgeSyncLogRecord::Put {
+            entry: entry.clone(),
+        })
+        .map_err(|message| EdgeSyncEnqueueCause::Persistence { message })?;
+        let encoded_bytes =
+            u64::try_from(encoded.len()).map_err(|_| EdgeSyncEnqueueCause::RecordTooLarge {
+                bytes: u64::MAX,
+                max_bytes: self.config.max_record_bytes,
+            })?;
+        if encoded_bytes > self.config.max_record_bytes {
+            return Err(EdgeSyncEnqueueCause::RecordTooLarge {
+                bytes: encoded_bytes,
+                max_bytes: self.config.max_record_bytes,
+            });
+        }
+        if let Err(err) = append_encoded_log_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
             &mut state,
-            &EdgeSyncLogRecord::Put {
-                entry: entry.clone(),
-            },
-        )?;
-        state.queued_bytes = state.queued_bytes.saturating_add(entry.queue_bytes);
+            &encoded,
+            1,
+            false,
+        ) {
+            fence_after_indeterminate_append_error(&mut state, &err);
+            return Err(edge_sync_enqueue_persistence_error(err));
+        }
+        state.next_id = next_id;
+        state.queued_bytes = next_queued_bytes;
         state.pending.insert(entry.id, entry);
 
         if state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "enqueue",
+            );
         }
         Ok(())
     }
@@ -856,6 +1217,10 @@ impl EdgeSyncQueue {
                 .values()
                 .map(|entry| entry.enqueued_unix_ms)
                 .min(),
+            persistence_fenced: state.persistence_fenced.is_some(),
+            persistence_fence_reason: state.persistence_fenced.clone(),
+            cleanup_pending: state.last_cleanup_error.is_some(),
+            last_cleanup_error: state.last_cleanup_error.clone(),
         }
     }
 
@@ -879,14 +1244,41 @@ impl EdgeSyncQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_queue_not_fenced(&state)?;
         let Some(entry) = state.pending.get(&id).cloned() else {
             return Ok(());
         };
-        append_log_record_locked(&mut state, &EdgeSyncLogRecord::Ack { id })?;
+        let encoded = encode_log_record(&EdgeSyncLogRecord::Ack { id })?;
+        let used_recovery_admission = match append_encoded_log_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
+            &mut state,
+            &encoded,
+            1,
+            true,
+        ) {
+            Ok(used_recovery_admission) => used_recovery_admission,
+            Err(err) => {
+                fence_after_indeterminate_append_error(&mut state, &err);
+                return Err(err.to_string());
+            }
+        };
         state.pending.remove(&id);
         state.queued_bytes = state.queued_bytes.saturating_sub(entry.queue_bytes);
-        if state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+        let disk_growth_capacity_exhausted = self
+            .local_disk_budget
+            .as_deref()
+            .is_some_and(local_disk_growth_capacity_exhausted);
+        if state.log_bytes > self.config.max_log_bytes
+            || used_recovery_admission
+            || disk_growth_capacity_exhausted
+        {
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "acknowledgement",
+            );
         }
         Ok(())
     }
@@ -913,26 +1305,78 @@ impl EdgeSyncQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_queue_not_fenced(&state)?;
         let to_remove = state
             .pending
             .iter()
             .filter(|(_, entry)| entry.enqueued_unix_ms < cutoff_unix_ms)
-            .map(|(id, _)| *id)
+            .map(|(id, entry)| (*id, entry.queue_bytes))
             .collect::<Vec<_>>();
-        let mut expired_entries = 0u64;
-        let mut expired_bytes = 0u64;
-        for id in to_remove {
-            let Some(entry) = state.pending.get(&id).cloned() else {
-                continue;
-            };
-            append_log_record_locked(&mut state, &EdgeSyncLogRecord::Ack { id })?;
-            state.pending.remove(&id);
-            state.queued_bytes = state.queued_bytes.saturating_sub(entry.queue_bytes);
-            expired_entries = expired_entries.saturating_add(1);
-            expired_bytes = expired_bytes.saturating_add(entry.queue_bytes);
+        if to_remove.is_empty() {
+            if state.last_cleanup_error.is_some()
+                || (stale_record_count(&state) > 0
+                    && (state.log_bytes > self.config.max_log_bytes
+                        || self
+                            .local_disk_budget
+                            .as_deref()
+                            .is_some_and(local_disk_growth_capacity_exhausted)))
+            {
+                try_compact_after_durable_record_locked(
+                    &self.path,
+                    self.local_disk_budget.as_ref(),
+                    &mut state,
+                    "cleanup retry",
+                );
+            }
+            return Ok((0, 0));
         }
-        if state.log_bytes > self.config.max_log_bytes {
-            compact_locked(&self.path, &mut state)?;
+
+        let mut encoded = Vec::new();
+        for (id, _) in &to_remove {
+            let record = encode_log_record(&EdgeSyncLogRecord::Ack { id: *id })?;
+            encoded
+                .try_reserve(record.len())
+                .map_err(|_| "edge sync expiry acknowledgement batch is too large".to_string())?;
+            encoded.extend_from_slice(&record);
+        }
+        let record_count = u64::try_from(to_remove.len())
+            .map_err(|_| "edge sync expiry record count exceeds u64".to_string())?;
+        let used_recovery_admission = match append_encoded_log_locked(
+            &self.path,
+            self.local_disk_budget.as_ref(),
+            &mut state,
+            &encoded,
+            record_count,
+            true,
+        ) {
+            Ok(used_recovery_admission) => used_recovery_admission,
+            Err(err) => {
+                fence_after_indeterminate_append_error(&mut state, &err);
+                return Err(err.to_string());
+            }
+        };
+
+        let mut expired_bytes = 0u64;
+        for (id, queue_bytes) in &to_remove {
+            state.pending.remove(id);
+            state.queued_bytes = state.queued_bytes.saturating_sub(*queue_bytes);
+            expired_bytes = expired_bytes.saturating_add(*queue_bytes);
+        }
+        let expired_entries = record_count;
+
+        if state.log_bytes > self.config.max_log_bytes
+            || used_recovery_admission
+            || self
+                .local_disk_budget
+                .as_deref()
+                .is_some_and(local_disk_growth_capacity_exhausted)
+        {
+            try_compact_after_durable_record_locked(
+                &self.path,
+                self.local_disk_budget.as_ref(),
+                &mut state,
+                "expiry",
+            );
         }
         Ok((expired_entries, expired_bytes))
     }
@@ -981,9 +1425,19 @@ pub fn edge_sync_accept_dedupe_config() -> Result<DedupeConfig, String> {
 pub fn open_edge_sync_accept_dedupe_store(
     base_data_path: &Path,
     config: DedupeConfig,
+    local_disk_budget: Option<Arc<LocalDiskBudget>>,
 ) -> Result<Arc<DedupeWindowStore>, String> {
     let path = edge_sync_dir(base_data_path).join(EDGE_SYNC_DEDUPE_FILE_NAME);
-    DedupeWindowStore::open(path, config).map(Arc::new)
+    match local_disk_budget {
+        Some(local_disk_budget) => DedupeWindowStore::open_with_disk_budget(
+            path,
+            config,
+            Some(local_disk_budget),
+            DiskCategory::EdgeSync,
+        ),
+        None => DedupeWindowStore::open(path, config),
+    }
+    .map(Arc::new)
 }
 
 fn override_row_tenant(row: &Row, tenant_id: &str) -> Row {
@@ -1006,7 +1460,7 @@ fn build_edge_sync_idempotency_key(source_id: &str, unix_ms: u64) -> String {
 fn load_existing_records(
     path: &Path,
     pending: &mut BTreeMap<u64, EdgeSyncEntry>,
-    next_id: &mut u64,
+    next_id: &mut Option<u64>,
     log_records: &mut u64,
 ) -> Result<(), String> {
     let file = File::open(path).map_err(|err| {
@@ -1015,107 +1469,329 @@ fn load_existing_records(
             path.display()
         )
     })?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = line.map_err(|err| {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut line_number = 0u64;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(|err| {
             format!(
                 "failed to read edge sync queue log {}: {err}",
                 path.display()
             )
         })?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        if read == 0 {
+            break;
         }
-        let record: EdgeSyncLogRecord = serde_json::from_str(trimmed).map_err(|err| {
-            format!(
-                "failed to decode edge sync queue record in {}: {err}",
+        line_number = line_number
+            .checked_add(1)
+            .ok_or_else(|| "edge sync queue line number overflow".to_string())?;
+        if line.last() != Some(&b'\n') {
+            return Err(format!(
+                "edge sync queue log {} ends with an incomplete record at line {line_number}",
                 path.display()
+            ));
+        }
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Err(format!(
+                "edge sync queue log {} contains a blank record at line {line_number}",
+                path.display()
+            ));
+        }
+        let record: EdgeSyncLogRecord = serde_json::from_slice(&line).map_err(|err| {
+            format!(
+                "failed to decode edge sync queue record in {} at line {line_number}: {err}",
+                path.display(),
             )
         })?;
-        *log_records = log_records.saturating_add(1);
+        *log_records = log_records
+            .checked_add(1)
+            .ok_or_else(|| "edge sync queue record count overflow".to_string())?;
         match record {
             EdgeSyncLogRecord::Put { mut entry } => {
                 if entry.queue_bytes == 0 {
                     entry.queue_bytes = estimate_queue_bytes(&entry);
                 }
-                *next_id = (*next_id).max(entry.id.saturating_add(1));
+                advance_next_id(next_id, entry.id);
                 pending.insert(entry.id, entry);
             }
             EdgeSyncLogRecord::Ack { id } => {
                 pending.remove(&id);
+                advance_next_id(next_id, id);
             }
         }
     }
     Ok(())
 }
 
-fn append_log_record_locked(
-    state: &mut EdgeSyncQueueState,
-    record: &EdgeSyncLogRecord,
-) -> Result<(), String> {
-    let serialized = serde_json::to_vec(record)
+fn advance_next_id(next_id: &mut Option<u64>, observed_id: u64) {
+    let Some(current) = *next_id else {
+        return;
+    };
+    *next_id = observed_id
+        .checked_add(1)
+        .map(|candidate| current.max(candidate));
+}
+
+fn encode_log_record(record: &EdgeSyncLogRecord) -> Result<Vec<u8>, String> {
+    let mut encoded = serde_json::to_vec(record)
         .map_err(|err| format!("failed to encode edge sync queue record: {err}"))?;
-    state
-        .file
-        .write_all(&serialized)
-        .and_then(|_| state.file.write_all(b"\n"))
-        .and_then(|_| state.file.flush())
-        .map_err(|err| format!("failed to append edge sync queue record: {err}"))?;
-    state.log_bytes = state
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn append_encoded_log_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut EdgeSyncQueueState,
+    encoded: &[u8],
+    record_count: u64,
+    allow_recovery: bool,
+) -> Result<bool, TsinkError> {
+    let encoded_bytes = u64::try_from(encoded.len())
+        .map_err(|_| TsinkError::Other("edge sync append exceeds u64 bytes".to_string()))?;
+    let next_log_bytes = state
         .log_bytes
-        .saturating_add(u64::try_from(serialized.len() + 1).unwrap_or(u64::MAX));
-    state.log_records = state.log_records.saturating_add(1);
+        .checked_add(encoded_bytes)
+        .ok_or_else(|| TsinkError::Other("edge sync log byte accounting overflow".to_string()))?;
+    let next_log_records = state
+        .log_records
+        .checked_add(record_count)
+        .ok_or_else(|| TsinkError::Other("edge sync log record accounting overflow".to_string()))?;
+
+    #[cfg(test)]
+    if append_failure_injected(path) {
+        return Err(TsinkError::Other(
+            "injected edge sync queue append failure".to_string(),
+        ));
+    }
+
+    let used_recovery_admission = if let Some(local_disk_budget) = local_disk_budget {
+        if allow_recovery {
+            match local_disk_budget.append_file_and_sync_parent(
+                path,
+                encoded,
+                DiskCategory::EdgeSync,
+            ) {
+                Ok(()) => false,
+                Err(
+                    TsinkError::DiskQuotaExceeded { .. }
+                    | TsinkError::InsufficientDiskSpace { .. }
+                    | TsinkError::InsufficientCompactionHeadroom { .. },
+                ) => {
+                    local_disk_budget.append_file_and_sync_parent_for_recovery(
+                        path,
+                        encoded,
+                        DiskCategory::EdgeSync,
+                    )?;
+                    true
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            local_disk_budget.append_file_and_sync_parent(path, encoded, DiskCategory::EdgeSync)?;
+            false
+        }
+    } else {
+        let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+            TsinkError::Other(format!(
+                "failed to open edge sync queue log for append: {err}"
+            ))
+        })?;
+        file.write_all(encoded).map_err(|err| {
+            TsinkError::Other(format!("failed to append edge sync queue record: {err}"))
+        })?;
+        file.flush().map_err(|err| {
+            TsinkError::Other(format!("failed to flush edge sync queue record: {err}"))
+        })?;
+        file.sync_all().map_err(|err| {
+            TsinkError::Other(format!("failed to sync edge sync queue record: {err}"))
+        })?;
+        false
+    };
+
+    state.log_bytes = next_log_bytes;
+    state.log_records = next_log_records;
+    Ok(used_recovery_admission)
+}
+
+fn compacted_log_len(pending: &BTreeMap<u64, EdgeSyncEntry>) -> Result<u64, String> {
+    pending.values().try_fold(0u64, |total, entry| {
+        let encoded = encode_log_record(&EdgeSyncLogRecord::Put {
+            entry: entry.clone(),
+        })?;
+        let record_bytes = u64::try_from(encoded.len()).map_err(|_| {
+            "encoded edge sync compaction record exceeds the supported byte range".to_string()
+        })?;
+        total
+            .checked_add(record_bytes)
+            .ok_or_else(|| "compacted edge sync log exceeds the supported byte range".to_string())
+    })
+}
+
+fn write_compacted_log(
+    pending: &BTreeMap<u64, EdgeSyncEntry>,
+    writer: &mut dyn Write,
+) -> Result<(), String> {
+    for entry in pending.values() {
+        let encoded = encode_log_record(&EdgeSyncLogRecord::Put {
+            entry: entry.clone(),
+        })?;
+        writer
+            .write_all(&encoded)
+            .map_err(|err| format!("failed to write edge sync queue compaction record: {err}"))?;
+    }
     Ok(())
 }
 
-fn compact_locked(path: &Path, state: &mut EdgeSyncQueueState) -> Result<(), String> {
-    let temp_path = path.with_extension("tmp");
-    let mut temp = File::create(&temp_path).map_err(|err| {
-        format!(
-            "failed to create edge sync compaction temp file {}: {err}",
-            temp_path.display()
-        )
-    })?;
-    let mut log_bytes = 0u64;
-    for entry in state.pending.values() {
-        let record = EdgeSyncLogRecord::Put {
-            entry: entry.clone(),
-        };
-        let encoded = serde_json::to_vec(&record)
-            .map_err(|err| format!("failed to encode edge sync compaction record: {err}"))?;
-        temp.write_all(&encoded)
-            .and_then(|_| temp.write_all(b"\n"))
+fn compact_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut EdgeSyncQueueState,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if compaction_failure_injected(path) {
+        return Err("injected edge sync queue compaction failure".to_string());
+    }
+
+    let compacted_bytes = compacted_log_len(&state.pending)?;
+    if let Some(local_disk_budget) = local_disk_budget {
+        local_disk_budget
+            .rewrite_file_atomically_and_sync_parent_for_cleanup_with(
+                path,
+                compacted_bytes,
+                DiskCategory::EdgeSync,
+                |writer| write_compacted_log(&state.pending, writer).map_err(TsinkError::Other),
+            )
             .map_err(|err| {
                 format!(
-                    "failed to write edge sync compaction temp file {}: {err}",
-                    temp_path.display()
+                    "failed to compact managed edge sync queue log {}: {err}",
+                    path.display()
                 )
             })?;
-        log_bytes = log_bytes.saturating_add(u64::try_from(encoded.len() + 1).unwrap_or(u64::MAX));
+    } else {
+        tsink::engine::fs_utils::write_file_atomically_and_sync_parent_with(
+            path,
+            compacted_bytes,
+            |writer| write_compacted_log(&state.pending, writer).map_err(TsinkError::Other),
+        )
+        .map_err(|err| {
+            format!(
+                "failed to compact edge sync queue log {}: {err}",
+                path.display()
+            )
+        })?;
     }
-    temp.flush().map_err(|err| {
-        format!(
-            "failed to flush edge sync compaction temp file {}: {err}",
-            temp_path.display()
-        )
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|err| {
-        format!(
-            "failed to replace edge sync queue log {} with compacted file {}: {err}",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
-    state.file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)
-        .map_err(|err| format!("failed to reopen compacted edge sync queue log: {err}"))?;
-    state.log_bytes = log_bytes;
-    state.log_records = state.pending.len() as u64;
+
+    state.log_bytes = std::fs::metadata(path)
+        .map_err(|err| {
+            format!(
+                "failed to inspect compacted edge sync queue log {}: {err}",
+                path.display()
+            )
+        })?
+        .len();
+    state.log_records = u64::try_from(state.pending.len())
+        .map_err(|_| "edge sync pending entry count exceeds u64".to_string())?;
     Ok(())
+}
+
+fn try_compact_after_durable_record_locked(
+    path: &Path,
+    local_disk_budget: Option<&Arc<LocalDiskBudget>>,
+    state: &mut EdgeSyncQueueState,
+    operation: &str,
+) {
+    match compact_locked(path, local_disk_budget, state) {
+        Ok(()) => state.last_cleanup_error = None,
+        Err(err) => {
+            state.last_cleanup_error = Some(err.clone());
+            eprintln!(
+                "edge sync queue compaction deferred after durable {operation} record: {err}"
+            );
+        }
+    }
+}
+
+fn ensure_queue_not_fenced(state: &EdgeSyncQueueState) -> Result<(), String> {
+    match state.persistence_fenced.as_ref() {
+        Some(reason) => Err(format!(
+            "edge sync queue is fenced after an indeterminate persistence failure: {reason}"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn fence_after_indeterminate_append_error(state: &mut EdgeSyncQueueState, error: &TsinkError) {
+    if !is_disk_resource_error(error) {
+        state.persistence_fenced = Some(error.to_string());
+    }
+}
+
+fn is_disk_resource_error(error: &TsinkError) -> bool {
+    matches!(
+        error,
+        TsinkError::DiskQuotaExceeded { .. }
+            | TsinkError::InsufficientDiskSpace { .. }
+            | TsinkError::InsufficientCompactionHeadroom { .. }
+    )
+}
+
+fn edge_sync_enqueue_persistence_error(error: TsinkError) -> EdgeSyncEnqueueCause {
+    match error {
+        TsinkError::DiskQuotaExceeded {
+            limit,
+            used,
+            reserved,
+            requested,
+        } => EdgeSyncEnqueueCause::DiskQuotaExceeded {
+            limit,
+            used,
+            reserved,
+            requested,
+        },
+        TsinkError::InsufficientDiskSpace {
+            required,
+            available,
+        } => EdgeSyncEnqueueCause::InsufficientDiskSpace {
+            required,
+            available,
+        },
+        TsinkError::InsufficientCompactionHeadroom {
+            limit,
+            used,
+            reserved,
+            requested,
+        } => EdgeSyncEnqueueCause::InsufficientCompactionHeadroom {
+            limit,
+            used,
+            reserved,
+            requested,
+        },
+        other => EdgeSyncEnqueueCause::PersistenceFenced {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn stale_record_count(state: &EdgeSyncQueueState) -> u64 {
+    state.log_records.saturating_sub(state.pending.len() as u64)
+}
+
+fn local_disk_growth_capacity_exhausted(budget: &LocalDiskBudget) -> bool {
+    let snapshot = budget.snapshot();
+    let Some(max_bytes) = snapshot.limits.max_bytes else {
+        return false;
+    };
+    let growth_limit = max_bytes.saturating_sub(snapshot.limits.maintenance_temp_reserve_bytes);
+    snapshot
+        .accounted_bytes
+        .saturating_add(snapshot.reserved_bytes)
+        >= growth_limit
 }
 
 fn estimate_queue_bytes(entry: &EdgeSyncEntry) -> u64 {
@@ -1162,6 +1838,7 @@ mod tests {
     use crate::cluster::rpc::InternalIngestRowsResponse;
     use crate::http::read_http_request;
     use tokio::io::AsyncWriteExt;
+    use tsink::LocalDiskLimits;
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("tempdir")
@@ -1186,6 +1863,14 @@ mod tests {
                 tsink::DataPoint::new(2, 2.0),
             ),
         ]
+    }
+
+    fn category_bytes(snapshot: &tsink::LocalDiskBudgetSnapshot, category: DiskCategory) -> u64 {
+        snapshot
+            .categories
+            .iter()
+            .find(|usage| usage.category == category)
+            .map_or(0, |usage| usage.bytes)
     }
 
     #[test]
@@ -1221,13 +1906,367 @@ mod tests {
         assert!(snapshot.queued_bytes > 0);
     }
 
-    fn force_queue_append_failure(queue: &EdgeSyncQueue, path: &Path) {
-        let read_only_file = File::open(path).expect("queue log should reopen read-only");
-        let mut state = queue
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.file = read_only_file;
+    #[test]
+    fn queue_open_rejects_blank_corrupt_and_unterminated_records() {
+        let dir = tempdir();
+        let parent = edge_sync_dir(dir.path());
+        std::fs::create_dir_all(&parent).expect("edge sync directory should build");
+        let mut unterminated =
+            encode_log_record(&EdgeSyncLogRecord::Ack { id: 1 }).expect("Ack should encode");
+        assert_eq!(unterminated.pop(), Some(b'\n'));
+        let cases = [
+            ("blank.log", b"\n".as_slice(), "blank record"),
+            (
+                "corrupt.log",
+                b"{not-json}\n".as_slice(),
+                "failed to decode",
+            ),
+            (
+                "unterminated.log",
+                unterminated.as_slice(),
+                "incomplete record",
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let path = parent.join(name);
+            std::fs::write(&path, bytes).expect("invalid queue fixture should write");
+            let err = EdgeSyncQueue::open(path, EdgeSyncQueueConfig::default())
+                .expect_err("invalid queue log should fail closed");
+            assert!(err.contains(expected), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn observed_maximum_id_fences_future_enqueue_without_reuse() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        std::fs::create_dir_all(path.parent().expect("queue parent"))
+            .expect("queue parent should build");
+        std::fs::write(
+            &path,
+            encode_log_record(&EdgeSyncLogRecord::Ack { id: u64::MAX })
+                .expect("maximum-id Ack should encode"),
+        )
+        .expect("queue fixture should write");
+
+        let queue = EdgeSyncQueue::open(path, EdgeSyncQueueConfig::default())
+            .expect("maximum-id history should remain readable");
+        assert_eq!(
+            queue
+                .enqueue_rows("edge-a", &test_rows())
+                .expect_err("maximum id must not be reused"),
+            EdgeSyncEnqueueCause::IdExhausted
+        );
+        assert_eq!(queue.snapshot().queued_entries, 0);
+    }
+
+    #[test]
+    fn budgeted_enqueue_rejects_quota_without_publishing_queue_state() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(1),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let queue = EdgeSyncQueue::open_with_disk_budget(
+            path.clone(),
+            EdgeSyncQueueConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("budgeted queue should open");
+
+        let error = queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect_err("enqueue should exceed the shared disk quota");
+
+        assert!(matches!(
+            error,
+            EdgeSyncEnqueueCause::DiskQuotaExceeded {
+                limit: 1,
+                used: 0,
+                reserved: 0,
+                requested,
+            } if requested > 1
+        ));
+        assert_eq!(queue.snapshot().queued_entries, 0);
+        assert_eq!(queue.snapshot().log_bytes, 0);
+        assert_eq!(
+            queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_id,
+            Some(1)
+        );
+        assert_eq!(std::fs::metadata(&path).expect("queue metadata").len(), 0);
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
+        assert_eq!(
+            category_bytes(&budget.snapshot(), DiskCategory::EdgeSync),
+            0
+        );
+
+        drop(queue);
+        let reopened = EdgeSyncQueue::open_with_disk_budget(
+            path,
+            EdgeSyncQueueConfig::default(),
+            Some(budget),
+        )
+        .expect("budgeted queue should reopen");
+        assert_eq!(reopened.snapshot().queued_entries, 0);
+    }
+
+    #[test]
+    fn budgeted_enqueue_reconciles_edge_sync_bytes_across_restart() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let queue = EdgeSyncQueue::open_with_disk_budget(
+            path.clone(),
+            EdgeSyncQueueConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("budgeted queue should open");
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("enqueue should succeed");
+        let log_bytes = queue.snapshot().log_bytes;
+        assert!(log_bytes > 0);
+        assert_eq!(
+            category_bytes(&budget.snapshot(), DiskCategory::EdgeSync),
+            log_bytes
+        );
+        drop(queue);
+        drop(budget);
+
+        let reopened_budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(8 * 1024 * 1024),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should reconcile on restart");
+        let reopened = EdgeSyncQueue::open_with_disk_budget(
+            path,
+            EdgeSyncQueueConfig::default(),
+            Some(Arc::clone(&reopened_budget)),
+        )
+        .expect("budgeted queue should reopen");
+        assert_eq!(reopened.snapshot().queued_entries, 1);
+        assert_eq!(reopened.snapshot().log_bytes, log_bytes);
+        assert_eq!(
+            category_bytes(&reopened_budget.snapshot(), DiskCategory::EdgeSync),
+            log_bytes
+        );
+    }
+
+    #[test]
+    fn budgeted_open_cleans_only_owned_atomic_and_legacy_temporaries() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let parent = path.parent().expect("queue parent");
+        std::fs::create_dir_all(parent).expect("queue parent should build");
+        let target_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("queue name should be UTF-8");
+        let generated_temp = parent.join(format!(".{target_name}.tmp-123-0000000000000000"));
+        let generated_lookalike = parent.join(format!(".{target_name}.tmp-123-000000000000000G"));
+        let legacy_temp = path.with_extension("tmp");
+        let legacy_lookalike = parent.join("queue.tmp.keep");
+        std::fs::write(&generated_temp, b"generated").expect("generated temp should write");
+        std::fs::write(&generated_lookalike, b"generated-lookalike")
+            .expect("generated lookalike should write");
+        std::fs::write(&legacy_temp, b"legacy").expect("legacy temp should write");
+        std::fs::write(&legacy_lookalike, b"legacy-lookalike")
+            .expect("legacy lookalike should write");
+        let budget = LocalDiskBudget::open(dir.path(), LocalDiskLimits::default())
+            .expect("budget should open");
+
+        let _queue = EdgeSyncQueue::open_with_disk_budget(
+            path.clone(),
+            EdgeSyncQueueConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("queue should open");
+
+        assert!(!generated_temp.exists());
+        assert!(!legacy_temp.exists());
+        assert!(generated_lookalike.exists());
+        assert!(legacy_lookalike.exists());
+        assert_eq!(std::fs::metadata(path).expect("queue metadata").len(), 0);
+        let expected_bytes = std::fs::metadata(generated_lookalike)
+            .expect("generated lookalike metadata")
+            .len()
+            .saturating_add(
+                std::fs::metadata(legacy_lookalike)
+                    .expect("legacy lookalike metadata")
+                    .len(),
+            );
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, expected_bytes);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.active_reservations, 0);
+    }
+
+    #[test]
+    fn compaction_failure_after_durable_put_is_cleanup_debt_not_enqueue_failure() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let config = EdgeSyncQueueConfig {
+            max_log_bytes: 1,
+            ..EdgeSyncQueueConfig::default()
+        };
+        let queue = EdgeSyncQueue::open(path.clone(), config).expect("queue should open");
+        let compaction_failure = inject_compaction_failure(&path);
+
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("durable Put should remain successful when compaction is deferred");
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.queued_entries, 1);
+        assert!(snapshot.cleanup_pending);
+        assert!(snapshot
+            .last_cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected")));
+        drop(compaction_failure);
+        queue
+            .expire_before(0)
+            .expect("cleanup worker should retry deferred compaction");
+        let snapshot = queue.snapshot();
+        assert!(!snapshot.cleanup_pending);
+        assert!(snapshot.last_cleanup_error.is_none());
+        drop(queue);
+
+        let reopened = EdgeSyncQueue::open(path, config).expect("queue should reopen");
+        assert_eq!(reopened.snapshot().queued_entries, 1);
+    }
+
+    #[test]
+    fn source_status_exposes_cleanup_debt_and_persistence_fencing() {
+        let cleanup_dir = tempdir();
+        let cleanup_path = edge_sync_dir(cleanup_dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let cleanup_runtime = EdgeSyncSourceRuntime::open_with_config(
+            cleanup_dir.path(),
+            EdgeSyncSourceBootstrap {
+                source_id: "edge-a".to_string(),
+                upstream_endpoint: "127.0.0.1:1".to_string(),
+                shared_auth_token: "secret".to_string(),
+                tenant_mapping: EdgeSyncTenantMapping::preserve(),
+            },
+            EdgeSyncQueueConfig {
+                max_log_bytes: 1,
+                ..EdgeSyncQueueConfig::default()
+            },
+        )
+        .expect("cleanup runtime should open");
+        let cleanup_failure = inject_compaction_failure(&cleanup_path);
+        cleanup_runtime
+            .enqueue_rows_typed(&test_rows())
+            .expect("durable enqueue should survive deferred compaction");
+        let status = cleanup_runtime.status_snapshot();
+        assert!(status.cleanup_pending);
+        assert!(status.degraded);
+        assert!(!status.persistence_fenced);
+        assert!(status
+            .last_cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected")));
+        drop(cleanup_failure);
+        cleanup_runtime
+            .cleanup_once()
+            .expect("cleanup should retry deferred compaction");
+        let status = cleanup_runtime.status_snapshot();
+        assert!(!status.cleanup_pending);
+        assert!(!status.degraded);
+        assert!(status.last_cleanup_error.is_none());
+
+        let fenced_dir = tempdir();
+        let fenced_path = edge_sync_dir(fenced_dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let fenced_runtime = EdgeSyncSourceRuntime::open_with_config(
+            fenced_dir.path(),
+            EdgeSyncSourceBootstrap {
+                source_id: "edge-b".to_string(),
+                upstream_endpoint: "127.0.0.1:1".to_string(),
+                shared_auth_token: "secret".to_string(),
+                tenant_mapping: EdgeSyncTenantMapping::preserve(),
+            },
+            EdgeSyncQueueConfig::default(),
+        )
+        .expect("fenced runtime should open");
+        let _append_failure = inject_append_failure(&fenced_path);
+        fenced_runtime
+            .enqueue_rows_typed(&test_rows())
+            .expect_err("indeterminate append failure should reject and fence enqueue");
+        let status = fenced_runtime.status_snapshot();
+        assert!(status.persistence_fenced);
+        assert!(status.degraded);
+        assert!(!status.cleanup_pending);
+        assert!(status
+            .persistence_fence_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("injected")));
+    }
+
+    #[test]
+    fn acknowledgement_uses_recovery_admission_at_growth_limit() {
+        let dir = tempdir();
+        let path = edge_sync_dir(dir.path()).join(EDGE_SYNC_QUEUE_FILE_NAME);
+        let queue = EdgeSyncQueue::open(path.clone(), EdgeSyncQueueConfig::default())
+            .expect("queue should open");
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("enqueue should succeed");
+        let id = queue.collect_due_entries(1)[0].id;
+        let put_bytes = queue.snapshot().log_bytes;
+        drop(queue);
+
+        let budget = LocalDiskBudget::open(
+            dir.path(),
+            LocalDiskLimits {
+                max_bytes: Some(put_bytes),
+                ..LocalDiskLimits::default()
+            },
+        )
+        .expect("full disk budget should reopen existing queue");
+        let queue = EdgeSyncQueue::open_with_disk_budget(
+            path.clone(),
+            EdgeSyncQueueConfig::default(),
+            Some(Arc::clone(&budget)),
+        )
+        .expect("budgeted queue should open at its growth limit");
+
+        queue
+            .ack_entry(id)
+            .expect("acknowledgement cleanup should use recovery admission");
+        assert_eq!(queue.snapshot().queued_entries, 0);
+        assert_eq!(queue.snapshot().log_bytes, 0);
+        assert_eq!(
+            category_bytes(&budget.snapshot(), DiskCategory::EdgeSync),
+            0
+        );
+        drop(queue);
+
+        let reopened = EdgeSyncQueue::open_with_disk_budget(
+            path,
+            EdgeSyncQueueConfig::default(),
+            Some(budget),
+        )
+        .expect("queue should reopen after recovered acknowledgement");
+        assert_eq!(reopened.snapshot().queued_entries, 0);
     }
 
     #[test]
@@ -1245,13 +2284,25 @@ mod tests {
             .next()
             .expect("entry should be pending");
         let before = queue.snapshot();
-        force_queue_append_failure(&queue, &path);
+        let _append_failure = inject_append_failure(&path);
 
         let error = queue
             .ack_entry(entry.id)
-            .expect_err("read-only queue log should reject the ack append");
-        assert!(error.contains("failed to append edge sync queue record"));
-        assert_eq!(queue.snapshot(), before);
+            .expect_err("injected queue failure should reject the ack append");
+        assert!(error.contains("injected edge sync queue append failure"));
+        let after = queue.snapshot();
+        assert_eq!(after.queued_entries, before.queued_entries);
+        assert_eq!(after.queued_bytes, before.queued_bytes);
+        assert_eq!(after.log_bytes, before.log_bytes);
+        assert_eq!(
+            after.oldest_enqueued_unix_ms,
+            before.oldest_enqueued_unix_ms
+        );
+        assert!(after.persistence_fenced);
+        assert!(after
+            .persistence_fence_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("injected")));
         drop(queue);
 
         let reopened =
@@ -1269,19 +2320,31 @@ mod tests {
         queue
             .enqueue_rows("edge-a", &test_rows())
             .expect("enqueue should succeed");
+        queue
+            .enqueue_rows("edge-a", &test_rows())
+            .expect("second enqueue should succeed");
         let before = queue.snapshot();
-        force_queue_append_failure(&queue, &path);
+        assert_eq!(before.queued_entries, 2);
+        let _append_failure = inject_append_failure(&path);
 
         let error = queue
             .expire_before(u64::MAX)
-            .expect_err("read-only queue log should reject the expiry ack append");
-        assert!(error.contains("failed to append edge sync queue record"));
-        assert_eq!(queue.snapshot(), before);
+            .expect_err("injected queue failure should reject the expiry ack append");
+        assert!(error.contains("injected edge sync queue append failure"));
+        let after = queue.snapshot();
+        assert_eq!(after.queued_entries, before.queued_entries);
+        assert_eq!(after.queued_bytes, before.queued_bytes);
+        assert_eq!(after.log_bytes, before.log_bytes);
+        assert_eq!(
+            after.oldest_enqueued_unix_ms,
+            before.oldest_enqueued_unix_ms
+        );
+        assert!(after.persistence_fenced);
         drop(queue);
 
         let reopened =
             EdgeSyncQueue::open(path, EdgeSyncQueueConfig::default()).expect("queue should reopen");
-        assert_eq!(reopened.snapshot().queued_entries, 1);
+        assert_eq!(reopened.snapshot().queued_entries, 2);
     }
 
     #[test]
@@ -1381,7 +2444,7 @@ mod tests {
         )
         .expect("runtime should open");
         runtime
-            .enqueue_rows(&test_rows())
+            .enqueue_rows_typed(&test_rows())
             .expect("rows should enqueue");
         runtime
             .replay_due_once()
@@ -1412,7 +2475,7 @@ mod tests {
         )
         .expect("runtime should open");
         runtime
-            .enqueue_rows(&test_rows())
+            .enqueue_rows_typed(&test_rows())
             .expect("rows should enqueue");
 
         runtime
@@ -1459,7 +2522,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = runtime
-            .enqueue_rows(&rows)
+            .enqueue_rows_typed(&rows)
             .expect_err("second queue chunk should exceed the entry limit");
 
         assert_eq!(error.submitted_rows, MAX_INTERNAL_INGEST_ROWS + 1);

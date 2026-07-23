@@ -1,4 +1,4 @@
-use super::super::tiering::{self, PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry};
+use super::super::tiering::{self, SegmentInventory, SegmentInventoryEntry};
 #[cfg(test)]
 use super::super::Arc;
 use super::super::{
@@ -17,7 +17,6 @@ use crate::engine::segment::{
 struct PersistedCatalogRefreshSnapshot {
     visibility_fence: PersistedCatalogVisibilityFence,
     visible_roots: BTreeSet<PathBuf>,
-    tombstones: crate::engine::tombstone::TombstoneMap,
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +82,7 @@ impl<'a> CatalogRefreshContext<'a> {
     }
 
     #[cfg(test)]
-    fn invoke_full_inventory_scan_hook(self) {
+    pub(super) fn invoke_full_inventory_scan_hook(self) {
         let hook = self
             .persist_test_hooks
             .full_inventory_scan_hook
@@ -168,11 +167,24 @@ impl<'a> CatalogRefreshContext<'a> {
             .read()
             .segments_by_root
             .iter()
-            .map(|(root, state)| SegmentInventoryEntry {
-                lane: state.lane,
-                tier: state.tier,
-                root: root.clone(),
-                manifest: state.manifest.clone(),
+            .map(|(root, state)| {
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .persist_test_hooks
+                        .persisted_catalog_inventory_entry_hook
+                        .read()
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                SegmentInventoryEntry {
+                    lane: state.lane,
+                    tier: state.tier,
+                    root: root.clone(),
+                    manifest: state.manifest.clone(),
+                }
             })
             .collect::<Vec<_>>();
         SegmentInventory::from_entries(entries)
@@ -189,46 +201,9 @@ impl<'a> CatalogRefreshContext<'a> {
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let mut tombstones = crate::engine::tombstone::TombstoneMap::new();
-        let mut paths = BTreeSet::new();
-        if let Some(path) = self.numeric_lane_path {
-            paths.insert(path.join(crate::engine::tombstone::TOMBSTONES_FILE_NAME));
-        }
-        if let Some(path) = self.blob_lane_path {
-            paths.insert(path.join(crate::engine::tombstone::TOMBSTONES_FILE_NAME));
-        }
-        if let Some(config) = self.tiered_storage {
-            for lane in [
-                super::super::tiering::SegmentLaneFamily::Numeric,
-                super::super::tiering::SegmentLaneFamily::Blob,
-            ] {
-                for tier in [
-                    PersistedSegmentTier::Hot,
-                    PersistedSegmentTier::Warm,
-                    PersistedSegmentTier::Cold,
-                ] {
-                    paths.insert(
-                        config
-                            .lane_path(lane, tier)
-                            .join(crate::engine::tombstone::TOMBSTONES_FILE_NAME),
-                    );
-                }
-            }
-        }
-        for path in paths {
-            for (series_id, ranges) in crate::engine::tombstone::load_tombstones(&path)? {
-                for range in ranges {
-                    crate::engine::tombstone::merge_tombstone_range(
-                        tombstones.entry(series_id).or_default(),
-                        range,
-                    );
-                }
-            }
-        }
         Ok(PersistedCatalogRefreshSnapshot {
             visibility_fence,
             visible_roots,
-            tombstones,
         })
     }
 
@@ -268,7 +243,6 @@ impl<'a> CatalogRefreshContext<'a> {
         LoadedInventoryCatalogRefresh {
             visibility_fence: snapshot.visibility_fence,
             visible_roots: snapshot.visible_roots,
-            tombstones: snapshot.tombstones,
             inventory,
         }
     }
@@ -361,6 +335,27 @@ impl ChunkStorage {
     #[cfg(test)]
     pub(in crate::engine::storage_engine) fn clear_full_inventory_scan_hook(&self) {
         *self.persist_test_hooks.full_inventory_scan_hook.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn set_persisted_catalog_inventory_entry_hook<F>(
+        &self,
+        hook: F,
+    ) where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .persisted_catalog_inventory_entry_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn clear_persisted_catalog_inventory_entry_hook(&self) {
+        self.persist_test_hooks
+            .persisted_catalog_inventory_entry_hook
+            .write()
+            .take();
     }
 
     pub(in crate::engine::storage_engine) fn load_segment_index_for_runtime_refresh(

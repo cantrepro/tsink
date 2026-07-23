@@ -157,10 +157,9 @@ impl<'a> RegistryPersistenceContext<'a> {
             self.local_disk_budget,
             crate::DiskCategory::Registry,
         )?;
-        crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
+        SeriesRegistry::remove_incremental_segments_preserving_unknown(
             delta_dir_path,
             self.local_disk_budget,
-            crate::DiskCategory::Registry,
         )?;
         self.remove_pending_series_ids(persisted_pending_series_ids);
         self.set_delta_series_count(0);
@@ -275,6 +274,54 @@ impl<'a> RegistryPersistenceContext<'a> {
         self.remove_pending_series_ids(persisted_series_ids.iter().copied());
         self.set_delta_series_count(
             current_delta_series_count
+                .saturating_add(saturating_u64_from_usize(persisted_series_ids.len())),
+        );
+        persist_catalog_index(checkpoint_path, sources)
+    }
+
+    /// Persists only pending definitions required by one bounded flush window. Unlike the
+    /// foreground checkpoint path, this never promotes the complete registry when the delta
+    /// count crosses the checkpoint threshold; that promotion is deliberately left to an
+    /// explicit/unbounded maintenance path.
+    pub(super) fn persist_selected_series_registry_index<PersistCatalog>(
+        self,
+        checkpoint_path: &Path,
+        selected_series_ids: &[SeriesId],
+        sources: &[registry_catalog::PersistedRegistryCatalogSource],
+        persist_catalog_index: PersistCatalog,
+    ) -> Result<()>
+    where
+        PersistCatalog:
+            Fn(&Path, &[registry_catalog::PersistedRegistryCatalogSource]) -> Result<()>,
+    {
+        let _registry_persistence_guard = self.persistence_lock.lock();
+        let pending_series_ids = {
+            let pending = self.pending_series_ids.read();
+            selected_series_ids
+                .iter()
+                .copied()
+                .filter(|series_id| pending.contains(series_id))
+                .collect::<Vec<_>>()
+        };
+        if pending_series_ids.is_empty() {
+            return persist_catalog_index(checkpoint_path, sources);
+        }
+
+        let pending_registry = self.pending_registry_subset(&pending_series_ids)?;
+        let persisted_series_ids = pending_registry.all_series_ids();
+        if persisted_series_ids.is_empty() {
+            self.remove_pending_series_ids(pending_series_ids);
+            return persist_catalog_index(checkpoint_path, sources);
+        }
+
+        pending_registry.persist_incremental_to_snapshot_path_with_disk_budget_and_kind(
+            checkpoint_path,
+            self.local_disk_budget,
+            self.disk_reservation_kind,
+        )?;
+        self.remove_pending_series_ids(persisted_series_ids.iter().copied());
+        self.set_delta_series_count(
+            self.delta_series_count_value()
                 .saturating_add(saturating_u64_from_usize(persisted_series_ids.len())),
         );
         persist_catalog_index(checkpoint_path, sources)

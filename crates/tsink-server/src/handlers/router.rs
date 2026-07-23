@@ -18,6 +18,7 @@ pub(super) async fn route_request(
         usage_accounting,
         managed_control_plane,
         local_disk_budget,
+        offline_restore_disk_budget,
     } = app_context;
     let RequestContext {
         request,
@@ -93,6 +94,7 @@ pub(super) async fn route_request(
                 internal_api,
                 cluster_context,
                 admin_path_prefix,
+                offline_restore_disk_budget,
             )
             .await
         }
@@ -103,6 +105,18 @@ pub(super) async fn route_request(
                 cluster_context,
                 admin_path_prefix,
                 local_disk_budget,
+                offline_restore_disk_budget,
+            )
+            .await
+        }
+        ("POST", "/internal/v1/restore_data_budgeted") => {
+            handle_internal_restore_data_budgeted(
+                &request,
+                internal_api,
+                cluster_context,
+                admin_path_prefix,
+                local_disk_budget,
+                offline_restore_disk_budget,
             )
             .await
         }
@@ -135,6 +149,7 @@ pub(super) async fn route_request(
             security_manager,
             usage_accounting,
             local_disk_budget,
+            offline_restore_disk_budget.map(Arc::as_ref),
         ),
         ("GET" | "POST", "/api/v1/query") => {
             handle_instant_query(
@@ -280,6 +295,7 @@ pub(super) async fn route_request(
                 usage_accounting,
                 managed_control_plane,
                 local_disk_budget,
+                offline_restore_disk_budget.map(Arc::as_ref),
             )
             .await
         }
@@ -308,6 +324,7 @@ pub(super) async fn route_request(
                 security_manager,
                 usage_accounting,
                 local_disk_budget,
+                offline_restore_disk_budget.map(Arc::as_ref),
             )
             .await
         }
@@ -402,14 +419,20 @@ pub(super) async fn route_request(
                 rules_runtime,
                 &request,
                 admin_path_prefix,
+                offline_restore_disk_budget.map(Arc::as_ref),
             )
             .await;
             emit_mutating_admin_audit_entry(cluster_context, &request, "snapshot", &response);
             response
         }
         ("POST", "/api/v1/admin/restore") if admin_api_enabled => {
-            let response =
-                handle_admin_restore(&request, admin_path_prefix, local_disk_budget).await;
+            let response = handle_admin_restore(
+                &request,
+                admin_path_prefix,
+                local_disk_budget,
+                offline_restore_disk_budget,
+            )
+            .await;
             emit_mutating_admin_audit_entry(cluster_context, &request, "restore", &response);
             response
         }
@@ -636,6 +659,7 @@ pub(super) async fn route_request(
                 &request,
                 admin_path_prefix,
                 cluster_context,
+                offline_restore_disk_budget,
             )
             .await;
             emit_mutating_admin_audit_entry(
@@ -652,6 +676,7 @@ pub(super) async fn route_request(
                 admin_path_prefix,
                 cluster_context,
                 local_disk_budget,
+                offline_restore_disk_budget,
             )
             .await;
             emit_mutating_admin_audit_entry(
@@ -719,6 +744,7 @@ mod tests {
             usage_accounting: None,
             managed_control_plane: None,
             local_disk_budget: None,
+            offline_restore_disk_budget: None,
         }
     }
 

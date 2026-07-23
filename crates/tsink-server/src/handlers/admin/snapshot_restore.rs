@@ -162,6 +162,7 @@ pub(crate) async fn handle_admin_snapshot(
     rules_runtime: Option<&RulesRuntime>,
     request: &HttpRequest,
     admin_path_prefix: Option<&Path>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
     let path = match non_empty_param(request.param("path")) {
         Some(path) => path,
@@ -186,6 +187,11 @@ pub(crate) async fn handle_admin_snapshot(
         Ok(path_buf) => path_buf,
         Err(err) => return text_response(400, &err),
     };
+    if let Err(err) =
+        validate_snapshot_destination_outside_offline_root(&path_buf, offline_restore_disk_budget)
+    {
+        return internal_error_response(422, "invalid_snapshot_path", err, false);
+    }
 
     let response_path = path.clone();
     match perform_local_data_snapshot(
@@ -216,7 +222,17 @@ pub(crate) async fn handle_admin_restore(
     request: &HttpRequest,
     admin_path_prefix: Option<&Path>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
 ) -> HttpResponse {
+    let Some(offline_restore_disk_budget) = offline_restore_disk_budget else {
+        return internal_error_response(
+            503,
+            "offline_restore_unconfigured",
+            "offline restore is unavailable because no dedicated restore root and finite disk limit are configured",
+            false,
+        );
+    };
+
     let payload = match parse_optional_json_body::<RestoreAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
         Err(err) => return text_response(400, &err),
@@ -251,20 +267,30 @@ pub(crate) async fn handle_admin_restore(
     let snapshot_path_buf =
         match resolve_admin_path(Path::new(&snapshot_path), admin_path_prefix, true) {
             Ok(path_buf) => path_buf,
-            Err(err) => return text_response(400, &err),
+            Err(err) => return internal_error_response(422, "invalid_restore_path", err, false),
         };
     let data_path_buf = match resolve_admin_path(Path::new(&data_path), admin_path_prefix, false) {
         Ok(path_buf) => path_buf,
-        Err(err) => return text_response(400, &err),
+        Err(err) => return internal_error_response(422, "invalid_restore_path", err, false),
     };
     if let Err(err) = validate_restore_target_outside_live_root(&data_path_buf, local_disk_budget) {
         return text_response(409, &err);
     }
+    if let Err(err) =
+        validate_restore_target_within_offline_root(&data_path_buf, offline_restore_disk_budget)
+    {
+        return internal_error_response(422, "invalid_restore_path", err, false);
+    }
 
     let response_snapshot_path = snapshot_path_buf.display().to_string();
     let response_data_path = data_path_buf.display().to_string();
+    let offline_restore_disk_budget = Arc::clone(offline_restore_disk_budget);
     let result = tokio::task::spawn_blocking(move || {
-        StorageBuilder::restore_from_snapshot(&snapshot_path_buf, &data_path_buf)
+        StorageBuilder::restore_from_snapshot_with_disk_budget(
+            &snapshot_path_buf,
+            &data_path_buf,
+            offline_restore_disk_budget,
+        )
     })
     .await;
 
@@ -279,9 +305,172 @@ pub(crate) async fn handle_admin_restore(
                 }
             }),
         ),
-        Ok(Err(err)) => text_response(500, &format!("restore failed: {err}")),
-        Err(err) => text_response(500, &format!("restore task failed: {err}")),
+        Ok(Err(err)) => admin_restore_error_response(&err),
+        Err(err) => internal_error_response(
+            503,
+            "restore_outcome_indeterminate",
+            format!("restore task failed: {err}"),
+            false,
+        ),
     }
+}
+
+pub(crate) fn validate_restore_target_within_offline_root(
+    target: &Path,
+    offline_restore_disk_budget: &tsink::LocalDiskBudget,
+) -> Result<(), String> {
+    let governed = offline_restore_disk_budget
+        .governs(target)
+        .map_err(|err| format!("failed to validate offline restore target: {err}"))?;
+    if !governed || target == offline_restore_disk_budget.root() {
+        return Err(format!(
+            "restore target '{}' must be a strict descendant of offline restore root '{}'",
+            target.display(),
+            offline_restore_disk_budget.root().display()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_snapshot_destination_outside_offline_root(
+    target: &Path,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
+) -> Result<(), String> {
+    let Some(offline_restore_disk_budget) = offline_restore_disk_budget else {
+        return Ok(());
+    };
+    let governed = offline_restore_disk_budget
+        .governs(target)
+        .map_err(|err| format!("failed to validate snapshot destination: {err}"))?;
+    if governed {
+        return Err(format!(
+            "snapshot destination '{}' must be outside offline restore root '{}' so snapshot bytes cannot consume the separately bounded restore capacity",
+            target.display(),
+            offline_restore_disk_budget.root().display()
+        ));
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+pub(crate) fn admin_restore_error_response(err: &tsink::TsinkError) -> HttpResponse {
+    match err {
+        tsink::TsinkError::InsufficientDiskSpace { .. }
+        | tsink::TsinkError::DiskQuotaExceeded { .. }
+        | tsink::TsinkError::InsufficientCompactionHeadroom { .. } => internal_error_response(
+            413,
+            "write_disk_quota_exceeded",
+            format!("restore rejected by offline disk budget: {err}"),
+            false,
+        )
+        .with_header(WRITE_ERROR_CODE_HEADER, "write_disk_quota_exceeded"),
+        tsink::TsinkError::InvalidConfiguration(_) => internal_error_response(
+            422,
+            "invalid_restore_path",
+            format!("restore rejected: {err}"),
+            false,
+        ),
+        tsink::TsinkError::DataCorruption(_)
+        | tsink::TsinkError::Json(_)
+        | tsink::TsinkError::Bincode(_)
+        | tsink::TsinkError::Utf8(_)
+        | tsink::TsinkError::ChecksumMismatch { .. } => internal_error_response(
+            422,
+            "invalid_snapshot",
+            format!("snapshot validation failed: {err}"),
+            false,
+        ),
+        _ => internal_error_response(
+            503,
+            "restore_outcome_indeterminate",
+            format!("restore failed: {err}"),
+            false,
+        ),
+    }
+}
+
+fn cluster_restore_data_error_response(
+    err: &tsink::TsinkError,
+    node_id: &str,
+    endpoint: &str,
+) -> HttpResponse {
+    let message = |kind: &str| format!("{kind} for node '{node_id}' via {endpoint}: {err}");
+    match err {
+        tsink::TsinkError::InsufficientDiskSpace { .. }
+        | tsink::TsinkError::DiskQuotaExceeded { .. }
+        | tsink::TsinkError::InsufficientCompactionHeadroom { .. } => {
+            admin_cluster_snapshot_error_response(
+                413,
+                "write_disk_quota_exceeded",
+                message("restore rejected by offline disk budget"),
+            )
+            .with_header(WRITE_ERROR_CODE_HEADER, "write_disk_quota_exceeded")
+        }
+        tsink::TsinkError::InvalidConfiguration(_) => admin_cluster_snapshot_error_response(
+            422,
+            "invalid_restore_path",
+            message("restore rejected"),
+        ),
+        tsink::TsinkError::DataCorruption(_)
+        | tsink::TsinkError::Json(_)
+        | tsink::TsinkError::Bincode(_)
+        | tsink::TsinkError::Utf8(_)
+        | tsink::TsinkError::ChecksumMismatch { .. } => admin_cluster_snapshot_error_response(
+            422,
+            "invalid_snapshot",
+            message("snapshot validation failed"),
+        ),
+        _ => admin_cluster_snapshot_error_response(
+            503,
+            "restore_outcome_indeterminate",
+            message("restore failed"),
+        ),
+    }
+}
+
+pub(crate) fn cluster_restore_remote_error_response(
+    err: &RpcError,
+    node_id: &str,
+    endpoint: &str,
+) -> HttpResponse {
+    if let RpcError::HttpStatus {
+        status,
+        error_code,
+        message,
+        ..
+    } = err
+    {
+        if *status == 404 {
+            return admin_cluster_snapshot_error_response(
+                503,
+                "remote_restore_incompatible",
+                format!(
+                    "remote node '{node_id}' via {endpoint} does not expose the budgeted restore capability; upgrade and configure its offline restore root before retrying"
+                ),
+            );
+        }
+        if (400..500).contains(status) {
+            let code = error_code.as_deref().unwrap_or("remote_restore_rejected");
+            let response = admin_cluster_snapshot_error_response(
+                *status,
+                code,
+                format!("remote restore rejected for node '{node_id}' via {endpoint}: {message}"),
+            );
+            return if *status == 413 {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            };
+        }
+    }
+    admin_cluster_snapshot_error_response(
+        503,
+        "restore_failed",
+        format!("remote restore failed for node '{node_id}' via {endpoint}: {err}"),
+    )
 }
 
 pub(crate) async fn handle_admin_delete_series(
@@ -560,14 +749,16 @@ pub(crate) async fn handle_admin_cluster_control_snapshot(
         );
     };
 
-    let (control_state, log_snapshot) = consensus.recovery_snapshot_bundle();
-    if let Err(err) = control_state_store.persist(&control_state) {
-        return admin_control_recovery_error_response(
-            500,
-            "control_snapshot_failed",
-            format!("failed to persist control state before snapshot: {err}"),
-        );
-    }
+    let (control_state, log_snapshot) = match consensus.exportable_recovery_snapshot_bundle() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return admin_control_recovery_error_response(
+                503,
+                "control_persistence_indeterminate",
+                err,
+            );
+        }
+    };
 
     let snapshot = ControlRecoverySnapshotFileV1 {
         magic: CONTROL_RECOVERY_SNAPSHOT_MAGIC.to_string(),
@@ -695,18 +886,40 @@ pub(crate) async fn handle_admin_cluster_control_restore(
         }
     };
 
-    let restored_state = match consensus.restore_recovery_snapshot(
-        loaded_snapshot.control_state,
-        loaded_snapshot.control_log.clone(),
-        force_local_leader,
-    ) {
-        Ok(state) => state,
+    let (restored_state, checkpoint_pending_detail, cleanup_pending_detail) = match consensus
+        .restore_recovery_snapshot(
+            loaded_snapshot.control_state,
+            loaded_snapshot.control_log.clone(),
+            force_local_leader,
+        ) {
+        Ok(state) => (state, None, None),
+        Err(err) if err.is_committed_checkpoint_pending() => {
+            (consensus.current_state(), Some(err.to_string()), None)
+        }
+        Err(err) if err.is_committed_cleanup_pending() => {
+            (consensus.current_state(), None, Some(err.to_string()))
+        }
         Err(err) => {
-            return admin_control_recovery_error_response(
-                409,
-                "control_restore_rejected",
+            let (status, code) = if err.is_indeterminate() || consensus.persistence_status().fenced
+            {
+                (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            } else if err.resource_limit().is_some() {
+                (413, "write_disk_quota_exceeded")
+            } else if err.is_persistence_failure() {
+                (503, "control_restore_persistence_failed")
+            } else {
+                (409, "control_restore_rejected")
+            };
+            let response = admin_control_recovery_error_response(
+                status,
+                code,
                 format!("control recovery restore rejected: {err}"),
             );
+            return if status == 413 || code == CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            };
         }
     };
 
@@ -724,12 +937,18 @@ pub(crate) async fn handle_admin_cluster_control_restore(
                 "appliedLogIndex": restored_state.applied_log_index,
                 "appliedLogTerm": restored_state.applied_log_term,
                 "commitIndex": loaded_snapshot.control_log.commit_index,
-                "currentTerm": loaded_snapshot.control_log.current_term
+                "currentTerm": loaded_snapshot.control_log.current_term,
+                "checkpointPending": checkpoint_pending_detail.is_some(),
+                "cleanupDebt": cleanup_pending_detail.is_some(),
+                "degraded": checkpoint_pending_detail.is_some() || cleanup_pending_detail.is_some(),
+                "checkpointDetail": checkpoint_pending_detail,
+                "cleanupDetail": cleanup_pending_detail
             }
         }),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_admin_cluster_snapshot(
     storage: &Arc<dyn Storage>,
     metadata_store: &Arc<MetricMetadataStore>,
@@ -738,6 +957,7 @@ pub(crate) async fn handle_admin_cluster_snapshot(
     request: &HttpRequest,
     admin_path_prefix: Option<&Path>,
     cluster_context: Option<&ClusterRequestContext>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
 ) -> HttpResponse {
     let payload = match parse_optional_json_body::<ClusterSnapshotAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
@@ -787,6 +1007,14 @@ pub(crate) async fn handle_admin_cluster_snapshot(
         },
         None => root_path.join("control-recovery.json"),
     };
+    for destination in [&root_path, &manifest_path, &control_snapshot_path] {
+        if let Err(err) = validate_snapshot_destination_outside_offline_root(
+            destination,
+            offline_restore_disk_budget.map(Arc::as_ref),
+        ) {
+            return admin_cluster_snapshot_error_response(422, "invalid_snapshot_path", err);
+        }
+    }
 
     let Some(cluster_context) = cluster_context else {
         return admin_cluster_snapshot_error_response(
@@ -809,9 +1037,45 @@ pub(crate) async fn handle_admin_cluster_snapshot(
     let control_snapshot = match build_control_recovery_snapshot_file(cluster_context) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            return admin_cluster_snapshot_error_response(500, "control_snapshot_failed", err);
+            return admin_cluster_snapshot_error_response(
+                503,
+                "control_persistence_indeterminate",
+                err,
+            );
         }
     };
+    let nodes = cluster_snapshot_nodes(&control_snapshot.control_state);
+    let mut resolved_node_paths = BTreeMap::new();
+    for node in &nodes {
+        let requested_snapshot_path = node_path_overrides
+            .get(node.id.as_str())
+            .cloned()
+            .unwrap_or_else(|| {
+                root_path
+                    .join("nodes")
+                    .join(node.id.as_str())
+                    .join("data.snapshot")
+                    .display()
+                    .to_string()
+            });
+        let resolved = match resolve_admin_path(
+            Path::new(&requested_snapshot_path),
+            admin_path_prefix,
+            false,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                return admin_cluster_snapshot_error_response(400, "invalid_path", err);
+            }
+        };
+        if let Err(err) = validate_snapshot_destination_outside_offline_root(
+            &resolved,
+            offline_restore_disk_budget.map(Arc::as_ref),
+        ) {
+            return admin_cluster_snapshot_error_response(422, "invalid_snapshot_path", err);
+        }
+        resolved_node_paths.insert(node.id.clone(), resolved);
+    }
     let control_snapshot_path_clone = control_snapshot_path.clone();
     let control_snapshot_for_write = control_snapshot.clone();
     let control_snapshot_write = tokio::task::spawn_blocking(move || {
@@ -834,39 +1098,20 @@ pub(crate) async fn handle_admin_cluster_snapshot(
             );
         }
     }
-
-    let nodes = cluster_snapshot_nodes(&control_snapshot.control_state);
     let local_node_id = cluster_context.runtime.membership.local_node_id.as_str();
     let mut cluster_nodes = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let requested_snapshot_path = node_path_overrides
-            .get(node.id.as_str())
-            .cloned()
-            .unwrap_or_else(|| {
-                root_path
-                    .join("nodes")
-                    .join(node.id.as_str())
-                    .join("data.snapshot")
-                    .display()
-                    .to_string()
-            });
+        let resolved_snapshot_path = resolved_node_paths
+            .remove(node.id.as_str())
+            .expect("cluster snapshot node path should be preflighted");
+        let requested_snapshot_path = resolved_snapshot_path.display().to_string();
         let snapshot = if node.id == local_node_id {
-            let resolved = match resolve_admin_path(
-                Path::new(&requested_snapshot_path),
-                admin_path_prefix,
-                false,
-            ) {
-                Ok(path) => path,
-                Err(err) => {
-                    return admin_cluster_snapshot_error_response(400, "invalid_path", err);
-                }
-            };
             match perform_local_data_snapshot(
                 storage,
                 metadata_store,
                 exemplar_store,
                 rules_runtime,
-                &resolved,
+                &resolved_snapshot_path,
                 Some(cluster_context),
             )
             .await
@@ -1002,7 +1247,15 @@ pub(crate) async fn handle_admin_cluster_restore(
     admin_path_prefix: Option<&Path>,
     cluster_context: Option<&ClusterRequestContext>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&Arc<tsink::LocalDiskBudget>>,
 ) -> HttpResponse {
+    let Some(offline_restore_disk_budget) = offline_restore_disk_budget else {
+        return admin_cluster_snapshot_error_response(
+            503,
+            "offline_restore_unconfigured",
+            "offline restore is unavailable because no dedicated restore root and finite disk limit are configured",
+        );
+    };
     let payload = match parse_optional_json_body::<ClusterRestoreAdminPayload>(request) {
         Ok(payload) => payload.unwrap_or_default(),
         Err(err) => return admin_cluster_snapshot_error_response(400, "invalid_request", err),
@@ -1066,6 +1319,11 @@ pub(crate) async fn handle_admin_cluster_restore(
         Ok(path) => path,
         Err(err) => return admin_cluster_snapshot_error_response(400, "invalid_path", err),
     };
+    if let Err(err) =
+        validate_restore_target_within_offline_root(&restore_root, offline_restore_disk_budget)
+    {
+        return admin_cluster_snapshot_error_response(422, "invalid_restore_path", err);
+    }
     let report_path = match report_path_override {
         Some(path) => match resolve_admin_path(Path::new(&path), admin_path_prefix, false) {
             Ok(path) => path,
@@ -1073,6 +1331,26 @@ pub(crate) async fn handle_admin_cluster_restore(
         },
         None => restore_root.join("cluster-restore-report.json"),
     };
+    if let Err(err) =
+        validate_restore_target_within_offline_root(&report_path, offline_restore_disk_budget)
+    {
+        return admin_cluster_snapshot_error_response(
+            422,
+            "invalid_restore_path",
+            format!("invalid cluster restore report path: {err}"),
+        );
+    }
+    if paths_overlap(&report_path, &snapshot_path) {
+        return admin_cluster_snapshot_error_response(
+            422,
+            "invalid_restore_path",
+            format!(
+                "cluster restore report path '{}' must not overlap source manifest '{}'",
+                report_path.display(),
+                snapshot_path.display()
+            ),
+        );
+    }
 
     let Some(cluster_context) = cluster_context else {
         return admin_cluster_snapshot_error_response(
@@ -1177,6 +1455,11 @@ pub(crate) async fn handle_admin_cluster_restore(
                     err,
                 );
             }
+            if let Err(err) =
+                validate_restore_target_within_offline_root(&data_path, offline_restore_disk_budget)
+            {
+                return admin_cluster_snapshot_error_response(422, "invalid_restore_path", err);
+            }
             let snapshot_path = match resolve_admin_path(
                 Path::new(node.snapshot_path.as_str()),
                 admin_path_prefix,
@@ -1187,6 +1470,30 @@ pub(crate) async fn handle_admin_cluster_restore(
                     return admin_cluster_snapshot_error_response(400, "invalid_path", err);
                 }
             };
+            if paths_overlap(&report_path, &data_path) {
+                return admin_cluster_snapshot_error_response(
+                    422,
+                    "invalid_restore_path",
+                    format!(
+                        "cluster restore report path '{}' must not overlap local restore target '{}' for node '{}'",
+                        report_path.display(),
+                        data_path.display(),
+                        node.node_id
+                    ),
+                );
+            }
+            if paths_overlap(&report_path, &snapshot_path) {
+                return admin_cluster_snapshot_error_response(
+                    422,
+                    "invalid_restore_path",
+                    format!(
+                        "cluster restore report path '{}' must not overlap local snapshot source '{}' for node '{}'",
+                        report_path.display(),
+                        snapshot_path.display(),
+                        node.node_id
+                    ),
+                );
+            }
             RestoreTarget::Local {
                 snapshot_path,
                 data_path,
@@ -1212,12 +1519,21 @@ pub(crate) async fn handle_admin_cluster_restore(
                 snapshot_path,
                 data_path,
             } => {
-                match perform_local_data_restore(&snapshot_path, &data_path, Some(cluster_context))
-                    .await
+                match perform_local_data_restore(
+                    &snapshot_path,
+                    &data_path,
+                    Some(cluster_context),
+                    Arc::clone(offline_restore_disk_budget),
+                )
+                .await
                 {
                     Ok(response) => response,
                     Err(err) => {
-                        return admin_cluster_snapshot_error_response(503, "restore_failed", err);
+                        return cluster_restore_data_error_response(
+                            &err,
+                            node.node_id.as_str(),
+                            node.endpoint.as_str(),
+                        );
                     }
                 }
             }
@@ -1226,7 +1542,7 @@ pub(crate) async fn handle_admin_cluster_restore(
                 data_path,
             } => match cluster_context
                 .rpc_client
-                .data_restore(
+                .data_restore_budgeted(
                     node.endpoint.as_str(),
                     &InternalDataRestoreRequest {
                         snapshot_path,
@@ -1237,31 +1553,10 @@ pub(crate) async fn handle_admin_cluster_restore(
             {
                 Ok(response) => response,
                 Err(err) => {
-                    if let RpcError::HttpStatus {
-                        status,
-                        error_code,
-                        message,
-                        ..
-                    } = &err
-                    {
-                        if (400..500).contains(status) {
-                            return admin_cluster_snapshot_error_response(
-                                *status,
-                                error_code.as_deref().unwrap_or("remote_restore_rejected"),
-                                format!(
-                                    "remote restore rejected for node '{}' via {}: {message}",
-                                    node.node_id, node.endpoint
-                                ),
-                            );
-                        }
-                    }
-                    return admin_cluster_snapshot_error_response(
-                        503,
-                        "restore_failed",
-                        format!(
-                            "remote restore failed for node '{}' via {}: {err}",
-                            node.node_id, node.endpoint
-                        ),
+                    return cluster_restore_remote_error_response(
+                        &err,
+                        node.node_id.as_str(),
+                        node.endpoint.as_str(),
                     );
                 }
             },
@@ -1276,18 +1571,40 @@ pub(crate) async fn handle_admin_cluster_restore(
         });
     }
 
-    let restored_state = match consensus.restore_recovery_snapshot(
-        preflight_control_state,
-        manifest.control_snapshot.control_log.clone(),
-        false,
-    ) {
-        Ok(state) => state,
+    let (restored_state, checkpoint_pending_detail, cleanup_pending_detail) = match consensus
+        .restore_recovery_snapshot(
+            preflight_control_state,
+            manifest.control_snapshot.control_log.clone(),
+            force_local_leader,
+        ) {
+        Ok(state) => (state, None, None),
+        Err(err) if err.is_committed_checkpoint_pending() => {
+            (consensus.current_state(), Some(err.to_string()), None)
+        }
+        Err(err) if err.is_committed_cleanup_pending() => {
+            (consensus.current_state(), None, Some(err.to_string()))
+        }
         Err(err) => {
-            return admin_cluster_snapshot_error_response(
-                409,
-                "control_restore_rejected",
+            let (status, code) = if err.is_indeterminate() || consensus.persistence_status().fenced
+            {
+                (503, CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE)
+            } else if err.resource_limit().is_some() {
+                (413, "write_disk_quota_exceeded")
+            } else if err.is_persistence_failure() {
+                (503, "control_restore_persistence_failed")
+            } else {
+                (409, "control_restore_rejected")
+            };
+            let response = admin_cluster_snapshot_error_response(
+                status,
+                code,
                 format!("cluster control restore rejected after data restore: {err}"),
             );
+            return if status == 413 || code == CONTROL_PERSISTENCE_INDETERMINATE_ERROR_CODE {
+                response.with_header(WRITE_ERROR_CODE_HEADER, code)
+            } else {
+                response
+            };
         }
     };
 
@@ -1312,22 +1629,21 @@ pub(crate) async fn handle_admin_cluster_restore(
     };
     let report_path_clone = report_path.clone();
     let report_for_write = report.clone();
+    let report_disk_budget = Arc::clone(offline_restore_disk_budget);
     let report_write = tokio::task::spawn_blocking(move || {
-        write_cluster_restore_report_file(&report_path_clone, &report_for_write)
+        write_cluster_restore_report_file(&report_path_clone, &report_for_write, report_disk_budget)
     })
     .await;
-    match report_write {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            return admin_cluster_snapshot_error_response(500, "cluster_restore_failed", err);
-        }
-        Err(err) => {
-            return admin_cluster_snapshot_error_response(
-                500,
-                "cluster_restore_failed",
-                format!("cluster restore report task failed: {err}"),
-            );
-        }
+    let report_pending_detail = match report_write {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err),
+        Err(err) => Some(format!("cluster restore report task failed: {err}")),
+    }
+    .map(|detail| bounded_write_rejection_diagnostic(&detail).to_string());
+    if let Some(detail) = report_pending_detail.as_deref() {
+        eprintln!(
+            "cluster restore committed data and control state but report publication remains pending: {detail}"
+        );
     }
 
     json_response(
@@ -1345,6 +1661,13 @@ pub(crate) async fn handle_admin_cluster_restore(
                 "leaderNodeId": restored_state.leader_node_id,
                 "rpoEstimateMs": report.rpo_estimate_ms,
                 "rtoMs": report.rto_ms,
+                "controlCheckpointPending": checkpoint_pending_detail.is_some(),
+                "controlCleanupDebt": cleanup_pending_detail.is_some(),
+                "reportPending": report_pending_detail.is_some(),
+                "degraded": checkpoint_pending_detail.is_some() || cleanup_pending_detail.is_some() || report_pending_detail.is_some(),
+                "controlCheckpointDetail": checkpoint_pending_detail,
+                "controlCleanupDetail": cleanup_pending_detail,
+                "reportDetail": report_pending_detail,
                 "clusterNodes": report.cluster_nodes.iter().map(|node| {
                     json!({
                         "nodeId": node.node_id,

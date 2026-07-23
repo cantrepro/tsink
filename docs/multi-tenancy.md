@@ -276,15 +276,26 @@ so restart cannot accept only a tenant prefix and duplicate it on retry. The loa
 backward-compatible with legacy single-record lines and sequence gaps, but rejects an unterminated
 tail, an empty batch, or a zero or duplicate sequence.
 
-The journal's in-memory record history is currently unbounded. Status, report, support-bundle, and
-export operations scan it synchronously, and export does not yet provide a bounded pagination or
-streaming cursor.
+The journal keeps exact all-time category totals, latest storage snapshots, record/status counters,
+and at most a configured number of tenant keys. Raw records are limited to the newest configured
+sequence window. Startup reads a fixed file-length snapshot with explicit record, frame, line,
+batch, scratch-memory, and legacy sequence-range bounds; an oversized or torn ledger is rejected
+before it can be reopened for append. New tenants beyond the configured tenant bound are rejected
+before durable publication.
+
+Raw exports and time-bucketed reports are snapshot-pinned pages with record and response-byte
+limits. Each response identifies the earliest retained sequence and whether more matches exist.
+Continuation uses the returned exclusive `afterSequence` plus the original `snapshotSequence`, so
+concurrent appends do not enter an in-progress traversal. If retention advances past a cursor, the
+server returns `410 usage_cursor_expired`; it never presents an incomplete page as complete.
+Unfiltered `bucket=none` summaries use the exact all-time aggregate and do not scan raw history.
+The support bundle requests that bounded single-tenant aggregate view.
 
 ### Retrieving usage data
 
 ```bash
 # Aggregated per-tenant summary
-curl 'http://127.0.0.1:9201/api/v1/admin/usage/report?tenant=acme' \
+curl 'http://127.0.0.1:9201/api/v1/admin/usage/report?tenant=acme&bucket=none' \
   -H 'Authorization: Bearer <admin-token>'
 
 # Time-bucketed breakdown (hour | day)
@@ -292,11 +303,15 @@ curl 'http://127.0.0.1:9201/api/v1/admin/usage/report?tenant=acme&bucket=day' \
   -H 'Authorization: Bearer <admin-token>'
 
 # All tenants
-curl 'http://127.0.0.1:9201/api/v1/admin/usage/report' \
+curl 'http://127.0.0.1:9201/api/v1/admin/usage/report?bucket=none' \
   -H 'Authorization: Bearer <admin-token>'
 
-# Raw NDJSON ledger records
-curl 'http://127.0.0.1:9201/api/v1/admin/usage/export?tenant=acme' \
+# First raw NDJSON page (read continuation metadata from response headers)
+curl -i 'http://127.0.0.1:9201/api/v1/admin/usage/export?tenant=acme&limit=1000' \
+  -H 'Authorization: Bearer <admin-token>'
+
+# Continue using X-Tsink-Usage-Next-After-Sequence and the original snapshot header
+curl -i 'http://127.0.0.1:9201/api/v1/admin/usage/export?tenant=acme&afterSequence=1000&snapshotSequence=5000&limit=1000' \
   -H 'Authorization: Bearer <admin-token>'
 
 # Force reconcile storage counters

@@ -182,6 +182,12 @@ the persistence failure because it cannot make them restart-safe. A malformed, e
 record causes opening the store to fail with a bounded line-number diagnostic instead of silently
 discarding deduplication state.
 
+When the server has a shared local-disk budget, marker appends reserve normal growth in the
+`Cluster` category. Quota or filesystem-headroom rejection maps to partial
+`413 write_disk_quota_exceeded`; the already-completed primary effects and exact in-memory replay
+state are preserved. Compaction computes the exact replacement length, streams through a bounded
+atomic writer, and may use Recovery admission only when it does not grow the file.
+
 Keys expire after `TSINK_CLUSTER_DEDUPE_WINDOW_SECS` (default 15 minutes) and can also be evicted by
 the entry bound. The log is compacted periodically to reclaim space. Idempotency keys are not
 currently bound to a receiver-verified payload fingerprint, so internal callers must never reuse a
@@ -224,13 +230,89 @@ Joining → Active → Leaving → Removed
 ```
 
 - **Joining** — node has sent an auto-join request but has not yet had its membership committed by the consensus leader.
-- **Active** — node is a full participant; it owns shards and its writes count toward consistency quorums.
+- **Active** — node is a full participant; it owns shards, votes in the control quorum, may assert
+  control leadership, and its writes count toward consistency quorums.
 - **Leaving** — node has requested removal; shard handoffs are initiated before the node transitions to Removed.
 - **Removed** — node is no longer in the ring and will be ignored by routing.
 
+Only Active nodes count as control voters. Joining and Leaving peers may still receive replication
+while membership changes converge, but their replies do not satisfy quorum and inbound leader
+append/snapshot assertions from them are rejected without allowing them to raise the receiver's
+term. A recorded leader that is no longer Active is ineligible to assert leadership; failover
+chooses the deterministic next candidate from the Active voter set.
+
+Because eligibility is checked against each receiver's committed state, activation and leadership
+transfer must not outrun control-log catch-up: activate a Joining node only after it has caught up,
+then transfer leadership only after activation commits. A membership certificate or joint-
+configuration proof for a newly activated leader to convince a lagging voter is not implemented
+yet and remains part of the incomplete Phase 2 boundary.
+
+An Active leader is also rejected if it tries to commit its own `LeaveNode` transition. For the
+current crash-safe workflow, leadership must first move to another Active voter, which then commits
+the old leader's leave. This prevents self-removal from making the proposer ineligible before it
+can finish commit propagation.
+
 ### Log replication and snapshots
 
-The control log is written to a JSON file on disk (`tsink-control-log`). The schema version is embedded (`CONTROL_LOG_SCHEMA_VERSION = 1`). When the number of uncommitted entries reaches `snapshot_interval_entries`, the current state is folded into a snapshot and the log is truncated, keeping only the entries that have not yet been applied by all peers.
+The control log is written to a JSON file on disk (`tsink-control-log`). Schema v2 requires an
+embedded `checkpointState` and `steppedDownTerm` in addition to the current term, commit and
+snapshot positions, and log entries. The checkpoint's `appliedLogIndex` must equal the log's
+`commitIndex`, its `appliedLogTerm` must match the committed term, and `steppedDownTerm` cannot
+exceed `currentTerm`. The v2 log is the authoritative recovery record; the separate control-state
+file remains a schema-v1 sidecar mirror for bootstrap and inspection.
+
+A committed checkpoint stages the complete log and mirror replacements together under one shared
+local-disk reservation in the `Cluster` category. Publication is deliberately ordered:
+
+1. synchronize and publish the v2 log, including its `checkpointState`;
+2. synchronize and publish the control-state mirror.
+
+A typed disk resource failure leaves the candidate unpublished when consensus does not yet require
+it and can be reported as a definitive resource rejection. Once quorum or a leader commit
+establishes that the candidate is required, failure before durable log publication instead installs
+the candidate as pending durability, fences mutation, and reports an indeterminate persistence
+failure. If the log is durable but mirror publication fails, the candidate is committed: the
+runtime installs the embedded checkpoint, records `committed_checkpoint_pending`, and fences later
+mutations until it can repair the mirror from the authoritative log with Recovery admission. An
+ambiguous log publication is also fenced rather than guessed. A higher observed consensus term is
+adopted in memory and fenced if its required log publication fails, preventing work under a stale
+term. Once published, `steppedDownTerm` preserves that leadership revocation across restart.
+
+Startup reads the log first. A valid v2 log is used to attempt repair of a stale, missing, or
+invalid mirror from its embedded checkpoint. If mirror repair fails, the runtime opens on that
+checkpoint but remains fenced with `pendingCheckpoint` set. Legacy v1 has no embedded checkpoint
+and therefore still requires a valid mirror for migration. A missing log paired with a mirror
+applied beyond index zero is rejected rather than promoting the non-authoritative mirror.
+
+Mirror repair uses Authoritative Recovery admission. It may recreate a missing mirror or grow a
+stale one while reconciled usage is already at the logical quota because the v2 log has already
+made that logical state authoritative. The full temporary peak must still satisfy physical-space
+and filesystem-headroom checks; ordinary Recovery rewrites remain non-growing.
+
+When both files are durable but grouped finalization, owned-temporary cleanup, or accounting
+reconciliation fails, the runtime records `cleanupDebt` and reports
+`committed_cleanup_pending`. Cleanup-only debt degrades health without fencing control authority;
+the next repair pass retries owned-temp cleanup and reconciliation before any fence repair. A
+control or cluster recovery-snapshot export is therefore allowed with cleanup-only debt, but any
+authority fence, pending durable candidate, or pending mirror checkpoint returns HTTP 503
+`control_persistence_indeterminate`.
+
+After a command is already quorum-committed, a commit-notice response can report a higher term. If
+that required term and step-down floor cannot yet be published to the log, the mutation remains a
+successful degraded commit: public control surfaces report `committed_persistence_pending` and
+auto-join reports `accepted_persistence_pending`. The node adopts the higher term in memory, fences
+leadership, retains the required log-only candidate, and retries publication. The command itself
+must not be submitted again as though it failed.
+
+When the number of committed entries reaches `snapshot_interval_entries`, the current state is
+folded into the embedded checkpoint and the committed prefix is removed from the retained entries.
+Legacy schema-v1 logs are accepted only as migration input and are rewritten as v2. That rewrite is
+a downgrade boundary: a binary that only understands v1 fails closed on the v2 log, so rolling back
+requires a compatible pre-upgrade copy rather than an in-place downgrade.
+
+Control recovery snapshots carry `steppedDownTerm`; older bundles that lack it decode as zero. A
+normal restore merges the live and restored revocation floors. Only an explicit `forceLocalLeader`
+recovery clears the floor, advances the consensus term, and selects the local node as leader.
 
 ---
 
@@ -443,7 +525,11 @@ Restore replays the control log from the snapshot point and imports segment file
 
 ## Cluster audit log
 
-`ClusterAuditLog` records a tamper-evident append-only log of all cluster control-plane mutations (membership changes, shard handoffs, snapshot operations, etc.). Each record contains:
+`ClusterAuditLog` records cluster control-plane mutation outcomes (membership changes, shard
+handoffs, snapshot operations, etc.) in a durable JSONL log. The log is not cryptographically
+chained or signed and must not be treated as tamper-evident. Audit persistence is a post-operation
+side effect: an audit failure is reported to server logs but does not roll back the completed
+control-plane mutation. Each record contains:
 
 - A monotonic `id`
 - A UTC `timestamp_unix_ms`
@@ -460,7 +546,16 @@ Restore replays the control log from the snapshot point and imports segment file
 | `TSINK_CLUSTER_AUDIT_MAX_LOG_BYTES` | 128 MiB |
 | `TSINK_CLUSTER_AUDIT_MAX_QUERY_LIMIT` | 1,000 records per query |
 
-Audit records are persisted to an append-only file and can be queried via the cluster status API filtered by operation name or actor identity.
+Audit records are appended durably and the file is periodically rewritten to enforce retention and
+size bounds. Deferred compaction and an indeterminate-append fence are visible in TSDB status and
+Prometheus metrics; the next append retries deferred cleanup, while a fenced log rejects further
+appends. Strict restart replay rejects an incomplete tail rather than silently truncating it.
+Records can be queried through the cluster audit admin API, filtered by operation name or actor
+identity.
+Under the shared server disk budget, record growth reserves the `Cluster` category. Compaction is
+an exact-length atomic replacement and may use Recovery admission when it does not grow the log.
+Unterminated records fail startup, expired records cannot cause ID reuse, and a compaction failure
+after a durable append remains cleanup debt.
 
 ---
 

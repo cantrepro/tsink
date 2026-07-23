@@ -107,6 +107,12 @@ All interaction with the engine goes through the `Storage` trait. Key methods:
 
 - One dedicated write worker receives `WriteCommand` messages over an `async-channel`.
 - A pool of read workers (sized by `cgroup::default_workers_limit()`) handles `ReadCommand` messages concurrently.
+- Each channel has a 1,024-command default bound plus independent atomic payload-byte admission
+  (64 MiB for writes and 16 MiB for reads). The byte ledger also covers producers waiting to enter
+  a full channel and releases each reservation when a worker receives the command.
+- Every read command carries a query cancellation token. Dropping the awaiting future cancels
+  running built-in query work at cooperative checkpoints; accepted writes retain side-effecting
+  completion semantics.
 - Uses `parking_lot::Mutex` and `std::thread` — suitable for embedding in any async runtime.
 
 ---
@@ -240,6 +246,9 @@ fails.
 select / select_all / select_with_options
     │
     ▼
+[0] QueryExecution            — acquire one shared concurrency slot; establish effective
+    │                            work, memory, cancellation, and deadline controls
+    ▼
 [1] candidate_planner          — resolve metric + label matchers → Vec<SeriesId>
     │                            via PostingsIndex (postings bitmaps, regex → finite literal set)
     ▼
@@ -268,6 +277,17 @@ select / select_all / select_with_options
 ```
 
 The `flush_visibility_lock` is the consistency fence: writers hold a write lock during flush publication; readers hold a shared read lock for the duration of snapshot capture, guaranteeing a consistent view.
+
+One public read owns one `QueryExecution`. Nested reads use the `*_with_execution` methods rather
+than acquiring additional permits. Candidate planning, exact metadata scans, chunk decode/merge,
+result materialization, and built-in aggregation charge the applicable matched-series,
+pattern-expansion, scanned/returned-sample, returned-byte, intermediate-vector, and modeled-memory
+limits. Long loops checkpoint cooperative cancellation and the effective wall-time deadline. Permit
+and memory leases are RAII-owned, so owned entrypoints release them on every success or error path.
+A caller-supplied execution remains admitted until its last clone and reservation are dropped. All
+query limits remain optional at the low-level API. The core's `Embedded` and server's `Server`
+profiles populate finite values; the all-`None` legacy configuration is selected explicitly with
+`ExpertUnlimited`.
 
 ---
 
@@ -379,7 +399,7 @@ Each sealed chunk builds a `TimestampSearchIndex` — an array of anchor entries
   series_index.delta.d/  — incremental series registry delta checkpoints
   series_index.catalog.json — fingerprint catalog for fast registry reload
   tombstones.json.store/ — sharded binary tombstone store (256 shards)
-  .rollups/              — rollup state JSON (policies.json, state.json)
+  .rollups/              — rollup policies/base state JSON plus bounded state-journal generations
   .process.lock          — exclusive-open process lock
 ```
 
@@ -417,7 +437,13 @@ The registry maps `(metric, labels)` pairs to stable numeric `SeriesId` values a
 
 ### Persistence
 
-The registry is persisted as a binary RIDX v2 file (`series_index.bin`) with incremental delta checkpoints in `series_index.delta.d/`. On startup, `registry_catalog.rs` validates per-segment xxh64 fingerprints against the catalog; a mismatch triggers a full registry rebuild from segment postings files.
+The registry is persisted as a binary RIDX v2 file (`series_index.bin`) with incremental delta
+checkpoints in `series_index.delta.d/`. Per-segment xxh64 validation entries live in
+`series_index.catalog.d/`; its bounded manifest intent makes ordinary root deltas idempotent without
+rewriting every entry. Complete checkpoints retain the legacy `series_index.catalog.json` snapshot
+for downgrade compatibility. On startup, `registry_catalog.rs` requires the catalog entry set and
+fingerprints to match the visible inventory exactly; an incomplete intent or mismatch triggers a
+full registry rebuild from segment postings files.
 
 ---
 
@@ -518,8 +544,15 @@ tsink includes a full in-process PromQL evaluator in `src/promql/`.
 
 - **`instant_query(query, time)`** — evaluates at a single timestamp.
 - **`range_query(query, start, end, step)`** — vectorized evaluation over a step range.
+- **`instant_query_with_control(...)` / `range_query_with_control(...)`** — applies
+  request-specific limit tightening and a cancellation token.
+- **`*_with_execution(...)`** — evaluates under an already-admitted core execution.
 
-A `PrefetchCache` is keyed by metric name and populated via `select_all` before evaluation, amortising storage round-trips across all eval timestamps in a range query.
+A `PrefetchCache` is keyed by metric name and populated via `select_all` before evaluation,
+amortising storage round-trips across all eval timestamps in a range query. The complete PromQL
+request carries one `QueryExecution` through prefetch, selectors, subqueries, all evaluation steps,
+binary and aggregation intermediates, and final result accounting; nested work does not consume a
+second query slot.
 
 Supported features: `rate`, `irate`, `increase`, `delta`, `histogram_quantile`, all standard aggregations (`sum`, `avg`, `count`, `min`, `max`, `topk`, `bottomk`, `quantile`), binary operators with `on`/`ignoring`/`group_left`/`group_right`, subqueries, `@` modifier.
 
@@ -543,7 +576,12 @@ Rollup policies define persistent, automated downsampling of raw data.
 
 Materialized series are stored under synthetic metric names of the form `__tsink_rollup__:<policy_id>:<original_metric>`. A rollup worker runs every 5 seconds, reads raw data for each pending policy/source pair, computes aggregated buckets, and writes the result back via a normal `insert_rows` call.
 
-Rollup state is checkpointed as JSON files in `.rollups/` with per-policy per-source progress cursors. When a tombstone is written to a source series, any rolled-up data covering the deleted range is invalidated and scheduled for re-materialization.
+Rollup policies and the rebased state snapshot live in `.rollups/policies.json` and
+`.rollups/state.json`. Per-source checkpoint/pending replacements use checksummed
+`state-journal-active.bin` / sealed `state-journal-*.bin` generations, so ordinary materialization
+does not rewrite the complete cursor map. Full policy/delete state-first snapshots advance the
+journal epoch and absorb old generations. When a tombstone is written to a source series, any
+rolled-up data covering the deleted range is invalidated and scheduled for re-materialization.
 
 ---
 
@@ -691,15 +729,53 @@ The server exposes `/metrics` in Prometheus exposition format and `/healthz` / `
 
 ### Background threads
 
-The runtime (`src/engine/runtime.rs`) manages three background workers:
+The runtime (`src/engine/runtime.rs`) owns at most four named threads per storage instance. There is
+no process-global maintenance pool and none of these workers calls embedder code.
 
-| Worker     | Interval          | Activity                                                                               |
-| ---------- | ----------------- | -------------------------------------------------------------------------------------- |
-| Flush      | 250 ms            | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
-| Compaction | 5 s (+ triggered) | Runs `Compactor::compact_once` for numeric and blob lanes.                             |
-| Rollup     | 5 s               | Executes pending rollup materializations.                                              |
+| Thread name | When created | Concurrency | Cadence and wakeups | Queue/work bound |
+|---|---|---:|---|---|
+| `tsink-flush` | Persistent read-write lanes | 1 | 250 ms; ingest/admission may unpark it sooner | One coalescing atomic wake bit. A cursor visits at most the configured maintenance items and modeled input bytes without wrapping through the active catalog twice in one pass. Healthy WAL-backed non-tiered current heads require half an initial point block; no-WAL/tiered durability and memory/WAL pressure override that fill threshold. |
+| `tsink-compaction` | At least one local lane compactor | 1 | 5 s; delete publication may unpark it sooner | `park` provides one coalescing wake token. One pass runs at most one numeric and one blob compactor operation; each operation selects at most eight source segments, although inventory discovery still visits the level. |
+| `tsink-persisted-refresh` | Persistent lanes, or a compute-only tiered reader | 1 | 250 ms for local state; for compute-only tiering, `min(remote_refresh_interval, 250 ms)`, never below 1 ms; dirty publication unparks it | Retention/tiering, post-flush metadata reconciliation, local catalog refresh, and remote catalog refresh share this single serialized slot. Pending local maintenance is represented by coalescing booleans, not an item queue. Retention/tiering visits one root/action page per wake and applies its ordinary registry-catalog delta through a bounded intent. Finite non-tiered unknown-dirty refresh charges lane/level scan pages, then stable add/prune root deltas, and clears dirty state only after terminal probes. Tiered segment-catalog snapshots remain complete-inventory operations. |
+| `tsink-rollups` | Persistent storage (the rollup state directory is available) | 1 | 5 s; writes, deletes, and policy changes may unpark it sooner | `park` provides one coalescing wake token. One background pass visits one policy and one cursor-seeked metric-postings page bounded by maintenance item and modeled identity-byte ceilings. Every raw or existing-materialized source read inherits the instance query work/deadline limits, while a finite maintenance byte ceiling further tightens its memory, scan, result, and intermediate-vector envelope; an oversized source is rejected before append-sort allocation without truncating its checkpoint window. Internal output writes are chunked to finite write-batch limits. Downsample and row assembly still retain proportional cloned data outside the source query reservation. |
 
-Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and stop themselves when the engine begins shutdown. If `background_fail_fast = true` (default), a background worker panic sets `fail_fast_triggered` and causes subsequent writes to return an error.
+All periodic intervals are normalized to a 1 ms minimum before a thread starts, and idle loops use
+`park_timeout` rather than polling. `StorageObservabilitySnapshot::background` reports installed and
+running threads, the effective interval, notifications, idle waits, passes, exits, and shutdown
+joins. It also reports close attempts/results, coordination wait and timeout totals, compaction
+passes against the fixed 128-pass close ceiling, whole-close duration, and worker-join wait. The
+server exports the same state with fixed worker/event labels; metrics collection cannot create
+unbounded labels.
+
+The single persisted-refresh slot is the retention/tiering and remote-catalog concurrency bound; it
+is not three hidden threads. Remote tier payload reads occur synchronously on query callers. Their
+finite concurrency is therefore the configured shared query concurrency, exposed as
+`max_remote_tier_fetch_concurrency`; it remains `None` when queries are explicitly left unbounded.
+
+Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) before and after acquiring
+their outer maintenance gate. Close changes the lifecycle state, unparks every installed worker,
+enters the shared maintenance gate, drains writer permits, and preflights the compaction gate. Each
+of those coordination waits is capped by the configured write/lifecycle timeout. A timeout returns
+`LifecycleTimeout` and restores `STORAGE_OPEN`, so the caller can retry without discarding accepted
+WAL or in-memory state. Once the compaction preflight completes, `CLOSING` prevents the owned
+compaction worker from beginning another filesystem pass.
+
+Close then drains every accepted active head, publishes and verifies pending segments, runs the
+complete retention pass, settles compaction for at most 128 passes, refreshes dirty catalog state,
+and checkpoints tombstones and the series registry. Only a successful pipeline changes the state
+to `CLOSED`; worker handles are then joined in the fixed compaction → flush → persisted-refresh →
+rollup order before the process lease is released. A panic is returned with the worker name, but
+shutdown still joins the remaining handles instead of returning early.
+
+This is not a portable whole-call deadline. Once a durability stage has entered `write`, `fsync`,
+directory sync, atomic rename, or removal, Rust's blocking filesystem APIs cannot be safely
+preempted without abandoning an unknown durability outcome. Complete active/pending/catalog loops
+are finite snapshots after writers and maintenance are quiesced, but their duration scales with
+accepted state; close intentionally uses complete unknown-dirty reconciliation rather than the
+finite background cursor. Worker join
+normally has no pass left to execute after the gates drain, but thread scheduling and a blocked
+kernel filesystem call have no portable timeout. If `background_fail_fast = true` (default), a
+background execution error sets `fail_fast_triggered` and fences subsequent writes.
 
 ---
 
@@ -716,12 +792,14 @@ Key engine knobs and their defaults:
 | `partition_window`                      | 1 hour                  | Time-bucket width for active partition heads.                                          |
 | `max_active_partition_heads_per_series` | 8                       | Maximum concurrent open partitions per series.                                         |
 | `max_writers`                           | cgroup CPU count        | Write parallelism gate (`Semaphore` permits).                                          |
-| `write_timeout`                         | 30 s                    | Maximum wait time for a write permit.                                                  |
+| `write_timeout`                         | 30 s                    | Per-acquisition wait for writer admission and close coordination.                     |
 | `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Accounted storage-memory budget.                                                       |
 | `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                                                           |
 | `chunk_points`                          | 2048                    | Points per sealed chunk.                                                               |
 | `compaction_interval`                   | 5 s                     | Background compaction frequency.                                                       |
 | `flush_interval`                        | 250 ms                  | Background flush frequency.                                                            |
+| persisted-refresh poll interval         | 250 ms or remote minimum | Serialized local/remote catalog, retention, and tiering worker cadence.                 |
+| rollup interval                         | 5 s                     | Background rollup frequency.                                                           |
 | `background_fail_fast`                  | `true`                  | A background durability failure fences new writes.                                     |
 
 Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.

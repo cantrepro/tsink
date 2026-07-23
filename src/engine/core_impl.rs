@@ -56,22 +56,31 @@ impl ChunkStorage {
     where
         I: IntoIterator<Item = SeriesId>,
     {
+        let mut series = Vec::new();
+        self.append_metric_series_for_ids(series_ids, &mut series);
+        series
+    }
+
+    pub(super) fn append_metric_series_for_ids<I>(
+        &self,
+        series_ids: I,
+        series: &mut Vec<MetricSeries>,
+    ) where
+        I: IntoIterator<Item = SeriesId>,
+    {
         let registry = self.catalog.registry.read();
-        series_ids
-            .into_iter()
-            .filter_map(|series_id| {
-                registry
-                    .decode_series_key(series_id)
-                    .and_then(|series_key| {
-                        (!rollups::is_internal_rollup_metric(&series_key.metric)).then_some(
-                            MetricSeries {
-                                name: series_key.metric,
-                                labels: series_key.labels,
-                            },
-                        )
-                    })
-            })
-            .collect()
+        series.extend(series_ids.into_iter().filter_map(|series_id| {
+            registry
+                .decode_series_key(series_id)
+                .and_then(|series_key| {
+                    (!rollups::is_internal_rollup_metric(&series_key.metric)).then_some(
+                        MetricSeries {
+                            name: series_key.metric,
+                            labels: series_key.labels,
+                        },
+                    )
+                })
+        }));
     }
 
     pub(super) fn latest_visible_timestamp_for_series_locked(

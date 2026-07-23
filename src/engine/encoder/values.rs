@@ -329,6 +329,109 @@ pub(super) fn decode_values(
     }
 }
 
+fn modeled_blob_value_heap_bytes(tag: u8, bytes_len: usize) -> Result<usize> {
+    match tag {
+        5 | 6 => Ok(bytes_len),
+        7 => std::mem::size_of::<NativeHistogram>()
+            .checked_add(bytes_len)
+            .ok_or(TsinkError::WriteBatchSizeOverflow),
+        other => Err(TsinkError::DataCorruption(format!(
+            "unknown blob value tag {other}"
+        ))),
+    }
+}
+
+fn modeled_single_value_heap_bytes(payload: &[u8]) -> Result<(usize, usize)> {
+    let tag = *payload
+        .first()
+        .ok_or_else(|| TsinkError::DataCorruption("constant-rle payload is empty".to_string()))?;
+    let mut pos = 1usize;
+    let heap_bytes = match tag {
+        1..=3 => {
+            let _ = read_bytes(payload, &mut pos, 8)?;
+            0
+        }
+        4 => {
+            let _ = read_bytes(payload, &mut pos, 1)?;
+            0
+        }
+        5..=7 => {
+            let len = usize::try_from(decode_uvarint(payload, &mut pos)?)
+                .map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+            let _ = read_bytes(payload, &mut pos, len)?;
+            modeled_blob_value_heap_bytes(tag, len)?
+        }
+        other => {
+            return Err(TsinkError::DataCorruption(format!(
+                "unknown constant value tag {other}"
+            )))
+        }
+    };
+    Ok((heap_bytes, pos))
+}
+
+pub(super) fn modeled_decoded_value_heap_bytes(
+    codec: ValueCodecId,
+    lane: ValueLane,
+    payload: &[u8],
+    point_count: usize,
+) -> Result<usize> {
+    match codec {
+        ValueCodecId::ConstantRle => {
+            let (one_value_bytes, used) = modeled_single_value_heap_bytes(payload)?;
+            if used != payload.len() {
+                return Err(TsinkError::DataCorruption(
+                    "constant-rle payload has trailing bytes".to_string(),
+                ));
+            }
+            one_value_bytes
+                .checked_mul(point_count)
+                .ok_or(TsinkError::WriteBatchSizeOverflow)
+        }
+        ValueCodecId::BytesDeltaBlock => {
+            if lane != ValueLane::Blob {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: "blob lane".to_string(),
+                    actual: "numeric lane".to_string(),
+                });
+            }
+            let mut pos = 0usize;
+            let mut heap_bytes = 0usize;
+            for _ in 0..point_count {
+                let tag = *payload.get(pos).ok_or_else(|| {
+                    TsinkError::DataCorruption(
+                        "blob payload truncated while reading tag".to_string(),
+                    )
+                })?;
+                pos += 1;
+                let len = usize::try_from(decode_uvarint(payload, &mut pos)?)
+                    .map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+                let bytes = read_bytes(payload, &mut pos, len)?;
+                if tag == 6 {
+                    std::str::from_utf8(bytes).map_err(|err| {
+                        TsinkError::DataCorruption(format!(
+                            "blob string payload is not valid UTF-8: {err}"
+                        ))
+                    })?;
+                }
+                heap_bytes = heap_bytes
+                    .checked_add(modeled_blob_value_heap_bytes(tag, len)?)
+                    .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            }
+            if pos != payload.len() {
+                return Err(TsinkError::DataCorruption(
+                    "blob payload has trailing bytes".to_string(),
+                ));
+            }
+            Ok(heap_bytes)
+        }
+        ValueCodecId::GorillaXorF64
+        | ValueCodecId::ZigZagDeltaBitpackI64
+        | ValueCodecId::DeltaBitpackU64
+        | ValueCodecId::BoolBitpack => Ok(0),
+    }
+}
+
 pub(super) fn decode_values_in_index_range(
     codec: ValueCodecId,
     lane: ValueLane,
@@ -705,7 +808,9 @@ fn decode_values_blob_delta_block(
         })?;
         pos += 1;
 
-        let len = decode_uvarint(payload, &mut pos)? as usize;
+        let len = usize::try_from(decode_uvarint(payload, &mut pos)?).map_err(|_| {
+            TsinkError::DataCorruption("blob value length does not fit this platform".to_string())
+        })?;
         let bytes = read_bytes(payload, &mut pos, len)?;
 
         let value = match tag {
@@ -753,7 +858,9 @@ fn decode_values_blob_delta_block_range(
         })?;
         pos += 1;
 
-        let len = decode_uvarint(payload, &mut pos)? as usize;
+        let len = usize::try_from(decode_uvarint(payload, &mut pos)?).map_err(|_| {
+            TsinkError::DataCorruption("blob value length does not fit this platform".to_string())
+        })?;
         let bytes = read_bytes(payload, &mut pos, len)?;
 
         if idx < start_idx {
@@ -871,17 +978,29 @@ fn decode_single_value(bytes: &[u8]) -> Result<(Value, usize)> {
             Value::Bool(raw != 0)
         }
         5 => {
-            let len = decode_uvarint(bytes, &mut pos)? as usize;
+            let len = usize::try_from(decode_uvarint(bytes, &mut pos)?).map_err(|_| {
+                TsinkError::DataCorruption(
+                    "constant bytes length does not fit this platform".to_string(),
+                )
+            })?;
             let payload = read_bytes(bytes, &mut pos, len)?;
             Value::Bytes(payload.to_vec())
         }
         6 => {
-            let len = decode_uvarint(bytes, &mut pos)? as usize;
+            let len = usize::try_from(decode_uvarint(bytes, &mut pos)?).map_err(|_| {
+                TsinkError::DataCorruption(
+                    "constant string length does not fit this platform".to_string(),
+                )
+            })?;
             let payload = read_bytes(bytes, &mut pos, len)?;
             Value::String(String::from_utf8(payload.to_vec())?)
         }
         7 => {
-            let len = decode_uvarint(bytes, &mut pos)? as usize;
+            let len = usize::try_from(decode_uvarint(bytes, &mut pos)?).map_err(|_| {
+                TsinkError::DataCorruption(
+                    "constant histogram length does not fit this platform".to_string(),
+                )
+            })?;
             let payload = read_bytes(bytes, &mut pos, len)?;
             Value::from(decode_histogram_payload(payload)?)
         }
@@ -900,7 +1019,13 @@ fn encode_histogram_payload(histogram: &NativeHistogram) -> Result<Vec<u8>> {
 }
 
 fn decode_histogram_payload(bytes: &[u8]) -> Result<NativeHistogram> {
-    Ok(bincode::deserialize(bytes)?)
+    use bincode::Options;
+
+    Ok(bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .deserialize(bytes)?)
 }
 
 struct BitWriter {

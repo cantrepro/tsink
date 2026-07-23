@@ -22,6 +22,10 @@ impl ChunkStorage {
         mutate: impl FnOnce(&mut PersistedIndexState) -> R,
     ) -> R {
         let mut persisted_index = publication.persisted_index.write();
+        #[cfg(test)]
+        for _ in persisted_index.segments_by_root.keys() {
+            publication.inspect_persisted_index_accounting_entry();
+        }
         let before_included = if publication.accounting_enabled {
             Self::persisted_index_included_memory_usage_bytes(&persisted_index)
         } else {
@@ -33,6 +37,10 @@ impl ChunkStorage {
             0
         };
         let result = mutate(&mut persisted_index);
+        #[cfg(test)]
+        for _ in persisted_index.segments_by_root.keys() {
+            publication.inspect_persisted_index_accounting_entry();
+        }
         let account = |component: &std::sync::atomic::AtomicU64, before: usize, after: usize| {
             if !publication.accounting_enabled || before == after {
                 return;
@@ -65,6 +73,208 @@ impl ChunkStorage {
         result
     }
 
+    fn account_lifecycle_persisted_index_component(
+        publication: LifecyclePublicationContext<'_>,
+        component: &std::sync::atomic::AtomicU64,
+        before: usize,
+        after: usize,
+    ) {
+        if !publication.accounting_enabled || before == after {
+            return;
+        }
+        let delta = saturating_u64_from_usize(before.abs_diff(after));
+        let update = |counter: &std::sync::atomic::AtomicU64| {
+            if after >= before {
+                counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(delta))
+                })
+            } else {
+                counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(delta))
+                })
+            }
+        };
+        let _ = update(component);
+        let _ = update(publication.shared_used_bytes);
+        let _ = update(publication.used_bytes);
+    }
+
+    fn persisted_index_scoped_memory_usage_bytes(
+        index: &PersistedIndexState,
+        scope: &PersistedIndexAccountingScope,
+    ) -> (usize, usize) {
+        let mut included = Self::hash_map_memory_usage_bytes::<SeriesId, Vec<PersistedChunkRef>>(
+            &index.chunk_refs,
+        )
+        .saturating_add(Self::hash_map_memory_usage_bytes::<
+            u64,
+            std::sync::OnceLock<crate::engine::encoder::TimestampSearchIndex>,
+        >(&index.chunk_timestamp_indexes))
+        .saturating_add(Self::hash_map_memory_usage_bytes::<
+            usize,
+            Arc<crate::mmap::PlatformMmap>,
+        >(&index.segment_maps))
+        .saturating_add(Self::hash_map_memory_usage_bytes::<
+            usize,
+            PersistedSegmentTier,
+        >(&index.segment_tiers))
+        .saturating_add(index.merged_postings.scoped_memory_usage_bytes(
+            &scope.metrics,
+            &scope.label_names,
+            &scope.labels,
+        ))
+        .saturating_add(Self::bitmap_memory_usage_bytes(
+            &index.runtime_metadata_delta_series_ids,
+        ));
+
+        for series_id in &scope.series_ids {
+            if let Some(refs) = index.chunk_refs.get(series_id) {
+                included = included.saturating_add(
+                    refs.capacity()
+                        .saturating_mul(std::mem::size_of::<PersistedChunkRef>()),
+                );
+            }
+        }
+
+        let mut mmap = 0usize;
+        for root in &scope.roots {
+            let Some(state) = index.segments_by_root.get(root) else {
+                continue;
+            };
+            included = included.saturating_add(Self::persisted_segment_state_memory_usage_bytes(
+                root, state,
+            ));
+            if let Some(mapped) = index.segment_maps.get(&state.segment_slot) {
+                mmap = mmap.saturating_add(mapped.len());
+            }
+            for refs in state.chunk_refs_by_series.values() {
+                for chunk_ref in refs {
+                    if let Some(search_index) = index
+                        .chunk_timestamp_indexes
+                        .get(&chunk_ref.sequence)
+                        .and_then(std::sync::OnceLock::get)
+                    {
+                        included = included.saturating_add(search_index.memory_usage_bytes());
+                    }
+                }
+            }
+        }
+
+        (included, mmap)
+    }
+
+    fn with_lifecycle_persisted_index_scoped_publication<R>(
+        publication: LifecyclePublicationContext<'_>,
+        build_scope: impl FnOnce(&PersistedIndexState) -> Result<PersistedIndexAccountingScope>,
+        mutate: impl FnOnce(&mut PersistedIndexState) -> Result<R>,
+    ) -> Result<R> {
+        let mut persisted_index = publication.persisted_index.write();
+        let scope = build_scope(&persisted_index)?;
+        #[cfg(test)]
+        for _ in &scope.roots {
+            publication.inspect_persisted_index_accounting_entry();
+        }
+        let (before_included, before_mmap) = if publication.accounting_enabled {
+            Self::persisted_index_scoped_memory_usage_bytes(&persisted_index, &scope)
+        } else {
+            (0, 0)
+        };
+        let result = mutate(&mut persisted_index);
+        #[cfg(test)]
+        for _ in &scope.roots {
+            publication.inspect_persisted_index_accounting_entry();
+        }
+        if publication.accounting_enabled {
+            let (after_included, after_mmap) =
+                Self::persisted_index_scoped_memory_usage_bytes(&persisted_index, &scope);
+            Self::account_lifecycle_persisted_index_component(
+                publication,
+                publication.persisted_index_used_bytes,
+                before_included,
+                after_included,
+            );
+            Self::account_lifecycle_persisted_index_component(
+                publication,
+                publication.persisted_mmap_used_bytes,
+                before_mmap,
+                after_mmap,
+            );
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn set_persisted_index_accounting_inspect_hook<F>(
+        &self,
+        hook: F,
+    ) where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .persisted_index_accounting_inspect_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn clear_persisted_index_accounting_inspect_hook(&self) {
+        self.persist_test_hooks
+            .persisted_index_accounting_inspect_hook
+            .write()
+            .take();
+    }
+
+    fn loaded_segments_accounting_scope(
+        loaded_segments: &[IndexedSegment],
+        loaded_series: &[PersistedSeries],
+    ) -> PersistedIndexAccountingScope {
+        let mut scope = PersistedIndexAccountingScope::default();
+        for segment in loaded_segments {
+            scope.roots.insert(segment.root.clone());
+            scope.series_ids.extend(
+                segment
+                    .chunk_index
+                    .entries
+                    .iter()
+                    .map(|entry| entry.series_id),
+            );
+        }
+        for series in loaded_series {
+            scope.series_ids.insert(series.series_id);
+            scope.include_series_definition(&series.metric, &series.labels);
+        }
+        scope
+    }
+
+    fn removed_roots_accounting_scope(
+        publication: LifecyclePublicationContext<'_>,
+        persisted_index: &PersistedIndexState,
+        roots: &[PathBuf],
+    ) -> Result<PersistedIndexAccountingScope> {
+        let mut scope = PersistedIndexAccountingScope::default();
+        scope.roots.extend(roots.iter().cloned());
+        for root in roots {
+            if let Some(segment) = persisted_index.segments_by_root.get(root) {
+                scope
+                    .series_ids
+                    .extend(segment.chunk_refs_by_series.keys().copied());
+            }
+        }
+
+        let registry = publication.registry.read();
+        let series_ids = scope.series_ids.iter().copied().collect::<Vec<_>>();
+        for series_id in series_ids {
+            let Some(series_key) = registry.decode_series_key(series_id) else {
+                return Err(TsinkError::DataCorruption(format!(
+                    "persisted series id {} is missing from the runtime registry",
+                    series_id
+                )));
+            };
+            scope.include_series_definition(&series_key.metric, &series_key.labels);
+        }
+        Ok(scope)
+    }
+
     pub(super) fn apply_loaded_segments_state_update(
         &self,
         loaded_segments: Vec<IndexedSegment>,
@@ -72,8 +282,11 @@ impl ChunkStorage {
     ) -> Result<PersistedSegmentsStateUpdate> {
         let publication = self.lifecycle_publication_context();
         let metadata_delta = publication.runtime_metadata_delta;
-        let state_update = Self::with_lifecycle_persisted_index_publication(
+        let accounting_scope =
+            Self::loaded_segments_accounting_scope(&loaded_segments, loaded_series);
+        let state_update = Self::with_lifecycle_persisted_index_scoped_publication(
             publication,
+            |_| Ok(accounting_scope),
             move |persisted_index| -> Result<PersistedSegmentsStateUpdate> {
                 let mut state_update = PersistedSegmentsStateUpdate::default();
                 for segment in loaded_segments {
@@ -112,8 +325,11 @@ impl ChunkStorage {
     ) -> Result<PersistedSegmentRemovalStateUpdate> {
         let publication = self.lifecycle_publication_context();
         let metadata_delta = publication.runtime_metadata_delta;
-        let state_update = Self::with_lifecycle_persisted_index_publication(
+        let state_update = Self::with_lifecycle_persisted_index_scoped_publication(
             publication,
+            |persisted_index| {
+                Self::removed_roots_accounting_scope(publication, persisted_index, roots)
+            },
             |persisted_index| -> Result<PersistedSegmentRemovalStateUpdate> {
                 let mut affected_series = Vec::new();
                 let mut fully_removed_series = BTreeSet::new();

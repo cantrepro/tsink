@@ -169,7 +169,9 @@ Returns self-instrumentation counters and gauges in Prometheus text exposition f
 
 **Response:** `200 text/plain` — Prometheus text exposition.
 
-Key exported metric families include `tsink_memory_*`, `tsink_series_total`, `tsink_uptime_seconds`, `tsink_wal_*`, `tsink_compaction_*`, `tsink_cluster_*`, `tsink_ingest_*`, `tsink_query_*`, and `tsink_exemplar_*`.
+Key exported metric families include `tsink_memory_*`, `tsink_series_total`,
+`tsink_uptime_seconds`, `tsink_wal_*`, `tsink_compaction_*`, `tsink_cluster_*`,
+`tsink_ingest_*`, `tsink_query_*`, `tsink_query_budget_*`, and `tsink_exemplar_*`.
 
 ---
 
@@ -236,6 +238,27 @@ Range PromQL evaluation.
 ```
 
 **Error codes:** `400` invalid parameters, `413` per-tenant range-points quota exceeded.
+
+### PromQL query-budget errors
+
+Instant and range evaluation each use one core query execution, including selector prefetch,
+subqueries, evaluation steps, and final result accounting. If a configured core query limit is
+reached, the response remains a Prometheus-style error envelope and includes a stable
+`X-Tsink-Read-Error-Code` header:
+
+| HTTP status | `errorType` and `X-Tsink-Read-Error-Code` | Meaning |
+|---:|---|---|
+| 400 | `invalid_query_limits` | Invalid request-specific or backend query-limit configuration. |
+| 429 | `query_limit_concurrent_queries` | All configured core query permits are in use. |
+| 429 | `query_limit_shared_memory_bytes` | The shared modeled query-memory budget is in use. |
+| 413 | `query_limit_<reason>` | A non-retryable per-query work or memory limit was exceeded. |
+| 503 | `query_cancelled` header, `canceled` error type | Cooperative cancellation was observed. |
+| 503 | `query_deadline_exceeded` header, `timeout` error type | The effective query deadline expired. |
+
+The two 429 responses include `Retry-After: 1`. Stable non-retryable reason suffixes are
+`per_query_memory_bytes`, `series_matched`, `samples_scanned`, `samples_returned`,
+`returned_bytes`, `pattern_expansion`, `steps`, and `intermediate_vector_size`. Limit failures do
+not return truncated success data.
 
 ---
 
@@ -359,15 +382,34 @@ Returns exemplars for the series matched by a PromQL expression.
 
 ### `GET /api/v1/status/tsdb`
 
-Returns a comprehensive JSON status snapshot covering effective storage limits, memory usage, WAL
-state, compaction levels, cluster topology, admission guardrails, ingestion protocol status,
-exemplar store metrics, rules and rollup state, edge-sync state, and tenant policy.
+Returns a comprehensive JSON status snapshot covering effective storage and query limits, memory
+usage, WAL state, compaction levels, cluster topology, admission guardrails, ingestion protocol
+status, exemplar store metrics, rules and rollup state, edge-sync state, and tenant policy.
 
 `data.effectiveStorageLimits` reports the controls enforced by the built storage backend. Optional
 fields are JSON `null` when the built-in backend has no finite limit; when
 `reportedByBackend` is `false`, they are unknown. `writeTimeoutNanos` preserves the configured
 duration without millisecond rounding. These are storage-side controls, not a complete process
-memory, local-disk, or query envelope; see [Resource limits and profiles](resource-limits.md).
+memory or local-disk envelope; see [Resource limits and profiles](resource-limits.md).
+`data.queryBudget` separately reports the core query limits, active and peak query permits, current
+and peak modeled query memory, lifecycle totals, fixed-reason rejection totals, cancellations,
+deadlines, and accounting-invariant violations. A `null` query-limit field means no finite value is
+configured for that dimension. The server selects the finite `Server` profile by default; null
+profile dimensions require explicit `ExpertUnlimited` or a deliberate low-level override.
+The background fields report the fixed per-instance thread/concurrency bounds and effective
+cadences. `data.backgroundWork` reports the four worker slots' installed/running state, notifications,
+idle parks, passes, exits, and shutdown joins. `persistedRefresh` also owns retention/tiering and
+remote catalog refresh; those activities are not hidden extra threads.
+
+When cluster consensus is active, `data.cluster.control.persistence` reports `fenced`,
+`pendingCheckpoint` (`{index, term}` or `null`), `cleanupDebt`, `detail`, and `degraded`. A pending
+checkpoint implies `fenced: true`: the schema-v2 log is durably authoritative but its control-state
+mirror still needs repair. `degraded` is true when persistence is fenced or cleanup debt is
+present. A fence can also represent a consensus-required candidate or post-commit higher term still
+awaiting durable log publication; in that case `pendingCheckpoint` is `null` and `detail` describes
+the indeterminate publication. `cleanupDebt` without a fence means the log and mirror are both
+durable but grouped finalization, owned-temp cleanup, or accounting reconciliation remains to be
+retried; cleanup is attempted before any separate fence repair.
 
 **Authentication:** public scope, read permission.
 
@@ -500,7 +542,10 @@ cpu_usage,host=web-1 value=42.0 1700000000000000000
 
 Admin endpoints require `--admin-api-enabled` on the server. All admin requests require the admin bearer token (or a public token if no dedicated admin token is configured).
 
-Mutating admin operations are recorded to the cluster audit log with the actor identity derived from the `Authorization` header. The actor ID can be overridden by passing `x-tsink-actor-id`.
+After a mutating admin operation produces its response, the server attempts to record the outcome in
+the cluster audit log with the actor identity derived from the `Authorization` header. The actor ID
+can be overridden by passing `x-tsink-actor-id`. Audit persistence failure is logged but does not
+roll back or reclassify an operation that already completed.
 
 ---
 
@@ -526,7 +571,11 @@ Take a local data snapshot.
 
 #### `POST /api/v1/admin/restore`
 
-Restore a local data snapshot.
+Restore a local data snapshot. The server must be started with a paired
+`--offline-restore-root` and finite `--offline-restore-disk-limit`; otherwise this endpoint fails
+closed with `503 offline_restore_unconfigured`. The destination must be a strict descendant of
+that root and must not overlap the live data directory. Snapshot source/target overlap and static
+link-like entries are rejected by the core restore preflight.
 
 **Request (query params or JSON body):**
 
@@ -543,6 +592,12 @@ Restore a local data snapshot.
   "data": {"snapshotPath": "...", "dataPath": "..."}
 }
 ```
+
+A logical quota or filesystem-headroom rejection returns HTTP 413 with
+`write_disk_quota_exceeded` and the matching `X-Tsink-Write-Error-Code` header. Invalid targets or
+snapshots return HTTP 422; other failures whose publication outcome cannot be proven return HTTP
+503. Snapshot creation rejects destinations beneath the offline restore root so exports cannot
+consume its reserved capacity.
 
 ---
 
@@ -859,10 +914,22 @@ Return aggregated usage report for one or all tenants.
 | `tenant` | — | Tenant ID to filter. Omit for all tenants. |
 | `start` | — | Unix milliseconds start (optional). |
 | `end` | — | Unix milliseconds end (optional). |
-| `bucket` | — | Time bucket granularity (`none`, `hour`, `day`). |
+| `bucket` | `hour` | Time bucket granularity (`none`, `hour`, `day`). |
 | `reconcile` | `false` | If `true`, reconciles counters against storage before reporting. |
+| `limit` | `1000` | Maximum matching recent records aggregated in this page; server maximum defaults to `4096`. Applies to time-filtered, bucketed, or cursor-based reports. |
+| `afterSequence` | — | Exclusive sequence cursor returned as `page.nextAfterSequence`. |
+| `snapshotSequence` | current last sequence | Pins continuation pages to the first page's `page.snapshotSequence`. |
+| `maxBytes` | `4194304` | Requested encoded response ceiling, no larger than the configured server maximum. |
 
 **Response:** `200 application/json` — `{report, reconciliation, reconciledStorageSnapshots}`.
+`report.page` states the snapshot, earliest retained sequence, number of records aggregated,
+continuation cursor, whether all raw history remains retained, and whether the result used the exact all-time aggregate. An unfiltered
+`bucket=none` request uses exact all-time per-tenant aggregates. Time-filtered and bucketed reports
+operate on the bounded recent-record window and must follow `nextAfterSequence` with the same
+`snapshotSequence` while `hasMore` is true.
+When `reconcile=true` completes, the response carries
+`X-Tsink-Usage-Reconciliation: completed`, including a structured response-size rejection after
+the reconciliation itself completed.
 
 ---
 
@@ -870,9 +937,22 @@ Return aggregated usage report for one or all tenants.
 
 Stream raw per-request usage records as newline-delimited JSON.
 
-**Query parameters:** Same `tenant`, `start`, `end` as the report endpoint.
+**Query parameters:** `tenant`, `start`, and `end` have the same meaning as for reports. `limit`
+defaults to `1000` (configured maximum `4096`), `maxBytes` defaults to `4194304`, and
+`afterSequence`/`snapshotSequence` continue a stable page.
 
 **Response:** `200 application/x-ndjson` — one JSON record per line.
+
+Every response includes `X-Tsink-Usage-Snapshot-Sequence`,
+`X-Tsink-Usage-Earliest-Available-Sequence`, `X-Tsink-Usage-Records-Returned`, and
+`X-Tsink-Usage-Response-Bytes`, `X-Tsink-Usage-Raw-History-Complete`, and
+`X-Tsink-Usage-Has-More`. When more records match, it also includes
+`X-Tsink-Usage-Next-After-Sequence`; pass that value as `afterSequence` and preserve the snapshot
+header as `snapshotSequence`. New appends are excluded from that pinned traversal. A cursor older
+than the retained window returns structured HTTP 410 `usage_cursor_expired` rather than silently
+skipping records. Invalid record/byte limits return structured HTTP 400, a single record that cannot
+fit the requested byte page returns structured HTTP 413, and a report whose aggregate encoding
+exceeds its response limit returns structured HTTP 413 `usage_report_response_too_large`.
 
 ---
 
@@ -907,7 +987,37 @@ Download a bounded JSON diagnostic snapshot for a tenant. Includes status, usage
 
 ### Cluster management
 
-All cluster endpoints require an active cluster runtime (`--cluster-enabled`). Parameters can be supplied as query params or in a JSON request body using either `snake_case` or `camelCase` field names.
+All cluster endpoints require an active cluster runtime (`--cluster-enabled`), which in turn
+requires an explicit `--data-path`. Parameters can be supplied as query params or in a JSON request
+body using either `snake_case` or `camelCase` field names.
+
+Membership and handoff mutations can have five ordinary outcomes. A normal commit returns
+`result: "committed"`; a quorum that is not yet complete returns HTTP 202 with `result: "pending"`;
+and an authoritative log whose replacement and parent-directory sync succeeded but whose state
+mirror could not be published returns HTTP 200 with
+`result: "committed_checkpoint_pending"`, `degraded: true`, `committedLogIndex`, and
+`committedLogTerm`. If the complete pair is durable but finalization, owned-temp cleanup, or
+accounting reconciliation remains, HTTP 200 instead returns
+`result: "committed_cleanup_pending"` with the same committed position and `degraded: true`. If a
+post-commit notice reveals a higher term that cannot yet be persisted, HTTP 200 returns
+`result: "committed_persistence_pending"`, the committed position, and `degraded: true`; auto-join
+uses `accepted_persistence_pending`. All three degraded outcomes are already committed and must not
+be retried as ordinary rejections. Before consensus requires a candidate, a shared-disk quota,
+physical-headroom, or maintenance-reserve rejection returns HTTP 413 with
+`write_disk_quota_exceeded`. If quorum or a
+leader commit already makes that candidate required, a failure before durable log publication is
+instead fenced and returned as HTTP 503 `control_persistence_indeterminate`; it is not a definitive
+quota rejection. Both responses set `X-Tsink-Write-Error-Code` to the stable code. Internal control
+RPC JSON uses the same codes with `retryable: false`: 413 is reserved for definitive typed disk
+resource failures, while fenced or indeterminate persistence uses 503.
+
+The degraded HTTP 200 applies only when the requested mutation itself reached the durable-log
+checkpoint-pending, durable-pair cleanup-pending, or quorum-committed higher-term-persistence-
+pending boundary. The last outcome adopts the higher term in memory, fences leadership, and
+retries its required log-only publication. If leader establishment or repair leaves a pre-existing
+persistence fence and the requested mutation has not run, membership, handoff, DR, and auto-join
+surfaces return 503 `control_persistence_indeterminate`, not a generic conflict or a committed
+result.
 
 #### `POST /api/v1/admin/cluster/join`
 
@@ -926,6 +1036,9 @@ Remove a node from the cluster ring.
 **Parameters:** `node_id`
 
 **Response:** `200 application/json`.
+
+The current Active leader cannot remove itself through this endpoint. Transfer leadership to
+another Active voter first, then submit the former leader's leave through the new leader.
 
 ---
 
@@ -989,9 +1102,41 @@ Shard handoff is the mechanism for migrating a shard between nodes.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/admin/cluster/snapshot` | Coordinate a cluster-wide data snapshot. Parameter: `path`. |
-| `POST` | `/api/v1/admin/cluster/restore` | Coordinate a cluster-wide restore. Parameters: `snapshot_path`, `data_path`. |
+| `POST` | `/api/v1/admin/cluster/restore` | Coordinate a cluster-wide restore. Parameters: `snapshot_path`, `restore_root`, optional `report_path`, optional per-node `dataPaths`, and `force_local_leader` (default `false`). |
 | `POST` | `/api/v1/admin/cluster/control/snapshot` | Snapshot the Raft control-plane log. Parameter: `path`. |
-| `POST` | `/api/v1/admin/cluster/control/restore` | Restore the Raft control-plane log from snapshot. Parameters: `snapshot_path`, `data_path`. |
+| `POST` | `/api/v1/admin/cluster/control/restore` | Restore the Raft control-plane log from snapshot. Parameters: `snapshot_path` and `force_local_leader` (default `false`). |
+
+Cluster data restore uses only the capability-gated
+`POST /internal/v1/restore_data_budgeted` peer route. A peer without
+`budgeted_restore_v1` is rejected as `503 remote_restore_incompatible`; the coordinator never
+falls back to the legacy route. The legacy internal alias is retained for compatibility but also
+fails closed without the peer's configured offline envelope and uses the same budgeted core API.
+An HTTP 413 from a peer retains its stable error code and write-error header.
+
+`restore_root`, every local node target, and `report_path` must be strict descendants of the
+coordinator's offline restore root. Before the first node restore, the coordinator rejects a report
+path that overlaps the source manifest, a local snapshot source, or a local restored target. The
+report itself is written through the same finite coordinator. A report failure after data and
+control publication therefore returns HTTP 200 with `reportPending: true`, `degraded: true`, and a
+bounded `reportDetail`; it does not misclassify the already-committed restore as rejected.
+
+A control restore whose log replacement and parent-directory sync succeed but whose mirror repair
+remains pending still returns success with `checkpointPending: true`, `degraded: true`, and
+`checkpointDetail`. Cluster-wide restore uses `controlCheckpointPending`, `degraded`, and
+`controlCheckpointDetail`. Typed disk resource rejection before authoritative publication returns
+HTTP 413 with `write_disk_quota_exceeded`. If only post-publication finalization or cleanup remains,
+control restore returns `cleanupDebt: true` and `cleanupDetail`; cluster-wide restore uses
+`controlCleanupDebt` and `controlCleanupDetail`.
+
+Creating either snapshot returns HTTP 503 `control_persistence_indeterminate` while control
+authority is fenced, a durable candidate is pending, or a mirror checkpoint needs repair.
+Cleanup-only debt remains exportable because both persistent files already describe the same
+authoritative checkpoint.
+
+Control recovery snapshots carry `steppedDownTerm`; older bundles without the field decode it as
+zero. A normal restore merges the live and restored step-down floors.
+`force_local_leader=true` (or `forceLocalLeader`) explicitly clears that floor, advances the term,
+and assigns leadership to the local node, and should be used only for intentional recovery.
 
 ---
 
@@ -1026,12 +1171,12 @@ All control-plane mutation requests require a JSON body. Responses follow `{"sta
 | `403` | Token has insufficient scope. |
 | `404` | Path not found. |
 | `409` | Conflict (e.g. scheduler already running, duplicate provisioning). |
-| `413` | Request exceeds a configured quota (rows, queries, range points, histogram buckets). |
+| `413` | Request or definitive write admission exceeds a configured quota, including local-disk quota/headroom. |
 | `415` | Unsupported `Content-Type`. |
 | `422` | Semantically unsupported or policy-rejected data, including retention/future-skew bounds, or a disabled payload feature. |
 | `429` | Retryable admission pressure or write timeout. |
 | `500` | Internal server error. |
-| `503` | Required subsystem not configured or unavailable. |
+| `503` | Required subsystem unavailable, or cluster control persistence is fenced/indeterminate. |
 | `507` | A persistent queue or local storage resource could not accept more data. |
 
 On write and read admission errors the response also sets:

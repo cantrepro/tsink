@@ -1185,6 +1185,17 @@ impl DigestExchangeRuntime {
                                 outcome.active_jobs = 1;
                             }
                         }
+                        Ok(ProposeOutcome::CommittedCheckpointPending { detail, .. })
+                        | Ok(ProposeOutcome::CommittedCleanupPending { detail, .. })
+                        | Ok(ProposeOutcome::CommittedPersistencePending { detail, .. }) => {
+                            outcome.proposals_committed =
+                                outcome.proposals_committed.saturating_add(1);
+                            if description == "begin_shard_handoff" {
+                                outcome.jobs_advanced = outcome.jobs_advanced.saturating_add(1);
+                                outcome.active_jobs = 1;
+                            }
+                            outcome.last_error = Some(detail);
+                        }
                         Ok(ProposeOutcome::Pending {
                             required,
                             acknowledged,
@@ -1333,6 +1344,16 @@ impl DigestExchangeRuntime {
                     if completes_job {
                         outcome.jobs_completed = outcome.jobs_completed.saturating_add(1);
                     }
+                }
+                Ok(ProposeOutcome::CommittedCheckpointPending { detail, .. })
+                | Ok(ProposeOutcome::CommittedCleanupPending { detail, .. })
+                | Ok(ProposeOutcome::CommittedPersistencePending { detail, .. }) => {
+                    outcome.proposals_committed = outcome.proposals_committed.saturating_add(1);
+                    outcome.jobs_advanced = outcome.jobs_advanced.saturating_add(1);
+                    if completes_job {
+                        outcome.jobs_completed = outcome.jobs_completed.saturating_add(1);
+                    }
+                    outcome.last_error = Some(detail);
                 }
                 Ok(ProposeOutcome::Pending {
                     required,

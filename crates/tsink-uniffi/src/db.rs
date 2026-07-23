@@ -9,8 +9,9 @@ use crate::query::{UQueryOptions, USeriesSelection};
 use crate::types::{
     UBatchWriteResult, UDataPoint, UDeleteSeriesResult, UEffectiveStorageLimits, ULabel,
     ULabeledDataPoints, UMetadataShardScope, UMetricSeries, UQueryRowsPage, UQueryRowsScanOptions,
-    URollupObservabilitySnapshot, URollupPolicy, URow, USeriesPoints, UShardWindowDigest,
-    UShardWindowRowsPage, UShardWindowScanOptions, UStorageObservabilitySnapshot, UWriteResult,
+    UResourceConfigurationSnapshot, URollupObservabilitySnapshot, URollupPolicy, URow,
+    USeriesPoints, UShardWindowDigest, UShardWindowRowsPage, UShardWindowScanOptions,
+    UStorageObservabilitySnapshot, UWriteResult,
 };
 
 #[derive(uniffi::Object)]
@@ -223,6 +224,10 @@ impl TsinkDB {
 
     pub fn effective_storage_limits(&self) -> UEffectiveStorageLimits {
         self.storage.effective_storage_limits().into()
+    }
+
+    pub fn resource_configuration_snapshot(&self) -> UResourceConfigurationSnapshot {
+        self.storage.resource_configuration_snapshot().into()
     }
 
     pub fn observability_snapshot(&self) -> UStorageObservabilitySnapshot {

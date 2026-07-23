@@ -19,6 +19,7 @@ pub mod label;
 pub(crate) mod mmap;
 pub mod promql;
 pub(crate) mod query_aggregation;
+pub mod query_budget;
 pub(crate) mod query_matcher;
 pub(crate) mod query_selection;
 pub mod storage;
@@ -27,24 +28,40 @@ pub mod value;
 pub mod wal;
 
 pub use disk_budget::{
-    DiskCategory, DiskCategoryUsage, LocalDiskBudget, LocalDiskBudgetSnapshot, LocalDiskLimits,
+    with_staged_file_replacements, DiskCategory, DiskCategoryUsage, LocalDiskBudget,
+    LocalDiskBudgetSnapshot, LocalDiskLimits, ManagedFileReplacement,
+    StagedManagedFileReplacements,
 };
 pub(crate) use disk_budget::{DiskReservation, DiskReservationKind};
 pub use error::{Result, TsinkError};
-pub use label::Label;
-pub use r#async::{AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder};
+pub use label::{
+    Label, DEFAULT_MAX_LABELS_PER_SERIES, DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+    MAX_SUPPORTED_LABELS_PER_SERIES,
+};
+pub use query_budget::{
+    QueryBudget, QueryBudgetConfigError, QueryBudgetError, QueryBudgetLimits, QueryBudgetSnapshot,
+    QueryCancellationToken, QueryExecution, QueryExecutionSnapshot, QueryLimitExceeded,
+    QueryLimitReason, QueryMemoryReservation, QueryWorkLimits,
+};
+pub use r#async::{AsyncRuntimeOptions, AsyncRuntimeSnapshot, AsyncStorage, AsyncStorageBuilder};
+pub use storage::modeled_write_batch_input_bytes;
 pub use storage::{
-    Aggregation, BatchWriteResult, CompactionObservabilitySnapshot, DeleteSeriesResult,
+    Aggregation, AsyncResourceLimits, BackgroundResourceLimits,
+    BackgroundWorkObservabilitySnapshot, BackgroundWorkerObservabilitySnapshot, BatchWriteResult,
+    CardinalityObservabilitySnapshot, CompactionObservabilitySnapshot, DeleteSeriesResult,
     DownsampleOptions, EffectiveStorageLimits, FlushObservabilitySnapshot,
     MemoryObservabilitySnapshot, MemoryPressureLevel, MemoryPressureSnapshot, MetadataShardScope,
     MetricSeries, QueryObservabilitySnapshot, QueryOptions, QueryRowsPage, QueryRowsScanOptions,
-    RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot, RetentionObservabilitySnapshot,
-    RollupObservabilitySnapshot, RollupPolicy, RollupPolicyStatus, RowWriteOutcome, RowWriteStatus,
-    SeriesMatcher, SeriesMatcherOp, SeriesPoints, SeriesSelection, ShardWindowDigest,
-    ShardWindowRowsPage, ShardWindowScanOptions, Storage, StorageBuilder,
-    StorageObservabilitySnapshot, StorageRuntimeMode, TimestampPrecision, WalObservabilitySnapshot,
-    WriteAcknowledgement, WriteMode, WriteRejection, WriteRejectionCategory, WriteResult,
-    DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES, MAX_WRITE_REJECTION_MESSAGE_BYTES,
+    RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot, ResolvedResourceLimits,
+    ResourceConfigurationSnapshot, ResourceLimitOverride, ResourceLimits, ResourceProfile,
+    ResourceProfileName, RetentionObservabilitySnapshot, RollupObservabilitySnapshot, RollupPolicy,
+    RollupPolicyStatus, RowWriteOutcome, RowWriteStatus, SeriesMatcher, SeriesMatcherOp,
+    SeriesPoints, SeriesSelection, ShardWindowDigest, ShardWindowRowsPage, ShardWindowScanOptions,
+    Storage, StorageBuilder, StorageObservabilitySnapshot, StorageRuntimeMode, TimestampPrecision,
+    WalObservabilitySnapshot, WriteAcknowledgement, WriteBatchLimits, WriteMode, WriteRejection,
+    WriteRejectionCategory, WriteResult, DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+    MAX_SNAPSHOT_RESTORE_DEPTH, MAX_SNAPSHOT_RESTORE_ENTRIES, MAX_WRITE_REJECTION_MESSAGE_BYTES,
+    RESOURCE_CONFIGURATION_SCHEMA_VERSION, SNAPSHOT_RESTORE_ENTRY_STAGING_ALLOWANCE_FLOOR_BYTES,
 };
 pub use value::{
     Aggregator, BytesAggregation, Codec, CodecAggregator, HistogramBucketSpan, HistogramCount,

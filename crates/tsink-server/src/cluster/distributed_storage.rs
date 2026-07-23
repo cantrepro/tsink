@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tsink::{
-    DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryOptions,
-    Result as TsinkResult, Row, SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage,
-    StorageObservabilitySnapshot, TsinkError,
+    DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryBudget,
+    QueryExecution, QueryOptions, Result as TsinkResult, Row, SeriesMatcher, SeriesMatcherOp,
+    SeriesSelection, Storage, StorageObservabilitySnapshot, TsinkError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +269,10 @@ impl DistributedStorageAdapter {
 }
 
 impl Storage for DistributedStorageAdapter {
+    fn query_budget(&self) -> Option<QueryBudget> {
+        self.local_storage.query_budget()
+    }
+
     fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
         self.local_storage.insert_rows(rows)
     }
@@ -313,6 +317,18 @@ impl Storage for DistributedStorageAdapter {
         )?;
 
         Ok(points)
+    }
+
+    fn select_with_execution(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<DataPoint>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.select(metric, labels, start, end)
     }
 
     fn select_with_options(
@@ -382,6 +398,17 @@ impl Storage for DistributedStorageAdapter {
         Ok(out)
     }
 
+    fn select_all_with_execution(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.select_all(metric, start, end)
+    }
+
     fn list_metrics(&self) -> TsinkResult<Vec<MetricSeries>> {
         self.list_metrics_distributed()
     }
@@ -414,6 +441,15 @@ impl Storage for DistributedStorageAdapter {
         Ok(series)
     }
 
+    fn select_series_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.select_series(selection)
+    }
+
     fn delete_series(&self, selection: &SeriesSelection) -> TsinkResult<DeleteSeriesResult> {
         let result = self.local_storage.delete_series(selection)?;
         self.invalidate_cache()?;
@@ -430,6 +466,10 @@ impl Storage for DistributedStorageAdapter {
 
     fn effective_storage_limits(&self) -> EffectiveStorageLimits {
         self.local_storage.effective_storage_limits()
+    }
+
+    fn resource_configuration_snapshot(&self) -> tsink::ResourceConfigurationSnapshot {
+        self.local_storage.resource_configuration_snapshot()
     }
 
     fn observability_snapshot(&self) -> StorageObservabilitySnapshot {

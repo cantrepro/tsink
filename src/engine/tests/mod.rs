@@ -69,10 +69,14 @@ mod ingest_failures;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
+mod query_budget;
 mod reliability;
+mod resource_profiles;
 mod retention_policy;
+mod rollup_write_batching;
 mod rollups;
 mod series_selection;
+mod write_transient_memory;
 
 pub(crate) fn assert_engine_memory_usage_reconciled(storage: &ChunkStorage) {
     if !storage.memory.accounting_enabled {
@@ -108,7 +112,23 @@ pub(crate) fn assert_engine_memory_usage_reconciled(storage: &ChunkStorage) {
     );
     assert_eq!(incremental.tombstone_bytes, reconciled.tombstone_bytes);
     assert_eq!(
+        incremental.wal_series_definition_cache_bytes,
+        reconciled.wal_series_definition_cache_bytes
+    );
+    assert_eq!(
         incremental.excluded_persisted_mmap_bytes,
         reconciled.excluded_persisted_mmap_bytes
     );
+}
+
+/// Raw `ChunkStorage` fixtures bypass the builder bootstrap that acquires and installs the
+/// shared object-store writer lease. Read-write tiering tests must install the same production
+/// fence explicitly; compute-only fixtures intentionally do not call this helper.
+pub(super) fn install_shared_object_store_writer_lock_for_test(
+    storage: &ChunkStorage,
+    object_store_root: &Path,
+) {
+    let writer_lock = super::process_lock::SharedObjectStoreProcessLock::acquire(object_store_root)
+        .expect("test fixture should acquire the shared object-store writer lease");
+    storage.install_shared_object_store_process_lock(writer_lock);
 }

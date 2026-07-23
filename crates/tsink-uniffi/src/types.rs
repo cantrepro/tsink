@@ -161,19 +161,86 @@ pub struct UDeleteSeriesResult {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct UWriteBatchLimits {
+    #[uniffi(default)]
+    pub max_rows: Option<u64>,
+    #[uniffi(default)]
+    pub max_modeled_input_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct UEffectiveStorageLimits {
     pub reported_by_backend: bool,
     pub persistent: bool,
     pub wal_enabled: bool,
     pub accounted_memory_bytes: Option<u64>,
     pub cardinality: Option<u64>,
+    pub max_labels_per_series: Option<u64>,
+    pub max_series_identity_bytes: Option<u64>,
+    pub max_new_series_per_window: Option<u64>,
+    pub new_series_window_nanos: Option<u64>,
+    #[uniffi(default)]
+    pub max_write_batch_rows: Option<u64>,
+    #[uniffi(default)]
+    pub max_write_batch_input_bytes: Option<u64>,
     pub wal_bytes: Option<u64>,
+    #[uniffi(default)]
+    pub wal_write_buffer_bytes: Option<u64>,
     pub local_disk_bytes: Option<u64>,
     pub filesystem_free_headroom_bytes: Option<u64>,
     pub maintenance_temp_reserve_bytes: Option<u64>,
     pub max_concurrent_writers: Option<u64>,
     pub write_timeout_nanos: Option<u64>,
+    pub max_background_threads: Option<u64>,
+    pub max_flush_concurrency: Option<u64>,
+    pub max_compaction_concurrency: Option<u64>,
+    pub max_retention_tiering_concurrency: Option<u64>,
+    pub max_remote_catalog_refresh_concurrency: Option<u64>,
+    pub max_remote_tier_fetch_concurrency: Option<u64>,
+    pub max_rollup_concurrency: Option<u64>,
+    pub flush_interval_nanos: Option<u64>,
+    pub compaction_interval_nanos: Option<u64>,
+    pub persisted_refresh_poll_interval_nanos: Option<u64>,
+    pub rollup_interval_nanos: Option<u64>,
     pub max_active_partition_heads_per_series: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UAsyncResourceLimits {
+    pub queue_command_capacity: u64,
+    pub write_queue_byte_capacity: u64,
+    pub read_queue_byte_capacity: u64,
+    pub read_workers: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UResolvedResourceLimits {
+    pub storage: UEffectiveStorageLimits,
+    pub query: UQueryBudgetLimits,
+    pub async_runtime: Option<UAsyncResourceLimits>,
+    pub maintenance_max_items_per_pass: Option<u64>,
+    pub maintenance_max_bytes_per_pass: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UResourceConfigurationSnapshot {
+    pub schema_version: u32,
+    pub reported_by_backend: bool,
+    pub selected_profile: crate::enums::UResourceProfileName,
+    /// Stable snake-case low-level override names.
+    pub overrides: Vec<String>,
+    pub resolved_limits: UResolvedResourceLimits,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UCardinalityObservabilitySnapshot {
+    pub series_count: u64,
+    pub pending_new_series: u64,
+    pub committed_in_window: u64,
+    pub current_window_start: Option<i64>,
+    pub admitted_new_series_total: u64,
+    pub committed_new_series_total: u64,
+    pub creation_rate_rejections_total: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -229,6 +296,18 @@ pub struct UMemoryObservabilitySnapshot {
     pub persisted_index_bytes: u64,
     pub persisted_mmap_bytes: u64,
     pub tombstone_bytes: u64,
+    #[uniffi(default)]
+    pub wal_series_definition_cache_bytes: u64,
+    #[uniffi(default)]
+    pub write_transient_bytes: u64,
+    #[uniffi(default)]
+    pub peak_write_transient_bytes: u64,
+    #[uniffi(default)]
+    pub write_transient_reservations_total: u64,
+    #[uniffi(default)]
+    pub write_transient_rejections_total: u64,
+    #[uniffi(default)]
+    pub write_transient_bytes_estimated: bool,
     pub excluded_persisted_mmap_bytes: u64,
     pub pressure: UMemoryPressureSnapshot,
 }
@@ -238,6 +317,8 @@ pub struct UWalObservabilitySnapshot {
     pub enabled: bool,
     pub sync_mode: String,
     pub acknowledged_writes_durable: bool,
+    #[uniffi(default)]
+    pub write_buffer_capacity_bytes: u64,
     pub size_bytes: u64,
     pub segment_count: u64,
     pub active_segment: u64,
@@ -290,6 +371,10 @@ pub struct UFlushObservabilitySnapshot {
     pub persist_success_total: u64,
     pub persist_noop_total: u64,
     pub persist_errors_total: u64,
+    pub persist_inspected_chunks_total: u64,
+    pub persist_selected_input_bytes_total: u64,
+    pub persist_item_limit_hits_total: u64,
+    pub persist_byte_limit_hits_total: u64,
     pub persisted_series_total: u64,
     pub persisted_chunks_total: u64,
     pub persisted_points_total: u64,
@@ -357,6 +442,51 @@ pub struct UQueryObservabilitySnapshot {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct UQueryWorkLimits {
+    pub max_series_matched: Option<u64>,
+    pub max_samples_scanned: Option<u64>,
+    pub max_samples_returned: Option<u64>,
+    pub max_returned_bytes: Option<u64>,
+    pub max_pattern_expansion: Option<u64>,
+    pub max_steps: Option<u64>,
+    pub max_intermediate_vector_size: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_wall_time_nanos: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UQueryBudgetLimits {
+    pub max_concurrent_queries: Option<u64>,
+    pub max_shared_memory_bytes: Option<u64>,
+    pub per_query: UQueryWorkLimits,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UQueryBudgetSnapshot {
+    pub limits: UQueryBudgetLimits,
+    pub active_queries: u64,
+    pub peak_active_queries: u64,
+    pub shared_reserved_memory_bytes: u64,
+    pub peak_shared_reserved_memory_bytes: u64,
+    pub queries_started_total: u64,
+    pub queries_completed_total: u64,
+    pub limit_rejections_total: u64,
+    pub concurrency_rejections_total: u64,
+    pub shared_memory_rejections_total: u64,
+    pub per_query_memory_rejections_total: u64,
+    pub series_matched_rejections_total: u64,
+    pub samples_scanned_rejections_total: u64,
+    pub samples_returned_rejections_total: u64,
+    pub returned_bytes_rejections_total: u64,
+    pub pattern_expansion_rejections_total: u64,
+    pub steps_rejections_total: u64,
+    pub intermediate_vector_size_rejections_total: u64,
+    pub cancellations_total: u64,
+    pub deadline_exceeded_total: u64,
+    pub accounting_invariant_violations_total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct URemoteStorageObservabilitySnapshot {
     pub enabled: bool,
     pub runtime_mode: UStorageRuntimeMode,
@@ -372,6 +502,41 @@ pub struct URemoteStorageObservabilitySnapshot {
     pub next_refresh_retry_unix_ms: Option<u64>,
     pub backoff_active: bool,
     pub last_refresh_error: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UBackgroundWorkerObservabilitySnapshot {
+    pub installed: bool,
+    pub running: bool,
+    pub interval_nanos: Option<u64>,
+    pub max_concurrency: u64,
+    pub starts_total: u64,
+    pub exits_total: u64,
+    pub notifications_total: u64,
+    pub idle_waits_total: u64,
+    pub passes_started_total: u64,
+    pub passes_completed_total: u64,
+    pub shutdown_joins_total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UBackgroundWorkObservabilitySnapshot {
+    pub max_threads: u64,
+    pub installed_threads: u64,
+    pub running_threads: u64,
+    pub close_attempts_total: u64,
+    pub close_success_total: u64,
+    pub close_errors_total: u64,
+    pub close_coordination_wait_nanos_total: u64,
+    pub close_coordination_timeouts_total: u64,
+    pub close_compaction_passes_total: u64,
+    pub close_compaction_pass_limit: u64,
+    pub close_duration_nanos_total: u64,
+    pub shutdown_join_wait_nanos_total: u64,
+    pub flush: UBackgroundWorkerObservabilitySnapshot,
+    pub compaction: UBackgroundWorkerObservabilitySnapshot,
+    pub persisted_refresh: UBackgroundWorkerObservabilitySnapshot,
+    pub rollup: UBackgroundWorkerObservabilitySnapshot,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -402,6 +567,7 @@ pub struct URollupPolicyStatus {
     pub materialized_series: u64,
     pub materialized_through: Option<i64>,
     pub lag: Option<i64>,
+    pub source_traversal_complete: bool,
     pub last_run_started_at_ms: Option<u64>,
     pub last_run_completed_at_ms: Option<u64>,
     pub last_run_duration_nanos: u64,
@@ -417,20 +583,27 @@ pub struct URollupObservabilitySnapshot {
     pub buckets_materialized_total: u64,
     pub points_materialized_total: u64,
     pub last_run_duration_nanos: u64,
+    pub source_traversal_complete: bool,
+    pub continuation_policy_id: Option<String>,
+    pub continuation_after_series_id: Option<u64>,
     pub policies: Vec<URollupPolicyStatus>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UStorageObservabilitySnapshot {
     pub limits: UEffectiveStorageLimits,
+    pub resource_configuration: UResourceConfigurationSnapshot,
     pub local_disk: Option<ULocalDiskBudgetSnapshot>,
     pub memory: UMemoryObservabilitySnapshot,
+    pub cardinality: UCardinalityObservabilitySnapshot,
     pub wal: UWalObservabilitySnapshot,
     pub retention: URetentionObservabilitySnapshot,
     pub flush: UFlushObservabilitySnapshot,
     pub compaction: UCompactionObservabilitySnapshot,
     pub query: UQueryObservabilitySnapshot,
+    pub query_budget: UQueryBudgetSnapshot,
     pub rollups: URollupObservabilitySnapshot,
     pub remote: URemoteStorageObservabilitySnapshot,
+    pub background: UBackgroundWorkObservabilitySnapshot,
     pub health: UStorageHealthSnapshot,
 }

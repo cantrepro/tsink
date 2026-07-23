@@ -5,7 +5,9 @@ use super::{
     RoaringTreemap, RollupQueryCandidate, RwLock, RwLockReadGuard, SeriesId, SeriesRegistry,
     TieredQueryPlan, VisibilityCacheReadContext,
 };
+use crate::QueryExecution;
 
+#[allow(clippy::too_many_arguments)]
 trait SeriesQueryReadOps {
     fn select_into_impl(
         &self,
@@ -15,6 +17,8 @@ trait SeriesQueryReadOps {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats>;
 
     fn select_raw_series_page_with_plan(
@@ -25,6 +29,8 @@ trait SeriesQueryReadOps {
         end: i64,
         plan: TieredQueryPlan,
         pagination: RawSeriesPagination,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage>;
 
     fn collect_points_for_series_into_with_plan(
@@ -34,6 +40,8 @@ trait SeriesQueryReadOps {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats>;
 
     fn collect_points_for_series_with_plan(
@@ -42,6 +50,8 @@ trait SeriesQueryReadOps {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<(Vec<DataPoint>, PersistedTierFetchStats)>;
 
     fn collect_raw_series_page_with_plan(
@@ -52,6 +62,8 @@ trait SeriesQueryReadOps {
         plan: TieredQueryPlan,
         offset: u64,
         limit: Option<usize>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage>;
 
     fn rollup_query_candidate(
@@ -130,6 +142,7 @@ impl<'a> SeriesQueryContext<'a> {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn select_into(
         self,
         metric: &str,
@@ -138,11 +151,22 @@ impl<'a> SeriesQueryContext<'a> {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats> {
-        self.ops
-            .select_into_impl(metric, labels, start, end, plan, out)
+        self.ops.select_into_impl(
+            metric,
+            labels,
+            start,
+            end,
+            plan,
+            out,
+            execution,
+            enforce_return_limit,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn select_raw_series_page(
         self,
         metric: &str,
@@ -151,11 +175,22 @@ impl<'a> SeriesQueryContext<'a> {
         end: i64,
         plan: TieredQueryPlan,
         pagination: RawSeriesPagination,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage> {
-        self.ops
-            .select_raw_series_page_with_plan(metric, labels, start, end, plan, pagination)
+        self.ops.select_raw_series_page_with_plan(
+            metric,
+            labels,
+            start,
+            end,
+            plan,
+            pagination,
+            execution,
+            enforce_return_limit,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn collect_points_for_series_into(
         self,
         series_id: SeriesId,
@@ -163,9 +198,18 @@ impl<'a> SeriesQueryContext<'a> {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats> {
-        self.ops
-            .collect_points_for_series_into_with_plan(series_id, start, end, plan, out)
+        self.ops.collect_points_for_series_into_with_plan(
+            series_id,
+            start,
+            end,
+            plan,
+            out,
+            execution,
+            enforce_return_limit,
+        )
     }
 
     pub(super) fn collect_points_for_series(
@@ -174,11 +218,20 @@ impl<'a> SeriesQueryContext<'a> {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<(Vec<DataPoint>, PersistedTierFetchStats)> {
-        self.ops
-            .collect_points_for_series_with_plan(series_id, start, end, plan)
+        self.ops.collect_points_for_series_with_plan(
+            series_id,
+            start,
+            end,
+            plan,
+            execution,
+            enforce_return_limit,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn collect_raw_series_page(
         self,
         series_id: SeriesId,
@@ -187,9 +240,19 @@ impl<'a> SeriesQueryContext<'a> {
         plan: TieredQueryPlan,
         offset: u64,
         limit: Option<usize>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage> {
-        self.ops
-            .collect_raw_series_page_with_plan(series_id, start, end, plan, offset, limit)
+        self.ops.collect_raw_series_page_with_plan(
+            series_id,
+            start,
+            end,
+            plan,
+            offset,
+            limit,
+            execution,
+            enforce_return_limit,
+        )
     }
 
     pub(super) fn rollup_query_candidate(
@@ -279,6 +342,7 @@ impl ChunkStorage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 impl SeriesQueryReadOps for ChunkStorage {
     fn select_into_impl(
         &self,
@@ -288,8 +352,20 @@ impl SeriesQueryReadOps for ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats> {
-        ChunkStorage::select_into_impl(self, metric, labels, start, end, plan, out)
+        ChunkStorage::select_into_impl(
+            self,
+            metric,
+            labels,
+            start,
+            end,
+            plan,
+            out,
+            execution,
+            enforce_return_limit,
+        )
     }
 
     fn select_raw_series_page_with_plan(
@@ -300,9 +376,19 @@ impl SeriesQueryReadOps for ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
         pagination: RawSeriesPagination,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage> {
         ChunkStorage::select_raw_series_page_with_plan(
-            self, metric, labels, start, end, plan, pagination,
+            self,
+            metric,
+            labels,
+            start,
+            end,
+            plan,
+            pagination,
+            execution,
+            enforce_return_limit,
         )
     }
 
@@ -313,9 +399,18 @@ impl SeriesQueryReadOps for ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
         out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<PersistedTierFetchStats> {
         ChunkStorage::collect_points_for_series_into_with_plan(
-            self, series_id, start, end, plan, out,
+            self,
+            series_id,
+            start,
+            end,
+            plan,
+            out,
+            execution,
+            enforce_return_limit,
         )
     }
 
@@ -325,8 +420,18 @@ impl SeriesQueryReadOps for ChunkStorage {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<(Vec<DataPoint>, PersistedTierFetchStats)> {
-        ChunkStorage::collect_points_for_series_with_plan(self, series_id, start, end, plan)
+        ChunkStorage::collect_points_for_series_with_plan(
+            self,
+            series_id,
+            start,
+            end,
+            plan,
+            execution,
+            enforce_return_limit,
+        )
     }
 
     fn collect_raw_series_page_with_plan(
@@ -337,9 +442,19 @@ impl SeriesQueryReadOps for ChunkStorage {
         plan: TieredQueryPlan,
         offset: u64,
         limit: Option<usize>,
+        execution: Option<&QueryExecution>,
+        enforce_return_limit: bool,
     ) -> Result<RawSeriesScanPage> {
         ChunkStorage::collect_raw_series_page_with_plan(
-            self, series_id, start, end, plan, offset, limit,
+            self,
+            series_id,
+            start,
+            end,
+            plan,
+            offset,
+            limit,
+            execution,
+            enforce_return_limit,
         )
     }
 

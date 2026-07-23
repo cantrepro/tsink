@@ -8,6 +8,21 @@ pub const MAX_LABEL_NAME_LEN: usize = 256;
 
 pub const MAX_LABEL_VALUE_LEN: usize = 16 * 1024;
 
+/// Default maximum number of labels accepted in a submitted series identity.
+///
+/// This is an ingest-safety limit, not the on-disk format maximum. Hosts may tighten it with
+/// [`crate::StorageBuilder::with_max_labels_per_series`].
+pub const DEFAULT_MAX_LABELS_PER_SERIES: usize = 128;
+
+/// Default maximum cumulative UTF-8 bytes in a submitted series identity.
+///
+/// The calculation includes the metric name and every label name and value. Hosts may tighten it
+/// with [`crate::StorageBuilder::with_max_series_identity_bytes`].
+pub const DEFAULT_MAX_SERIES_IDENTITY_BYTES: usize = 64 * 1024;
+
+/// Maximum label count representable by the WAL and persisted segment formats.
+pub const MAX_SUPPORTED_LABELS_PER_SERIES: usize = u16::MAX as usize;
+
 /// Maximum metric-name length that can be marshaled losslessly by the current binary format.
 pub const MAX_METRIC_NAME_LEN: usize = u16::MAX as usize;
 

@@ -285,6 +285,32 @@ impl SeriesRegistry {
         Some(SeriesKey { metric, labels })
     }
 
+    /// Returns `(metric_bytes, label_count, label_text_bytes)` for a decoded series identity
+    /// without allocating the decoded `String`/`Label` values.
+    ///
+    /// Query admission uses this read-only shape to reserve and charge identity materialization
+    /// before [`Self::decode_series_key`] performs any heap allocation.
+    pub(crate) fn decoded_series_key_shape(
+        &self,
+        series_id: SeriesId,
+    ) -> Option<(usize, usize, usize)> {
+        let shard_idx = self.load_series_registry_shard_idx(series_id)?;
+        let shard = self.series_shards[shard_idx].read();
+        let definition = shard.by_id.get(&series_id)?;
+        let metric_dict = self.metric_dict.read();
+        let label_name_dict = self.label_name_dict.read();
+        let label_value_dict = self.label_value_dict.read();
+
+        let metric_bytes = metric_dict.get_value(definition.metric_id)?.len();
+        let mut label_text_bytes = 0usize;
+        for pair in &definition.label_pairs {
+            label_text_bytes = label_text_bytes
+                .saturating_add(label_name_dict.get_value(pair.name_id)?.len())
+                .saturating_add(label_value_dict.get_value(pair.value_id)?.len());
+        }
+        Some((metric_bytes, definition.label_pairs.len(), label_text_bytes))
+    }
+
     pub fn series_metric(&self, series_id: SeriesId) -> Option<String> {
         let definition = self.get_by_id(series_id)?;
         self.metric_dict

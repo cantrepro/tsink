@@ -1,12 +1,536 @@
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufWriter, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{Result, TsinkError};
 
 static STAGE_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Recovery-owned namespace scans must complete within a fixed work envelope before callers
+/// delete any discovered entry. Count every directory entry, including unknown names, so an
+/// attacker cannot hide unbounded work behind lookalikes that the caller later ignores.
+pub(crate) const MAX_RECOVERY_NAMESPACE_ENTRIES: usize = 16_384;
+pub(crate) const MAX_RECOVERY_NAMESPACE_DEPTH: u32 = 128;
+
+/// One entry counter shared across every directory participating in a recovery scan.
+///
+/// Callers that inspect several sibling directories must reuse the same value so the configured
+/// ceiling is global rather than silently resetting for each directory.
+#[derive(Debug)]
+pub(crate) struct RecoveryNamespaceBudget {
+    max_entries: usize,
+    observed_entries: usize,
+}
+
+impl RecoveryNamespaceBudget {
+    pub(crate) fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            observed_entries: 0,
+        }
+    }
+
+    pub(crate) fn collect_directory_entries(
+        &mut self,
+        directory: &Path,
+        operation: &str,
+    ) -> Result<Vec<std::fs::DirEntry>> {
+        let remaining = self.max_entries.saturating_sub(self.observed_entries);
+        let mut entries = Vec::new();
+        entries.try_reserve(remaining.min(1024)).map_err(|_| {
+            TsinkError::Other(format!(
+                "unable to allocate bounded directory scan for {operation}: {}",
+                directory.display()
+            ))
+        })?;
+        for entry in std::fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+            if self.observed_entries == self.max_entries {
+                return Err(TsinkError::DataCorruption(format!(
+                    "{operation} exceeds its {}-entry global work bound: {}",
+                    self.max_entries,
+                    directory.display()
+                )));
+            }
+            entries.push(entry.map_err(|source| TsinkError::IoWithPath {
+                path: directory.to_path_buf(),
+                source,
+            })?);
+            self.observed_entries = self.observed_entries.checked_add(1).ok_or_else(|| {
+                TsinkError::Other(format!(
+                    "{operation} namespace entry counter overflow at {}",
+                    directory.display()
+                ))
+            })?;
+        }
+        Ok(entries)
+    }
+
+    /// Charges one streamed entry without retaining the directory's remaining siblings.
+    pub(crate) fn observe_entry(&mut self, directory: &Path, operation: &str) -> Result<()> {
+        if self.observed_entries == self.max_entries {
+            return Err(TsinkError::DataCorruption(format!(
+                "{operation} exceeds its {}-entry global work bound: {}",
+                self.max_entries,
+                directory.display()
+            )));
+        }
+        self.observed_entries = self.observed_entries.checked_add(1).ok_or_else(|| {
+            TsinkError::Other(format!(
+                "{operation} namespace entry counter overflow at {}",
+                directory.display()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn collect_directory_entries_bounded(
+    directory: &Path,
+    max_entries: usize,
+    operation: &str,
+) -> Result<Vec<std::fs::DirEntry>> {
+    RecoveryNamespaceBudget::new(max_entries).collect_directory_entries(directory, operation)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedRemovalKind {
+    Directory,
+    FileLike,
+}
+
+#[derive(Debug)]
+struct PlannedRemovalEntry {
+    path: PathBuf,
+    kind: PlannedRemovalKind,
+}
+
+/// An exact, bounded, no-follow deletion plan for recovery-owned directory trees.
+///
+/// Execution never enumerates a directory again and never calls recursive removal. A descendant
+/// injected after planning therefore makes a final `remove_dir` fail with `DirectoryNotEmpty`
+/// instead of expanding the cleanup work beyond the admitted envelope.
+#[derive(Debug)]
+pub(crate) struct RecursiveNamespaceRemovalPlan {
+    entries: Vec<PlannedRemovalEntry>,
+    root_count: usize,
+}
+
+impl RecursiveNamespaceRemovalPlan {
+    pub(crate) fn include_file_like_roots_with_admission<F>(
+        mut self,
+        roots: &[PathBuf],
+        base_retained_bytes: usize,
+        mut admit: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
+        let retained_paths = self.entries.iter().try_fold(0usize, |total, entry| {
+            total.checked_add(entry.path.capacity()).ok_or_else(|| {
+                TsinkError::Other(
+                    "bounded recovery deletion-plan path accounting overflow".to_string(),
+                )
+            })
+        })?;
+        let prospective_capacity =
+            self.entries.len().checked_add(roots.len()).ok_or_else(|| {
+                TsinkError::Other("bounded recovery deletion-plan length overflow".to_string())
+            })?;
+        let root_path_bytes = roots.iter().try_fold(0usize, |total, root| {
+            total.checked_add(root.capacity()).ok_or_else(|| {
+                TsinkError::Other("bounded recovery file-root path accounting overflow".to_string())
+            })
+        })?;
+        let prospective = base_retained_bytes
+            .checked_add(
+                prospective_capacity
+                    .checked_mul(std::mem::size_of::<PlannedRemovalEntry>())
+                    .ok_or_else(|| {
+                        TsinkError::Other(
+                            "bounded recovery deletion-plan capacity overflow".to_string(),
+                        )
+                    })?,
+            )
+            .and_then(|bytes| bytes.checked_add(retained_paths))
+            .and_then(|bytes| bytes.checked_add(root_path_bytes))
+            .ok_or_else(|| {
+                TsinkError::Other("bounded recovery deletion-plan memory overflow".to_string())
+            })?;
+        admit(prospective)?;
+        self.entries.try_reserve(roots.len()).map_err(|_| {
+            TsinkError::Other(
+                "unable to extend bounded recovery namespace deletion plan".to_string(),
+            )
+        })?;
+        for root in roots {
+            let metadata =
+                std::fs::symlink_metadata(root).map_err(|source| TsinkError::IoWithPath {
+                    path: root.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata) {
+                return Err(TsinkError::DataCorruption(format!(
+                    "planned recovery file-like root changed into a directory: {}",
+                    root.display()
+                )));
+            }
+            self.entries.push(PlannedRemovalEntry {
+                path: root.clone(),
+                kind: PlannedRemovalKind::FileLike,
+            });
+        }
+        self.root_count = self.root_count.checked_add(roots.len()).ok_or_else(|| {
+            TsinkError::Other("bounded recovery root counter overflow".to_string())
+        })?;
+        let actual = base_retained_bytes
+            .checked_add(
+                self.entries
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<PlannedRemovalEntry>())
+                    .ok_or_else(|| {
+                        TsinkError::Other(
+                            "bounded recovery deletion-plan capacity overflow".to_string(),
+                        )
+                    })?,
+            )
+            .and_then(|bytes| {
+                self.entries
+                    .iter()
+                    .try_fold(bytes, |total, entry| {
+                        total.checked_add(entry.path.capacity()).ok_or(())
+                    })
+                    .ok()
+            })
+            .ok_or_else(|| {
+                TsinkError::Other("bounded recovery deletion-plan memory overflow".to_string())
+            })?;
+        admit(actual)?;
+        Ok(self)
+    }
+
+    pub(crate) fn remove(mut self) -> Result<usize> {
+        self.entries.sort_unstable_by(|left, right| {
+            right
+                .path
+                .components()
+                .count()
+                .cmp(&left.path.components().count())
+                .then_with(|| right.path.cmp(&left.path))
+        });
+        for entry in self.entries {
+            let metadata = match std::fs::symlink_metadata(&entry.path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(TsinkError::IoWithPath {
+                        path: entry.path,
+                        source,
+                    });
+                }
+            };
+            let is_plain_directory =
+                metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata);
+            match entry.kind {
+                PlannedRemovalKind::Directory if !is_plain_directory => {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "planned recovery directory changed type before removal: {}",
+                        entry.path.display()
+                    )));
+                }
+                PlannedRemovalKind::FileLike if is_plain_directory => {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "planned recovery file-like entry changed into a directory before removal: {}",
+                        entry.path.display()
+                    )));
+                }
+                PlannedRemovalKind::Directory => {
+                    remove_empty_dir_if_exists(&entry.path).map_err(|source| {
+                        TsinkError::IoWithPath {
+                            path: entry.path,
+                            source,
+                        }
+                    })?;
+                }
+                PlannedRemovalKind::FileLike => {
+                    remove_file_if_exists(&entry.path).map_err(|source| {
+                        TsinkError::IoWithPath {
+                            path: entry.path,
+                            source,
+                        }
+                    })?;
+                }
+            }
+        }
+        Ok(self.root_count)
+    }
+}
+
+/// Validates all descendants of recovery-owned directory roots within one global work envelope.
+///
+/// The roots themselves are not charged because callers have already counted them while scanning
+/// their parent namespace. Every descendant is charged, including non-UTF-8 names, links, and
+/// special entries. Link-like entries are never traversed. This is a preflight for recursive
+/// removal: callers must validate every candidate root in one call before deleting the first one.
+/// Builds one exact recursive deletion plan using a shared global namespace counter and a caller
+/// supplied memory admission function. Directory enumeration is depth-first and streaming, so
+/// unrelated siblings never accumulate in a `Vec<DirEntry>` or pending-path stack.
+#[cfg(test)]
+fn validate_recursive_namespace_bounded(
+    roots: &[PathBuf],
+    max_entries: usize,
+    max_depth: u32,
+    operation: &str,
+) -> Result<RecursiveNamespaceRemovalPlan> {
+    let mut entry_budget = RecoveryNamespaceBudget::new(max_entries);
+    validate_recursive_namespace_with_admission(
+        roots,
+        &mut entry_budget,
+        max_depth,
+        operation,
+        0,
+        |_| Ok(()),
+    )
+}
+
+pub(crate) fn validate_recursive_namespace_with_admission<F>(
+    roots: &[PathBuf],
+    entry_budget: &mut RecoveryNamespaceBudget,
+    max_depth: u32,
+    operation: &str,
+    base_retained_bytes: usize,
+    mut admit: F,
+) -> Result<RecursiveNamespaceRemovalPlan>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    let mut builder = RecursiveNamespacePlanBuilder {
+        entries: Vec::new(),
+        retained_path_bytes: 0,
+        base_retained_bytes,
+        operation,
+        admit: &mut admit,
+    };
+    builder.admit_current(0)?;
+    for root in roots {
+        let metadata =
+            std::fs::symlink_metadata(root).map_err(|source| TsinkError::IoWithPath {
+                path: root.clone(),
+                source,
+            })?;
+        if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+            return Err(TsinkError::DataCorruption(format!(
+                "{operation} root is link-like or not a directory: {}",
+                root.display()
+            )));
+        }
+        collect_recursive_namespace_streaming(
+            root,
+            0,
+            0,
+            max_depth,
+            operation,
+            entry_budget,
+            &mut builder,
+        )?;
+        builder.push(root.clone(), PlannedRemovalKind::Directory, 0)?;
+    }
+    Ok(RecursiveNamespaceRemovalPlan {
+        entries: builder.entries,
+        root_count: roots.len(),
+    })
+}
+
+struct RecursiveNamespacePlanBuilder<'a, F> {
+    entries: Vec<PlannedRemovalEntry>,
+    retained_path_bytes: usize,
+    base_retained_bytes: usize,
+    operation: &'a str,
+    admit: &'a mut F,
+}
+
+impl<F> RecursiveNamespacePlanBuilder<'_, F>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    fn required_bytes(&self, traversal_bytes: usize) -> Result<usize> {
+        self.base_retained_bytes
+            .checked_add(
+                self.entries
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<PlannedRemovalEntry>())
+                    .ok_or_else(|| {
+                        TsinkError::Other(format!(
+                            "{0} deletion-plan vector capacity overflow",
+                            self.operation
+                        ))
+                    })?,
+            )
+            .and_then(|bytes| bytes.checked_add(self.retained_path_bytes))
+            .and_then(|bytes| bytes.checked_add(traversal_bytes))
+            .ok_or_else(|| TsinkError::Other(format!("{} memory model overflow", self.operation)))
+    }
+
+    fn admit_current(&mut self, traversal_bytes: usize) -> Result<()> {
+        let required = self.required_bytes(traversal_bytes)?;
+        (self.admit)(required)
+    }
+
+    fn push(
+        &mut self,
+        path: PathBuf,
+        kind: PlannedRemovalKind,
+        traversal_bytes: usize,
+    ) -> Result<()> {
+        let path_bytes = path.capacity();
+        let prospective_capacity = if self.entries.len() == self.entries.capacity() {
+            self.entries.len().checked_add(1).ok_or_else(|| {
+                TsinkError::Other(format!("{} plan length overflow", self.operation))
+            })?
+        } else {
+            self.entries.capacity()
+        };
+        let prospective = self
+            .base_retained_bytes
+            .checked_add(
+                prospective_capacity
+                    .checked_mul(std::mem::size_of::<PlannedRemovalEntry>())
+                    .ok_or_else(|| {
+                        TsinkError::Other(format!("{} plan capacity overflow", self.operation))
+                    })?,
+            )
+            .and_then(|bytes| bytes.checked_add(self.retained_path_bytes))
+            .and_then(|bytes| bytes.checked_add(path_bytes))
+            .and_then(|bytes| bytes.checked_add(traversal_bytes))
+            .ok_or_else(|| {
+                TsinkError::Other(format!("{} memory model overflow", self.operation))
+            })?;
+        (self.admit)(prospective)?;
+        if self.entries.len() == self.entries.capacity() {
+            self.entries.try_reserve_exact(1).map_err(|_| {
+                TsinkError::Other(format!(
+                    "unable to allocate recursive namespace deletion plan for {}",
+                    self.operation
+                ))
+            })?;
+        }
+        self.retained_path_bytes = self
+            .retained_path_bytes
+            .checked_add(path_bytes)
+            .ok_or_else(|| {
+                TsinkError::Other(format!("{} retained path overflow", self.operation))
+            })?;
+        self.entries.push(PlannedRemovalEntry { path, kind });
+        self.admit_current(traversal_bytes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_recursive_namespace_streaming<F>(
+    directory: &Path,
+    depth: u32,
+    traversal_path_bytes: usize,
+    max_depth: u32,
+    operation: &str,
+    entry_budget: &mut RecoveryNamespaceBudget,
+    builder: &mut RecursiveNamespacePlanBuilder<'_, F>,
+) -> Result<()>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    if depth > max_depth {
+        return Err(TsinkError::DataCorruption(format!(
+            "{operation} exceeds its {max_depth}-level recursive depth bound: {}",
+            directory.display()
+        )));
+    }
+    let traversal_frames = usize::try_from(depth)
+        .unwrap_or(usize::MAX)
+        .checked_add(1)
+        .and_then(|frames| {
+            frames.checked_mul(
+                std::mem::size_of::<std::fs::ReadDir>() + 2 * std::mem::size_of::<usize>(),
+            )
+        })
+        .ok_or_else(|| TsinkError::Other(format!("{operation} frame model overflow")))?;
+    builder.admit_current(
+        traversal_path_bytes
+            .checked_add(traversal_frames)
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?,
+    )?;
+    let entries = std::fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        entry_budget.observe_entry(directory, operation)?;
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let component_bytes = name.as_encoded_bytes().len();
+        let anticipated_path_bytes = directory
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .checked_add(component_bytes)
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| TsinkError::Other(format!("{operation} path size overflow")))?;
+        let transient = traversal_path_bytes
+            .checked_add(traversal_frames)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::fs::DirEntry>()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::ffi::OsString>()))
+            .and_then(|bytes| bytes.checked_add(component_bytes))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PathBuf>()))
+            .and_then(|bytes| bytes.checked_add(anticipated_path_bytes))
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
+        builder.admit_current(transient)?;
+        let path = directory.join(&name);
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+                path: path.clone(),
+                source,
+            })?;
+        let is_plain_directory =
+            metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata);
+        if is_plain_directory {
+            let child_depth = depth.checked_add(1).ok_or_else(|| {
+                TsinkError::Other(format!(
+                    "{operation} recursive depth counter overflow at {}",
+                    path.display()
+                ))
+            })?;
+            if child_depth > max_depth {
+                return Err(TsinkError::DataCorruption(format!(
+                    "{operation} exceeds its {max_depth}-level recursive depth bound: {}",
+                    path.display()
+                )));
+            }
+            let child_traversal = traversal_path_bytes
+                .checked_add(std::mem::size_of::<PathBuf>())
+                .and_then(|bytes| bytes.checked_add(path.capacity()))
+                .ok_or_else(|| TsinkError::Other(format!("{operation} traversal path overflow")))?;
+            collect_recursive_namespace_streaming(
+                &path,
+                child_depth,
+                child_traversal,
+                max_depth,
+                operation,
+                entry_budget,
+                builder,
+            )?;
+            builder.push(path, PlannedRemovalKind::Directory, traversal_path_bytes)?;
+        } else {
+            builder.push(path, PlannedRemovalKind::FileLike, traversal_path_bytes)?;
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 type DirectorySyncHook = dyn Fn(&Path) -> Result<()> + Send + Sync + 'static;
@@ -21,7 +545,7 @@ pub(crate) struct DirectorySyncHookGuard {
 }
 
 #[cfg(test)]
-struct TmpWriteFailureHookGuard {
+pub(crate) struct TmpWriteFailureHookGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -136,7 +660,7 @@ where
 }
 
 #[cfg(test)]
-fn fail_tmp_write_after_bytes_once(
+pub(crate) fn fail_tmp_write_after_bytes_once(
     target: PathBuf,
     bytes_before_failure: usize,
     kind: std::io::ErrorKind,
@@ -176,12 +700,114 @@ fn fail_tmp_write_after_bytes_once(
     TmpWriteFailureHookGuard { _lock: lock }
 }
 
+#[cfg(test)]
+pub(crate) fn panic_tmp_write_after_bytes_once(
+    target: PathBuf,
+    bytes_before_panic: usize,
+    message: impl Into<String>,
+) -> TmpWriteFailureHookGuard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let lock = tmp_write_failure_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let panicked = Arc::new(AtomicBool::new(false));
+    let message = message.into();
+    let target_parent = target.parent().map(Path::to_path_buf);
+    let target_prefix = target
+        .file_name()
+        .map(|name| format!(".{}.tmp-", name.to_string_lossy()));
+    *tmp_write_failure_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::new(
+        move |candidate: &Path, file: &mut std::fs::File, bytes: &[u8]| {
+            let matches_target = candidate.parent().map(Path::to_path_buf) == target_parent
+                && candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .zip(target_prefix.as_deref())
+                    .is_some_and(|(name, prefix)| name.starts_with(prefix));
+            if !matches_target || panicked.swap(true, Ordering::SeqCst) {
+                return None;
+            }
+            let prefix_len = bytes_before_panic.min(bytes.len());
+            file.write_all(&bytes[..prefix_len])
+                .expect("injected temporary-write panic prefix must be writable");
+            panic!("{message}");
+        },
+    ));
+    TmpWriteFailureHookGuard { _lock: lock }
+}
+
 pub(crate) fn path_exists_no_follow(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    let is_symlink = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        is_symlink || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        is_symlink
+    }
+}
+
+/// Returns whether two paths overlap after resolving every existing component.
+///
+/// Missing suffixes are retained lexically after their nearest existing ancestor. This catches
+/// aliases through intermediate symlinks while still supporting a restore target that does not
+/// exist yet.
+pub(crate) fn paths_overlap_resolved(left: &Path, right: &Path) -> Result<bool> {
+    let left = resolve_path_allow_missing(left)?;
+    let right = resolve_path_allow_missing(right)?;
+    Ok(left.starts_with(&right) || right.starts_with(&left))
+}
+
+fn resolve_path_allow_missing(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(TsinkError::Io)?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::canonicalize(&resolved) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(TsinkError::IoWithPath {
+                            path: resolved,
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(windows)]
@@ -221,6 +847,16 @@ fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+fn remove_empty_dir_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_windows_fs_operation(|| std::fs::remove_dir(path))
+}
+
+#[cfg(not(windows))]
+fn remove_empty_dir_with_retry(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(path)
+}
+
+#[cfg(windows)]
 fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
     retry_windows_fs_operation(|| std::fs::remove_file(path))
 }
@@ -240,8 +876,27 @@ fn rename_path_with_retry(source: &Path, destination: &Path) -> std::io::Result<
     std::fs::rename(source, destination)
 }
 
+/// Renames one path without synchronizing either parent directory.
+///
+/// Callers that need to distinguish publication from a later durability error use this before an
+/// explicit parent sync. Most callers should prefer [`rename_and_sync_parents`].
+pub(crate) fn rename_path(source: &Path, destination: &Path) -> Result<()> {
+    rename_path_with_retry(source, destination).map_err(|source_err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: source_err,
+    })
+}
+
 pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
     match remove_dir_all_with_retry(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn remove_empty_dir_if_exists(path: &Path) -> std::io::Result<bool> {
+    match remove_empty_dir_with_retry(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -357,8 +1012,19 @@ pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    copy_dir_recursive_at_depth(source, destination, 0)
+}
+
+fn copy_dir_recursive_at_depth(source: &Path, destination: &Path, depth: u32) -> Result<()> {
+    if depth > crate::MAX_SNAPSHOT_RESTORE_DEPTH {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot restore directory depth {depth} exceeds limit {} at {}",
+            crate::MAX_SNAPSHOT_RESTORE_DEPTH,
+            source.display()
+        )));
+    }
     let metadata = std::fs::symlink_metadata(source)?;
-    if !metadata.is_dir() {
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
         return Err(TsinkError::InvalidConfiguration(format!(
             "expected directory while copying {}, found non-directory",
             source.display()
@@ -368,12 +1034,24 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
     std::fs::create_dir_all(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
-        let entry_type = entry.file_type()?;
         let entry_source = entry.path();
         let entry_destination = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&entry_source)?;
+        if is_link_or_reparse_point(&metadata) {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "unsupported link-like entry while copying snapshot: {}",
+                entry_source.display()
+            )));
+        }
+        let entry_type = metadata.file_type();
 
         if entry_type.is_dir() {
-            copy_dir_recursive(&entry_source, &entry_destination)?;
+            let child_depth = depth.checked_add(1).ok_or_else(|| {
+                TsinkError::Other(
+                    "snapshot restore directory depth exceeds the supported range".to_string(),
+                )
+            })?;
+            copy_dir_recursive_at_depth(&entry_source, &entry_destination, child_depth)?;
         } else if entry_type.is_file() {
             std::fs::copy(&entry_source, &entry_destination)?;
         } else {
@@ -390,7 +1068,7 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) => {
-            if !metadata.is_dir() {
+            if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
                 return Err(TsinkError::InvalidConfiguration(format!(
                     "snapshot source is not a directory: {}",
                     source.display()
@@ -403,34 +1081,347 @@ pub(crate) fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()
     }
 }
 
-pub(crate) fn copy_dir_contents(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
-    if !metadata.is_dir() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoreDirectoryMeasurement {
+    pub(crate) logical_bytes: u64,
+    pub(crate) entry_count: u64,
+    pub(crate) max_directory_depth: u32,
+}
+
+impl RestoreDirectoryMeasurement {
+    pub(crate) fn staging_admission_bytes(self, entry_allowance_bytes: u64) -> Result<u64> {
+        let entry_allowance = self
+            .entry_count
+            .checked_mul(entry_allowance_bytes)
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "snapshot restore entry staging allowance exceeds the supported byte range"
+                        .to_string(),
+                )
+            })?;
+        self.logical_bytes
+            .checked_add(entry_allowance)
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "snapshot restore staging admission exceeds the supported byte range"
+                        .to_string(),
+                )
+            })
+    }
+}
+
+/// Measures the finite logical-byte and entry-count bounds for a trusted restore tree.
+///
+/// The root directory counts as one entry. Static symlink, Windows reparse-point, and special-entry
+/// checks run before destination mutation, but the caller must keep the source immutable because
+/// portable path traversal cannot prevent a concurrent namespace swap after this check.
+pub(crate) fn measure_restore_directory(source: &Path) -> Result<RestoreDirectoryMeasurement> {
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|source_err| TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
         return Err(TsinkError::InvalidConfiguration(format!(
-            "snapshot path is not a directory: {}",
+            "snapshot path is not a plain directory: {}",
             source.display()
         )));
     }
 
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let entry_type = entry.file_type()?;
+    let mut measurement = RestoreDirectoryMeasurement {
+        logical_bytes: 0,
+        entry_count: 1,
+        max_directory_depth: 0,
+    };
+    let mut pending = vec![(source.to_path_buf(), 0u32)];
+    while let Some((directory, directory_depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|source_err| TsinkError::IoWithPath {
+            path: directory.clone(),
+            source: source_err,
+        })? {
+            let entry = entry.map_err(|source_err| TsinkError::IoWithPath {
+                path: directory.clone(),
+                source: source_err,
+            })?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|source_err| TsinkError::IoWithPath {
+                    path: path.clone(),
+                    source: source_err,
+                })?;
+            if is_link_or_reparse_point(&metadata) {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "unsupported link-like entry while measuring snapshot: {}",
+                    path.display()
+                )));
+            }
+            measurement.entry_count = measurement.entry_count.checked_add(1).ok_or_else(|| {
+                TsinkError::Other(
+                    "snapshot restore entry count exceeds the supported range".to_string(),
+                )
+            })?;
+            if measurement.entry_count > crate::MAX_SNAPSHOT_RESTORE_ENTRIES {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "snapshot restore entry count {} exceeds limit {} at {}",
+                    measurement.entry_count,
+                    crate::MAX_SNAPSHOT_RESTORE_ENTRIES,
+                    path.display()
+                )));
+            }
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                let child_depth = directory_depth.checked_add(1).ok_or_else(|| {
+                    TsinkError::Other(
+                        "snapshot restore directory depth exceeds the supported range".to_string(),
+                    )
+                })?;
+                if child_depth > crate::MAX_SNAPSHOT_RESTORE_DEPTH {
+                    return Err(TsinkError::InvalidConfiguration(format!(
+                        "snapshot restore directory depth {child_depth} exceeds limit {} at {}",
+                        crate::MAX_SNAPSHOT_RESTORE_DEPTH,
+                        path.display()
+                    )));
+                }
+                measurement.max_directory_depth = measurement.max_directory_depth.max(child_depth);
+                pending.push((path, child_depth));
+            } else if file_type.is_file() {
+                measurement.logical_bytes = measurement
+                    .logical_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| {
+                    TsinkError::Other(format!(
+                        "snapshot byte count exceeds the supported range while measuring {}",
+                        path.display()
+                    ))
+                })?;
+            } else {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "unsupported non-file entry while measuring snapshot: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(measurement)
+}
+
+/// Copies a trusted directory tree within already-admitted logical-byte and entry-count ceilings.
+///
+/// Every directory and regular file consumes exactly one measured entry. A regular file is copied
+/// through a length-limited reader, so source growth can fail the operation but cannot write beyond
+/// the measured logical-byte ceiling. Static link-like checks are repeated, but callers must still
+/// keep the source immutable to exclude namespace-swap races.
+pub(crate) fn copy_dir_contents_bounded(
+    source: &Path,
+    destination: &Path,
+    expected: RestoreDirectoryMeasurement,
+) -> Result<()> {
+    let mut remaining_bytes = expected.logical_bytes;
+    let mut remaining_entries = expected.entry_count;
+    let mut observed_max_directory_depth = 0u32;
+    copy_dir_contents_bounded_inner(
+        source,
+        destination,
+        &mut remaining_bytes,
+        &mut remaining_entries,
+        0,
+        expected.max_directory_depth,
+        &mut observed_max_directory_depth,
+    )?;
+    if remaining_bytes != 0
+        || remaining_entries != 0
+        || observed_max_directory_depth != expected.max_directory_depth
+    {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot changed after admission: remaining_bytes={remaining_bytes}, remaining_entries={remaining_entries}, measured_max_depth={}, observed_max_depth={observed_max_directory_depth}",
+            expected.max_directory_depth
+        )));
+    }
+    Ok(())
+}
+
+fn copy_dir_contents_bounded_inner(
+    source: &Path,
+    destination: &Path,
+    remaining_bytes: &mut u64,
+    remaining_entries: &mut u64,
+    directory_depth: u32,
+    admitted_max_directory_depth: u32,
+    observed_max_directory_depth: &mut u32,
+) -> Result<()> {
+    if directory_depth > crate::MAX_SNAPSHOT_RESTORE_DEPTH
+        || directory_depth > admitted_max_directory_depth
+    {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot directory depth {directory_depth} exceeds its admitted bound {admitted_max_directory_depth} at {}",
+            source.display()
+        )));
+    }
+    *observed_max_directory_depth = (*observed_max_directory_depth).max(directory_depth);
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|source_err| TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot directory changed into a link-like or non-directory entry: {}",
+            source.display()
+        )));
+    }
+    consume_restore_entry(remaining_entries, source)?;
+    std::fs::create_dir_all(destination).map_err(|source_err| TsinkError::IoWithPath {
+        path: destination.to_path_buf(),
+        source: source_err,
+    })?;
+
+    for entry in std::fs::read_dir(source).map_err(|source_err| TsinkError::IoWithPath {
+        path: source.to_path_buf(),
+        source: source_err,
+    })? {
+        let entry = entry.map_err(|source_err| TsinkError::IoWithPath {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
         let entry_source = entry.path();
         let entry_destination = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&entry_source).map_err(|source_err| {
+            TsinkError::IoWithPath {
+                path: entry_source.clone(),
+                source: source_err,
+            }
+        })?;
+        if is_link_or_reparse_point(&metadata) {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "unsupported link-like entry while restoring snapshot: {}",
+                entry_source.display()
+            )));
+        }
+        let file_type = metadata.file_type();
 
-        if entry_type.is_dir() {
-            copy_dir_recursive(&entry_source, &entry_destination)?;
-        } else if entry_type.is_file() {
-            std::fs::copy(&entry_source, &entry_destination)?;
-        } else {
+        if file_type.is_dir() {
+            let child_depth = directory_depth.checked_add(1).ok_or_else(|| {
+                TsinkError::Other(
+                    "snapshot restore directory depth exceeds the supported range".to_string(),
+                )
+            })?;
+            copy_dir_contents_bounded_inner(
+                &entry_source,
+                &entry_destination,
+                remaining_bytes,
+                remaining_entries,
+                child_depth,
+                admitted_max_directory_depth,
+                observed_max_directory_depth,
+            )?;
+            continue;
+        }
+        if !file_type.is_file() {
             return Err(TsinkError::InvalidConfiguration(format!(
                 "unsupported non-file entry while restoring snapshot: {}",
                 entry_source.display()
             )));
         }
+        consume_restore_entry(remaining_entries, &entry_source)?;
+
+        let admitted_file_bytes = metadata.len();
+        if admitted_file_bytes > *remaining_bytes {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot changed after admission: {} requires {admitted_file_bytes} bytes but only {} measured bytes remain",
+                entry_source.display(),
+                *remaining_bytes
+            )));
+        }
+
+        let mut source_file =
+            std::fs::File::open(&entry_source).map_err(|source_err| TsinkError::IoWithPath {
+                path: entry_source.clone(),
+                source: source_err,
+            })?;
+        let opened_metadata =
+            source_file
+                .metadata()
+                .map_err(|source_err| TsinkError::IoWithPath {
+                    path: entry_source.clone(),
+                    source: source_err,
+                })?;
+        if !opened_metadata.file_type().is_file() || opened_metadata.len() != admitted_file_bytes {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot file changed after admission: {}",
+                entry_source.display()
+            )));
+        }
+
+        let mut destination_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&entry_destination)
+            .map_err(|source_err| TsinkError::IoWithPath {
+                path: entry_destination.clone(),
+                source: source_err,
+            })?;
+        let copied = {
+            let mut bounded_reader = (&mut source_file).take(admitted_file_bytes);
+            std::io::copy(&mut bounded_reader, &mut destination_file).map_err(|source_err| {
+                TsinkError::IoWithPath {
+                    path: entry_destination.clone(),
+                    source: source_err,
+                }
+            })?
+        };
+        if copied != admitted_file_bytes {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot file changed after admission: {} yielded {copied} of {admitted_file_bytes} bytes",
+                entry_source.display()
+            )));
+        }
+        let mut extra = [0u8; 1];
+        if source_file
+            .read(&mut extra)
+            .map_err(|source_err| TsinkError::IoWithPath {
+                path: entry_source.clone(),
+                source: source_err,
+            })?
+            != 0
+        {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot file grew after admission: {}",
+                entry_source.display()
+            )));
+        }
+        std::fs::set_permissions(&entry_destination, metadata.permissions()).map_err(
+            |source_err| TsinkError::IoWithPath {
+                path: entry_destination.clone(),
+                source: source_err,
+            },
+        )?;
+        destination_file
+            .flush()
+            .map_err(|source_err| TsinkError::IoWithPath {
+                path: entry_destination.clone(),
+                source: source_err,
+            })?;
+        destination_file
+            .sync_all()
+            .map_err(|source_err| TsinkError::IoWithPath {
+                path: entry_destination.clone(),
+                source: source_err,
+            })?;
+        *remaining_bytes = remaining_bytes.checked_sub(copied).ok_or_else(|| {
+            TsinkError::Other("bounded snapshot copy byte accounting underflow".to_string())
+        })?;
     }
 
+    sync_dir(destination)
+}
+
+fn consume_restore_entry(remaining_entries: &mut u64, path: &Path) -> Result<()> {
+    *remaining_entries = remaining_entries.checked_sub(1).ok_or_else(|| {
+        TsinkError::InvalidConfiguration(format!(
+            "snapshot added an entry after admission: {}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -497,6 +1488,23 @@ impl<W: Write> Write for ExactLengthWriter<'_, W> {
 }
 
 pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    write_tmp_and_sync_with_observer(path, bytes, |_| {})
+}
+
+/// Writes a synchronized atomic-replacement temporary while transferring cleanup ownership as
+/// soon as the directory entry exists.
+///
+/// `on_created` runs immediately after `create_new` succeeds and before any payload write or test
+/// hook. Grouped publishers use it to register the generated path in an unwind guard, so a panic
+/// during staging cannot strand a temporary whose name the caller never observed.
+pub(crate) fn write_tmp_and_sync_with_observer<F>(
+    path: &Path,
+    bytes: &[u8],
+    on_created: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(&Path),
+{
     let Some(parent) = path.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
             "temporary file target has no parent directory: {}",
@@ -504,6 +1512,7 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         )));
     };
     std::fs::create_dir_all(parent)?;
+    let mut on_created = Some(on_created);
 
     for _ in 0..256 {
         let tmp_path = tmp_path_for(path)?;
@@ -516,6 +1525,9 @@ pub(crate) fn write_tmp_and_sync(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),
         };
+        on_created
+            .take()
+            .expect("temporary creation observer may only run once")(&tmp_path);
 
         #[cfg(test)]
         let mut file = file;
@@ -943,6 +1955,93 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn recovery_namespace_budget_accepts_exact_cap_and_rejects_cap_plus_one() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        std::fs::write(temp_dir.path().join("known"), b"one").unwrap();
+        std::fs::write(temp_dir.path().join("unknown"), b"two").unwrap();
+
+        let entries = collect_directory_entries_bounded(temp_dir.path(), 2, "test scan")
+            .expect("the exact cap must be accepted");
+        assert_eq!(entries.len(), 2);
+
+        std::fs::write(temp_dir.path().join("another-unknown"), b"three").unwrap();
+        let err = collect_directory_entries_bounded(temp_dir.path(), 2, "test scan")
+            .expect_err("cap plus one must be rejected");
+        assert!(err.to_string().contains("2-entry global work bound"));
+    }
+
+    // Linux and other byte-oriented Unix filesystems permit opaque non-UTF-8 names. macOS APIs
+    // reject these byte sequences before the scan can observe them.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn recovery_namespace_budget_counts_non_utf8_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        std::fs::write(temp_dir.path().join("known"), b"one").unwrap();
+        std::fs::write(
+            temp_dir.path().join(OsString::from_vec(vec![0xff, 0xfe])),
+            b"opaque",
+        )
+        .unwrap();
+
+        let err = collect_directory_entries_bounded(temp_dir.path(), 1, "non-UTF-8 test scan")
+            .expect_err("an opaque second entry must still consume the cap");
+        assert!(err.to_string().contains("1-entry global work bound"));
+    }
+
+    #[test]
+    fn recursive_namespace_preflight_uses_one_cap_across_all_roots() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let first = temp_dir.path().join("first");
+        let second = temp_dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("one"), b"one").unwrap();
+        std::fs::write(second.join("two"), b"two").unwrap();
+        let roots = vec![first.clone(), second.clone()];
+
+        validate_recursive_namespace_bounded(&roots, 2, 4, "recursive test")
+            .expect("the exact aggregate cap must be accepted");
+
+        std::fs::write(second.join("three"), b"three").unwrap();
+        let err = validate_recursive_namespace_bounded(&roots, 2, 4, "recursive test")
+            .expect_err("cap plus one across a later root must fail");
+        assert!(err.to_string().contains("2-entry global work bound"));
+    }
+
+    #[test]
+    fn recursive_namespace_preflight_rejects_excess_depth() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let root = temp_dir.path().join("root");
+        std::fs::create_dir_all(root.join("one/two")).unwrap();
+
+        let err = validate_recursive_namespace_bounded(&[root], 8, 1, "depth test")
+            .expect_err("depth beyond the admitted bound must fail");
+        assert!(err.to_string().contains("1-level recursive depth bound"));
+    }
+
+    #[test]
+    fn recursive_namespace_plan_never_enumerates_late_descendants() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let root = temp_dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("planned"), b"planned").unwrap();
+        let plan =
+            validate_recursive_namespace_bounded(std::slice::from_ref(&root), 1, 4, "race test")
+                .expect("the initial tree must fit its exact cap");
+
+        std::fs::write(root.join("late"), b"late").unwrap();
+        let err = plan
+            .remove()
+            .expect_err("a late descendant must make non-recursive removal fail");
+        assert!(matches!(err, TsinkError::IoWithPath { .. }));
+        assert!(root.exists());
+        assert_eq!(std::fs::read(root.join("late")).unwrap(), b"late");
+    }
+
+    #[test]
     fn write_file_atomically_creates_missing_parent_directories() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let path = temp_dir.path().join("nested/state/series-index.bin");
@@ -1212,10 +2311,8 @@ mod tests {
         assert!(matches!(snapshot_err, TsinkError::InvalidConfiguration(_)));
         assert!(!snapshot_dest.exists());
 
-        let restore_dest = temp_dir.path().join("restore-dest");
         let restore_err =
-            copy_dir_contents(&source_link, &restore_dest).expect_err("symlink root must fail");
+            measure_restore_directory(&source_link).expect_err("symlink root must fail");
         assert!(matches!(restore_err, TsinkError::InvalidConfiguration(_)));
-        assert!(!restore_dest.exists());
     }
 }
