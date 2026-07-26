@@ -508,8 +508,10 @@ mod tests {
             .unwrap();
 
         let mut persisted_index = PersistedIndexState::default();
-        let mut merged_postings = SegmentPostingsIndex::default();
-        merged_postings.series_postings = bitmap(&[persisted.series_id]);
+        let mut merged_postings = SegmentPostingsIndex {
+            series_postings: bitmap(&[persisted.series_id]),
+            ..SegmentPostingsIndex::default()
+        };
         merged_postings
             .metric_postings
             .insert("cpu".to_string(), bitmap(&[persisted.series_id]));

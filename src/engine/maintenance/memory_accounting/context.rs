@@ -20,12 +20,14 @@ impl<'a> VisibilityMemoryMeasurementContext<'a> {
             .visibility_cache
             .series_visible_bounded_max_timestamps
             .read();
+        let epochs = self.visibility_cache.series_visibility_cache_epochs.read();
 
         ChunkStorage::btree_set_series_id_memory_usage_bytes(&materialized_series).saturating_add(
             ChunkStorage::series_visibility_state_memory_usage_bytes(
                 &summaries,
                 &visible_cache,
                 &bounded_visible_cache,
+                &epochs,
             ),
         )
     }
@@ -34,6 +36,7 @@ impl<'a> VisibilityMemoryMeasurementContext<'a> {
 #[derive(Clone, Copy)]
 struct TombstoneMemoryMeasurementContext<'a> {
     tombstones: &'a RwLock<crate::engine::tombstone::TombstoneMap>,
+    remote_tombstones: &'a RwLock<Arc<crate::engine::tombstone::ImmutableTombstoneSnapshot>>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +55,9 @@ impl WalMemoryMeasurementContext<'_> {
 impl<'a> TombstoneMemoryMeasurementContext<'a> {
     fn tombstone_memory_usage_bytes(self) -> usize {
         let tombstones = self.tombstones.read();
+        let remote = self.remote_tombstones.read();
         ChunkStorage::tombstone_map_memory_usage_bytes(&tombstones)
+            .saturating_add(remote.memory_usage_bytes())
     }
 }
 
@@ -127,6 +132,8 @@ pub(super) struct MemoryAccountingContext<'a> {
     persisted_mmap_used_bytes: &'a AtomicU64,
     tombstone_used_bytes: &'a AtomicU64,
     tombstone_staged_bytes: &'a AtomicU64,
+    remote_catalog_staging: &'a RemoteCatalogMemoryAccounting,
+    wal_writer_buffer_used_bytes: &'a AtomicU64,
     wal_series_definition_cache_used_bytes: &'a AtomicU64,
     write_transient: &'a Arc<WriteTransientMemoryAccounting>,
     shared_used_bytes: &'a AtomicU64,
@@ -157,6 +164,7 @@ impl<'a> MemoryAccountingContext<'a> {
     pub(super) fn used_value(self) -> usize {
         Self::tracked_bytes(self.used_bytes)
             .saturating_add(Self::tracked_bytes(self.tombstone_staged_bytes))
+            .saturating_add(self.remote_catalog_staging.current_bytes())
             .saturating_add(self.write_transient.current_bytes())
     }
 
@@ -168,6 +176,10 @@ impl<'a> MemoryAccountingContext<'a> {
         self.used_bytes_by_shard.iter().fold(0usize, |acc, shard| {
             acc.saturating_add(Self::component_value(shard))
         })
+    }
+
+    pub(super) fn wal_writer_buffer_used_value(self) -> usize {
+        Self::tracked_bytes(self.wal_writer_buffer_used_bytes)
     }
 
     fn sync_shard_memory_usage(self, shard_idx: usize) -> usize {
@@ -202,6 +214,10 @@ impl<'a> MemoryAccountingContext<'a> {
         let persisted_index_used = self.lifecycle.measured_persisted_index_memory_usage_bytes();
         let persisted_mmap_used = self.lifecycle.measured_persisted_mmap_memory_usage_bytes();
         let tombstone_used = self.tombstones.tombstone_memory_usage_bytes();
+        // The live buffer's actual capacity is captured once when the WAL is assembled and kept
+        // as a dedicated fixed component of shared accounting. Avoid taking the WAL writer mutex
+        // here: observability and admission may run while an append deliberately retains that lock.
+        let wal_writer_buffer_used = self.wal_writer_buffer_used_value();
         let wal_series_definition_cache_used =
             self.wal.series_definition_cache_memory_usage_bytes();
 
@@ -210,6 +226,7 @@ impl<'a> MemoryAccountingContext<'a> {
             .saturating_add(persisted_index_used)
             .saturating_add(persisted_mmap_used)
             .saturating_add(tombstone_used)
+            .saturating_add(wal_writer_buffer_used)
             .saturating_add(wal_series_definition_cache_used);
         let used = active_and_sealed_used.saturating_add(shared_used);
 
@@ -225,6 +242,7 @@ impl<'a> MemoryAccountingContext<'a> {
         Self::store_tracked_bytes(self.shared_used_bytes, shared_used);
         Self::store_tracked_bytes(self.used_bytes, used);
         used.saturating_add(Self::tracked_bytes(self.tombstone_staged_bytes))
+            .saturating_add(self.remote_catalog_staging.current_bytes())
             .saturating_add(self.write_transient.current_bytes())
     }
 }
@@ -241,6 +259,8 @@ impl ChunkStorage {
             persisted_mmap_used_bytes: &self.memory.persisted_mmap_used_bytes,
             tombstone_used_bytes: &self.memory.tombstone_used_bytes,
             tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
+            remote_catalog_staging: self.memory.remote_catalog_staging.as_ref(),
+            wal_writer_buffer_used_bytes: &self.memory.wal_writer_buffer_used_bytes,
             wal_series_definition_cache_used_bytes: &self
                 .memory
                 .wal_series_definition_cache_used_bytes,
@@ -258,6 +278,7 @@ impl ChunkStorage {
             lifecycle: self.lifecycle_publication_context(),
             tombstones: TombstoneMemoryMeasurementContext {
                 tombstones: &self.visibility.tombstones,
+                remote_tombstones: &self.visibility.remote_tombstones,
             },
             wal: WalMemoryMeasurementContext {
                 wal: self.persisted.wal.as_ref(),

@@ -1,18 +1,24 @@
 use std::collections::BTreeMap;
 
-use crate::{label::canonical_series_identity, Label};
+use crate::{
+    label::canonical_series_identity, Label, QueryMemoryReservation, SeriesSelection, TsinkError,
+};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
-use regex::Regex;
 
 use crate::promql::ast::{CallExpr, Expr, LabelMatcher, MatchOp};
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::types::{
-    histogram_count_value, histogram_counter_reset_detected, histogram_quantile_native,
-    histogram_scale, histogram_sub, is_stale_nan_value, PromqlValue, Sample,
+    histogram_bucket_count, histogram_count_value, histogram_counter_reset_detected,
+    histogram_quantile_native, histogram_scale, histogram_sub, is_stale_nan_value, PromqlValue,
+    Sample,
 };
 
 use super::time::duration_to_units;
-use super::{resolve_at_modifier, selector::matchers_match, Engine, QueryParams};
+use super::{
+    resolve_at_modifier,
+    selector::{select_series_with_retained_execution_result, PreparedPromqlMatchers},
+    Engine, QueryParams,
+};
 
 pub(crate) fn eval_call(
     engine: &Engine,
@@ -899,6 +905,15 @@ fn eval_histogram_quantile(
     let mut out = Vec::new();
     for sample in vector {
         if let Some(histogram) = sample.histogram() {
+            let bucket_count = histogram_bucket_count(histogram);
+            let bucket_scratch_bytes = super::modeled_vec_capacity_bytes::<
+                crate::promql::types::HistogramBucket,
+            >(bucket_count)
+            .saturating_mul(2);
+            let _bucket_scratch = params
+                .execution
+                .reserve_memory(bucket_scratch_bytes)
+                .map_err(TsinkError::from)?;
             let value = histogram_quantile_native(phi, histogram).map_err(PromqlError::Eval)?;
             out.push(Sample::from_float(
                 sample.metric,
@@ -1324,6 +1339,15 @@ fn eval_sort(
     let value = engine.eval(&call.args[0], params)?;
     let mut vector = expect_instant_vector(value, &call.func)?;
     ensure_histogram_free_vector(&vector, &call.func)?;
+    params.checkpoint()?;
+    params
+        .execution
+        .observe_intermediate_vector_size(u64::try_from(vector.len()).unwrap_or(u64::MAX))
+        .map_err(TsinkError::from)?;
+    params.memory.reserve(
+        params.execution,
+        super::modeled_vec_capacity_bytes::<Sample>(vector.len()),
+    )?;
     vector.sort_by(|a, b| {
         let ord = a
             .value
@@ -1335,6 +1359,7 @@ fn eval_sort(
             ord
         }
     });
+    params.checkpoint()?;
     Ok(PromqlValue::InstantVector(vector))
 }
 
@@ -1354,28 +1379,44 @@ fn eval_sort_by_label(
 
     let mut vector = expect_instant_vector(engine.eval(&call.args[0], params)?, &call.func)?;
     ensure_histogram_free_vector(&vector, &call.func)?;
-    let mut label_names = Vec::with_capacity(call.args.len() - 1);
+    params.checkpoint()?;
+    params
+        .execution
+        .observe_intermediate_vector_size(u64::try_from(vector.len()).unwrap_or(u64::MAX))
+        .map_err(TsinkError::from)?;
+    let label_name_count = call.args.len() - 1;
+    params.memory.reserve(
+        params.execution,
+        super::modeled_vec_capacity_bytes::<Sample>(vector.len()).saturating_add(
+            super::modeled_vec_capacity_bytes::<String>(label_name_count),
+        ),
+    )?;
+    let mut label_names = Vec::with_capacity(label_name_count);
     for arg in &call.args[1..] {
         label_names.push(expect_string(engine.eval(arg, params)?, &call.func)?);
     }
 
+    for sample in &mut vector {
+        sample.labels.sort_unstable();
+    }
     vector.sort_by(|a, b| {
         for label_name in &label_names {
             let av = label_value_for_sort(a, label_name);
             let bv = label_value_for_sort(b, label_name);
-            let ord = natural_cmp(&av, &bv);
+            let ord = natural_cmp(av, bv);
             if !ord.is_eq() {
                 return if desc { ord.reverse() } else { ord };
             }
         }
 
-        let tie = full_series_sort_key(a).cmp(&full_series_sort_key(b));
+        let tie = full_series_sort_bytes(a).cmp(full_series_sort_bytes(b));
         if desc {
             tie.reverse()
         } else {
             tie
         }
     });
+    params.checkpoint()?;
     Ok(PromqlValue::InstantVector(vector))
 }
 
@@ -1438,7 +1479,7 @@ fn eval_info(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Resu
         .eval_time
         .saturating_sub(engine.default_lookback_delta());
     let range_end = params.eval_time.saturating_add(1);
-    let info_series = load_info_series(engine, &info_matchers, range_start, range_end)?;
+    let info_series = load_info_series(engine, &info_matchers, range_start, range_end, params)?;
 
     for sample in &mut vector {
         let Some(job) = label_value(sample, "job") else {
@@ -1448,16 +1489,54 @@ fn eval_info(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Resu
             continue;
         };
 
+        let extra_label_count = info_series
+            .iter()
+            .filter(|series| series.job == job && series.instance == instance)
+            .map(|series| series.data_labels.len())
+            .fold(0usize, usize::saturating_add);
+        if extra_label_count == 0 {
+            continue;
+        }
+        params
+            .execution
+            .observe_intermediate_vector_size(u64::try_from(extra_label_count).unwrap_or(u64::MAX))
+            .map_err(TsinkError::from)?;
+        let combined_label_capacity = sample
+            .labels
+            .len()
+            .saturating_add(extra_label_count)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4)
+            .max(sample.labels.capacity());
+        let extra_label_bytes = info_series
+            .iter()
+            .filter(|series| series.job == job && series.instance == instance)
+            .flat_map(|series| series.data_labels.iter())
+            .fold(0u64, |bytes, label| {
+                bytes
+                    .saturating_add(super::modeled_string_bytes(&label.name))
+                    .saturating_add(super::modeled_string_bytes(&label.value))
+            });
+        params.memory.reserve(
+            params.execution,
+            super::modeled_vec_capacity_bytes::<Label>(extra_label_count)
+                .saturating_add(super::modeled_vec_capacity_bytes::<Label>(
+                    combined_label_capacity,
+                ))
+                .saturating_add(extra_label_bytes),
+        )?;
+
         let mut extra_labels = info_series
             .iter()
             .filter(|series| series.job == job && series.instance == instance)
             .flat_map(|series| series.data_labels.iter().cloned())
             .collect::<Vec<_>>();
-        extra_labels.sort();
+        extra_labels.sort_unstable();
         extra_labels.dedup_by(|a, b| a.name == b.name);
 
         for label in extra_labels {
-            set_label(&mut sample.labels, &label.name, &label.value);
+            set_label_struct_owned(&mut sample.labels, label);
         }
     }
 
@@ -1514,28 +1593,166 @@ fn eval_label_replace(
     let src = expect_string(engine.eval(&call.args[3], params)?, &call.func)?;
     let pattern = expect_string(engine.eval(&call.args[4], params)?, &call.func)?;
 
-    let regex = Regex::new(&pattern).map_err(PromqlError::from)?;
+    let regex = crate::query_matcher::prepare_bounded_regex_with_execution(
+        &pattern,
+        crate::query_matcher::RegexAnchoring::Unanchored,
+        params.execution,
+    )
+    .map_err(|error| match error {
+        crate::query_matcher::BoundedRegexPreparationError::Regex(error) => {
+            PromqlError::Regex(error.to_string())
+        }
+        crate::query_matcher::BoundedRegexPreparationError::Query(error) => {
+            PromqlError::Storage(TsinkError::from(error))
+        }
+    })?;
+    params
+        .execution
+        .observe_intermediate_vector_size(u64::try_from(vector.len()).unwrap_or(u64::MAX))
+        .map_err(TsinkError::from)?;
+    params.memory.reserve(
+        params.execution,
+        crate::query_matcher::modeled_bounded_regex_capture_scratch_bytes(regex.regex()),
+    )?;
+    let transform_upper = modeled_label_replace_transform_upper(
+        &vector,
+        &dst,
+        &replacement,
+        &src,
+        regex.regex(),
+        params,
+    )?;
+    params.memory.reserve(params.execution, transform_upper)?;
     let mut out = Vec::with_capacity(vector.len());
 
     for mut sample in vector {
+        params.checkpoint()?;
         let src_val = sample
             .labels
             .iter()
             .find(|l| l.name == src)
-            .map(|l| l.value.clone())
-            .unwrap_or_default();
+            .map(|l| l.value.as_str())
+            .unwrap_or("");
 
-        if regex.is_match(&src_val) {
+        if regex.regex().is_match(src_val) {
             let replaced = regex
-                .replace_all(&src_val, replacement.as_str())
-                .to_string();
-            set_label(&mut sample.labels, &dst, &replaced);
+                .regex()
+                .replace_all(src_val, replacement.as_str())
+                .into_owned();
+            set_label_owned(&mut sample.labels, &dst, replaced);
         }
 
         out.push(sample);
     }
 
     Ok(PromqlValue::InstantVector(out))
+}
+
+fn modeled_string_len_bytes(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        u64::try_from(len)
+            .unwrap_or(u64::MAX)
+            .saturating_add(super::PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn replacement_capture_reference_upper(replacement: &str) -> u64 {
+    let bytes = replacement.as_bytes();
+    let mut references = 0u64;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte == b'$' && bytes.get(index.saturating_add(1)).copied() != Some(b'$') {
+            references = references.saturating_add(1);
+        }
+    }
+    references
+}
+
+fn label_replace_value_upper_bytes(
+    source_len: usize,
+    replacement_len: usize,
+    capture_references: u64,
+    match_count: usize,
+    matched_bytes: usize,
+) -> u64 {
+    let source_len = u64::try_from(source_len).unwrap_or(u64::MAX);
+    let replacement_len = u64::try_from(replacement_len).unwrap_or(u64::MAX);
+    let match_count = u64::try_from(match_count).unwrap_or(u64::MAX);
+    let matched_bytes = u64::try_from(matched_bytes).unwrap_or(u64::MAX);
+    // Every capture is contained by its whole match, so all referenced captures together are
+    // bounded by `capture_references * matched_bytes`. Keeping the complete source length is
+    // conservative because replace_all omits the matched source bytes.
+    source_len
+        .saturating_add(match_count.saturating_mul(replacement_len))
+        .saturating_add(capture_references.saturating_mul(matched_bytes))
+}
+
+fn modeled_growing_string_upper_bytes(len: u64) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        // A geometrically growing String can briefly retain its old allocation while acquiring
+        // the next (at most doubled) buffer. Three times the final upper length covers that
+        // reallocation peak; replace_all's Cow is moved directly into the destination afterward.
+        len.saturating_mul(3)
+            .saturating_add(super::PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_label_replace_transform_upper(
+    vector: &[Sample],
+    dst: &str,
+    replacement: &str,
+    src: &str,
+    regex: &regex::Regex,
+    params: &QueryParams<'_>,
+) -> Result<u64> {
+    let capture_references = replacement_capture_reference_upper(replacement);
+    let mut bytes = super::modeled_vec_capacity_bytes::<Sample>(vector.len());
+    for sample in vector {
+        params.checkpoint()?;
+        let source = sample
+            .labels
+            .iter()
+            .find(|label| label.name == src)
+            .map(|label| label.value.as_str())
+            .unwrap_or("");
+        let mut match_count = 0usize;
+        let mut matched_bytes = 0usize;
+        for matched in regex.find_iter(source) {
+            params.checkpoint()?;
+            match_count = match_count.saturating_add(1);
+            matched_bytes = matched_bytes.saturating_add(matched.as_str().len());
+        }
+        if match_count == 0 {
+            continue;
+        }
+
+        let value_upper = label_replace_value_upper_bytes(
+            source.len(),
+            replacement.len(),
+            capture_references,
+            match_count,
+            matched_bytes,
+        );
+        bytes = bytes.saturating_add(modeled_growing_string_upper_bytes(value_upper));
+
+        if sample.labels.iter().all(|label| label.name != dst) {
+            bytes = bytes.saturating_add(modeled_string_len_bytes(dst.len()));
+            if sample.labels.len() == sample.labels.capacity() {
+                let grown_capacity = sample
+                    .labels
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(sample.labels.len().saturating_add(1))
+                    .max(4);
+                bytes = bytes
+                    .saturating_add(super::modeled_vec_capacity_bytes::<Label>(grown_capacity));
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn eval_label_join(
@@ -1555,29 +1772,94 @@ fn eval_label_join(
     let dst = expect_string(engine.eval(&call.args[1], params)?, &call.func)?;
     let sep = expect_string(engine.eval(&call.args[2], params)?, &call.func)?;
 
-    let mut src_labels = Vec::new();
+    let source_label_count = call.args.len() - 3;
+    params.memory.reserve(
+        params.execution,
+        super::modeled_vec_capacity_bytes::<String>(source_label_count),
+    )?;
+    let mut src_labels = Vec::with_capacity(source_label_count);
     for arg in &call.args[3..] {
         src_labels.push(expect_string(engine.eval(arg, params)?, &call.func)?);
     }
 
+    params
+        .execution
+        .observe_intermediate_vector_size(u64::try_from(vector.len()).unwrap_or(u64::MAX))
+        .map_err(TsinkError::from)?;
+    let transform_upper =
+        modeled_label_join_transform_upper(&vector, &dst, &sep, &src_labels, params)?;
+    params.memory.reserve(params.execution, transform_upper)?;
     for sample in &mut vector {
-        let joined = src_labels
-            .iter()
-            .map(|name| {
-                sample
-                    .labels
-                    .iter()
-                    .find(|l| l.name == *name)
-                    .map(|l| l.value.clone())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join(&sep);
-
-        set_label(&mut sample.labels, &dst, &joined);
+        params.checkpoint()?;
+        let joined_len = label_join_value_len(sample, &src_labels, sep.len());
+        let mut joined = String::with_capacity(joined_len);
+        for (index, name) in src_labels.iter().enumerate() {
+            if index > 0 {
+                joined.push_str(&sep);
+            }
+            if let Some(value) = sample
+                .labels
+                .iter()
+                .find(|label| label.name == *name)
+                .map(|label| label.value.as_str())
+            {
+                joined.push_str(value);
+            }
+        }
+        set_label_owned(&mut sample.labels, &dst, joined);
     }
 
     Ok(PromqlValue::InstantVector(vector))
+}
+
+fn label_join_value_len(sample: &Sample, source_labels: &[String], separator_len: usize) -> usize {
+    let values_len = source_labels.iter().fold(0usize, |bytes, name| {
+        bytes.saturating_add(
+            sample
+                .labels
+                .iter()
+                .find(|label| label.name == *name)
+                .map_or(0, |label| label.value.len()),
+        )
+    });
+    values_len.saturating_add(
+        source_labels
+            .len()
+            .saturating_sub(1)
+            .saturating_mul(separator_len),
+    )
+}
+
+fn modeled_label_join_transform_upper(
+    vector: &[Sample],
+    dst: &str,
+    separator: &str,
+    source_labels: &[String],
+    params: &QueryParams<'_>,
+) -> Result<u64> {
+    let mut bytes = 0u64;
+    for sample in vector {
+        params.checkpoint()?;
+        bytes = bytes.saturating_add(modeled_string_len_bytes(label_join_value_len(
+            sample,
+            source_labels,
+            separator.len(),
+        )));
+        if sample.labels.iter().all(|label| label.name != dst) {
+            bytes = bytes.saturating_add(modeled_string_len_bytes(dst.len()));
+            if sample.labels.len() == sample.labels.capacity() {
+                let grown_capacity = sample
+                    .labels
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(sample.labels.len().saturating_add(1))
+                    .max(4);
+                bytes = bytes
+                    .saturating_add(super::modeled_vec_capacity_bytes::<Label>(grown_capacity));
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn map_scalar_or_vector(value: PromqlValue, map: impl Fn(f64) -> f64) -> Result<PromqlValue> {
@@ -1676,40 +1958,75 @@ fn absent_labels_from_matchers(matchers: &[crate::promql::ast::LabelMatcher]) ->
     labels
 }
 
-fn label_value_for_sort(sample: &Sample, name: &str) -> String {
+fn label_value_for_sort<'a>(sample: &'a Sample, name: &str) -> &'a str {
     if name == "__name__" {
-        return sample.metric.clone();
+        return &sample.metric;
     }
 
     sample
         .labels
         .iter()
         .find(|label| label.name == name)
-        .map(|label| label.value.clone())
-        .unwrap_or_default()
+        .map(|label| label.value.as_str())
+        .unwrap_or("")
 }
 
-fn full_series_sort_key(sample: &Sample) -> String {
-    let mut labels = sample.labels.clone();
-    labels.sort();
-    format!(
-        "{}\u{1f}{}",
-        sample.metric,
-        labels
-            .iter()
-            .map(|label| format!("{}={}", label.name, label.value))
-            .collect::<Vec<_>>()
-            .join("\u{1f}")
+fn full_series_sort_bytes(sample: &Sample) -> impl Iterator<Item = u8> + '_ {
+    sample.metric.bytes().chain(std::iter::once(b'\x1f')).chain(
+        sample.labels.iter().enumerate().flat_map(|(index, label)| {
+            (index > 0)
+                .then_some(b'\x1f')
+                .into_iter()
+                .chain(label.name.bytes())
+                .chain(std::iter::once(b'='))
+                .chain(label.value.bytes())
+        }),
     )
 }
 
-#[derive(Clone)]
 struct InfoSeries {
     job: String,
     instance: String,
     metric: String,
     timestamp: i64,
     data_labels: Vec<Label>,
+    _reservation: QueryMemoryReservation,
+}
+
+fn modeled_info_series_entry_bytes(
+    metric: &str,
+    job: &str,
+    instance: &str,
+    data_labels: impl Iterator<Item = (usize, usize)>,
+) -> u64 {
+    let (data_label_count, data_label_text_bytes) =
+        data_labels.fold((0usize, 0usize), |(count, bytes), (name, value)| {
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(name).saturating_add(value),
+            )
+        });
+    let copied_strings = [metric, job, instance]
+        .into_iter()
+        .fold(0u64, |bytes, value| {
+            // The key and value each own one copy.
+            bytes.saturating_add(super::modeled_string_bytes(value).saturating_mul(2))
+        });
+    u64::try_from(
+        std::mem::size_of::<(String, String, String)>()
+            .saturating_add(std::mem::size_of::<InfoSeries>()),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(super::modeled_vec_capacity_bytes::<Label>(data_label_count))
+    .saturating_add(u64::try_from(data_label_text_bytes).unwrap_or(u64::MAX))
+    .saturating_add(
+        u64::try_from(data_label_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
+            .saturating_mul(super::PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+    )
+    .saturating_add(copied_strings)
+    .saturating_add(super::PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
 }
 
 fn info_selector_matchers(expr: &Expr) -> Result<Vec<LabelMatcher>> {
@@ -1731,45 +2048,71 @@ fn load_info_series(
     matchers: &[LabelMatcher],
     start: i64,
     end: i64,
+    params: &QueryParams<'_>,
 ) -> Result<Vec<InfoSeries>> {
-    let metric_matchers = matchers
-        .iter()
-        .filter(|matcher| matcher.name == "__name__")
-        .cloned()
-        .collect::<Vec<_>>();
+    let prepared_matchers = PreparedPromqlMatchers::new(matchers, params.execution)?;
+    let has_metric_matchers = matchers.iter().any(|matcher| matcher.name == "__name__");
     let data_matchers = matchers
         .iter()
         .filter(|matcher| matcher.name != "__name__")
         .cloned()
         .collect::<Vec<_>>();
 
-    let metrics = candidate_info_metrics(engine, &metric_matchers)?;
+    let metrics = candidate_info_metrics(engine, has_metric_matchers, &prepared_matchers, params)?;
     let mut selected: BTreeMap<(String, String, String), InfoSeries> = BTreeMap::new();
 
     for metric in metrics {
-        for (labels, points) in engine.storage().select_all(&metric, start, end)? {
+        let mut retained = super::selector::load_metric_rows_with_retained_execution(
+            engine,
+            &metric,
+            start,
+            end,
+            params.execution,
+        )?;
+        for (labels, points) in retained.rows.drain(..) {
             let Some(point) = latest_point_for_info(points, start, end) else {
                 continue;
             };
-            if !matchers_match(&metric, &labels, matchers)? {
+            if !prepared_matchers.matches(&metric, &labels) {
                 continue;
             }
 
             let Some(job) = labels
                 .iter()
                 .find(|label| label.name == "job")
-                .map(|label| label.value.clone())
+                .map(|label| label.value.as_str())
             else {
                 continue;
             };
             let Some(instance) = labels
                 .iter()
                 .find(|label| label.name == "instance")
-                .map(|label| label.value.clone())
+                .map(|label| label.value.as_str())
             else {
                 continue;
             };
 
+            let entry_bytes = modeled_info_series_entry_bytes(
+                &metric,
+                job,
+                instance,
+                labels
+                    .iter()
+                    .filter(|label| label.name != "job" && label.name != "instance")
+                    .filter(|label| {
+                        data_matchers.is_empty()
+                            || data_matchers
+                                .iter()
+                                .any(|matcher| matcher.name == label.name)
+                    })
+                    .map(|label| (label.name.len(), label.value.len())),
+            );
+            let entry_reservation = params
+                .execution
+                .reserve_memory(entry_bytes)
+                .map_err(TsinkError::from)?;
+            let job = job.to_string();
+            let instance = instance.to_string();
             let mut data_labels = labels
                 .into_iter()
                 .filter(|label| label.name != "job" && label.name != "instance")
@@ -1791,6 +2134,7 @@ fn load_info_series(
                 metric: metric.clone(),
                 timestamp: point.timestamp,
                 data_labels,
+                _reservation: entry_reservation,
             };
 
             match selected.get(&key) {
@@ -1802,6 +2146,10 @@ fn load_info_series(
         }
     }
 
+    params.memory.reserve(
+        params.execution,
+        super::modeled_vec_capacity_bytes::<InfoSeries>(selected.len()),
+    )?;
     let mut out = selected.into_values().collect::<Vec<_>>();
     out.sort_by(|a, b| a.metric.cmp(&b.metric));
     Ok(out)
@@ -1809,15 +2157,22 @@ fn load_info_series(
 
 fn candidate_info_metrics(
     engine: &Engine,
-    metric_matchers: &[LabelMatcher],
+    has_metric_matchers: bool,
+    prepared_matchers: &PreparedPromqlMatchers<'_>,
+    params: &QueryParams<'_>,
 ) -> Result<Vec<String>> {
-    if metric_matchers.is_empty() {
+    if !has_metric_matchers {
+        params.reserve_metric_names(["target_info"])?;
         return Ok(vec!["target_info".to_string()]);
     }
 
-    let mut metrics = engine
-        .storage()
-        .list_metrics()?
+    let mut selected = select_series_with_retained_execution_result(
+        engine,
+        &SeriesSelection::new(),
+        params.execution,
+    )?;
+    params.reserve_metric_names(selected.series.iter().map(|series| series.name.as_str()))?;
+    let mut metrics = std::mem::take(&mut selected.series)
         .into_iter()
         .map(|series| series.name)
         .collect::<Vec<_>>();
@@ -1825,7 +2180,7 @@ fn candidate_info_metrics(
     metrics.dedup();
     let mut out = Vec::new();
     for metric in metrics {
-        if matchers_match(&metric, &[], metric_matchers)? {
+        if prepared_matchers.matches_metric_name(&metric) {
             out.push(metric);
         }
     }
@@ -1857,12 +2212,12 @@ fn latest_point_for_info(
     }
 }
 
-fn label_value(sample: &Sample, name: &str) -> Option<String> {
+fn label_value<'a>(sample: &'a Sample, name: &str) -> Option<&'a str> {
     sample
         .labels
         .iter()
         .find(|label| label.name == name)
-        .map(|label| label.value.clone())
+        .map(|label| label.value.as_str())
 }
 
 fn natural_cmp(lhs: &str, rhs: &str) -> std::cmp::Ordering {
@@ -1929,5 +2284,23 @@ fn set_label(labels: &mut Vec<Label>, name: &str, value: &str) {
         return;
     }
     labels.push(Label::new(name.to_string(), value.to_string()));
-    labels.sort();
+    labels.sort_unstable();
+}
+
+fn set_label_owned(labels: &mut Vec<Label>, name: &str, value: String) {
+    if let Some(label) = labels.iter_mut().find(|label| label.name == name) {
+        label.value = value;
+        return;
+    }
+    labels.push(Label::new(name.to_string(), value));
+    labels.sort_unstable();
+}
+
+fn set_label_struct_owned(labels: &mut Vec<Label>, new_label: Label) {
+    if let Some(label) = labels.iter_mut().find(|label| label.name == new_label.name) {
+        label.value = new_label.value;
+        return;
+    }
+    labels.push(new_label);
+    labels.sort_unstable();
 }

@@ -459,7 +459,10 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
 #[test]
 fn memory_admission_backpressure_uses_background_flush_without_sealing_current_head() {
     let temp_dir = TempDir::new().unwrap();
-    let first_blob = "a".repeat(4096);
+    // Keep the background-eligible old head substantially larger than the current heads. That
+    // leaves a real admission window after the old head is finalized even when fixed retained
+    // components such as the WAL writer buffer are charged to the same budget.
+    let first_blob = "a".repeat(32 * 1024);
     let second_blob = "b".repeat(4096);
     let third_blob = "c".repeat(4096);
     let fourth_blob = "d".repeat(4096);
@@ -483,7 +486,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                     crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
                 max_writers: 1,
                 write_timeout,
-                memory_budget_bytes: 1_000_000,
+                memory_budget_bytes: 8_000_000,
                 cardinality_limit: usize::MAX,
                 max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
                 max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
@@ -543,18 +546,31 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         .budget_bytes
         .store(u64::MAX, std::sync::atomic::Ordering::Release);
     calibration.flush_background_eligible_active().unwrap();
-    calibration.persist_segment_with_outcome().unwrap();
-    let post_relief_required =
-        memory_required_for_rejected_write(&calibration, std::slice::from_ref(&fourth_row));
+
+    // Admission has multiple exact boundaries: the retained-growth estimate that triggers
+    // backpressure and the later transient write-staging peak. Follow structured `required`
+    // values until the complete post-relief write fits instead of calibrating only the first.
+    let mut post_relief_required = 1usize;
+    loop {
+        calibration.memory.budget_bytes.store(
+            u64::try_from(post_relief_required).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+        match calibration.insert_rows(std::slice::from_ref(&fourth_row)) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, post_relief_required);
+                assert!(required > post_relief_required);
+                post_relief_required = required;
+            }
+            Err(error) => panic!("unexpected post-relief calibration failure: {error}"),
+        }
+    }
     assert!(
         post_relief_required < pre_relief_required,
         "background-eligible flush should reduce admission memory requirement: pre={pre_relief_required} post={post_relief_required}",
     );
-    let target_budget = pre_relief_required.saturating_sub(1);
-    assert!(
-        post_relief_required <= target_budget,
-        "calibrated post-relief requirement should fit below the pressure budget: budget={target_budget} post={post_relief_required}",
-    );
+    let target_budget = post_relief_required;
 
     let storage = std::sync::Arc::new(build_storage(&temp_dir, Duration::from_secs(1)));
 

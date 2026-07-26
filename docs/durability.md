@@ -7,6 +7,8 @@ it is not a promise about hardware or filesystem behavior beyond the operations 
 The canonical API is `Storage::write_batch`. `Storage::insert_rows_with_result` exposes the same
 batch-level durability for the compatibility write path. See
 [`ADR 0001`](adr/0001-write-contract.md) for acceptance, rollback, and indexed-outcome semantics.
+The deterministic injection coverage for each storage boundary is listed in
+[the durability failpoint matrix](durability-failpoints.md).
 
 ## Acknowledgement levels
 
@@ -21,13 +23,13 @@ accepted rows has no canonical acknowledgement.
 
 ## Core storage matrix
 
-| Storage configuration | Normal non-empty acknowledgement | Clean close | Abrupt process termination | Power or host loss |
-|---|---|---|---|---|
-| In-memory; no data path | `Volatile` | No persistent copy exists | Accepted rows are lost | Accepted rows are lost |
-| Data path; WAL disabled | `Volatile` | `close()` flushes pending state and returns any flush error | Rows not already persisted may be lost | No write-time persistence guarantee |
-| WAL `Periodic(interval)` | Usually `Appended`; the append that performs an elapsed-interval sync may return `Durable` | `close()` synchronizes and flushes or returns an error | Recovery replays WAL data that reached stable storage; the unsynchronized interval is a loss window | Same loss window, subject to filesystem and device semantics |
-| WAL `PerAppend` | `Durable` after the logical WAL write and its publication are synchronized | `close()` also flushes segment state and reports failure | WAL recovery is intended to restore the acknowledged logical batch | Intended to survive when the platform honors the synchronization operations; no stronger hardware claim is made |
-| Compute-only runtime | Writes are rejected | No writable local state | Not applicable | Not applicable |
+| Storage configuration | Visibility to current readers | Normal non-empty acknowledgement | Clean close | Abrupt process termination | Power or host loss |
+|---|---|---|---|---|---|
+| In-memory; no data path | After the complete atomic in-memory publication, before return | `Volatile` | No persistent copy exists | Accepted rows are lost | Accepted rows are lost |
+| Data path; WAL disabled | After the complete atomic in-memory publication, before return | `Volatile` | `close()` publishes pending rows as synchronized segment state or returns the failure | Only rows already published as segments are intended to survive | No write-time persistence guarantee; already-published segments have the platform-qualified file/directory guarantee below |
+| WAL `Periodic(interval)` | After in-memory application and logical WAL publication, before return | Usually `Appended`; it is `Durable` if that append performs the elapsed-interval sync or synchronized segment publication has already advanced through its high-water mark | `close()` publishes pending rows as synchronized segment state, checkpoints recovery metadata, and returns any failure | Every returned `Durable` write is intended to replay; an `Appended` write may or may not replay | `Durable` writes have the platform-qualified guarantee below; `Appended` writes remain inside a loss window |
+| WAL `PerAppend` | After in-memory application and logical WAL publication, before return | `Durable` after the WAL frames and publish boundary are synchronized | `close()` also publishes pending segment state, checkpoints recovery metadata, and returns any failure | Recovery is intended to restore every acknowledged non-empty logical batch | Intended to survive when the platform honors the synchronization operations; no stronger hardware claim is made |
+| Compute-only runtime | Writes are rejected; queries observe the last successfully installed catalog generation | Not applicable | No writable local state | Locally cached process state is lost and the remote catalog is loaded again | Not applicable to local writes |
 
 `Periodic` does not currently own an autonomous timer that fsyncs an idle WAL. The interval is
 checked by later appends and lifecycle work, so an idle process can retain an `Appended` high-water
@@ -36,6 +38,49 @@ mark until another write or close.
 An empty compatibility write is a durable no-op because it creates no state to lose. A canonical
 empty batch instead returns zero outcomes and no acknowledgement. Lifecycle and compute-only checks
 still run in both cases.
+
+## Exact core synchronization operations
+
+For a WAL-backed write, tsink performs these operations in order:
+
+1. Encode the series-definition and sample frames into the active WAL segment and flush the
+   `BufWriter`, making the bytes available to the operating system.
+2. In `PerAppend`, or when a `Periodic` append observes that its interval has elapsed, call
+   `sync_data` on the active WAL segment. An append that does not take this step cannot be
+   acknowledged as `Durable`.
+3. Write the logical commit boundary to `wal/wal.published.tmp`. On the durable path, call
+   `sync_data` on that temporary file. Rename it over `wal/wal.published`, then synchronize the
+   `wal/` directory on platforms where directory-handle synchronization is supported.
+4. Only after the boundary publication is attempted does the write expose the corresponding WAL
+   high-water mark and return its acknowledgement. Recovery discards a syntactically valid WAL
+   suffix beyond the last published boundary rather than treating an uncommitted frame as a later
+   write.
+
+Creating or rotating a WAL segment synchronizes the `wal/` directory, and rotation synchronizes the
+previous active segment before switching files. `Periodic(interval)` is append-driven: no timer
+wakes solely to synchronize an idle WAL. Its loss window can therefore exceed `interval` when no
+later append occurs. A successful segment flush or clean close can make earlier data durable without
+changing the acknowledgement already returned to its caller.
+
+Segment publication writes and calls `sync_all` on temporary
+`chunks.bin`, `chunk_index.bin`, `series.bin`, `postings.bin`, and `manifest.bin` files. It renames
+the completed staging directory into the lane's `segments/L*/` namespace, then synchronizes the
+published segment directory and its level directory. Recovery metadata such as
+`series_index.bin`, incremental registry state, registry catalogs, tombstones, and rollup state
+uses synchronized temporary-file replacement followed by parent-directory synchronization.
+The manifest is published last within each segment so recovery never treats a partially encoded
+staging directory as a complete segment.
+
+WAL reset first flushes and synchronizes the active WAL file, installs and synchronizes its empty
+replacement, removes older WAL segment files, synchronizes `wal/`, and atomically replaces the
+published-boundary marker with its file and directory synchronization enabled. It occurs only after
+the corresponding segment and recovery-metadata publication has committed.
+
+On Linux, macOS, and other non-Windows targets, directory synchronization opens the directory and
+calls `sync_all`. The current Windows implementation synchronizes regular files but treats
+directory-handle synchronization as a no-op because the Rust file API used here does not support
+flushing directory handles. Consequently, the strongest Windows claim excludes a guarantee that a
+just-created or just-renamed directory entry survives sudden power loss.
 
 ## Visibility and ordering
 
@@ -56,15 +101,40 @@ ceiling fails open with a structured error instead of partially publishing a lat
 
 If logical WAL publication fails after in-memory application, tsink cannot truthfully claim WAL
 recovery for that batch. The current core returns a successful `Volatile` acknowledgement and marks
-the durability path degraded for observability; callers must not reinterpret it as `Appended` or
-`Durable`.
+the durability path degraded for observability. It retains the complete WAL prefix instead of
+truncating against already-advanced sequence state: the preceding durable marker may ignore that
+prefix, a marker replacement whose outcome was ambiguous may expose it, or a later successful
+marker may include it. All are valid outcomes for `Volatile`; callers must not reinterpret it as
+`Appended` or `Durable`.
 
 ## Background and close failures
 
-The built-in engine fences or reports background persistence failure according to
-`with_background_fail_fast`. A successful `close()` waits for owned lifecycle work and returns only
-after its required flush/synchronization work succeeds. A failed close is not a durability
-acknowledgement and must be handled by the embedder.
+A WAL append, flush, or required `sync_data` failure occurs before the staged rows are published to
+readers. The write returns an error and truncates the attempted WAL suffix back to its preceding
+boundary; the old publish marker remains authoritative on restart. If rollback itself fails, the
+combined error is surfaced and the old publish boundary still prevents the attempted suffix from
+being intentionally replayed. A failure while publishing the boundary after in-memory application
+is different: the rows are already visible, so the core returns successful `Volatile`, records a
+maintenance error, and makes no crash-recovery claim for that batch.
+
+A segment-file, segment-directory, or recovery-metadata synchronization failure prevents that
+flush from advancing the durable WAL high-water mark or trimming the protected WAL prefix. The
+existing in-memory/WAL state remains the recovery source where possible, and the failure is exposed
+through maintenance health and the lifecycle result rather than being converted into a stronger
+write acknowledgement.
+
+The built-in engine handles a background persistence failure according to
+`with_background_fail_fast`:
+
+- when enabled, it records the worker and error, sets the fail-fast health fence, stops that worker,
+  and rejects subsequent writes as degraded;
+- when disabled, it records degraded health but leaves writes enabled and lets the worker retry on
+  later wakes. Each foreground write still receives only the acknowledgement established by its own
+  WAL path.
+
+A successful `close()` waits for owned lifecycle work and returns only after its required
+flush/synchronization work succeeds. A failed close is not a durability acknowledgement and must be
+handled by the embedder.
 
 Close unparks all four possible instance-owned workers and attempts every join in fixed order. If a
 worker panicked, the returned error names it, but that first error does not leave later worker handles
@@ -206,31 +276,121 @@ leadership is fenced, and the required log-only candidate is retried. This is po
 persistence debt, not permission to retry the command. As a related crash-safe membership rule, an
 Active leader must transfer leadership before another voter can commit that leader's leave.
 
+## Online snapshot export
+
+`Storage::snapshot` is an online, point-in-time export. It first fences background maintenance,
+drains every write permit, and takes the rollup, compaction, and visibility publication fences
+before copying. The copied registry is generated from the fenced in-memory registry rather than
+from a possibly stale on-disk compatibility snapshot, and WAL copying occurs under the same fence,
+so an acknowledged write is represented by either the copied persisted state or its copied WAL
+prefix. The validated data-directory manifest is copied byte for byte.
+
+The destination must not already exist and must resolve outside the managed data directory.
+Before destination ancestry is created, every managed source subtree is opened component by
+component without following links, measured through directory handles, and retained as a closed
+identity manifest. Unix classifies entries with `fstatat(AT_SYMLINK_NOFOLLOW)` before opening only
+directories or regular files. Windows holds ancestor/component handles without delete sharing.
+The combined staged namespace, including generated manifest/registry files, is admitted against
+restore's 100,000-entry limit; descendant depth is at most 128.
+
+Each secure session is capped at 64 MiB of modeled retained state. Every simultaneously live source
+session, staging manifest, verification manifest, and generated buffer shares one 128 MiB operation
+cap, admitted incrementally as manifests grow. Registry snapshot encoding admits its output and
+cloned-series scratch before either proportional allocation. The exact source identities are reused
+by the copy, and source and complete staged trees are remeasured through their anchors before
+publication. Copying uses length-bounded streams into a uniquely named sibling staging directory
+created relative to a retained parent handle. Permission changes apply to the already-open
+destination file, never its pathname. Every copied regular file is flushed and synchronized, every
+copied directory is synchronized, and source growth, shrinkage, change-time changes, type changes,
+or path replacement fail the operation.
+
+Publication uses an atomic no-replace rename, so a destination created by another actor after
+preflight is preserved rather than overwritten. Linux and Android use
+`renameat2(RENAME_NOREPLACE)`, Apple platforms use `renamex_np(RENAME_EXCL)`, and Windows uses
+`MoveFileExW` without replacement. Other Unix targets fail explicitly when that safe primitive is
+not configured instead of using a racy check followed by an overwriting rename. Any failure before
+the rename reports and retains the handle-attested staging tree; it never rescans the staging
+pathname to “bless” a replacement for cleanup. Publication is relative to the retained parent and
+re-attests the caller-requested parent pathname afterward. If the rename succeeds but
+post-publication attestation or final parent synchronization fails, the visible destination is
+retained and the error says its durability or requested-path reachability is indeterminate. It is
+not recursively removed because another actor may already have created files below it. As
+elsewhere, Windows currently lacks
+directory-handle synchronization, so its claim is atomic visibility and regular-file
+synchronization, not power-loss persistence of the new directory entry.
+
+The staging namespace is private to the operation: callers and other same-identity processes must
+not enumerate, rewrite, rename, or inject entries below `.tmp-tsink-snapshot-*` while a snapshot is
+running. Closed file identities, no-follow checks, and whole-tree verification detect ordinary
+pre-boundary replacements, but portable filesystems do not expose an atomic
+conditional rename by source identity. On Windows, `MoveFileExW` also requires a narrow release of
+the staging-root no-delete handle immediately before the move; retained parent/ancestor handles and
+post-move identity verification bound but do not eliminate a hostile same-UID race in that
+interval. Unix canonicalization of an existing alias (for example `/var` to `/private/var`) is
+compatibility normalization before the anchor is acquired, not a claim that a hostile actor cannot
+mutate the alias during that initial resolution.
+
 ## Offline snapshot restore
 
 Restore is an offline operation: complete it before opening storage at the target. Both restore APIs
-measure and validate the snapshot before destination mutation, reject resolved source/target overlap
-in either direction, and cap the trusted source at 100,000 entries and descendant-directory depth
-128. Static symlinks, Windows reparse points, and other non-file entries are rejected during
-measurement and checked again during bounded copy. These are path-based checks, not a descriptor-
-relative traversal guarantee; the caller must keep the source trusted and immutable so another
-process cannot replace a validated namespace entry before it is opened.
+perform retained-handle manifest and compatibility preflight before creating destination ancestry,
+reject resolved source/target overlap in either direction, and cap the trusted source at 100,000
+entries and descendant-directory depth 128. Static symlinks, Windows reparse points, and other
+non-file entries are rejected during handle-anchored measurement and checked again during bounded
+copy. No descriptor/handle is retained per entry: the finite manifest stores device/volume,
+inode/file-index, change/last-write time, length, and type, then reopens each parent and child
+relative to an anchor and compares that closed identity. Secure traversal manifests, staging
+manifests, verification state, and generated copy buffers share the 128 MiB aggregate secure-copy
+operation cap.
+
+Before the existing target is inspected or moved, restore copies the snapshot into a private
+validation sibling and opens that copy through the normal strict discovery, segment validation,
+registry recovery, tombstone hydration, WAL replay, rollup loading, and catalog-loading paths.
+Validation derives timestamp precision, chunk capacity, and partition duration from the snapshot
+manifest and enables WAL only when the measured snapshot contains the canonical WAL directory. It
+uses the finite `Server` profile (2 GiB accounted memory, 10 million series, 8 GiB WAL, and 256 GiB
+local disk), with filesystem headroom and maintenance reserve set to zero. These production-open
+limits are separate from the 128 MiB secure-copy cap and can intentionally reject a snapshot made
+under larger custom or `ExpertUnlimited` limits. Validation requires non-degraded health and ends
+through a non-persisting lifecycle: it does not run normal close/flush, checkpoint persistence,
+retention deletion, or background workers.
 
 `StorageBuilder::restore_from_snapshot_with_disk_budget` uses a caller-owned offline
 `LocalDiskBudget` rooted above the strict-descendant target. Before creating target ancestry or a
-staging tree, it reserves the measured logical file bytes plus one per-entry allowance for every
-snapshot entry and missing target-parent directory. The allowance is the greater of the 4 KiB
-policy floor and the destination filesystem's reported allocation unit. This is deliberately
-conservative admission, not an exact physical-allocation assertion.
+staging tree, its staging term reserves
+`2 * logical_file_bytes + (snapshot_entries + 2) * entry_allowance`: one copied tree, one
+source-logical recovery scratch envelope, the snapshot entries, the validation lock, and one
+possible atomic recovery scratch entry. The coordinator separately adds one allowance for every
+missing target-parent directory. The allowance is the greater of the 4 KiB policy floor and the
+destination filesystem's reported allocation unit. The validation and publication copies reuse
+the same staging reservation sequentially. This is deliberately conservative admission, not an
+exact physical-allocation assertion.
 
 The staged copy synchronizes its files and directory before activation. Missing target ancestry is
-created with its new parent links synchronized. If a target already exists, activation first moves
-it to a distinct backup, synchronizes the parent, publishes the staged tree, and synchronizes the
-parent again. A publication failure attempts to restore and synchronize the preceding target rather
-than claiming that the replacement never became visible. After the managed operation returns, an
-exclusive tree scan installs exact logical accounting before new admission resumes. A scan failure
-is explicit and conservatively retains the full reservation; if activation had committed, the
-result says that restore committed but accounting reconciliation failed.
+created with its new parent links synchronized. The staging directory itself is create-exclusive.
+If a target already exists, activation identity-checks and moves it to a distinct absent backup
+relative to the retained parent, synchronizes that parent, publishes the staged tree into an absent
+target, and synchronizes the parent again. Both renames use atomic no-replace primitives, so a
+concurrently installed backup or target is preserved and makes restore fail rather than being
+overwritten. A failure before staging publication attempts an identity-attested backup-to-target
+rollback through the same parent anchor. Once staging is visible as the target, failure never rolls
+it back or deletes it; the visible target and backup are reported and retained.
+
+After successful replacement publication, restore verifies the original target against its
+retained pre-move manifest and removes that exact backup with handle-relative cleanup. A normal
+populated-target restore therefore leaves no backup debt. If the backup name, identity, type, or
+descendant set changed, exact cleanup refuses to adopt or delete the replacement; the visible
+target and any surviving backup are retained and reported. A copy or attestation failure likewise
+retains staging without path-only cleanup. After the managed operation returns, an exclusive tree
+scan installs exact logical accounting before new admission resumes. A scan failure is explicit
+and conservatively retains the full reservation; if activation had committed, the result says that
+restore committed but accounting reconciliation failed.
+
+Restore is offline for the containing namespace as well as the target: callers must exclude
+same-identity processes that mutate the target, backup, or `.tmp-tsink-restore-*` entries during
+the operation. Unknown entries observed at a cleanup boundary are retained, but the same portable
+conditional-unlink limitation described for snapshot staging applies to an actor racing inside the
+last identity-check syscall window.
 
 Server restore requires a separate offline root and finite limit and retains that root's process
 lease until listener drain and storage shutdown complete. Standalone restore, the compatibility

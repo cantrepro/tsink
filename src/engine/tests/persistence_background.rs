@@ -40,6 +40,45 @@ fn bounded_catalog_refresh_storage(
     .unwrap()
 }
 
+fn finite_compute_only_remote_storage(
+    tiered_storage: super::super::config::TieredStorageConfig,
+    next_segment_id: u64,
+    max_items: usize,
+) -> ChunkStorage {
+    finite_compute_only_remote_storage_with_limits(
+        tiered_storage,
+        next_segment_id,
+        max_items,
+        256 * 1024 * 1024,
+    )
+}
+
+fn finite_compute_only_remote_storage_with_limits(
+    tiered_storage: super::super::config::TieredStorageConfig,
+    next_segment_id: u64,
+    max_items: usize,
+    max_bytes: u64,
+) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        None,
+        None,
+        next_segment_id,
+        ChunkStorageOptions {
+            runtime_mode: StorageRuntimeMode::ComputeOnly,
+            retention_enforced: false,
+            maintenance_max_items_per_pass: max_items,
+            maintenance_max_bytes_per_pass: max_bytes,
+            remote_segment_refresh_interval: Duration::from_millis(1),
+            tiered_storage: Some(tiered_storage),
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap()
+}
+
 fn write_numeric_segment_to_path(
     lane_path: &std::path::Path,
     registry: &SeriesRegistry,
@@ -588,7 +627,6 @@ fn flush_pipeline_waits_for_inflight_tombstone_visibility_publication() {
         )
         .unwrap(),
     );
-
     storage
         .insert_rows(&[
             Row::with_labels(
@@ -2647,12 +2685,9 @@ fn dirty_persisted_refresh_skips_stale_scanned_state_after_delete_visibility_cha
 }
 
 #[test]
-fn remote_catalog_refresh_keeps_concurrent_queries_running() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc;
+fn finite_remote_catalog_refresh_refuses_v2_only_state_without_changing_visibility() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::thread;
-    use std::time::Instant;
 
     let object_store_dir = TempDir::new().unwrap();
     let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
@@ -2664,57 +2699,67 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
         .series_id;
     let segment_root =
         write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let legacy_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_segment_catalog(
+        &super::super::tiering::shared_segment_catalog_path(&tiered_storage),
+        &legacy_inventory,
+    )
+    .unwrap();
 
-    let storage = Arc::new(
-        ChunkStorage::new_with_data_path_and_options(
-            2,
-            None,
-            None,
-            None,
-            2,
-            ChunkStorageOptions {
-                timestamp_precision: TimestampPrecision::Seconds,
-                retention_window: i64::MAX,
-                future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
-                max_future_skew_window: None,
-                retention_enforced: false,
-                runtime_mode: StorageRuntimeMode::ComputeOnly,
-                partition_window: i64::MAX,
-                max_active_partition_heads_per_series:
-                    crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
-                max_writers: 2,
-                write_timeout: Duration::from_secs(1),
-                memory_budget_bytes: u64::MAX,
-                cardinality_limit: usize::MAX,
-                max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
-                max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
-                max_new_series_per_window: None,
-                new_series_window_units: 1,
-                new_series_window_nanos: 60_000_000_000,
-                write_batch_limits: Default::default(),
-                wal_size_limit_bytes: u64::MAX,
-                admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
-                compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                maintenance_max_items_per_pass: 1_024,
-                maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
-                background_threads_enabled: false,
-                background_fail_fast: false,
-                metadata_shard_count: None,
-                remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
-                remote_segment_refresh_interval: Duration::from_millis(1),
-                tiered_storage: Some(super::super::config::TieredStorageConfig {
-                    object_store_root: object_store_dir.path().to_path_buf(),
-                    segment_catalog_path: None,
-                    mirror_hot_segments: false,
-                    hot_retention_window: 10,
-                    warm_retention_window: 50,
-                }),
-                #[cfg(test)]
-                current_time_override: None,
-            },
-        )
-        .unwrap(),
-    );
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        None,
+        None,
+        2,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_window: i64::MAX,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
+            max_future_skew_window: None,
+            retention_enforced: false,
+            runtime_mode: StorageRuntimeMode::ComputeOnly,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 2,
+            write_timeout: Duration::from_secs(1),
+            memory_budget_bytes: u64::MAX,
+            cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 1_024,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_millis(1),
+            tiered_storage: Some(tiered_storage),
+            #[cfg(test)]
+            current_time_override: None,
+        },
+    )
+    .unwrap();
     storage
         .apply_loaded_segment_indexes(
             crate::engine::segment::load_segment_indexes_from_dirs_with_series(
@@ -2726,60 +2771,50 @@ fn remote_catalog_refresh_keeps_concurrent_queries_running() {
         )
         .unwrap();
     storage.mark_remote_catalog_refresh_success();
+    std::thread::sleep(Duration::from_millis(5));
 
-    thread::sleep(Duration::from_millis(5));
-
-    let scan_started = Arc::new(AtomicBool::new(false));
-    let release_scan = Arc::new(AtomicBool::new(false));
     let scan_count = Arc::new(AtomicUsize::new(0));
     storage.set_full_inventory_scan_hook({
-        let scan_started = Arc::clone(&scan_started);
-        let release_scan = Arc::clone(&release_scan);
         let scan_count = Arc::clone(&scan_count);
         move || {
             scan_count.fetch_add(1, Ordering::SeqCst);
-            scan_started.store(true, Ordering::SeqCst);
-            while !release_scan.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(10));
-            }
         }
     });
-    storage.start_background_persisted_refresh_thread().unwrap();
-    storage.notify_persisted_refresh_thread();
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !scan_started.load(Ordering::SeqCst) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        scan_started.load(Ordering::SeqCst),
-        "background remote refresh did not reach the full inventory scan hook",
-    );
-
-    let concurrent_storage = Arc::clone(&storage);
-    let concurrent_labels = labels.clone();
-    let (query_tx, query_rx) = mpsc::channel();
-    let concurrent_query = thread::spawn(move || {
-        let result =
-            concurrent_storage.select("remote_refresh_query_metric", &concurrent_labels, 0, 10);
-        query_tx.send(result).unwrap();
-    });
-
-    let concurrent_points = query_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("concurrent query should not block on remote inventory refresh");
+    let concurrent_points = storage
+        .select("remote_refresh_query_metric", &labels, 0, 10)
+        .unwrap();
     assert_eq!(
-        concurrent_points.unwrap(),
+        concurrent_points,
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
     );
-
-    release_scan.store(true, Ordering::SeqCst);
-
-    concurrent_query.join().unwrap();
     assert_eq!(
         scan_count.load(Ordering::SeqCst),
+        0,
+        "finite remote refresh must not scan object-store roots or fall back to v2",
+    );
+    let failed = storage.observability_snapshot().remote;
+    assert_eq!(failed.catalog_refresh_errors_total, 1);
+    assert_eq!(failed.consecutive_refresh_failures, 1);
+    assert!(failed.backoff_active);
+    assert!(failed
+        .last_refresh_error
+        .as_deref()
+        .is_some_and(|error| error.contains("authoritative v3 pointer")));
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .remote
+            .catalog_refresh_errors_total,
         1,
-        "only one remote refresh should scan the object-store inventory",
+        "the structured refusal should enter backoff instead of retrying on every query",
     );
 
     storage.clear_full_inventory_scan_hook();
@@ -2819,15 +2854,18 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
         hot_retention_window: 10,
         warm_retention_window: 50,
     };
-    let shared_catalog_path = super::super::tiering::shared_segment_catalog_path(&tiered_storage);
     let initial_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
         None,
         None,
         Some(&tiered_storage),
     )
     .unwrap();
-    super::super::tiering::persist_segment_catalog(&shared_catalog_path, &initial_inventory)
-        .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &initial_inventory,
+        None,
+    )
+    .unwrap();
 
     let storage = ChunkStorage::new_with_data_path_and_options(
         2,
@@ -2908,8 +2946,12 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
         Some(&tiered_storage),
     )
     .unwrap();
-    super::super::tiering::persist_segment_catalog(&shared_catalog_path, &updated_inventory)
-        .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &updated_inventory,
+        None,
+    )
+    .unwrap();
 
     storage
         .sync_persisted_segments_from_disk_if_dirty()
@@ -2939,6 +2981,1130 @@ fn remote_catalog_refresh_uses_shared_catalog_without_full_inventory_scans() {
     assert!(!points.contains(&DataPoint::new(1, 1.0)));
     assert!(points.contains(&DataPoint::new(10_000, 10_000.0)));
 
+    storage.clear_full_inventory_scan_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_refresh_uses_exact_item_pages_and_terminal_probe() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "exact")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_exact_pages", &labels)
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=2 {
+        write_numeric_segment_to_path(
+            &hot_lane,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage, 3, 1);
+
+    for _ in 0..2 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        let memory = storage.memory_observability_snapshot();
+        assert!(
+            memory.remote_catalog_staging_bytes > 0,
+            "decoded catalog entries and the resumable reader must stay admitted between wakes",
+        );
+        assert!(memory.accounted_bytes >= memory.remote_catalog_staging_bytes);
+        assert!(
+            storage
+                .persisted
+                .persisted_index
+                .read()
+                .segments_by_root
+                .is_empty(),
+            "catalog entries must remain private until the full generation validates",
+        );
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "a validation page is not a completed refresh",
+        );
+    }
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        1,
+        "one exact item page should publish one addition",
+    );
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .remote
+            .catalog_refreshes_total,
+        0,
+    );
+
+    for _ in 0..3 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "exact-boundary addition/removal pages must not report success before the terminal probe",
+        );
+    }
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let completed = storage.observability_snapshot().remote;
+    assert_eq!(completed.catalog_refreshes_total, 1);
+    assert_eq!(completed.catalog_refresh_errors_total, 0);
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "terminal completion must release the retained catalog cursor and map",
+    );
+    assert_eq!(
+        storage
+            .select("remote_catalog_exact_pages", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_apply_byte_ceiling_has_exact_boundary_and_no_publication_below_it() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "apply-byte-boundary")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_apply_byte_boundary", &labels)
+        .unwrap()
+        .series_id;
+    let root =
+        write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+
+    let probe = finite_compute_only_remote_storage(tiered_storage.clone(), 2, 1);
+    let (apply_required, apply_staging) = probe
+        .remote_catalog_add_apply_limits_for_test(&inventory.entries()[0])
+        .unwrap();
+    assert!(apply_required > 1);
+    assert!(apply_staging > 0);
+    probe.close().unwrap();
+
+    let below = finite_compute_only_remote_storage_with_limits(
+        tiered_storage.clone(),
+        2,
+        1,
+        apply_required - 1,
+    );
+    let rejection = (0..16)
+        .find_map(|_| match below.refresh_remote_catalog_bounded() {
+            Ok(completed) => {
+                assert!(!completed);
+                None
+            }
+            Err(err) => Some(err),
+        })
+        .expect("N-1 maintenance bytes should reject the apply page");
+    assert!(matches!(
+        rejection,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "finite remote segment catalog apply",
+            limit,
+            required,
+        } if limit == apply_required - 1 && required == apply_required
+    ));
+    assert!(!below
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        below
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "a pre-publication maintenance rejection must discard the retained cycle lease",
+    );
+    below.close().unwrap();
+
+    let exact =
+        finite_compute_only_remote_storage_with_limits(tiered_storage, 2, 1, apply_required);
+    for _ in 0..16 {
+        if exact.refresh_remote_catalog_bounded().unwrap() {
+            break;
+        }
+    }
+    assert!(exact
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        exact
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "terminal success at the exact threshold must release the cycle lease",
+    );
+    exact.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_removal_byte_ceiling_has_exact_boundary() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "r".repeat(8 * 1024))];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_remove_byte_boundary", &labels)
+        .unwrap()
+        .series_id;
+    let root = write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &super::super::tiering::SegmentInventory::from_entries(Vec::new()),
+        None,
+    )
+    .unwrap();
+    let load_visible = |storage: &ChunkStorage| {
+        storage
+            .apply_loaded_segment_indexes(
+                crate::engine::segment::load_segment_indexes_from_dirs_with_series(
+                    vec![root.clone()],
+                    true,
+                )
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+    };
+
+    let probe = finite_compute_only_remote_storage(tiered_storage.clone(), 2, 1);
+    load_visible(&probe);
+    let (remove_required, remove_staging) = probe
+        .remote_catalog_remove_apply_limits_for_test(&root)
+        .unwrap();
+    assert!(remove_required > 1);
+    assert!(remove_staging > 0);
+    probe.close().unwrap();
+
+    let below = finite_compute_only_remote_storage_with_limits(
+        tiered_storage.clone(),
+        2,
+        1,
+        remove_required - 1,
+    );
+    load_visible(&below);
+    let rejection = (0..16)
+        .find_map(|_| match below.refresh_remote_catalog_bounded() {
+            Ok(completed) => {
+                assert!(!completed);
+                None
+            }
+            Err(err) => Some(err),
+        })
+        .expect("N-1 maintenance bytes should reject the removal page");
+    assert!(matches!(
+        rejection,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "finite remote segment catalog apply",
+            limit,
+            required,
+        } if limit == remove_required - 1 && required == remove_required
+    ));
+    assert!(below
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        below
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+    );
+    below.close().unwrap();
+
+    let exact =
+        finite_compute_only_remote_storage_with_limits(tiered_storage, 2, 1, remove_required);
+    load_visible(&exact);
+    for _ in 0..16 {
+        if exact.refresh_remote_catalog_bounded().unwrap() {
+            break;
+        }
+    }
+    assert!(!exact
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        exact
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+    );
+    exact.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_reader_memory_admission_has_exact_boundaries_and_close_release() {
+    use std::sync::atomic::Ordering;
+
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "memory")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_memory", &labels)
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage, 2, 1);
+    let base = storage.memory_used_value();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0
+    );
+
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::try_from(base).unwrap(), Ordering::Release);
+    let construction_required = match storage.refresh_remote_catalog_bounded().unwrap_err() {
+        TsinkError::MemoryBudgetExceeded { required, .. } => required,
+        err => panic!("expected cycle construction admission failure, got {err:?}"),
+    };
+    assert!(construction_required > base);
+    storage.memory.budget_bytes.store(
+        u64::try_from(construction_required - 1).unwrap(),
+        Ordering::Release,
+    );
+    assert!(matches!(
+        storage.refresh_remote_catalog_bounded(),
+        Err(TsinkError::MemoryBudgetExceeded { required, .. })
+            if required == construction_required
+    ));
+
+    storage.memory.budget_bytes.store(
+        u64::try_from(construction_required).unwrap(),
+        Ordering::Release,
+    );
+    let reader_required = match storage.refresh_remote_catalog_bounded().unwrap_err() {
+        TsinkError::MemoryBudgetExceeded { required, .. } => required,
+        err => panic!("expected generation page admission failure, got {err:?}"),
+    };
+    assert!(reader_required > construction_required);
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "a failed generation-page admission must discard its cycle lease",
+    );
+
+    storage.memory.budget_bytes.store(
+        u64::try_from(reader_required - 1).unwrap(),
+        Ordering::Release,
+    );
+    assert!(matches!(
+        storage.refresh_remote_catalog_bounded(),
+        Err(TsinkError::MemoryBudgetExceeded { required, .. }) if required == reader_required
+    ));
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::try_from(reader_required).unwrap(), Ordering::Release);
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0,
+        "the exact budget must admit and retain the first decoded page",
+    );
+
+    storage.close().unwrap();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "close must release an incomplete catalog continuation",
+    );
+}
+
+#[test]
+fn finite_remote_catalog_addition_is_memory_admitted_before_visibility_mutation() {
+    use std::sync::atomic::Ordering;
+
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "apply-memory")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_apply_memory", &labels)
+        .unwrap()
+        .series_id;
+    let root =
+        write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage, 2, 1);
+    storage.refresh_memory_usage();
+    let (_, apply_staging) = storage
+        .remote_catalog_add_apply_limits_for_test(&inventory.entries()[0])
+        .unwrap();
+
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    let staged = storage.memory_observability_snapshot();
+    assert!(staged.remote_catalog_staging_bytes > 0);
+    storage.memory.budget_bytes.store(
+        u64::try_from(staged.accounted_bytes).unwrap(),
+        Ordering::Release,
+    );
+    match storage.refresh_remote_catalog_bounded().unwrap_err() {
+        TsinkError::MemoryBudgetExceeded { .. } => {}
+        err => panic!("expected remote addition admission failure, got {err:?}"),
+    }
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+    );
+
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    let restaged = storage.memory_observability_snapshot();
+    let modeled_apply_floor = restaged.accounted_bytes.saturating_add(apply_staging);
+    assert!(modeled_apply_floor > restaged.accounted_bytes);
+    storage.memory.budget_bytes.store(
+        u64::try_from(modeled_apply_floor - 1).unwrap(),
+        Ordering::Release,
+    );
+    let apply_required = match storage.refresh_remote_catalog_bounded() {
+        Err(TsinkError::MemoryBudgetExceeded { required, .. }) => required,
+        result => panic!(
+            "remote addition admission returned {result:?}; expected at least modeled floor {modeled_apply_floor}"
+        ),
+    };
+    assert_eq!(
+        apply_required, modeled_apply_floor,
+        "the complete apply peak should be admitted in one exact reservation step",
+    );
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    storage.memory.budget_bytes.store(
+        u64::try_from(apply_required - 1).unwrap(),
+        Ordering::Release,
+    );
+    assert!(matches!(
+        storage.refresh_remote_catalog_bounded(),
+        Err(TsinkError::MemoryBudgetExceeded { required, .. }) if required == apply_required
+    ));
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::try_from(apply_required).unwrap(), Ordering::Release);
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    let memory = storage.memory_observability_snapshot();
+    assert!(
+        memory.accounted_bytes <= apply_required,
+        "admitted publication must not leave the modeled total over budget",
+    );
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    for _ in 0..8 {
+        if storage.refresh_remote_catalog_bounded().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "terminal completion must release the exact-threshold cycle lease",
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_apply_preflight_failure_has_no_publication_or_residual_lease() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "apply-preflight-failure")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_apply_preflight_failure", &labels)
+        .unwrap()
+        .series_id;
+    let root = write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage, 2, 1);
+
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0,
+        "the validated catalog page should be retained before apply",
+    );
+    std::fs::remove_file(root.join("series.bin")).unwrap();
+
+    let err = (0..8)
+        .find_map(|_| storage.refresh_remote_catalog_bounded().err())
+        .expect("the missing pinned segment metadata must fail apply preflight");
+    assert!(
+        matches!(
+            err,
+            TsinkError::Io(_) | TsinkError::IoWithPath { .. } | TsinkError::DataCorruption(_)
+        ),
+        "unexpected apply-preflight error: {err:?}",
+    );
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "preflight failure must release inspection, apply, and retained-cycle reservations",
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn concurrent_catalog_and_write_reservations_share_one_global_admission_limit() {
+    use std::sync::atomic::Ordering;
+    use std::sync::{mpsc, Arc, Barrier};
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = Arc::new(new_raw_numeric_storage(
+        temp_dir.path().join(NUMERIC_LANE_ROOT),
+        1,
+    ));
+    let base = storage.memory_used_value();
+    const RESERVATION_BYTES: usize = 32 * 1024;
+    storage.memory.budget_bytes.store(
+        u64::try_from(base + RESERVATION_BYTES).unwrap(),
+        Ordering::Release,
+    );
+    let start = Arc::new(Barrier::new(3));
+    let release = Arc::new(Barrier::new(3));
+    let (result_tx, result_rx) = mpsc::channel();
+    let catalog_worker = {
+        let storage = Arc::clone(&storage);
+        let start = Arc::clone(&start);
+        let release = Arc::clone(&release);
+        let result_tx = result_tx.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            let reservation = storage.remote_catalog_memory_reservation(RESERVATION_BYTES);
+            result_tx.send(reservation.is_ok()).unwrap();
+            release.wait();
+            drop(reservation);
+        })
+    };
+    let write_worker = {
+        let storage = Arc::clone(&storage);
+        let start = Arc::clone(&start);
+        let release = Arc::clone(&release);
+        let result_tx = result_tx.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            let reservation = storage.reserve_write_transient_memory(RESERVATION_BYTES);
+            result_tx.send(reservation.is_ok()).unwrap();
+            release.wait();
+            drop(reservation);
+        })
+    };
+    drop(result_tx);
+    start.wait();
+    let admitted = [result_rx.recv().unwrap(), result_rx.recv().unwrap()];
+    assert_eq!(admitted.into_iter().filter(|admitted| *admitted).count(), 1);
+    let active = storage.memory_observability_snapshot();
+    assert_eq!(
+        active
+            .remote_catalog_staging_bytes
+            .saturating_add(active.write_transient_bytes),
+        RESERVATION_BYTES,
+    );
+    assert!(matches!(
+        storage.reserve_write_transient_memory(1),
+        Err(TsinkError::MemoryBudgetExceeded { .. }),
+    ));
+    let mut tombstone_reservation = storage.tombstone_memory_reservation();
+    assert!(matches!(
+        tombstone_reservation.ensure(1),
+        Err(TsinkError::MemoryBudgetExceeded { .. }),
+    ));
+    drop(tombstone_reservation);
+    release.wait();
+    catalog_worker.join().unwrap();
+    write_worker.join().unwrap();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+    );
+    let released_base = storage.memory_used_value();
+    storage.memory.budget_bytes.store(
+        u64::try_from(released_base + RESERVATION_BYTES).unwrap(),
+        Ordering::Release,
+    );
+    drop(
+        storage
+            .remote_catalog_memory_reservation(RESERVATION_BYTES)
+            .unwrap(),
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_refresh_restarts_on_pointer_change_during_scan_and_apply() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "swap")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_pointer_swap", &labels)
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=5 {
+        write_numeric_segment_to_path(
+            &hot_lane,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let complete_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let inventory_for = |segment_ids: &[u64]| {
+        super::super::tiering::SegmentInventory::from_entries(
+            complete_inventory
+                .entries()
+                .iter()
+                .filter(|entry| segment_ids.contains(&entry.manifest.segment_id))
+                .cloned()
+                .collect(),
+        )
+    };
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(&[1, 2]),
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage.clone(), 6, 1);
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let first_generation_staging = storage
+        .memory_observability_snapshot()
+        .remote_catalog_staging_bytes;
+    assert!(first_generation_staging > 0);
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(&[3, 4]),
+        None,
+    )
+    .unwrap();
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        first_generation_staging,
+        "pointer churn must replace, not accumulate, the retained generation lease",
+    );
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        1,
+        "the second pointer should have reached its first bounded addition",
+    );
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .remote
+            .catalog_refreshes_total,
+        0,
+        "a pointer swap during apply must not report the older generation as complete",
+    );
+
+    let final_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(&[5]),
+        None,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if storage
+            .observability_snapshot()
+            .remote
+            .catalog_refreshes_total
+            == 1
+        {
+            break;
+        }
+    }
+    let visible = storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].ends_with("seg-0000000000000005"));
+    assert_eq!(
+        super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage)
+            .unwrap()
+            .generation,
+        final_pointer.generation
+    );
+    let completed = storage.observability_snapshot().remote;
+    assert_eq!(completed.catalog_refreshes_total, 1);
+    assert_eq!(completed.catalog_refresh_errors_total, 0);
+    storage.close().unwrap();
+}
+
+#[test]
+fn repeated_remote_pointer_churn_defers_success_until_publication_quiets() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "churn")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_pointer_churn", &labels)
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=4 {
+        write_numeric_segment_to_path(
+            &hot_lane,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let complete_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let inventory_for = |segment_id| {
+        super::super::tiering::SegmentInventory::from_entries(
+            complete_inventory
+                .entries()
+                .iter()
+                .filter(|entry| entry.manifest.segment_id == segment_id)
+                .cloned()
+                .collect(),
+        )
+    };
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(1),
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage.clone(), 5, 1);
+
+    for next_segment_id in 2..=4 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "a generation replaced before its apply phase must not report success",
+        );
+        assert!(storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .is_empty());
+        super::super::tiering::persist_shared_segment_catalog_budgeted(
+            &tiered_storage,
+            &inventory_for(next_segment_id),
+            None,
+        )
+        .unwrap();
+    }
+
+    for _ in 0..8 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if storage
+            .observability_snapshot()
+            .remote
+            .catalog_refreshes_total
+            == 1
+        {
+            break;
+        }
+    }
+    let completed = storage.observability_snapshot().remote;
+    assert_eq!(completed.catalog_refreshes_total, 1);
+    assert_eq!(completed.catalog_refresh_errors_total, 0);
+    let visible = storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].ends_with("seg-0000000000000004"));
+    storage.close().unwrap();
+}
+
+#[test]
+fn corrupt_v3_generation_keeps_last_remote_visibility_and_never_scans_tier_roots() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "corrupt")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_corruption", &labels)
+        .unwrap()
+        .series_id;
+    let first_root =
+        write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 2, &[(2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let complete_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let inventory_for = |segment_id| {
+        super::super::tiering::SegmentInventory::from_entries(
+            complete_inventory
+                .entries()
+                .iter()
+                .filter(|entry| entry.manifest.segment_id == segment_id)
+                .cloned()
+                .collect(),
+        )
+    };
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(1),
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage.clone(), 3, 1_024);
+    storage
+        .apply_loaded_segment_indexes(
+            crate::engine::segment::load_segment_indexes_from_dirs_with_series(
+                vec![first_root.clone()],
+                true,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+    storage.mark_remote_catalog_refresh_success();
+    std::thread::sleep(Duration::from_millis(5));
+
+    let corrupt_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory_for(2),
+        None,
+    )
+    .unwrap();
+    let corrupt_path = super::super::tiering::shared_segment_catalog_generation_path(
+        &tiered_storage,
+        corrupt_pointer.generation,
+    );
+    let mut corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    *corrupt_bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
+
+    let full_scans = Arc::new(AtomicUsize::new(0));
+    storage.set_full_inventory_scan_hook({
+        let full_scans = Arc::clone(&full_scans);
+        move || {
+            full_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "a corrupt generation must release reader and staged-map memory before backoff",
+    );
+
+    let visible = storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(visible, vec![first_root]);
+    assert_eq!(
+        storage
+            .select("remote_catalog_corruption", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    assert_eq!(full_scans.load(Ordering::SeqCst), 0);
+    let failed = storage.observability_snapshot().remote;
+    assert_eq!(failed.catalog_refresh_errors_total, 1);
+    assert_eq!(failed.consecutive_refresh_failures, 1);
+    assert!(failed.backoff_active);
     storage.clear_full_inventory_scan_hook();
     storage.close().unwrap();
 }
@@ -3263,6 +4429,11 @@ fn unknown_dirty_catalog_failed_page_retries_its_exact_root_delta() {
         .read()
         .segments_by_root
         .contains_key(&root));
+    assert_eq!(
+        storage.observability_snapshot().flush.hot_segments_visible,
+        1,
+        "a post-index-mutation failure must publish the exact visible-root counter delta"
+    );
     assert!(storage
         .persisted
         .persisted_index_dirty
@@ -3290,6 +4461,11 @@ fn unknown_dirty_catalog_failed_page_retries_its_exact_root_delta() {
             .unwrap(),
         vec![DataPoint::new(1, 1.0)]
     );
+    assert_eq!(
+        storage.observability_snapshot().flush.hot_segments_visible,
+        1,
+        "retry must not double-apply a counter delta already reconciled on failure"
+    );
     let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
     let inventory =
         super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
@@ -3302,6 +4478,85 @@ fn unknown_dirty_catalog_failed_page_retries_its_exact_root_delta() {
     .is_some());
 
     storage.clear_catalog_transition_post_index_mutation_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn unknown_dirty_catalog_restarts_after_a_retained_root_disappears() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = bounded_catalog_refresh_storage(&lane_path, 3, 1, 256 * 1024 * 1024);
+    storage.persist_series_registry_index().unwrap();
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "disappeared")];
+    let series_id = registry
+        .resolve_or_insert("paged_unknown_dirty_disappearance", &labels)
+        .unwrap()
+        .series_id;
+    let disappeared_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    for _ in 0..16 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if storage.bounded_unknown_dirty_catalog_retains_root_for_test(&disappeared_root) {
+            break;
+        }
+    }
+    assert!(
+        storage.bounded_unknown_dirty_catalog_retains_root_for_test(&disappeared_root),
+        "test did not reach the retained-snapshot boundary"
+    );
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&disappeared_root));
+
+    crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&disappeared_root).unwrap();
+    let replacement_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(2, 2.0)]);
+
+    for _ in 0..64 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+    }
+
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    let persisted_index = storage.persisted.persisted_index.read();
+    assert!(!persisted_index
+        .segments_by_root
+        .contains_key(&disappeared_root));
+    assert!(persisted_index
+        .segments_by_root
+        .contains_key(&replacement_root));
+    drop(persisted_index);
+    assert_eq!(
+        storage
+            .select("paged_unknown_dirty_disappearance", &labels, 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(2, 2.0)]
+    );
+
     storage.close().unwrap();
 }
 
@@ -4123,6 +5378,15 @@ fn snapshot_fences_background_flush_before_copying_wal_state() {
         )
         .unwrap(),
     );
+    let fixture_manifest_builder = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(4_096)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::MAX);
+    super::super::data_directory_manifest::install_current_manifest_for_test(
+        &fixture_manifest_builder,
+    )
+    .unwrap();
 
     storage
         .insert_rows(&[
@@ -4173,6 +5437,7 @@ fn snapshot_fences_background_flush_before_copying_wal_state() {
         .with_data_path(&restore_path)
         .with_chunk_points(4_096)
         .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::MAX)
         .build()
         .unwrap();
     assert_eq!(
@@ -4183,6 +5448,433 @@ fn snapshot_fences_background_flush_before_copying_wal_state() {
     );
 
     restored.close().unwrap();
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_rejects_earlier_source_tree_mutation_before_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    let fixture_manifest_builder = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::MAX);
+    super::super::data_directory_manifest::install_current_manifest_for_test(
+        &fixture_manifest_builder,
+    )
+    .unwrap();
+
+    storage.set_snapshot_pre_publication_hook({
+        let lane_path = lane_path.clone();
+        move || {
+            std::fs::write(lane_path.join("late-source-entry"), b"late").unwrap();
+            Ok(())
+        }
+    });
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+    storage.clear_snapshot_pre_publication_hook();
+
+    assert!(
+        err.to_string()
+            .contains("snapshot source changed before publication"),
+        "unexpected late-source mutation error: {err}"
+    );
+    assert!(
+        !snapshot_path.exists(),
+        "a snapshot with a late source mutation must not be published"
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_aggregate_entry_limit_accepts_exact_n_and_rejects_n_plus_one() {
+    super::super::ensure_snapshot_aggregate_entry_limit(crate::MAX_SNAPSHOT_RESTORE_ENTRIES)
+        .expect("the exact aggregate restore entry limit must be accepted");
+    let err = super::super::ensure_snapshot_aggregate_entry_limit(
+        crate::MAX_SNAPSHOT_RESTORE_ENTRIES + 1,
+    )
+    .expect_err("one aggregate entry beyond the restore limit must be rejected");
+    assert!(err.to_string().contains("snapshot aggregate entry count"));
+    assert!(err
+        .to_string()
+        .contains(&crate::MAX_SNAPSHOT_RESTORE_ENTRIES.to_string()));
+}
+
+#[test]
+fn snapshot_publication_sync_failure_retains_the_visible_destination() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_retention_enforced(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "snapshot_publication_failure",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    let sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+        temp_dir.path().to_path_buf(),
+        "injected snapshot publication parent sync failure",
+    );
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+    drop(sync_failure);
+
+    assert!(
+        err.to_string()
+            .contains("injected snapshot publication parent sync failure"),
+        "unexpected snapshot error: {err}"
+    );
+    assert!(
+        crate::engine::fs_utils::path_exists_no_follow(&snapshot_path).unwrap(),
+        "an error after rename must retain the visible destination because its durability is indeterminate"
+    );
+    assert!(
+        !std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-tsink-snapshot-")
+        }),
+        "the renamed staging pathname must remain absent"
+    );
+    assert_eq!(
+        storage
+            .select("snapshot_publication_failure", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)],
+        "snapshot cleanup must not mutate the live source"
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_postrename_cleanup_preserves_a_raced_staging_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_retention_enforced(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "snapshot_identity_cleanup",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+
+    let synchronized_parent = temp_dir.path().to_path_buf();
+    let destination_for_hook = snapshot_path.clone();
+    let observed_staging = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+    let staging_for_hook = std::sync::Arc::clone(&observed_staging);
+    let sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-tsink-snapshot-"))
+            {
+                *staging_for_hook
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(path.to_path_buf());
+                return false;
+            }
+            if path != synchronized_parent || !destination_for_hook.exists() {
+                return false;
+            }
+            std::fs::write(
+                destination_for_hook.join("consumer-created"),
+                b"consumer-state",
+            )
+            .unwrap();
+            let raced_staging = staging_for_hook
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .expect("snapshot staging must have been synchronized before publication");
+            std::fs::create_dir(&raced_staging).unwrap();
+            std::fs::write(raced_staging.join("foreign"), b"foreign-state").unwrap();
+            true
+        },
+        "injected post-rename sync failure with a raced staging path",
+    );
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+    drop(sync_failure);
+
+    assert!(
+        err.to_string()
+            .contains("injected post-rename sync failure"),
+        "{err}"
+    );
+    assert!(
+        snapshot_path.exists(),
+        "a visible destination must be retained after parent-sync failure"
+    );
+    assert_eq!(
+        std::fs::read(snapshot_path.join("consumer-created")).unwrap(),
+        b"consumer-state",
+        "post-rename consumer data must never be removed by snapshot cleanup"
+    );
+    let raced_staging = observed_staging
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(raced_staging.join("foreign")).unwrap(),
+        b"foreign-state",
+        "cleanup must not mistake the raced staging pathname for the published snapshot"
+    );
+    assert_eq!(
+        storage
+            .select("snapshot_identity_cleanup", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_existing_destination_is_rejected_without_mutating_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    std::fs::create_dir(&snapshot_path).unwrap();
+    std::fs::write(snapshot_path.join("owner.txt"), b"preexisting").unwrap();
+
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_retention_enforced(false)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+
+    assert!(matches!(err, TsinkError::InvalidConfiguration(message)
+        if message.contains("snapshot destination already exists")));
+    assert_eq!(
+        std::fs::read(snapshot_path.join("owner.txt")).unwrap(),
+        b"preexisting"
+    );
+    assert_eq!(std::fs::read_dir(&snapshot_path).unwrap().count(), 1);
+    assert!(
+        !std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-tsink-snapshot-")
+        }),
+        "preflight rejection must not create a staging namespace"
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_destination_created_during_copy_is_not_replaced() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let wal_path = temp_dir.path().join(WAL_DIR_NAME);
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    let storage = std::sync::Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            2,
+            Some(wal),
+            Some(lane_path),
+            None,
+            1,
+            options,
+        )
+        .unwrap(),
+    );
+    let fixture_manifest_builder = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_chunk_points(2)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_partition_duration(Duration::MAX);
+    super::super::data_directory_manifest::install_current_manifest_for_test(
+        &fixture_manifest_builder,
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[Row::new("snapshot_noreplace_race", DataPoint::new(1, 1.0))])
+        .unwrap();
+
+    storage.set_snapshot_pre_wal_copy_hook({
+        let snapshot_path = snapshot_path.clone();
+        move || std::fs::create_dir(&snapshot_path).unwrap()
+    });
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+    storage.clear_snapshot_pre_wal_copy_hook();
+
+    assert!(
+        err.to_string()
+            .contains(&snapshot_path.display().to_string()),
+        "unexpected no-replace publication error: {err}"
+    );
+    assert!(
+        snapshot_path.is_dir(),
+        "the destination created by another owner must remain"
+    );
+    assert_eq!(
+        std::fs::read_dir(&snapshot_path).unwrap().count(),
+        0,
+        "snapshot publication must not add entries to the raced destination"
+    );
+    assert!(
+        !std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-tsink-snapshot-")
+        }),
+        "the losing owned staging tree must be removed"
+    );
+    assert_eq!(
+        storage
+            .select("snapshot_noreplace_race", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 1.0)],
+        "a destination race must not mutate the live source"
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_copied_subtree_sync_failure_retains_unverified_staging() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let snapshot_path = temp_dir.path().join("snapshot");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "snapshot_copy_sync_failure",
+            DataPoint::new(1, 2.0),
+        )])
+        .unwrap();
+
+    let expected_snapshot_parent = temp_dir.path().to_path_buf();
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| {
+            path.file_name().is_some_and(|name| name == WAL_DIR_NAME)
+                && path.starts_with(&expected_snapshot_parent)
+                && path.to_string_lossy().contains(".tmp-tsink-snapshot-")
+        },
+        "injected copied WAL directory sync failure",
+    );
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("injected copied WAL directory sync failure"),
+        "unexpected snapshot copy error: {err}"
+    );
+    assert!(!snapshot_path.exists());
+    let staging = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-tsink-snapshot-"))
+        })
+        .expect("a copy-time sync failure before identity capture must retain staging");
+    assert!(staging.join(WAL_DIR_NAME).exists());
+    assert_eq!(
+        storage
+            .select("snapshot_copy_sync_failure", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 2.0)]
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn snapshot_synchronizes_missing_destination_ancestors_before_staging() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let destination_root = temp_dir.path().join("snapshot-root");
+    let snapshot_path = destination_root.join("nested/snapshot");
+    let storage = StorageBuilder::new()
+        .with_data_path(&data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new(
+            "snapshot_ancestor_sync_failure",
+            DataPoint::new(1, 3.0),
+        )])
+        .unwrap();
+
+    let synchronized_parent = destination_root.clone();
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| path == synchronized_parent,
+        "injected snapshot ancestor sync failure",
+    );
+    let err = storage.snapshot(&snapshot_path).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("injected snapshot ancestor sync failure"),
+        "unexpected snapshot ancestry error: {err}"
+    );
+    assert!(!snapshot_path.exists());
+    assert!(
+        std::fs::read_dir(destination_root.join("nested"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-tsink-snapshot-")),
+        "ancestor synchronization must fail before staging creation"
+    );
+    assert_eq!(
+        storage
+            .select("snapshot_ancestor_sync_failure", &[], 0, 10)
+            .unwrap(),
+        vec![DataPoint::new(1, 3.0)]
+    );
     storage.close().unwrap();
 }
 
@@ -4872,6 +6564,119 @@ fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_s
 }
 
 #[test]
+fn finite_tiered_known_dirty_diff_advances_without_replaying_visibility_mutation() {
+    use std::sync::atomic::Ordering;
+
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let local_lane = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: Some(data_dir.path().join("local-tiered-catalog.json")),
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let shared_hot_lane = tiered_storage.lane_path(
+        super::super::tiering::SegmentLaneFamily::Numeric,
+        super::super::tiering::PersistedSegmentTier::Hot,
+    );
+    let labels = vec![Label::new("host", "known-dirty")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("finite_tiered_known_dirty", &labels)
+        .unwrap()
+        .series_id;
+    let added_root =
+        write_numeric_segment_to_path(&shared_hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(local_lane),
+        None,
+        2,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            maintenance_max_items_per_pass: 4,
+            maintenance_max_bytes_per_pass: u64::MAX,
+            tiered_storage: Some(tiered_storage.clone()),
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
+    storage.persist_series_registry_index().unwrap();
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(added_root.clone()), std::iter::empty());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(
+        !storage.has_known_persisted_segment_changes(),
+        "the already-installed diff must transfer ownership to the retained publication cursor"
+    );
+    assert!(storage.bounded_tiered_catalog_publication_is_pending());
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&added_root));
+    let installed_visibility_generation = storage.visibility_state_generation();
+
+    let mut continuation_passes = 1usize;
+    while storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst)
+    {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        continuation_passes = continuation_passes.saturating_add(1);
+        assert!(
+            continuation_passes < 64,
+            "finite known-dirty catalog publication failed to converge"
+        );
+        assert_eq!(
+            storage.visibility_state_generation(),
+            installed_visibility_generation,
+            "cursor wakes must not replay the already-installed root transition"
+        );
+    }
+    assert!(continuation_passes > 1);
+    assert!(!storage.bounded_tiered_catalog_publication_is_pending());
+    let pointer =
+        super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage).unwrap();
+    assert_eq!(pointer.entry_count, 1);
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .memory
+            .remote_catalog_staging_bytes,
+        0
+    );
+    let inventory = storage.persisted_segment_inventory();
+    assert_eq!(inventory.entries().len(), 1);
+    assert_eq!(inventory.entries()[0].root, added_root);
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &data_dir.path().join(SERIES_INDEX_FILE_NAME),
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
 fn background_post_flush_maintenance_stage_does_not_block_queries() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5029,6 +6834,177 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
 
     storage.clear_post_flush_maintenance_stage_hook();
     storage.close().unwrap();
+}
+
+#[test]
+fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reapplying() {
+    use std::sync::atomic::Ordering;
+
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let checkpoint_path = data_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let hot_root = hot_lane
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000001");
+    let labels = vec![Label::new("host", "bounded-marker")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_post_flush_marker", &labels)
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(
+        &hot_lane,
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(60, 60.0), (61, 61.0)],
+    );
+
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: Some(data_dir.path().join("local-tiered-catalog.json")),
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(hot_lane.clone()),
+        None,
+        2,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_window: 100,
+            future_skew_window: default_future_skew_window(TimestampPrecision::Seconds),
+            max_future_skew_window: None,
+            retention_enforced: true,
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            partition_window: i64::MAX,
+            max_active_partition_heads_per_series:
+                crate::storage::DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+            max_writers: 2,
+            write_timeout: Duration::from_secs(1),
+            memory_budget_bytes: u64::MAX,
+            cardinality_limit: usize::MAX,
+            max_labels_per_series: crate::label::DEFAULT_MAX_LABELS_PER_SERIES,
+            max_series_identity_bytes: crate::label::DEFAULT_MAX_SERIES_IDENTITY_BYTES,
+            max_new_series_per_window: None,
+            new_series_window_units: 1,
+            new_series_window_nanos: 60_000_000_000,
+            write_batch_limits: Default::default(),
+            wal_size_limit_bytes: u64::MAX,
+            admission_poll_interval: DEFAULT_ADMISSION_POLL_INTERVAL,
+            compaction_interval: DEFAULT_COMPACTION_INTERVAL,
+            maintenance_max_items_per_pass: 4,
+            maintenance_max_bytes_per_pass: u64::MAX,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            metadata_shard_count: None,
+            remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
+            remote_segment_refresh_interval: Duration::from_secs(5),
+            tiered_storage: Some(tiered_storage.clone()),
+            #[cfg(test)]
+            current_time_override: Some(100),
+        },
+    )
+    .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&hot_lane).unwrap(), false)
+        .unwrap();
+    storage.checkpoint_series_registry_index().unwrap();
+    storage
+        .refresh_segment_catalog_and_observability_from_persisted_state(&[])
+        .unwrap();
+    let initial_pointer =
+        super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage).unwrap();
+    let initial_entry = storage.persisted_segment_inventory().entries()[0].clone();
+    let warm_root = super::super::tiering::destination_segment_root(
+        &tiered_storage,
+        initial_entry.lane,
+        super::super::tiering::PersistedSegmentTier::Warm,
+        &initial_entry.manifest,
+    );
+
+    storage
+        .coordination
+        .post_flush_maintenance_pending
+        .store(true, Ordering::SeqCst);
+    let marker_dir = data_dir.path().join(".post-flush-replacements");
+    let mut passes = 0usize;
+    let mut observed_deferred_marker = false;
+    while storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::SeqCst)
+        || storage
+            .coordination
+            .startup_metadata_reconcile_pending
+            .load(Ordering::SeqCst)
+    {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        passes = passes.saturating_add(1);
+        assert!(
+            passes < 128,
+            "finite post-flush marker/catalog publication failed to converge"
+        );
+
+        let marker_present = marker_dir
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some());
+        if marker_present {
+            observed_deferred_marker = true;
+            assert!(
+                hot_root.exists(),
+                "the source root must remain durable until pointer publication completes"
+            );
+            assert_eq!(
+                super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage)
+                    .unwrap(),
+                initial_pointer,
+                "a retained Committing marker must keep finite readers on the prior pointer"
+            );
+        }
+    }
+
+    assert!(passes > 1);
+    assert!(
+        observed_deferred_marker,
+        "the finite publication should retain a real Committing marker across wakes"
+    );
+    assert!(!hot_root.exists());
+    assert!(warm_root.exists());
+    super::super::maintenance::ensure_no_pending_post_flush_replacement(data_dir.path()).unwrap();
+    assert!(!storage.bounded_tiered_catalog_publication_is_pending());
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .memory
+            .remote_catalog_staging_bytes,
+        0
+    );
+    let replacement_pointer =
+        super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage).unwrap();
+    assert!(replacement_pointer.generation > initial_pointer.generation);
+    assert_eq!(replacement_pointer.entry_count, 1);
+
+    let visible_inventory = storage.persisted_segment_inventory();
+    assert_eq!(visible_inventory.entries().len(), 1);
+    assert_eq!(visible_inventory.entries()[0].root, warm_root);
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&visible_inventory),
+    )
+    .unwrap()
+    .is_some());
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
 }
 
 #[test]
@@ -5546,4 +7522,239 @@ fn close_waits_for_inflight_background_refresh_before_final_persist() {
         .is_ok());
     close_thread.join().unwrap();
     assert!(scan_calls.load(Ordering::SeqCst) >= 1);
+}
+
+fn bounded_metadata_reconciliation_storage(max_items: usize, max_bytes: u64) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            maintenance_max_items_per_pass: max_items,
+            maintenance_max_bytes_per_pass: max_bytes,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn live_metadata_reconciliation_obeys_exact_item_boundary_across_wakes() {
+    let storage = bounded_metadata_reconciliation_storage(2, u64::MAX);
+    storage.mark_materialized_series_ids(1..=5);
+
+    assert!(storage.run_live_metadata_reconciliation_page().unwrap());
+    assert_eq!(storage.materialized_series_snapshot(), vec![3, 4, 5]);
+    assert_eq!(
+        storage
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .after_series_id,
+        Some(2),
+    );
+
+    assert!(storage.run_live_metadata_reconciliation_page().unwrap());
+    assert_eq!(storage.materialized_series_snapshot(), vec![5]);
+    assert_eq!(
+        storage
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .after_series_id,
+        Some(4),
+    );
+
+    // The fifth item is the N+1 boundary for the preceding page. Its removal changes the
+    // visibility generation, so a final empty verification cycle is deliberately retained.
+    assert!(storage.run_live_metadata_reconciliation_page().unwrap());
+    assert!(storage.materialized_series_snapshot().is_empty());
+    assert_eq!(
+        storage
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .phase,
+        super::super::BackgroundMetadataReconciliationPhase::Verify,
+    );
+    assert!(!storage.run_live_metadata_reconciliation_page().unwrap());
+    let terminal_cursor = storage
+        .coordination
+        .background_metadata_reconciliation_cursor
+        .lock();
+    assert_eq!(terminal_cursor.after_series_id, None);
+    assert!(!terminal_cursor.cycle_started);
+    assert!(!terminal_cursor.cycle_generation_changed);
+}
+
+#[test]
+fn live_metadata_reconciliation_exact_live_multiple_finishes_without_empty_wake() {
+    let storage = bounded_metadata_reconciliation_storage(2, u64::MAX);
+    storage
+        .insert_rows(&[
+            Row::new("metadata_reconcile_exact_live_a", DataPoint::new(1, 1.0)),
+            Row::new("metadata_reconcile_exact_live_b", DataPoint::new(1, 2.0)),
+        ])
+        .unwrap();
+    assert_eq!(storage.materialized_series_snapshot().len(), 2);
+
+    assert!(
+        !storage.run_live_metadata_reconciliation_page().unwrap(),
+        "an exact live multiple should use its terminal cursor probe in the same page",
+    );
+    assert_eq!(storage.materialized_series_snapshot().len(), 2);
+    assert_eq!(
+        storage
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .after_series_id,
+        None,
+    );
+}
+
+#[test]
+fn metadata_reconciliation_active_range_model_matches_full_traversal_count() {
+    let storage = bounded_metadata_reconciliation_storage(8, u64::MAX);
+    storage
+        .insert_rows(&[
+            Row::new("metadata_reconcile_active_model", DataPoint::new(1, 1.0)),
+            Row::new("metadata_reconcile_active_model", DataPoint::new(2, 2.0)),
+            Row::new("metadata_reconcile_active_model", DataPoint::new(3, 3.0)),
+        ])
+        .unwrap();
+    let series_id = storage.materialized_series_snapshot()[0];
+    storage.clear_series_visible_timestamp_cache(std::iter::once(series_id));
+
+    // In test builds the production point_count() fast path asserts equality with the complete
+    // partition-order traversal used by query-deadline-aware preflight.
+    let modeled =
+        storage.series_visibility_refresh_staging_upper_bound(std::iter::once(&series_id));
+    assert!(modeled > 512);
+}
+
+#[test]
+fn live_metadata_reconciliation_obeys_exact_byte_dependency_window() {
+    let probe = bounded_metadata_reconciliation_storage(8, u64::MAX);
+    probe.mark_materialized_series_ids(std::iter::once(1));
+    let exact_bytes = probe.modeled_metadata_reconciliation_item_bytes(1);
+    drop(probe);
+
+    let exact = bounded_metadata_reconciliation_storage(8, exact_bytes);
+    exact.mark_materialized_series_ids(std::iter::once(1));
+    assert!(exact.run_live_metadata_reconciliation_page().unwrap());
+    assert!(exact.materialized_series_snapshot().is_empty());
+
+    let below = bounded_metadata_reconciliation_storage(8, exact_bytes.saturating_sub(1));
+    below.mark_materialized_series_ids(std::iter::once(1));
+    let error = below
+        .run_live_metadata_reconciliation_page()
+        .expect_err("N-1 bytes must reject the indivisible series dependency window");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "live metadata reconciliation series",
+            item_limit: 8,
+            byte_limit,
+            selected_items: 0,
+            selected_bytes: 0,
+        } if byte_limit == exact_bytes - 1
+    ));
+    assert_eq!(below.materialized_series_snapshot(), vec![1]);
+    assert_eq!(
+        below
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .after_series_id,
+        None,
+        "a failed dependency window must not advance or retain an owned page",
+    );
+    below.reset_background_metadata_reconciliation_cursor();
+    let reset_cursor = below
+        .coordination
+        .background_metadata_reconciliation_cursor
+        .lock();
+    assert_eq!(reset_cursor.after_series_id, None);
+    assert!(!reset_cursor.cycle_started);
+    assert!(!reset_cursor.cycle_generation_changed);
+}
+
+#[test]
+fn live_metadata_reconciliation_revalidates_ids_reinserted_behind_cursor() {
+    let storage = bounded_metadata_reconciliation_storage(2, u64::MAX);
+    storage.mark_materialized_series_ids(1..=4);
+
+    assert!(storage.run_live_metadata_reconciliation_page().unwrap());
+    assert_eq!(storage.materialized_series_snapshot(), vec![3, 4]);
+
+    // Simulate a writer reviving an already visited identity. The insertion generation forces a
+    // verification cycle, which reaches the lower ID without rescanning from the root each wake.
+    storage.mark_materialized_series_ids(std::iter::once(1));
+    let mut passes = 0usize;
+    while storage.run_live_metadata_reconciliation_page().unwrap() {
+        passes = passes.saturating_add(1);
+        assert!(passes < 8, "metadata reconciliation failed to converge");
+    }
+    assert!(storage.materialized_series_snapshot().is_empty());
+    assert!(
+        passes >= 2,
+        "the changed generation must require a clean verification sweep",
+    );
+}
+
+#[test]
+fn startup_metadata_reconciliation_pending_bit_tracks_bounded_continuations() {
+    let storage = bounded_metadata_reconciliation_storage(1, u64::MAX);
+    storage.mark_materialized_series_ids(1..=2);
+    storage.schedule_startup_maintenance();
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert!(storage
+        .coordination
+        .startup_metadata_reconcile_pending
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(storage.materialized_series_snapshot(), vec![2]);
+
+    let mut passes = 0usize;
+    while storage
+        .coordination
+        .startup_metadata_reconcile_pending
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        passes = passes.saturating_add(1);
+        assert!(passes < 8, "pending reconciliation failed to settle");
+    }
+    assert!(storage.materialized_series_snapshot().is_empty());
+    assert!(!storage.run_post_flush_maintenance_if_pending().unwrap());
+}
+
+#[test]
+fn close_releases_retained_metadata_reconciliation_cursor() {
+    let storage = bounded_metadata_reconciliation_storage(1, u64::MAX);
+    storage.mark_materialized_series_ids(1..=3);
+    assert!(storage.run_live_metadata_reconciliation_page().unwrap());
+    assert_eq!(
+        storage
+            .coordination
+            .background_metadata_reconciliation_cursor
+            .lock()
+            .after_series_id,
+        Some(1),
+    );
+
+    storage.close().unwrap();
+
+    let cursor = storage
+        .coordination
+        .background_metadata_reconciliation_cursor
+        .lock();
+    assert_eq!(cursor.after_series_id, None);
+    assert!(!cursor.cycle_started);
+    assert!(!cursor.cycle_generation_changed);
 }

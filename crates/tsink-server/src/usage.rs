@@ -6,8 +6,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tsink::{DiskCategory, Label, LocalDiskBudget, MetricSeries, Storage};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tsink::{
+    modeled_write_batch_input_bytes, DiskCategory, HistogramBucketSpan, Label, LocalDiskBudget,
+    MetricSeries, NativeHistogram, QueryCancellationToken, QueryExecution,
+    QueryExecutionAccounting, QueryExecutionSnapshot, QueryMemoryReservation, QueryRowsScanOptions,
+    QueryWorkLimits, Row, SeriesSelection, Storage, Value,
+};
+use xxhash_rust::xxh64::Xxh64;
 
 const USAGE_LEDGER_DIR: &str = "usage-accounting";
 const USAGE_LEDGER_FILE: &str = "ledger.ndjson";
@@ -16,6 +22,23 @@ const USAGE_LEDGER_BATCH_SCHEMA_VERSION: u16 = 1;
 const ESTIMATED_SERIES_OVERHEAD_BYTES: u64 = 64;
 const ESTIMATED_SAMPLE_BYTES: u64 = 16;
 const STORAGE_RECONCILE_BATCH_SIZE: usize = 128;
+const STORAGE_RECONCILE_PAGE_MAX_ROWS: usize = 128;
+const STORAGE_RECONCILE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const STORAGE_RECONCILE_MAX_MANIFEST_SERIES: usize = 1_000_000;
+const STORAGE_RECONCILE_PAGE_MEMORY_MULTIPLIER: usize = 4;
+const STORAGE_RECONCILE_OPERATION_MEMORY_MULTIPLIER: usize = 4;
+const STORAGE_RECONCILE_TOTAL_BYTES_MULTIPLIER: usize = 8;
+const STORAGE_RECONCILE_MAX_ROWS_PER_PASS: u64 = 1_000_000;
+const STORAGE_RECONCILE_MAX_SAMPLES_SCANNED_PER_PAGE: u64 = 1_000_000;
+const STORAGE_RECONCILE_MAX_SAMPLES_SCANNED_PER_PASS: u64 = 4_000_000;
+const STORAGE_RECONCILE_MAX_PAGES_PER_PASS: u64 = 100_000;
+const STORAGE_RECONCILE_OPERATION_WALL_TIME: Duration = Duration::from_secs(120);
+const STORAGE_RECONCILE_MAX_SNAPSHOT_ATTEMPTS: usize = 2;
+const STORAGE_RECONCILE_PASSES_PER_ATTEMPT: u64 = 2;
+const STORAGE_RECONCILE_MANIFESTS_PER_ATTEMPT: u64 = 2;
+const STORAGE_RECONCILE_FINGERPRINT_SEED_A: u64 = 0x9e37_79b1_85eb_ca87;
+const STORAGE_RECONCILE_FINGERPRINT_SEED_B: u64 = 0xc2b2_ae3d_27d4_eb4f;
+const STORAGE_RECONCILE_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 const USAGE_LEDGER_STARTUP_READER_MAX_BYTES: usize = 8 * 1024;
 const USAGE_LEDGER_STARTUP_INDEX_ALLOWANCE_BYTES: usize = 64;
 
@@ -882,6 +905,45 @@ impl UsageAccounting {
         }
     }
 
+    async fn append_prepared_storage_reconciliation_async(
+        &self,
+        prepared: PreparedStorageReconciliation,
+    ) -> Result<Vec<UsageLedgerRecord>, UsageAccountingError> {
+        let permit = match Arc::clone(&self.inner.async_append_serialization)
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(err) => {
+                let err = UsageAccountingError::Other(format!(
+                    "usage accounting append coordinator is closed: {err}"
+                ));
+                self.note_failure(&err);
+                return Err(err);
+            }
+        };
+        let accounting = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let PreparedStorageReconciliation {
+                records,
+                _operation_memory,
+            } = prepared;
+            let result = accounting.append_records(records);
+            drop(_operation_memory);
+            result
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => {
+                let err = append_task_join_failure("reconciliation append", join_err);
+                self.note_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
     pub async fn record_best_effort(&self, input: UsageRecordInput<'_>) {
         if self.record_async(input).await.is_err() {
             // append_records records a fixed-cardinality health failure and emits a rate-limited
@@ -1371,19 +1433,23 @@ impl UsageAccounting {
         &self,
         storage: &Arc<dyn Storage>,
     ) -> Result<Vec<UsageStorageSnapshot>, UsageAccountingError> {
-        let records = collect_storage_reconciliation_records(storage, self.inner.limits)?;
-        Ok(storage_snapshots_from_records(
-            self.append_records(records)?,
-        ))
+        let prepared = collect_storage_reconciliation_records(storage, self.inner.limits)?;
+        let PreparedStorageReconciliation {
+            records,
+            _operation_memory,
+        } = prepared;
+        let records = self.append_records(records)?;
+        drop(_operation_memory);
+        Ok(storage_snapshots_from_records(records))
     }
 
     pub async fn reconcile_storage_async(
         &self,
         storage: Arc<dyn Storage>,
     ) -> Result<Vec<UsageStorageSnapshot>, UsageAccountingError> {
-        // Bound full-database scans independently from ordinary ledger appends. Holding this
-        // permit through publication also gives concurrent admin reconciliation requests a clear
-        // whole-operation order without coupling request metering to scan latency.
+        // Bound reconciliation independently from ordinary ledger appends. Holding this permit
+        // through publication also gives concurrent admin requests a clear whole-operation order
+        // without coupling request metering to scan latency.
         let reconciliation_permit = match Arc::clone(&self.inner.async_reconcile_serialization)
             .acquire_owned()
             .await
@@ -1397,27 +1463,13 @@ impl UsageAccounting {
                 return Err(err);
             }
         };
-        // The storage scan can be substantially slower than the final ledger append. Keep it off
-        // runtime workers, but do not hold the one-permit append coordinator while it runs so
-        // ordinary request metering remains independent of reconciliation latency.
-        let limits = self.inner.limits;
-        let records = match tokio::task::spawn_blocking(move || {
-            collect_storage_reconciliation_records(&storage, limits)
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(join_err) => {
-                let err = UsageAccountingError::Other(format!(
-                    "usage accounting reconciliation scan task failed: {join_err}"
-                ));
-                self.note_failure(&err);
-                return Err(err);
-            }
-        };
-
+        // Each metadata read and row page runs as a separate bounded blocking task. Cursor and
+        // aggregate state remain in this future between awaits, so cancellation before append
+        // drops all unpublished state after at most the currently running bounded task completes.
+        let prepared =
+            collect_storage_reconciliation_records_async(storage, self.inner.limits).await?;
         let records = self
-            .append_records_async(records, "reconciliation append")
+            .append_prepared_storage_reconciliation_async(prepared)
             .await?;
         drop(reconciliation_permit);
         Ok(storage_snapshots_from_records(records))
@@ -1436,40 +1488,1542 @@ fn append_task_join_failure(
 fn collect_storage_reconciliation_records(
     storage: &Arc<dyn Storage>,
     limits: UsageLedgerLimits,
-) -> Result<Vec<UsageLedgerRecord>, UsageAccountingError> {
-    let metrics = storage.list_metrics().map_err(|err| {
-        UsageAccountingError::Other(format!(
-            "usage storage reconciliation failed to list metrics: {err}"
-        ))
-    })?;
-    let mut per_tenant = BTreeMap::<String, StorageAccumulator>::new();
+) -> Result<PreparedStorageReconciliation, UsageAccountingError> {
+    let scan_limits = StorageReconciliationScanLimits::from_ledger_limits(limits)?;
+    let execution = admit_storage_reconciliation_execution(storage, scan_limits)?;
+    for _attempt in 0..scan_limits.max_snapshot_attempts {
+        let plan = load_storage_reconciliation_plan(storage, limits, scan_limits, &execution)?;
+        let Some(first_pass) =
+            run_storage_reconciliation_pass(storage, &plan, scan_limits, &execution)?
+        else {
+            continue;
+        };
+        let Some(second_pass) =
+            run_storage_reconciliation_pass(storage, &plan, scan_limits, &execution)?
+        else {
+            continue;
+        };
+        let final_manifest =
+            load_storage_reconciliation_manifest(storage, scan_limits, &execution)?;
+        if first_pass == second_pass && plan.metrics() == final_manifest.metrics.as_slice() {
+            return storage_reconciliation_records(first_pass.per_tenant, &plan, limits);
+        }
+    }
+    Err(storage_reconciliation_snapshot_error(scan_limits))
+}
 
-    for chunk in metrics.chunks(STORAGE_RECONCILE_BATCH_SIZE) {
-        let selected = storage
-            .select_many(chunk, i64::MIN, i64::MAX)
-            .map_err(|err| {
-                UsageAccountingError::Other(format!(
-                    "usage storage reconciliation failed to read points: {err}"
-                ))
+fn admit_storage_reconciliation_execution(
+    storage: &Arc<dyn Storage>,
+    scan_limits: StorageReconciliationScanLimits,
+) -> Result<QueryExecution, UsageAccountingError> {
+    if storage.select_series_execution_accounting() != QueryExecutionAccounting::Complete {
+        return Err(UsageAccountingError::Other(
+            "usage storage reconciliation requires completely execution-accounted metadata selection"
+                .to_string(),
+        ));
+    }
+    if storage.scan_series_rows_execution_accounting() != QueryExecutionAccounting::Complete {
+        return Err(UsageAccountingError::Other(
+            "usage storage reconciliation requires completely execution-accounted guarded row-page scans"
+                .to_string(),
+        ));
+    }
+    storage
+        .begin_query_execution(
+            scan_limits.operation_query_limits()?,
+            QueryCancellationToken::new(),
+        )
+        .map_err(|err| {
+            storage_reconciliation_storage_error(
+                "admit the finite whole-operation query execution",
+                err,
+            )
+        })?
+        .ok_or_else(|| {
+            UsageAccountingError::Other(
+                "usage storage reconciliation requires execution-accounted metadata and row scans; the storage backend exposes no query budget"
+                    .to_string(),
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageReconciliationScanLimits {
+    max_manifest_series: usize,
+    max_manifest_bytes: usize,
+    max_series_per_page: usize,
+    max_rows_per_page: usize,
+    max_page_bytes: usize,
+    max_page_memory_bytes: usize,
+    max_operation_memory_bytes: usize,
+    max_rows_per_pass: u64,
+    max_returned_bytes_per_pass: u64,
+    max_samples_scanned_per_page: u64,
+    max_samples_scanned_per_pass: u64,
+    max_pages_per_pass: u64,
+    max_snapshot_attempts: usize,
+}
+
+impl StorageReconciliationScanLimits {
+    fn from_ledger_limits(limits: UsageLedgerLimits) -> Result<Self, UsageAccountingError> {
+        let max_page_bytes = STORAGE_RECONCILE_PAGE_MAX_BYTES.min(limits.max_frame_bytes);
+        let max_page_memory_bytes = max_page_bytes
+            .checked_mul(STORAGE_RECONCILE_PAGE_MEMORY_MULTIPLIER)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation page-memory limit overflowed usize".to_string(),
+                )
             })?;
-        for series in selected {
-            let tenant_id = tenant_id_for_metric_series(&series.series);
-            if !per_tenant.contains_key(&tenant_id) && per_tenant.len() >= limits.max_tenants {
+        let max_operation_memory_bytes = limits
+            .startup_scratch_bytes
+            .checked_mul(STORAGE_RECONCILE_OPERATION_MEMORY_MULTIPLIER)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation operation-memory limit overflowed usize"
+                        .to_string(),
+                )
+            })?;
+        let max_returned_bytes_per_pass = limits
+            .startup_scratch_bytes
+            .checked_mul(STORAGE_RECONCILE_TOTAL_BYTES_MULTIPLIER)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation total-byte limit overflowed usize".to_string(),
+                )
+            })?;
+        for (name, value) in [
+            ("manifest bytes", limits.startup_scratch_bytes),
+            ("series per page", STORAGE_RECONCILE_BATCH_SIZE),
+            ("rows per page", STORAGE_RECONCILE_PAGE_MAX_ROWS),
+            ("page bytes", max_page_bytes),
+            ("page memory bytes", max_page_memory_bytes),
+            ("operation memory bytes", max_operation_memory_bytes),
+            ("returned bytes per pass", max_returned_bytes_per_pass),
+        ] {
+            if value == 0 {
                 return Err(UsageAccountingError::Limit(format!(
-                    "usage storage reconciliation observed more than {} tenants",
-                    limits.max_tenants
+                    "usage storage reconciliation {name} must be greater than zero"
                 )));
             }
-            let point_count = series.points.len() as u64;
-            let acc = per_tenant.entry(tenant_id).or_default();
-            acc.series_total = acc.series_total.saturating_add(1);
-            acc.samples_total = acc.samples_total.saturating_add(point_count);
-            acc.logical_storage_bytes = acc
-                .logical_storage_bytes
-                .saturating_add(estimated_series_bytes(&series.series, point_count));
+        }
+        Ok(Self {
+            max_manifest_series: STORAGE_RECONCILE_MAX_MANIFEST_SERIES,
+            max_manifest_bytes: limits.startup_scratch_bytes,
+            max_series_per_page: STORAGE_RECONCILE_BATCH_SIZE,
+            max_rows_per_page: STORAGE_RECONCILE_PAGE_MAX_ROWS,
+            max_page_bytes,
+            max_page_memory_bytes,
+            max_operation_memory_bytes,
+            max_rows_per_pass: STORAGE_RECONCILE_MAX_ROWS_PER_PASS,
+            max_returned_bytes_per_pass: u64::try_from(max_returned_bytes_per_pass)
+                .unwrap_or(u64::MAX),
+            max_samples_scanned_per_page: STORAGE_RECONCILE_MAX_SAMPLES_SCANNED_PER_PAGE,
+            max_samples_scanned_per_pass: STORAGE_RECONCILE_MAX_SAMPLES_SCANNED_PER_PASS,
+            max_pages_per_pass: STORAGE_RECONCILE_MAX_PAGES_PER_PASS,
+            max_snapshot_attempts: STORAGE_RECONCILE_MAX_SNAPSHOT_ATTEMPTS,
+        })
+    }
+
+    fn operation_query_limits(self) -> Result<QueryWorkLimits, UsageAccountingError> {
+        let attempts = u64::try_from(self.max_snapshot_attempts).map_err(|_| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation attempt limit overflowed u64".to_string(),
+            )
+        })?;
+        let passes = storage_reconciliation_limit_mul(
+            attempts,
+            STORAGE_RECONCILE_PASSES_PER_ATTEMPT,
+            "pass count",
+        )?;
+        let manifests = storage_reconciliation_limit_mul(
+            attempts,
+            STORAGE_RECONCILE_MANIFESTS_PER_ATTEMPT,
+            "manifest count",
+        )?;
+        let page_calls =
+            storage_reconciliation_limit_mul(passes, self.max_pages_per_pass, "page count")?;
+        let manifest_series = storage_reconciliation_limit_mul(
+            manifests,
+            u64::try_from(self.max_manifest_series).unwrap_or(u64::MAX),
+            "manifest series",
+        )?;
+        let page_series = storage_reconciliation_limit_mul(
+            page_calls,
+            u64::try_from(self.max_series_per_page).unwrap_or(u64::MAX),
+            "page series",
+        )?;
+        let max_series_matched =
+            storage_reconciliation_limit_add(manifest_series, page_series, "matched series")?;
+        let max_samples_scanned = storage_reconciliation_limit_mul(
+            passes,
+            self.max_samples_scanned_per_pass,
+            "scanned samples",
+        )?;
+        // One discarded page can be returned before a pass observes manifest drift. Include that
+        // page in the whole-operation cap even though it is never applied to an aggregate.
+        let returned_rows_per_pass = storage_reconciliation_limit_add(
+            self.max_rows_per_pass,
+            u64::try_from(self.max_rows_per_page).unwrap_or(u64::MAX),
+            "returned rows per pass",
+        )?;
+        let max_samples_returned =
+            storage_reconciliation_limit_mul(passes, returned_rows_per_pass, "returned samples")?;
+        let manifest_returned_bytes = storage_reconciliation_limit_mul(
+            manifests,
+            u64::try_from(self.max_manifest_bytes).unwrap_or(u64::MAX),
+            "manifest returned bytes",
+        )?;
+        let page_returned_bytes_per_pass = storage_reconciliation_limit_add(
+            self.max_returned_bytes_per_pass,
+            u64::try_from(self.max_page_bytes).unwrap_or(u64::MAX),
+            "page returned bytes per pass",
+        )?;
+        let page_returned_bytes = storage_reconciliation_limit_mul(
+            passes,
+            page_returned_bytes_per_pass,
+            "page returned bytes",
+        )?;
+        let max_returned_bytes = storage_reconciliation_limit_add(
+            manifest_returned_bytes,
+            page_returned_bytes,
+            "whole-operation returned bytes",
+        )?;
+        let max_pattern_expansion = storage_reconciliation_limit_mul(
+            manifests,
+            u64::try_from(self.max_manifest_series).unwrap_or(u64::MAX),
+            "pattern expansion",
+        )?;
+        // A plan reservation and a final-manifest reservation can coexist. Page/backend working
+        // memory replaces, rather than nests with, the final manifest but may coexist with plan
+        // state during either pass.
+        let two_operation_reservations = storage_reconciliation_limit_mul(
+            2,
+            u64::try_from(self.max_operation_memory_bytes).unwrap_or(u64::MAX),
+            "operation memory",
+        )?;
+        let max_memory_bytes = storage_reconciliation_limit_add(
+            two_operation_reservations,
+            u64::try_from(self.max_page_memory_bytes).unwrap_or(u64::MAX),
+            "whole-operation memory",
+        )?;
+        let max_intermediate_vector_size = u64::try_from(self.max_manifest_series)
+            .unwrap_or(u64::MAX)
+            .max(self.max_samples_scanned_per_page)
+            .max(u64::try_from(self.max_rows_per_page).unwrap_or(u64::MAX));
+
+        Ok(QueryWorkLimits {
+            max_series_matched: Some(max_series_matched),
+            max_samples_scanned: Some(max_samples_scanned),
+            max_samples_returned: Some(max_samples_returned),
+            max_returned_bytes: Some(max_returned_bytes),
+            max_pattern_expansion: Some(max_pattern_expansion),
+            max_steps: None,
+            max_intermediate_vector_size: Some(max_intermediate_vector_size),
+            max_memory_bytes: Some(max_memory_bytes),
+            max_wall_time: Some(STORAGE_RECONCILE_OPERATION_WALL_TIME),
+        })
+    }
+}
+
+fn storage_reconciliation_limit_mul(
+    left: u64,
+    right: u64,
+    name: &str,
+) -> Result<u64, UsageAccountingError> {
+    left.checked_mul(right).ok_or_else(|| {
+        UsageAccountingError::Limit(format!(
+            "usage storage reconciliation {name} limit overflowed u64"
+        ))
+    })
+}
+
+fn storage_reconciliation_limit_add(
+    left: u64,
+    right: u64,
+    name: &str,
+) -> Result<u64, UsageAccountingError> {
+    left.checked_add(right).ok_or_else(|| {
+        UsageAccountingError::Limit(format!(
+            "usage storage reconciliation {name} limit overflowed u64"
+        ))
+    })
+}
+
+fn storage_reconciliation_execution_delta(
+    before: QueryExecutionSnapshot,
+    after: QueryExecutionSnapshot,
+) -> Result<QueryExecutionSnapshot, UsageAccountingError> {
+    let counter_delta = |name: &str, before: u64, after: u64| {
+        after.checked_sub(before).ok_or_else(|| {
+            UsageAccountingError::Other(format!(
+                "usage storage reconciliation query counter '{name}' moved backwards from {before} to {after}"
+            ))
+        })
+    };
+    Ok(QueryExecutionSnapshot {
+        memory_reserved_bytes: after.memory_reserved_bytes,
+        series_matched: counter_delta(
+            "series_matched",
+            before.series_matched,
+            after.series_matched,
+        )?,
+        samples_scanned: counter_delta(
+            "samples_scanned",
+            before.samples_scanned,
+            after.samples_scanned,
+        )?,
+        samples_returned: counter_delta(
+            "samples_returned",
+            before.samples_returned,
+            after.samples_returned,
+        )?,
+        returned_bytes: counter_delta(
+            "returned_bytes",
+            before.returned_bytes,
+            after.returned_bytes,
+        )?,
+        pattern_expansion: counter_delta(
+            "pattern_expansion",
+            before.pattern_expansion,
+            after.pattern_expansion,
+        )?,
+        steps: counter_delta("steps", before.steps, after.steps)?,
+        intermediate_vector_size: after.intermediate_vector_size,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct StorageReconciliationPlan {
+    manifest: Arc<StorageReconciliationManifest>,
+    base_per_tenant: Arc<BTreeMap<String, StorageAccumulator>>,
+    prepared_records_retained_upper_bound: u64,
+}
+
+impl StorageReconciliationPlan {
+    fn metrics(&self) -> &[MetricSeries] {
+        &self.manifest.metrics
+    }
+}
+
+#[derive(Debug)]
+struct StorageReconciliationManifest {
+    metrics: Vec<MetricSeries>,
+    operation_memory_reservation: QueryMemoryReservation,
+    manifest_retained_bytes: u64,
+    operation_retained_bytes: u64,
+}
+
+struct PreparedStorageReconciliation {
+    records: Vec<UsageLedgerRecord>,
+    _operation_memory: Arc<StorageReconciliationManifest>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageReconciliationCursor {
+    series_offset: usize,
+    row_offset: u64,
+    expect_empty_probe: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageReconciliationPageRequest {
+    max_rows: usize,
+    max_returned_bytes: u64,
+    max_samples_scanned: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageReconciliationPassResult {
+    per_tenant: BTreeMap<String, StorageAccumulator>,
+    rows_total: u64,
+    returned_bytes_total: u64,
+    pages_total: u64,
+    fingerprint: [u64; 2],
+}
+
+struct StorageReconciliationPassState {
+    per_tenant: BTreeMap<String, StorageAccumulator>,
+    cursor: Option<StorageReconciliationCursor>,
+    rows_total: u64,
+    returned_bytes_total: u64,
+    samples_scanned_total: u64,
+    pages_total: u64,
+    fingerprint_a: Xxh64,
+    fingerprint_b: Xxh64,
+}
+
+impl StorageReconciliationPassState {
+    fn new(plan: &StorageReconciliationPlan) -> Self {
+        Self {
+            per_tenant: plan.base_per_tenant.as_ref().clone(),
+            cursor: (!plan.metrics().is_empty()).then_some(StorageReconciliationCursor::default()),
+            rows_total: 0,
+            returned_bytes_total: 0,
+            samples_scanned_total: 0,
+            pages_total: 0,
+            fingerprint_a: Xxh64::new(STORAGE_RECONCILE_FINGERPRINT_SEED_A),
+            fingerprint_b: Xxh64::new(STORAGE_RECONCILE_FINGERPRINT_SEED_B),
         }
     }
 
+    fn page_request(
+        &self,
+        scan_limits: StorageReconciliationScanLimits,
+    ) -> Result<StorageReconciliationPageRequest, UsageAccountingError> {
+        if self.pages_total >= scan_limits.max_pages_per_pass {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation exceeded the per-pass page maximum {}",
+                scan_limits.max_pages_per_pass
+            )));
+        }
+        let remaining_scan = scan_limits
+            .max_samples_scanned_per_pass
+            .checked_sub(self.samples_scanned_total)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation exceeded the per-pass scanned-sample maximum {}",
+                    scan_limits.max_samples_scanned_per_pass
+                ))
+            })?;
+        if remaining_scan == 0 {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation needs another terminal page after reaching the per-pass scanned-sample maximum {}",
+                scan_limits.max_samples_scanned_per_pass
+            )));
+        }
+
+        let remaining_rows = scan_limits
+            .max_rows_per_pass
+            .checked_sub(self.rows_total)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation exceeded the per-pass row maximum {}",
+                    scan_limits.max_rows_per_pass
+                ))
+            })?;
+        let remaining_bytes = scan_limits
+            .max_returned_bytes_per_pass
+            .checked_sub(self.returned_bytes_total)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation exceeded the per-pass returned-byte maximum {}",
+                    scan_limits.max_returned_bytes_per_pass
+                ))
+            })?;
+        let cursor = self
+            .cursor
+            .expect("a page request is only valid while a cursor remains");
+        let at_total_capacity = remaining_rows == 0 || remaining_bytes == 0;
+        let max_rows = if at_total_capacity || cursor.expect_empty_probe {
+            1
+        } else {
+            usize::try_from(remaining_rows)
+                .unwrap_or(usize::MAX)
+                .min(scan_limits.max_rows_per_page)
+        };
+        // A one-byte result budget lets an empty capacity probe succeed while rejecting any Row,
+        // whose fixed modeled representation is necessarily larger than one byte.
+        let max_returned_bytes = if at_total_capacity {
+            1
+        } else {
+            remaining_bytes.min(u64::try_from(scan_limits.max_page_bytes).unwrap_or(u64::MAX))
+        };
+        Ok(StorageReconciliationPageRequest {
+            max_rows,
+            max_returned_bytes,
+            max_samples_scanned: remaining_scan.min(scan_limits.max_samples_scanned_per_page),
+        })
+    }
+
+    fn apply_page(
+        &mut self,
+        page: StorageReconciliationPage,
+        scan_limits: StorageReconciliationScanLimits,
+    ) -> Result<(), UsageAccountingError> {
+        self.pages_total = self.pages_total.checked_add(1).ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation page count overflowed u64".to_string(),
+            )
+        })?;
+        self.rows_total = self.rows_total.checked_add(page.rows).ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation row count overflowed u64".to_string(),
+            )
+        })?;
+        self.returned_bytes_total = self
+            .returned_bytes_total
+            .checked_add(page.returned_bytes)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation returned-byte count overflowed u64".to_string(),
+                )
+            })?;
+        self.samples_scanned_total = self
+            .samples_scanned_total
+            .checked_add(page.samples_scanned)
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation scanned-sample count overflowed u64".to_string(),
+                )
+            })?;
+        if self.rows_total > scan_limits.max_rows_per_pass {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation observed more than {} rows in one pass",
+                scan_limits.max_rows_per_pass
+            )));
+        }
+        if self.returned_bytes_total > scan_limits.max_returned_bytes_per_pass {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation observed more than {} returned bytes in one pass",
+                scan_limits.max_returned_bytes_per_pass
+            )));
+        }
+        if self.samples_scanned_total > scan_limits.max_samples_scanned_per_pass {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation scanned more than {} samples in one pass",
+                scan_limits.max_samples_scanned_per_pass
+            )));
+        }
+        for (tenant_id, samples) in page.samples_per_tenant {
+            let acc = self.per_tenant.get_mut(tenant_id.as_str()).ok_or_else(|| {
+                UsageAccountingError::Other(format!(
+                    "usage storage reconciliation row referenced tenant '{tenant_id}' absent from the fenced manifest"
+                ))
+            })?;
+            acc.samples_total = acc.samples_total.checked_add(samples).ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation sample total overflowed for tenant '{tenant_id}'"
+                ))
+            })?;
+            let sample_bytes = samples.checked_mul(ESTIMATED_SAMPLE_BYTES).ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation byte total overflowed for tenant '{tenant_id}'"
+                ))
+            })?;
+            acc.logical_storage_bytes = acc
+                .logical_storage_bytes
+                .checked_add(sample_bytes)
+                .ok_or_else(|| {
+                    UsageAccountingError::Limit(format!(
+                        "usage storage reconciliation byte total overflowed for tenant '{tenant_id}'"
+                    ))
+                })?;
+        }
+        self.fingerprint_a.update(&page.rows.to_le_bytes());
+        self.fingerprint_a
+            .update(&page.fingerprint[0].to_le_bytes());
+        self.fingerprint_a
+            .update(&page.fingerprint[1].to_le_bytes());
+        self.fingerprint_b.update(&page.rows.to_le_bytes());
+        self.fingerprint_b
+            .update(&page.fingerprint[0].to_le_bytes());
+        self.fingerprint_b
+            .update(&page.fingerprint[1].to_le_bytes());
+        self.cursor = page.next_cursor;
+        Ok(())
+    }
+
+    fn finish(self) -> StorageReconciliationPassResult {
+        StorageReconciliationPassResult {
+            per_tenant: self.per_tenant,
+            rows_total: self.rows_total,
+            returned_bytes_total: self.returned_bytes_total,
+            pages_total: self.pages_total,
+            fingerprint: [self.fingerprint_a.digest(), self.fingerprint_b.digest()],
+        }
+    }
+}
+
+struct StorageReconciliationPage {
+    next_cursor: Option<StorageReconciliationCursor>,
+    samples_per_tenant: BTreeMap<String, u64>,
+    rows: u64,
+    returned_bytes: u64,
+    samples_scanned: u64,
+    fingerprint: [u64; 2],
+}
+
+fn load_storage_reconciliation_plan(
+    storage: &Arc<dyn Storage>,
+    limits: UsageLedgerLimits,
+    scan_limits: StorageReconciliationScanLimits,
+    execution: &QueryExecution,
+) -> Result<StorageReconciliationPlan, UsageAccountingError> {
+    let mut manifest = load_storage_reconciliation_manifest(storage, scan_limits, execution)?;
+    let mut base_per_tenant = BTreeMap::<String, StorageAccumulator>::new();
+    for series in &manifest.metrics {
+        let tenant_id = tenant_id_for_metric_series(series);
+        if !base_per_tenant.contains_key(&tenant_id) && base_per_tenant.len() >= limits.max_tenants
+        {
+            return Err(UsageAccountingError::Limit(format!(
+                "usage storage reconciliation observed more than {} tenants",
+                limits.max_tenants
+            )));
+        }
+        let acc = base_per_tenant.entry(tenant_id.clone()).or_default();
+        acc.series_total = acc.series_total.checked_add(1).ok_or_else(|| {
+            UsageAccountingError::Limit(format!(
+                "usage storage reconciliation series total overflowed for tenant '{tenant_id}'"
+            ))
+        })?;
+        acc.logical_storage_bytes = acc
+            .logical_storage_bytes
+            .checked_add(estimated_series_bytes(series, 0))
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(format!(
+                    "usage storage reconciliation byte total overflowed for tenant '{tenant_id}'"
+                ))
+            })?;
+    }
+    let accumulator_map_bytes =
+        modeled_storage_reconciliation_accumulator_map_retained_bytes(&base_per_tenant)?;
+    let concurrent_accumulator_bytes = accumulator_map_bytes.checked_mul(3).ok_or_else(|| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation accumulator-map memory overflowed u64".to_string(),
+        )
+    })?;
+    let prepared_records_retained_upper_bound =
+        modeled_storage_reconciliation_records_retained_upper_bound(&base_per_tenant, limits)?;
+    let operation_retained_bytes = manifest
+        .manifest_retained_bytes
+        .checked_add(concurrent_accumulator_bytes)
+        .and_then(|bytes| bytes.checked_add(prepared_records_retained_upper_bound))
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation operation-memory model overflowed u64".to_string(),
+            )
+        })?;
+    if operation_retained_bytes
+        > u64::try_from(scan_limits.max_operation_memory_bytes).unwrap_or(u64::MAX)
+    {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation operation requires {operation_retained_bytes} modeled retained bytes, exceeding the maximum {}",
+            scan_limits.max_operation_memory_bytes
+        )));
+    }
+    manifest
+        .operation_memory_reservation
+        .resize(operation_retained_bytes)
+        .map_err(|err| {
+            storage_reconciliation_storage_error(
+                "retain the manifest, accumulator maps, and prepared records",
+                tsink::TsinkError::from(err),
+            )
+        })?;
+    manifest.operation_retained_bytes = operation_retained_bytes;
+    if manifest.operation_memory_reservation.bytes() != operation_retained_bytes {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation operation reservation invariant failed: requested {operation_retained_bytes}, retained {}",
+            manifest.operation_memory_reservation.bytes()
+        )));
+    }
+    Ok(StorageReconciliationPlan {
+        manifest: Arc::new(manifest),
+        base_per_tenant: Arc::new(base_per_tenant),
+        prepared_records_retained_upper_bound,
+    })
+}
+
+fn load_storage_reconciliation_manifest(
+    storage: &Arc<dyn Storage>,
+    scan_limits: StorageReconciliationScanLimits,
+    execution: &QueryExecution,
+) -> Result<StorageReconciliationManifest, UsageAccountingError> {
+    let before = execution.snapshot();
+    let memory_before_reservation = before.memory_reserved_bytes;
+    let mut selected = storage
+        .select_series_with_execution_result(&SeriesSelection::new(), execution)
+        .map_err(|err| {
+            storage_reconciliation_storage_error("list the bounded metric manifest", err)
+        })?;
+    let mut memory_reservation = selected.take_memory_reservation().ok_or_else(|| {
+        UsageAccountingError::Other(
+            "usage storage reconciliation metric manifest omitted its retained-memory reservation"
+                .to_string(),
+        )
+    })?;
+    let mut metrics = selected.into_series();
+    let execution_snapshot = execution.snapshot();
+    let execution_delta = storage_reconciliation_execution_delta(before, execution_snapshot)?;
+    if metrics.len() > scan_limits.max_manifest_series {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation manifest contains {} series, exceeding the maximum {}",
+            metrics.len(),
+            scan_limits.max_manifest_series
+        )));
+    }
+    let modeled_bytes = modeled_storage_reconciliation_manifest_bytes(&metrics)?;
+    if modeled_bytes > scan_limits.max_manifest_bytes {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation manifest requires {modeled_bytes} modeled bytes, exceeding the maximum {}",
+            scan_limits.max_manifest_bytes
+        )));
+    }
+    let metric_count = u64::try_from(metrics.len()).unwrap_or(u64::MAX);
+    let modeled_bytes = u64::try_from(modeled_bytes).unwrap_or(u64::MAX);
+    if execution_delta.series_matched < metric_count
+        || execution_delta.series_matched
+            > u64::try_from(scan_limits.max_manifest_series).unwrap_or(u64::MAX)
+        || execution_delta.returned_bytes < modeled_bytes
+        || execution_delta.returned_bytes
+            > u64::try_from(scan_limits.max_manifest_bytes).unwrap_or(u64::MAX)
+        || execution_delta.pattern_expansion
+            > u64::try_from(scan_limits.max_manifest_series).unwrap_or(u64::MAX)
+    {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation metric manifest violated its per-call accounting bounds: returned {metric_count} series/{modeled_bytes} modeled bytes, charged {}/{} with {} pattern candidates",
+            execution_delta.series_matched,
+            execution_delta.returned_bytes,
+            execution_delta.pattern_expansion
+        )));
+    }
+
+    metrics.sort();
+    if metrics.windows(2).any(|window| window[0] == window[1]) {
+        return Err(UsageAccountingError::Other(
+            "usage storage reconciliation metric manifest contains duplicate series identities"
+                .to_string(),
+        ));
+    }
+    let retained_bytes = modeled_storage_reconciliation_manifest_retained_bytes(&metrics)?;
+    if retained_bytes > u64::try_from(scan_limits.max_operation_memory_bytes).unwrap_or(u64::MAX) {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation manifest retains {retained_bytes} modeled bytes, exceeding the per-manifest memory maximum {}",
+            scan_limits.max_operation_memory_bytes
+        )));
+    }
+    memory_reservation.resize(retained_bytes).map_err(|err| {
+        storage_reconciliation_storage_error(
+            "adopt the bounded metric manifest reservation",
+            tsink::TsinkError::from(err),
+        )
+    })?;
+    let expected_reserved_memory = memory_before_reservation
+        .checked_add(retained_bytes)
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation manifest reservation overflowed u64".to_string(),
+            )
+        })?;
+    if memory_reservation.bytes() != retained_bytes
+        || execution.snapshot().memory_reserved_bytes < expected_reserved_memory
+    {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation manifest reservation invariant failed after guarded adoption: requested {retained_bytes}, retained {}, expected execution total at least {expected_reserved_memory}, execution reports {}",
+            memory_reservation.bytes(),
+            execution.snapshot().memory_reserved_bytes
+        )));
+    }
+    Ok(StorageReconciliationManifest {
+        metrics,
+        operation_memory_reservation: memory_reservation,
+        manifest_retained_bytes: retained_bytes,
+        operation_retained_bytes: retained_bytes,
+    })
+}
+
+fn modeled_storage_reconciliation_manifest_bytes(
+    metrics: &[MetricSeries],
+) -> Result<usize, UsageAccountingError> {
+    let mut bytes = metrics
+        .len()
+        .checked_mul(std::mem::size_of::<MetricSeries>())
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation manifest byte model overflowed usize".to_string(),
+            )
+        })?;
+    for series in metrics {
+        bytes = bytes.checked_add(series.name.len()).ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation manifest byte model overflowed usize".to_string(),
+            )
+        })?;
+        bytes = bytes
+            .checked_add(
+                series
+                    .labels
+                    .len()
+                    .checked_mul(std::mem::size_of::<Label>())
+                    .ok_or_else(|| {
+                        UsageAccountingError::Limit(
+                            "usage storage reconciliation manifest byte model overflowed usize"
+                                .to_string(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                UsageAccountingError::Limit(
+                    "usage storage reconciliation manifest byte model overflowed usize".to_string(),
+                )
+            })?;
+        for label in &series.labels {
+            bytes = bytes
+                .checked_add(label.name.len())
+                .and_then(|value| value.checked_add(label.value.len()))
+                .ok_or_else(|| {
+                    UsageAccountingError::Limit(
+                        "usage storage reconciliation manifest byte model overflowed usize"
+                            .to_string(),
+                    )
+                })?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_manifest_retained_bytes(
+    metrics: &Vec<MetricSeries>,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes =
+        modeled_storage_reconciliation_vec_retained_bytes::<MetricSeries>(metrics.capacity())?;
+    for series in metrics {
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_string_retained_bytes(series.name.capacity())?,
+        )?;
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_vec_retained_bytes::<Label>(series.labels.capacity())?,
+        )?;
+        for label in &series.labels {
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(label.name.capacity())?,
+            )?;
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(label.value.capacity())?,
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_rows_retained_bytes(
+    rows: &Vec<Row>,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes = modeled_storage_reconciliation_vec_retained_bytes::<Row>(rows.capacity())?;
+    for row in rows {
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_string_retained_bytes(row.metric_capacity())?,
+        )?;
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_vec_retained_bytes::<Label>(row.labels_capacity())?,
+        )?;
+        for label in row.labels() {
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(label.name.capacity())?,
+            )?;
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(label.value.capacity())?,
+            )?;
+        }
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_value_retained_bytes(&row.data_point().value)?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_accumulator_map_retained_bytes(
+    per_tenant: &BTreeMap<String, StorageAccumulator>,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes = 0u64;
+    for tenant_id in per_tenant.keys() {
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            storage_reconciliation_allocation_retained_bytes(
+                u64::try_from(std::mem::size_of::<(String, StorageAccumulator)>()).map_err(
+                    |_| {
+                        UsageAccountingError::Limit(
+                            "usage storage reconciliation accumulator-map model overflowed u64"
+                                .to_string(),
+                        )
+                    },
+                )?,
+            )?,
+        )?;
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_string_retained_bytes(tenant_id.capacity())?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_records_retained_upper_bound(
+    per_tenant: &BTreeMap<String, StorageAccumulator>,
+    limits: UsageLedgerLimits,
+) -> Result<u64, UsageAccountingError> {
+    if per_tenant.len() > limits.max_batch_records {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation produced {} tenant records, exceeding the configured batch maximum {}",
+            per_tenant.len(), limits.max_batch_records
+        )));
+    }
+    let record_capacity = if per_tenant.is_empty() {
+        0
+    } else {
+        per_tenant
+            .len()
+            .checked_next_power_of_two()
+            .unwrap_or(limits.max_batch_records)
+            .min(limits.max_batch_records)
+            .max(per_tenant.len())
+    };
+    let mut bytes =
+        modeled_storage_reconciliation_vec_retained_bytes::<UsageLedgerRecord>(record_capacity)?;
+    for tenant_id in per_tenant.keys() {
+        for capacity in [
+            tenant_id.capacity(),
+            "reconcile_storage".len(),
+            "admin".len(),
+            "success".len(),
+        ] {
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(capacity)?,
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_records_retained_bytes(
+    records: &Vec<UsageLedgerRecord>,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes =
+        modeled_storage_reconciliation_vec_retained_bytes::<UsageLedgerRecord>(records.capacity())?;
+    for record in records {
+        for capacity in [
+            record.tenant_id.capacity(),
+            record.operation.capacity(),
+            record.source.capacity(),
+            record.status.capacity(),
+        ] {
+            storage_reconciliation_checked_add(
+                &mut bytes,
+                modeled_storage_reconciliation_string_retained_bytes(capacity)?,
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_page_accumulator_upper_bound(
+    series: &[MetricSeries],
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes = 0u64;
+    for metric_series in series {
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            storage_reconciliation_allocation_retained_bytes(
+                u64::try_from(std::mem::size_of::<(String, u64)>()).map_err(|_| {
+                    UsageAccountingError::Limit(
+                        "usage storage reconciliation page-accumulator model overflowed u64"
+                            .to_string(),
+                    )
+                })?,
+            )?,
+        )?;
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_string_retained_bytes(
+                tenant_id_for_labels(&metric_series.labels).len(),
+            )?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_page_accumulator_retained_bytes(
+    per_tenant: &BTreeMap<String, u64>,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes = 0u64;
+    for tenant_id in per_tenant.keys() {
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            storage_reconciliation_allocation_retained_bytes(
+                u64::try_from(std::mem::size_of::<(String, u64)>()).map_err(|_| {
+                    UsageAccountingError::Limit(
+                        "usage storage reconciliation page-accumulator model overflowed u64"
+                            .to_string(),
+                    )
+                })?,
+            )?,
+        )?;
+        storage_reconciliation_checked_add(
+            &mut bytes,
+            modeled_storage_reconciliation_string_retained_bytes(tenant_id.capacity())?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_value_retained_bytes(
+    value: &Value,
+) -> Result<u64, UsageAccountingError> {
+    match value {
+        Value::Bytes(bytes) => {
+            modeled_storage_reconciliation_vec_retained_bytes::<u8>(bytes.capacity())
+        }
+        Value::String(text) => {
+            modeled_storage_reconciliation_string_retained_bytes(text.capacity())
+        }
+        Value::Histogram(histogram) => {
+            modeled_storage_reconciliation_histogram_retained_bytes(histogram)
+        }
+        Value::F64(_) | Value::I64(_) | Value::U64(_) | Value::Bool(_) => Ok(0),
+    }
+}
+
+fn modeled_storage_reconciliation_histogram_retained_bytes(
+    histogram: &NativeHistogram,
+) -> Result<u64, UsageAccountingError> {
+    let mut bytes = storage_reconciliation_allocation_retained_bytes(
+        u64::try_from(std::mem::size_of::<NativeHistogram>()).map_err(|_| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+            )
+        })?,
+    )?;
+    for allocation in [
+        modeled_storage_reconciliation_vec_retained_bytes::<HistogramBucketSpan>(
+            histogram.negative_spans.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<i64>(
+            histogram.negative_deltas.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<f64>(
+            histogram.negative_counts.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<HistogramBucketSpan>(
+            histogram.positive_spans.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<i64>(
+            histogram.positive_deltas.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<f64>(
+            histogram.positive_counts.capacity(),
+        )?,
+        modeled_storage_reconciliation_vec_retained_bytes::<f64>(
+            histogram.custom_values.capacity(),
+        )?,
+    ] {
+        storage_reconciliation_checked_add(&mut bytes, allocation)?;
+    }
+    Ok(bytes)
+}
+
+fn modeled_storage_reconciliation_vec_retained_bytes<T>(
+    capacity: usize,
+) -> Result<u64, UsageAccountingError> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let capacity = u64::try_from(capacity).map_err(|_| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+        )
+    })?;
+    let element_bytes = u64::try_from(std::mem::size_of::<T>()).map_err(|_| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+        )
+    })?;
+    let bytes = capacity.checked_mul(element_bytes).ok_or_else(|| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+        )
+    })?;
+    storage_reconciliation_allocation_retained_bytes(bytes)
+}
+
+fn modeled_storage_reconciliation_string_retained_bytes(
+    capacity: usize,
+) -> Result<u64, UsageAccountingError> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    storage_reconciliation_allocation_retained_bytes(u64::try_from(capacity).map_err(|_| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+        )
+    })?)
+}
+
+fn storage_reconciliation_allocation_retained_bytes(
+    bytes: u64,
+) -> Result<u64, UsageAccountingError> {
+    bytes
+        .checked_add(STORAGE_RECONCILE_ALLOCATION_ALLOWANCE_BYTES)
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+            )
+        })
+}
+
+fn storage_reconciliation_checked_add(
+    total: &mut u64,
+    bytes: u64,
+) -> Result<(), UsageAccountingError> {
+    *total = total.checked_add(bytes).ok_or_else(|| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation retained-memory model overflowed u64".to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+fn run_storage_reconciliation_pass(
+    storage: &Arc<dyn Storage>,
+    plan: &StorageReconciliationPlan,
+    scan_limits: StorageReconciliationScanLimits,
+    execution: &QueryExecution,
+) -> Result<Option<StorageReconciliationPassResult>, UsageAccountingError> {
+    let mut state = StorageReconciliationPassState::new(plan);
+    while let Some(cursor) = state.cursor {
+        let request = state.page_request(scan_limits)?;
+        let Some(page) = scan_storage_reconciliation_page(
+            storage,
+            plan,
+            cursor,
+            scan_limits,
+            request,
+            execution,
+        )?
+        else {
+            return Ok(None);
+        };
+        state.apply_page(page, scan_limits)?;
+    }
+    Ok(Some(state.finish()))
+}
+
+fn scan_storage_reconciliation_page(
+    storage: &Arc<dyn Storage>,
+    plan: &StorageReconciliationPlan,
+    cursor: StorageReconciliationCursor,
+    scan_limits: StorageReconciliationScanLimits,
+    request: StorageReconciliationPageRequest,
+    execution: &QueryExecution,
+) -> Result<Option<StorageReconciliationPage>, UsageAccountingError> {
+    let chunk_end = cursor
+        .series_offset
+        .saturating_add(scan_limits.max_series_per_page)
+        .min(plan.metrics().len());
+    if cursor.series_offset >= chunk_end || request.max_rows == 0 || request.max_returned_bytes == 0
+    {
+        return Err(UsageAccountingError::Other(
+            "usage storage reconciliation received an invalid page cursor or zero page limit"
+                .to_string(),
+        ));
+    }
+    let chunk = &plan.metrics()[cursor.series_offset..chunk_end];
+    let chunk_series = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+    let execution_before = execution.snapshot();
+    let mut detailed_page = storage
+        .scan_series_rows_with_execution_result(
+            chunk,
+            i64::MIN,
+            i64::MAX,
+            QueryRowsScanOptions {
+                max_rows: Some(request.max_rows),
+                row_offset: (cursor.row_offset != 0).then_some(cursor.row_offset),
+            },
+            execution,
+        )
+        .map_err(|err| storage_reconciliation_storage_error("scan a bounded row page", err))?;
+    let mut page_memory_reservation = detailed_page.take_memory_reservation().ok_or_else(|| {
+        UsageAccountingError::Other(
+            "usage storage reconciliation row page omitted its retained-memory reservation"
+                .to_string(),
+        )
+    })?;
+    let page = detailed_page.into_page();
+    let retained_rows_bytes = modeled_storage_reconciliation_rows_retained_bytes(&page.rows)?;
+    let page_accumulator_upper_bound =
+        modeled_storage_reconciliation_page_accumulator_upper_bound(chunk)?;
+    let retained_page_bytes = retained_rows_bytes
+        .checked_add(page_accumulator_upper_bound)
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation row-page memory model overflowed u64".to_string(),
+            )
+        })?;
+    if retained_page_bytes > u64::try_from(scan_limits.max_page_memory_bytes).unwrap_or(u64::MAX) {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation row page retains {retained_page_bytes} modeled bytes, exceeding the per-page memory maximum {}",
+            scan_limits.max_page_memory_bytes
+        )));
+    }
+    page_memory_reservation
+        .resize(retained_page_bytes)
+        .map_err(|err| {
+            storage_reconciliation_storage_error(
+                "adopt the bounded row-page reservation",
+                tsink::TsinkError::from(err),
+            )
+        })?;
+    let execution_snapshot = execution.snapshot();
+    let execution_delta =
+        storage_reconciliation_execution_delta(execution_before, execution_snapshot)?;
+    let expected_reserved_memory = execution_before
+        .memory_reserved_bytes
+        .checked_add(retained_page_bytes)
+        .ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation row-page reservation overflowed u64".to_string(),
+            )
+        })?;
+    if page_memory_reservation.bytes() != retained_page_bytes
+        || execution_snapshot.memory_reserved_bytes < expected_reserved_memory
+    {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation row-page reservation invariant failed after guarded adoption: requested {retained_page_bytes}, retained {}, expected execution total at least {expected_reserved_memory}, execution reports {}",
+            page_memory_reservation.bytes(),
+            execution_snapshot.memory_reserved_bytes
+        )));
+    }
+    let row_count = u64::try_from(page.rows.len()).unwrap_or(u64::MAX);
+    if page.rows.len() > request.max_rows || page.rows_scanned != row_count {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation backend violated the row-page contract: returned {} rows with rows_scanned={} under maximum {}",
+            page.rows.len(),
+            page.rows_scanned,
+            request.max_rows
+        )));
+    }
+    let modeled_bytes = modeled_write_batch_input_bytes(&page.rows).map_err(|err| {
+        UsageAccountingError::Limit(format!(
+            "usage storage reconciliation could not model row-page bytes: {err}"
+        ))
+    })?;
+    if modeled_bytes > scan_limits.max_page_bytes
+        || u64::try_from(modeled_bytes).unwrap_or(u64::MAX) > request.max_returned_bytes
+    {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation page requires {modeled_bytes} modeled bytes, exceeding its byte limit {}",
+            request.max_returned_bytes
+        )));
+    }
+    let modeled_bytes_u64 = u64::try_from(modeled_bytes).unwrap_or(u64::MAX);
+    if execution_delta.series_matched < chunk_series {
+        // A series disappeared after the manifest was read. Discard this pass and retry from the
+        // beginning; publishing its aggregate would expose a tenant prefix from mixed snapshots.
+        return Ok(None);
+    }
+    if execution_delta.series_matched > chunk_series
+        || execution_delta.samples_returned != row_count
+        || execution_delta.samples_returned > u64::try_from(request.max_rows).unwrap_or(u64::MAX)
+        || execution_delta.returned_bytes < modeled_bytes_u64
+        || execution_delta.returned_bytes > request.max_returned_bytes
+        || execution_delta.samples_scanned < page.rows_scanned
+        || execution_delta.samples_scanned > request.max_samples_scanned
+    {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation row page violated its per-page accounting bounds: returned {row_count} rows/{modeled_bytes_u64} modeled bytes, matched {}, charged {}/{}, scanned {}",
+            execution_delta.series_matched,
+            execution_delta.samples_returned,
+            execution_delta.returned_bytes,
+            execution_delta.samples_scanned
+        )));
+    }
+    if cursor.expect_empty_probe
+        && (page.truncated || page.next_row_offset.is_some() || !page.rows.is_empty())
+    {
+        // The preceding full page reported end-of-stream, but the exact terminal probe found
+        // more work. Treat this as observed concurrent drift and restart the bounded attempt.
+        return Ok(None);
+    }
+
+    let mut samples_per_tenant = BTreeMap::<String, u64>::new();
+    let mut fingerprint_a = Xxh64::new(STORAGE_RECONCILE_FINGERPRINT_SEED_A);
+    let mut fingerprint_b = Xxh64::new(STORAGE_RECONCILE_FINGERPRINT_SEED_B);
+    for row in &page.rows {
+        if !chunk
+            .iter()
+            .any(|series| series.name == row.metric() && series.labels.as_slice() == row.labels())
+        {
+            return Err(UsageAccountingError::Other(format!(
+                "usage storage reconciliation backend returned unrequested series '{}'",
+                row.metric()
+            )));
+        }
+        let tenant_id = tenant_id_for_labels(row.labels()).to_string();
+        let samples = samples_per_tenant.entry(tenant_id).or_default();
+        *samples = samples.checked_add(1).ok_or_else(|| {
+            UsageAccountingError::Limit(
+                "usage storage reconciliation tenant page count overflowed u64".to_string(),
+            )
+        })?;
+        update_storage_reconciliation_fingerprint(&mut fingerprint_a, &mut fingerprint_b, row)?;
+    }
+    let retained_page_accumulator =
+        modeled_storage_reconciliation_page_accumulator_retained_bytes(&samples_per_tenant)?;
+    if retained_page_accumulator > page_accumulator_upper_bound {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation page accumulator retained {retained_page_accumulator} bytes, exceeding its preflighted maximum {page_accumulator_upper_bound}"
+        )));
+    }
+
+    let expected_next_offset = cursor.row_offset.checked_add(row_count).ok_or_else(|| {
+        UsageAccountingError::Limit(
+            "usage storage reconciliation row cursor overflowed u64".to_string(),
+        )
+    })?;
+    let next_cursor = if page.truncated {
+        if page.rows.is_empty() || page.next_row_offset != Some(expected_next_offset) {
+            return Err(UsageAccountingError::Other(format!(
+                "usage storage reconciliation backend returned a non-progressing page cursor: current={}, rows={}, next={:?}",
+                cursor.row_offset,
+                page.rows.len(),
+                page.next_row_offset
+            )));
+        }
+        Some(StorageReconciliationCursor {
+            series_offset: cursor.series_offset,
+            row_offset: expected_next_offset,
+            expect_empty_probe: false,
+        })
+    } else if page.rows.len() == request.max_rows {
+        if page.next_row_offset.is_some() {
+            return Err(UsageAccountingError::Other(
+                "usage storage reconciliation backend returned a terminal page with a continuation cursor"
+                    .to_string(),
+            ));
+        }
+        Some(StorageReconciliationCursor {
+            series_offset: cursor.series_offset,
+            row_offset: expected_next_offset,
+            expect_empty_probe: true,
+        })
+    } else if chunk_end < plan.metrics().len() {
+        if page.next_row_offset.is_some() {
+            return Err(UsageAccountingError::Other(
+                "usage storage reconciliation backend returned a partial terminal page with a continuation cursor"
+                    .to_string(),
+            ));
+        }
+        Some(StorageReconciliationCursor {
+            series_offset: chunk_end,
+            row_offset: 0,
+            expect_empty_probe: false,
+        })
+    } else {
+        if page.next_row_offset.is_some() {
+            return Err(UsageAccountingError::Other(
+                "usage storage reconciliation backend returned a final page with a continuation cursor"
+                    .to_string(),
+            ));
+        }
+        None
+    };
+
+    Ok(Some(StorageReconciliationPage {
+        next_cursor,
+        samples_per_tenant,
+        rows: row_count,
+        returned_bytes: execution_delta.returned_bytes,
+        samples_scanned: execution_delta.samples_scanned,
+        fingerprint: [fingerprint_a.digest(), fingerprint_b.digest()],
+    }))
+}
+
+fn update_storage_reconciliation_fingerprint(
+    fingerprint_a: &mut Xxh64,
+    fingerprint_b: &mut Xxh64,
+    row: &Row,
+) -> Result<(), UsageAccountingError> {
+    update_storage_reconciliation_len_prefixed(
+        fingerprint_a,
+        fingerprint_b,
+        row.metric().as_bytes(),
+    );
+    update_storage_reconciliation_dual(
+        fingerprint_a,
+        fingerprint_b,
+        &u64::try_from(row.labels().len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for label in row.labels() {
+        update_storage_reconciliation_len_prefixed(
+            fingerprint_a,
+            fingerprint_b,
+            label.name.as_bytes(),
+        );
+        update_storage_reconciliation_len_prefixed(
+            fingerprint_a,
+            fingerprint_b,
+            label.value.as_bytes(),
+        );
+    }
+    let mut writer = StorageReconciliationFingerprintWriter {
+        fingerprint_a,
+        fingerprint_b,
+    };
+    serde_json::to_writer(&mut writer, row.data_point()).map_err(|err| {
+        UsageAccountingError::Other(format!(
+            "usage storage reconciliation failed to fingerprint a row: {err}"
+        ))
+    })?;
+    writer.write_all(&[0xff]).map_err(|err| {
+        UsageAccountingError::Other(format!(
+            "usage storage reconciliation failed to delimit a row fingerprint: {err}"
+        ))
+    })
+}
+
+fn update_storage_reconciliation_len_prefixed(
+    fingerprint_a: &mut Xxh64,
+    fingerprint_b: &mut Xxh64,
+    bytes: &[u8],
+) {
+    update_storage_reconciliation_dual(
+        fingerprint_a,
+        fingerprint_b,
+        &u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes(),
+    );
+    update_storage_reconciliation_dual(fingerprint_a, fingerprint_b, bytes);
+}
+
+fn update_storage_reconciliation_dual(
+    fingerprint_a: &mut Xxh64,
+    fingerprint_b: &mut Xxh64,
+    bytes: &[u8],
+) {
+    fingerprint_a.update(bytes);
+    fingerprint_b.update(bytes);
+}
+
+struct StorageReconciliationFingerprintWriter<'a> {
+    fingerprint_a: &'a mut Xxh64,
+    fingerprint_b: &'a mut Xxh64,
+}
+
+impl Write for StorageReconciliationFingerprintWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        update_storage_reconciliation_dual(self.fingerprint_a, self.fingerprint_b, bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn collect_storage_reconciliation_records_async(
+    storage: Arc<dyn Storage>,
+    limits: UsageLedgerLimits,
+) -> Result<PreparedStorageReconciliation, UsageAccountingError> {
+    let scan_limits = StorageReconciliationScanLimits::from_ledger_limits(limits)?;
+    let execution = admit_storage_reconciliation_execution(&storage, scan_limits)?;
+    for _attempt in 0..scan_limits.max_snapshot_attempts {
+        let plan = {
+            let storage = Arc::clone(&storage);
+            let execution = execution.clone();
+            reconciliation_blocking_task("manifest", move || {
+                load_storage_reconciliation_plan(&storage, limits, scan_limits, &execution)
+            })
+            .await?
+        };
+        let Some(first_pass) = run_storage_reconciliation_pass_async(
+            Arc::clone(&storage),
+            plan.clone(),
+            scan_limits,
+            execution.clone(),
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(second_pass) = run_storage_reconciliation_pass_async(
+            Arc::clone(&storage),
+            plan.clone(),
+            scan_limits,
+            execution.clone(),
+        )
+        .await?
+        else {
+            continue;
+        };
+        let final_manifest = {
+            let storage = Arc::clone(&storage);
+            let execution = execution.clone();
+            reconciliation_blocking_task("final manifest", move || {
+                load_storage_reconciliation_manifest(&storage, scan_limits, &execution)
+            })
+            .await?
+        };
+        if first_pass == second_pass && plan.metrics() == final_manifest.metrics.as_slice() {
+            return storage_reconciliation_records(first_pass.per_tenant, &plan, limits);
+        }
+    }
+    Err(storage_reconciliation_snapshot_error(scan_limits))
+}
+
+async fn run_storage_reconciliation_pass_async(
+    storage: Arc<dyn Storage>,
+    plan: StorageReconciliationPlan,
+    scan_limits: StorageReconciliationScanLimits,
+    execution: QueryExecution,
+) -> Result<Option<StorageReconciliationPassResult>, UsageAccountingError> {
+    let mut state = StorageReconciliationPassState::new(&plan);
+    while let Some(cursor) = state.cursor {
+        let request = state.page_request(scan_limits)?;
+        let page = {
+            let storage = Arc::clone(&storage);
+            let plan = plan.clone();
+            let execution = execution.clone();
+            reconciliation_blocking_task("row page", move || {
+                scan_storage_reconciliation_page(
+                    &storage,
+                    &plan,
+                    cursor,
+                    scan_limits,
+                    request,
+                    &execution,
+                )
+            })
+            .await?
+        };
+        let Some(page) = page else {
+            return Ok(None);
+        };
+        state.apply_page(page, scan_limits)?;
+    }
+    Ok(Some(state.finish()))
+}
+
+async fn reconciliation_blocking_task<T, F>(
+    task_name: &'static str,
+    task: F,
+) -> Result<T, UsageAccountingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, UsageAccountingError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(join_err) => Err(UsageAccountingError::Other(format!(
+            "usage accounting reconciliation {task_name} task failed: {join_err}"
+        ))),
+    }
+}
+
+fn storage_reconciliation_records(
+    per_tenant: BTreeMap<String, StorageAccumulator>,
+    plan: &StorageReconciliationPlan,
+    limits: UsageLedgerLimits,
+) -> Result<PreparedStorageReconciliation, UsageAccountingError> {
     if per_tenant.len() > limits.max_batch_records {
         return Err(UsageAccountingError::Limit(format!(
             "usage storage reconciliation produced {} tenant records, exceeding the configured batch maximum {}",
@@ -1504,7 +3058,49 @@ fn collect_storage_reconciliation_records(
             logical_storage_bytes: acc.logical_storage_bytes,
         });
     }
-    Ok(records)
+    let retained_records = modeled_storage_reconciliation_records_retained_bytes(&records)?;
+    if retained_records > plan.prepared_records_retained_upper_bound {
+        return Err(UsageAccountingError::Limit(format!(
+            "usage storage reconciliation prepared-record retained bytes {retained_records} exceeded the preflighted maximum {}",
+            plan.prepared_records_retained_upper_bound
+        )));
+    }
+    if plan.manifest.operation_memory_reservation.bytes() != plan.manifest.operation_retained_bytes
+    {
+        return Err(UsageAccountingError::Other(format!(
+            "usage storage reconciliation operation reservation changed before append: expected {}, retained {}",
+            plan.manifest.operation_retained_bytes,
+            plan.manifest.operation_memory_reservation.bytes()
+        )));
+    }
+    Ok(PreparedStorageReconciliation {
+        records,
+        _operation_memory: Arc::clone(&plan.manifest),
+    })
+}
+
+fn storage_reconciliation_snapshot_error(
+    scan_limits: StorageReconciliationScanLimits,
+) -> UsageAccountingError {
+    UsageAccountingError::Other(format!(
+        "usage storage reconciliation could not observe two identical bounded passes and an unchanged metric manifest in {} attempts; no storage records were published",
+        scan_limits.max_snapshot_attempts
+    ))
+}
+
+fn storage_reconciliation_storage_error(
+    operation: &str,
+    err: tsink::TsinkError,
+) -> UsageAccountingError {
+    if matches!(&err, tsink::TsinkError::QueryBudget(_)) {
+        UsageAccountingError::Limit(format!(
+            "usage storage reconciliation could not {operation} within its finite work limits: {err}"
+        ))
+    } else {
+        UsageAccountingError::Other(format!(
+            "usage storage reconciliation failed to {operation}: {err}"
+        ))
+    }
 }
 
 fn storage_snapshots_from_records(records: Vec<UsageLedgerRecord>) -> Vec<UsageStorageSnapshot> {
@@ -1620,7 +3216,7 @@ impl BucketAccumulator {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StorageAccumulator {
     series_total: u64,
     samples_total: u64,
@@ -2343,12 +3939,15 @@ fn matches_time_filter(
 }
 
 fn tenant_id_for_metric_series(series: &MetricSeries) -> String {
-    series
-        .labels
+    tenant_id_for_labels(&series.labels).to_string()
+}
+
+fn tenant_id_for_labels(labels: &[Label]) -> &str {
+    labels
         .iter()
         .find(|label| label.name == tenant::TENANT_LABEL)
-        .map(|label| label.value.clone())
-        .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string())
+        .map(|label| label.value.as_str())
+        .unwrap_or(tenant::DEFAULT_TENANT_ID)
 }
 
 fn estimated_series_bytes(series: &MetricSeries, point_count: u64) -> u64 {
@@ -2376,13 +3975,14 @@ fn unix_timestamp_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::tenant;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
     use tsink::{
-        DataPoint, Label, LocalDiskLimits, QueryOptions, Row, SeriesPoints, StorageBuilder,
-        TimestampPrecision,
+        DataPoint, Label, LocalDiskLimits, QueryBudgetLimits, QueryOptions, Row, SeriesPoints,
+        StorageBuilder, TimestampPrecision,
     };
 
     #[derive(Debug, Default)]
@@ -2422,6 +4022,18 @@ mod tests {
     }
 
     impl Storage for ObservedReconciliationStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+            self.inner.select_series_execution_accounting()
+        }
+
+        fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+            self.inner.scan_series_rows_execution_accounting()
+        }
+
         fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
             self.inner.insert_rows(rows)
         }
@@ -2486,6 +4098,303 @@ mod tests {
             self.inner.list_metrics()
         }
 
+        fn list_metrics_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<Vec<MetricSeries>> {
+            if let Some(sender) = self
+                .list_metrics_entered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            if let Some(gate) = self.list_metrics_gate.as_ref() {
+                gate.wait();
+            }
+            self.inner.list_metrics_with_execution(execution)
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            selection: &SeriesSelection,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            if let Some(sender) = self
+                .list_metrics_entered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            if let Some(gate) = self.list_metrics_gate.as_ref() {
+                gate.wait();
+            }
+            self.inner
+                .select_series_with_execution_result(selection, execution)
+        }
+
+        fn scan_series_rows_with_execution(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::QueryRowsPage> {
+            let result = self
+                .inner
+                .scan_series_rows_with_execution(series, start, end, options, execution);
+            if let Some(sender) = self
+                .select_many_completed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            result
+        }
+
+        fn scan_series_rows_with_execution_result(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::QueryRowsExecutionResult> {
+            let result = self
+                .inner
+                .scan_series_rows_with_execution_result(series, start, end, options, execution);
+            if let Some(sender) = self
+                .select_many_completed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            result
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct MutateAfterFirstReconciliationPageStorage {
+        inner: Arc<dyn Storage>,
+        mutation: Vec<Row>,
+        mutated: AtomicBool,
+    }
+
+    impl Storage for MutateAfterFirstReconciliationPageStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+            self.inner.select_series_execution_accounting()
+        }
+
+        fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+            self.inner.scan_series_rows_execution_accounting()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_many(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<SeriesPoints>> {
+            self.inner.select_many(series, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.list_metrics()
+        }
+
+        fn list_metrics_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.list_metrics_with_execution(execution)
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            selection: &SeriesSelection,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.inner
+                .select_series_with_execution_result(selection, execution)
+        }
+
+        fn scan_series_rows_with_execution(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::QueryRowsPage> {
+            let page = self
+                .inner
+                .scan_series_rows_with_execution(series, start, end, options, execution)?;
+            if !self.mutated.swap(true, Ordering::SeqCst) {
+                self.inner.insert_rows(&self.mutation)?;
+            }
+            Ok(page)
+        }
+
+        fn scan_series_rows_with_execution_result(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::QueryRowsExecutionResult> {
+            let page = self
+                .inner
+                .scan_series_rows_with_execution_result(series, start, end, options, execution)?;
+            if !self.mutated.swap(true, Ordering::SeqCst) {
+                self.inner.insert_rows(&self.mutation)?;
+            }
+            Ok(page)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct MissingReconciliationGuardStorage {
+        inner: Arc<dyn Storage>,
+        omit_manifest_guard: bool,
+        omit_row_guard: bool,
+    }
+
+    impl Storage for MissingReconciliationGuardStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+            QueryExecutionAccounting::Complete
+        }
+
+        fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+            QueryExecutionAccounting::Complete
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_many(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<SeriesPoints>> {
+            self.inner.select_many(series, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            selection: &SeriesSelection,
+            execution: &QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            if self.omit_manifest_guard {
+                return self
+                    .inner
+                    .select_series_with_execution(selection, execution)
+                    .map(tsink::SelectSeriesExecutionResult::unaccounted);
+            }
+            self.inner
+                .select_series_with_execution_result(selection, execution)
+        }
+
+        fn scan_series_rows_with_execution_result(
+            &self,
+            series: &[MetricSeries],
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &QueryExecution,
+        ) -> tsink::Result<tsink::QueryRowsExecutionResult> {
+            if self.omit_row_guard {
+                return self
+                    .inner
+                    .scan_series_rows_with_execution(series, start, end, options, execution)
+                    .map(tsink::QueryRowsExecutionResult::unaccounted);
+            }
+            self.inner
+                .scan_series_rows_with_execution_result(series, start, end, options, execution)
+        }
+
         fn close(&self) -> tsink::Result<()> {
             self.inner.close()
         }
@@ -2496,6 +4405,31 @@ mod tests {
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    fn make_scoped_single_series_rows(count: usize) -> Vec<Row> {
+        tenant::scope_rows_for_tenant(
+            (0..count)
+                .map(|index| {
+                    Row::with_labels(
+                        "bounded_reconciliation",
+                        vec![Label::new("host", "a")],
+                        DataPoint::new(
+                            i64::try_from(index).expect("test timestamp should fit"),
+                            index as f64,
+                        ),
+                    )
+                })
+                .collect(),
+            "team-a",
+        )
+        .expect("rows should scope")
+    }
+
+    fn make_storage_with_rows(rows: &[Row]) -> Arc<dyn Storage> {
+        let storage = make_storage();
+        storage.insert_rows(rows).expect("rows should insert");
+        storage
     }
 
     fn make_two_tenant_storage() -> Arc<dyn Storage> {
@@ -2874,6 +4808,359 @@ mod tests {
         assert!(accounting
             .latest_storage_snapshot_for("team-a")
             .is_some_and(|snapshot| snapshot.samples_total == 2));
+    }
+
+    #[test]
+    fn storage_reconciliation_reuses_one_query_slot_and_releases_all_query_memory() {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(512 * 1024 * 1024),
+                per_query: QueryWorkLimits::default(),
+            })
+            .build()
+            .expect("single-slot storage should build");
+        storage
+            .insert_rows(&make_scoped_single_series_rows(3))
+            .expect("rows should insert");
+        let accounting = UsageAccounting::open(None).expect("usage store should open");
+
+        let snapshots = accounting
+            .reconcile_storage(&storage)
+            .expect("reconciliation must not attempt a nested query admission");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].samples_total, 3);
+
+        let budget = storage.query_budget_snapshot();
+        assert_eq!(budget.queries_started_total, 1);
+        assert_eq!(budget.queries_completed_total, 1);
+        assert_eq!(budget.peak_active_queries, 1);
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.concurrency_rejections_total, 0);
+    }
+
+    #[test]
+    fn reconciliation_rejects_complete_claims_that_omit_result_guards() {
+        let ledger_limits = UsageLedgerLimits::default();
+        let scan_limits = StorageReconciliationScanLimits::from_ledger_limits(ledger_limits)
+            .expect("scan limits should derive");
+        let rows = make_scoped_single_series_rows(1);
+
+        let manifest_inner = make_storage_with_rows(&rows);
+        let manifest_storage: Arc<dyn Storage> = Arc::new(MissingReconciliationGuardStorage {
+            inner: Arc::clone(&manifest_inner),
+            omit_manifest_guard: true,
+            omit_row_guard: false,
+        });
+        let manifest_execution =
+            admit_storage_reconciliation_execution(&manifest_storage, scan_limits)
+                .expect("the declared operation accounting should admit");
+        let manifest_err = load_storage_reconciliation_plan(
+            &manifest_storage,
+            ledger_limits,
+            scan_limits,
+            &manifest_execution,
+        )
+        .expect_err("a metadata result without its guard must fail closed");
+        assert!(
+            manifest_err
+                .to_string()
+                .contains("manifest omitted its retained-memory reservation"),
+            "{manifest_err}"
+        );
+        drop(manifest_execution);
+        assert_eq!(
+            manifest_inner
+                .query_budget_snapshot()
+                .shared_reserved_memory_bytes,
+            0
+        );
+
+        let row_inner = make_storage_with_rows(&rows);
+        let row_storage: Arc<dyn Storage> = Arc::new(MissingReconciliationGuardStorage {
+            inner: Arc::clone(&row_inner),
+            omit_manifest_guard: false,
+            omit_row_guard: true,
+        });
+        let row_execution = admit_storage_reconciliation_execution(&row_storage, scan_limits)
+            .expect("the declared operation accounting should admit");
+        let row_plan = load_storage_reconciliation_plan(
+            &row_storage,
+            ledger_limits,
+            scan_limits,
+            &row_execution,
+        )
+        .expect("the guarded manifest should load");
+        let row_err =
+            run_storage_reconciliation_pass(&row_storage, &row_plan, scan_limits, &row_execution)
+                .expect_err("a row page without its guard must fail closed");
+        assert!(
+            row_err
+                .to_string()
+                .contains("row page omitted its retained-memory reservation"),
+            "{row_err}"
+        );
+        drop(row_plan);
+        drop(row_execution);
+        assert_eq!(
+            row_inner
+                .query_budget_snapshot()
+                .shared_reserved_memory_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_reconciliation_accepts_exact_row_and_byte_limits_but_rejects_n_plus_one() {
+        let ledger_limits = UsageLedgerLimits::default();
+
+        let exact_rows = make_scoped_single_series_rows(2);
+        let exact_storage = make_storage_with_rows(&exact_rows);
+        let mut row_limits = StorageReconciliationScanLimits::from_ledger_limits(ledger_limits)
+            .expect("scan limits should derive");
+        row_limits.max_rows_per_page = 2;
+        row_limits.max_rows_per_pass = 2;
+        let memory_before = exact_storage
+            .query_budget_snapshot()
+            .shared_reserved_memory_bytes;
+        let exact_execution = admit_storage_reconciliation_execution(&exact_storage, row_limits)
+            .expect("exact reconciliation should admit");
+        let exact_plan = load_storage_reconciliation_plan(
+            &exact_storage,
+            ledger_limits,
+            row_limits,
+            &exact_execution,
+        )
+        .expect("exact manifest should load");
+        let cloned_plan = exact_plan.clone();
+        assert!(
+            Arc::ptr_eq(&exact_plan.base_per_tenant, &cloned_plan.base_per_tenant),
+            "per-page plan clones must share the preflighted base map"
+        );
+        drop(cloned_plan);
+        let manifest_reservation = exact_plan.manifest.operation_memory_reservation.bytes();
+        assert!(manifest_reservation > 0);
+        assert!(
+            manifest_reservation > exact_plan.manifest.manifest_retained_bytes,
+            "the live operation guard must also cover accumulator maps and prepared records"
+        );
+        assert!(
+            exact_storage
+                .query_budget_snapshot()
+                .shared_reserved_memory_bytes
+                >= memory_before.saturating_add(manifest_reservation)
+        );
+        let exact = run_storage_reconciliation_pass(
+            &exact_storage,
+            &exact_plan,
+            row_limits,
+            &exact_execution,
+        )
+        .expect("exact row limit should scan")
+        .expect("exact row limit should remain stable");
+        assert_eq!(exact.rows_total, 2);
+        assert_eq!(
+            exact.pages_total, 2,
+            "a full terminal page must be followed by an empty exact probe"
+        );
+        drop(exact_plan);
+        drop(exact_execution);
+        assert_eq!(
+            exact_storage
+                .query_budget_snapshot()
+                .shared_reserved_memory_bytes,
+            memory_before,
+            "dropping the plan must release its retained manifest reservation"
+        );
+
+        let n_plus_one_rows = make_scoped_single_series_rows(3);
+        let n_plus_one_storage = make_storage_with_rows(&n_plus_one_rows);
+        let n_plus_one_execution =
+            admit_storage_reconciliation_execution(&n_plus_one_storage, row_limits)
+                .expect("N+1 reconciliation should admit");
+        let n_plus_one_plan = load_storage_reconciliation_plan(
+            &n_plus_one_storage,
+            ledger_limits,
+            row_limits,
+            &n_plus_one_execution,
+        )
+        .expect("N+1 manifest should load");
+        let err = run_storage_reconciliation_pass(
+            &n_plus_one_storage,
+            &n_plus_one_plan,
+            row_limits,
+            &n_plus_one_execution,
+        )
+        .expect_err("N+1 rows must fail closed");
+        assert!(matches!(err, UsageAccountingError::Limit(_)), "{err}");
+        drop(n_plus_one_plan);
+        drop(n_plus_one_execution);
+
+        let exact_bytes = exact.returned_bytes_total;
+        let mut byte_limits = StorageReconciliationScanLimits::from_ledger_limits(ledger_limits)
+            .expect("scan limits should derive");
+        byte_limits.max_returned_bytes_per_pass = exact_bytes;
+        let exact_byte_execution =
+            admit_storage_reconciliation_execution(&exact_storage, byte_limits)
+                .expect("exact-byte reconciliation should admit");
+        let exact_byte_plan = load_storage_reconciliation_plan(
+            &exact_storage,
+            ledger_limits,
+            byte_limits,
+            &exact_byte_execution,
+        )
+        .expect("exact-byte manifest should load");
+        assert!(run_storage_reconciliation_pass(
+            &exact_storage,
+            &exact_byte_plan,
+            byte_limits,
+            &exact_byte_execution,
+        )
+        .expect("exact byte limit should scan")
+        .is_some());
+        drop(exact_byte_plan);
+        drop(exact_byte_execution);
+        let n_plus_one_byte_execution =
+            admit_storage_reconciliation_execution(&n_plus_one_storage, byte_limits)
+                .expect("N+1-byte reconciliation should admit");
+        let n_plus_one_byte_plan = load_storage_reconciliation_plan(
+            &n_plus_one_storage,
+            ledger_limits,
+            byte_limits,
+            &n_plus_one_byte_execution,
+        )
+        .expect("N+1-byte manifest should load");
+        let err = run_storage_reconciliation_pass(
+            &n_plus_one_storage,
+            &n_plus_one_byte_plan,
+            byte_limits,
+            &n_plus_one_byte_execution,
+        )
+        .expect_err("N+1 returned bytes must fail closed");
+        assert!(matches!(err, UsageAccountingError::Limit(_)), "{err}");
+    }
+
+    #[test]
+    fn reconciliation_retained_memory_model_charges_spare_capacity_until_guard_drop() {
+        let mut metric = String::with_capacity(256);
+        metric.push('m');
+        let mut labels = Vec::with_capacity(16);
+        let mut label_name = String::with_capacity(64);
+        label_name.push_str("host");
+        let mut label_value = String::with_capacity(128);
+        label_value.push('a');
+        labels.push(Label::new(label_name, label_value));
+        let row = Row::with_labels(metric, labels, DataPoint::new(1, 1.0));
+        let mut rows = Vec::with_capacity(32);
+        rows.push(row);
+
+        let retained =
+            modeled_storage_reconciliation_rows_retained_bytes(&rows).expect("bytes should model");
+        let logical = u64::try_from(
+            modeled_write_batch_input_bytes(&rows).expect("logical bytes should model"),
+        )
+        .expect("logical byte model should fit");
+        assert!(
+            retained > logical,
+            "capacity model must include spare capacity and allocation allowances"
+        );
+
+        let storage = make_storage();
+        let execution = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_memory_bytes: Some(retained),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("query should admit")
+            .expect("built-in storage should expose a query budget");
+        let guard = execution
+            .reserve_memory(retained)
+            .expect("retained rows should reserve");
+        assert_eq!(guard.bytes(), retained);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, retained);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            retained
+        );
+        drop(guard);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn prepared_reconciliation_keeps_operation_memory_charged_until_drop() {
+        let storage = make_two_tenant_storage();
+        let memory_before = storage.query_budget_snapshot().shared_reserved_memory_bytes;
+        let prepared =
+            collect_storage_reconciliation_records(&storage, UsageLedgerLimits::default())
+                .expect("reconciliation should prepare");
+        let retained = prepared
+            ._operation_memory
+            .operation_memory_reservation
+            .bytes();
+        assert!(retained > 0);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            memory_before.saturating_add(retained)
+        );
+        assert_eq!(prepared.records.len(), 2);
+
+        drop(prepared);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            memory_before
+        );
+    }
+
+    #[test]
+    fn concurrent_storage_mutation_retries_without_publishing_a_failed_prefix() {
+        let accounting = UsageAccounting::open(None).expect("usage store should open");
+        let inner = make_two_tenant_storage();
+        let mutation = tenant::scope_rows_for_tenant(
+            vec![Row::with_labels(
+                "cpu_usage",
+                vec![Label::new("host", "a")],
+                DataPoint::new(2, 4.0),
+            )],
+            "team-a",
+        )
+        .expect("mutation should scope");
+        let storage: Arc<dyn Storage> = Arc::new(MutateAfterFirstReconciliationPageStorage {
+            inner,
+            mutation,
+            mutated: AtomicBool::new(false),
+        });
+
+        let snapshots = accounting
+            .reconcile_storage(&storage)
+            .expect("one observed mutation should be discarded and retried");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.tenant_id == "team-a")
+                .expect("team-a snapshot should exist")
+                .samples_total,
+            3
+        );
+        let records = accounting.export_records(None, None, None);
+        assert_eq!(
+            records.len(),
+            2,
+            "only the stable retry may publish its atomic tenant batch"
+        );
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]

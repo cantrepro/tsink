@@ -1,6 +1,10 @@
 # Multi-tenancy
 
-tsink's multi-tenancy model gives every tenant a fully isolated data namespace with independent quotas, admission budgets, authentication tokens, and lifecycle state — all sharing a single storage engine with zero cross-tenant data leakage.
+tsink's multi-tenancy model gives every tenant an isolated data namespace with independent quotas,
+admission budgets, authentication tokens, and lifecycle state while sharing one storage engine.
+Tenant identity is carried through the supported request, storage-key, query, and observability
+paths; operators should still validate their authentication and proxy configuration before
+production use.
 
 ---
 
@@ -102,7 +106,10 @@ The file has a `defaults` block whose values are inherited by every tenant, and 
 
 ### Quota fields
 
-All quota fields are optional. Unset fields fall back to the `defaults` block, then to the server's built-in defaults (unlimited if not specified).
+All tenant-policy quota fields are optional. Unset tenant entries fall back to the policy file's
+`defaults` block; a field still unset there adds no tenant-specific restriction. This does not
+remove the finite core `Server` resource profile or the server's separate global request-admission
+envelopes.
 
 | Field | Description |
 |---|---|

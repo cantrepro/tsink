@@ -1,6 +1,7 @@
 # Configuration reference
 
-Complete listing of every configuration knob in tsink — the embedded library API, the server CLI flags, and the environment variables that tune ingestion, clustering, and background workers.
+Reference for the supported embedded builder, server CLI, and environment controls that tune
+ingestion, clustering, and background workers.
 
 Sections are ordered from most commonly used to most advanced.
 
@@ -60,6 +61,7 @@ see the [embedded library guide](embedded-library.md) and
 | Builder method | Type | Default | Description |
 |---|---|---|---|
 | `with_retention(duration)` | `Duration` | `14 days` | How long data is retained. Writes outside this window are rejected when `retention_enforced` is set (which `with_retention` enables automatically). |
+| `with_retention_enforced(enabled)` | `bool` | `false` | Enable or disable retention rejection and filtering independently of the configured window. |
 | `with_tiered_retention_policy(hot, warm)` | `(Duration, Duration)` | *(both fall back to `retention`)* | Sets the ages at which data moves from local hot storage to the warm tier and then to the cold tier. Calling it also enables retention enforcement. |
 | `with_mirror_hot_segments_to_object_store(bool)` | `bool` | `false` | Copy freshly-persisted hot segments into `<object_store_path>/hot/` in addition to writing locally. Useful for cross-node availability. |
 | `with_remote_segment_cache_policy(policy)` | `RemoteSegmentCachePolicy` | `MetadataOnly` | Selects the remote segment cache policy. `MetadataOnly` is the only policy currently available. |
@@ -77,9 +79,10 @@ see the [embedded library guide](embedded-library.md) and
 
 | Builder method | Type | Default | Description |
 |---|---|---|---|
-| `with_max_writers(n)` | `usize` | CPU-count (cgroup-aware) | Maximum writes admitted concurrently by the synchronous engine. |
+| `with_max_writers(n)` | `usize` | `4` (`Embedded`) | Maximum writes admitted concurrently by the synchronous engine. |
 | `with_write_timeout(duration)` | `Duration` | `30s` | Maximum time a write call will wait for a writer slot before returning a backpressure error. |
 | `with_max_future_skew(duration)` | `Duration` | *(unset)* | Opt-in clock-relative admission cutoff. A timestamp exactly at `now + duration` is accepted; a later timestamp is rejected before series or WAL state is created. |
+| `with_write_batch_limits(limits)` | `WriteBatchLimits` | 100,000 rows / 64 MiB (`Embedded`) | Pre-clone top-level row and modeled input bounds. Violations commit nothing and return a structured batch-limit error before allocating indexed outcomes. |
 
 ### Memory & cardinality
 
@@ -89,7 +92,7 @@ see the [embedded library guide](embedded-library.md) and
 | `with_cardinality_limit(n)` | `usize` | `1,000,000` (`Embedded`) | Hard cap on the total number of unique series. Writes that would create a new series beyond this limit are rejected with a cardinality error. |
 | `with_max_labels_per_series(n)` | `usize` | `128` | Maximum labels in a submitted series identity. Values above the 65,535-label storage-format maximum fail during build. |
 | `with_max_series_identity_bytes(n)` | `usize` | `65536` | Maximum cumulative UTF-8 bytes in the metric name and all label names and values. |
-| `with_series_creation_rate_limit(n, window)` | `usize`, `Duration` | *(unset)* | Maximum successfully published new series in a fixed storage-clock window. Concurrent in-flight reservations count; failed writes release them. |
+| `with_series_creation_rate_limit(n, window)` | `usize`, `Duration` | 100,000 / 60 s (`Embedded`) | Maximum successfully published new series in a fixed storage-clock window. Concurrent in-flight reservations count; failed writes release them. |
 
 ### WAL
 
@@ -100,6 +103,20 @@ see the [embedded library guide](embedded-library.md) and
 | `with_wal_buffer_size(n)` | `usize` | `4096` | I/O buffer size for WAL writes. Larger buffers reduce syscall overhead on high-throughput workloads. |
 | `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` synchronizes each non-empty batch. `Periodic(duration)` checks the elapsed interval during a later append; it has no autonomous timer, so successful writes may be `Appended` until another write or lifecycle action synchronizes them. |
 | `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. |
+
+### Local disk
+
+| Builder method | Type | Default | Description |
+|---|---|---|---|
+| `with_local_disk_limit(n)` | `u64` | `16 GiB` (`Embedded`) | Logical byte quota beneath the persistent data path. Existing over-limit data can reopen, but new growth is rejected. |
+| `with_filesystem_free_headroom(n)` | `u64` | `256 MiB` (`Embedded`) | Filesystem free space reserved for the host. |
+| `with_maintenance_temp_reserve(n)` | `u64` | `1 GiB` (`Embedded`) | Portion of the logical quota reserved for maintenance and recovery admission. |
+
+### Query budget
+
+| Builder method | Type | Default | Description |
+|---|---|---|---|
+| `with_query_budget_limits(limits)` | `QueryBudgetLimits` | finite (`Embedded`) | Override shared query concurrency/memory and per-query work, result, deadline, and memory limits. Exact resolved values are exposed by `resource_configuration_snapshot()` and listed in [resource limits](resource-limits.md). |
 
 ### Background workers
 
@@ -154,7 +171,7 @@ tsink-server --help
 | `--warm-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which warm segments move to the cold object-store tier. |
 | `--storage-mode <MODE>` | `read-write` | `read-write` — normal full node. `compute-only` — query-only node backed by object store. |
 | `--remote-segment-refresh-interval <DURATION>` | `5s` | Metadata refresh interval for `compute-only` nodes. |
-| `--mirror-hot-segments-to-object-store` | `false` | Copy hot segments to object store as they are sealed. |
+| `--mirror-hot-segments-to-object-store <BOOL>` | `false` | Copy hot segments to object store as they are sealed. |
 | `--wal-enabled <BOOL>` | `true` | Enable (`true`) or disable (`false`) the WAL. |
 | `--wal-sync-mode <MODE>` | `per-append` | `per-append` (synchronize each non-empty write) or `periodic` (append-driven interval, higher throughput). |
 | `--chunk-points <N>` | `2048` | Target data points per chunk (1–65535). |
@@ -249,7 +266,7 @@ Cluster mode is an experimental advanced capability, not part of tsink's primary
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable experimental cluster mode. Requires `--data-path`. |
+| `--cluster-enabled <BOOL>` | `false` | Enable experimental cluster mode. Requires `--data-path`. |
 | `--cluster-node-id <ID>` | *(required)* | Stable, unique identifier for this node. Must not change after initial startup. |
 | `--cluster-bind <HOST:PORT>` | *(none)* | Internal RPC bind/advertise address. Peers will connect to this address. |
 | `--cluster-node-role <ROLE>` | `hybrid` | `storage` — data only; `query` — query fan-out only; `hybrid` — both. |
@@ -261,7 +278,7 @@ Cluster mode is an experimental advanced capability, not part of tsink's primary
 | `--cluster-read-partial-response <POLICY>` | `allow` | `allow` — return partial results when some shards are unavailable; `deny` — fail the query. |
 | `--cluster-internal-auth-token <TOKEN>` | *(none)* | Shared secret for internal RPC authentication (used when mTLS is not enabled). |
 | `--cluster-internal-auth-token-file <PATH>` | *(none)* | File/exec manifest for the internal RPC token. |
-| `--cluster-internal-mtls-enabled` | `false` | Enable mTLS for all internal peer-to-peer RPC. |
+| `--cluster-internal-mtls-enabled <BOOL>` | `false` | Enable mTLS for all internal peer-to-peer RPC. |
 | `--cluster-internal-mtls-ca-cert <PATH>` | *(none)* | PEM CA bundle for internal mTLS. |
 | `--cluster-internal-mtls-cert <PATH>` | *(none)* | PEM client certificate for internal mTLS. |
 | `--cluster-internal-mtls-key <PATH>` | *(none)* | PEM client key for internal mTLS. |
@@ -319,8 +336,12 @@ These variables control per-protocol feature flags and per-request limits.
 | Variable | Default | Description |
 |---|---|---|
 | `TSINK_RULES_SCHEDULER_TICK_MS` | `1000` | Interval in milliseconds between rules-engine scheduler evaluations. |
-| `TSINK_RULES_MAX_RECORDING_ROWS_PER_EVAL` | `10000` | Maximum rows written by a single recording rule evaluation. Evaluations that would exceed this produce a partial result and log a warning. |
+| `TSINK_RULES_MAX_RECORDING_ROWS_PER_EVAL` | `10000` | Maximum rows written by a single recording rule evaluation. Evaluations that would exceed this are rejected before row construction. |
 | `TSINK_RULES_MAX_ALERT_INSTANCES_PER_RULE` | `10000` | Maximum number of alert instances tracked per alerting rule. |
+
+Embedded callers can configure the finite rules-sidecar count, input-byte, retained, durable,
+startup, replacement, runtime-update, and status ceilings through
+`RulesRuntime::open_with_config`; see [Rules](rules.md#environment-variables).
 
 ---
 

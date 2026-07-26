@@ -1672,7 +1672,213 @@ pub(super) async fn handle_internal_ingest_write(
     response
 }
 
+struct InternalExemplarCancellationGuard {
+    token: tsink::QueryCancellationToken,
+}
+
+const INTERNAL_ACCOUNTED_RESPONSE_HEADER_ENVELOPE_BYTES: u64 = 2 * 1024;
+
+impl Drop for InternalExemplarCancellationGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+#[derive(Serialize)]
+struct InternalAccountedQueryExemplarsResponse<'a> {
+    series: &'a [ExemplarSeries],
+    accounting: tsink::QueryExecutionSnapshot,
+}
+
+#[derive(Default)]
+struct InternalAccountedJsonLengthWriter<'a> {
+    bytes: usize,
+    execution: Option<&'a tsink::QueryExecution>,
+    control_error: Option<tsink::QueryBudgetError>,
+}
+
+impl std::io::Write for InternalAccountedJsonLengthWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(execution) = self.execution {
+            if let Err(error) = execution.checkpoint() {
+                self.control_error = Some(error);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "internal accounted response was canceled",
+                ));
+            }
+        }
+        self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "internal exemplar response length overflow",
+            )
+        })?;
+        if self.bytes > MAX_BODY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "internal accounted response exceeds its hard byte limit",
+            ));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct InternalAccountedJsonWriter<'a, W> {
+    inner: W,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+}
+
+impl<W: std::io::Write> std::io::Write for InternalAccountedJsonWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "internal accounted response was canceled",
+            ));
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn internal_exemplar_query_error_response(error: ExemplarQueryError) -> HttpResponse {
+    match error {
+        ExemplarQueryError::Budget(error) => internal_select_batch_query_error_response(&error),
+        ExemplarQueryError::InvalidSelection => internal_error_response(
+            400,
+            "invalid_request",
+            "invalid exemplar query request",
+            false,
+        ),
+        ExemplarQueryError::StoreUnavailable => internal_error_response(
+            503,
+            "exemplar_query_unavailable",
+            "exemplar storage is unavailable",
+            true,
+        ),
+        ExemplarQueryError::Allocation => internal_error_response(
+            500,
+            "exemplar_query_allocation_failed",
+            "exemplar query allocation failed",
+            false,
+        ),
+    }
+}
+
+fn encode_internal_accounted_json_response<T: Serialize + ?Sized>(
+    payload: &T,
+    execution: &tsink::QueryExecution,
+) -> Result<(HttpResponse, tsink::QueryMemoryReservation), HttpResponse> {
+    let mut length_writer = InternalAccountedJsonLengthWriter {
+        bytes: 0,
+        execution: Some(execution),
+        control_error: None,
+    };
+    if serde_json::to_writer(&mut length_writer, payload).is_err() {
+        if let Some(error) = length_writer.control_error {
+            return Err(internal_select_batch_query_error_response(&error));
+        }
+        return Err(internal_error_response(
+            if length_writer.bytes > MAX_BODY_BYTES {
+                413
+            } else {
+                500
+            },
+            if length_writer.bytes > MAX_BODY_BYTES {
+                "query_response_too_large"
+            } else {
+                "query_response_serialization_failed"
+            },
+            if length_writer.bytes > MAX_BODY_BYTES {
+                "internal query response exceeds its hard byte limit"
+            } else {
+                "failed to measure internal query response"
+            },
+            false,
+        ));
+    }
+    let reserved_bytes = u64::try_from(length_writer.bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(INTERNAL_ACCOUNTED_RESPONSE_HEADER_ENVELOPE_BYTES);
+    let mut reservation = execution
+        .reserve_memory(reserved_bytes)
+        .map_err(|error| internal_select_batch_query_error_response(&error))?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(length_writer.bytes).map_err(|_| {
+        internal_error_response(
+            500,
+            "query_response_allocation_failed",
+            "failed to allocate internal query response",
+            false,
+        )
+    })?;
+    body.resize(length_writer.bytes, 0);
+    let written = {
+        let cursor = std::io::Cursor::new(body.as_mut_slice());
+        let mut writer = InternalAccountedJsonWriter {
+            inner: cursor,
+            execution,
+            control_error: None,
+        };
+        if serde_json::to_writer(&mut writer, payload).is_err() {
+            if let Some(error) = writer.control_error {
+                return Err(internal_select_batch_query_error_response(&error));
+            }
+            return Err(internal_error_response(
+                500,
+                "query_response_serialization_failed",
+                "failed to serialize internal query response",
+                false,
+            ));
+        }
+        usize::try_from(writer.inner.position()).unwrap_or(usize::MAX)
+    };
+    if written != length_writer.bytes {
+        return Err(internal_error_response(
+            500,
+            "query_response_length_changed",
+            "internal query response length changed after preflight",
+            false,
+        ));
+    }
+    reservation
+        .resize(
+            u64::try_from(body.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_add(INTERNAL_ACCOUNTED_RESPONSE_HEADER_ENVELOPE_BYTES),
+        )
+        .map_err(|error| internal_select_batch_query_error_response(&error))?;
+    Ok((
+        HttpResponse::new(200, body).with_header("Content-Type", "application/json"),
+        reservation,
+    ))
+}
+
+fn encode_internal_accounted_exemplar_response(
+    result: &AccountedExemplarQueryResult,
+    execution: &tsink::QueryExecution,
+) -> Result<(HttpResponse, tsink::QueryMemoryReservation), HttpResponse> {
+    encode_internal_accounted_json_response(
+        &InternalAccountedQueryExemplarsResponse {
+            series: result.series(),
+            accounting: execution.snapshot(),
+        },
+        execution,
+    )
+}
+
 pub(super) async fn handle_internal_query_exemplars(
+    storage: &Arc<dyn Storage>,
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
     internal_api: Option<&InternalApiConfig>,
@@ -1733,29 +1939,98 @@ pub(super) async fn handle_internal_query_exemplars(
             false,
         );
     }
-
-    match exemplar_store.query(
-        &payload.selectors,
-        payload.start,
-        payload.end,
-        payload.limit,
-    ) {
-        Ok(series) => json_response(
-            200,
-            &InternalQueryExemplarsResponse {
-                series: series
-                    .into_iter()
-                    .map(exemplar_series_to_internal)
-                    .collect(),
-            },
-        ),
-        Err(err) => internal_error_response(
-            503,
-            "exemplar_query_failed",
-            format!("internal exemplar query failed: {err}"),
-            true,
-        ),
+    if payload.limit == 0 || payload.limit > exemplar_store.config().max_query_results {
+        return internal_error_response(
+            422,
+            "exemplar_limit_exceeded",
+            "query_exemplars limit is outside the configured hard range",
+            false,
+        );
     }
+
+    let Some(query_limits) = payload.query_limits else {
+        return match exemplar_store.query(
+            &payload.selectors,
+            payload.start,
+            payload.end,
+            payload.limit,
+        ) {
+            Ok(series) => json_response(
+                200,
+                &InternalQueryExemplarsResponse {
+                    series: series
+                        .into_iter()
+                        .map(exemplar_series_to_internal)
+                        .collect(),
+                    accounting: None,
+                },
+            ),
+            Err(_) => internal_error_response(
+                503,
+                "exemplar_query_failed",
+                "internal exemplar query failed",
+                true,
+            ),
+        };
+    };
+
+    let cancellation = tsink::QueryCancellationToken::new();
+    let _cancellation_guard = InternalExemplarCancellationGuard {
+        token: cancellation.clone(),
+    };
+    let execution = match storage.begin_query_execution(query_limits, cancellation) {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
+            return internal_error_response(
+                409,
+                "query_accounting_unavailable",
+                "storage does not expose exemplar query execution admission",
+                false,
+            )
+        }
+        Err(tsink::TsinkError::QueryBudget(error)) => {
+            return internal_select_batch_query_error_response(&error)
+        }
+        Err(_) => {
+            return internal_error_response(
+                503,
+                "query_admission_failed",
+                "internal exemplar query admission failed",
+                true,
+            )
+        }
+    };
+    let store = Arc::clone(exemplar_store);
+    let selectors = payload.selectors;
+    let start = payload.start;
+    let end = payload.end;
+    let limit = payload.limit;
+    let worker_execution = execution.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        store.query_with_execution_result(&selectors, start, end, limit, &worker_execution)
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return internal_exemplar_query_error_response(error),
+        Err(_) => {
+            return internal_error_response(
+                500,
+                "exemplar_query_task_failed",
+                "internal exemplar query task failed",
+                false,
+            )
+        }
+    };
+    let (response, response_reservation) =
+        match encode_internal_accounted_exemplar_response(&result, &execution) {
+            Ok(encoded) => encoded,
+            Err(response) => return response,
+        };
+    drop(result);
+    drop(response_reservation);
+    drop(execution);
+    response
 }
 
 pub(super) async fn handle_internal_ingest_rows(
@@ -2170,6 +2445,340 @@ pub(super) async fn handle_internal_select(
     }
 }
 
+fn internal_select_batch_query_error_response(error: &tsink::QueryBudgetError) -> HttpResponse {
+    let (status, code, retryable) = match error {
+        tsink::QueryBudgetError::InvalidLimits(_) => {
+            (400, "invalid_query_limits".to_string(), false)
+        }
+        tsink::QueryBudgetError::LimitExceeded(exceeded) => {
+            let retryable = matches!(
+                exceeded.reason,
+                tsink::QueryLimitReason::ConcurrentQueries
+                    | tsink::QueryLimitReason::SharedMemoryBytes
+            );
+            (
+                if retryable { 429 } else { 413 },
+                format!("query_limit_{}", exceeded.reason.as_str()),
+                retryable,
+            )
+        }
+        tsink::QueryBudgetError::Cancelled => (503, "query_cancelled".to_string(), false),
+        tsink::QueryBudgetError::DeadlineExceeded => {
+            (503, "query_deadline_exceeded".to_string(), false)
+        }
+        _ => {
+            return internal_error_response(
+                500,
+                "query_accounting_failed",
+                format!("internal select_batch query accounting failed: {error}"),
+                false,
+            );
+        }
+    };
+    internal_error_response(status, code, error.to_string(), retryable)
+}
+
+fn internal_select_batch_accounting_unavailable(message: impl Into<String>) -> HttpResponse {
+    internal_error_response(409, "query_accounting_unavailable", message, false)
+}
+
+fn remaining_internal_select_batch_limit(
+    limit: Option<u64>,
+    current: u64,
+    reason: tsink::QueryLimitReason,
+) -> Result<Option<u64>, tsink::QueryBudgetError> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let remaining = limit.saturating_sub(current);
+    if remaining == 0 {
+        return Err(tsink::QueryLimitExceeded::new(reason, limit, current, 1).into());
+    }
+    Ok(Some(remaining))
+}
+
+fn remaining_internal_select_batch_limits(
+    execution: &tsink::QueryExecution,
+) -> Result<tsink::QueryWorkLimits, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let snapshot = execution.snapshot();
+    let mut limits = execution.limits();
+    // Handoff peers can contain the same logical selector as the current owner. Subtracting local
+    // matches would reject a duplicate-only bridge before its response flags can establish the
+    // exact union. The child retains the same finite cap; aggregation charges only newly matched
+    // request indices.
+    limits.max_samples_scanned = remaining_internal_select_batch_limit(
+        limits.max_samples_scanned,
+        snapshot.samples_scanned,
+        tsink::QueryLimitReason::SamplesScanned,
+    )?;
+    limits.max_samples_returned = remaining_internal_select_batch_limit(
+        limits.max_samples_returned,
+        snapshot.samples_returned,
+        tsink::QueryLimitReason::SamplesReturned,
+    )?;
+    limits.max_returned_bytes = remaining_internal_select_batch_limit(
+        limits.max_returned_bytes,
+        snapshot.returned_bytes,
+        tsink::QueryLimitReason::ReturnedBytes,
+    )?;
+    limits.max_pattern_expansion = remaining_internal_select_batch_limit(
+        limits.max_pattern_expansion,
+        snapshot.pattern_expansion,
+        tsink::QueryLimitReason::PatternExpansion,
+    )?;
+    limits.max_steps = remaining_internal_select_batch_limit(
+        limits.max_steps,
+        snapshot.steps,
+        tsink::QueryLimitReason::Steps,
+    )?;
+
+    if let Some(deadline) = execution.cancellation_token().deadline() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(tsink::QueryBudgetError::DeadlineExceeded);
+        };
+        if remaining.is_zero() {
+            return Err(tsink::QueryBudgetError::DeadlineExceeded);
+        }
+        limits.max_wall_time = Some(remaining);
+    }
+    Ok(limits)
+}
+
+fn aggregate_internal_select_batch_accounting(
+    execution: &tsink::QueryExecution,
+    snapshot: tsink::QueryExecutionSnapshot,
+    additional_series_matched: u64,
+) -> Result<(), tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    execution.charge_series_matched(additional_series_matched)?;
+    execution.charge_samples_scanned(snapshot.samples_scanned)?;
+    execution.charge_samples_returned(snapshot.samples_returned)?;
+    execution.charge_returned_bytes(snapshot.returned_bytes)?;
+    execution.charge_pattern_expansion(snapshot.pattern_expansion)?;
+    execution.charge_steps(snapshot.steps)?;
+    execution.observe_intermediate_vector_size(snapshot.intermediate_vector_size)?;
+    Ok(())
+}
+
+fn validate_internal_select_batch_accounting(
+    selectors: &[MetricSeries],
+    series: &[SeriesPoints],
+    snapshot: tsink::QueryExecutionSnapshot,
+    matched_selectors: &[bool],
+) -> Result<(), &'static str> {
+    if series.len() != selectors.len() {
+        return Err("response series count does not match the requested selector count");
+    }
+    if series
+        .iter()
+        .zip(selectors)
+        .any(|(item, selector)| item.series != *selector)
+    {
+        return Err("response series identities are not in requested selector order");
+    }
+    if matched_selectors.len() != selectors.len() {
+        return Err("matched-selector count does not match the requested selector count");
+    }
+    let matched_count = matched_selectors.iter().filter(|matched| **matched).count();
+    if snapshot.series_matched != u64::try_from(matched_count).unwrap_or(u64::MAX) {
+        return Err("reported matched-series count does not match selector-existence bits");
+    }
+    if series
+        .iter()
+        .zip(matched_selectors)
+        .any(|(item, matched)| !matched && !item.points.is_empty())
+    {
+        return Err("response returned points for a selector reported as missing");
+    }
+    if snapshot.series_matched > u64::try_from(selectors.len()).unwrap_or(u64::MAX) {
+        return Err("reported matched-series count exceeds the requested selector count");
+    }
+    let returned_samples = series.iter().fold(0u64, |count, item| {
+        count.saturating_add(u64::try_from(item.points.len()).unwrap_or(u64::MAX))
+    });
+    if snapshot.samples_returned < returned_samples {
+        return Err("reported returned-sample count is smaller than the response");
+    }
+    if snapshot.samples_scanned < snapshot.samples_returned {
+        return Err("reported scanned-sample count is smaller than returned samples");
+    }
+    let returned_bytes = crate::cluster::query::modeled_series_points_returned_bytes(series);
+    if snapshot.returned_bytes < returned_bytes {
+        return Err("reported returned-byte count is smaller than the response");
+    }
+    let minimum_vector_size = series.iter().fold(
+        u64::try_from(selectors.len()).unwrap_or(u64::MAX),
+        |size, item| size.max(u64::try_from(item.points.len()).unwrap_or(u64::MAX)),
+    );
+    if snapshot.intermediate_vector_size < minimum_vector_size {
+        return Err("reported intermediate-vector high-water is smaller than the response");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum InternalSelectBatchExecutionError {
+    Storage(tsink::TsinkError),
+    InvalidAccounting(String),
+}
+
+fn execute_bounded_internal_select_batch(
+    storage: &dyn Storage,
+    selectors: &[MetricSeries],
+    start: i64,
+    end: i64,
+    execution: &tsink::QueryExecution,
+) -> Result<tsink::SelectManyExecutionResult, InternalSelectBatchExecutionError> {
+    execution
+        .observe_intermediate_vector_size(u64::try_from(selectors.len()).unwrap_or(u64::MAX))
+        .map_err(tsink::TsinkError::from)
+        .map_err(InternalSelectBatchExecutionError::Storage)?;
+    let selected = storage
+        .select_many_with_execution_result(selectors, start, end, execution)
+        .map_err(InternalSelectBatchExecutionError::Storage)?;
+    if selected.series.len() != selectors.len()
+        || selected
+            .series
+            .iter()
+            .zip(selectors)
+            .any(|(item, selector)| item.series != *selector)
+    {
+        return Err(InternalSelectBatchExecutionError::InvalidAccounting(
+            "storage returned identities or ordering outside the bounded request".to_string(),
+        ));
+    }
+    if selected
+        .matched_selectors
+        .as_ref()
+        .is_none_or(|matched| matched.len() != selectors.len())
+    {
+        return Err(InternalSelectBatchExecutionError::InvalidAccounting(
+            "storage omitted exact selector-existence bits for the bounded request".to_string(),
+        ));
+    }
+    let required_result_memory =
+        crate::cluster::query::modeled_series_points_vec_retained_bytes(&selected.series)
+            .saturating_add(selected.matched_selectors.as_ref().map_or(
+                0,
+                crate::cluster::query::modeled_matched_selectors_vec_retained_bytes,
+            ));
+    if selected.reserved_memory_bytes() < required_result_memory {
+        return Err(InternalSelectBatchExecutionError::InvalidAccounting(
+            format!(
+                "storage retained {} result bytes but reserved only {}",
+                required_result_memory,
+                selected.reserved_memory_bytes()
+            ),
+        ));
+    }
+    let matched_selectors = selected
+        .matched_selectors
+        .as_deref()
+        .expect("selector-existence length was validated above");
+    validate_internal_select_batch_accounting(
+        selectors,
+        &selected.series,
+        execution.snapshot(),
+        matched_selectors,
+    )
+    .map_err(|message| InternalSelectBatchExecutionError::InvalidAccounting(message.to_string()))?;
+    Ok(selected)
+}
+
+#[derive(Debug)]
+enum InternalSelectSeriesExecutionError {
+    Storage(tsink::TsinkError),
+    InvalidAccounting(String),
+}
+
+fn validate_internal_select_series_accounting(
+    series: &[MetricSeries],
+    before: tsink::QueryExecutionSnapshot,
+    after: tsink::QueryExecutionSnapshot,
+) -> Result<(), &'static str> {
+    let series_count = u64::try_from(series.len()).unwrap_or(u64::MAX);
+    if after.series_matched.saturating_sub(before.series_matched) < series_count {
+        return Err("reported matched-series count is smaller than the response");
+    }
+    let returned_bytes = crate::cluster::query::modeled_metric_series_slice_returned_bytes(series);
+    if after.returned_bytes.saturating_sub(before.returned_bytes) < returned_bytes {
+        return Err("reported returned-byte count is smaller than the response");
+    }
+    if after.intermediate_vector_size < series_count {
+        return Err("reported intermediate-vector high-water is smaller than the response");
+    }
+    Ok(())
+}
+
+fn execute_bounded_internal_select_series(
+    storage: &dyn Storage,
+    selection: &SeriesSelection,
+    scope: &MetadataShardScope,
+    execution: &tsink::QueryExecution,
+) -> Result<tsink::SelectSeriesExecutionResult, InternalSelectSeriesExecutionError> {
+    let before = execution.snapshot();
+    let selected = storage
+        .select_series_in_shards_with_execution_result(selection, scope, execution)
+        .map_err(InternalSelectSeriesExecutionError::Storage)?;
+    let required_result_memory =
+        crate::cluster::query::modeled_metric_series_vec_retained_bytes(&selected.series);
+    if selected.reserved_memory_bytes() < required_result_memory {
+        return Err(InternalSelectSeriesExecutionError::InvalidAccounting(
+            format!(
+                "storage retained {} metadata result bytes but reserved only {}",
+                required_result_memory,
+                selected.reserved_memory_bytes()
+            ),
+        ));
+    }
+    validate_internal_select_series_accounting(&selected.series, before, execution.snapshot())
+        .map_err(|message| {
+            InternalSelectSeriesExecutionError::InvalidAccounting(message.to_string())
+        })?;
+    Ok(selected)
+}
+
+fn internal_select_batch_bridge_query_error(error: &RpcError) -> Option<HttpResponse> {
+    if let RpcError::QueryBudget { error } = error {
+        return Some(internal_select_batch_query_error_response(error));
+    }
+    let RpcError::HttpStatus {
+        status,
+        error_code: Some(code),
+        message,
+        retryable,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    let is_query_error = code == "invalid_query_limits"
+        || code == "query_accounting_unavailable"
+        || code == "query_accounting_invalid"
+        || code == "query_cancelled"
+        || code == "query_deadline_exceeded"
+        || code.starts_with("query_limit_");
+    is_query_error.then(|| {
+        internal_error_response(
+            *status,
+            code.clone(),
+            format!("handoff bridge rejected bounded select_batch: {message}"),
+            *retryable,
+        )
+    })
+}
+
+struct InternalSelectCancellationGuard {
+    token: tsink::QueryCancellationToken,
+}
+
+impl Drop for InternalSelectCancellationGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
 pub(super) async fn handle_internal_select_batch(
     storage: &Arc<dyn Storage>,
     request: &HttpRequest,
@@ -2196,8 +2805,8 @@ pub(super) async fn handle_internal_select_batch(
         );
     }
 
-    let mut bridge_batches = BTreeMap::<(String, String, u64), Vec<MetricSeries>>::new();
-    for selector in &payload.selectors {
+    let mut bridge_batches = BTreeMap::<(String, String, u64), Vec<(usize, MetricSeries)>>::new();
+    for (selector_index, selector) in payload.selectors.iter().enumerate() {
         if selector.name.trim().is_empty() {
             return internal_error_response(
                 400,
@@ -2224,7 +2833,7 @@ pub(super) async fn handle_internal_select_batch(
                     bridge_source.stale_ring_version,
                 ))
                 .or_default()
-                .push(selector.clone());
+                .push((selector_index, selector.clone()));
         }
 
         if let Some(response) = validate_internal_series_owner(
@@ -2239,15 +2848,73 @@ pub(super) async fn handle_internal_select_batch(
 
     let start = payload.start;
     let end = payload.end;
+    let query_limits = payload.query_limits;
     let selectors = payload.selectors;
     let requested = selectors.clone();
+    let (execution, _cancellation_guard) = if let Some(query_limits) = query_limits {
+        if storage.select_many_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+            return internal_select_batch_accounting_unavailable(
+                "storage does not provide complete select_batch query accounting",
+            );
+        }
+        let cancellation = tsink::QueryCancellationToken::new();
+        match storage.begin_query_execution(query_limits, cancellation.clone()) {
+            Ok(Some(execution)) => (
+                Some(execution),
+                Some(InternalSelectCancellationGuard {
+                    token: cancellation,
+                }),
+            ),
+            Ok(None) => {
+                return internal_select_batch_accounting_unavailable(
+                    "storage does not expose query execution admission",
+                )
+            }
+            Err(tsink::TsinkError::QueryBudget(error)) => {
+                return internal_select_batch_query_error_response(&error)
+            }
+            Err(error) => {
+                return internal_error_response(
+                    503,
+                    "query_admission_failed",
+                    format!("internal select_batch query admission failed: {error}"),
+                    true,
+                )
+            }
+        }
+    } else {
+        (None, None)
+    };
     let storage = Arc::clone(storage);
-    let result =
-        tokio::task::spawn_blocking(move || storage.select_many(&selectors, start, end)).await;
+    let worker_execution = execution.clone();
+    let result = tokio::task::spawn_blocking(move || match worker_execution.as_ref() {
+        Some(execution) => execute_bounded_internal_select_batch(
+            storage.as_ref(),
+            &selectors,
+            start,
+            end,
+            execution,
+        ),
+        None => storage
+            .select_many(&selectors, start, end)
+            .map(tsink::SelectManyExecutionResult::unaccounted)
+            .map_err(InternalSelectBatchExecutionError::Storage),
+    })
+    .await;
 
     match result {
-        Ok(Ok(series)) => {
-            let mut series = series;
+        Ok(Ok(mut selected)) => {
+            let mut series = std::mem::take(&mut selected.series);
+            let mut matched_selectors = selected.matched_selectors.take();
+            let mut result_reservation = selected.take_memory_reservation();
+            if execution.is_some() && result_reservation.is_none() {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select_batch storage omitted its result reservation",
+                    false,
+                );
+            }
             if !bridge_batches.is_empty() {
                 let Some(cluster_context) = cluster_context else {
                     return internal_error_response(
@@ -2258,22 +2925,48 @@ pub(super) async fn handle_internal_select_batch(
                     );
                 };
 
-                for ((source_node_id, endpoint, stale_ring_version), selectors) in bridge_batches {
-                    let bridge_response = match cluster_context
-                        .rpc_client
-                        .select_batch(
-                            &endpoint,
-                            &InternalSelectBatchRequest {
-                                ring_version: stale_ring_version,
-                                selectors: selectors.clone(),
-                                start,
-                                end,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(response) => Ok(response.series),
-                        Err(crate::cluster::rpc::RpcError::HttpStatus { status: 404, .. }) => {
+                for ((source_node_id, endpoint, stale_ring_version), indexed_selectors) in
+                    bridge_batches
+                {
+                    let selectors = indexed_selectors
+                        .iter()
+                        .map(|(_, selector)| selector.clone())
+                        .collect::<Vec<_>>();
+                    let bridge_query_limits = match execution.as_ref() {
+                        Some(execution) => {
+                            match remaining_internal_select_batch_limits(execution) {
+                                Ok(limits) => Some(limits),
+                                Err(error) => {
+                                    return internal_select_batch_query_error_response(&error)
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let bridge_request = InternalSelectBatchRequest {
+                        ring_version: stale_ring_version,
+                        selectors: selectors.clone(),
+                        start,
+                        end,
+                        query_limits: bridge_query_limits,
+                    };
+                    let bridge_rpc = match execution.as_ref() {
+                        Some(execution) => cluster_context
+                            .rpc_client
+                            .select_batch_accounted(&endpoint, &bridge_request, execution)
+                            .await
+                            .map(|accounted| (accounted.response, Some(accounted.reservation))),
+                        None => cluster_context
+                            .rpc_client
+                            .select_batch(&endpoint, &bridge_request)
+                            .await
+                            .map(|response| (response, None)),
+                    };
+                    let (bridge_response, bridge_transport_reservation) = match bridge_rpc {
+                        Ok(response) => response,
+                        Err(crate::cluster::rpc::RpcError::HttpStatus { status: 404, .. })
+                            if execution.is_none() =>
+                        {
                             let mut legacy = Vec::with_capacity(selectors.len());
                             for selector in &selectors {
                                 let response = cluster_context
@@ -2307,16 +3000,24 @@ pub(super) async fn handle_internal_select_batch(
                                     }
                                 }
                             }
-                            Ok(legacy)
+                            (
+                                InternalSelectBatchResponse {
+                                    series: legacy,
+                                    accounting: None,
+                                },
+                                None,
+                            )
                         }
-                        Err(err) => Err(err),
-                    };
-
-                    match bridge_response {
-                        Ok(bridge_series) => {
-                            series = merge_handoff_series_points(&requested, series, bridge_series);
+                        Err(crate::cluster::rpc::RpcError::HttpStatus { status: 404, .. }) => {
+                            return internal_select_batch_accounting_unavailable(format!(
+                                "handoff source node '{}' ({}) does not support bounded select_batch accounting",
+                                source_node_id, endpoint
+                            ));
                         }
                         Err(err) => {
+                            if let Some(response) = internal_select_batch_bridge_query_error(&err) {
+                                return response;
+                            }
                             return internal_error_response(
                                 503,
                                 "handoff_bridge_failed",
@@ -2327,18 +3028,159 @@ pub(super) async fn handle_internal_select_batch(
                                 true,
                             );
                         }
+                    };
+
+                    if let Some(reservation) = result_reservation.as_mut() {
+                        let current =
+                            crate::cluster::query::modeled_series_points_vec_retained_bytes(
+                                &series,
+                            );
+                        let additional =
+                            crate::cluster::query::modeled_series_points_vec_retained_bytes(
+                                &bridge_response.series,
+                            );
+                        if let Err(error) =
+                            reservation.resize(current.saturating_add(additional).saturating_mul(2))
+                        {
+                            return internal_select_batch_query_error_response(&error);
+                        }
                     }
+
+                    if let Some(execution) = execution.as_ref() {
+                        let Some(accounting) = bridge_response.accounting.as_ref() else {
+                            return internal_select_batch_accounting_unavailable(format!(
+                                "handoff source node '{}' ({}) returned no bounded select_batch accounting",
+                                source_node_id, endpoint
+                            ));
+                        };
+                        let Some(bridge_matched_selectors) =
+                            accounting.matched_selectors.as_deref()
+                        else {
+                            return internal_select_batch_accounting_unavailable(format!(
+                                "handoff source node '{}' ({}) returned aggregate-only select_batch accounting",
+                                source_node_id, endpoint
+                            ));
+                        };
+                        if let Err(message) = validate_internal_select_batch_accounting(
+                            &selectors,
+                            &bridge_response.series,
+                            accounting.execution,
+                            bridge_matched_selectors,
+                        ) {
+                            return internal_error_response(
+                                502,
+                                "query_accounting_invalid",
+                                format!(
+                                    "handoff source node '{}' ({}) returned invalid select_batch accounting: {message}",
+                                    source_node_id, endpoint
+                                ),
+                                false,
+                            );
+                        }
+                        let Some(global_matched_selectors) = matched_selectors.as_mut() else {
+                            return internal_error_response(
+                                500,
+                                "query_accounting_invalid",
+                                "bounded select_batch lost local selector-existence accounting",
+                                false,
+                            );
+                        };
+                        let mut additional_series_matched = 0u64;
+                        for ((selector_index, _), bridge_matched) in indexed_selectors
+                            .iter()
+                            .zip(bridge_matched_selectors.iter().copied())
+                        {
+                            if bridge_matched && !global_matched_selectors[*selector_index] {
+                                global_matched_selectors[*selector_index] = true;
+                                additional_series_matched =
+                                    additional_series_matched.saturating_add(1);
+                            }
+                        }
+                        if let Err(error) = aggregate_internal_select_batch_accounting(
+                            execution,
+                            accounting.execution,
+                            additional_series_matched,
+                        ) {
+                            return internal_select_batch_query_error_response(&error);
+                        }
+                    }
+                    series =
+                        merge_handoff_series_points(&requested, series, bridge_response.series);
+                    drop(bridge_transport_reservation);
                 }
             }
 
-            json_response(200, &InternalSelectBatchResponse { series })
+            if let Some(reservation) = result_reservation.as_mut() {
+                if let Err(error) = reservation.resize(
+                    crate::cluster::query::modeled_series_points_vec_retained_bytes(&series)
+                        .saturating_add(matched_selectors.as_ref().map_or(0, |matched| {
+                            u64::try_from(matched.capacity()).unwrap_or(u64::MAX)
+                        })),
+                ) {
+                    return internal_select_batch_query_error_response(&error);
+                }
+            }
+
+            let accounting = match (execution.as_ref(), matched_selectors) {
+                (Some(execution), Some(matched_selectors)) => {
+                    let snapshot = execution.snapshot();
+                    let matched_count =
+                        matched_selectors.iter().filter(|matched| **matched).count();
+                    if snapshot.series_matched != u64::try_from(matched_count).unwrap_or(u64::MAX) {
+                        return internal_error_response(
+                            500,
+                            "query_accounting_invalid",
+                            "bounded select_batch aggregate matched-series accounting is inconsistent",
+                            false,
+                        );
+                    }
+                    Some(crate::cluster::rpc::InternalSelectBatchAccounting {
+                        execution: snapshot,
+                        matched_selectors: Some(matched_selectors),
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return internal_error_response(
+                        500,
+                        "query_accounting_invalid",
+                        "bounded select_batch selector-existence accounting is inconsistent",
+                        false,
+                    )
+                }
+            };
+            let payload = InternalSelectBatchResponse { series, accounting };
+            let (response, response_reservation) = match execution.as_ref() {
+                Some(execution) => {
+                    match encode_internal_accounted_json_response(&payload, execution) {
+                        Ok((response, reservation)) => (response, Some(reservation)),
+                        Err(response) => return response,
+                    }
+                }
+                None => (json_response(200, &payload), None),
+            };
+            drop(payload);
+            drop(result_reservation);
+            drop(response_reservation);
+            response
         }
-        Ok(Err(err)) => internal_error_response(
+        Ok(Err(InternalSelectBatchExecutionError::Storage(tsink::TsinkError::QueryBudget(
+            error,
+        )))) => internal_select_batch_query_error_response(&error),
+        Ok(Err(InternalSelectBatchExecutionError::Storage(err))) => internal_error_response(
             503,
             "storage_select_failed",
             format!("internal select_batch failed: {err}"),
             true,
         ),
+        Ok(Err(InternalSelectBatchExecutionError::InvalidAccounting(message))) => {
+            internal_error_response(
+                500,
+                "query_accounting_invalid",
+                format!("internal select_batch storage accounting is invalid: {message}"),
+                false,
+            )
+        }
         Err(err) => internal_error_response(
             503,
             "storage_select_task_failed",
@@ -2364,6 +3206,14 @@ pub(super) async fn handle_internal_select_series(
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    handle_internal_select_series_payload(storage, payload, cluster_context).await
+}
+
+async fn handle_internal_select_series_payload(
+    storage: &Arc<dyn Storage>,
+    payload: InternalSelectSeriesRequest,
+    cluster_context: Option<&ClusterRequestContext>,
+) -> HttpResponse {
     let ring_validation =
         match validate_internal_metadata_ring_version(payload.ring_version, cluster_context) {
             Ok(validation) => validation,
@@ -2380,18 +3230,74 @@ pub(super) async fn handle_internal_select_series(
         Err(response) => return response,
     };
     let selection = payload.selection;
+    let query_limits = payload.query_limits;
+    let (execution, _cancellation_guard) = if let Some(query_limits) = query_limits {
+        if storage.select_series_in_shards_execution_accounting()
+            != tsink::QueryExecutionAccounting::Complete
+        {
+            return internal_select_batch_accounting_unavailable(
+                "storage does not provide complete select_series query accounting",
+            );
+        }
+        let cancellation = tsink::QueryCancellationToken::new();
+        match storage.begin_query_execution(query_limits, cancellation.clone()) {
+            Ok(Some(execution)) => (
+                Some(execution),
+                Some(InternalSelectCancellationGuard {
+                    token: cancellation,
+                }),
+            ),
+            Ok(None) => {
+                return internal_select_batch_accounting_unavailable(
+                    "storage does not expose query execution admission",
+                )
+            }
+            Err(tsink::TsinkError::QueryBudget(error)) => {
+                return internal_select_batch_query_error_response(&error)
+            }
+            Err(error) => {
+                return internal_error_response(
+                    503,
+                    "query_admission_failed",
+                    format!("internal select_series query admission failed: {error}"),
+                    true,
+                )
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     let storage = Arc::clone(storage);
     let selection_for_storage = selection.clone();
     let shard_scope_for_storage = shard_scope.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        storage.select_series_in_shards(&selection_for_storage, &shard_scope_for_storage)
+    let worker_execution = execution.clone();
+    let result = tokio::task::spawn_blocking(move || match worker_execution.as_ref() {
+        Some(execution) => execute_bounded_internal_select_series(
+            storage.as_ref(),
+            &selection_for_storage,
+            &shard_scope_for_storage,
+            execution,
+        ),
+        None => storage
+            .select_series_in_shards(&selection_for_storage, &shard_scope_for_storage)
+            .map(tsink::SelectSeriesExecutionResult::unaccounted)
+            .map_err(InternalSelectSeriesExecutionError::Storage),
     })
     .await;
 
     match result {
-        Ok(Ok(series)) => {
-            let mut series = series;
+        Ok(Ok(mut selected)) => {
+            let mut series = std::mem::take(&mut selected.series);
+            let mut result_reservation = selected.take_memory_reservation();
+            if execution.is_some() && result_reservation.is_none() {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select_series storage omitted its result reservation",
+                    false,
+                );
+            }
             if !ring_validation.bridge_sources.is_empty() {
                 let Some(cluster_context) = cluster_context else {
                     return internal_error_response(
@@ -2402,6 +3308,17 @@ pub(super) async fn handle_internal_select_series(
                     );
                 };
                 for bridge_source in &ring_validation.bridge_sources {
+                    let bridge_query_limits = match execution.as_ref() {
+                        Some(execution) => {
+                            match remaining_internal_select_batch_limits(execution) {
+                                Ok(limits) => Some(limits),
+                                Err(error) => {
+                                    return internal_select_batch_query_error_response(&error)
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     let request = InternalSelectSeriesRequest {
                         ring_version: bridge_source.stale_ring_version,
                         shard_scope: Some(MetadataShardScope::new(
@@ -2409,16 +3326,78 @@ pub(super) async fn handle_internal_select_series(
                             bridge_source.shards.iter().copied().collect(),
                         )),
                         selection: selection.clone(),
+                        query_limits: bridge_query_limits,
                     };
-                    match cluster_context
-                        .rpc_client
-                        .select_series(&bridge_source.endpoint, &request)
-                        .await
-                    {
-                        Ok(response) => {
-                            series = merge_metric_series(series, response.series);
+                    let bridge_rpc = match execution.as_ref() {
+                        Some(execution) => cluster_context
+                            .rpc_client
+                            .select_series_accounted(&bridge_source.endpoint, &request, execution)
+                            .await
+                            .map(|accounted| (accounted.response, Some(accounted.reservation))),
+                        None => cluster_context
+                            .rpc_client
+                            .select_series(&bridge_source.endpoint, &request)
+                            .await
+                            .map(|response| (response, None)),
+                    };
+                    match bridge_rpc {
+                        Ok((response, bridge_transport_reservation)) => {
+                            if let Some(execution) = execution.as_ref() {
+                                let Some(accounting) = response.accounting.as_ref() else {
+                                    return internal_select_batch_accounting_unavailable(
+                                        "bounded handoff select_series response omitted execution accounting",
+                                    );
+                                };
+                                if let Err(message) = validate_internal_select_series_accounting(
+                                    &response.series,
+                                    tsink::QueryExecutionSnapshot::default(),
+                                    accounting.execution,
+                                ) {
+                                    return internal_error_response(
+                                        502,
+                                        "query_accounting_invalid",
+                                        format!(
+                                            "bounded handoff select_series returned invalid accounting: {message}"
+                                        ),
+                                        false,
+                                    );
+                                }
+                                if let Some(reservation) = result_reservation.as_mut() {
+                                    let current =
+                                        crate::cluster::query::modeled_metric_series_vec_retained_bytes(
+                                            &series,
+                                        );
+                                    let additional =
+                                        crate::cluster::query::modeled_metric_series_vec_retained_bytes(
+                                            &response.series,
+                                        );
+                                    if let Err(error) = reservation.resize(
+                                        current.saturating_add(additional).saturating_mul(2),
+                                    ) {
+                                        return internal_select_batch_query_error_response(&error);
+                                    }
+                                }
+                                let previous_len = series.len();
+                                series = merge_metric_series(series, response.series);
+                                let additional_series_matched =
+                                    u64::try_from(series.len().saturating_sub(previous_len))
+                                        .unwrap_or(u64::MAX);
+                                if let Err(error) = aggregate_internal_select_batch_accounting(
+                                    execution,
+                                    accounting.execution,
+                                    additional_series_matched,
+                                ) {
+                                    return internal_select_batch_query_error_response(&error);
+                                }
+                            } else {
+                                series = merge_metric_series(series, response.series);
+                            }
+                            drop(bridge_transport_reservation);
                         }
                         Err(err) => {
+                            if let Some(response) = internal_select_batch_bridge_query_error(&err) {
+                                return response;
+                            }
                             return internal_error_response(
                                 503,
                                 "handoff_bridge_failed",
@@ -2432,14 +3411,50 @@ pub(super) async fn handle_internal_select_series(
                     }
                 }
             }
-            json_response(200, &InternalSelectSeriesResponse { series })
+            if let Some(reservation) = result_reservation.as_mut() {
+                if let Err(error) = reservation.resize(
+                    crate::cluster::query::modeled_metric_series_vec_retained_bytes(&series),
+                ) {
+                    return internal_select_batch_query_error_response(&error);
+                }
+            }
+            let accounting = execution.as_ref().map(|execution| {
+                crate::cluster::rpc::InternalSelectSeriesAccounting {
+                    execution: execution.snapshot(),
+                }
+            });
+            let payload = InternalSelectSeriesResponse { series, accounting };
+            let (response, response_reservation) = match execution.as_ref() {
+                Some(execution) => {
+                    match encode_internal_accounted_json_response(&payload, execution) {
+                        Ok((response, reservation)) => (response, Some(reservation)),
+                        Err(response) => return response,
+                    }
+                }
+                None => (json_response(200, &payload), None),
+            };
+            drop(payload);
+            drop(result_reservation);
+            drop(response_reservation);
+            response
         }
-        Ok(Err(err)) => internal_error_response(
+        Ok(Err(InternalSelectSeriesExecutionError::Storage(tsink::TsinkError::QueryBudget(
+            error,
+        )))) => internal_select_batch_query_error_response(&error),
+        Ok(Err(InternalSelectSeriesExecutionError::Storage(err))) => internal_error_response(
             503,
             "storage_select_series_failed",
             format!("internal select_series failed: {err}"),
             true,
         ),
+        Ok(Err(InternalSelectSeriesExecutionError::InvalidAccounting(message))) => {
+            internal_error_response(
+                500,
+                "query_accounting_invalid",
+                format!("internal select_series storage accounting is invalid: {message}"),
+                false,
+            )
+        }
         Err(err) => internal_error_response(
             503,
             "storage_select_series_task_failed",
@@ -2469,6 +3484,19 @@ pub(super) async fn handle_internal_list_metrics(
             Err(response) => return response,
         }
     };
+    if payload.query_limits.is_some() {
+        return handle_internal_select_series_payload(
+            storage,
+            InternalSelectSeriesRequest {
+                ring_version: payload.ring_version,
+                shard_scope: payload.shard_scope,
+                selection: SeriesSelection::new(),
+                query_limits: payload.query_limits,
+            },
+            cluster_context,
+        )
+        .await;
+    }
     let ring_validation =
         match validate_internal_metadata_ring_version(payload.ring_version, cluster_context) {
             Ok(validation) => validation,
@@ -2507,6 +3535,7 @@ pub(super) async fn handle_internal_list_metrics(
                             ring_validation.shard_count,
                             bridge_source.shards.iter().copied().collect(),
                         )),
+                        query_limits: None,
                     };
                     match cluster_context
                         .rpc_client
@@ -2530,7 +3559,13 @@ pub(super) async fn handle_internal_list_metrics(
                     }
                 }
             }
-            json_response(200, &InternalListMetricsResponse { series })
+            json_response(
+                200,
+                &InternalListMetricsResponse {
+                    series,
+                    accounting: None,
+                },
+            )
         }
         Ok(Err(err)) => internal_error_response(
             503,
@@ -2545,6 +3580,11 @@ pub(super) async fn handle_internal_list_metrics(
             true,
         ),
     }
+}
+
+enum InternalDigestExecutionError {
+    Storage(tsink::TsinkError),
+    InvalidAccounting,
 }
 
 pub(super) async fn handle_internal_digest_window(
@@ -2563,6 +3603,22 @@ pub(super) async fn handle_internal_digest_window(
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    let Some(query_limits) = payload.query_limits else {
+        return internal_error_response(
+            400,
+            "query_limits_required",
+            "internal digest_window requires finite query_limits",
+            false,
+        );
+    };
+    if !crate::cluster::repair::internal_maintenance_query_limits_are_finite(query_limits) {
+        return internal_error_response(
+            400,
+            "invalid_query_limits",
+            "internal digest_window query_limits must make every work limit finite",
+            false,
+        );
+    }
     if payload.window_end <= payload.window_start {
         return internal_error_response(
             422,
@@ -2621,35 +3677,106 @@ pub(super) async fn handle_internal_digest_window(
         }
     }
 
+    if storage.compute_shard_window_digest_execution_accounting()
+        != tsink::QueryExecutionAccounting::Complete
+    {
+        return internal_select_batch_accounting_unavailable(
+            "storage does not provide complete digest_window query accounting",
+        );
+    }
+    let cancellation = tsink::QueryCancellationToken::new();
+    let _cancellation_guard = InternalSelectCancellationGuard {
+        token: cancellation.clone(),
+    };
+    let execution = match storage.begin_query_execution(query_limits, cancellation) {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
+            return internal_select_batch_accounting_unavailable(
+                "storage does not expose digest_window query admission",
+            )
+        }
+        Err(tsink::TsinkError::QueryBudget(error)) => {
+            return internal_select_batch_query_error_response(&error)
+        }
+        Err(_) => {
+            return internal_error_response(
+                503,
+                "query_admission_failed",
+                "internal digest_window query admission failed",
+                true,
+            )
+        }
+    };
+
     let storage = Arc::clone(storage);
     let shard = payload.shard;
     let ring_version = payload.ring_version;
     let window_start = payload.window_start;
     let window_end = payload.window_end;
+    let worker_execution = execution.clone();
     let digest_task = tokio::task::spawn_blocking(move || {
-        compute_shard_window_digest(
-            storage.as_ref(),
-            shard,
-            shard_count,
-            ring_version,
-            window_start,
-            window_end,
+        let before = worker_execution.snapshot();
+        let digest = storage
+            .compute_shard_window_digest_with_execution(
+                shard,
+                shard_count,
+                window_start,
+                window_end,
+                &worker_execution,
+            )
+            .map_err(InternalDigestExecutionError::Storage)?;
+        crate::cluster::repair::validate_internal_digest_execution_accounting(
+            digest.series_count,
+            digest.point_count,
+            before,
+            worker_execution.snapshot(),
         )
+        .map_err(|_| InternalDigestExecutionError::InvalidAccounting)?;
+        Ok::<_, InternalDigestExecutionError>(digest)
     })
     .await;
 
     match digest_task {
-        Ok(Ok(digest)) => json_response(200, &digest),
-        Ok(Err(err)) => internal_error_response(
+        Ok(Ok(digest)) => {
+            let payload = InternalAccountedDigestWindowResponse {
+                digest: InternalDigestWindowResponse {
+                    shard: digest.shard,
+                    ring_version,
+                    window_start: digest.window_start,
+                    window_end: digest.window_end,
+                    series_count: digest.series_count,
+                    point_count: digest.point_count,
+                    fingerprint: digest.fingerprint,
+                },
+                accounting: execution.snapshot(),
+            };
+            match encode_internal_accounted_json_response(&payload, &execution) {
+                Ok((response, response_reservation)) => {
+                    drop(response_reservation);
+                    response
+                }
+                Err(response) => response,
+            }
+        }
+        Ok(Err(InternalDigestExecutionError::Storage(tsink::TsinkError::QueryBudget(error)))) => {
+            internal_select_batch_query_error_response(&error)
+        }
+        Ok(Err(InternalDigestExecutionError::InvalidAccounting)) => internal_error_response(
+            500,
+            "query_accounting_invalid",
+            "bounded digest_window storage returned invalid accounting",
+            false,
+        ),
+        Ok(Err(InternalDigestExecutionError::Storage(_))) => internal_error_response(
             503,
             "digest_compute_failed",
-            format!("internal digest computation failed: {err}"),
+            "internal digest computation failed",
             true,
         ),
-        Err(err) => internal_error_response(
+        Err(_) => internal_error_response(
             503,
             "digest_compute_task_failed",
-            format!("internal digest compute task failed: {err}"),
+            "internal digest compute task failed",
             true,
         ),
     }
@@ -2837,8 +3964,13 @@ async fn handle_internal_restore_data_impl(
     }
 }
 
+enum InternalRepairBackfillExecutionError {
+    Storage(tsink::TsinkError),
+    InvalidAccounting,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn collect_internal_repair_backfill_rows(
+fn collect_internal_repair_backfill_rows_with_execution(
     storage: &dyn Storage,
     ring_version: u64,
     shard: u32,
@@ -2848,9 +3980,17 @@ pub(super) fn collect_internal_repair_backfill_rows(
     max_series: Option<usize>,
     max_rows: Option<usize>,
     row_offset: Option<u64>,
-) -> Result<InternalRepairBackfillResponse, String> {
-    let page = storage
-        .scan_shard_window_rows(
+    execution: &tsink::QueryExecution,
+) -> Result<
+    (
+        InternalRepairBackfillResponse,
+        tsink::QueryMemoryReservation,
+    ),
+    InternalRepairBackfillExecutionError,
+> {
+    let before = execution.snapshot();
+    let result = storage
+        .scan_shard_window_rows_with_execution_result(
             shard,
             shard_count,
             window_start,
@@ -2860,28 +4000,65 @@ pub(super) fn collect_internal_repair_backfill_rows(
                 max_rows,
                 row_offset,
             },
+            execution,
         )
-        .map_err(|err| format!("storage shard-window row scan failed: {err}"))?;
+        .map_err(InternalRepairBackfillExecutionError::Storage)?;
+    if result.page.shard != shard
+        || result.page.shard_count != shard_count
+        || result.page.window_start != window_start
+        || result.page.window_end != window_end
+        || result.reserved_memory_bytes()
+            < tsink::modeled_query_rows_retained_bytes(&result.page.rows)
+    {
+        return Err(InternalRepairBackfillExecutionError::InvalidAccounting);
+    }
+    let returned_bytes = crate::cluster::rpc::modeled_repair_rows_returned_bytes(&result.page.rows);
+    crate::cluster::repair::validate_internal_repair_backfill_execution_accounting(
+        result.page.series_scanned,
+        result.page.rows_scanned,
+        result.page.rows.len(),
+        returned_bytes,
+        Some(result.reserved_memory_bytes()),
+        before,
+        execution.snapshot(),
+    )
+    .map_err(|_| InternalRepairBackfillExecutionError::InvalidAccounting)?;
 
-    Ok(InternalRepairBackfillResponse {
-        shard: page.shard,
+    let response_clone_upper =
+        crate::cluster::rpc::modeled_internal_repair_rows_clone_upper_bytes(&result.page.rows);
+    let mut response_reservation = execution
+        .reserve_memory(response_clone_upper)
+        .map_err(|error| InternalRepairBackfillExecutionError::Storage(error.into()))?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(result.page.rows.len())
+        .map_err(|_| {
+            InternalRepairBackfillExecutionError::Storage(tsink::TsinkError::Other(
+                "failed to allocate bounded repair response rows".to_string(),
+            ))
+        })?;
+    for row in &result.page.rows {
+        execution
+            .checkpoint()
+            .map_err(|error| InternalRepairBackfillExecutionError::Storage(error.into()))?;
+        rows.push(InternalRow::from(row));
+    }
+    response_reservation
+        .resize(crate::cluster::rpc::modeled_internal_repair_rows_retained_bytes(&rows))
+        .map_err(|error| InternalRepairBackfillExecutionError::Storage(error.into()))?;
+
+    let response = InternalRepairBackfillResponse {
+        shard: result.page.shard,
         ring_version,
-        window_start: page.window_start,
-        window_end: page.window_end,
-        series_scanned: page.series_scanned,
-        rows_scanned: page.rows_scanned,
-        truncated: page.truncated,
-        next_row_offset: page.next_row_offset,
-        rows: page
-            .rows
-            .into_iter()
-            .map(|row| InternalRow {
-                metric: row.metric().to_string(),
-                labels: row.labels().to_vec(),
-                data_point: row.data_point().clone(),
-            })
-            .collect(),
-    })
+        window_start: result.page.window_start,
+        window_end: result.page.window_end,
+        series_scanned: result.page.series_scanned,
+        rows_scanned: result.page.rows_scanned,
+        truncated: result.page.truncated,
+        next_row_offset: result.page.next_row_offset,
+        rows,
+    };
+    drop(result);
+    Ok((response, response_reservation))
 }
 
 pub(super) async fn handle_internal_repair_backfill(
@@ -2900,6 +4077,22 @@ pub(super) async fn handle_internal_repair_backfill(
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    let Some(query_limits) = payload.query_limits else {
+        return internal_error_response(
+            400,
+            "query_limits_required",
+            "internal repair_backfill requires finite query_limits",
+            false,
+        );
+    };
+    if !crate::cluster::repair::internal_maintenance_query_limits_are_finite(query_limits) {
+        return internal_error_response(
+            400,
+            "invalid_query_limits",
+            "internal repair_backfill query_limits must make every work limit finite",
+            false,
+        );
+    }
     if payload.window_end <= payload.window_start {
         return internal_error_response(
             422,
@@ -2974,6 +4167,37 @@ pub(super) async fn handle_internal_repair_backfill(
         }
     }
 
+    if storage.scan_shard_window_rows_execution_accounting()
+        != tsink::QueryExecutionAccounting::Complete
+    {
+        return internal_select_batch_accounting_unavailable(
+            "storage does not provide complete repair_backfill query accounting",
+        );
+    }
+    let cancellation = tsink::QueryCancellationToken::new();
+    let _cancellation_guard = InternalSelectCancellationGuard {
+        token: cancellation.clone(),
+    };
+    let execution = match storage.begin_query_execution(query_limits, cancellation) {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
+            return internal_select_batch_accounting_unavailable(
+                "storage does not expose repair_backfill query admission",
+            )
+        }
+        Err(tsink::TsinkError::QueryBudget(error)) => {
+            return internal_select_batch_query_error_response(&error)
+        }
+        Err(_) => {
+            return internal_error_response(
+                503,
+                "query_admission_failed",
+                "internal repair_backfill query admission failed",
+                true,
+            )
+        }
+    };
+
     let storage = Arc::clone(storage);
     let shard = payload.shard;
     let ring_version = payload.ring_version;
@@ -2982,8 +4206,9 @@ pub(super) async fn handle_internal_repair_backfill(
     let max_series = payload.max_series;
     let max_rows = payload.max_rows;
     let row_offset = payload.row_offset;
+    let worker_execution = execution.clone();
     let repair_task = tokio::task::spawn_blocking(move || {
-        collect_internal_repair_backfill_rows(
+        collect_internal_repair_backfill_rows_with_execution(
             storage.as_ref(),
             ring_version,
             shard,
@@ -2993,22 +4218,48 @@ pub(super) async fn handle_internal_repair_backfill(
             max_series,
             max_rows,
             row_offset,
+            &worker_execution,
         )
     })
     .await;
 
     match repair_task {
-        Ok(Ok(response)) => json_response(200, &response),
-        Ok(Err(err)) => internal_error_response(
+        Ok(Ok((backfill, result_reservation))) => {
+            let payload = InternalAccountedRepairBackfillResponse {
+                backfill,
+                accounting: execution.snapshot(),
+            };
+            match encode_internal_accounted_json_response(&payload, &execution) {
+                Ok((response, response_reservation)) => {
+                    drop(payload);
+                    drop(result_reservation);
+                    drop(response_reservation);
+                    response
+                }
+                Err(response) => response,
+            }
+        }
+        Ok(Err(InternalRepairBackfillExecutionError::Storage(tsink::TsinkError::QueryBudget(
+            error,
+        )))) => internal_select_batch_query_error_response(&error),
+        Ok(Err(InternalRepairBackfillExecutionError::InvalidAccounting)) => {
+            internal_error_response(
+                500,
+                "query_accounting_invalid",
+                "bounded repair_backfill storage returned invalid accounting",
+                false,
+            )
+        }
+        Ok(Err(InternalRepairBackfillExecutionError::Storage(_))) => internal_error_response(
             503,
             "repair_backfill_failed",
-            format!("internal repair_backfill failed: {err}"),
+            "internal repair_backfill failed",
             true,
         ),
-        Err(err) => internal_error_response(
+        Err(_) => internal_error_response(
             503,
             "repair_backfill_task_failed",
-            format!("internal repair_backfill task failed: {err}"),
+            "internal repair_backfill task failed",
             true,
         ),
     }
@@ -3307,6 +4558,7 @@ mod tests {
     use super::*;
     use crate::cluster::rpc::InternalErrorResponse;
     use std::collections::HashMap;
+    use std::sync::Barrier;
 
     fn make_storage() -> Arc<dyn Storage> {
         StorageBuilder::new()
@@ -4572,6 +5824,182 @@ mod tests {
                 .accepted_total,
             2
         );
+    }
+
+    fn query_exemplar_storage(memory_bytes: u64) -> Arc<dyn Storage> {
+        StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .with_query_budget_limits(tsink::QueryBudgetLimits {
+                max_concurrent_queries: Some(2),
+                max_shared_memory_bytes: Some(memory_bytes),
+                per_query: tsink::QueryWorkLimits {
+                    max_memory_bytes: Some(memory_bytes),
+                    ..tsink::QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("query storage should build")
+    }
+
+    fn seeded_query_exemplar_store() -> Arc<ExemplarStore> {
+        let store = Arc::new(ExemplarStore::in_memory_with_config(ExemplarStoreConfig {
+            max_total_exemplars: 8,
+            max_exemplars_per_series: 8,
+            max_exemplars_per_request: 8,
+            max_query_results: 8,
+            max_query_selectors: 4,
+        }));
+        store
+            .apply_writes(&[ExemplarWrite {
+                metric: "latency_seconds".to_string(),
+                series_labels: vec![
+                    Label::new("job", "api"),
+                    Label::new(tenant::TENANT_LABEL, tenant::DEFAULT_TENANT_ID),
+                ],
+                exemplar_labels: vec![Label::new("trace_id", "abc")],
+                timestamp: 10,
+                value: 1.5,
+            }])
+            .expect("seed internal exemplar");
+        store
+    }
+
+    fn internal_query_exemplar_request(internal_api: &InternalApiConfig) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: "/internal/v1/query_exemplars".to_string(),
+            headers: internal_headers(
+                Some(&internal_api.auth_token),
+                Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                &[("content-type", "application/json")],
+            ),
+            body: serde_json::to_vec(&InternalQueryExemplarsRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                selectors: vec![SeriesSelection {
+                    metric: Some("latency_seconds".to_string()),
+                    matchers: vec![SeriesMatcher::equal(
+                        tenant::TENANT_LABEL,
+                        tenant::DEFAULT_TENANT_ID,
+                    )],
+                    start: None,
+                    end: None,
+                }],
+                start: 0,
+                end: 20,
+                limit: 1,
+                query_limits: Some(tsink::QueryWorkLimits::default()),
+            })
+            .expect("internal exemplar request should encode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_query_exemplars_has_exact_memory_boundary_and_zero_residual() {
+        const CALIBRATION_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+        let internal_api = internal_api();
+        let calibration_storage = query_exemplar_storage(CALIBRATION_MEMORY_BYTES);
+        let calibration_store = seeded_query_exemplar_store();
+        let request = internal_query_exemplar_request(&internal_api);
+        let calibration = handle_internal_query_exemplars(
+            &calibration_storage,
+            &calibration_store,
+            &request,
+            Some(&internal_api),
+            None,
+        )
+        .await;
+        assert_eq!(calibration.status, 200);
+        let calibration_body: InternalQueryExemplarsResponse =
+            serde_json::from_slice(&calibration.body).expect("calibration response should decode");
+        assert_eq!(calibration_body.series.len(), 1);
+        assert!(calibration_body.accounting.is_some());
+        let calibration_snapshot = calibration_storage.query_budget_snapshot();
+        let exact_memory = calibration_snapshot.peak_shared_reserved_memory_bytes;
+        assert!(exact_memory > 1);
+        assert_eq!(calibration_snapshot.active_queries, 0);
+        assert_eq!(calibration_snapshot.shared_reserved_memory_bytes, 0);
+
+        let exact_storage = query_exemplar_storage(exact_memory);
+        let exact_store = seeded_query_exemplar_store();
+        let exact = handle_internal_query_exemplars(
+            &exact_storage,
+            &exact_store,
+            &request,
+            Some(&internal_api),
+            None,
+        )
+        .await;
+        assert_eq!(exact.status, 200);
+        assert_eq!(exact.body, calibration.body);
+        let exact_snapshot = exact_storage.query_budget_snapshot();
+        assert_eq!(exact_snapshot.active_queries, 0);
+        assert_eq!(exact_snapshot.shared_reserved_memory_bytes, 0);
+
+        let under_storage = query_exemplar_storage(exact_memory - 1);
+        let under_store = seeded_query_exemplar_store();
+        let under = handle_internal_query_exemplars(
+            &under_storage,
+            &under_store,
+            &request,
+            Some(&internal_api),
+            None,
+        )
+        .await;
+        assert_eq!(under.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&under.body).expect("memory rejection should decode");
+        assert_eq!(error.code, "query_limit_per_query_memory_bytes");
+        let under_snapshot = under_storage.query_budget_snapshot();
+        assert_eq!(under_snapshot.active_queries, 0);
+        assert_eq!(under_snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(under_snapshot.per_query_memory_rejections_total, 1);
+        assert_eq!(under_snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_internal_query_exemplars_cancels_worker_and_releases_budget() {
+        const TEST_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+        let storage = query_exemplar_storage(TEST_MEMORY_BYTES);
+        let store = seeded_query_exemplar_store();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        store.set_query_test_gate(Arc::clone(&entered), Arc::clone(&release));
+        let internal_api = internal_api();
+        let request = internal_query_exemplar_request(&internal_api);
+        let storage_for_handler = Arc::clone(&storage);
+        let store_for_handler = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            handle_internal_query_exemplars(
+                &storage_for_handler,
+                &store_for_handler,
+                &request,
+                Some(&internal_api),
+                None,
+            )
+            .await
+        });
+
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .expect("query-entry waiter should join");
+        assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+        task.abort();
+        assert!(task.await.expect_err("handler should abort").is_cancelled());
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .expect("query-release waiter should join");
+        for _ in 0..1_000 {
+            if storage.query_budget_snapshot().active_queries == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert!(snapshot.cancellations_total >= 1);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
     }
 
     #[test]

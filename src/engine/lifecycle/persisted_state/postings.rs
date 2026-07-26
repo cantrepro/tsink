@@ -108,9 +108,6 @@ impl ChunkStorage {
             return;
         }
 
-        persisted_index
-            .merged_postings
-            .clear_missing_label_postings_cache();
         for series in series {
             Self::insert_series_into_merged_postings(
                 &mut persisted_index.merged_postings,
@@ -132,9 +129,6 @@ impl ChunkStorage {
 
         let publication = self.lifecycle_publication_context();
         let registry = publication.registry.read();
-        persisted_index
-            .merged_postings
-            .clear_missing_label_postings_cache();
         for &series_id in series_ids {
             let Some(series_key) = registry.decode_series_key(series_id) else {
                 return Err(TsinkError::DataCorruption(format!(

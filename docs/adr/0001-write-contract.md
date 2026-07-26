@@ -81,7 +81,10 @@ uniquely determine the result:
   autonomous timer that guarantees a sync in the absence of another write or lifecycle action.
 - If logical WAL publication fails after in-memory apply, the engine records the degradation and
   returns a successful `Volatile` acknowledgement because it cannot claim WAL recovery for that
-  batch.
+  batch. It preserves the complete appended prefix after the in-process sequence has advanced
+  instead of truncating it from a destructor: the preceding marker may ignore the prefix, an
+  ambiguously replaced marker may expose it, or a later marker may include it. Those are all
+  permitted `Volatile` outcomes and none may be upgraded in the original response.
 
 `insert_rows` has the same acceptance and error behavior but intentionally discards this durability
 metadata after a successful write.
@@ -90,9 +93,15 @@ metadata after a successful write.
 
 `Storage::write_batch(rows, mode)` returns a `BatchWriteResult` with exactly one ordered
 `RowWriteOutcome` for each input index. Expected validation, admission, and safe apply failures are
-returned as structured `WriteRejectionCategory` values inside `Ok(BatchWriteResult)`; the outer
-`TsinkError` is reserved for a backend that cannot provide trustworthy canonical outcomes, such as
-the default implementation on a legacy third-party backend.
+returned as structured `WriteRejectionCategory` values inside `Ok(BatchWriteResult)`. Configured
+top-level row/input bounds and checked input-size overflow are the deliberate exception: they return
+an outer `TsinkError` before allocating the very outcome vector the bound is meant to constrain,
+and commit no rows. When pre-commit admission fails before the full write scratch lease exists, the
+built-in engine separately admits the bounded rejection-result envelope before constructing
+indexed outcomes. If even that response envelope cannot fit the configured memory budget, the
+engine returns the outer memory error and commits no rows instead of allocating an unaccounted
+result. The outer error also remains available when a backend cannot provide trustworthy canonical
+outcomes, such as the default implementation on a legacy third-party backend.
 
 - `WriteMode::Atomic` invokes the all-or-error pipeline once. Success marks every row accepted and
   returns one batch acknowledgement. Failure marks every index rejected, commits no input row, and

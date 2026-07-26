@@ -48,9 +48,18 @@ impl SeriesRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn estimate_new_series_memory_growth_bytes(
         &self,
         series: &[SeriesKey],
+    ) -> Result<usize> {
+        self.estimate_new_series_memory_growth_bytes_with_transient_admission(series, |_| Ok(()))
+    }
+
+    pub(crate) fn estimate_new_series_memory_growth_bytes_with_transient_admission(
+        &self,
+        series: &[SeriesKey],
+        mut admit_transient: impl FnMut(usize) -> Result<()>,
     ) -> Result<usize> {
         if series.is_empty() {
             return Ok(0);
@@ -190,7 +199,13 @@ impl SeriesRegistry {
         }
 
         for (shard_idx, series_ids) in all_series_inserts {
-            let mut updated = self.all_series_shards[shard_idx].read().series_ids.clone();
+            let shard = self.all_series_shards[shard_idx].read();
+            admit_transient(Self::modeled_postings_clone_and_insert_bytes(
+                Some(&shard.series_ids),
+                series_ids.len(),
+            ))?;
+            let mut updated = shard.series_ids.clone();
+            drop(shard);
             let before = Self::bitmap_memory_usage_bytes(&updated);
             for series_id in series_ids {
                 updated.insert(series_id);
@@ -201,12 +216,14 @@ impl SeriesRegistry {
 
         for (metric_id, series_ids) in metric_inserts {
             let shard_idx = Self::metric_postings_shard_idx(metric_id);
-            let mut updated = self.metric_postings_shards[shard_idx]
-                .read()
-                .metric_postings
-                .get(&metric_id)
-                .cloned()
-                .unwrap_or_default();
+            let shard = self.metric_postings_shards[shard_idx].read();
+            let current = shard.metric_postings.get(&metric_id);
+            admit_transient(Self::modeled_postings_clone_and_insert_bytes(
+                current,
+                series_ids.len(),
+            ))?;
+            let mut updated = current.cloned().unwrap_or_default();
+            drop(shard);
             let before = Self::bitmap_memory_usage_bytes(&updated);
             for series_id in series_ids {
                 updated.insert(series_id);
@@ -217,12 +234,17 @@ impl SeriesRegistry {
 
         for (name_id, series_ids) in label_name_inserts {
             let shard_idx = Self::label_postings_shard_idx(name_id);
-            let mut updated = self.label_postings_shards[shard_idx]
-                .read()
+            let shard = self.label_postings_shards[shard_idx].read();
+            let current = shard
                 .label_name_states
                 .get(&name_id)
-                .map(|state| state.present.clone())
-                .unwrap_or_default();
+                .map(|state| &state.present);
+            admit_transient(Self::modeled_postings_clone_and_insert_bytes(
+                current,
+                series_ids.len(),
+            ))?;
+            let mut updated = current.cloned().unwrap_or_default();
+            drop(shard);
             let before = Self::bitmap_memory_usage_bytes(&updated);
             for series_id in series_ids {
                 updated.insert(series_id);
@@ -235,7 +257,12 @@ impl SeriesRegistry {
         for (pair, series_ids) in pair_inserts {
             let shard_idx = Self::label_postings_shard_idx(pair.name_id);
             let shard = self.label_postings_shards[shard_idx].read();
-            let mut updated = shard.postings.get(&pair).cloned().unwrap_or_default();
+            let current = shard.postings.get(&pair);
+            admit_transient(Self::modeled_postings_clone_and_insert_bytes(
+                current,
+                series_ids.len(),
+            ))?;
+            let mut updated = current.cloned().unwrap_or_default();
             let before = Self::bitmap_memory_usage_bytes(&updated);
             for series_id in series_ids {
                 updated.insert(series_id);
@@ -302,8 +329,6 @@ impl SeriesRegistry {
         shard.by_key.insert(key, series_id);
         self.series_count.fetch_add(1, Ordering::AcqRel);
         self.add_estimated_memory_bytes(added_series_bytes);
-        self.bump_postings_generation();
-
         Ok(SeriesResolution {
             series_id,
             metric_id,
@@ -387,7 +412,6 @@ impl SeriesRegistry {
             return;
         }
 
-        let mut removed_any = false;
         for resolution in created {
             let key = SeriesKeyIds {
                 metric_id: resolution.metric_id,
@@ -421,11 +445,7 @@ impl SeriesRegistry {
                     .remove(&resolution.series_id);
                 self.series_count.fetch_sub(1, Ordering::AcqRel);
                 self.sub_estimated_memory_bytes(removed_series_bytes);
-                removed_any = true;
             }
-        }
-        if removed_any {
-            self.bump_postings_generation();
         }
     }
 
@@ -498,7 +518,6 @@ impl SeriesRegistry {
         self.series_count.fetch_add(1, Ordering::AcqRel);
         self.add_estimated_memory_bytes(added_series_bytes);
         self.reserve_series_id(series_id)?;
-        self.bump_postings_generation();
 
         Ok(SeriesResolution {
             series_id,

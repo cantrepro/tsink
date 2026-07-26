@@ -184,6 +184,7 @@ mod tests {
         }
 
         let response = handle_metadata(
+            &storage,
             &metadata_store,
             &HttpRequest {
                 method: "GET".to_string(),

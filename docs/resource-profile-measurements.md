@@ -1,8 +1,9 @@
 # Resource-profile measurements
 
 This file records the reproducible measurements used to calibrate finite resource profiles. It
-reports tsink's modeled accounting surfaces and, in new runs, a separately labeled process-wide
-RSS high-water observation. The RSS value is not engine-only accounting. See
+reports tsink's modeled accounting surfaces and, in new runs, separately labeled process-wide
+current/peak RSS and requested-heap observations. Neither process metric is engine-only
+accounting. See
 [`resource-limits.md`](resource-limits.md) for the included and excluded modeled-memory categories.
 
 ## Qualification status
@@ -17,9 +18,14 @@ All results on this page were collected from a modified working tree while Phase
 was still changing. They are useful for rejecting undersized values and improving the harness, but
 the final gate still requires a clean post-implementation rerun.
 
+The commands below require a repository checkout. The measurement scripts and retained raw results
+are deliberately excluded from the published runtime crate; the current harness is available in
+the [`scripts` directory](https://github.com/cantrepro/tsink/tree/master/scripts), and the
+interpretation-independent logs are under [`benchmark-results`](../benchmark-results).
+
 ## Measurement environment
 
-- Date: 2026-07-22 through 2026-07-23
+- Date: 2026-07-22 through 2026-07-26
 - Host: Apple arm64 laptop, 24 GiB physical memory
 - OS: Darwin 25.5.0
 - Rust: 1.97.1 (`aarch64-apple-darwin`)
@@ -40,12 +46,27 @@ Memory terms have deliberately narrow names:
   transient lease while `insert_rows` is executing and is not process RSS.
 - `post_settle_accounted_memory_bytes` is the one modeled sample taken after the configured settle
   delay and before close.
+- `peak_write_transient_bytes` is the highest concurrent modeled foreground-write/replay scratch
+  reservation seen since the storage instance opened. It is a historical component maximum. It
+  cannot be added to an unrelated post-write or post-settle retained-state sample to invent a
+  phase-coincident total.
+- `process_current_rss_*` reports current process RSS before storage build, after caller input
+  construction where that phase exists, after workload completion, after close, and after dropping
+  storage. Darwin uses Mach task information; Linux uses resident pages from `/proc/self/statm`.
+  Unsupported targets emit `unavailable`.
 - `process_peak_rss_bytes_so_far` is the operating system's `getrusage(RUSAGE_SELF)` high-water for
   the complete benchmark process: bytes on Darwin and KiB converted to bytes on other supported
   Unix targets. It is `unavailable` on non-Unix targets. The observation includes the allocator,
   runtime, benchmark-owned data, and all earlier runs in the same process, so it is deliberately
   named “so far” and cannot be attributed exclusively to tsink. Suite results report the maximum
   available observation rather than a per-run RSS percentile.
+- `process_current_requested_heap_*` and `process_peak_requested_heap_bytes_so_far` are
+  whole-process requested bytes observed by a benchmark-only `System` global-allocator wrapper.
+  They include benchmark and runtime allocations routed through Rust's global allocator, but omit
+  allocator metadata/slack, memory mappings, thread stacks, and foreign allocations. Checked
+  overflow or underflow latches all later observations to `unavailable`. Like RSS high-water, the
+  peak is process-lifetime and is attributable to one repetition only when that repetition runs in
+  a fresh child.
 - A `MemoryBudgetExceeded { required, ... }` value is the engine's projected requirement at the
   rejected admission point. It is a useful lower bound for that operation, not a workload-wide
   high-water mark.
@@ -54,6 +75,37 @@ Memory terms have deliberately narrow names:
 
 The July 23 runs below predate the renamed post-write sampling fields. Their reported
 `accounted_memory_bytes` values are post-settle samples and are labeled that way here.
+
+### Fresh-process runner
+
+The qualification runner starts every repetition in a new benchmark child, preserves distinct run
+identifiers, and computes nearest-rank aggregates from the machine-readable result rows:
+
+```bash
+TSINK_BPP_OUTPUT_DIR=benchmark-results/resource-profiles \
+  scripts/measure_bpp_fresh.sh test
+```
+
+Each new retained log records the revision, dirty state, a deterministic source-state hash over
+tracked and non-ignored untracked files, the tracked binary-diff hash, and harness hashes; package
+version; CPU, physical memory, OS, architecture, and checkout/storage filesystem types; Rust/Cargo
+versions; bench build profile; full workload configuration; raw result rows; and aggregate metrics.
+Generated benchmark results and build output are excluded from the source-state hash, and a
+terminal hash check rejects
+a suite if source changed while its children ran. Checkout, temporary, and diagnostic configured
+storage roots are redacted from streamed Cargo and child output before it reaches the log. The
+runner refuses to overwrite an existing UTC-stamped log. Standard runs clear ambient workload
+overrides and validate the named result kind/profile, identical configuration and result schemas,
+ordered run identifiers, and known storage kind. Intentional diagnostics require
+`TSINK_BPP_ALLOW_PRESET_OVERRIDES=1`; `TSINK_BPP_KEEP_DIR` additionally requires
+`TSINK_BPP_ALLOW_KEEP_DIR=1` and is labeled as configured storage. With three repetitions, p95 is
+the maximum. Dirty-tree observations remain development evidence and cannot satisfy the final
+clean-revision gate.
+
+Rows produced earlier by `scripts/measure_bpp.sh` ran all repetitions in one process. Their modeled
+storage and persisted-size values remain useful, but later `ru_maxrss` values include allocator
+retention and every preceding repetition. Those cumulative high-waters are not per-run RSS
+measurements and must not be divided by modeled memory as calibration ratios.
 
 ## Superseded high-cardinality result
 
@@ -138,6 +190,25 @@ A one-repetition harness verification after adding the RSS field completed with 
 rejections and reported `process_peak_rss_bytes_so_far=45,563,904` on Darwin. That value validates
 the output path only: it is a process-wide cumulative high-water from a modified working tree, not
 a three-run Test-profile RSS calibration or an engine memory limit.
+
+### 2026-07-26 Test continuation rerun
+
+After the final workspace verification matrix passed, the exact named Test row was repeated on
+base revision `4b54297e94ca1c86b4416c9bdc4f161e41e67629` with the still-uncommitted implementation
+diff whose pre-documentation SHA-256 was
+`f074a2db9898a8f249fdc4077cef6153bac802f86755f0ee5b02376c9765b0a4`. The host and toolchain
+otherwise match the environment above: Darwin 25.5.0 on arm64 and Rust 1.97.1.
+
+| Runs | Retained points/run | Late rejections | Suite failures | p50 / p95 peak post-write accounted bytes | p50 / p95 post-settle accounted bytes | p50 / p95 pre-close local disk | p50 / p95 final persisted bytes | p50 / p95 effective B/point | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 251,000 | 0 | 0 | 5,947,719 / 5,963,340 | 4,115,711 / 4,146,673 | 5,044,411 / 5,049,674 | 585,399 / 587,316 | 2.332267 / 2.339904 | 46,104,576 |
+
+The largest post-write modeled sample is 8.9% of the 64 MiB Test ceiling. The process-RSS value is
+the cumulative benchmark-process high-water described above, not a tsink-only measurement, a
+per-repetition observation, or an enforced limit. `TARGET_CHECK` remained false because both
+effective-B/point percentiles exceed the separate 0.75/1.0 targets. This rerun therefore strengthens
+only the modeled-memory evidence; it does not finish Phase 2 or satisfy the final clean-revision
+qualification gate.
 
 The large effective-B/point variation despite a deterministic data seed shows that background
 maintenance scheduling materially affects the post-settle layout. Release qualification needs a
@@ -259,6 +330,21 @@ supports retaining the existing 256 MiB provisional Edge constant; it does not q
 RSS, the non-memory profile dimensions, or the benchmark's separate bytes-per-point target (the
 reported `TARGET_CHECK` remains false for this high-cardinality mixed row).
 
+### 2026-07-26 Edge continuation rerun
+
+The exact named Edge row was repeated on the same base revision after the Test result above. The
+pre-result-documentation working-tree diff SHA-256 was
+`ed079c59bd40e28fe7dcae69004f60afd0084c33ed15faa1d082852aacf75593`.
+
+| Runs | Retained points/run | Late rejections | Suite failures | p50 / p95 peak post-write accounted bytes | p50 / p95 post-settle accounted bytes | p50 / p95 pre-close local disk | p50 / p95 final persisted bytes | p50 / p95 effective B/point | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 1,020,000 | 0 | 0 | 90,047,240 / 90,134,415 | 88,502,387 / 88,527,536 | 44,286,996 / 44,291,168 | 4,444,149 / 4,454,270 | 4.357009 / 4.366931 | 429,703,168 |
+
+The largest modeled post-write sample is 33.6% of the 256 MiB ceiling and remains close to the
+earlier post-fix row. The cumulative process RSS includes every repetition and allocator retention,
+so its apparent ratio to the modeled ceiling is not a calibration ratio. The persisted-size target
+again failed, so this is continuation evidence rather than final qualification.
+
 ## Embedded profile calibration row
 
 The named row is three repetitions, 50,000 active series, and 2,050,000 retained points per run.
@@ -301,6 +387,21 @@ used 41.2% of the 536,870,912-byte ceiling. This supports retaining 512 MiB as t
 Embedded memory and maintenance value; it does not qualify process RSS or the profile's other
 resource dimensions.
 
+### 2026-07-26 Embedded continuation rerun
+
+The exact named Embedded row was repeated on base revision
+`4b54297e94ca1c86b4416c9bdc4f161e41e67629`. The pre-result-documentation working-tree diff
+SHA-256 was `ad78f222a27981811c24f47acfe75abca0f12f6664d59aafba05023c8bf3b08f`.
+
+| Runs | Retained points/run | Late rejections | Suite failures | p50 / p95 peak post-write accounted bytes | p50 / p95 post-settle accounted bytes | p50 / p95 pre-close local disk | p50 / p95 final persisted bytes | p50 / p95 effective B/point | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 2,050,000 | 0 | 0 | 221,056,826 / 221,100,680 | 220,602,302 / 220,674,333 | 95,345,735 / 95,360,760 | 10,298,723 / 10,301,732 | 5.023767 / 5.025235 | 1,018,019,840 |
+
+The largest modeled post-write sample is 41.2% of the 512 MiB ceiling and remains close to the
+earlier post-fix row. Cumulative process RSS is not attributable to one repetition, and both
+persisted-size percentiles missed the separate target. This is modified-tree continuation evidence,
+not a clean-revision or total-process qualification.
+
 ## Named workload presets and remaining matrix
 
 The script's exact default rows are:
@@ -319,6 +420,7 @@ Reproduce the Server rows with:
 ```bash
 scripts/measure_bpp.sh server
 scripts/measure_bpp.sh server-writers
+scripts/measure_bpp.sh server-queries
 ```
 
 The earlier Edge failures are superseded by direct post-fix evidence. The stock 256 MiB row now
@@ -337,6 +439,21 @@ The largest measured peak is 20.5% of the 2 GiB ceiling, so the base row does no
 Server memory default. It does not qualify the profile by itself because RSS, query entry-point
 breadth, and non-memory constants remain open.
 
+### 2026-07-26 Server base continuation rerun
+
+The exact named Server base row was repeated on base revision
+`4b54297e94ca1c86b4416c9bdc4f161e41e67629`. The pre-result-documentation working-tree diff
+SHA-256 was `03dbf83912bd5f2d88a2059397fc0999de89bb4427d0a25f102192c81513375b`.
+
+| Runs | Retained points/run | Late rejections | Suite failures | p50 / p95 peak post-write accounted bytes | p50 / p95 post-settle accounted bytes | p50 / p95 pre-close local disk | p50 / p95 final persisted bytes | p50 / p95 effective B/point | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 4,100,000 | 0 | 0 | 441,000,192 / 441,075,551 | 440,460,413 / 440,591,746 | 190,716,800 / 190,724,905 | 20,047,052 / 20,062,045 | 4.889525 / 4.893182 | 1,995,440,128 |
+
+The largest modeled post-write sample is 20.5% of the 2 GiB ceiling. The cumulative process RSS
+includes every repetition and allocator retention, so the apparent percentage of the modeled
+ceiling is not a calibration ratio. The separate persisted-size target failed, and the row remains
+modified-tree continuation evidence.
+
 The Server writer row starts all 16 profile writer slots together, with 25,000 unique new series per
 writer. All three repetitions admitted every one of the 400,000 submitted series:
 
@@ -346,6 +463,21 @@ writer. All three repetitions admitted every one of the 400,000 submitted series
 
 This exercises the configured writer concurrency and new-series admission path. It is not a
 process-memory measurement and does not establish a throughput service-level objective.
+
+### 2026-07-26 Server writer continuation rerun
+
+The exact named writer row was repeated on base revision
+`4b54297e94ca1c86b4416c9bdc4f161e41e67629`. The pre-result-documentation working-tree diff
+SHA-256 was `2052f44da9f5af18a0eff06603c6327452029045e5b4ddfaf026b479e29d87a1`.
+
+| Runs | New series/run | Failures | p50 / p95 aggregate series/s | p50 / p95 per-run writer-p95 latency | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 400,000 | 0 | 114,842.262 / 115,986.291 | 3,261.169 / 3,386.310 ms | 4,083,548,160 |
+
+All 1.2 million submitted series were admitted. The cumulative process RSS includes all three
+repetitions and allocator retention. This specialized row originally omitted retained-state
+modeled-memory samples, so the result cannot be used as a ratio or qualify the profile as a
+total-process envelope.
 
 The deterministic Server query-pressure row now fills all 32 profile query slots before releasing
 the workers, verifies that the N+1 admission returns `ConcurrentQueries`, and then starts those
@@ -359,6 +491,20 @@ reservation:
 
 This demonstrates the Server concurrency boundary and release invariant under simultaneous ingest.
 It does not calibrate async, PromQL, or HTTP query entry points, process RSS, or larger query shapes.
+
+### 2026-07-26 Server query-pressure continuation rerun
+
+The exact named query-pressure row was repeated on base revision
+`4b54297e94ca1c86b4416c9bdc4f161e41e67629`. The pre-result-documentation working-tree diff
+SHA-256 was `3c94bc31a2422d762b589ad98f6bb46482df5df12a2ccfa4c4fe31f7b13cf424`.
+
+| Runs | Queries/run | Structured N+1 rejections/run | Query points/run | Writer points/run | p50 / p95 query-p95 latency | p50 / p95 writer latency | p50 / p95 peak shared query reservation | Active / shared reservation after each run | Maximum process RSS so far |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 32/32 | 1 | 262,144 | 100,000 | 6.944 / 8.415 ms | 438.050 / 457.891 ms | 4,411,479 / 6,666,297 bytes | 0 / 0 | 168,181,760 |
+
+This rerun preserves the exact concurrency rejection and release invariants. It still exercises the
+core query execution directly; async, PromQL, HTTP, and distributed query entry-point calibration
+remain separate work.
 
 ## Remaining clean-environment gate
 

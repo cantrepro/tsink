@@ -1,0 +1,87 @@
+FRESH_PROCESS_RUN run=1 total_runs=3 preset=test
+Running workload benchmark with preset=test
+  TSINK_RESOURCE_PROFILE=test
+  TSINK_MEMORY_LIMIT_BYTES=profile-default
+  TSINK_MAINTENANCE_MAX_BYTES_PER_PASS=profile-default
+  TSINK_BPP_RUNS=1
+  TSINK_ACTIVE_SERIES=1000
+  TSINK_PRIME_ALL_SERIES=1
+  TSINK_MIN_POINTS_PER_SERIES=1
+  TSINK_WARMUP_POINTS=50000
+  TSINK_MEASURE_POINTS=200000
+  TSINK_BATCH_SIZE=2048
+  TSINK_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES=4
+  TSINK_OOO_MAX_SECONDS=300
+  TSINK_OOO_CROSS_PARTITION_PERMILLE=0
+  TSINK_OOO_CROSS_PARTITIONS=0
+  TSINK_SHORT_LIVED_LIFETIME_STEPS=512
+  TSINK_RETENTION_SECONDS=604800
+  TSINK_PARTITION_SECONDS=86400
+    Finished `bench` profile [optimized] target(s) in 0.10s
+     Running benches/workload.rs (target/release/deps/workload-3b0aca16dc5bf5d7)
+WORKLOAD_CONFIGURATION resource_profile=test memory_limit_override_bytes=none maintenance_max_bytes_override=none runs=1 run_id_offset=0 seed=3235823838
+workload: starting mixed workload suite
+workload: runs=1 active_series=1000 warmup_points=50000 measured_points=200000 batch_size=2048
+workload: retention=604800s partition=86400s max_active_partition_heads_per_series=4 ooo_max=300s ooo_permille=250 ooo_cross_partition_permille=0 ooo_cross_partitions=0 sparse_emit_permille=120 prime_all_series=true shared_metric_names=false
+workload: WARNING active_series=1000 is below suite target 1000000
+RUN_RESULT run=1 resource_profile=test accounted_memory_limit_bytes=67108864 local_disk_limit_bytes=268435456 wal_limit_bytes=33554432 cardinality_limit=10000 max_concurrent_writers=2 max_concurrent_queries=2 maintenance_max_items_per_pass=10000 maintenance_max_bytes_per_pass=67108864 retained_points=251000 late_rejected_points=0 max_post_write_accounted_memory_bytes=5827520 post_settle_accounted_memory_bytes=5058635 active_and_sealed_bytes=3442291 registry_bytes=204790 metadata_cache_bytes=1069472 wal_series_definition_cache_bytes=339918 write_transient_bytes=0 peak_write_transient_bytes=10019153 persisted_index_bytes=2164 persisted_mmap_bytes=0 tombstone_bytes=0 local_disk_accounted_bytes_before_close=5044411 persisted_bytes=625743 effective_bpp=2.493000 process_current_rss_before_build_bytes=6275072 process_current_rss_after_input_build_bytes=unavailable process_current_rss_post_work_bytes=36519936 process_current_rss_after_close_bytes=44040192 process_current_rss_after_drop_bytes=43532288 process_peak_rss_bytes_so_far=44220416 path=/var/folders/cj/d14y5d055w3bcwp2w2pwrpfh0000gn/T/.tmpaiNrBw/run-00
+SUITE_RESULT resource_profile=test runs=1 failures=0 p50_effective_bpp=2.493000 p95_effective_bpp=2.493000 p50_max_post_write_accounted_memory_bytes=5827520 p95_max_post_write_accounted_memory_bytes=5827520 max_post_write_accounted_memory_bytes=5827520 p50_post_settle_accounted_memory_bytes=5058635 p95_post_settle_accounted_memory_bytes=5058635 max_post_settle_accounted_memory_bytes=5058635 p50_peak_write_transient_bytes=10019153 p95_peak_write_transient_bytes=10019153 max_peak_write_transient_bytes=10019153 p50_local_disk_accounted_bytes_before_close=5044411 p95_local_disk_accounted_bytes_before_close=5044411 max_local_disk_accounted_bytes_before_close=5044411 p50_persisted_bytes=625743 p95_persisted_bytes=625743 max_persisted_bytes=625743 max_process_peak_rss_bytes_so_far=44220416
+TARGET_CHECK all_runs_succeeded=true p50<=0.75=false p95<=1.0=false pass=false
+FRESH_PROCESS_RUN run=2 total_runs=3 preset=test
+Running workload benchmark with preset=test
+  TSINK_RESOURCE_PROFILE=test
+  TSINK_MEMORY_LIMIT_BYTES=profile-default
+  TSINK_MAINTENANCE_MAX_BYTES_PER_PASS=profile-default
+  TSINK_BPP_RUNS=1
+  TSINK_ACTIVE_SERIES=1000
+  TSINK_PRIME_ALL_SERIES=1
+  TSINK_MIN_POINTS_PER_SERIES=1
+  TSINK_WARMUP_POINTS=50000
+  TSINK_MEASURE_POINTS=200000
+  TSINK_BATCH_SIZE=2048
+  TSINK_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES=4
+  TSINK_OOO_MAX_SECONDS=300
+  TSINK_OOO_CROSS_PARTITION_PERMILLE=0
+  TSINK_OOO_CROSS_PARTITIONS=0
+  TSINK_SHORT_LIVED_LIFETIME_STEPS=512
+  TSINK_RETENTION_SECONDS=604800
+  TSINK_PARTITION_SECONDS=86400
+    Finished `bench` profile [optimized] target(s) in 0.10s
+     Running benches/workload.rs (target/release/deps/workload-3b0aca16dc5bf5d7)
+WORKLOAD_CONFIGURATION resource_profile=test memory_limit_override_bytes=none maintenance_max_bytes_override=none runs=1 run_id_offset=1 seed=3235823838
+workload: starting mixed workload suite
+workload: runs=1 active_series=1000 warmup_points=50000 measured_points=200000 batch_size=2048
+workload: retention=604800s partition=86400s max_active_partition_heads_per_series=4 ooo_max=300s ooo_permille=250 ooo_cross_partition_permille=0 ooo_cross_partitions=0 sparse_emit_permille=120 prime_all_series=true shared_metric_names=false
+workload: WARNING active_series=1000 is below suite target 1000000
+RUN_RESULT run=2 resource_profile=test accounted_memory_limit_bytes=67108864 local_disk_limit_bytes=268435456 wal_limit_bytes=33554432 cardinality_limit=10000 max_concurrent_writers=2 max_concurrent_queries=2 maintenance_max_items_per_pass=10000 maintenance_max_bytes_per_pass=67108864 retained_points=251000 late_rejected_points=0 max_post_write_accounted_memory_bytes=5921936 post_settle_accounted_memory_bytes=5251495 active_and_sealed_bytes=3632775 registry_bytes=204790 metadata_cache_bytes=1071848 wal_series_definition_cache_bytes=339918 write_transient_bytes=0 peak_write_transient_bytes=10220252 persisted_index_bytes=2164 persisted_mmap_bytes=0 tombstone_bytes=0 local_disk_accounted_bytes_before_close=5049674 persisted_bytes=624326 effective_bpp=2.487355 process_current_rss_before_build_bytes=6275072 process_current_rss_after_input_build_bytes=unavailable process_current_rss_post_work_bytes=36634624 process_current_rss_after_close_bytes=44253184 process_current_rss_after_drop_bytes=43745280 process_peak_rss_bytes_so_far=44433408 path=/var/folders/cj/d14y5d055w3bcwp2w2pwrpfh0000gn/T/.tmpzjEtAf/run-01
+SUITE_RESULT resource_profile=test runs=1 failures=0 p50_effective_bpp=2.487355 p95_effective_bpp=2.487355 p50_max_post_write_accounted_memory_bytes=5921936 p95_max_post_write_accounted_memory_bytes=5921936 max_post_write_accounted_memory_bytes=5921936 p50_post_settle_accounted_memory_bytes=5251495 p95_post_settle_accounted_memory_bytes=5251495 max_post_settle_accounted_memory_bytes=5251495 p50_peak_write_transient_bytes=10220252 p95_peak_write_transient_bytes=10220252 max_peak_write_transient_bytes=10220252 p50_local_disk_accounted_bytes_before_close=5049674 p95_local_disk_accounted_bytes_before_close=5049674 max_local_disk_accounted_bytes_before_close=5049674 p50_persisted_bytes=624326 p95_persisted_bytes=624326 max_persisted_bytes=624326 max_process_peak_rss_bytes_so_far=44433408
+TARGET_CHECK all_runs_succeeded=true p50<=0.75=false p95<=1.0=false pass=false
+FRESH_PROCESS_RUN run=3 total_runs=3 preset=test
+Running workload benchmark with preset=test
+  TSINK_RESOURCE_PROFILE=test
+  TSINK_MEMORY_LIMIT_BYTES=profile-default
+  TSINK_MAINTENANCE_MAX_BYTES_PER_PASS=profile-default
+  TSINK_BPP_RUNS=1
+  TSINK_ACTIVE_SERIES=1000
+  TSINK_PRIME_ALL_SERIES=1
+  TSINK_MIN_POINTS_PER_SERIES=1
+  TSINK_WARMUP_POINTS=50000
+  TSINK_MEASURE_POINTS=200000
+  TSINK_BATCH_SIZE=2048
+  TSINK_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES=4
+  TSINK_OOO_MAX_SECONDS=300
+  TSINK_OOO_CROSS_PARTITION_PERMILLE=0
+  TSINK_OOO_CROSS_PARTITIONS=0
+  TSINK_SHORT_LIVED_LIFETIME_STEPS=512
+  TSINK_RETENTION_SECONDS=604800
+  TSINK_PARTITION_SECONDS=86400
+    Finished `bench` profile [optimized] target(s) in 0.10s
+     Running benches/workload.rs (target/release/deps/workload-3b0aca16dc5bf5d7)
+WORKLOAD_CONFIGURATION resource_profile=test memory_limit_override_bytes=none maintenance_max_bytes_override=none runs=1 run_id_offset=2 seed=3235823838
+workload: starting mixed workload suite
+workload: runs=1 active_series=1000 warmup_points=50000 measured_points=200000 batch_size=2048
+workload: retention=604800s partition=86400s max_active_partition_heads_per_series=4 ooo_max=300s ooo_permille=250 ooo_cross_partition_permille=0 ooo_cross_partitions=0 sparse_emit_permille=120 prime_all_series=true shared_metric_names=false
+workload: WARNING active_series=1000 is below suite target 1000000
+RUN_RESULT run=3 resource_profile=test accounted_memory_limit_bytes=67108864 local_disk_limit_bytes=268435456 wal_limit_bytes=33554432 cardinality_limit=10000 max_concurrent_writers=2 max_concurrent_queries=2 maintenance_max_items_per_pass=10000 maintenance_max_bytes_per_pass=67108864 retained_points=251000 late_rejected_points=0 max_post_write_accounted_memory_bytes=5854779 post_settle_accounted_memory_bytes=5210948 active_and_sealed_bytes=3595012 registry_bytes=204790 metadata_cache_bytes=1069064 wal_series_definition_cache_bytes=339918 write_transient_bytes=0 peak_write_transient_bytes=10141483 persisted_index_bytes=2164 persisted_mmap_bytes=0 tombstone_bytes=0 local_disk_accounted_bytes_before_close=5037162 persisted_bytes=637793 effective_bpp=2.541008 process_current_rss_before_build_bytes=6275072 process_current_rss_after_input_build_bytes=unavailable process_current_rss_post_work_bytes=36519936 process_current_rss_after_close_bytes=43909120 process_current_rss_after_drop_bytes=43384832 process_peak_rss_bytes_so_far=44105728 path=/var/folders/cj/d14y5d055w3bcwp2w2pwrpfh0000gn/T/.tmpUGqep8/run-02
+SUITE_RESULT resource_profile=test runs=1 failures=0 p50_effective_bpp=2.541008 p95_effective_bpp=2.541008 p50_max_post_write_accounted_memory_bytes=5854779 p95_max_post_write_accounted_memory_bytes=5854779 max_post_write_accounted_memory_bytes=5854779 p50_post_settle_accounted_memory_bytes=5210948 p95_post_settle_accounted_memory_bytes=5210948 max_post_settle_accounted_memory_bytes=5210948 p50_peak_write_transient_bytes=10141483 p95_peak_write_transient_bytes=10141483 max_peak_write_transient_bytes=10141483 p50_local_disk_accounted_bytes_before_close=5037162 p95_local_disk_accounted_bytes_before_close=5037162 max_local_disk_accounted_bytes_before_close=5037162 p50_persisted_bytes=637793 p95_persisted_bytes=637793 max_persisted_bytes=637793 max_process_peak_rss_bytes_so_far=44105728
+TARGET_CHECK all_runs_succeeded=true p50<=0.75=false p95<=1.0=false pass=false

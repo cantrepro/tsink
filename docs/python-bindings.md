@@ -61,7 +61,7 @@ db.close()
 ## TsinkStorageBuilder
 
 Create a builder, call configuration methods, then call `build()` once to get a
-`TsinkDb` handle. The builder is consumed by `build()` and cannot be reused.
+`TsinkDB` handle. The builder is consumed by `build()` and cannot be reused.
 
 ```python
 from datetime import timedelta
@@ -100,7 +100,7 @@ All methods return `None` and mutate the builder in place.
 |---|---|---|
 | `with_resource_profile(profile)` | `Embedded` | Select `Test`, `Embedded`, `Edge`, `Server`, or `ExpertUnlimited`. Rust `Custom(ResourceLimits)` is not yet constructible through UniFFI. |
 | `with_data_path(path)` | *none* | Directory for WAL, segments, and metadata. |
-| `with_object_store_path(path)` | *none* | Path (or object-store prefix) for warm/cold tier segments. |
+| `with_object_store_path(path)` | *none* | Local, FUSE, or network-filesystem mount for warm/cold tier segments; native object-store URIs are not supported. |
 
 #### Retention
 
@@ -132,13 +132,17 @@ All methods return `None` and mutate the builder in place.
 | `with_cardinality_limit(series)` | 1,000,000 (`Embedded`) | Maximum unique series count. |
 | `with_max_labels_per_series(labels)` | 128 | Maximum labels in a submitted series identity. |
 | `with_max_series_identity_bytes(bytes)` | 64 KiB | Maximum cumulative metric and label UTF-8 bytes in one identity. |
-| `with_series_creation_rate_limit(series, window)` | unset | Fixed-window limit for successfully published new series. |
-| `with_write_batch_limits(limits)` | both fields unset | Pre-clone top-level row and modeled logical-input-byte bounds. The row bound also caps best-effort outcomes. |
+| `with_series_creation_rate_limit(series, window)` | 100,000 / 60 s (`Embedded`) | Fixed-window limit for successfully published new series. |
+| `with_write_batch_limits(limits)` | 100,000 rows / 64 MiB (`Embedded`) | Pre-clone top-level row and modeled logical-input-byte bounds. The row bound also caps best-effort outcomes. |
 
 #### Query budget
 
-`with_query_budget_limits(limits)` configures the shared core query boundary. Every optional field
-defaults to `None`, which means unbounded for that dimension; zero is not a valid finite value.
+`with_query_budget_limits(limits)` overrides the shared core query boundary. The selected
+`Embedded` profile defaults to 8 concurrent queries, 128 MiB shared query memory, 32 MiB per query,
+250,000 matched/intermediate series, 10,000,000 scanned samples, 2,000,000 returned samples,
+64 MiB returned bytes, 1,000,000 pattern candidates and steps, and a 30-second wall-time limit.
+`None` removes an individual limit only in an explicitly supplied override; zero is not a valid
+finite value.
 
 ```python
 from tsink import QueryBudgetLimits, QueryWorkLimits
@@ -168,7 +172,7 @@ RSS. See [Resource limits and profiles](resource-limits.md) for the exact accoun
 
 | Method | Default | Description |
 |---|---|---|
-| `with_max_writers(n)` | CPU count | Parallel writer threads. |
+| `with_max_writers(n)` | 4 (`Embedded`) | Concurrent writes admitted by the synchronous engine. |
 | `with_write_timeout(duration)` | 30 s | Maximum wait for a writer slot. |
 
 #### WAL
@@ -176,10 +180,18 @@ RSS. See [Resource limits and profiles](resource-limits.md) for the exact accoun
 | Method | Default | Description |
 |---|---|---|
 | `with_wal_enabled(bool)` | `True` | Enable/disable the write-ahead log. |
-| `with_wal_size_limit(bytes)` | unlimited | Maximum WAL size on disk. |
-| `with_wal_buffer_size(size)` | 4 KiB | Finite WAL `BufWriter` capacity; reported but outside the storage-memory budget. |
+| `with_wal_size_limit(bytes)` | 512 MiB (`Embedded`) | Maximum WAL size on disk. |
+| `with_wal_buffer_size(size)` | 4 KiB | Finite WAL `BufWriter` capacity; the live retained capacity is charged to the storage-memory budget and reported by the observability APIs. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | `WalSyncMode.PER_APPEND` synchronizes each non-empty write; `WalSyncMode.PERIODIC(interval)` uses an append-driven sync interval. |
 | `with_wal_replay_mode(mode)` | `Strict` | `WalReplayMode.STRICT` or `WalReplayMode.SALVAGE`. |
+
+#### Local disk
+
+| Method | Default | Description |
+|---|---|---|
+| `with_local_disk_limit(bytes)` | 16 GiB (`Embedded`) | Maximum admitted bytes beneath the persistent data directory. |
+| `with_filesystem_free_headroom(bytes)` | 256 MiB (`Embedded`) | Filesystem space reserved for the host. |
+| `with_maintenance_temp_reserve(bytes)` | 1 GiB (`Embedded`) | Logical quota reserved for compaction and recovery work. |
 
 #### Remote segments
 
@@ -195,13 +207,13 @@ RSS. See [Resource limits and profiles](resource-limits.md) for the exact accoun
 |---|---|---|
 | `with_runtime_mode(mode)` | `ReadWrite` | `StorageRuntimeMode.READ_WRITE` or `COMPUTE_ONLY`. |
 | `with_background_fail_fast(bool)` | `True` | Halt on unrecoverable background errors. |
-| `with_metadata_shard_count(n)` | *auto* | Number of metadata shards. |
+| `with_metadata_shard_count(n)` | *none* | Enable a fixed metadata shard index for bounded shard-scoped discovery. |
 
 ---
 
-## TsinkDb
+## TsinkDB
 
-`TsinkDb` is the main database handle returned by `builder.build()`. It is
+`TsinkDB` is the main database handle returned by `builder.build()`. It is
 thread-safe and can be shared across Python threads.
 
 ### Writing data
@@ -476,8 +488,10 @@ Finite profiles process one configured item/byte-bounded source page per call. E
 ```python
 db.snapshot("/backups/tsink-2026-03-12")
 
-# Restore to a new data directory.
-TsinkStorageBuilder.restore_from_snapshot("/backups/tsink-2026-03-12", "/var/lib/tsink")
+# Restore to a new data directory before opening it.
+from tsink import restore_from_snapshot
+
+restore_from_snapshot("/backups/tsink-2026-03-12", "/var/lib/tsink")
 ```
 
 ---
@@ -497,6 +511,8 @@ print(f"low-level overrides: {resources.overrides}")
 print(f"accounted memory limit: {limits.accounted_memory_bytes}")
 print(f"accounted memory: {snap.memory.accounted_bytes} bytes")
 print(f"memory pressure: {snap.memory.pressure.level}")
+print(f"remote catalog staging: {snap.memory.remote_catalog_staging_bytes} bytes")
+print(f"WAL writer buffer: {snap.memory.wal_writer_buffer_bytes} bytes")
 print(f"WAL definition cache: {snap.memory.wal_series_definition_cache_bytes} bytes")
 print(f"write scratch: current={snap.memory.write_transient_bytes}, "
       f"peak={snap.memory.peak_write_transient_bytes}, "
@@ -528,9 +544,11 @@ built-in backend has no finite limit for that field; the memory value is not a p
 `snap.resource_configuration` is the same typed record returned by
 `db.resource_configuration_snapshot()`; it includes the selected profile, resolved limits, and
 stable snake-case override names.
-`wal_series_definition_cache_bytes` is retained accounted memory. The transient fields are
-conservative current/peak write and startup-replay reservations; `write_transient_bytes_estimated`
-distinguishes that model from allocator sampling.
+`remote_catalog_staging_bytes` is retained accounted memory for finite compute-only catalog reads
+and read-write catalog publication. `wal_writer_buffer_bytes` is the actual retained capacity of
+the live WAL writer buffer, and `wal_series_definition_cache_bytes` is retained accounted memory.
+The transient fields are conservative current/peak write and startup-replay reservations;
+`write_transient_bytes_estimated` distinguishes that model from allocator sampling.
 
 ---
 
@@ -634,7 +652,7 @@ message and is one of these variants:
 | Variant | When it occurs |
 |---|---|
 | `NoDataPoints` | No data found for the given metric/time range. |
-| `InvalidTimeRange` | `start > end` or otherwise invalid range. |
+| `InvalidTimeRange` | `start >= end` in a half-open storage query, or another invalid range. |
 | `StorageClosed` | Operation attempted after `close()`. |
 | `InvalidInput` | Bad metric name, label, or unsupported operation. |
 | `IoError` | File-system or disk I/O failure. |

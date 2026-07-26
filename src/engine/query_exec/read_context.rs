@@ -274,7 +274,11 @@ impl<'a> SeriesQueryContext<'a> {
 }
 
 pub(super) trait TimeRangeFilterOps {
-    fn refresh_missing_visibility_summaries(&self, series_ids: &RoaringTreemap) -> Result<()>;
+    fn refresh_missing_visibility_summaries(
+        &self,
+        series_ids: &RoaringTreemap,
+        execution: &QueryExecution,
+    ) -> Result<()>;
 
     fn latest_visible_timestamp_in_persisted_chunk(
         &self,
@@ -301,7 +305,7 @@ pub(super) struct TimeRangeFilterContext<'a> {
     pub(super) persisted_index: &'a RwLock<PersistedIndexState>,
     pub(super) visibility_cache: VisibilityCacheReadContext<'a>,
     pub(super) visibility_fence: &'a RwLock<()>,
-    pub(super) tombstones: &'a RwLock<crate::engine::tombstone::TombstoneMap>,
+    pub(super) tombstones: super::super::visibility::TombstoneReadContext<'a>,
     pub(super) active_retention_cutoff: Option<i64>,
     pub(super) ops: &'a dyn TimeRangeFilterOps,
 }
@@ -314,8 +318,10 @@ impl<'a> TimeRangeFilterContext<'a> {
     pub(super) fn refresh_missing_visibility_summaries(
         self,
         series_ids: &RoaringTreemap,
+        execution: &QueryExecution,
     ) -> Result<()> {
-        self.ops.refresh_missing_visibility_summaries(series_ids)
+        self.ops
+            .refresh_missing_visibility_summaries(series_ids, execution)
     }
 }
 
@@ -335,7 +341,7 @@ impl ChunkStorage {
             persisted_index: &self.persisted.persisted_index,
             visibility_cache: self.visibility_cache_read_context(),
             visibility_fence: &self.visibility.flush_visibility_lock,
-            tombstones: &self.visibility.tombstones,
+            tombstones: self.tombstone_read_context(),
             active_retention_cutoff: self.active_retention_cutoff(),
             ops: self,
         }
@@ -484,12 +490,12 @@ impl SeriesQueryReadOps for ChunkStorage {
 }
 
 impl TimeRangeFilterOps for ChunkStorage {
-    fn refresh_missing_visibility_summaries(&self, series_ids: &RoaringTreemap) -> Result<()> {
-        let missing_series_ids = self.missing_visibility_summary_series_ids(series_ids.iter());
-        if !missing_series_ids.is_empty() {
-            self.refresh_series_visible_timestamp_cache(missing_series_ids)?;
-        }
-        Ok(())
+    fn refresh_missing_visibility_summaries(
+        &self,
+        series_ids: &RoaringTreemap,
+        execution: &QueryExecution,
+    ) -> Result<()> {
+        self.refresh_missing_visibility_summaries_for_query(series_ids, execution)
     }
 
     fn latest_visible_timestamp_in_persisted_chunk(

@@ -44,6 +44,21 @@ impl StartupFinalizeState {
 }
 
 impl StartupFinalizePhase {
+    pub(super) fn run_snapshot_validation(storage: &Arc<ChunkStorage>) -> Result<()> {
+        // Exercise the same bounded in-memory reconciliation and resource checks that make a
+        // normal instance serviceable, while deliberately suppressing every durable publication,
+        // retention deletion, maintenance schedule, and worker start.
+        storage.reconcile_live_metadata_indexes()?;
+        if storage.memory_budget_value() != usize::MAX {
+            storage.refresh_memory_usage();
+            storage.enforce_memory_budget_if_needed()?;
+        }
+        if let Some(local_disk_budget) = &storage.persisted.local_disk_budget {
+            local_disk_budget.reconcile()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn run(
         storage: &Arc<ChunkStorage>,
         finalize_state: StartupFinalizeState,

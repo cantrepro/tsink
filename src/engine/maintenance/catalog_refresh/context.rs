@@ -52,9 +52,24 @@ impl<'a> CatalogRefreshContext<'a> {
         std::mem::take(&mut *self.pending_persisted_segment_diff.lock())
     }
 
+    pub(super) fn take_one_known_persisted_segment_change(self) -> PendingPersistedSegmentDiff {
+        self.pending_persisted_segment_diff.lock().take_one()
+    }
+
     pub(super) fn restore_known_persisted_segment_changes(self, diff: PendingPersistedSegmentDiff) {
         if !diff.is_empty() {
             self.pending_persisted_segment_diff.lock().merge(diff);
+        }
+    }
+
+    pub(super) fn restore_known_persisted_segment_change_if_unmodified(
+        self,
+        diff: PendingPersistedSegmentDiff,
+    ) {
+        if !diff.is_empty() {
+            self.pending_persisted_segment_diff
+                .lock()
+                .restore_if_unmodified(diff);
         }
     }
 
@@ -68,6 +83,12 @@ impl<'a> CatalogRefreshContext<'a> {
 
     pub(super) fn set_persisted_index_dirty(self, dirty: bool) {
         self.persisted_index_dirty.store(dirty, Ordering::SeqCst);
+    }
+
+    pub(super) fn synchronize_persisted_index_dirty_with_pending(self) {
+        let pending = self.pending_persisted_segment_diff.lock();
+        self.persisted_index_dirty
+            .store(!pending.is_empty(), Ordering::SeqCst);
     }
 
     pub(super) fn runtime_refresh_segment_inventory(self) -> Result<SegmentInventory> {
@@ -319,9 +340,22 @@ impl ChunkStorage {
             .restore_known_persisted_segment_changes(diff);
     }
 
+    pub(in crate::engine::storage_engine) fn restore_known_persisted_segment_change_if_unmodified(
+        &self,
+        diff: PendingPersistedSegmentDiff,
+    ) {
+        self.catalog_refresh_context()
+            .restore_known_persisted_segment_change_if_unmodified(diff);
+    }
+
     pub(in crate::engine::storage_engine) fn has_known_persisted_segment_changes(&self) -> bool {
         self.catalog_refresh_context()
             .has_known_persisted_segment_changes()
+    }
+
+    pub(in crate::engine::storage_engine) fn synchronize_persisted_index_dirty_with_pending(&self) {
+        self.catalog_refresh_context()
+            .synchronize_persisted_index_dirty_with_pending();
     }
 
     #[cfg(test)]

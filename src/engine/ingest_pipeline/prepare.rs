@@ -274,6 +274,9 @@ impl<'a> WritePrepareVisibilityContext<'a> {
                                     metadata_bytes = metadata_bytes.saturating_add(
                                         std::mem::size_of::<(SeriesId, SeriesVisibilitySummary)>(),
                                     );
+                                    metadata_bytes = metadata_bytes.saturating_add(
+                                        std::mem::size_of::<(SeriesId, u64)>(),
+                                    );
                                 }
                                 let needs_bounded_entry =
                                     indexes.iter().any(|idx| points[*idx].ts <= bounded_cutoff);
@@ -302,23 +305,34 @@ impl<'a> WritePrepareVisibilityContext<'a> {
 impl<'a> WritePrepareMemoryBudgetContext<'a> {
     fn retained_budget_after_reservations(self, estimated_growth_bytes: usize) -> usize {
         let budget = self
+            .memory_reservation_admission
             .budget_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
         let staged = self
+            .memory_reservation_admission
             .tombstone_staged_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
-        let transient = self.write_transient.current_bytes();
+        let remote_catalog_staged = self
+            .memory_reservation_admission
+            .remote_catalog_staging
+            .current_bytes();
+        let transient = self
+            .memory_reservation_admission
+            .write_transient
+            .current_bytes();
 
         budget
             .saturating_sub(staged)
+            .saturating_sub(remote_catalog_staged)
             .saturating_sub(transient)
             .saturating_sub(estimated_growth_bytes)
     }
 
     fn shortfall(self, estimated_growth_bytes: usize) -> Option<(usize, usize)> {
         let budget = self
+            .memory_reservation_admission
             .budget_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
@@ -327,16 +341,26 @@ impl<'a> WritePrepareMemoryBudgetContext<'a> {
         }
 
         let used = self
+            .memory_reservation_admission
             .used_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
         let staged = self
+            .memory_reservation_admission
             .tombstone_staged_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize;
-        let transient = self.write_transient.current_bytes();
+        let remote_catalog_staged = self
+            .memory_reservation_admission
+            .remote_catalog_staging
+            .current_bytes();
+        let transient = self
+            .memory_reservation_admission
+            .write_transient
+            .current_bytes();
         let required = used
             .saturating_add(staged)
+            .saturating_add(remote_catalog_staged)
             .saturating_add(transient)
             .saturating_add(estimated_growth_bytes);
         (required > budget).then_some((budget, required))
@@ -351,13 +375,7 @@ impl<'a> WritePrepareMemoryBudgetContext<'a> {
             .base_reserved_bytes()
             .checked_add(retained_growth_bytes)
             .ok_or(TsinkError::WriteBatchSizeOverflow)?;
-        reservation.ensure(
-            required_reservation,
-            self.used_bytes,
-            self.tombstone_staged_bytes,
-            self.budget_bytes,
-            self.memory_rejections_total,
-        )
+        reservation.ensure(required_reservation, self.memory_reservation_admission)
     }
 }
 

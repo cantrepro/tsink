@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use super::super::super::{
     lane_for_value, Label, Result, Row, SeriesCreationRateReservation, SeriesDefinitionFrame,
@@ -20,6 +19,13 @@ fn checked_mul(lhs: usize, rhs: usize) -> Result<usize> {
         .ok_or(TsinkError::WriteBatchSizeOverflow)
 }
 
+pub(super) fn modeled_write_rejection_result_bytes(rows_len: usize) -> Result<usize> {
+    let per_row = std::mem::size_of::<crate::RowWriteOutcome>()
+        .checked_add(crate::MAX_WRITE_REJECTION_MESSAGE_BYTES)
+        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+    checked_mul(rows_len, per_row)
+}
+
 /// Conservative peak for every tsink-owned allocation that can coexist between write
 /// preflight and WAL publication. Caller-owned rows are deliberately excluded.
 fn modeled_write_preparation_peak_bytes(rows: &[Row], wal_enabled: bool) -> Result<usize> {
@@ -34,10 +40,6 @@ fn modeled_write_preparation_peak_bytes(rows: &[Row], wal_enabled: bool) -> Resu
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PendingNewSeriesPlan>()))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SeriesDefinitionFrame>()))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SeriesResolution>()))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::RowWriteOutcome>()))
-        // A rejected canonical outcome can own one bounded diagnostic string. Reserve the full
-        // allowance per row because atomic rejection clones one diagnostic across the response.
-        .and_then(|bytes| bytes.checked_add(crate::MAX_WRITE_REJECTION_MESSAGE_BYTES))
         .and_then(|bytes| {
             std::mem::size_of::<(usize, usize)>()
                 .checked_mul(4)
@@ -67,7 +69,11 @@ fn modeled_write_preparation_peak_bytes(rows: &[Row], wal_enabled: bool) -> Resu
         0
     };
 
-    checked_add(checked_add(clone_envelope, control_envelope)?, wal_envelope)
+    let canonical_result_envelope = modeled_write_rejection_result_bytes(rows_len)?;
+    checked_add(
+        checked_add(checked_add(clone_envelope, control_envelope)?, wal_envelope)?,
+        canonical_result_envelope,
+    )
 }
 
 struct PendingNewSeriesPlan {
@@ -136,38 +142,31 @@ impl<'a> WriteResolveContext<'a> {
         });
     }
 
-    fn enforce_new_series_admission(self, estimated_registry_growth: usize) -> Result<()> {
-        let budget = self
-            .budget_bytes
-            .load(Ordering::Acquire)
-            .min(usize::MAX as u64) as usize;
-        if budget == usize::MAX {
-            return Ok(());
-        }
+    fn reserve_new_series_overlap(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+        additional_bytes: usize,
+    ) -> Result<()> {
+        let required = reservation
+            .base_reserved_bytes()
+            .checked_add(additional_bytes)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        reservation.ensure(required, self.memory_reservation_admission)
+    }
 
-        let used = self
-            .used_bytes
-            .load(Ordering::Acquire)
-            .min(usize::MAX as u64) as usize;
-        let staged = self
-            .tombstone_staged_bytes
-            .load(Ordering::Acquire)
-            .min(usize::MAX as u64) as usize;
-        let transient = self.write_transient.current_bytes();
-        let required = used
-            .saturating_add(staged)
-            .saturating_add(transient)
-            .saturating_add(estimated_registry_growth);
-        if required > budget {
-            let _ = self.memory_rejections_total.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |value| Some(value.saturating_add(1)),
-            );
-            return Err(TsinkError::MemoryBudgetExceeded { budget, required });
-        }
-
-        Ok(())
+    fn publish_registry_memory_and_release_overlap(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+    ) {
+        // Serialize the transient-to-retained transfer with every other storage-memory
+        // reservation. No concurrent writer can observe both the old retained counter and the
+        // released overlap.
+        let _admission_guard = self
+            .memory_reservation_admission
+            .reservation_admission_lock
+            .lock();
+        self.sync_registry_memory_usage();
+        reservation.reset_to_base();
     }
 
     fn reserve_new_series_rate(
@@ -222,13 +221,16 @@ impl<'a> WriteResolver<'a> {
         &self,
         scratch: usize,
     ) -> Result<WriteTransientMemoryReservation> {
-        self.engine.write_transient.new_reservation(
-            scratch,
-            self.engine.used_bytes,
-            self.engine.tombstone_staged_bytes,
-            self.engine.budget_bytes,
-            self.engine.memory_rejections_total,
-        )
+        self.engine
+            .write_transient
+            .new_reservation(scratch, self.engine.memory_reservation_admission)
+    }
+
+    pub(super) fn reserve_write_rejection_result(
+        &self,
+        rows_len: usize,
+    ) -> Result<WriteTransientMemoryReservation> {
+        self.reserve_write_scratch(modeled_write_rejection_result_bytes(rows_len)?)
     }
 
     #[cfg(test)]
@@ -322,10 +324,19 @@ impl<'a> WriteResolver<'a> {
                 })
                 .collect::<Vec<_>>();
             let estimated_registry_growth = self.engine.with_registry(|registry| {
-                registry.estimate_new_series_memory_growth_bytes(&planned_series)
+                registry.estimate_new_series_memory_growth_bytes_with_transient_admission(
+                    &planned_series,
+                    |required| {
+                        self.engine
+                            .reserve_new_series_overlap(&transient_memory, required)
+                    },
+                )
             })?;
+            // Estimation clones are gone. Replace their temporary peak with an atomic retained
+            // growth overlap before dictionaries or postings can be mutated.
+            transient_memory.reset_to_base();
             self.engine
-                .enforce_new_series_admission(estimated_registry_growth)?;
+                .reserve_new_series_overlap(&transient_memory, estimated_registry_growth)?;
         }
 
         if !pending_new_series_plans.is_empty() {
@@ -380,6 +391,8 @@ impl<'a> WriteResolver<'a> {
             }) {
                 self.engine.release_new_series_capacity(reserved_capacity);
                 self.engine.rollback_created_series(&newly_created_series);
+                self.engine
+                    .publish_registry_memory_and_release_overlap(&transient_memory);
                 return Err(err);
             }
 
@@ -387,9 +400,8 @@ impl<'a> WriteResolver<'a> {
             if let Some(reservation) = series_creation_rate_reservation.as_mut() {
                 reservation.retain(newly_created_series.len());
             }
-            if !newly_created_series.is_empty() {
-                self.engine.sync_registry_memory_usage();
-            }
+            self.engine
+                .publish_registry_memory_and_release_overlap(&transient_memory);
             created_series.extend(newly_created_series.iter().cloned());
             for plan_idx in created_plan_indexes {
                 let plan = &pending_new_series_plans[plan_idx];

@@ -10,6 +10,7 @@ use super::merge::{pop_next_point_from_sources, QueryMergeCursor, QueryMergeSour
 use super::pagination::{RawSeriesPagination, SortedSeriesDedupeMode, SortedSeriesPageCollector};
 use super::*;
 use crate::engine::chunk::ChunkHeader;
+use crate::engine::tombstone::TombstoneMap;
 
 fn default_future_skew_window(precision: TimestampPrecision) -> i64 {
     super::super::duration_to_timestamp_units(
@@ -332,6 +333,42 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
         .resolve_existing("cpu", &labels)
         .unwrap()
         .series_id;
+    storage.visibility.tombstones.write().insert(
+        series_id,
+        vec![tombstone::TombstoneRange { start: 1, end: 2 }],
+    );
+    let remote_shard_index = tombstone::ImmutableTombstoneSnapshot::shard_index(series_id);
+    let mut remote_shards = (0..tombstone::LIVE_TOMBSTONE_SHARD_COUNT)
+        .map(|_| {
+            tombstone::ImmutableTombstoneShard::from_map_with_memory_usage(TombstoneMap::new(), 0)
+        })
+        .collect::<Vec<_>>();
+    let mut remote_map = TombstoneMap::new();
+    remote_map.insert(
+        series_id,
+        vec![tombstone::TombstoneRange { start: 2, end: 3 }],
+    );
+    remote_shards[remote_shard_index] =
+        tombstone::ImmutableTombstoneShard::from_map_with_memory_usage(remote_map, 0);
+    {
+        let _visibility_guard = storage.visibility_write_fence();
+        storage
+            .tombstone_publication_context()
+            .publish_remote_tombstones_locked(
+                &storage,
+                Arc::new(tombstone::ImmutableTombstoneSnapshot::from_shards(
+                    remote_shards,
+                )),
+            )
+            .unwrap();
+    }
+    let execution = storage
+        .begin_query_execution(
+            crate::QueryWorkLimits::default(),
+            crate::QueryCancellationToken::new(),
+        )
+        .unwrap()
+        .unwrap();
     let plan = TieredQueryPlan::from_cutoffs(0, 10, None, None);
 
     let (merge_snapshot, _) = storage
@@ -340,7 +377,14 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
     assert!(merge_snapshot.analysis.can_use_merge_path());
     let mut merge_points = Vec::new();
     storage
-        .execute_series_read_merge_path(series_id, 0, 10, merge_snapshot, &mut merge_points, None)
+        .execute_series_read_merge_path(
+            series_id,
+            0,
+            10,
+            merge_snapshot,
+            &mut merge_points,
+            Some(&execution),
+        )
         .unwrap();
 
     let (append_snapshot, _) = storage
@@ -354,19 +398,59 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
             10,
             append_snapshot,
             &mut append_sort_points,
-            None,
+            Some(&execution),
         )
         .unwrap();
 
     assert_eq!(merge_points, append_sort_points);
-    assert_eq!(
-        merge_points,
-        vec![
-            DataPoint::new(1, 1.0),
-            DataPoint::new(2, 2.0),
-            DataPoint::new(3, 3.0),
-        ]
-    );
+    assert_eq!(merge_points, vec![DataPoint::new(3, 3.0)]);
 
-    storage.close().unwrap();
+    let (merge_page_snapshot, _) = storage
+        .snapshot_series_read_sources(series_id, 0, 10, plan)
+        .unwrap();
+    let merge_page = storage
+        .collect_raw_series_page_with_merge(
+            series_id,
+            0,
+            10,
+            merge_page_snapshot,
+            RawSeriesPagination {
+                offset: 0,
+                limit: Some(10),
+            },
+            Some(&execution),
+        )
+        .unwrap();
+    let (append_page_snapshot, _) = storage
+        .snapshot_series_read_sources(series_id, 0, 10, plan)
+        .unwrap();
+    let append_page = storage
+        .collect_raw_series_page_with_append_sort(
+            series_id,
+            0,
+            10,
+            append_page_snapshot,
+            RawSeriesPagination {
+                offset: 0,
+                limit: Some(10),
+            },
+            Some(&execution),
+        )
+        .unwrap();
+    assert_eq!(merge_page.points, vec![DataPoint::new(3, 3.0)]);
+    assert_eq!(append_page.points, merge_page.points);
+
+    drop(execution);
+    storage.visibility.tombstones.write().remove(&series_id);
+    {
+        let _visibility_guard = storage.visibility_write_fence();
+        storage
+            .tombstone_publication_context()
+            .publish_remote_tombstones_locked(
+                &storage,
+                tombstone::ImmutableTombstoneSnapshot::empty(),
+            )
+            .unwrap();
+    }
+    drop(storage);
 }

@@ -77,6 +77,33 @@ fn encoded_registry_decoded_len(registry_payload: &[u8]) -> Result<usize> {
     Ok(decoded_len)
 }
 
+pub(crate) fn modeled_registry_payload_for_inspection(registry_payload: &[u8]) -> Result<usize> {
+    let decoded_bytes = encoded_registry_decoded_len(registry_payload)?;
+    registry_payload
+        .len()
+        .checked_add(
+            decoded_bytes
+                .checked_mul(STARTUP_REGISTRY_DECODE_RETAIN_FACTOR)
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+        )
+        .ok_or(TsinkError::WriteBatchSizeOverflow)
+}
+
+pub(crate) fn validate_registry_payload_for_inspection(
+    registry_payload: &[u8],
+    max_modeled_bytes: usize,
+) -> Result<usize> {
+    let required = modeled_registry_payload_for_inspection(registry_payload)?;
+    if required > max_modeled_bytes {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "series index modeled decode requires {required} bytes, limit is {max_modeled_bytes}"
+        )));
+    }
+    let registry =
+        SeriesRegistry::load_from_encoded_registry_bytes(registry_payload, max_modeled_bytes)?;
+    Ok(registry.series_count())
+}
+
 fn try_registry_vec_with_capacity<T>(count: usize, context: &str) -> Result<Vec<T>> {
     let allocation_bytes = count
         .checked_mul(std::mem::size_of::<T>())
@@ -786,6 +813,139 @@ impl SeriesRegistry {
         Ok(())
     }
 
+    pub(crate) fn encoded_registry_bytes_for_snapshot_with_admission(
+        &self,
+        admit_transient_bytes: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        let metric_dict = self.metric_dict.read();
+        let label_name_dict = self.label_name_dict.read();
+        let label_value_dict = self.label_value_dict.read();
+
+        let mut logical_len = REGISTRY_INDEX_HEADER_LEN;
+        for (_, value) in metric_dict
+            .entries()
+            .chain(label_name_dict.entries())
+            .chain(label_value_dict.entries())
+        {
+            let _ = u32::try_from(value.len()).map_err(|_| {
+                TsinkError::InvalidConfiguration(
+                    "dictionary value exceeds u32 length in registry index".to_string(),
+                )
+            })?;
+            logical_len = logical_len
+                .checked_add(REGISTRY_DICTIONARY_ENTRY_HEADER_LEN)
+                .and_then(|bytes| bytes.checked_add(value.len()))
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        }
+
+        let mut series_count = 0usize;
+        let mut label_pair_count = 0usize;
+        for shard in &self.series_shards {
+            let shard = shard.read();
+            series_count = series_count
+                .checked_add(shard.by_id.len())
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            for definition in shard.by_id.values() {
+                let _ = u16::try_from(definition.label_pairs.len()).map_err(|_| {
+                    TsinkError::InvalidConfiguration(
+                        "series label pair count exceeds u16 in registry index".to_string(),
+                    )
+                })?;
+                label_pair_count = label_pair_count
+                    .checked_add(definition.label_pairs.len())
+                    .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            }
+        }
+        logical_len = logical_len
+            .checked_add(
+                series_count
+                    .checked_mul(REGISTRY_SERIES_ENTRY_HEADER_LEN)
+                    .ok_or(TsinkError::WriteBatchSizeOverflow)?,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    label_pair_count
+                        .checked_mul(REGISTRY_LABEL_PAIR_LEN)
+                        .ok_or(TsinkError::WriteBatchSizeOverflow)
+                        .ok()?,
+                )
+            })
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        if logical_len > MAX_DECODED_FRAMED_FILE_BYTES {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "framed file size {logical_len} exceeds the format safety limit {MAX_DECODED_FRAMED_FILE_BYTES}"
+            )));
+        }
+
+        let series_vector_bytes = series_count
+            .checked_mul(std::mem::size_of::<(
+                SeriesDefinition,
+                Option<SeriesValueFamily>,
+            )>())
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let cloned_label_bytes = label_pair_count
+            .checked_mul(std::mem::size_of::<LabelPairId>())
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let peak_transient_bytes = logical_len
+            .checked_add(series_vector_bytes)
+            .and_then(|bytes| bytes.checked_add(cloned_label_bytes))
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+
+        // Admission occurs before the series clone/sort vector or output bytes are allocated.
+        // `sort_unstable_by_key` is deliberately allocation-free, so this model covers every
+        // proportional transient allocation in the snapshot encoder.
+        admit_transient_bytes(peak_transient_bytes)?;
+
+        let mut series = Vec::new();
+        series.try_reserve_exact(series_count).map_err(|_| {
+            TsinkError::Other("unable to allocate admitted snapshot registry series".to_string())
+        })?;
+        for shard in &self.series_shards {
+            let shard = shard.read();
+            series.extend(shard.by_id.values().cloned().map(|definition| {
+                let family = shard.value_families.get(&definition.series_id).copied();
+                (definition, family)
+            }));
+        }
+        series.sort_unstable_by_key(|(entry, _)| entry.series_id);
+
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(logical_len).map_err(|_| {
+            TsinkError::Other("unable to allocate admitted snapshot registry bytes".to_string())
+        })?;
+        bytes.extend_from_slice(&REGISTRY_INDEX_MAGIC);
+        append_u16(&mut bytes, REGISTRY_INDEX_VERSION);
+        append_u16(&mut bytes, 0u16);
+        append_u64(&mut bytes, self.next_series_id_value());
+        append_u32(&mut bytes, metric_dict.len() as u32);
+        append_u32(&mut bytes, label_name_dict.len() as u32);
+        append_u32(&mut bytes, label_value_dict.len() as u32);
+        append_u64(&mut bytes, series.len() as u64);
+        append_u64(&mut bytes, REGISTRY_SECTION_VALUE_FAMILY);
+        append_u64(&mut bytes, 0u64);
+        for (id, value) in metric_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+        for (id, value) in label_name_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+        for (id, value) in label_value_dict.entries() {
+            write_dict_entry(&mut bytes, id, value)?;
+        }
+        for (entry, family) in &series {
+            append_u64(&mut bytes, entry.series_id);
+            append_u32(&mut bytes, entry.metric_id);
+            append_u16(&mut bytes, entry.label_pairs.len() as u16);
+            append_u16(&mut bytes, encode_optional_series_value_family(*family));
+            for pair in &entry.label_pairs {
+                append_u32(&mut bytes, pair.name_id);
+                append_u32(&mut bytes, pair.value_id);
+            }
+        }
+        debug_assert_eq!(bytes.len(), logical_len);
+        Ok(bytes)
+    }
+
     fn encoded_registry_bytes(&self) -> Result<Vec<u8>> {
         let metric_dict = self.metric_dict.read();
         let label_name_dict = self.label_name_dict.read();
@@ -998,7 +1158,6 @@ impl SeriesRegistry {
             next_series_id: AtomicU64::new(next_series_id.max(1)),
             pending_series_reservations: AtomicUsize::new(0),
             estimated_total_bytes: AtomicUsize::new(0),
-            postings_generation: AtomicU64::new(0),
             metric_dict: RwLock::new(metric_dict),
             label_name_dict: RwLock::new(label_name_dict),
             label_value_dict: RwLock::new(label_value_dict),

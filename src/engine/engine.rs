@@ -23,14 +23,15 @@ use crate::engine::series::{
 use crate::engine::wal::{FramedWal, SamplesBatchFrame, SeriesDefinitionFrame};
 use crate::mmap::PlatformMmap;
 use crate::storage::{
-    BatchWriteResult, RowWriteOutcome, SeriesSelection, TimestampPrecision, WriteMode,
-    WriteRejection,
+    BatchWriteResult, RowWriteOutcome, SeriesSelection, StorageHealthSnapshot, TimestampPrecision,
+    WriteMode, WriteRejection,
 };
 use crate::{
     CardinalityObservabilitySnapshot, DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label,
     MetricSeries, QueryBudget, QueryBudgetSnapshot, QueryCancellationToken, QueryExecution,
-    QueryOptions, QueryWorkLimits, RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot,
-    ResourceConfigurationSnapshot, Result, Row, SeriesPoints, Storage, StorageBuilder,
+    QueryOptions, QueryRowsExecutionResult, QueryWorkLimits, RemoteSegmentCachePolicy,
+    RemoteStorageObservabilitySnapshot, ResourceConfigurationSnapshot, Result, Row,
+    SelectManyExecutionResult, SelectSeriesExecutionResult, SeriesPoints, Storage, StorageBuilder,
     StorageObservabilitySnapshot, StorageRuntimeMode, TsinkError, Value, WriteResult,
 };
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -43,6 +44,8 @@ mod config;
 mod construction;
 #[path = "core_impl.rs"]
 mod core_impl;
+#[path = "data_directory_manifest.rs"]
+pub(crate) mod data_directory_manifest;
 #[path = "deletion.rs"]
 mod deletion;
 #[path = "ingest.rs"]
@@ -61,6 +64,8 @@ mod observability;
 mod process_lock;
 #[path = "query_exec.rs"]
 mod query_exec;
+#[doc(hidden)]
+pub use query_exec::modeled_query_rows_retained_bytes;
 #[path = "query_read.rs"]
 mod query_read;
 #[path = "registry_catalog.rs"]
@@ -99,7 +104,8 @@ pub(in crate::engine::storage_engine) use core_impl::{
     WriteResolveContext, WriteSeriesValidationContext,
 };
 pub(in crate::engine::storage_engine) use maintenance::{
-    BackgroundCatalogRefreshCursor, WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
+    BackgroundCatalogRefreshCursor, MemoryReservationAdmissionContext,
+    RemoteCatalogMemoryAccounting, WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::{DataPathProcessLock, SharedObjectStoreProcessLock};
@@ -232,6 +238,30 @@ struct BackgroundRetentionMaintenanceCursor {
     after_root: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BackgroundMetadataReconciliationPhase {
+    #[default]
+    Sweep,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BackgroundMetadataReconciliationCursor {
+    phase: BackgroundMetadataReconciliationPhase,
+    after_series_id: Option<SeriesId>,
+    observed_generation: u64,
+    cycle_started: bool,
+    cycle_generation_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BackgroundTombstoneRecoverySnapshotCursor {
+    pending: bool,
+    after_series_id: Option<SeriesId>,
+    observed_generation: u64,
+    cycle_started: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct MaintenancePassSelection {
     items: usize,
@@ -276,12 +306,22 @@ struct ChunkBufferState {
 
 /// Query-visible tombstones, visibility summaries, and publication fencing.
 struct VisibilityState {
-    tombstones: Arc<RwLock<HashMap<SeriesId, Vec<crate::engine::tombstone::TombstoneRange>>>>,
+    /// Durable local/startup base view. Read-write mutation remains in-place under this lock.
+    tombstones: Arc<RwLock<crate::engine::tombstone::TombstoneMap>>,
+    /// Finite compute-only refresh publishes this fixed-fanout immutable overlay by `Arc` swap.
+    remote_tombstones:
+        RwLock<Arc<crate::engine::tombstone::ImmutableTombstoneSnapshot>>,
     materialized_series: RwLock<BTreeSet<SeriesId>>,
     series_visibility_summaries: RwLock<HashMap<SeriesId, state::SeriesVisibilitySummary>>,
     series_visible_max_timestamps: RwLock<HashMap<SeriesId, Option<i64>>>,
     series_visible_bounded_max_timestamps: RwLock<HashMap<SeriesId, Option<i64>>>,
+    /// A cached series is usable only when this tag equals `remote_tombstone_epoch`.
+    series_visibility_cache_epochs: RwLock<HashMap<SeriesId, u64>>,
+    #[cfg(test)]
+    visibility_cache_accounting_entries_visited: AtomicU64,
+    remote_tombstone_epoch: AtomicU64,
     visibility_state_generation: AtomicU64,
+    tombstone_state_generation: AtomicU64,
     live_series_pruning_generation: AtomicU64,
     max_observed_timestamp: AtomicI64,
     max_bounded_observed_timestamp: AtomicI64,
@@ -345,8 +385,11 @@ struct MemoryAccountingState {
     persisted_mmap_used_bytes: AtomicU64,
     tombstone_used_bytes: AtomicU64,
     tombstone_staged_bytes: AtomicU64,
+    remote_catalog_staging: Arc<RemoteCatalogMemoryAccounting>,
+    wal_writer_buffer_used_bytes: AtomicU64,
     wal_series_definition_cache_used_bytes: AtomicU64,
     write_transient: Arc<WriteTransientMemoryAccounting>,
+    reservation_admission_lock: Mutex<()>,
     budget_bytes: AtomicU64,
     active_backpressured_writers: AtomicU64,
     backpressure_events_total: AtomicU64,
@@ -360,6 +403,8 @@ struct CoordinationState {
     post_flush_maintenance_pending: AtomicBool,
     startup_metadata_reconcile_pending: AtomicBool,
     background_retention_maintenance_cursor: Mutex<BackgroundRetentionMaintenanceCursor>,
+    background_metadata_reconciliation_cursor: Mutex<BackgroundMetadataReconciliationCursor>,
+    background_tombstone_recovery_snapshot_cursor: Mutex<BackgroundTombstoneRecoverySnapshotCursor>,
     background_catalog_refresh_cursor: Mutex<BackgroundCatalogRefreshCursor>,
     lifecycle: Arc<AtomicU8>,
     background_maintenance_lock: Mutex<()>,
@@ -432,6 +477,47 @@ pub struct ChunkStorage {
     persist_test_hooks: PersistTestHooks,
 }
 
+/// RAII owner for a production-decoded snapshot validation instance.
+///
+/// Dropping this guard always ends the lifecycle without invoking the normal durable close
+/// pipeline, so an early return or panic cannot flush replayed WAL state into the disposable
+/// validation copy.
+pub(crate) struct SnapshotValidationStorage {
+    storage: Option<Arc<ChunkStorage>>,
+}
+
+impl SnapshotValidationStorage {
+    pub(super) fn new(storage: Arc<ChunkStorage>) -> Self {
+        Self {
+            storage: Some(storage),
+        }
+    }
+
+    pub(crate) fn health(&self) -> StorageHealthSnapshot {
+        self.storage
+            .as_deref()
+            .expect("snapshot validation storage is present until finish")
+            .observability_snapshot_impl()
+            .health
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        let storage = self
+            .storage
+            .take()
+            .expect("snapshot validation storage may only be finished once");
+        storage.finish_snapshot_validation_lifecycle()
+    }
+}
+
+impl Drop for SnapshotValidationStorage {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.take() {
+            let _ = storage.finish_snapshot_validation_lifecycle();
+        }
+    }
+}
+
 struct MetadataShardIndex {
     shard_count: u32,
     series_ids_by_shard: RwLock<Vec<BTreeSet<SeriesId>>>,
@@ -495,6 +581,30 @@ impl MetadataShardIndex {
 }
 
 impl Storage for ChunkStorage {
+    fn select_many_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn select_series_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn select_series_in_shards_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn compute_shard_window_digest_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn scan_shard_window_rows_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn scan_series_rows_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
     fn query_budget(&self) -> Option<QueryBudget> {
         Some(self.query_budget.clone())
     }
@@ -534,12 +644,21 @@ impl Storage for ChunkStorage {
         // row so row-at-a-time execution cannot bypass batch limits or double-reserve scratch.
         let transient_memory = match self.admit_write_rows_impl(rows) {
             Ok(transient_memory) => transient_memory,
-            Err(error)
-                if matches!(
-                    error,
-                    TsinkError::StorageClosed | TsinkError::StorageShuttingDown
-                ) =>
-            {
+            // Top-level shape limits intentionally remain outer errors: returning one outcome per
+            // row would let an oversized untrusted request force the allocation those limits are
+            // meant to prevent. Every other pre-commit admission failure is safe to report as a
+            // complete canonical result because no row has been mutated.
+            Err(
+                error @ (TsinkError::WriteBatchRowLimitExceeded { .. }
+                | TsinkError::WriteBatchInputLimitExceeded { .. }
+                | TsinkError::WriteBatchSizeOverflow),
+            ) => return Err(error),
+            Err(error) => {
+                // The full write lease was not installed. Admit the bounded canonical response
+                // separately so a memory rejection cannot allocate the exact outcome envelope
+                // that admission refused. If even the response does not fit, preserve the outer
+                // resource error rather than bypassing the configured memory budget.
+                let _result_memory = self.admit_write_rejection_result_impl(rows.len())?;
                 let outcomes = (0..rows.len())
                     .map(|index| {
                         let cause_index = match mode {
@@ -554,7 +673,6 @@ impl Storage for ChunkStorage {
                     .collect();
                 return Ok(BatchWriteResult::from_outcomes(None, outcomes));
             }
-            Err(error) => return Err(error),
         };
 
         match mode {
@@ -569,12 +687,16 @@ impl Storage for ChunkStorage {
                         // makes the outcome trustworthy for every row, but the causal index remains
                         // unknown until the ingest pipeline exposes it directly.
                         let rejection = WriteRejection::from_error(&error, None);
-                        Ok(BatchWriteResult::from_outcomes(
-                            None,
-                            (0..rows.len())
-                                .map(|index| RowWriteOutcome::rejected(index, rejection.clone()))
-                                .collect(),
-                        ))
+                        let last_index = rows.len() - 1;
+                        let mut outcomes = Vec::with_capacity(rows.len());
+                        // Keep at most `rows.len()` owned rejection messages alive: clone into the
+                        // first N-1 outcomes, then move the original into the final outcome. The
+                        // transient lease models exactly N outcome/message envelopes.
+                        for index in 0..last_index {
+                            outcomes.push(RowWriteOutcome::rejected(index, rejection.clone()));
+                        }
+                        outcomes.push(RowWriteOutcome::rejected(last_index, rejection));
+                        Ok(BatchWriteResult::from_outcomes(None, outcomes))
                     }
                 }
             }
@@ -681,9 +803,18 @@ impl Storage for ChunkStorage {
         end: i64,
         execution: &QueryExecution,
     ) -> Result<Vec<SeriesPoints>> {
+        self.select_many_with_execution_result(series, start, end, execution)
+            .map(SelectManyExecutionResult::into_series)
+    }
+
+    fn select_many_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> Result<SelectManyExecutionResult> {
         execution.checkpoint()?;
-        let matched = self.count_existing_series(series);
-        execution.charge_series_matched(matched)?;
         self.select_many_api(series, start, end, execution)
     }
 
@@ -772,8 +903,17 @@ impl Storage for ChunkStorage {
         selection: &SeriesSelection,
         execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
+        self.select_series_with_execution_result(selection, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
         execution.checkpoint()?;
-        self.select_series_api(selection, execution)
+        self.select_series_result_api(selection, execution)
     }
 
     #[cfg(test)]
@@ -798,8 +938,18 @@ impl Storage for ChunkStorage {
         scope: &crate::storage::MetadataShardScope,
         execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
+        self.select_series_in_shards_with_execution_result(selection, scope, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_in_shards_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        scope: &crate::storage::MetadataShardScope,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
         execution.checkpoint()?;
-        self.select_series_in_shards_api(selection, scope, execution)
+        self.select_series_in_shards_result_api(selection, scope, execution)
     }
 
     fn compute_shard_window_digest(
@@ -873,16 +1023,35 @@ impl Storage for ChunkStorage {
         options: crate::storage::ShardWindowScanOptions,
         execution: &QueryExecution,
     ) -> Result<crate::storage::ShardWindowRowsPage> {
-        execution.checkpoint()?;
-        let page = self.scan_shard_window_rows_api(
+        self.scan_shard_window_rows_with_execution_result(
             shard,
             shard_count,
             window_start,
             window_end,
             options,
             execution,
-        )?;
-        Ok(page)
+        )
+        .map(crate::storage::ShardWindowRowsExecutionResult::into_page)
+    }
+
+    fn scan_shard_window_rows_with_execution_result(
+        &self,
+        shard: u32,
+        shard_count: u32,
+        window_start: i64,
+        window_end: i64,
+        options: crate::storage::ShardWindowScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<crate::storage::ShardWindowRowsExecutionResult> {
+        execution.checkpoint()?;
+        self.scan_shard_window_rows_api(
+            shard,
+            shard_count,
+            window_start,
+            window_end,
+            options,
+            execution,
+        )
     }
 
     fn scan_series_rows(
@@ -906,10 +1075,22 @@ impl Storage for ChunkStorage {
         options: crate::storage::QueryRowsScanOptions,
         execution: &QueryExecution,
     ) -> Result<crate::storage::QueryRowsPage> {
+        self.scan_series_rows_with_execution_result(series, start, end, options, execution)
+            .map(QueryRowsExecutionResult::into_page)
+    }
+
+    fn scan_series_rows_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: crate::storage::QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
         execution.checkpoint()?;
         let matched = self.count_existing_series(series);
         execution.charge_series_matched(matched)?;
-        self.scan_series_rows_api(series, start, end, options, execution)
+        self.scan_series_rows_result_api(series, start, end, options, execution)
     }
 
     fn scan_metric_rows(
@@ -1096,8 +1277,7 @@ impl Storage for ChunkStorage {
     }
 
     fn trigger_rollup_run(&self) -> Result<crate::storage::RollupObservabilitySnapshot> {
-        let progress = self.run_rollup_pipeline_once()?;
-        Ok(self.rollup_observability_snapshot_with_progress(progress))
+        self.run_rollup_pipeline_once_with_snapshot()
     }
 
     fn snapshot(&self, destination: &Path) -> Result<()> {
@@ -1167,69 +1347,341 @@ impl Storage for ChunkStorage {
                 destination.display()
             )));
         };
-        std::fs::create_dir_all(destination_parent)?;
 
-        let staging = crate::engine::fs_utils::stage_dir_path(destination, "snapshot")?;
-        std::fs::create_dir_all(&staging)?;
+        let rollup_snapshot_path = self.rollups.runtime.dir_path();
+        let aggregate_namespace_path = self
+            .persisted
+            .series_index_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let candidates = [
+                    self.persisted.numeric_lane_path.as_deref(),
+                    self.persisted.blob_lane_path.as_deref(),
+                    wal_dir.as_deref(),
+                    rollup_snapshot_path,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                let first = *candidates.first()?;
+                first
+                    .ancestors()
+                    .skip(1)
+                    .find(|ancestor| {
+                        !ancestor.as_os_str().is_empty()
+                            && candidates
+                                .iter()
+                                .all(|candidate| candidate.starts_with(ancestor))
+                    })
+                    .map(Path::to_path_buf)
+            });
+        let aggregate_namespace_fence = aggregate_namespace_path
+            .as_deref()
+            .map(|path| {
+                crate::engine::fs_utils::SecureSnapshotNamespaceFence::open_with_operation_baseline(
+                    path, 0,
+                )
+            })
+            .transpose()?;
+        let mut source_retained_bytes = aggregate_namespace_fence
+            .as_ref()
+            .map_or(0, |fence| fence.retained_memory_bytes());
+        let mut open_optional_tree = |source: Option<&Path>| -> Result<
+            Option<crate::engine::fs_utils::SecureSnapshotSourceTree>,
+        > {
+            let Some(source) = source else {
+                return Ok(None);
+            };
+            if let Some(fence) = &aggregate_namespace_fence {
+                fence.attest()?;
+            }
+            let tree = crate::engine::fs_utils::SecureSnapshotSourceTree::
+                open_optional_and_measure_with_operation_baseline(
+                    source,
+                    source_retained_bytes,
+                )?;
+            if let Some(tree) = &tree {
+                source_retained_bytes =
+                    crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                        &[source_retained_bytes, tree.retained_memory_bytes()],
+                        "secure snapshot aggregate source sessions",
+                        source,
+                    )?;
+            }
+            if let Some(fence) = &aggregate_namespace_fence {
+                fence.attest()?;
+            }
+            Ok(tree)
+        };
+        let numeric_snapshot = open_optional_tree(self.persisted.numeric_lane_path.as_deref())?;
+        let blob_snapshot = open_optional_tree(self.persisted.blob_lane_path.as_deref())?;
+        let wal_snapshot = open_optional_tree(wal_dir.as_deref())?;
+        let rollup_snapshot = open_optional_tree(rollup_snapshot_path)?;
+
+        let manifest_snapshot =
+            if let Some(data_path) = self
+                .persisted
+                .series_index_path
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                let path =
+                    data_path.join(data_directory_manifest::DATA_DIRECTORY_MANIFEST_FILE_NAME);
+                if let Some(fence) = &aggregate_namespace_fence {
+                    fence.attest()?;
+                }
+                let file = crate::engine::fs_utils::SecureSnapshotSourceFile::
+                    open_with_operation_baseline(&path, source_retained_bytes)?;
+                source_retained_bytes =
+                    crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                        &[source_retained_bytes, file.retained_memory_bytes()],
+                        "secure snapshot aggregate source sessions",
+                        &path,
+                    )?;
+                if let Some(fence) = &aggregate_namespace_fence {
+                    fence.attest()?;
+                }
+                Some(file)
+            } else {
+                None
+            };
+        let snapshot_catalog_path = self
+            .persisted
+            .tiered_storage
+            .as_ref()
+            .and_then(|config| config.segment_catalog_path.as_deref());
+        let catalog_snapshot = match snapshot_catalog_path {
+            Some(path) => {
+                if let Some(fence) = &aggregate_namespace_fence {
+                    fence.attest()?;
+                }
+                let file = crate::engine::fs_utils::SecureSnapshotSourceFile::
+                    open_optional_with_operation_baseline(path, source_retained_bytes)?;
+                if let Some(file) = &file {
+                    source_retained_bytes =
+                        crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                            &[source_retained_bytes, file.retained_memory_bytes()],
+                            "secure snapshot aggregate source sessions",
+                            path,
+                        )?;
+                }
+                if let Some(fence) = &aggregate_namespace_fence {
+                    fence.attest()?;
+                }
+                file
+            }
+            None => None,
+        };
+
+        // Admit the combined published namespace and every simultaneously live closed-identity
+        // source session before destination ancestry is created.
+        let mut aggregate_snapshot_entries = 2u64; // snapshot root + generated registry
+        if manifest_snapshot.is_some() {
+            aggregate_snapshot_entries =
+                aggregate_snapshot_entries.checked_add(1).ok_or_else(|| {
+                    TsinkError::Other("snapshot aggregate entry count overflow".to_string())
+                })?;
+        }
+        if catalog_snapshot.is_some() {
+            aggregate_snapshot_entries =
+                aggregate_snapshot_entries.checked_add(1).ok_or_else(|| {
+                    TsinkError::Other("snapshot aggregate entry count overflow".to_string())
+                })?;
+        }
+        for tree in [
+            numeric_snapshot.as_ref(),
+            blob_snapshot.as_ref(),
+            wal_snapshot.as_ref(),
+            rollup_snapshot.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            aggregate_snapshot_entries = aggregate_snapshot_entries
+                .checked_add(tree.measurement().entry_count)
+                .ok_or_else(|| {
+                    TsinkError::Other("snapshot aggregate entry count overflow".to_string())
+                })?;
+        }
+        ensure_snapshot_aggregate_entry_limit(aggregate_snapshot_entries)?;
+        if let Some(fence) = &aggregate_namespace_fence {
+            fence.attest()?;
+        }
+
+        crate::engine::fs_utils::create_dir_all_and_sync_parents(destination_parent)?;
+        let mut staging = crate::engine::fs_utils::SecureSnapshotStagingDirectory::create_unique(
+            destination,
+            "snapshot",
+        )?;
+        let staging_path = staging.path().to_path_buf();
+        staging.set_operation_baseline_retained_bytes(
+            source_retained_bytes,
+            "secure snapshot aggregate operation state",
+        )?;
+
         let snapshot_result = (|| -> Result<()> {
-            if let Some(path) = &self.persisted.numeric_lane_path {
-                crate::engine::fs_utils::copy_dir_if_exists(
-                    path,
-                    &staging.join(NUMERIC_LANE_ROOT),
+            if let Some(manifest) = &manifest_snapshot {
+                crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                    &[
+                        source_retained_bytes,
+                        staging.retained_memory_bytes(),
+                        usize::try_from(manifest.len()).unwrap_or(usize::MAX),
+                    ],
+                    "secure snapshot manifest read buffer",
+                    manifest.path(),
+                )?;
+                let bytes =
+                    manifest.read_all_bounded(data_directory_manifest::MAX_MANIFEST_FILE_BYTES)?;
+                let buffer_baseline =
+                    crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                        &[source_retained_bytes, bytes.capacity()],
+                        "secure snapshot manifest buffer",
+                        manifest.path(),
+                    )?;
+                staging.set_operation_baseline_retained_bytes(
+                    buffer_baseline,
+                    "secure snapshot manifest write",
+                )?;
+                data_directory_manifest::validate_snapshot_manifest_bytes(&bytes, manifest.path())?;
+                staging.write_file(
+                    Path::new(data_directory_manifest::DATA_DIRECTORY_MANIFEST_FILE_NAME),
+                    &bytes,
+                    None,
+                )?;
+                drop(bytes);
+                staging.set_operation_baseline_retained_bytes(
+                    source_retained_bytes,
+                    "secure snapshot aggregate operation state",
                 )?;
             }
-            if let Some(path) = &self.persisted.blob_lane_path {
-                crate::engine::fs_utils::copy_dir_if_exists(path, &staging.join(BLOB_LANE_ROOT))?;
+            if let Some(tree) = &numeric_snapshot {
+                tree.copy_to(&mut staging, Path::new(NUMERIC_LANE_ROOT))?;
             }
-            if let Some(config) = &self.persisted.tiered_storage {
-                if let Some(catalog_path) = config.segment_catalog_path.as_ref() {
-                    if catalog_path.exists() {
-                        std::fs::copy(
-                            catalog_path,
-                            staging.join(tiering::SEGMENT_CATALOG_FILE_NAME),
-                        )?;
-                    }
-                }
+            if let Some(tree) = &blob_snapshot {
+                tree.copy_to(&mut staging, Path::new(BLOB_LANE_ROOT))?;
+            }
+            if let Some(catalog) = &catalog_snapshot {
+                catalog.copy_to(&mut staging, Path::new(tiering::SEGMENT_CATALOG_FILE_NAME))?;
             }
             #[cfg(test)]
             self.invoke_snapshot_pre_wal_copy_hook();
-            if let Some(path) = wal_dir.as_deref() {
-                crate::engine::fs_utils::copy_dir_if_exists(path, &staging.join(WAL_DIR_NAME))?;
+            if let Some(tree) = &wal_snapshot {
+                tree.copy_to(&mut staging, Path::new(WAL_DIR_NAME))?;
             }
-            if let Some(path) = self.rollups.runtime.dir_path() {
-                crate::engine::fs_utils::copy_dir_if_exists(
-                    path,
-                    &staging.join(rollups::ROLLUP_DIR_NAME),
-                )?;
+            if let Some(tree) = &rollup_snapshot {
+                tree.copy_to(&mut staging, Path::new(rollups::ROLLUP_DIR_NAME))?;
             }
-            // Persist the current in-memory registry into the snapshot staging directory.
-            // Copying the on-disk index can race with background refresh and capture a stale
-            // mapping that omits series already present in WAL/segments.
-            self.catalog
+
+            // The in-memory registry is authoritative; copying the persisted file could race with
+            // refresh and omit series already represented by WAL/segments.
+            let staging_retained_before_registry = staging.retained_memory_bytes();
+            let registry_bytes = self
+                .catalog
                 .registry
                 .read()
-                .persist_to_path(&staging.join(SERIES_INDEX_FILE_NAME))?;
+                .encoded_registry_bytes_for_snapshot_with_admission(|transient_bytes| {
+                    crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                        &[
+                            source_retained_bytes,
+                            staging_retained_before_registry,
+                            transient_bytes,
+                        ],
+                        "secure snapshot registry encoding transient",
+                        destination,
+                    )
+                    .map(|_| ())
+                })?;
+            let registry_baseline =
+                crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                    &[source_retained_bytes, registry_bytes.capacity()],
+                    "secure snapshot generated registry buffer",
+                    destination,
+                )?;
+            staging.set_operation_baseline_retained_bytes(
+                registry_baseline,
+                "secure snapshot registry write",
+            )?;
+            staging.write_file(Path::new(SERIES_INDEX_FILE_NAME), &registry_bytes, None)?;
+            drop(registry_bytes);
+            staging.set_operation_baseline_retained_bytes(
+                source_retained_bytes,
+                "secure snapshot aggregate operation state",
+            )?;
+            staging.sync_root()
+        })();
+        if let Err(err) = snapshot_result {
+            return Err(TsinkError::Other(format!(
+                "secure snapshot staging failed: {err}; retaining handle-attested staging tree at {}",
+                staging_path.display()
+            )));
+        }
+        #[cfg(test)]
+        if let Err(publication_err) = self.invoke_snapshot_pre_publication_hook() {
+            return Err(TsinkError::Other(format!(
+                "snapshot pre-publication hook failed: {publication_err}; retaining handle-attested staging tree at {}",
+                staging_path.display()
+            )));
+        }
+
+        let final_source_verification = (|| -> Result<()> {
+            let verification_baseline =
+                crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                    &[source_retained_bytes, staging.retained_memory_bytes()],
+                    "secure snapshot final source verification",
+                    destination,
+                )?;
+            if let Some(fence) = &aggregate_namespace_fence {
+                fence.attest()?;
+            }
+            for tree in [
+                numeric_snapshot.as_ref(),
+                blob_snapshot.as_ref(),
+                wal_snapshot.as_ref(),
+                rollup_snapshot.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                tree.verify_unchanged(verification_baseline)?;
+                tree.verify_requested_namespace_unchanged()?;
+            }
+            if let Some(manifest) = &manifest_snapshot {
+                manifest.verify_unchanged()?;
+            }
+            if let Some(catalog) = &catalog_snapshot {
+                catalog.verify_unchanged()?;
+            }
+            if let Some(fence) = &aggregate_namespace_fence {
+                fence.attest()?;
+            }
             Ok(())
         })();
-
-        if let Err(err) = snapshot_result {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
-            drop(write_permits);
-            return Err(err);
+        if let Err(err) = final_source_verification {
+            return Err(TsinkError::Other(format!(
+                "snapshot source changed before publication: {err}; retaining handle-attested staging tree at {}",
+                staging_path.display()
+            )));
         }
 
-        if let Err(err) = crate::engine::fs_utils::sync_dir(&staging) {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
-            drop(write_permits);
-            return Err(err);
-        }
-
-        if let Err(err) = crate::engine::fs_utils::rename_and_sync_parents(&staging, destination) {
-            let _ = crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&staging);
-            drop(write_permits);
-            return Err(err);
-        }
-
+        staging
+            .publish_noreplace(destination)
+            .map_err(|publication| {
+                if publication.published {
+                    TsinkError::Other(format!(
+                        "snapshot reached visible destination {} but post-publication attestation or parent synchronization failed: {}; the visible destination is retained",
+                        destination.display(),
+                        publication.error
+                    ))
+                } else {
+                    TsinkError::Other(format!(
+                        "snapshot publication failed before rename: {}; retaining handle-attested staging tree at {}",
+                        publication.error,
+                        staging_path.display()
+                    ))
+                }
+            })?;
         drop(write_permits);
         Ok(())
     }
@@ -1271,6 +1723,12 @@ pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     bootstrap::build_storage(builder)
 }
 
+pub(crate) fn build_storage_for_snapshot_validation(
+    builder: StorageBuilder,
+) -> Result<SnapshotValidationStorage> {
+    bootstrap::build_storage_for_snapshot_validation(builder)
+}
+
 pub fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Path) -> Result<()> {
     bootstrap::restore_storage_from_snapshot(snapshot_path, data_path)
 }
@@ -1281,6 +1739,16 @@ pub fn restore_storage_from_snapshot_with_disk_budget(
     disk_budget: Arc<crate::LocalDiskBudget>,
 ) -> Result<()> {
     bootstrap::restore_storage_from_snapshot_with_disk_budget(snapshot_path, data_path, disk_budget)
+}
+
+fn ensure_snapshot_aggregate_entry_limit(entries: u64) -> Result<()> {
+    if entries > crate::MAX_SNAPSHOT_RESTORE_ENTRIES {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot aggregate entry count {entries} exceeds restore limit {}",
+            crate::MAX_SNAPSHOT_RESTORE_ENTRIES
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

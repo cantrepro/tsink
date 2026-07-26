@@ -4,6 +4,7 @@ use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use super::bounded_remote::BoundedRemoteCatalogRefreshCycle;
 use super::*;
 use crate::engine::segment::{
     is_not_found_error, read_segment_manifest, read_segment_manifest_fingerprint,
@@ -16,8 +17,9 @@ const CATALOG_SCAN_DIRECTORY_OPEN_BYTES: u64 = 4 * 1024;
 // path-component allowance before the entry is classified. A larger path is rejected explicitly.
 const CATALOG_SCAN_DIRECTORY_ENTRY_BYTES: u64 = 256 * 1024;
 const CATALOG_SCAN_MAX_PATH_BYTES: usize = 256 * 1024;
-const CATALOG_SCAN_MANIFEST_INSPECTION_BYTES: u64 = MAX_SEGMENT_MANIFEST_FILE_BYTES as u64;
-const CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD: u64 = 512;
+pub(super) const CATALOG_SCAN_MANIFEST_INSPECTION_BYTES: u64 =
+    MAX_SEGMENT_MANIFEST_FILE_BYTES as u64;
+pub(super) const CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD: u64 = 512;
 const CATALOG_TOMBSTONE_REFRESH_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 const CATALOG_SCAN_OPERATION: &str = "unknown-dirty persisted catalog scan";
 const CATALOG_APPLY_OPERATION: &str = "unknown-dirty persisted catalog apply";
@@ -59,6 +61,7 @@ enum CatalogRefreshPhase {
     },
 }
 
+#[derive(Clone)]
 enum PendingCatalogRefreshPage {
     Add {
         key: CatalogScanKey,
@@ -77,6 +80,7 @@ struct BackgroundCatalogRefreshCycle {
     entries: BTreeMap<CatalogScanKey, SegmentInventoryEntry>,
     final_roots: BTreeSet<PathBuf>,
     retained_bytes: u64,
+    memory_reservation: RemoteCatalogMemoryReservation,
     observed_namespace_entries: usize,
     phase: CatalogRefreshPhase,
     pending_page: Option<PendingCatalogRefreshPage>,
@@ -91,6 +95,10 @@ struct BackgroundCatalogRefreshCycle {
 #[derive(Default)]
 pub(in crate::engine::storage_engine) struct BackgroundCatalogRefreshCursor {
     cycle: Option<BackgroundCatalogRefreshCycle>,
+    pub(super) remote_cycle: Option<BoundedRemoteCatalogRefreshCycle>,
+    pub(super) writer_publication_cycle:
+        Option<super::publication::BoundedTieredCatalogPublicationCycle>,
+    pub(super) writer_publication_completed_visibility_generation: Option<u64>,
 }
 
 struct CatalogRefreshPassBudget {
@@ -138,10 +146,52 @@ impl CatalogRefreshPassBudget {
     fn exhausted(&self) -> bool {
         self.remaining_items == 0 || self.remaining_bytes == 0
     }
+
+    fn remaining_items(&self) -> usize {
+        self.remaining_items
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.remaining_bytes
+    }
+
+    fn exhaust(&mut self) {
+        self.remaining_items = 0;
+        self.remaining_bytes = 0;
+    }
 }
 
 impl BackgroundCatalogRefreshCycle {
     fn new(storage: &ChunkStorage, visibility_generation: u64) -> Result<Self> {
+        let target_construction_bytes = [
+            storage.persisted.numeric_lane_path.as_ref(),
+            storage.persisted.blob_lane_path.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(
+            std::mem::size_of::<Self>().saturating_add(4096),
+            |total, path| {
+                total.saturating_add(
+                    path.as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD as usize),
+                )
+            },
+        );
+        let target_construction_work = u64::try_from(target_construction_bytes).unwrap_or(u64::MAX);
+        let byte_limit = storage.runtime.maintenance_max_bytes_per_pass;
+        if target_construction_work > byte_limit {
+            return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                operation: CATALOG_SCAN_OPERATION,
+                limit: byte_limit,
+                required: target_construction_work,
+            });
+        }
+        let memory_reservation =
+            storage.remote_catalog_memory_reservation(target_construction_bytes)?;
         let mut targets = Vec::new();
         if let Some(path) = storage.persisted.numeric_lane_path.as_ref() {
             targets.push(CatalogScanTarget {
@@ -169,7 +219,6 @@ impl BackgroundCatalogRefreshCycle {
                 ),
             )
         });
-        let byte_limit = storage.runtime.maintenance_max_bytes_per_pass;
         if retained_bytes > byte_limit {
             return Err(TsinkError::MaintenanceWorkItemTooLarge {
                 operation: CATALOG_SCAN_OPERATION,
@@ -178,12 +227,13 @@ impl BackgroundCatalogRefreshCycle {
             });
         }
 
-        Ok(Self {
+        let mut cycle = Self {
             expected_visibility_generation: visibility_generation,
             targets,
             entries: BTreeMap::new(),
             final_roots: BTreeSet::new(),
             retained_bytes,
+            memory_reservation,
             observed_namespace_entries: 0,
             phase: CatalogRefreshPhase::Scanning {
                 target_index: 0,
@@ -193,7 +243,31 @@ impl BackgroundCatalogRefreshCycle {
             },
             pending_page: None,
             invalidated: false,
-        })
+        };
+        cycle.restore_retained_memory_reservation(storage);
+        Ok(cycle)
+    }
+
+    fn modeled_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.retained_bytes.min(usize::MAX as u64) as usize)
+            .saturating_add(4096)
+    }
+
+    fn resize_memory_reservation(
+        &mut self,
+        storage: &ChunkStorage,
+        requested_bytes: usize,
+    ) -> Result<()> {
+        storage
+            .resize_remote_catalog_memory_reservation(&mut self.memory_reservation, requested_bytes)
+    }
+
+    fn restore_retained_memory_reservation(&mut self, storage: &ChunkStorage) {
+        let retained = self.modeled_retained_bytes();
+        storage
+            .resize_remote_catalog_memory_reservation(&mut self.memory_reservation, retained)
+            .expect("shrinking an admitted bounded catalog reservation cannot fail");
     }
 
     fn modeled_retained_entry_bytes(entry: &SegmentInventoryEntry) -> u64 {
@@ -204,7 +278,12 @@ impl BackgroundCatalogRefreshCycle {
         )
     }
 
-    fn insert_preferred(&mut self, entry: SegmentInventoryEntry, byte_limit: u64) -> Result<()> {
+    fn insert_preferred(
+        &mut self,
+        storage: &ChunkStorage,
+        entry: SegmentInventoryEntry,
+        byte_limit: u64,
+    ) -> Result<()> {
         let path_bytes = entry.root.as_os_str().as_encoded_bytes().len();
         if path_bytes > CATALOG_SCAN_MAX_PATH_BYTES {
             return Err(TsinkError::MaintenanceWorkItemTooLarge {
@@ -244,11 +323,17 @@ impl BackgroundCatalogRefreshCycle {
             });
         }
 
+        let reservation_required = self
+            .modeled_retained_bytes()
+            .saturating_sub(old_bytes.min(usize::MAX as u64) as usize)
+            .saturating_add(new_bytes.min(usize::MAX as u64) as usize);
+        self.resize_memory_reservation(storage, reservation_required)?;
         if let Some(old) = self.entries.insert(key, entry.clone()) {
             self.final_roots.remove(&old.root);
         }
         self.final_roots.insert(entry.root);
         self.retained_bytes = required;
+        self.restore_retained_memory_reservation(storage);
         Ok(())
     }
 }
@@ -295,14 +380,18 @@ fn open_segment_level(target: &CatalogScanTarget, level: u8) -> Result<Option<Re
         })
 }
 
-fn modeled_segment_source_bytes(entry: &SegmentInventoryEntry) -> Result<u64> {
-    let fingerprint = read_segment_manifest_fingerprint(&entry.root).map_err(|err| {
-        segment_validation_error(
-            &entry.root,
-            SegmentValidationContext::RuntimeRefresh,
-            &err.to_string(),
-        )
-    })?;
+pub(super) fn modeled_segment_source_bytes(entry: &SegmentInventoryEntry) -> Result<u64> {
+    let fingerprint = match read_segment_manifest_fingerprint(&entry.root) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) if is_not_found_error(&err) => return Err(err),
+        Err(err) => {
+            return Err(segment_validation_error(
+                &entry.root,
+                SegmentValidationContext::RuntimeRefresh,
+                &err.to_string(),
+            ));
+        }
+    };
     if fingerprint.manifest != entry.manifest {
         return Err(segment_validation_error(
             &entry.root,
@@ -330,12 +419,32 @@ fn modeled_segment_source_bytes(entry: &SegmentInventoryEntry) -> Result<u64> {
         })
 }
 
+pub(super) fn segment_root_is_missing(root: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(root),
+        Err(err) if err.kind() == io::ErrorKind::NotFound
+    )
+}
+
 impl ChunkStorage {
     pub(super) fn reset_bounded_unknown_dirty_catalog_refresh(&self) {
         self.coordination
             .background_catalog_refresh_cursor
             .lock()
             .cycle = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn bounded_unknown_dirty_catalog_retains_root_for_test(
+        &self,
+        root: &Path,
+    ) -> bool {
+        self.coordination
+            .background_catalog_refresh_cursor
+            .lock()
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.entries.values().any(|entry| entry.root == root))
     }
 
     fn scan_unknown_dirty_catalog_page(
@@ -385,7 +494,7 @@ impl ChunkStorage {
                     root: pending.root,
                     manifest,
                 };
-                cycle.insert_preferred(entry, budget.byte_limit)?;
+                cycle.insert_preferred(self, entry, budget.byte_limit)?;
                 let CatalogRefreshPhase::Scanning {
                     pending_manifest, ..
                 } = &mut cycle.phase
@@ -533,10 +642,12 @@ impl ChunkStorage {
         cycle: &mut BackgroundCatalogRefreshCycle,
         budget: &mut CatalogRefreshPassBudget,
     ) -> Result<bool> {
-        let Some(pending) = cycle.pending_page.as_ref() else {
+        let Some(pending) = cycle.pending_page.clone() else {
             return Ok(true);
         };
-        let transition = match pending {
+        let selected_bytes_at_entry = budget.byte_limit.saturating_sub(budget.remaining_bytes);
+        let retained_before_apply = cycle.modeled_retained_bytes();
+        let transition = match &pending {
             PendingCatalogRefreshPage::Add {
                 key,
                 root,
@@ -565,7 +676,14 @@ impl ChunkStorage {
                 )? {
                     return Ok(false);
                 }
-                let source_bytes = modeled_segment_source_bytes(&entry)?;
+                let source_bytes = match modeled_segment_source_bytes(&entry) {
+                    Ok(source_bytes) => source_bytes,
+                    Err(_) if segment_root_is_missing(root) => {
+                        cycle.invalidated = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let required = descriptor_bytes
                     .saturating_add(CATALOG_SCAN_MANIFEST_INSPECTION_BYTES)
                     .saturating_add(source_bytes);
@@ -579,6 +697,27 @@ impl ChunkStorage {
                 if !budget.charge(CATALOG_APPLY_OPERATION, 0, source_bytes)? {
                     return Ok(false);
                 }
+                let runtime_preflight = tiering::preflight_segment_runtime_refresh_memory(root)?;
+                if runtime_preflight.source_bytes != source_bytes {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "bounded catalog segment source changed during admission: {}",
+                        root.display()
+                    )));
+                }
+                let mutation_bytes =
+                    modeled_removal_bytes(root, &entry.manifest).min(usize::MAX as u64) as usize;
+                let preallocation_bytes =
+                    super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(root)
+                        .saturating_add(
+                            super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_transition_descriptor_bytes(root),
+                        )
+                        .saturating_add(descriptor_bytes.min(usize::MAX as u64) as usize)
+                        .saturating_add(runtime_preflight.reservation_bytes)
+                        .saturating_add(mutation_bytes);
+                cycle.resize_memory_reservation(
+                    self,
+                    retained_before_apply.saturating_add(preallocation_bytes),
+                )?;
 
                 let already_visible = self
                     .persisted
@@ -589,7 +728,14 @@ impl ChunkStorage {
                 let loaded_segments = if already_visible {
                     Vec::new()
                 } else {
-                    vec![Self::load_segment_index_for_runtime_refresh(root)?]
+                    match Self::load_segment_index_for_runtime_refresh(root) {
+                        Ok(segment) => vec![segment],
+                        Err(_) if segment_root_is_missing(root) => {
+                            cycle.invalidated = true;
+                            return Ok(false);
+                        }
+                        Err(err) => return Err(err),
+                    }
                 };
                 let added_roots = vec![root.clone()];
                 let registry_catalog_delta =
@@ -619,6 +765,15 @@ impl ChunkStorage {
                 )? {
                     return Ok(false);
                 }
+                cycle.resize_memory_reservation(
+                    self,
+                    retained_before_apply
+                        .saturating_add(
+                            CATALOG_TOMBSTONE_REFRESH_DESCRIPTOR_BYTES.min(usize::MAX as u64)
+                                as usize,
+                        )
+                        .saturating_add(16 * 1024),
+                )?;
                 PersistedCatalogTransition {
                     visibility_fence: Some(PersistedCatalogVisibilityFence {
                         visibility_generation: cycle.expected_visibility_generation,
@@ -648,6 +803,17 @@ impl ChunkStorage {
                 if !budget.charge(CATALOG_APPLY_OPERATION, 1, modeled_bytes)? {
                     return Ok(false);
                 }
+                cycle.resize_memory_reservation(
+                    self,
+                    retained_before_apply
+                        .saturating_add(
+                            super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(root),
+                        )
+                        .saturating_add(
+                            super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_transition_descriptor_bytes(root),
+                        )
+                        .saturating_add(modeled_bytes.min(usize::MAX as u64) as usize),
+                )?;
                 let removed_roots = vec![root.clone()];
                 let registry_catalog_delta =
                     self.persisted_registry_catalog_delta_for_root_changes(&[], &removed_roots)?;
@@ -670,9 +836,60 @@ impl ChunkStorage {
             }
         };
 
+        let transition_root = match &pending {
+            PendingCatalogRefreshPage::Add { root, .. }
+            | PendingCatalogRefreshPage::Remove { root } => root.as_path(),
+            PendingCatalogRefreshPage::RefreshTombstonesOnly => std::path::Path::new(""),
+        };
+        let transition_manifest = match &pending {
+            PendingCatalogRefreshPage::Remove { root } => self
+                .persisted
+                .persisted_index
+                .read()
+                .segments_by_root
+                .get(root)
+                .map(|state| state.manifest.clone()),
+            _ => None,
+        };
+        let publication_staging =
+            super::bounded_remote::modeled_transition_publication_capacity_bytes(
+                &transition,
+                transition_root,
+                transition_manifest.as_ref(),
+            );
+        let already_selected_bytes = budget
+            .byte_limit
+            .saturating_sub(budget.remaining_bytes)
+            .saturating_sub(selected_bytes_at_entry);
+        let publication_work = u64::try_from(publication_staging).unwrap_or(u64::MAX);
+        if publication_work > already_selected_bytes
+            && !budget.charge(
+                CATALOG_APPLY_OPERATION,
+                0,
+                publication_work.saturating_sub(already_selected_bytes),
+            )?
+        {
+            drop(transition);
+            cycle.restore_retained_memory_reservation(self);
+            return Ok(false);
+        }
+        cycle.resize_memory_reservation(
+            self,
+            retained_before_apply.saturating_add(publication_staging),
+        )?;
         let publication = self.begin_persisted_catalog_publication();
-        let result = publication.publish_transition(transition);
+        let result = publication.publish_transition_with_finite_recovery_budget(
+            transition,
+            budget.remaining_items(),
+            budget.remaining_bytes(),
+            true,
+        );
         drop(publication);
+        // A committed-recovery probe may consume any portion of the supplied remainder. End this
+        // wake after the one atomic visibility transition so subsequent work cannot double-spend
+        // the same finite-pass allowance.
+        budget.exhaust();
+        cycle.restore_retained_memory_reservation(self);
         let current_generation = self.visibility_state_generation();
         match result {
             Ok(PersistedCatalogRefreshApply::Applied) => {
@@ -715,6 +932,9 @@ impl ChunkStorage {
                 }
                 cycle.expected_visibility_generation = current_generation;
                 Ok(true)
+            }
+            Ok(PersistedCatalogRefreshApply::Deferred) => {
+                unreachable!("non-tiered bounded catalog deltas do not stage writer catalogs")
             }
             Ok(PersistedCatalogRefreshApply::SkippedStaleVisibleState) => {
                 cycle.expected_visibility_generation = current_generation;
@@ -882,7 +1102,7 @@ impl ChunkStorage {
     }
 }
 
-fn modeled_removal_bytes(root: &Path, manifest: &SegmentManifest) -> u64 {
+pub(super) fn modeled_removal_bytes(root: &Path, manifest: &SegmentManifest) -> u64 {
     let root_bytes = u64::try_from(root.as_os_str().as_encoded_bytes().len()).unwrap_or(u64::MAX);
     let chunk_bytes = u64::try_from(manifest.chunk_count)
         .unwrap_or(u64::MAX)

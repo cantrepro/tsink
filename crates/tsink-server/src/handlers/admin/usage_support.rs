@@ -3,6 +3,7 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_admin_support_bundle(
     storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     rules_runtime: Option<&RulesRuntime>,
     request: &HttpRequest,
@@ -42,6 +43,7 @@ pub(crate) async fn handle_admin_support_bundle(
             "statusTsdb": support_bundle_section_from_response(
                 handle_tsdb_status(
                     storage,
+                    metadata_store,
                     exemplar_store,
                     &status_request,
                     cluster_context,

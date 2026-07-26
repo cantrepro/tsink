@@ -1,6 +1,7 @@
 # PromQL reference
 
-This page is a complete reference for the PromQL dialect supported by tsink.
+This page documents the currently supported tsink PromQL dialect. It is a compatibility reference
+for the features listed here, not a claim of complete upstream Prometheus parity.
 For architecture and implementation details see [docs/promql.md](promql.md).
 
 ---
@@ -430,6 +431,25 @@ These identifiers are recognised by the lexer as numeric literals, not function 
 ## Stale NaN markers
 
 tsink recognises the Prometheus stale NaN bit pattern (`0x7ff0000000000002`) and silently drops such samples from vector selectors, matching Prometheus staleness semantics.
+
+---
+
+## Parser safety limits
+
+The embedded lexer/parser accepts at most 64 KiB of UTF-8 query text, 16,384 non-EOF tokens, and
+64 nested expression levels. These are hard parser safety ceilings and remain in effect for
+`ExpertUnlimited`; server tenant policy may impose a smaller query-length limit. An over-limit
+query fails explicitly with a PromQL parse error before evaluation.
+Execution-aware entrypoints reserve a conservative parser/AST envelope before tokenization and
+retain the parsed tree's charge through evaluation.
+
+PromQL label matchers reuse the core structured-selection ceilings: at most 128 matchers per
+selector, 256 bytes per matcher name, 16 KiB per matcher value or regex, and 64 KiB of cumulative
+matcher text. Query-controlled regexes use the same 256 KiB compiled-program, 64 KiB lazy-DFA
+cache, and 64-level regex nesting limits as direct `SeriesSelection`. Regex errors do not echo the
+submitted pattern. Selector regexes compile once per selector evaluation. `label_replace` also
+pre-admits capture workspace and a conservative output-growth bound before replacement, while
+`label_join` pre-admits its joined strings and label-vector growth.
 
 ---
 

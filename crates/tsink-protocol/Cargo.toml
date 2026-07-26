@@ -1,0 +1,21 @@
+[package]
+name = "tsink-protocol"
+version = "0.10.2"
+edition = "2021"
+rust-version = "1.89"
+authors = ["cantrepro"]
+description = "Reusable Prometheus and OTLP protobuf models for tsink adapters and test fixtures"
+repository = "https://github.com/cantrepro/tsink"
+homepage = "https://github.com/cantrepro/tsink"
+documentation = "https://docs.rs/tsink-protocol"
+license = "MIT"
+readme = "README.md"
+keywords = ["prometheus", "opentelemetry", "protobuf", "metrics"]
+categories = ["encoding", "network-programming"]
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3.2.0"

@@ -1251,6 +1251,15 @@ fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
     let metric = "flush_visibility_publication_fault";
     let now = 100i64;
 
+    let manifest_seed = builder_at_time(now)
+        .with_data_path(&data_path)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .with_background_threads_enabled_for_tests(false)
+        .build()
+        .unwrap();
+    manifest_seed.close().unwrap();
+
     let wal =
         FramedWal::open(&wal_path, WalSyncMode::Periodic(Duration::from_secs(3_600))).unwrap();
     let mut options = base_storage_test_options(TimestampPrecision::Seconds, Some(now));

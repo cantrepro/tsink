@@ -24,8 +24,11 @@ limits, not capacity promises or measured maximum throughput claims:
 
 The complete values, including identity, batch, query-work, async queue, disk-reserve, cadence, and
 maintenance-pass limits, are returned by `ResourceProfile::finite_limits()` and validated before
-storage opens. Profile disk limits are dormant for in-memory storage; an explicit disk override
-without a persistent read-write data path remains an error.
+storage opens. A custom value that does not fit the target platform's `usize`, or that would become
+the engine's `usize::MAX` unlimited sentinel, is rejected with an actionable build error;
+unbounded migration behavior requires `ExpertUnlimited`. Profile disk limits are dormant for
+in-memory storage; an explicit disk override without a persistent read-write data path remains an
+error.
 
 After build, the canonical inspection API is `Storage::effective_storage_limits()`. The same value
 is included at `Storage::observability_snapshot().limits`, is available directly from
@@ -80,7 +83,7 @@ values remain inspectable.
 
 | Effective field | Builder control | Legacy default | Current enforcement scope |
 |---|---|---|---|
-| `accounted_memory_bytes` | `with_memory_limit(bytes)` | `None` | Modeled bytes for active and sealed chunks, the series registry, metadata caches, persisted indexes, full persisted mapping lengths, tombstones, foreground write preparation/WAL encoding, streamed startup WAL replay, and conservative pre-live registry/inventory/index hydration. Writes apply backpressure and eventually return `MemoryBudgetExceeded`. This is not a process-RSS cap. |
+| `accounted_memory_bytes` | `with_memory_limit(bytes)` | `None` | Modeled bytes for active and sealed chunks, the series registry, metadata caches, persisted indexes, full persisted mapping lengths, tombstones, finite catalog reader/publication staging, foreground write preparation/WAL encoding, streamed startup WAL replay, and conservative pre-live registry/inventory/index hydration. Writes apply backpressure and eventually return `MemoryBudgetExceeded`. This is not a process-RSS cap. |
 | `cardinality` | `with_cardinality_limit(series)` | `None` | Total registered metric-and-label identities. A write that must create too many series returns `CardinalityLimitExceeded`. |
 | `max_labels_per_series` | `with_max_labels_per_series(labels)` | 128 | Maximum labels in every submitted series identity. The storage format has a separate hard maximum of 65,535. Violations are rejected as `InvalidLabel` before registry allocation. |
 | `max_series_identity_bytes` | `with_max_series_identity_bytes(bytes)` | 64 KiB | Maximum cumulative UTF-8 bytes across the metric name and every label name and value. Violations are rejected as `InvalidLabel` before registry allocation. |
@@ -89,7 +92,7 @@ values remain inspectable.
 | `max_write_batch_rows` | `with_write_batch_limits(...)` | `None` | Maximum rows in one top-level write. The check runs before tsink clones row identities or values and also bounds the indexed outcome allocation for `BestEffort`; row-wise execution cannot bypass it. Replay applies the same bound to one committed sample frame. |
 | `max_write_batch_input_bytes` | `with_write_batch_limits(...)` | `None` | Maximum checked logical input model: `Row` and `Label` storage, metric/label UTF-8, bytes/string payloads, and native-histogram structures and vectors. `modeled_write_batch_input_bytes` exposes the exact calculation. Violations return `WriteBatchInputLimitExceeded` before a transient lease or clone. |
 | `wal_bytes` | `with_wal_size_limit(bytes)` | `None` | Recognized WAL segment bytes when a local WAL is active. The definitive quota check is serialized with the WAL writer, so concurrent logical writes cannot collectively pass a stale check. This is a WAL sublimit, not a data-directory quota. |
-| `wal_write_buffer_bytes` | `with_wal_buffer_size(bytes)` | 4 KiB when WAL is active | Inspected finite capacity of the WAL `BufWriter`. It is reported but deliberately not charged to `accounted_memory_bytes`. |
+| `wal_write_buffer_bytes` | `with_wal_buffer_size(bytes)` | 4 KiB when WAL is active | Actual retained capacity of the live WAL `BufWriter`. It is reported and charged to `accounted_memory_bytes`; no live WAL contributes zero. |
 | `local_disk_bytes` | `with_local_disk_limit(bytes)` | `None` | Persistent core data-directory bytes admitted through the shared coordinator. Normal growth returns `DiskQuotaExceeded` at the boundary; reopening existing over-limit data remains possible. |
 | `filesystem_free_headroom_bytes` | `with_filesystem_free_headroom(bytes)` | 0 for persistent storage | Physical free space that both normal and recovery work must leave available. A failed reservation returns `InsufficientDiskSpace`. |
 | `maintenance_temp_reserve_bytes` | `with_maintenance_temp_reserve(bytes)` | 0 for persistent storage | Logical capacity withheld from normal growth but available to bounded maintenance output. Exhaustion returns `InsufficientCompactionHeadroom`. |
@@ -159,13 +162,48 @@ replacing files after admission.
 `write_transient_bytes` is included in both `accounted_bytes` and
 `estimated_accounted_bytes`; `peak_write_transient_bytes`, admitted-reservation and budget-rejection
 counters, and `write_transient_bytes_estimated = true` disclose the model. The retained WAL
+writer buffer is charged at its live retained capacity as `wal_writer_buffer_bytes`, and the
 series-definition cache is charged separately as `wal_series_definition_cache_bytes`; foreground
 publication and one-frame-at-a-time startup replay transfer that modeled retained growth into the
 shared budget before releasing the transient lease. Every built `ChunkStorage` eagerly initializes
 the cache, so its metadata path does not trigger the standalone WAL helper's lazy rebuild. A
-standalone `FramedWal` has no storage-memory budget of its own. The fixed WAL writer buffer,
-caller-owned inputs, and collections returned by public WAL inspection helpers remain named
-exclusions.
+standalone `FramedWal` has no storage-memory budget of its own. Caller-owned inputs and collections
+returned by public WAL inspection helpers remain named exclusions.
+
+Atomic write application also grows the same transient lease before cloning any affected active
+series. Its conservative staging peak includes six additional modeled copies of every pre-existing
+active state plus six copies of the already-admitted retained-growth allowance, with a fixed staged
+map-entry allowance per series. This covers simultaneous staged builders, rotated-head
+finalization, timestamp/value codec candidates, and the final encoded payload. The full reservation
+must coexist with retained storage under the global admission lock; an exact budget admits it and
+one byte less rejects before publication. Startup WAL replay applies the same model to its
+one-frame-at-a-time lease and returns to the frame baseline after each successful frame. This is an
+estimated Rust-owned allocation envelope, not an RSS measurement.
+
+Finite catalog work has a separate `remote_catalog_staging_bytes` component. Compute-only v3
+validation admits the generation path and cursor before construction, preflights each one-frame
+page and decoded path before allocation, and transfers the temporary page charge into the retained
+root map without a gap or double charge. The reservation survives bounded wakes and is replaced or
+released on pointer churn, validation/publication error, visibility invalidation, terminal
+completion, reset, and close. Finite read-write publication uses the same counter for its complete
+v3/v2/pointer staging envelope. Each finite compute-only add/remove page also admits a conservative
+one-root apply peak before source validation, runtime-index loading, or visibility publication. The
+peak includes loaded segment/mapping structures, every root-bearing transition vector and clone,
+the registry-catalog delta, inventory before/after images, scoped visibility/accounting scratch,
+and eventual persisted-index/registry/postings growth. A fixed-file/header pass computes the load
+upper bound without decoding heap-backed metadata; actual `Vec`, `String`, chunk-index, and postings
+capacities are reconciled before the visibility fence. The same peak must fit
+`maintenance_max_bytes_per_pass`. Apply-only growth is returned to the retained cursor level on
+success, deferral, stale visibility, and error, while an outer failed/replaced/completed cycle
+returns the cursor lease too. Foreground write and tombstone admission include this counter in their
+global total. The former `remote_refresh_apply_staging` exclusion is therefore removed for the
+finite compute-only v3 path.
+
+Canonical indexed results are part of the transient write model. When full write admission fails
+before installing that lease, the engine tries a response-only reservation sized for one bounded
+diagnostic per input row. An exact response allowance returns indexed rejections and releases the
+lease as the caller takes ownership; one byte less remains an outer `MemoryBudgetExceeded` and
+allocates no outcome vector.
 
 The storage-memory budget still does not account for all process memory. Query results, general
 runtime decode/intermediate vectors outside the bounded startup hydration path, and caller-provided
@@ -193,9 +231,9 @@ inspectable admission signal.
 `Backpressured`, `Rejecting`, and `Degraded` states. The approaching threshold is inspectable and is
 currently 9,000 basis points (90%) of a finite budget. Active-writer, event, and rejection counters
 are memory-specific; older flush admission counters combine memory and WAL pressure. `Degraded`
-means the storage instance is degraded and does not assert that memory caused it. Atomic byte
-reservations prevent concurrent foreground writers and replay work from collectively passing a
-stale budget check.
+means the storage instance is degraded and does not assert that memory caused it. One shared
+admission gate serializes growth across write/replay, tombstone, and remote-catalog staging
+counters so concurrent reservations cannot collectively pass a stale budget check.
 
 ### Query-budget boundary
 
@@ -231,8 +269,10 @@ assert_eq!(storage.query_budget_snapshot().limits, query_limits);
 ```
 
 Every field is optional. `None` means that the query-budget layer enforces no finite value for that
-dimension; the all-`None` legacy default is therefore unbounded, not a named profile. Zero is not a
-valid finite value, and a per-query memory limit cannot exceed the shared query-memory limit.
+dimension. `QueryBudgetLimits::default()` is the all-`None` low-level value, but
+`StorageBuilder::new()` replaces it with the finite `Embedded` profile; the all-`None` behavior is
+used by a built-in instance only after explicit `ExpertUnlimited` selection or an explicit
+override. Zero is not a valid finite value, and a per-query memory limit cannot exceed the shared query-memory limit.
 Request-specific `QueryWorkLimits` can only tighten instance limits. The admitted
 `QueryExecution::limits()` value exposes the fieldwise effective result.
 
@@ -243,23 +283,118 @@ Concurrency and shared modeled query memory are instance-wide. Storage reads pre
 work and checkpoint long loops; a limit failure is a structured `QueryBudgetError` and does not
 silently truncate the result.
 
+`max_returned_bytes` and `max_memory_bytes` deliberately use different models. Returned bytes are
+canonical logical result work: fixed result slots plus metric, label, byte-string, UTF-8 string, and
+native-histogram content lengths. Allocator capacity, spare capacity, and allocation allowances do
+not change that charge, so cloning, serializing, or deserializing the same logical value does not
+change its in-process returned-byte cost. A protocol adapter can additionally charge exact encoded
+bytes, as local Prometheus remote read does for each encoded frame. Query memory instead models
+retained allocations from their collection capacities and value payloads, with a fixed
+per-allocation allowance where documented.
+
 Legacy direct storage reads admit one execution internally. Nested engine callers can carry the
 same execution through the `*_with_execution` methods so they do not acquire another concurrency
 slot. PromQL instant and range requests likewise use one execution for selector planning and
 prefetch, subqueries, all steps, binary operations, aggregations, and final result accounting.
 `instant_query_with_control` and `range_query_with_control` accept request-specific limits and a
 `QueryCancellationToken`; callers that already own an execution can use the corresponding
-`*_with_execution` methods. Owned entrypoints release the query permit and modeled-memory
+`*_with_execution` methods. Protocol adapters that must retain accounting through response
+serialization use `instant_query_with_execution_result` or
+`range_query_with_execution_result` and keep the returned `PromqlExecutionResult` alive. Its
+result guard is transferred from the evaluator's same-execution reservations without a
+zero-accounting gap or a duplicate full-result admission. Owned entrypoints release the query
+permit and modeled-memory
 reservations through RAII on every exit path. A caller-supplied execution intentionally remains
 admitted until its last clone and reservation are dropped, while temporary reservations created by
 the failed operation are still released immediately.
 
+The deterministic acceptance matrix in `tests/query_budget_surface_acceptance_test.rs` selects the
+finite `Test` profile and tightens only its returned-sample limit to two. Direct storage, the async
+facade, and PromQL range evaluation each accept exactly two logical samples, reject a three-sample
+result with the structured `SamplesReturned` reason rather than truncating it, and finish with zero
+active permits and zero shared query-memory reservations. The direct and PromQL cases also prove
+that an already-expired caller deadline rejects before admission. The async cancellation
+characterization uses the same finite `Test` query limits and proves that dropping a running read
+future cancels cooperative work and releases its permit, shared-memory gauge, and queued input-byte
+reservation. The server's matching in-process HTTP range test exercises the same profile-backed
+boundary without loopback I/O and maps N+1 to HTTP 413 plus
+`X-Tsink-Read-Error-Code: query_limit_samples_returned`. This is propagation and release evidence
+for the four entry surfaces; it is not calibration evidence for the provisional profile constants
+or larger query shapes.
+
+Execution-aware point and metadata selection also have detailed result contracts:
+`SelectManyExecutionResult` carries selector-aligned existence bits and a retained-memory guard,
+`SelectSeriesExecutionResult` carries the metadata vector and its guard, and
+`QueryRowsExecutionResult` does the same for a paged row scan. A built-in backend that advertises
+`QueryExecutionAccounting::Complete` charges the result work and keeps its modeled allocation
+reserved until that detailed result, or a replacement wrapper guard, is dropped. Row scans also
+pre-admit the complete cloned identity-resolution vector before resolving any requested series.
+`ChunkStorage`, tenant-scoping/default-tenant fallback, and distributed storage propagate or
+replace these guards around their final retained vectors. Compatibility backends default to
+`Unaccounted`; bounded PromQL and internal/distributed server paths that require complete
+accounting reject such a backend instead of trusting an unguarded result. Callers that need this
+retained-result guarantee must keep the detailed result contract: converting to a plain
+compatibility `Vec` transfers the vector to caller ownership after the guard is released.
+PromQL multi-series fetches, including range prefetch and `info()` data reads, now consume both
+detailed metadata and detailed point batches. They validate point-result identities and existence
+evidence, pre-admit the label/point row transform, resize the transferred point guard to the actual
+capacity-based row model, and keep that reservation through row consumption or adopt it into the
+prefetch cache. A bounded backend that cannot provide complete point accounting is rejected before
+the point batch is requested.
+
+Structured `SeriesSelection` preparation has non-configurable safety ceilings that remain active
+for `ExpertUnlimited`: at most 128 matchers, 256 UTF-8 bytes per matcher name, 16 KiB per value or
+regex pattern, and 64 KiB cumulatively across matcher names and values. The public constants are
+`MAX_SERIES_SELECTION_MATCHERS`, `MAX_SERIES_MATCHER_NAME_BYTES`,
+`MAX_SERIES_MATCHER_VALUE_BYTES`, and `MAX_SERIES_SELECTION_MATCHER_BYTES`. Shape validation runs
+before regex construction and before shard-scope materialization. Query-controlled regex builders
+use a 256 KiB approximate compiled-program limit, a 64 KiB lazy-DFA cache limit, and a nesting
+limit of 64. Invalid-regex diagnostics are bounded to 256 bytes and do not echo the submitted
+pattern.
+
+Adapters can use the typed `SeriesSelection::validate_shape` check before any allocation,
+`SeriesSelection::validate` for bounded non-execution regex validation, or
+`SeriesSelection::prepare_with_execution` for query-accounted preparation. The execution-aware
+guard must remain live through cache-key construction, request cloning, planning, fanout, and
+matcher use.
+
+Built-in execution-aware metadata reads conservatively reserve the compiled matcher vector,
+owned matcher strings, bounded regex programs/caches, finite-literal optimization state, anchored
+pattern staging, and one compiler/parser scratch envelope before entering the regex compiler. That
+reservation remains attached to the prepared selection through candidate matching and is released
+on success, shape/compile failure, cancellation, or deadline expiry. These are modeled bounds, not
+claims about private allocator metadata inside the regex crate.
+
 The portable query-memory model charges tsink-owned collection capacities and value payloads plus a
 named per-allocation allowance. It covers storage decode buffers, snapshots, candidate sets,
-built-in aggregation working sets, and PromQL intermediates. It is not RSS, does not include private
-global-allocator metadata, and cannot charge memory allocated internally by caller-provided
-`Aggregator` or `CodecAggregator` implementations; their tsink-owned inputs and returned values are
-still accounted.
+built-in aggregation working sets, PromQL parse/regex preparation, stable-sort scratch,
+label-transform amplification, capture locations, and the guarded final point/metadata/PromQL
+results described above. Native-histogram bucket materialization uses exact final capacity,
+one bounded decode vector, and allocation-free sorting. This model is not RSS and does not include
+private global-allocator metadata or slack. It cannot charge memory allocated internally by
+caller-provided `Aggregator`,
+`CodecAggregator`, or storage-backend implementations; their tsink-owned inputs and returned values
+are still subject to the applicable work counters.
+
+Bounded distributed `select_series` and point batches execute remote targets sequentially in
+deterministic order. Before each peer, the coordinator forwards the residual cumulative
+scan/pattern/step limits and remaining deadline, accounts planning and merge state, validates the
+peer's detailed counters and existence evidence, and charges only newly merged logical series and
+points to final result limits. An exactly exhausted cumulative scan limit intentionally rejects
+before another peer is contacted, even if that peer might report zero additional scan work; zero
+cannot be forwarded as a valid finite limit, and this conservative false positive prevents a peer
+from independently consuming the full allowance.
+
+Returned-sample and returned-byte limits are final logical-result limits, not transport-size
+budgets divided among replicas. Each sequential peer receives the original finite result limits,
+while the coordinator enforces the deduplicated final union. Independently, every raw internal RPC
+response has a physical cap of `MAX_HEADER_BYTES + MAX_BODY_BYTES`; transport JSON and HTTP overhead
+can therefore reject a peer response even when its logical result would fit. On bounded calls, RPC
+request JSON is length-counted and reserved before its fixed-size serialization, the exact HTTP
+request header is preflighted, raw response capacity is reserved as it grows, and a conservative
+decode envelope remains reserved with the decoded response until merge consumption. TLS, socket,
+runtime, and kernel buffers, plus external allocator bookkeeping, remain outside that portable
+reservation model.
 
 `Storage::query_budget_snapshot()` and `Storage::observability_snapshot().query_budget` report the
 configured limits, active and peak permits, active and peak shared memory, lifecycle counters,
@@ -347,6 +482,19 @@ one empty terminal page before the worker may claim a clean full cycle. Startup,
 capacity-reclamation retention paths remain complete lifecycle operations rather than background
 pages.
 
+Live-metadata reconciliation no longer snapshots the complete materialized-series set. A
+process-local scalar cursor visits one ordered series ID at a time and charges that series'
+conservative visibility-summary rebuild, ID handoff, and allocator allowance to the same item/byte
+limits. One series is the indivisible dependency window; if its modeled rebuild cannot fit, the
+pass returns `MaintenanceDependencyWindowExceeded` before advancing the cursor. Per-series summary
+and dead-series publication finishes before cursor commit, so errors retry the same ID and no
+page-sized collection survives a wake. Any visibility-generation change during a cycle forces a
+clean verification cycle from the beginning, covering a writer that reinserts an already visited
+ID without repeatedly rescanning the prefix on every ordinary wake. Background work advances one
+page; explicit startup, foreground retention, and test-fixture reconciliation drain the same finite
+pages before returning. Close discards the scalar continuation after excluding the background
+worker.
+
 Incremental series-registry publications also stay within the startup recovery namespace bound.
 Small publications are merged into one active `RJNL` generation with at most 1,024 series and
 4 MiB of stored and decoded registry payload. Crossing either threshold first seals the active
@@ -416,12 +564,102 @@ and process restart discards the cursor because startup strict hydration is auth
 `MaintenanceWorkItemTooLarge`, `MaintenanceDependencyWindowExceeded`, and
 `MaintenanceNamespaceLimitExceeded` are explicit rather than truncating a catalog.
 
-Tiered local/shared segment catalogs remain monolithic snapshot files: a tiered publication must
-still materialize and rewrite the complete final inventory to preserve their current crash-safe
-replacement contract. Lifecycle startup and close also intentionally use complete strict
-reconciliation, and `ExpertUnlimited` explicitly keeps the complete runtime path. The scoped
-accounting path can still traverse a touched Roaring posting bitmap and an invalidated missing-label
-cache; removing those key-local cardinality costs requires incremental bitmap/cache byte counters.
+Finite compute-only remote refresh uses the shared v3 catalog pointer and immutable framed
+generations. A generation admits at most 16,384 entries, a 256-byte relative path, a 336-byte frame,
+and 5,505,052 bytes total. The pointer is a separate fixed 44-byte work item; each generation pass
+charges header/frame file bytes and item work, and the process-local staged inventory has its own
+fixed hard retained ceiling plus admission to the global storage-memory budget. Its generation
+path, reader/page/frame allocations, decoded paths, retained cursor, and staged root map are
+reported as `remote_catalog_staging_bytes`. Bounded additions precede bounded removals only after
+complete validation. A missing or invalid v3 pointer fails closed, releases the staged-reader
+lease, keeps the last visible inventory, and never falls back to a tier scan. Pointer changes
+replace rather than accumulate the process-local reservation, so continuous writer publication can
+delay convergence; there is no stale-reader lease in this format. Lifecycle startup and
+`ExpertUnlimited` retain the v2/physical-scan compatibility path.
+
+Finite read-write tiered catalog publication uses a process-local, file-handle-free continuation.
+It scans the visible persisted-root map one charged item at a time into a 16,384-entry
+identity-ordered snapshot, then streams the local v2 compatibility image, immutable v3 generation,
+and shared v2 compatibility image in item/byte-charged fragments. Each retained entry, path,
+encoder scratch page, and cursor allocation is admitted to the global storage-memory budget and
+reported as `remote_catalog_staging_bytes` until terminal success or error. The generation
+namespace is a fixed hard-bounded dependency window: its complete observed count must fit the
+fresh pass before directory creation or orphan-stage cleanup can mutate disk.
+
+The readable v2 images still precede the v3 pointer commit, while finite readers remain on the
+prior immutable generation until the final fixed-size atomic pointer replacement. A visibility
+generation change discards the unpublished cursor and exact owned stages before restarting from
+the latest persisted snapshot. Pre-pointer failure removes exact stage names and the unpublished
+generation, settles observed partial-file growth against the disk budget, and releases the
+retained memory reservation. Startup/initial one-shot publication also removes only the two exact
+deterministic crash-orphan stage names; it does not glob the surrounding host-owned namespace.
+Post-flush Committing markers keep source roots until the pointer is durable, advance an existing
+cursor without replaying the installed visibility transition, and checkpoint the complete
+registry-catalog image when a cursor may contain work from multiple callers. `ExpertUnlimited`
+retains the legacy complete one-shot publication path.
+
+The finite writer cursor builds its ordered snapshot directly from persisted state, so it no
+longer requires a caller-owned complete `SegmentInventory` merely to encode the catalog. Explicit
+complete-inventory compatibility transitions and `ExpertUnlimited` still materialize their input
+snapshot before the publication boundary. The cursor's ordered retained snapshot remains
+proportional to the live catalog but is hard-capped by the namespace ceiling and admitted to the
+global storage-memory budget; each scan/encode fragment is independently rejectable when it cannot
+fit one maintenance pass.
+
+Finite read-write tombstone recovery snapshots no longer clone and republish the complete live map.
+The live tombstone index is ordered by series ID with a conservative fixed per-node memory charge,
+and a process-local cursor copies at most the configured item/byte page under the tombstone
+visibility fence. Each page uses the existing crash-atomic multi-lane update coordinator, and a
+dedicated tombstone generation restarts paging only when the tombstone map changes; unrelated
+segment/catalog visibility publication cannot starve it. Startup marks the reconciliation pending,
+the persisted-refresh worker advances one page per otherwise-exclusive maintenance wake, and close
+drains the same cursor while writers are stopped. `ExpertUnlimited` retains the legacy one-shot
+snapshot.
+
+Startup hydration defines the live map as the union of every durable lane, while supported runtime
+removals persist an empty-range update before removing a live entry. Therefore ordinary finite
+reconciliation only needs monotonic per-series upserts. An authoritative empty map is handled
+separately by one bounded empty-snapshot transaction, which removes stale manifests and their exact
+owned shards without cloning a map. A touched persisted shard remains an indivisible dependency:
+the format caps it at 64 MiB, and manifest/coordinator records have their existing fixed caps, but
+the conservative decode/re-encode peak for one series across all configured lanes must fit
+`maintenance_max_bytes_per_pass` or the page returns `MaintenanceWorkItemTooLarge` without a commit.
+Startup planning resolves coordinators before hydration, and cursor-created committed or
+indeterminate debt is resolved immediately while its source page remains fenced. An unexpected
+committed transaction left by a different runtime tombstone writer still requires the existing
+authoritative whole-map reload before paging; that rare
+correctness window is memory-admitted but is not maintenance-pageable yet.
+
+Before those bounded segment additions, finite compute-only refresh also advances a separate
+remote-tombstone continuation. It probes only the six configured shared lane manifests; an existing
+manifest and each immutable referenced shard are distinct charged work items, while missing lanes
+are a fixed six-probe no-file-read case. Manifest length/hash fingerprints and validated shard
+names are pinned, decoded shard fragments remain private and charged to
+`tombstone_staged_bytes` across wakes, and every manifest is read again before publication. A
+changed manifest or visibility generation discards the staged continuation and retries. No
+tombstone-store root is enumerated.
+
+After complete validation, the cursor unions the staged deletes with the current live map so a
+retry cannot resurrect an older delete, then admits one visibility-fenced publication item. A
+decode, validation, admission, or terminal-revalidation failure leaves the previous map visible.
+The current live `BTreeMap` replacement and affected-series visibility-cache rebuild are still one
+monolithic terminal item: their conservative and exact staging requirements must fit
+`maintenance_max_bytes_per_pass`, otherwise the refresh returns
+`MaintenanceWorkItemTooLarge` without swapping visibility. Restarting with a raised maintenance
+ceiling can unstrand an already bounded deployment; supporting arbitrarily larger tombstone sets
+under the same ceiling requires a future immutable sharded live tombstone snapshot and
+epoch-tagged cache publication rather than pagination of the mutable map swap.
+
+Finite read-write tiered publication now resumes the ordered scan and streamed v2/v3 encoders
+across maintenance wakes, with source retirement fenced behind its pointer-last terminal pass.
+The retained ordered snapshot remains proportional to the live tiered inventory, while each wake
+is item/byte bounded as described above. New-series estimation now measures
+only affected postings keys and grows the already-installed write-transient lease before cloning
+each Roaring bitmap. The lease is then replaced by the estimated retained-registry overlap and
+transferred to the registry counter under the shared admission gate, so concurrent writers cannot
+pass a stale check. Missing-label postings are not retained in either the live registry or the
+merged persisted index: each query derives them inside the preadmitted four-bitmap metadata
+candidate working set, so query traffic cannot grow storage-owned cache state.
 
 When both numeric and blob lanes are persistent, the background compaction worker alternates one
 lane per wake. Each compactor therefore consumes the configured pass limits at most once per
@@ -462,9 +700,8 @@ sealed chunk is persisted, retention observes the complete admitted inventory, c
 most 128 settling passes, dirty persisted state is refreshed, and tombstone/registry recovery
 indexes are checkpointed. The active and sealed loops are finite because writer permits remain
 drained. Standard finite profiles also bound admitted series, WAL, and local-disk state; explicit
-`ExpertUnlimited` does not. Close intentionally completes any unknown-dirty scan in its strict
-lifecycle path, while tiered segment-catalog formats still require proportional complete-catalog
-publication.
+`ExpertUnlimited` does not. Close intentionally completes any unknown-dirty scan and any retained
+tiered-writer publication cursor in its strict lifecycle path.
 
 Blocking filesystem calls are the portability boundary. A call already executing file write/sync,
 directory sync, atomic rename, or removal cannot be safely cancelled by portable Rust APIs without
@@ -484,11 +721,13 @@ identities against the per-query and shared query-memory ceilings; failure prece
 writes, and checkpoint progress, and every reservation is released on success or error.
 Finite explicit/manual rollup calls now advance the shared source cursor by one item/byte-bounded
 page and return continuation state; status uses the accumulated traversal counters rather than a
-fresh complete enumeration. Tiered segment-catalog publication and `ExpertUnlimited` manual rollup
-drains retain complete work, so the snapshot must not be interpreted as a universal per-worker
-CPU/work guarantee. `close()` unparks and joins all owned workers—even if an earlier join reports a
-panic—but cannot portably interrupt a filesystem operation that has already entered the kernel.
-The remaining pass-budget integrations are residual Phase-2 work.
+fresh complete enumeration. Finite tiered segment-catalog writer publication is paged;
+`ExpertUnlimited` manual rollup drains retain complete work, so the snapshot must not be
+interpreted as a universal per-worker CPU/work guarantee. Finite compute-only v3 refresh is paged,
+but continuous pointer churn can restart it before convergence. `close()` unparks and joins all
+owned workers—even if an
+earlier join reports a panic—but cannot portably interrupt a filesystem operation that has already
+entered the kernel. The remaining pass-budget integrations are residual Phase-2 work.
 
 ### Local-disk accounting boundary
 
@@ -586,14 +825,29 @@ Offline restore has a separate, explicit core envelope.
 must not overlap that root. The restore tree is measured before destination mutation, with the root
 counting toward a 100,000-entry limit and descendant-directory depth capped at 128. Static
 symlinks, Windows reparse points, special entries, and resolved source/target overlap in either
-direction are rejected. The source must nevertheless be trusted and immutable for the call:
-portable path-based traversal cannot close a concurrent namespace-swap race between validation and
-open.
+direction are rejected. Source and staging traversal is anchored to no-follow directory handles
+and a finite closed-identity manifest. Each secure session is capped at 64 MiB modeled retained
+memory, and simultaneously live secure traversal, staging-manifest, verification, and generated
+copy-buffer state shares a 128 MiB operation cap. This cap does not include the storage instance
+used for semantic validation.
 
-The budgeted restore reserves
-`logical_file_bytes + snapshot_entries * entry_allowance + missing_target_ancestors * entry_allowance`,
-where `entry_allowance` is the greater of the 4 KiB policy floor and the destination filesystem's
-reported allocation unit. The entry allowance is a conservative admission policy for entry
+Before target capture or publication, a private copy is opened with strict production
+discovery/recovery/hydration. It uses the finite `Server` envelope: 2 GiB accounted memory, 10
+million series, 8 GiB WAL, and 256 GiB local disk. Filesystem free-headroom and maintenance-temp
+reserve are set to zero for validation. Non-degraded health is required, workers are disabled, and
+the validation-only shutdown does not run the normal flush/checkpoint pipeline. Consequently a
+structurally valid snapshot created under larger custom or `ExpertUnlimited` limits can be rejected
+by restore's deliberate validation ceiling. The containing namespace remains an exclusive private
+contract; retained anchors do not claim protection from a hostile same-UID actor during the
+platform's final narrow rename window.
+
+The budgeted restore staging term is
+`2 * logical_file_bytes + (snapshot_entries + 2) * entry_allowance`, where the two extra entries
+are the validation lock and one possible atomic recovery scratch path. The coordinator separately
+adds `missing_target_ancestors * entry_allowance`. `entry_allowance` is the greater of the 4 KiB
+policy floor and the destination filesystem's reported allocation unit. The second logical copy is
+the recovery scratch envelope; validation and publication staging reuse one complete copied-tree
+reservation sequentially. The entry allowance is a conservative admission policy for entry
 metadata and minimum allocation, not a claim that every filesystem's physical footprint is exactly
 that value. Target activation is serialized with cooperating managed mutations. An exclusive scan
 replaces the reservation with exact logical accounting before admission resumes; if reconciliation
@@ -624,6 +878,109 @@ log, cluster dedupe markers, edge source queue, and standalone edge-accept dedup
 Cluster mode requires an explicit data path, so these cluster writers cannot fall back to an
 unleased, unbudgeted temporary root. Omitting `--data-path` is supported only for non-cluster
 in-memory operation.
+
+The server-owned metric-metadata sidecar also has a finite, validated in-process
+`MetricMetadataStoreConfig`, independent of the core storage-memory budget. Its defaults are
+100,000 retained entries, 64 KiB per logical record, 512 updates and 4 MiB of logical input per
+update batch, 64 MiB of modeled retained memory, a 16 MiB durable file/snapshot, 96 MiB of startup
+staging, 32 MiB of aggregate write/snapshot staging, and at most 10,000 records or 16 MiB per query
+result. Empty/zero limits and inconsistent entry, record, or batch relationships are rejected at
+construction.
+
+Writes validate caller-owned input before cloning it, stage only the bounded changed-key overlay,
+and stream the ordered current/overlay merge into one incrementally admitted output buffer. They
+do not clone the complete map or build a second entries vector. The complete encoded replacement
+is persisted before the overlay becomes visible; native disk-quota, headroom, JSON, and I/O error
+variants remain intact. Other sidecar limits carry a stable
+`MetricMetadataStoreErrorCode`, available through `classify_apply_error`, so adapters need not
+parse diagnostics. Current/peak retained, durable, transient, and guarded-query bytes plus
+per-category rejection counters are available from `metrics_snapshot`.
+
+Startup checks file length before allocating its input buffer, bounds raw-entry references, checks
+each raw record before decoding it, and admits the decoded map against both retained and startup
+peaks. Failed opens return bounded diagnostics and have no live per-store rejection counter.
+Snapshots use the same durable-output and aggregate-transient ceilings as writes. The
+execution-aware query API cooperatively checkpoints both its scan and clone loops, preadmits cloned
+records, reconciles the guard to observed vector/string capacities, and retains its
+`QueryMemoryReservation` through result drop. The legacy plain-`Vec` query is explicitly
+caller-owned and only has the per-result sidecar ceilings; aggregate caller-owned results remain
+outside store observability.
+
+The server-owned exemplar sidecar has a separate finite, validated
+`ExemplarStoreResourceLimits` envelope. Its defaults cap the store at 50,000 series, the configured
+50,000 retained exemplars and 128 exemplars per series, 512 writes per request, 32 MiB of
+actual-capacity request input, 64 MiB of modeled retained state, 64 MiB of write staging, 128 MiB
+for retained-plus-replacement staging and concurrent staging, 64 MiB each for the durable file and
+serialization output, 160 MiB for startup, and 64 MiB/256 KiB for snapshot output/scratch.
+Metric, label-count, component-byte, cumulative series-identity, and cumulative exemplar-label
+limits are finite and cannot exceed the core format's hard limits; non-finite exemplar values are
+rejected consistently by memory-only and persistent stores. Invalid zero or inconsistent
+replacement/concurrency relationships, and accidental `usize::MAX`/`u64::MAX` unlimited
+sentinels, fail when the store is constructed. Serialization and durable-file ceilings are
+independent: a caller may deliberately impose a smaller serialization envelope and receive its
+distinct stable rejection code.
+
+Writes validate caller-owned shapes and observed `String`/`Vec` capacities before store allocation,
+then clone only affected series into a bounded ordered overlay. The legacy total/per-series
+retention behavior still accepts writes by evicting the oldest exemplar and reports the exact
+dropped count. Series, shape, byte, retained, transient, replacement, serialization, and durable
+ceilings instead reject fail closed. The complete effective state is measured and streamed from
+the live map plus overlay; persistent stores publish the replacement file before applying the
+overlay in memory. Native JSON, I/O, disk-quota, and headroom errors remain their original
+`TsinkError` source. A bounded store error additionally exposes `ExemplarStoreErrorCode`, with
+stable names such as `exemplar_retained_bytes_limit` and
+`exemplar_snapshot_transient_bytes_limit`.
+
+Startup rejects durable length and a conservative parser/staging peak before decoding. That peak
+is the observed raw-file bytes plus the maximum normalized retained state, one shape-bounded
+decoded entry (including doubled label-vector growth and per-allocation allowances), and 16 KiB of
+parser/file scratch. The 160 MiB default covers this formula at the complete 64 MiB durable-file
+ceiling; exact N/N-1 tests also reopen a valid JSON file padded to that ceiling. Startup bounds the
+open handle to the observed length plus one trailing-growth byte and rejects a path-length change
+before publication. It then uses a Serde sequence visitor to validate and normalize one entry at a
+time into exact-capacity owned strings and vectors in the bounded map; it does not materialize a
+complete decoded entries vector.
+The decoded and normalized entry are charged concurrently, so a file written at retained limit N
+reopens at the same retained N. Entry, unique-series, per-series, retained, and startup peaks are
+checked before each insertion. Snapshots premeasure the exact serialized length, reserve only fixed
+serialization scratch, and publish atomically. Current/peak
+retained, durable, and transient bytes, their configured limits, rejection categories, and the
+last stable rejection code are inspectable through `metrics_snapshot`; transient ownership returns
+to zero on success, typed rejection, and native persistence failure. Exact N/N-1 tests cover each
+byte envelope, atomic same-timestamp replacement, oversized startup files before decode, snapshot
+publication, and concurrent durable accounting. These are deterministic model-boundary tests, not
+whole-process RSS measurements.
+
+The rules sidecar has a separate validated `RulesStoreLimits` envelope. Defaults are 256 groups,
+256 rules per group, 4,096 rules total, 10,000 alert instances per rule, 64 labels per label set,
+64 KiB per label set, 1 KiB names, 256 KiB expressions, and 64 KiB annotations. Modeled retained
+state is capped at 16 MiB, the durable file at 32 MiB, startup staging at 128 MiB, whole-config
+replacement staging at 64 MiB, runtime-update staging at 48 MiB, and caller-owned status plus its
+HTTP JSON encoding at 64 MiB. All limits must be nonzero, the per-group rule limit cannot exceed
+the total rule limit, and the status ceiling cannot exceed the server's 64 MiB HTTP-body ceiling.
+Embedded callers can supply different values through `RulesRuntime::open_with_config`; the three
+existing rules environment variables continue to configure scheduler tick, recording rows per
+evaluation, and alert instances per rule.
+
+Rule configuration is structurally and byte validated before PromQL parsing or rule-ID scratch
+allocation. Retained accounting uses observed `String` and `Vec` capacities plus modeled
+ordered-map nodes and a portable per-allocation allowance, then reconciles the constructed
+candidate. A replacement accounts for old and candidate state concurrently. Runtime updates build
+a bounded ordered replacement overlay, stream it together with the live map, and reconcile the
+final retained state. Both paths measure JSON without first cloning the state, admit one complete
+encoded buffer, persist it, and only then publish the candidate. Native persistence failures stay
+typed internally; bounded limit and validation diagnostics do not include hostile input.
+
+Startup opens one file handle, rejects the metadata length before allocating, uses fallible exact
+allocation, checks for trailing growth, enforces a nesting-depth ceiling of 64, and admits a
+conservative raw-plus-decoded peak before Serde constructs owned state. Durable snapshots use the
+durable-file ceiling and report a separate snapshot-file peak; they are not charged to the HTTP
+status ceiling. Admin rule responses avoid an intermediate `serde_json::Value`: the caller-owned
+status object and its exact success-envelope buffer are premeasured together, then the buffer's
+actual capacity is reconciled. The public `RulesRuntime::snapshot` result becomes caller-owned at
+return, so callers retaining multiple snapshots must enforce their own aggregate ceiling. As with
+the metadata sidecar, a failed rules-store open has no live store on which to expose its startup
+rejection counter; the returned startup diagnostic remains bounded.
 
 Those writers reserve exact growth and synchronize successful publication. Most publish in-memory
 state only after persistence; dedupe is the explicit exception, retaining an exact completed result
@@ -717,12 +1074,10 @@ synchronized before state-first publication. Partial or ambiguous publication fe
 mutation until reopen, while a proven complete pair can report cleanup debt without becoming a
 false rejection.
 
-A complete server-wide model still needs:
-
-- a stable, leased crash-recovery coordinator for cross-lane and cross-filesystem tombstone
-  manifest publication;
-- a measured policy for batching exclusive cleanup reconciliation, which currently favors exactness
-  over cleanup throughput.
+The server-wide model now includes the stable leased crash-recovery coordinator for cross-lane and
+cross-filesystem tombstone manifest publication described in ADR 0005. The remaining disk-policy
+calibration item is a measured policy for batching exclusive cleanup reconciliation, which
+currently favors exactness over cleanup throughput.
 
 Core tests now cover over-limit recovery, restart reconciliation, unknown files, concurrent
 reservations, whole-operation multi-output compaction preflight at exact N/N+1, competing
@@ -788,8 +1143,13 @@ are exposed in status; retained and configured record/tenant bounds are exported
 These server-side usage-state and read limits remain finite even when the core storage profile is
 `ExpertUnlimited`; there is no unlimited usage-ledger CLI sentinel. That explicit profile can
 remove the separate local-disk envelope, so durable replay can again become proportional to an
-unbounded ledger file. Complete storage reconciliation is concurrency-isolated but still performs a
-full database scan and remains residual work for a cursor-bounded reconciliation design.
+unbounded ledger file. Complete storage reconciliation is concurrency-isolated and finite: it uses
+guarded metadata and row-page results under one operation execution, caps manifest, page, row,
+sample, byte, memory, page-count, attempt, and wall-time work, and fails closed when a backend
+cannot prove complete accounting. It compares two bounded passes and a final manifest before
+publication. This is an optimistic consistency fence rather than a durable storage generation: a
+continuously mutating database can exhaust the finite retry count, and a hash collision or ABA
+change is not a linearizable snapshot proof.
 
 ### Residual query-envelope work
 
@@ -807,19 +1167,32 @@ post-estimate concurrent write therefore cannot grow the vector past its admitte
 dead-series pruning observes the dead-ID length and reserves the one simultaneously live companion
 vector reused by removal, delta reconciliation, and shard unpublication. The default-tenant server
 wrapper admits one execution across both its scoped and legacy selections, observes their combined
-intermediate length, and pre-reserves an in-place merge/label-stripping path. Series count,
-returned-byte, intermediate-length, and per-query/shared-memory failures remain structured and
-release the slot on every exit. WAL-definition merging, other metadata entry points,
-adapter-owned distributed merge buffers, and caller-owned returned vectors remain separate named
-boundaries.
+intermediate length, and pre-reserves an in-place merge/label-stripping path. Ordinary and
+shard-scoped metadata selection now pass that execution through live-retention filtering; cold
+visibility repair, its ID vectors, retention partitions, and time-range summary repair are no
+longer compatibility work outside the query envelope. Series count, returned-byte,
+intermediate-length, and per-query/shared-memory failures remain structured and release the slot on
+every exit. Prometheus remote read encodes and drops each completed query result
+before starting the next one, caps the aggregate uncompressed protobuf at 64 MiB, charges each local
+encoded frame to that query's returned-byte limit, and preflights the maximum Snappy allocation.
+The retained encoded and compressed buffers are a fixed server-adapter envelope rather than a core
+shared-query-memory reservation; public read-request admission bounds their concurrent
+multiplicity. Bounded distributed metadata and point fanout now reserve planning, RPC transport and
+decode envelopes, peer results, and merge state under the shared execution, and retain a detailed
+guard around the final vector. The compatibility distributed `list_metrics` path, WAL-definition
+merging, some async and metadata-HTTP result handoffs, other adapters that do not opt into detailed
+accounting, and caller-owned vectors after a detailed guard is consumed remain separate named
+boundaries. PromQL's exact single-series compatibility read and `info()` merge map are now charged
+inside the shared query execution rather than listed among those exclusions.
 Rollup maintenance creates one internal execution per source read, preserving those instance limits
 and tightening memory, scanned/returned samples, returned bytes, and intermediate length to the
 finite maintenance ceiling. It never paginates or truncates a source into a false checkpoint: an
 append-sort working set that cannot fit is rejected before allocation and retried on a later policy
 cycle. Explicit `ExpertUnlimited` leaves both query and maintenance controls unbounded unless the
 embedder supplies an override.
-Caller-provided aggregator internals and allocator/runtime overhead remain outside that portable
-model, and profile constants still require calibration across those entry points.
+Caller-provided aggregator/backend internals, public-adapter buffers not explicitly reserved above,
+caller-owned compatibility results, external allocator/runtime/kernel overhead, and profile
+calibration across these entry points remain outside this portable model.
 
 ### Cardinality shape and background work
 
@@ -834,15 +1207,19 @@ committed window usage, the storage-clock window start, lifetime admissions/comm
 Per-metric budgets are intentionally not part of the embedded core. Server operators may layer
 tenant policy on top of the canonical structured rejection path, but no standard per-metric or
 per-tenant cardinality profile is published. Background workers have fixed inspectable topology
-and cadence. The shared maintenance item/byte pair currently bounds compaction, sealed-chunk
+and cadence. Because those cadences are not independently configurable yet, a custom profile that
+specifies different values is rejected during build instead of being silently ignored. The shared
+maintenance item/byte pair currently bounds compaction, sealed-chunk
 persistence, active-flush discovery, retention/tiering root/action pagination, finite non-tiered
-unknown-dirty catalog reconciliation, and rollup postings traversal; each rollup source read and its
-downstream transform/row assembly share one finite query/maintenance envelope. Tiered
-segment-catalog publication retains complete snapshots. Finite explicit/manual rollup calls share
-the background cursor and advance at most one item/byte-bounded policy/source page; bounded status
-counters plus the continuation policy and exclusive series ID distinguish partial progress until a
-terminal page proves the cycle complete. Only explicit `ExpertUnlimited` drains that complete cycle
-in one manual call.
+unknown-dirty catalog reconciliation, finite compute-only v3 catalog reading/application, and
+finite read-write catalog publication and tombstone recovery-snapshot paging, and rollup postings
+traversal; each rollup source read and its downstream transform/row assembly share one finite
+query/maintenance envelope. Tiered writer publication retains one complete, hard-bounded snapshot,
+but its simultaneous memory peak is admitted before publication.
+Finite explicit/manual rollup calls share the background cursor and advance at most one
+item/byte-bounded policy/source page; bounded status counters plus the continuation policy and
+exclusive series ID distinguish partial progress until a terminal page proves the cycle complete.
+Only explicit `ExpertUnlimited` drains that complete rollup cycle in one manual call.
 
 ## Why profile constants remain provisional
 

@@ -3,12 +3,18 @@ use super::*;
 impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn build_visibility_state() -> VisibilityState {
         VisibilityState {
-            tombstones: Arc::new(RwLock::new(HashMap::new())),
+            tombstones: Arc::new(RwLock::new(TombstoneMap::new())),
+            remote_tombstones: RwLock::new(tombstone::ImmutableTombstoneSnapshot::empty()),
             materialized_series: RwLock::new(BTreeSet::new()),
             series_visibility_summaries: RwLock::new(HashMap::new()),
             series_visible_max_timestamps: RwLock::new(HashMap::new()),
             series_visible_bounded_max_timestamps: RwLock::new(HashMap::new()),
+            series_visibility_cache_epochs: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            visibility_cache_accounting_entries_visited: AtomicU64::new(0),
+            remote_tombstone_epoch: AtomicU64::new(0),
             visibility_state_generation: AtomicU64::new(0),
+            tombstone_state_generation: AtomicU64::new(0),
             live_series_pruning_generation: AtomicU64::new(0),
             max_observed_timestamp: AtomicI64::new(i64::MIN),
             max_bounded_observed_timestamp: AtomicI64::new(i64::MIN),
@@ -27,6 +33,24 @@ impl ChunkStorage {
         self.visibility
             .visibility_state_generation
             .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(in crate::engine::storage_engine) fn tombstone_state_generation(&self) -> u64 {
+        self.visibility
+            .tombstone_state_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub(in crate::engine::storage_engine) fn bump_tombstone_state_generation(&self) {
+        self.visibility
+            .tombstone_state_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(in crate::engine::storage_engine) fn remote_tombstone_epoch(&self) -> u64 {
+        self.visibility
+            .remote_tombstone_epoch
+            .load(Ordering::Acquire)
     }
 
     pub(in crate::engine::storage_engine) fn visibility_read_fence(

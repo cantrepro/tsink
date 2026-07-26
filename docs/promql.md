@@ -54,6 +54,11 @@ let result: PromqlValue = engine.range_query("rate(errors_total[1m])", start, en
 `Engine::new` defaults to `TimestampPrecision::Nanoseconds`.
 Both methods parse the expression internally before evaluation.
 
+Parsing has hard safety ceilings exposed as `MAX_PARSE_INPUT_BYTES`, `MAX_PARSE_TOKENS`, and
+`MAX_PARSE_DEPTH`: currently 64 KiB of UTF-8 input, 16,384 non-EOF tokens, and 64 expression
+levels. The lexer rejects before unbounded token growth, and the parser bounds both recursive work
+and the depth of the AST it constructs.
+
 ---
 
 ## Value types

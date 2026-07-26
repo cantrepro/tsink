@@ -532,7 +532,7 @@ fn concurrent_distinct_new_series_writers_across_metrics_create_all_series() {
 }
 
 #[test]
-fn cached_missing_label_selector_sees_concurrent_new_series() {
+fn missing_label_selector_sees_concurrent_new_series_with_query_transient_postings() {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::thread;
@@ -583,7 +583,7 @@ fn cached_missing_label_selector_sees_concurrent_new_series() {
         )
         .unwrap(),
     );
-    let metric = "cached_missing_label_selector";
+    let metric = "unretained_missing_label_selector";
     storage
         .insert_rows(&[
             Row::with_labels(

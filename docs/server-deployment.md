@@ -71,7 +71,7 @@ Use `--help` to print the full listing with types and defaults.
 |---|---|---|
 | `--resource-profile PROFILE` | `server` | Core resource base: `test`, `embedded`, `edge`, `server`, or explicit migration profile `expert-unlimited`. |
 | `--data-path PATH` | *none* | Directory for WAL, segments, metadata, and rules. Required for persistent storage. |
-| `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. Must not overlap `--data-path`. |
+| `--object-store-path PATH` | *none* | Shared local, FUSE, or network-filesystem mount for warm/cold tier segments. Native object-store URIs are not supported; the path must not overlap `--data-path`. |
 | `--local-disk-limit BYTES` | `256 GiB` (`Server`, when persistent) | Shared logical byte limit for budget-integrated writers under `--data-path`. Must be greater than zero when set. |
 | `--filesystem-free-headroom BYTES` | `2 GiB` (`Server`, when persistent) | Filesystem free space that budget-integrated writes must leave available. |
 | `--maintenance-temp-reserve BYTES` | `16 GiB` (`Server`, when persistent) | Capacity withheld from normal growth for maintenance temporary output. Must be smaller than `--local-disk-limit` when that limit is set. |

@@ -91,7 +91,7 @@ fn rollback_created_series_removes_series_without_rewinding_ids_or_dictionaries(
 }
 
 #[test]
-fn estimate_new_series_memory_growth_matches_real_registry_delta_with_active_missing_cache() {
+fn estimate_new_series_memory_growth_matches_real_delta_after_unretained_missing_query() {
     let registry = SeriesRegistry::new();
     registry
         .resolve_or_insert("baseline_metric", &[Label::new("host", "baseline")])
@@ -106,8 +106,10 @@ fn estimate_new_series_memory_growth_matches_real_registry_delta_with_active_mis
         .resolve_or_insert("cache_seed", &[Label::new("host", "missing")])
         .unwrap();
     let job_name_id = registry.label_name_id("job").unwrap();
+    let memory_before_missing_query = registry.memory_usage_bytes();
     let seeded_missing = registry.missing_label_postings_for_id(job_name_id);
     assert_eq!(seeded_missing.len(), 2);
+    assert_eq!(registry.memory_usage_bytes(), memory_before_missing_query);
 
     let estimate_keys = vec![
         SeriesKey {
@@ -141,4 +143,58 @@ fn estimate_new_series_memory_growth_matches_real_registry_delta_with_active_mis
 
     let after = registry.memory_usage_bytes();
     assert_eq!(estimated, after.saturating_sub(before));
+}
+
+#[test]
+fn postings_clone_estimation_admission_has_exact_n_and_n_minus_one_boundaries() {
+    let registry = SeriesRegistry::new();
+    for host in 0..512 {
+        registry
+            .resolve_or_insert(
+                "cpu",
+                &[
+                    Label::new("host", host.to_string()),
+                    Label::new("job", "api"),
+                ],
+            )
+            .unwrap();
+    }
+    let planned = vec![SeriesKey {
+        metric: "cpu".to_string(),
+        labels: vec![Label::new("host", "new"), Label::new("job", "api")],
+    }];
+
+    let mut exact = 0usize;
+    let expected_growth = registry
+        .estimate_new_series_memory_growth_bytes_with_transient_admission(&planned, |required| {
+            exact = exact.max(required);
+            Ok(())
+        })
+        .unwrap();
+    assert!(exact > 0);
+
+    let one_under = registry
+        .estimate_new_series_memory_growth_bytes_with_transient_admission(&planned, |required| {
+            if required > exact - 1 {
+                return Err(crate::TsinkError::MemoryBudgetExceeded {
+                    budget: exact - 1,
+                    required,
+                });
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(
+        one_under,
+        crate::TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == exact - 1 && required == exact
+    ));
+
+    let admitted_growth = registry
+        .estimate_new_series_memory_growth_bytes_with_transient_admission(&planned, |required| {
+            assert!(required <= exact);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(admitted_growth, expected_growth);
 }

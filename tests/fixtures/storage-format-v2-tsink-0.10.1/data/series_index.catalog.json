@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "segments": [
+    {
+      "lane": "numeric",
+      "level": 0,
+      "segment_id": 1,
+      "chunk_count": 3,
+      "point_count": 4,
+      "series_count": 3,
+      "min_ts": 200,
+      "max_ts": 240,
+      "wal_highwater_segment": 0,
+      "wal_highwater_frame": 6,
+      "chunks_len": 231,
+      "chunks_hash64": 11766679991972142977,
+      "chunk_index_len": 128,
+      "chunk_index_hash64": 2241719789301791635,
+      "series_len": 187,
+      "series_hash64": 14541310985420289817,
+      "postings_len": 124,
+      "postings_hash64": 14557447291178301459
+    },
+    {
+      "lane": "blob",
+      "level": 0,
+      "segment_id": 2,
+      "chunk_count": 2,
+      "point_count": 2,
+      "series_count": 2,
+      "min_ts": 210,
+      "max_ts": 220,
+      "wal_highwater_segment": 0,
+      "wal_highwater_frame": 6,
+      "chunks_len": 260,
+      "chunks_hash64": 7698155345042668988,
+      "chunk_index_len": 102,
+      "chunk_index_hash64": 12564719137593471879,
+      "series_len": 153,
+      "series_hash64": 9424379843580655836,
+      "postings_len": 107,
+      "postings_hash64": 13026260879854445619
+    }
+  ],
+  "series_fingerprint": {
+    "series_count": 5,
+    "series_hash64": 13780664624644456642
+  }
+}

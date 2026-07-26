@@ -453,6 +453,33 @@ impl ChunkStorage {
                         };
                         let _pass = BackgroundWorkerPassGuard::new(runtime.as_ref());
 
+                        // When no higher-priority persisted delta is pending, recovery-snapshot
+                        // reconciliation owns this wake's complete shared maintenance envelope.
+                        // A stranded page therefore cannot starve post-flush/catalog publication,
+                        // and one worker wake cannot multiply the configured item/byte limits.
+                        if storage.bounded_tombstone_recovery_snapshot_is_pending()
+                            && !storage
+                                .coordination
+                                .post_flush_maintenance_pending
+                                .load(Ordering::Acquire)
+                            && !storage
+                                .persisted
+                                .persisted_index_dirty
+                                .load(Ordering::Acquire)
+                            && !storage.has_known_persisted_segment_changes()
+                        {
+                            let flow = control.handle_result(
+                                "tombstone_recovery_snapshot",
+                                storage.run_bounded_tombstone_recovery_snapshot_if_pending(),
+                            );
+                            drop(maintenance_guard);
+                            break 'pass match flow {
+                                BackgroundWorkerFlow::Continue => Some(interval),
+                                BackgroundWorkerFlow::Pause(duration) => Some(duration),
+                                BackgroundWorkerFlow::Exit => None,
+                            };
+                        }
+
                         match control.handle_result(
                             "flush_maintenance",
                             storage.run_post_flush_maintenance_if_pending(),

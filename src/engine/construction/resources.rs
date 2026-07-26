@@ -53,6 +53,30 @@ impl PendingPersistedSegmentDiff {
     pub(in crate::engine::storage_engine) fn merge(&mut self, other: Self) {
         self.record_changes(other.added_roots, other.removed_roots);
     }
+
+    pub(in crate::engine::storage_engine) fn take_one(&mut self) -> Self {
+        let mut selected = Self::default();
+        if let Some(root) = self.added_roots.pop_first() {
+            selected.added_roots.insert(root);
+        } else if let Some(root) = self.removed_roots.pop_first() {
+            selected.removed_roots.insert(root);
+        }
+        selected
+    }
+
+    /// Restores an older claimed intent only if no newer intent for that root arrived meanwhile.
+    pub(in crate::engine::storage_engine) fn restore_if_unmodified(&mut self, claimed: Self) {
+        for root in claimed.added_roots {
+            if !self.added_roots.contains(&root) && !self.removed_roots.contains(&root) {
+                self.added_roots.insert(root);
+            }
+        }
+        for root in claimed.removed_roots {
+            if !self.added_roots.contains(&root) && !self.removed_roots.contains(&root) {
+                self.removed_roots.insert(root);
+            }
+        }
+    }
 }
 
 impl ChunkStorage {

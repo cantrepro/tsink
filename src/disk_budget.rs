@@ -894,10 +894,11 @@ impl LocalDiskBudget {
     /// Returns the effective per-entry allowance used for snapshot restore staging admission.
     ///
     /// This is `max(SNAPSHOT_RESTORE_ENTRY_STAGING_ALLOWANCE_FLOOR_BYTES,
-    /// destination_filesystem_allocation_unit)`. A budgeted restore reserves
-    /// `logical_file_bytes + entry_count * this_value`. The result is a conservative admission
-    /// unit for entry metadata and minimum allocation, not an exact statement of total physical
-    /// filesystem consumption.
+    /// destination_filesystem_allocation_unit)`. The copied-tree component of budgeted restore is
+    /// `logical_file_bytes + entry_count * this_value`; semantic-validation recovery scratch and
+    /// operation-owned entries extend the complete restore peak. The result is a conservative
+    /// admission unit for entry metadata and minimum allocation, not an exact statement of total
+    /// physical filesystem consumption.
     pub fn snapshot_restore_entry_staging_allowance_bytes(&self) -> Result<u64> {
         let allocation_unit = self
             .space_probe
@@ -3607,6 +3608,10 @@ fn classify_path(root: &Path, path: &Path) -> DiskCategory {
         || file_name.eq_ignore_ascii_case("series_index.delta.bin")
         || file_name.eq_ignore_ascii_case("series_index.catalog.json")
         || file_name.eq_ignore_ascii_case("segment_catalog.json")
+        || file_name.eq_ignore_ascii_case(
+            crate::engine::storage_engine::data_directory_manifest::
+                DATA_DIRECTORY_MANIFEST_FILE_NAME,
+        )
         || path_component_strs(relative)
             .any(|component| component.eq_ignore_ascii_case("series_index.delta.d"))
     {

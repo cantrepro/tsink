@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::storage::SeriesSelection;
-use crate::QueryExecution;
+use crate::{QueryExecution, SelectSeriesExecutionResult};
 
 use super::metadata_context::MetadataListMaterialization;
 use super::{
@@ -105,37 +105,37 @@ impl ChunkStorage {
         let scope = scope.normalized()?;
         context.live_metric_series_for_scope(&scope, "list_metrics_in_shards")
     }
-    pub(in crate::engine::storage_engine) fn select_series_api(
+    pub(in crate::engine::storage_engine) fn select_series_result_api(
         &self,
         selection: &SeriesSelection,
         execution: &QueryExecution,
-    ) -> Result<Vec<MetricSeries>> {
-        self.select_series_with_optional_scope_api(selection, None, execution)
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.select_series_with_optional_scope_result_api(selection, None, execution)
     }
 
-    pub(in crate::engine::storage_engine) fn select_series_in_shards_api(
+    pub(in crate::engine::storage_engine) fn select_series_in_shards_result_api(
         &self,
         selection: &SeriesSelection,
         scope: &crate::storage::MetadataShardScope,
         execution: &QueryExecution,
-    ) -> Result<Vec<MetricSeries>> {
+    ) -> Result<SelectSeriesExecutionResult> {
         let scope = scope.normalized()?;
-        self.select_series_with_optional_scope_api(selection, Some(scope), execution)
+        self.select_series_with_optional_scope_result_api(selection, Some(scope), execution)
     }
 
-    fn select_series_with_optional_scope_api(
+    fn select_series_with_optional_scope_result_api(
         &self,
         selection: &SeriesSelection,
         scope: Option<crate::storage::MetadataShardScope>,
         execution: &QueryExecution,
-    ) -> Result<Vec<MetricSeries>> {
+    ) -> Result<SelectSeriesExecutionResult> {
         self.observability
             .query
             .select_series_calls_total
             .fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
 
-        let result = (|| -> Result<Vec<MetricSeries>> {
+        let result = (|| -> Result<SelectSeriesExecutionResult> {
             execution.checkpoint()?;
             self.ensure_open()?;
             self.request_background_persisted_refresh_if_needed();
@@ -144,12 +144,14 @@ impl ChunkStorage {
                 #[cfg(test)]
                 self.invoke_metadata_query_time_range_summary_hook();
             }
-            let series = match scope.as_ref() {
-                Some(scope) => self.select_series_in_shards_impl(selection, scope, execution),
-                None => self.select_series_impl_with_execution(selection, execution),
+            let (series, reservation) = match scope.as_ref() {
+                Some(scope) => {
+                    self.select_series_in_shards_impl_result(selection, scope, execution)
+                }
+                None => self.select_series_impl_with_execution_result(selection, execution),
             }?;
             self.charge_series_query_result(execution, 0, 0, &series)?;
-            Ok(series)
+            Ok(SelectSeriesExecutionResult::accounted(series, reservation))
         })();
 
         self.observability
@@ -162,7 +164,10 @@ impl ChunkStorage {
                 self.observability
                     .query
                     .select_series_returned_total
-                    .fetch_add(saturating_u64_from_usize(series.len()), Ordering::Relaxed);
+                    .fetch_add(
+                        saturating_u64_from_usize(series.series.len()),
+                        Ordering::Relaxed,
+                    );
                 Ok(series)
             }
             Err(err) => {

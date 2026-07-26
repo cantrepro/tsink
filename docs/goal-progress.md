@@ -29,6 +29,32 @@ meanings defined there: `DONE`, `IN PROGRESS`, `BLOCKED`, `DEFERRED`, and `HUMAN
 The quick BPP and Criterion regression jobs in CI were inspected but were not part of the initial
 baseline run.
 
+### Continuation audit
+
+- Date: 2026-07-26
+- Audited revision: `4b54297e94ca1c86b4416c9bdc4f161e41e67629`
+- Branch: `master`, four commits ahead of `origin/master`
+- Toolchain: Rust/Cargo 1.97.1
+- Initial working tree: clean
+
+The continuation audit re-read the implementation, public documentation, adapters, package
+manifests, and workflows rather than treating this ledger as authority. It found that the
+cross-lane/tiered tombstone coordinator described by
+[`ADR 0005`](adr/0005-cross-filesystem-tombstone-transactions.md) is implemented and tested, while
+this ledger still called it incomplete. It also found stale finite-profile defaults, stale on-disk
+layout names, invalid Python and cluster quick-start forms, incomplete downstream package metadata,
+and a publication workflow that could publish on every push to `master`.
+
+At the audited revision, formatting and the all-target workspace check passed. The all-features
+clippy run found one pre-existing `field_reassign_with_default` test lint, and the all-features
+workspace test reached 892 passing core unit tests before four core integration regressions failed:
+one canonical memory-admission test received an outer error instead of indexed rejections, and
+three tests still assumed legacy unlimited builder defaults. The continuation reconciles the
+canonical case by separately admitting the bounded rejection-result envelope: indexed outcomes are
+returned when that response fits, while an outer memory error remains when even the result cannot
+be admitted. It also makes the three intentionally unbounded test configurations explicit. The
+complete rerun is recorded below; the initial failures are not hidden as environmental.
+
 ## Verified baseline inventory and contradictions
 
 The statements in this section describe the unmodified baseline. The roadmap ledger below records
@@ -67,9 +93,21 @@ the changes made since that snapshot.
   [`ADR 0001`](adr/0001-write-contract.md) documentation.
 - `DONE` Declare Rust 1.89 as the MSRV, add CI coverage, and pass the locked all-target workspace
   check on that toolchain.
-- `DONE` Verify crate contents and the package dry run. The current package contains 249 files and excludes
+- `DONE` Verify crate contents and the package dry run. The current package contains 264 files and excludes
   `GOAL.md`, `docs/goal-progress.md`, `.github`, and `scripts`.
 - `DONE` Improve documentation of the primary embedded lifecycle and canonical write APIs.
+- `DONE` Re-audit public examples, finite-profile defaults, on-disk layout, and tuning guidance
+  against the implementation. Correct Python naming/restore usage, boolean CLI examples, real
+  segment/tombstone/catalog paths, and the direct server invocation shown by `--help`.
+- `DONE` Add pull-request, rustdoc, no-default-feature, and package-dry-run CI coverage and remove
+  automatic publication from `master`. Published GitHub Releases and manual tag dispatches now
+  require a real version tag at the exact checked-out revision, a promoted and empty-Unreleased
+  changelog, the release workflow's Ubuntu verification matrix, MSRV validation, a server-version
+  smoke test, and package dry runs. It does not currently depend on the separate Windows CI or
+  benchmark jobs. Actual registry publication remains fail closed until every mandatory GOAL
+  release gate exists.
+- `DONE` Complete crates.io/PyPI metadata for the server and Python binding packages while keeping
+  repository-only measurement and migration helper scripts out of runtime package contents.
 - `DONE` Pass the complete post-change formatting, lint, test, documentation, no-default-feature,
   MSRV, and package verification matrix recorded below.
 
@@ -124,6 +162,13 @@ the changes made since that snapshot.
 - `DONE` Make hinted-handoff and edge replay remove entries after a valid complete atomic result;
   edge queue Ack records are successfully appended and synchronized before pending in-memory state
   is removed. Retention expiry remains a separate, explicit edge-queue removal path.
+- `DONE` Make `tsink-migrate backfill` retain and validate remote-write response evidence instead
+  of accepting any 2xx. Every non-empty batch requires one canonical acknowledgement and no
+  partial, indeterminate, or error evidence; metadata counts must be consistent, all submitted
+  native histograms and exemplars must be accepted, and any dropped exemplar fails the migration.
+  The default acknowledgement floor is `durable`; explicitly weaker floors and the weakest observed
+  result are reported. The point limit remains hard when one source series must be split into
+  label-preserving sample, histogram, and exemplar fragments.
 
 Phase 1 does not claim a cross-component HTTP transaction, cross-node atomicity, or exactly-once
 delivery. Those boundaries are explicit and observable. Comprehensive disk quota enforcement
@@ -142,7 +187,14 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
 - `DONE` Make current memory observability explicit about estimated accounted bytes, mmap virtual
   extent, unknown excluded bytes, and named excluded work classes. Publish deterministic
   `Normal`, `ApproachingLimit`, `Backpressured`, `Rejecting`, and instance-level `Degraded`
-  pressure states plus memory-specific waiter, event, and rejection counters.
+  pressure states plus memory-specific waiter, event, and rejection counters. The live WAL writer
+  buffer is charged at its actual retained capacity and exposed as a separate memory component;
+  finite persistent configurations smaller than that indivisible allocation fail before opening
+  the data path.
+- `DONE` Admit atomic active-state clone/finalization/codec staging through the foreground
+  `write_transient_bytes` lease. The conservative model charges each pre-existing state and the
+  prepared retained-growth allowance before any clone, applies to startup WAL replay, releases on
+  every outcome, and has an exact-fit/one-byte-short no-publication regression.
 - `DONE` Move initial local-disk reconciliation, exact owned-orphan planning, tombstone
   recovery/cleanup preflight, and post-flush replacement-marker recovery out of the unbounded
   startup gap. These operations now admit conservative transient peaks against the configured
@@ -159,7 +211,7 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
 - `DONE` Close the concurrent WAL-quota preflight race by performing the definitive size check
   while holding the WAL writer lock. A deterministic competing-writer test proves that only one
   frame can consume the final available quota and that runtime accounting matches disk.
-- `IN PROGRESS` The persistent core now has a shared local-disk coordinator with checked atomic
+- `DONE` The persistent core now has a shared local-disk coordinator with checked atomic
   reservations, configurable physical headroom and maintenance reserve, exact restart/cleanup
   reconciliation, category accounting, over-limit recovery admission, structured failures, and
   observability across sync, async, UniFFI/Python, and server status/metrics surfaces. Core WAL,
@@ -269,8 +321,14 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   advertise `budgeted_restore_v1`, and local cluster targets plus the post-restore report share that
   coordinator without an unbudgeted fallback. Report/source/target overlap is rejected before
   restore mutation, while a bounded post-commit report failure is explicit degraded success.
-  A stable leased coordinator for cross-lane, potentially cross-filesystem tombstone manifest
-  publication remains incomplete, so the disk item is not `DONE`.
+  The cross-lane and tiered tombstone transaction described by
+  [`ADR 0005`](adr/0005-cross-filesystem-tombstone-transactions.md) is also present: the data path
+  has a crash-recoverable transaction record, one read-write owner holds the shared object-store
+  writer lease, remote visibility is durably anchored before delete acknowledgement, and startup
+  converges interrupted publication. The continuation audit passed all 31 focused deletion tests
+  and all 5 shared-object-store writer-lease tests. Expensive full reconciliation after effective
+  cleanup remains a throughput risk recorded below, but it is no longer a missing disk-consistency
+  mechanism or a reason to leave this acceptance item open.
 - `IN PROGRESS` Make core background ownership explicit and observable. A built instance now reports
   its fixed flush, compaction, persisted-refresh/retention/tiering, and rollup thread/concurrency
   bounds plus effective cadences. Every worker records starts, exits, coalesced notifications, idle
@@ -319,8 +377,39 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   snapshot within the maintenance byte ceiling and 16,384-entry namespace, then publishes stable
   add/prune root deltas with exact-page retry and visibility-generation invalidation. It never
   publishes a partial scan as complete; restart falls back to strict startup hydration.
-  `ExpertUnlimited`, lifecycle startup/close, and tiered segment-catalog publication retain
-  complete snapshots. Finite explicit/manual rollup calls now advance the same shared cursor by
+  Finite compute-only segment refresh now requires the side-by-side v3 pointer and immutable framed
+  generation described by
+  [`ADR 0006`](adr/0006-framed-tiered-segment-catalog-generations.md). It validates the complete
+  checksummed generation in item/byte-bounded pages before live mutation, applies bounded additions
+  before removals, requires a distinct terminal pointer probe, and never falls back to a tier scan
+  for missing or corrupt v3. Pointer changes restart the process-local cycle; without a shared
+  stale-reader lease, continuous writer publication can delay convergence. The v2 JSON snapshot
+  remains readable for old binaries, startup, and `ExpertUnlimited`. Finite read-write publication
+  now scans persisted roots and streams local v2, immutable v3, and shared v2 fragments through a
+  process-local item/byte-bounded continuation. It commits the authoritative pointer last, restarts
+  on visibility-generation churn, accounts retained state as `remote_catalog_staging_bytes`, and
+  keeps post-flush source roots behind a durable Committing marker until the pointer is published.
+  Exact owned startup cleanup removes deterministic crash-orphan stages without globbing the
+  shared namespace; `ExpertUnlimited` retains the complete one-shot path.
+  Finite compute-only add/remove pages now reserve their complete one-root load and publication
+  peak against both the maintenance byte ceiling and shared storage-memory budget before source
+  validation, runtime-index loading, or visibility mutation. The model includes root/vector clones,
+  registry-catalog and inventory deltas, scoped visibility/accounting scratch, and eventual live
+  index/registry/postings growth, then reconciles actual collection/string/postings capacities
+  before publication and restores the cursor-only lease on every outcome. Exact N/N-1 byte and
+  memory tests, plus a missing-source preflight failure, prove no under-budget publication and zero
+  residual reservation after terminal/error cleanup. `ExpertUnlimited` retains its complete legacy
+  path.
+  Finite compute-only tombstone refresh now has its separate process-local continuation: it probes
+  only six exact shared manifests, charges each existing manifest and immutable referenced shard,
+  retains admitted decoded fragments across wakes, terminally revalidates every manifest, and
+  publishes their monotonic union with the old live map under one visibility fence before segment
+  additions. Manifest/pointer/visibility changes restart without exposing the staged map, and no
+  tombstone root scan is used. The final mutable `HashMap` swap plus visibility-cache rebuild
+  remains one hard-bounded item; `MaintenanceWorkItemTooLarge` preserves old visibility when it
+  cannot fit. Replacing that structured strand point with an immutable sharded live snapshot and
+  epoch-tagged cache is still open. Finite explicit/manual
+  rollup calls now advance the same shared cursor by
   one policy and one item/byte-bounded source-postings page, return structured continuation state,
   retain the cursor on global failure, and require an empty terminal page for an exact multiple.
   Rollup status uses traversal counters rather than re-enumerating every source. Explicit
@@ -345,11 +434,73 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   companion vector are reserved before allocation and charged to the same
   series/result/intermediate limits. Cold repair re-admits actual range growth while holding the
   active/sealed read guards, so a concurrent post-estimate write cannot bypass the memory envelope.
+  Ordinary and shard-scoped metadata selection now carries that execution through missing-summary
+  repair, live/dead retention partitioning, and time-range summary repair. ID vectors are admitted
+  before collection, long partitions checkpoint cooperatively, and exact/one-under memory and
+  vector tests release every reservation.
   The default-tenant server wrapper shares that execution across scoped and legacy selections and
-  reserves its combined in-place merge. A three-run Server pressure row filled all 32 query slots,
+  reserves its combined in-place merge. Execution-aware point and metadata operations now return
+  detailed results whose capacity-based modeled-memory guards remain live with the vectors;
+  point batches also carry exact selector-existence bits. Guarded paged row scans likewise retain
+  their result allocation and pre-admit the complete cloned identity-resolution vector before
+  allocation. Built-in local storage,
+  tenant/default-tenant wrappers, and distributed storage propagate or replace those guards around
+  their final retained results. Third-party compatibility backends still default to
+  `QueryExecutionAccounting::Unaccounted`, and bounded PromQL/internal/distributed paths that need
+  complete accounting reject that contract instead of accepting an unguarded result.
+  PromQL multi-series fetch, range-prefetch, and `info()` data paths now use both detailed metadata
+  and detailed point results. They validate batch identities/existence evidence, pre-admit their
+  label/point row transform, resize and transfer the point reservation to the actual
+  capacity-based rows, and retain it through consumption or cache ownership. Bounded point
+  backends fail closed before selection when they report `Unaccounted`. The exact-label selector
+  fast path now uses that same guarded point contract instead of the compatibility `Vec` handoff,
+  and retains its first result guard across later expression reads. `info()` pre-admits its keyed
+  series map before cloning keys or labels, drops replaced-entry reservations, reserves
+  map-to-vector conversion, and accounts both scratch and retained label-merge growth. Exact/one-
+  under memory and false-`Complete` tests cover these paths.
+  `max_returned_bytes` now uses a canonical logical model based on fixed slots and content lengths,
+  including byte/string and native-histogram contents, while retained memory continues to use
+  capacities and allocation allowances. PromQL `info()` metric discovery and series selection
+  reuse the same execution; focused tests at a one-query concurrency ceiling prove there is no
+  nested permit acquisition, request-tightened series accounting is retained, and all query
+  resources return to zero. Prometheus remote-read now admits one execution per HTTP request and
+  reuses it across every protobuf query, candidate discovery, guarded batch point read, protobuf
+  transform, aggregate response encoding, and Snappy compression. Its allocation-free protobuf
+  wire preflight admits the decoded body and decoded request heap before those allocations.
+  Exact-two and one-over returned-sample tests prove cumulative accounting at a one-query
+  concurrency ceiling, stable 413 error codes, and complete permit/memory release without loopback
+  I/O. Exact/one-under aggregate byte and full-request memory tests, malformed/oversized input
+  tests, and false/missing detailed-result guards cover non-truncating failure and release paths.
+  The aggregate protobuf remains capped at 64 MiB and an over-limit result never returns a partial
+  response. Raw and compressed buffers overlap under query-memory reservations through successful
+  compression and usage recording; the compressed body becomes caller/transport-owned only at the
+  explicit `HttpResponse` handoff, where that query reservation is released.
+  Bounded distributed metadata and point reads execute peers sequentially, forwarding residual
+  cumulative scan/pattern/step/deadline work, reserving planning and merge state, validating peer
+  counters/existence evidence, and charging the deduplicated final logical union. Exactly exhausted
+  scan work intentionally rejects before another peer, even if that peer might add no scan work.
+  Final logical result limits are not divided into physical transport shares: each peer retains the
+  original finite result limits, and every raw response is independently constrained by the fixed
+  HTTP header/body cap. Accounted RPC calls preflight exact request JSON and headers, reserve raw
+  response growth, and retain a conservative decode envelope until merge consumption.
+  Compatibility/caller-owned vectors after their detailed guard is consumed, caller/backend
+  internals, and external allocator/runtime/kernel/TLS buffers remain outside the portable
+  shared-memory model. The embedded PromQL parser also rejects more than 64 KiB of input,
+  16,384 non-EOF tokens, or 64 nested expression levels; unary, binary,
+  parenthesis, and repeated subquery chains have exact-boundary tests and cannot recurse or
+  construct an arbitrarily deep AST. A no-loopback acceptance matrix now selects the finite `Test`
+  profile and tightens only `max_samples_returned` to two. Direct, async, PromQL range, and HTTP
+  range entrypoints all accept exact N, reject N+1 structurally without truncation, and release
+  every permit and shared-memory reservation; direct and PromQL expired deadlines also reject
+  before admission, the async dropped-future characterization now uses the same finite `Test`
+  query limits and releases its permit/queue bytes, and HTTP preserves the stable 413 error code.
+  This closes baseline standard-profile propagation evidence, not large-shape or profile-constant
+  calibration.
+  A three-run Server pressure row filled all 32 query slots,
   rejected N+1 structurally, completed 32/32 range reads plus a concurrent
-  100,000-point writer each run, and released active/shared memory accounting to zero; async,
-  PromQL, HTTP, and broader query-shape calibration remain open, so this item is not `DONE`.
+  100,000-point writer each run, and released active/shared memory accounting to zero; high-scale
+  async, PromQL, HTTP, distributed, and broader query-shape calibration remain open, so this item
+  is not `DONE`.
 - `DONE` Bound the runtime-independent async facade's owned command inputs. The read and write
   channels retain their finite command counts and now have independent finite modeled-byte caps,
   atomic RAII admission across concurrent and channel-blocked producers, structured rejections,
@@ -381,9 +532,15 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   the 512 MiB Embedded row at 221,164,931 bytes. The Server base row passed 3/3 with a 441,129,372-
   byte p95 modeled peak, while its query-pressure row passed 3/3 with a 6,092,048-byte p95 peak
   shared query reservation. The 16-writer row admitted 400,000 new series in each of three runs.
-  The harness now records a separately labeled process-wide RSS high-water, but the clean RSS
-  matrix, query entry-point breadth, and non-memory calibration remain open,
-  so exact profile constants are still provisional pending the final clean matrix.
+  A 2026-07-26 modified-tree continuation repeated every named row: Test, Edge, Embedded, and Server
+  base peaked at 5,963,340, 90,134,415, 221,100,680, and 441,075,551 modeled bytes respectively,
+  while their process-wide RSS high-waters were 46,104,576, 429,703,168, 1,018,019,840, and
+  1,995,440,128 bytes. The writer row admitted all 1.2 million submitted series but reached
+  4,083,548,160 bytes of process RSS; the query row retained exact N/N+1 and release invariants with
+  a 6,666,297-byte peak shared reservation. Every mixed row still missed the separate persisted
+  B/point target. The clean/multi-host RSS matrix, modeled-to-process reconciliation, high-scale
+  and larger-shape query breadth, and non-memory calibration remain open, so exact profile
+  constants are provisional.
 - `DEFERRED` Complete byte reservations for remaining transient and non-write memory growth,
   the residual background pass integrations, and final profile measurements.
 
@@ -393,19 +550,115 @@ important allocation classes are named but unaccounted. Snapshot restore require
 immutable source because static path validation does not protect against a hostile concurrent
 namespace swap. Shared query budgets are enforceable and observable; standard profiles now install
 finite values, while explicit `ExpertUnlimited` preserves the legacy all-`None` query controls.
-The named constants are not yet calibrated, and caller-provided aggregator internals remain outside
-the modeled query-memory boundary. Usage metering is awaited and may add response latency. Its
-in-memory state and administrative readers are now finite; a complete storage reconciliation still
-performs a full database scan on its separately serialized blocking lane.
+Detailed built-in point/metadata/row-page results and bounded tenant/distributed propagation retain
+their modeled-memory guards, but compatibility caller-owned vectors, caller/backend internals, and
+external allocator/runtime/kernel buffers remain outside that contract. The named constants and
+broader adapter/query shapes are not yet calibrated. Usage metering is awaited and may add response
+latency. Its in-memory state and administrative readers are finite. Complete storage reconciliation
+uses guarded bounded pages, one whole-operation execution, two-pass fingerprints, a final manifest,
+and finite row/sample/byte/memory/page/attempt/time ceilings on its separately serialized lane; it
+is still an optimistic retry protocol rather than a durable linearizable storage generation.
 
-### Phase 3 — durability, format upgrades, and crash recovery: `DEFERRED`
+### Phase 3 — durability, format upgrades, and crash recovery: `IN PROGRESS`
 
-WAL and segment recovery tests exist, but the durability matrix, data-directory manifest, golden
-upgrade fixtures, and process crash harness are not complete.
+The durability matrix and WAL/segment recovery tests now have an initial public-API, cross-process
+crash harness. For three deterministic seeds in each of `PerAppend` and one-hour `Periodic` mode,
+the parent starts a child on a fresh temporary database, receives one uniquely numbered
+acknowledgement only after the write returns and the pipe record is flushed, then kills the child
+while its storage remains live and blocked before the next write. The parent reopens the database,
+requires every `Durable` sample to have survived with its exact identity and value, and permits an
+`Appended` or `Volatile` sample to be absent or present but never corrupt. Six child executions
+finish in roughly two seconds on the current development host.
 
-### Phase 4 — `tsink-test`: `DEFERRED`
+Two frozen compatibility fixtures now cover the supported pre-manifest storage-format-v2 layout.
+The independently produced fixture was written by tsink package 0.10.1 from local release commit
+`00cc627df7b36ae1838f68da273c42949f0a5d52` in an isolated `/tmp` `git archive` export, using
+locked dependencies and a frozen external public-API driver that rejects other package versions.
+That historical release predates `tsink-manifest.json`, so the directory was naturally
+manifestless and no identity file was removed. The original format-focused fixture remains
+unchanged; it was produced by the current v2 writer before its manual generator removed only the
+manifest. The local checkout contains no tag ref for 0.10.1, so the independent provenance claims
+the exact release commit and package version rather than a signed or annotated artifact.
 
-No dedicated testkit crate, public manual clock, or deterministic maintenance fixture exists.
+Both fixtures' checked-in provenance and every data file's content-hash/size inventory are verified
+before every test copy. The public legacy-open path installs the current manifest; each test then
+queries numeric, blob, native-histogram, retained, tombstoned, and genuinely WAL-recovered records,
+writes a new typed record, closes, reopens, and verifies the old and new state plus the current
+manifest. Each upgraded fixture is then snapshotted and restored through the public APIs; the
+restored manifest is checked byte-for-byte before strict reopen, followed by the same complete old,
+tombstoned, histogram, WAL-recovered, and new-data assertions. Generators are explicit and manual,
+refuse to overwrite existing fixtures, and are never invoked by tests. Retention-policy metadata is
+not applicable because the builder policy is runtime configuration rather than persisted v2 state;
+the named retained samples prove only that ordinary non-tombstoned data remains visible. The known
+zero-byte `.tsink.lock` entries are intentionally frozen. Fresh generation is not promised to be
+byte-identical because segment creation timestamps and concurrent series registration can vary;
+inventories freeze reviewed bytes rather than authorizing automatic hash replacement.
+
+This evidence establishes independent previous-release compatibility for the exact supported
+format-2 path, but does not test migration from a storage format older than 2. The crash harness
+covers abrupt user-process termination, not kernel/power loss. The deterministic in-process
+failpoint matrix listed in the charter is now implemented and indexed in
+[`durability-failpoints.md`](durability-failpoints.md): definition/sample WAL append, flush, sync,
+chunk sealing, segment creation, index writing, file/directory sync, catalog/manifest replacement,
+compaction publication, WAL reset, snapshot copy, and snapshot final publication all have named
+failure/retry evidence. Those hooks prove software ordering and recovery at their injected
+boundaries; they do not simulate torn sectors, kernel or power failure, lying devices, controller
+caches, or every supported filesystem.
+
+Snapshot/restore now enforce aggregate 100,000-entry/depth-128 staging limits, reuse exact measured
+copy ceilings, create staging exclusively, publish through platform no-replace primitives, and
+preserve raced names. Cleanup never expands from the precomputed operation namespace; completed
+trees require captured descendant identities, unknown or replaced entries are retained, partial
+copies without complete identity evidence are retained, and a visible snapshot whose final parent
+sync fails is reported with indeterminate durability rather than recursively deleting possible
+consumer data. The final inspection/salvage acceptance audit is complete. Cross-platform
+handle-relative traversal/copy qualification remains open, so Phase 3 and the full crash-recovery
+gate remain in progress.
+
+### Phase 4 — `tsink-test`: `IN PROGRESS`
+
+The workspace now includes the foundational `tsink-test` crate. `TsinkTestDb` supports isolated
+`TempDir`, pure in-memory, and caller-owned persistent-directory modes with
+`ResourceProfile::Test` by default. Its deliberately narrow public surface preserves canonical
+atomic `BatchWriteResult`, evaluates instant and range PromQL at caller-supplied timestamps,
+restarts temporary or persistent storage on the same directory, exposes a process-safe diagnostic
+identifier and bounded operation ring, and provides explicit idempotent close with best-effort
+`Drop`. Its PromQL assertion layer calls those same direct instant/range methods and adds
+error-returning normalized full-value comparison, approximate scalar checks with explicit
+tolerance, empty/non-empty vector or matrix checks, and structural parser, unsupported-operation,
+and query-limit expectations. Assertion failures hard-cap the query, expected/actual summaries,
+total message, and a finite-profile nearby-series snapshot drawn from at most 4 of 16 bounded
+accepted identities and 3 points per identity. No separate PromQL semantics layer or implicit
+wall-clock time is introduced.
+
+The focused public-API suite proves close/restart persistence, persistent reopen across fixture
+values, parallel independent temporary roots and IDs, direct explicit-time PromQL, deterministic
+vector/matrix normalization, exact scalar-tolerance boundaries, typed expected errors, bounded
+nearby-series diagnostics, diagnostic eviction, and configuration rejection with
+`cargo test -p tsink-test --all-targets` (18 passed). The fixture-data slice proves canonical
+atomic ingestion for label/series/sample helpers, checked evenly spaced counter and gauge
+sequences, PromQL-queryable classic histogram expansion, malformed histogram rejection, and
+first-class native histogram round-trip. The package also passes 2 doctests, warning-free
+package-local clippy, and formatting verification.
+
+Generated Prometheus remote read/write and OTLP metric models now live in the small
+`tsink-protocol` workspace crate rather than the server binary package. `tsink-server` consumes
+that shared crate, while the default `tsink-test` dependency set remains engine-plus-`tempfile`
+only. Enabling `tsink-test/prometheus` adds the shared protobuf model and Snappy encoder and exposes
+a deterministic endpoint-ready remote-write payload builder plus a lower-level encoder for
+intentional negative fixtures. Three feature tests decode the body through the real model and
+prove canonical labels, exact samples, structured ambiguity rejection, and malformed-request
+preservation. The extracted server schema suites remain green (4 Prometheus fixture executions and
+6 OTLP normalization executions across the server and migration binaries), and
+`tsink-protocol` passes warning-free clippy and package-content inspection. The complete
+`tsink-test --all-features --all-targets` run passes 21 tests plus 2 doctests; the default
+dependency tree remains exactly `tsink`, `tempfile`, and their transitive dependencies.
+
+This is not the complete Phase 4 milestone. The crate starts no protocol listener and contains no
+Prometheus remote-write/read or OTLP adapter, public manual clock, deterministic maintenance
+driver, current-time assertion mode, remote-read and OTLP payload helpers, corruption/fault
+fixtures, or Python/pytest fixture yet. It shells out to no binary, downloads nothing, and requires
+no Docker for its current direct-core tests.
 
 ### Phase 5 — Prometheus compatibility program: `DEFERRED`
 
@@ -428,7 +681,15 @@ Benchmark and measurement scripts exist, but no complete measured resource-envel
 
 ### Phase 9 — release engineering and distribution: `DEFERRED`
 
-A publish workflow exists, but tagged release gating, artifacts, checksums, SBOMs/attestations, and
+Published GitHub Releases and manual tag dispatches verify the real tag, version, revision, a
+promoted changelog with no pending Unreleased entries, formatting, lint, all-feature and
+no-default-feature tests, docs, MSRV, server version, and package assembly. Native wheels executable
+on their builders are installed and exercised before upload, but the current matrix cannot execute
+every cross-compiled target. PyPI publication is therefore intentionally disabled while wheel and
+sdist build artifacts remain available. crates.io publication is also intentionally disabled
+because the required storage-format compatibility suite, process-crash durability suite,
+compatibility matrix, final artifact checksums, and attestations do not yet exist. Full cross-target
+runtime coverage, standalone release artifacts, checksums, SBOMs/attestations, and broader
 compatibility gates remain incomplete.
 
 ### Phase 10 — v1.0 readiness: `DEFERRED`
@@ -492,6 +753,16 @@ Phase 2 targeted verification completed since that full matrix:
   the shared core/server local-disk slice.
 - `cargo test -p tsink --all-features` — `PASS`: 586 core unit, 17 async, 4 concurrency, 59
   integration, and all remaining core suites; 0 failures.
+- `cargo test -p tsink --test query_budget_surface_acceptance_test -- --nocapture --test-threads=1`
+  — `PASS` (3 tests): finite `Test`-profile direct, async, and PromQL exact-N/N+1 returned-sample
+  admission, structured rejection, direct/PromQL deadline rejection, and zero permit/memory
+  residue.
+- `cargo test -p tsink --test async_storage_test dropped_read_futures_cancel_running_work_and_release_queued_bytes -- --nocapture --test-threads=1`
+  — `PASS` (1 test; 20 filtered): a dropped async read cancels work under the finite `Test` query
+  budget and releases its query permit, shared-memory gauge, and queued input-byte reservation.
+- `cargo test -p tsink-server range_http_test_profile_accepts_exact_n_rejects_n_plus_one_and_releases -- --nocapture --test-threads=1`
+  — `PASS` (1 matching test; 861 filtered): no-loopback finite `Test`-profile HTTP range admission,
+  stable 413/error-code mapping, and zero permit/memory residue.
 - `cargo test -p tsink-uniffi` — `PASS`: 19 unit, 13 integration, and 1 configuration test.
 - `cargo test -p tsink-server status_and_metrics_report_core_local_disk_scope_when_persistent` —
   `PASS`; `cargo doc --workspace --all-features --no-deps` — `PASS` after the shared server slice.
@@ -510,6 +781,13 @@ Phase 2 targeted verification completed since that full matrix:
 - Server metadata, exemplar, rules, usage-ledger, and managed-control-plane tiny-quota,
   persist-before-publish, exact-accounting, restart, concurrent-ordering, and torn-tail tests —
   `PASS`.
+- `cargo test -p tsink-server --all-features exemplar_store::tests -- --test-threads=1` —
+  `PASS` (19 tests) after the exemplar lifecycle envelope: exact/N-1 shape, series, batch,
+  retained, replacement, transient, serialization, durable, startup, and snapshot limits;
+  streamed/normalized restart with stable retained accounting; actual disk-budget buffer
+  reconciliation before publication; a valid 64 MiB maximum-file reopen under the 160 MiB default
+  startup formula; atomic failure paths; and concurrent durable accounting with zero transient
+  residue. The focused exemplar resource-metric rendering test also passes.
 - Direct and internal sidecar disk-quota response tests — `PASS`, including metadata-only,
   exemplar-only, and rows-committed partial-progress cases; overlapping live-root admin restore is
   rejected without replacing the live tree.
@@ -622,9 +900,169 @@ Phase 2 targeted verification completed since that full matrix:
   server/UniFFI clippy, and benchmark-workload clippy all pass with warnings denied. The stronger
   test-target lint also moved three mid-file test modules to their file ends and removed three
   mechanical test-only warnings without runtime changes.
+- 2026-07-26 continuation audit: `cargo check --workspace --all-targets` passed at the audited
+  revision. The initial full clippy run exposed one server test-only
+  `field_reassign_with_default` warning, and the initial all-features workspace test exposed four
+  integration failures after 892 core unit tests passed; those findings are recorded in
+  the continuation baseline above rather than relabeled as passes.
+- `cargo test -p tsink --test integration_test --test promql_query_budget_test` — `PASS`: all 70
+  core integration tests and all 11 PromQL budget tests passed after admitting bounded canonical
+  rejection results separately, preserving an outer error when the result itself cannot fit,
+  making the three legacy-unlimited test configurations explicit, and threading `info()` reads
+  through the caller's execution.
+- `cargo test -p tsink-server handlers::public_api::remote_read::tests -- --test-threads=1` —
+  `PASS`: 7 deterministic handler/unit tests cover one shared execution across two returned
+  series, cumulative `max_samples_returned`, exact and one-under encoded-byte boundaries,
+  multi-query sequential slot release, stable 400/413/429/500/503 mappings, and zero active/shared
+  resources after both success and failure.
+- Canonical detailed-result and distributed query-accounting verification — `PASS`:
+  `cargo test -p tsink --lib engine::storage_engine::tests::query_budget --all-features`
+  passed all 19 tests; `cargo test -p tsink --test promql_query_budget_test --all-features`
+  passed all 17 tests; and the all-feature `cluster::query::tests` and
+  `cluster::query_merge::tests` server filters passed 26 and 4 tests respectively. Focused tests
+  pin capacity-independent logical bytes for byte strings, UTF-8 strings, and native histograms;
+  exact/one-under point, metadata-result, and planning-memory limits; detailed-result guard
+  lifetime/release; PromQL multi-series guard adoption, fail-closed point accounting, and exact
+  prefetch-memory boundaries; bounded remote deduplication; and the intentional
+  zero-scan-residual rejection.
+- `cargo test -p tsink-server --bin tsink-migrate` — `PASS`: 46 tests passed and one live
+  interoperability test remained explicitly ignored. Focused response tests cover canonical
+  acknowledgements including the default durable floor and explicit weaker opt-in, metadata-only
+  idempotent replay, partial/indeterminate evidence, exact exemplar and native-histogram counts,
+  rejection of any dropped exemplar, and hard batching for one oversized mixed-payload series.
+- PromQL parser safety verification — `PASS`: 82 extended lexer/parser tests, 43 PromQL integration
+  tests, and 12 library PromQL tests cover exact/one-over byte, token, and depth ceilings plus
+  4,096-level adversarial parenthesis, unary, and right-associative shapes without stack overflow.
+- Focused deletion and shared-object-store lease verification — `PASS`: 31 tombstone/deletion
+  tests and 5 writer-lease tests, confirming the ADR 0005 coordinator recorded above is present.
+- Public-API process crash durability verification — `PASS`: `cargo check -p tsink --test
+  crash_durability_test`, `cargo clippy -p tsink --test crash_durability_test -- -D warnings`, and
+  `cargo test -p tsink --test crash_durability_test -- --nocapture` passed. One parent test
+  completed six abrupt child kills in 1.96 seconds: three deterministic crash points each for
+  `PerAppend` and one-hour `Periodic`, with flushed acknowledgement handshakes, no child
+  `close`/Drop path, exact durable-sample recovery, non-guaranteed appended/volatile handling, and
+  recovered identity/value validation.
+- Frozen pre-manifest storage-format-v2 compatibility verification — `PASS`: the current
+  compatibility test contains two passing cases. One keeps the format-focused fixture generated by
+  the current v2 writer. The second opens bytes independently written by tsink 0.10.1 from release
+  commit `00cc627df7b36ae1838f68da273c42949f0a5d52`, built offline from an isolated `git archive`.
+  The historical `cargo run --offline --locked` generation completed against package 0.10.1;
+  targeted rustfmt and diff checks passed; `cargo check -p tsink --test
+  storage_format_compatibility_test` and warning-denied clippy over that target passed; and `cargo
+  test -p tsink --test storage_format_compatibility_test -- --nocapture` passed 2 tests.
+  Each case verifies checked-in provenance and every regular data file's xxHash64/size inventory
+  before copying it, exercises the strict legacy-open path and installed current manifest, checks
+  numeric, blob, native-histogram, retained, tombstoned, and WAL-recovered data, then writes,
+  closes, reopens, and verifies both old and new records. Each upgraded fixture then snapshots,
+  restores through the public API, verifies byte-for-byte manifest preservation, strict-opens the
+  restored directory, and re-verifies all applicable old and new state. Both drivers remain
+  manual-only and refuse destructive replacement of an existing fixture.
+- Finite remote segment-catalog v3 verification — `PASS`: `cargo fmt --all -- --check`,
+  `cargo check -p tsink --all-targets`, and `cargo clippy -p tsink --lib --tests -- -D warnings`
+  passed. All 58 persistence-background, 31 retention-policy, and 35 deletion-filter tests passed,
+  followed by all 910 core library tests. Focused coverage includes exact frame/item/byte and
+  namespace limits, v2 compatibility, ordered publication, symlink/corruption refusal, v2-only
+  finite backoff without a scan, full validation before visibility mutation, exact-page terminal
+  probes, pointer changes during validation/application, and repeated pointer churn delaying
+  success until publication becomes quiet.
+- Finite remote catalog apply-envelope verification — `PASS`: `cargo fmt --all -- --check`,
+  `cargo check -p tsink --all-targets`, `cargo clippy -p tsink --lib --tests -- -D warnings`, all 8
+  `finite_remote_catalog` tests, and all 71 persistence-background tests passed. The focused
+  additions cover exact N/N-1 maintenance bytes for both add and removal pages (including an 8 KiB
+  series identity), exact N/N-1 shared-memory admission for the complete add peak, no visibility
+  mutation on rejection, source disappearance before load, capacity reconciliation before the
+  visibility fence, and zero residual catalog staging after failure or terminal completion.
+- Finite remote tombstone continuation verification — `PASS`: `cargo check --lib`; all 3
+  `maintenance::catalog_refresh::bounded_tombstones::tests`; all 54 tombstone-filtered core tests;
+  the 3 finite-remote-catalog tests; and focused pointer-churn, corrupt-v3, and
+  ExpertUnlimited-compatibility tests. Deterministic coverage pins one-item manifest/shard/
+  revalidation/publication wakes, no root scan, unchanged live visibility before the terminal
+  swap, exact terminal byte admission versus N+1 structured rejection, retained-charge release,
+  and manifest replacement causing a clean restart before a complete retry.
+- Workflow and package hygiene validation — `PASS`: both GitHub workflow files parse as YAML,
+  their embedded release shell fragments pass syntax checks, manual branch dispatch is rejected,
+  artifact checkouts resolve to the verified commit, and both crates.io and PyPI publication remain
+  fail closed behind their documented missing gates. Locked Cargo metadata resolves, both
+  downstream package lists contain their README, and the root package contains 264 files.
+- Final 2026-07-26 workspace matrix — `PASS`: `cargo fmt --all -- --check`,
+  `cargo check --workspace --all-targets --locked`, and all-feature workspace clippy with warnings
+  denied passed. The loopback-permitted `cargo test --workspace --all-features --locked --quiet`
+  passed 893 core unit tests, all core integration suites, 715 server tests with one ignored
+  fixture-regeneration test, 46 migration tests with one ignored fixture-regeneration test, and all
+  async, UniFFI, documentation, and binary suites. The serialized no-default-feature workspace
+  check/test matrix passed the same counts.
+- Final documentation/toolchain/package matrix — `PASS`: rustdoc built the all-feature workspace
+  with warnings denied; Rust 1.89 checked every workspace target; `tsink-server --version` reported
+  `0.10.2`; local Markdown targets and heading anchors passed across 36 files; workflow YAML and
+  embedded shell parsed; and package dry runs produced 264-file core, 91-file server, and 18-file
+  UniFFI archives. The core archive also compiled from its packaged source.
+- The first final all-feature attempt found five missing UniFFI Python renames for newly exported
+  resource-profile types; the focused contract and final matrix now pass. A later parallel attempt
+  exposed a real rollup-response race after 892 core tests passed: explicit runs released their
+  serialization lock before taking the returned status snapshot. Snapshotting now occurs inside
+  that lock, the 30-test rollup filter passed 20 consecutive repetitions, and the final default-
+  parallel workspace rerun passed.
+- The exact named Test resource-profile row was repeated after that matrix: all 3 runs retained
+  251,000 points with zero late rejections and zero suite failures. Peak post-write modeled memory
+  was 5,963,340 bytes against the 67,108,864-byte profile ceiling, and the process-wide cumulative
+  RSS high-water was 46,104,576 bytes. Effective persisted size remained 2.332267 B/point at p50
+  and 2.339904 B/point at p95, so the separate 0.75/1.0 target still fails. The run is recorded
+  with its base revision and pre-documentation working-diff digest in
+  [`resource-profile-measurements.md`](resource-profile-measurements.md); it does not claim the
+  still-open clean-revision gate.
+- The exact named Edge row then passed 3/3 with 1,020,000 retained points per run, no late
+  rejections, and no suite failures. Its largest post-write modeled sample was 90,134,415 bytes
+  against the 268,435,456-byte ceiling, while cumulative process RSS reached 429,703,168 bytes.
+  That separation confirms that the enforced modeled ceiling is not a total-process RSS claim.
+  Persisted size remained 4.357009 B/point at p50 and 4.366931 at p95, so this row also leaves the
+  separate B/point and final clean-revision gates open.
+- The exact named Embedded row also passed 3/3 with 2,050,000 retained points per run, no late
+  rejections, and no suite failures. Its largest post-write modeled sample was 221,100,680 bytes
+  against the 536,870,912-byte ceiling, while cumulative process RSS reached 1,018,019,840 bytes.
+  Persisted size was 5.023767 B/point at p50 and 5.025235 at p95. The result is recorded with exact
+  working-diff provenance and leaves the same total-process, B/point, and clean-revision gates open.
+- The Server base continuation row passed 3/3 with 4,100,000 retained points per run, no late
+  rejections, and no suite failures. Its largest post-write modeled sample was 441,075,551 bytes
+  against the 2,147,483,648-byte ceiling; cumulative process RSS reached 1,995,440,128 bytes.
+  Persisted size was 4.889525 B/point at p50 and 4.893182 at p95. Exact provenance is recorded, and
+  the writer/query-pressure reruns plus the broader clean qualification matrix remain open.
+- The Server 16-writer continuation row admitted all 400,000 new series in each of 3 runs with no
+  failures. Aggregate throughput was 114,842.262 series/s at p50 and 115,986.291 at p95, while
+  cumulative process RSS reached 4,083,548,160 bytes—about 1.90 times the Server profile's 2 GiB
+  modeled-memory ceiling. The specialized row exposes no modeled retained-state sample, so that
+  gap remains a concrete total-process calibration blocker rather than a qualified capacity claim.
+- The Server query-pressure continuation row passed 3/3: all 32 admitted queries per run returned
+  all 262,144 points, each N+1 admission rejected structurally, every overlapping 100,000-point
+  writer completed, and active/shared query reservations ended at zero. Query-p95 latency was
+  6.944 ms at p50 and 8.415 ms at p95; peak shared reservation was 6,666,297 bytes and cumulative
+  process RSS was 168,181,760 bytes. The small deterministic acceptance matrix now covers direct,
+  async, PromQL, and HTTP propagation; high-scale adapter, distributed, and larger-shape
+  calibration remain open.
+- Independent final review found and closed six release-workflow gaps: checkout and tag
+  verification now bind to the immutable event SHA; `[Unreleased]` must be the first changelog
+  section; the ledger no longer implies that the Ubuntu release job depends on separate Windows
+  and benchmark CI; Python wheels/sdist build unconditionally while publication is disabled;
+  release/manual runs for one tag share a concurrency group; and missing artifact globs fail
+  instead of warning. YAML/duplicate-key checks, all 18 shell blocks, all 3 embedded Python
+  snippets, positive and adversarial tag/changelog simulations, job-graph inspection, and a
+  publication-command/token scan pass on the final workflow. The same review found one extra owned
+  bounded rejection message in the atomic error path.
+  Cloning only N-1 row rejections and moving the original into the final outcome restores the
+  modeled N-message peak; the focused 11-test transient-memory and 7-test canonical-atomic filters
+  pass.
+- A post-review loopback-enabled workspace run passed all 893 core unit tests but then exposed one
+  intermittent `test_concurrent_different_metrics` failure when a background fail-fast fence caused
+  writers to see `StorageShuttingDown`. The case passed immediately in isolation, the complete
+  four-test concurrency binary passed 5/5 repetitions, and the isolated case passed 20/20 further
+  repetitions. Its assertion now includes the storage health snapshot if the failure recurs. A
+  subsequent complete default-parallel workspace run passed the full matrix, including all 893 core
+  unit tests, the concurrency binary, 715 server tests with one ignored fixture test, and every
+  remaining suite. The original intermittent signal remains recorded rather than being treated as
+  a diagnosed fix.
 
-The affected matrix above was rerun for this slice. The complete workspace matrix will be repeated
-after the remaining Phase 2 implementation. These results do not make the phase complete.
+The complete current workspace matrix was repeated for this slice. These results do not make
+Phase 2 complete: final clean resource measurements, higher-scale query-shape calibration, and the
+residual boundaries recorded above remain open.
 
 The first sandboxed package dry run could not resolve the registry host. Re-running with host
 network access succeeded; this was environmental rather than a package failure.
@@ -673,12 +1111,18 @@ assigned to later roadmap phases.
   accounting are not implemented.
 - Memory pressure is pressure on estimated accounted storage state, not process RSS. Query working
   sets now have a separate modeled budget covering tsink-owned decode buffers, snapshots, candidate
-  sets, built-in aggregation state, and PromQL intermediates when configured. Excluded byte totals
-  remain honestly unknown; caller-provided aggregator internals, pending/staged writes, WAL buffers
-  and replay, rollup work, remote refresh staging, thread stacks, allocator/runtime overhead, and
-  adapter/server state are named but not yet charged to a complete process envelope.
-- Atomic active-state staging and metadata/exemplar replacement can temporarily clone state; that
-  transient memory amplification is not yet measured or governed by a complete resource profile.
+  sets, built-in aggregation state, PromQL intermediates, guarded detailed results, bounded
+  distributed merge state, and accounted internal-RPC request/header/raw/decode buffers when
+  configured. Excluded byte totals remain honestly unknown; caller-provided aggregator/backend
+  internals, compatibility results after transfer to caller ownership, public-adapter buffers not
+  explicitly reserved, caller-owned write inputs, rollup work, remote
+  refresh complete-inventory input materialization, thread stacks,
+  allocator/runtime/kernel/TLS overhead, and other server state are not charged to a complete
+  process envelope. Atomic active-state staging is admitted through `write_transient_bytes`;
+  metadata, exemplar, and rules replacement have separate finite store envelopes. Finite
+  compute-only v3 generation reading, decoded page/path retention, one-root
+  application/publication, retained cursors, and staged root maps are admitted separately and
+  exposed as `remote_catalog_staging_bytes`.
 - Exact disk cleanup that removes an owned entry performs a full-tree reconciliation and relies on
   an internal no-nested-reservation invariant; a no-op orphan pass skips that rescan. This is
   correctness-first but can make repeated effective cleanup expensive, so batching or safe deferred
@@ -696,9 +1140,17 @@ assigned to later roadmap phases.
   edge-accept dedupe markers now share live-root reservations. External restore can use a separate
   caller-owned core coordinator; the server now opens and leases an independently finite instance
   for standalone/internal/cluster targets and report persistence.
-- There is no data-directory manifest, previous-release golden fixture, or process-kill crash
-  harness. `Durable` currently describes the documented synchronization operations, not a
-  cross-platform hardware guarantee.
+- The public-API process-kill harness covers deterministic `PerAppend` and `Periodic` user-process
+  termination and validates all recovered identities and values. It does not simulate kernel or
+  power loss or qualify every supported platform/filesystem. A separate deterministic in-process
+  matrix exercises the charter's complete named failpoint list, but those injected Rust failures
+  are not hardware-crash evidence. Two content-hashed golden fixtures cover the supported
+  pre-manifest storage-format-v2 layout, including legacy-open upgrade, mixed typed data,
+  tombstones, and WAL recovery. One is format-focused and current-writer-produced; the other was
+  independently written by tsink 0.10.1 from exact local release commit
+  `00cc627df7b36ae1838f68da273c42949f0a5d52` before a root manifest existed. This does not cover
+  migration from a storage format older than 2. `Durable` continues to describe the documented
+  synchronization operations, not a cross-platform hardware guarantee.
 - Rows, metadata, and exemplars remain separate transactions, so a later sidecar failure can report
   partial progress after rows commit. Sidecar replacement now synchronizes the file and parent
   directory, but response acknowledgements remain conservatively `Volatile` because the envelope
@@ -718,14 +1170,20 @@ assigned to later roadmap phases.
   newly activated leader can present to a lagging voter is not implemented, so that convergence
   guarantee remains incomplete Phase 2 work.
 - `HUMAN GATE`: external design partners, real cross-release upgrades, constrained edge validation,
-  external testkit adoption, and maintainer approval of stable APIs remain unresolved.
+  external testkit adoption, maintainer approval of stable APIs, and selection of a monitored
+  security-disclosure contact/channel remain unresolved. A security address is not fabricated in
+  repository metadata.
 
 ## Recommended next three tasks
 
-1. Design the stable leased coordinator for cross-filesystem tombstone publication, then measure
-   cleanup-reconciliation throughput.
-2. Calibrate the implemented query-budget dimensions under constrained direct, async, PromQL, and
-   HTTP workloads, and revise the provisional profile values from those measurements.
-3. Run the complete clean constrained test, embedded, edge, and server workload matrix; qualify or
+1. Calibrate the implemented query envelope under constrained direct, async, PromQL, HTTP, and
+   distributed workloads, and decide explicit contracts for remaining compatibility adapters and
+   caller-owned result vectors. Keep cancellation/error release and logical-versus-physical byte
+   evidence separate from process-memory measurements.
+2. Replace the hard-bounded monolithic remote-tombstone map/cache publication with an immutable
+   sharded live snapshot and epoch-tagged cache, and measure catalog/tombstone
+   cleanup/reconciliation throughput under a large managed namespace. Finite compute-only catalog,
+   tombstone-file staging, and read-write tiered catalog publication are now paged.
+3. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
    revise the shipped provisional constants and record the final evidence. Preserve the explicit
    expert-only unlimited migration path and deterministic base-plus-override contract.

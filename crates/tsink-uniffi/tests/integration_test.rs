@@ -131,7 +131,9 @@ fn effective_storage_limits_are_available_through_uniffi() {
     );
     let memory = db.observability_snapshot().memory;
     assert_eq!(memory.accounted_bytes, memory.budgeted_bytes);
+    assert_eq!(memory.wal_writer_buffer_bytes, 0);
     assert_eq!(memory.wal_series_definition_cache_bytes, 0);
+    assert_eq!(memory.remote_catalog_staging_bytes, 0);
     assert_eq!(memory.write_transient_bytes, 0);
     assert_eq!(memory.write_transient_reservations_total, 0);
     assert_eq!(memory.write_transient_rejections_total, 0);

@@ -36,9 +36,8 @@ use crate::cluster::query::{
     ReadFanoutResponseMetadata, SeriesPoints, FANOUT_REMOTE_REQUEST_LATENCY_BUCKETS_SECONDS,
 };
 use crate::cluster::repair::{
-    compute_shard_window_digest, DigestExchangeSnapshot, RebalanceRunTriggerError,
-    RebalanceSchedulerControlSnapshot, RebalanceSchedulerSnapshot, RepairControlSnapshot,
-    RepairRunTriggerError,
+    DigestExchangeSnapshot, RebalanceRunTriggerError, RebalanceSchedulerControlSnapshot,
+    RebalanceSchedulerSnapshot, RepairControlSnapshot, RepairRunTriggerError,
 };
 use crate::cluster::replication::{
     stable_series_identity_hash, write_routing_labeled_metrics_snapshot,
@@ -50,23 +49,25 @@ use crate::cluster::ring::ShardRing;
 use crate::cluster::rpc::{
     authorize_internal_request_with_policy, internal_error_response, normalize_capabilities,
     required_capabilities_for_internal_rows, required_capabilities_for_internal_write,
-    required_capabilities_for_rows, InternalApiConfig, InternalControlAppendRequest,
+    required_capabilities_for_rows, InternalAccountedDigestWindowResponse,
+    InternalAccountedRepairBackfillResponse, InternalApiConfig, InternalControlAppendRequest,
     InternalControlAutoJoinRequest, InternalControlAutoJoinResponse, InternalControlCommand,
     InternalControlInstallSnapshotRequest, InternalDataRestoreRequest, InternalDataRestoreResponse,
     InternalDataSnapshotRequest, InternalDataSnapshotResponse, InternalDigestWindowRequest,
-    InternalExemplar, InternalExemplarSeries, InternalIngestRowsRequest,
-    InternalIngestRowsResponse, InternalIngestWriteRequest, InternalIngestWriteResponse,
-    InternalListMetricsRequest, InternalListMetricsResponse, InternalMetricMetadataUpdate,
-    InternalQueryExemplarsRequest, InternalQueryExemplarsResponse, InternalRepairBackfillRequest,
-    InternalRepairBackfillResponse, InternalRow, InternalSelectBatchRequest,
-    InternalSelectBatchResponse, InternalSelectRequest, InternalSelectResponse,
-    InternalSelectSeriesRequest, InternalSelectSeriesResponse, InternalWriteExemplar, RpcError,
-    CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1, CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1,
-    CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1, CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1,
-    CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1, CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1,
-    CLUSTER_CAPABILITY_METADATA_INGEST_V1, DEFAULT_INTERNAL_RING_VERSION,
-    EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES, HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES,
-    INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS, METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
+    InternalDigestWindowResponse, InternalExemplar, InternalExemplarSeries,
+    InternalIngestRowsRequest, InternalIngestRowsResponse, InternalIngestWriteRequest,
+    InternalIngestWriteResponse, InternalListMetricsRequest, InternalListMetricsResponse,
+    InternalMetricMetadataUpdate, InternalQueryExemplarsRequest, InternalQueryExemplarsResponse,
+    InternalRepairBackfillRequest, InternalRepairBackfillResponse, InternalRow,
+    InternalSelectBatchRequest, InternalSelectBatchResponse, InternalSelectRequest,
+    InternalSelectResponse, InternalSelectSeriesRequest, InternalSelectSeriesResponse,
+    InternalWriteExemplar, RpcError, CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1,
+    CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1, CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1,
+    CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1, CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1,
+    CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1, CLUSTER_CAPABILITY_METADATA_INGEST_V1,
+    DEFAULT_INTERNAL_RING_VERSION, EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES,
+    HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES, INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS,
+    METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
 };
 #[cfg(test)]
 use crate::cluster::rpc::{
@@ -76,9 +77,13 @@ use crate::cluster::rpc::{
 use crate::cluster::ClusterRequestContext;
 use crate::edge_sync;
 use crate::exemplar_store::{
-    ExemplarSeries, ExemplarStore, ExemplarStoreConfig, ExemplarStoreMetricsSnapshot, ExemplarWrite,
+    AccountedExemplarQueryResult, ExemplarQueryError, ExemplarSeries, ExemplarStore,
+    ExemplarStoreConfig, ExemplarStoreMetricsSnapshot, ExemplarWrite,
 };
-use crate::http::{json_response, text_response, HttpRequest, HttpResponse, MAX_BODY_BYTES};
+use crate::http::{
+    json_response, percent_decode, percent_decoded_len, text_response, HttpRequest, HttpResponse,
+    MAX_BODY_BYTES,
+};
 use crate::legacy_ingest::{
     self, AdapterCounterSnapshot, AdapterWriteObservation, AdapterWriteOutcome, LegacyAdapterKind,
     LegacyIngestStatusSnapshot,
@@ -89,7 +94,10 @@ use crate::managed_control_plane::{
     ManagedMaintenanceApplyRequest, ManagedTenantApplyRequest, ManagedTenantLifecycleRequest,
     ManagedUpgradeApplyRequest,
 };
-use crate::metadata_store::{metric_type_to_api_string, MetricMetadataRecord, MetricMetadataStore};
+use crate::metadata_store::{
+    metric_type_to_api_string, MetricMetadataQueryError, MetricMetadataRecord, MetricMetadataStore,
+    MetricMetadataStoreMetricsSnapshot,
+};
 use crate::otlp::{
     normalize_metrics_export_request, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
     OtlpMetricKind, OtlpNormalizationStats,
@@ -97,8 +105,8 @@ use crate::otlp::{
 use crate::prom_remote::{
     histogram, BucketSpan, Histogram as PromHistogram,
     HistogramResetHint as PromHistogramResetHint, Label as PromLabel, LabelMatcher, MatcherType,
-    MetricType, Query, QueryResult, ReadRequest, ReadResponse, ReadResponseType,
-    Sample as PromSample, TimeSeries, WriteRequest,
+    MetricType, Query, QueryResult, ReadRequest, ReadResponseType, Sample as PromSample,
+    TimeSeries, WriteRequest,
 };
 use crate::prom_write::{
     normalize_remote_write_request, NormalizedExemplar, NormalizedHistogramSample,
@@ -148,13 +156,9 @@ use self::internal_api::{
     handle_internal_restore_data, handle_internal_restore_data_budgeted, handle_internal_select,
     handle_internal_select_batch, handle_internal_select_series, handle_internal_snapshot_data,
     internal_write_exemplar_to_store_write, membership_from_control_state,
-    metric_series_identity_key,
 };
 #[cfg(test)]
-use self::internal_api::{
-    collect_internal_repair_backfill_rows, exemplar_series_to_internal,
-    owned_metadata_shard_scope_for_local_node,
-};
+use self::internal_api::{exemplar_series_to_internal, owned_metadata_shard_scope_for_local_node};
 use admin::*;
 use public_api::*;
 
@@ -2037,6 +2041,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[allow(clippy::too_many_arguments)]
 fn handle_metrics(
     storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     rules_runtime: Option<&RulesRuntime>,
     server_start: Instant,
@@ -2050,6 +2055,7 @@ fn handle_metrics(
 ) -> HttpResponse {
     metrics::render_metrics(
         storage,
+        metadata_store,
         exemplar_store,
         rules_runtime,
         server_start,
@@ -2267,9 +2273,53 @@ fn query_budget_status_json(snapshot: &tsink::QueryBudgetSnapshot) -> JsonValue 
 
 // The status adapter assembles independent optional server subsystems without making them core
 // storage dependencies; keeping those borrowed inputs explicit makes that boundary visible.
+fn metric_metadata_store_status_json(metadata_store: &MetricMetadataStore) -> JsonValue {
+    let Ok(snapshot) = metadata_store.metrics_snapshot() else {
+        return json!({ "available": false });
+    };
+    let limits = snapshot.limits;
+    json!({
+        "available": true,
+        "entries": snapshot.entries,
+        "memory": {
+            "retainedBytes": snapshot.retained_bytes,
+            "peakRetainedBytes": snapshot.peak_retained_bytes,
+            "transientBytes": snapshot.transient_bytes,
+            "peakTransientBytes": snapshot.peak_transient_bytes,
+            "queryResultBytes": snapshot.query_result_bytes,
+            "peakQueryResultBytes": snapshot.peak_query_result_bytes,
+        },
+        "durableFileBytes": snapshot.durable_file_bytes,
+        "limits": {
+            "maxEntries": limits.max_entries,
+            "maxRecordBytes": limits.max_record_bytes,
+            "maxUpdateBatchEntries": limits.max_update_batch_entries,
+            "maxUpdateBatchBytes": limits.max_update_batch_bytes,
+            "maxRetainedBytes": limits.max_retained_bytes,
+            "maxDurableFileBytes": limits.max_durable_file_bytes,
+            "maxStartupTransientBytes": limits.max_startup_transient_bytes,
+            "maxWriteTransientBytes": limits.max_write_transient_bytes,
+            "maxQueryRecords": limits.max_query_records,
+            "maxQueryResultBytes": limits.max_query_result_bytes,
+        },
+        "rejections": {
+            "total": snapshot.rejections_total,
+            "entryTotal": snapshot.entry_rejections_total,
+            "recordTotal": snapshot.record_rejections_total,
+            "updateBatchTotal": snapshot.update_batch_rejections_total,
+            "retainedTotal": snapshot.retained_rejections_total,
+            "durableFileTotal": snapshot.durable_file_rejections_total,
+            "transientTotal": snapshot.transient_rejections_total,
+            "queryTotal": snapshot.query_rejections_total,
+            "persistenceTotal": snapshot.persistence_rejections_total,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tsdb_status(
     storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     request: &HttpRequest,
     cluster_context: Option<&ClusterRequestContext>,
@@ -2308,6 +2358,7 @@ async fn handle_tsdb_status(
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
     let effective_storage_limits = storage.effective_storage_limits();
+    let metadata_store_status = metric_metadata_store_status_json(metadata_store);
     let local_disk = local_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let server_disk_limits = local_disk_budget.map(tsink::LocalDiskBudget::limits);
@@ -2507,6 +2558,7 @@ async fn handle_tsdb_status(
                     "maxActivePartitionHeadsPerSeries": effective_storage_limits.max_active_partition_heads_per_series
                 },
                 "resourceConfiguration": observability.resource_configuration,
+                "metricMetadataStore": metadata_store_status,
                 "localDisk": local_disk_status_json(local_disk.as_ref()),
                 "offlineRestoreDisk": local_disk_status_json(offline_restore_disk.as_ref()),
                 "memory": {
@@ -2522,6 +2574,8 @@ async fn handle_tsdb_status(
                     "persistedIndexBytes": observability.memory.persisted_index_bytes,
                     "persistedMmapBytes": observability.memory.persisted_mmap_bytes,
                     "tombstoneBytes": observability.memory.tombstone_bytes,
+                    "remoteCatalogStagingBytes": observability.memory.remote_catalog_staging_bytes,
+                    "walWriterBufferBytes": observability.memory.wal_writer_buffer_bytes,
                     "walSeriesDefinitionCacheBytes": observability.memory.wal_series_definition_cache_bytes,
                     "writeTransientBytes": observability.memory.write_transient_bytes,
                     "peakWriteTransientBytes": observability.memory.peak_write_transient_bytes,
@@ -7305,74 +7359,6 @@ fn with_read_metadata_headers(
         )
 }
 
-fn cluster_json_success_response(
-    data: JsonValue,
-    metadata: &ReadFanoutResponseMetadata,
-) -> HttpResponse {
-    let mut payload = json!({
-        "status": "success",
-        "data": data,
-        "partialResponse": {
-            "enabled": metadata.partial_response,
-            "policy": metadata.partial_response_policy.to_string(),
-            "consistency": metadata.consistency.to_string(),
-            "warningCount": metadata.warnings.len(),
-        }
-    });
-    if metadata.partial_response && !metadata.warnings.is_empty() {
-        payload["warnings"] = JsonValue::Array(
-            metadata
-                .warnings
-                .iter()
-                .cloned()
-                .map(JsonValue::String)
-                .collect(),
-        );
-    }
-    with_read_metadata_headers(json_response(200, &payload), metadata)
-}
-
-#[derive(Debug, Serialize)]
-struct MetadataApiEntry {
-    #[serde(rename = "type")]
-    metric_type: String,
-    help: String,
-    unit: String,
-}
-
-fn metadata_query_limit(request: &HttpRequest) -> Result<usize, HttpResponse> {
-    let Some(limit) = request.param("limit") else {
-        return Ok(METADATA_API_DEFAULT_LIMIT);
-    };
-    let parsed = limit.parse::<usize>().map_err(|_| {
-        promql_error_response("bad_data", "parameter 'limit' must be a positive integer")
-    })?;
-    if parsed == 0 {
-        return Err(promql_error_response(
-            "bad_data",
-            "parameter 'limit' must be greater than zero",
-        ));
-    }
-    Ok(parsed.min(METADATA_API_MAX_LIMIT))
-}
-
-fn metadata_response_payload(
-    records: Vec<MetricMetadataRecord>,
-) -> BTreeMap<String, Vec<MetadataApiEntry>> {
-    let mut data = BTreeMap::new();
-    for record in records {
-        data.insert(
-            record.metric_family_name,
-            vec![MetadataApiEntry {
-                metric_type: metric_type_to_api_string(record.metric_type).to_string(),
-                help: record.help,
-                unit: record.unit,
-            }],
-        );
-    }
-    data
-}
-
 fn write_admission_error_response(err: WriteAdmissionError) -> HttpResponse {
     let (status, error_code, retry_after_seconds) = if err.retryable() {
         (429, "write_overloaded", Some("1"))
@@ -7698,7 +7684,8 @@ fn read_admission_error_response(err: ReadAdmissionError) -> HttpResponse {
     response
 }
 
-fn fanout_error_response(err: ReadFanoutError) -> HttpResponse {
+#[cfg(test)]
+pub(crate) fn fanout_error_response(err: ReadFanoutError) -> HttpResponse {
     let (status, error_code, retry_after_seconds) = match &err {
         ReadFanoutError::InvalidRequest { .. } => (400, None, None),
         ReadFanoutError::MergeLimitExceeded { .. } => {
@@ -7917,17 +7904,27 @@ fn storage_for_promql_request(
     let ring_version = cluster_ring_version(Some(cluster_context));
     let read_fanout = match effective_read_fanout(cluster_context) {
         Ok(fanout) => fanout,
-        Err(err) => {
+        Err(_) => {
             return Err(promql_error_response(
                 "execution",
-                &format!("cluster read fanout topology unavailable: {err}"),
+                "cluster read fanout topology is unavailable",
+            )
+            .with_header(
+                READ_ERROR_CODE_HEADER,
+                "promql_cluster_topology_unavailable",
             ))
         }
     };
     let read_fanout =
         match apply_request_read_policies(request, cluster_context, read_fanout, tenant_policy) {
             Ok(fanout) => fanout,
-            Err(err) => return Err(promql_error_response("bad_data", &err)),
+            Err(_) => {
+                return Err(promql_error_response(
+                    "bad_data",
+                    "invalid cluster read policy override",
+                )
+                .with_header(READ_ERROR_CODE_HEADER, "promql_invalid_cluster_read_policy"))
+            }
         };
 
     // PromQL evaluation runs in `spawn_blocking`, so distributed `Storage` reads cross back into
@@ -7957,89 +7954,6 @@ fn promql_error_response(error_type: &str, error: &str) -> HttpResponse {
     )
 }
 
-fn promql_success_response(value: &PromqlValue, precision: TimestampPrecision) -> HttpResponse {
-    let (result_type, result) = match value {
-        PromqlValue::Scalar(v, t) => (
-            "scalar",
-            json!([timestamp_to_f64(*t, precision), format_value(*v)]),
-        ),
-        PromqlValue::InstantVector(samples) => {
-            let items: Vec<JsonValue> = samples
-                .iter()
-                .map(|s| {
-                    let mut metric = serde_json::Map::new();
-                    metric.insert("__name__".to_string(), JsonValue::String(s.metric.clone()));
-                    for label in &s.labels {
-                        metric.insert(label.name.clone(), JsonValue::String(label.value.clone()));
-                    }
-                    if let Some(histogram) = s.histogram.as_deref() {
-                        json!({
-                            "metric": metric,
-                            "histogram": [
-                                timestamp_to_f64(s.timestamp, precision),
-                                promql_histogram_json(histogram),
-                            ],
-                        })
-                    } else {
-                        json!({
-                            "metric": metric,
-                            "value": [timestamp_to_f64(s.timestamp, precision), format_value(s.value)],
-                        })
-                    }
-                })
-                .collect();
-            ("vector", JsonValue::Array(items))
-        }
-        PromqlValue::RangeVector(series) => {
-            let items: Vec<JsonValue> = series
-                .iter()
-                .map(|s| {
-                    let mut metric = serde_json::Map::new();
-                    metric.insert("__name__".to_string(), JsonValue::String(s.metric.clone()));
-                    for label in &s.labels {
-                        metric.insert(label.name.clone(), JsonValue::String(label.value.clone()));
-                    }
-                    let values: Vec<JsonValue> = s
-                        .samples
-                        .iter()
-                        .map(|(t, v)| json!([timestamp_to_f64(*t, precision), format_value(*v)]))
-                        .collect();
-                    let histograms: Vec<JsonValue> = s
-                        .histograms
-                        .iter()
-                        .map(|(t, histogram)| {
-                            json!([
-                                timestamp_to_f64(*t, precision),
-                                promql_histogram_json(histogram.as_ref()),
-                            ])
-                        })
-                        .collect();
-                    let mut item = serde_json::Map::new();
-                    item.insert("metric".to_string(), JsonValue::Object(metric));
-                    item.insert("values".to_string(), JsonValue::Array(values));
-                    if !histograms.is_empty() {
-                        item.insert("histograms".to_string(), JsonValue::Array(histograms));
-                    }
-                    JsonValue::Object(item)
-                })
-                .collect();
-            ("matrix", JsonValue::Array(items))
-        }
-        PromqlValue::String(s, t) => ("string", json!([timestamp_to_f64(*t, precision), s])),
-    };
-
-    json_response(
-        200,
-        &json!({
-            "status": "success",
-            "data": {
-                "resultType": result_type,
-                "result": result,
-            }
-        }),
-    )
-}
-
 fn timestamp_to_f64(ts: i64, precision: TimestampPrecision) -> f64 {
     match precision {
         TimestampPrecision::Seconds => ts as f64,
@@ -8047,39 +7961,6 @@ fn timestamp_to_f64(ts: i64, precision: TimestampPrecision) -> f64 {
         TimestampPrecision::Microseconds => ts as f64 / 1_000_000.0,
         TimestampPrecision::Nanoseconds => ts as f64 / 1_000_000_000.0,
     }
-}
-
-fn format_value(v: f64) -> String {
-    if v.is_nan() {
-        "NaN".to_string()
-    } else if v.is_infinite() {
-        if v.is_sign_positive() {
-            "+Inf".to_string()
-        } else {
-            "-Inf".to_string()
-        }
-    } else {
-        v.to_string()
-    }
-}
-
-fn promql_histogram_json(histogram: &tsink::NativeHistogram) -> JsonValue {
-    let buckets = histogram_buckets(histogram).unwrap_or_default();
-    json!({
-        "count": format_value(histogram_count_value(histogram)),
-        "sum": format_value(histogram.sum),
-        "buckets": buckets
-            .into_iter()
-            .map(|bucket| {
-                json!([
-                    histogram_bucket_boundary_code(bucket.lower_inclusive, bucket.upper_inclusive),
-                    format_value(bucket.lower),
-                    format_value(bucket.upper),
-                    format_value(bucket.count),
-                ])
-            })
-            .collect::<Vec<_>>(),
-    })
 }
 
 fn histogram_bucket_boundary_code(lower_inclusive: bool, upper_inclusive: bool) -> i32 {
@@ -8137,7 +8018,7 @@ mod tests {
     use std::cmp::Ordering as CmpOrdering;
     use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -8203,6 +8084,348 @@ mod tests {
 
         fn memory_budget(&self) -> usize {
             self.inner.memory_budget()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct LyingSelectSeriesAccountingStorage {
+        inner: Arc<dyn Storage>,
+    }
+
+    impl Storage for LyingSelectSeriesAccountingStorage {
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn begin_query_execution(
+            &self,
+            requested: QueryWorkLimits,
+            cancellation: tsink::QueryCancellationToken,
+        ) -> tsink::Result<Option<tsink::QueryExecution>> {
+            self.inner.begin_query_execution(requested, cancellation)
+        }
+
+        fn select_many_with_execution_result(
+            &self,
+            series: &[MetricSeries],
+            _start: i64,
+            _end: i64,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectManyExecutionResult> {
+            let output = series
+                .iter()
+                .cloned()
+                .map(|series| tsink::SeriesPoints {
+                    series,
+                    points: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let matched = vec![true; series.len()];
+            let required = crate::cluster::query::modeled_series_points_vec_retained_bytes(&output)
+                .saturating_add(
+                    crate::cluster::query::modeled_matched_selectors_vec_retained_bytes(&matched),
+                );
+            let reservation = execution
+                .reserve_memory(required)
+                .map_err(TsinkError::from)?;
+            Ok(tsink::SelectManyExecutionResult::accounted(
+                output,
+                matched,
+                reservation,
+            ))
+        }
+
+        fn select_many_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn select_series_in_shards(
+            &self,
+            selection: &SeriesSelection,
+            scope: &MetadataShardScope,
+        ) -> tsink::Result<Vec<MetricSeries>> {
+            self.inner.select_series_in_shards(selection, scope)
+        }
+
+        fn select_series_in_shards_with_execution_result(
+            &self,
+            selection: &SeriesSelection,
+            scope: &MetadataShardScope,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.inner
+                .select_series_in_shards_with_execution_result(selection, scope, execution)
+                .map(|result| tsink::SelectSeriesExecutionResult::unaccounted(result.into_series()))
+        }
+
+        fn select_series_in_shards_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn compute_shard_window_digest_with_execution(
+            &self,
+            shard: u32,
+            shard_count: u32,
+            window_start: i64,
+            window_end: i64,
+            _execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::ShardWindowDigest> {
+            Ok(tsink::ShardWindowDigest {
+                shard,
+                shard_count,
+                window_start,
+                window_end,
+                series_count: 1,
+                point_count: 1,
+                fingerprint: 1,
+            })
+        }
+
+        fn compute_shard_window_digest_execution_accounting(
+            &self,
+        ) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn scan_shard_window_rows_with_execution_result(
+            &self,
+            shard: u32,
+            shard_count: u32,
+            window_start: i64,
+            window_end: i64,
+            _options: ShardWindowScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::ShardWindowRowsExecutionResult> {
+            let rows = vec![Row::new(
+                "lying_repair_metric",
+                DataPoint::new(window_start, tsink::Value::Bytes(vec![7; 32 * 1024])),
+            )];
+            let weak_retained_bytes = u64::try_from(rows.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::try_from(std::mem::size_of::<Row>()).unwrap_or(u64::MAX))
+                .saturating_add(
+                    rows.iter()
+                        .map(|row| u64::try_from(row.metric().len()).unwrap_or(u64::MAX))
+                        .sum::<u64>(),
+                );
+            execution
+                .charge_series_matched(1)
+                .map_err(TsinkError::from)?;
+            execution
+                .charge_samples_scanned(1)
+                .map_err(TsinkError::from)?;
+            execution
+                .charge_samples_returned(1)
+                .map_err(TsinkError::from)?;
+            execution
+                .charge_returned_bytes(crate::cluster::rpc::modeled_repair_rows_returned_bytes(
+                    &rows,
+                ))
+                .map_err(TsinkError::from)?;
+            execution
+                .observe_intermediate_vector_size(1)
+                .map_err(TsinkError::from)?;
+            let weak_reservation = execution
+                .reserve_memory(weak_retained_bytes)
+                .map_err(TsinkError::from)?;
+            Ok(tsink::ShardWindowRowsExecutionResult::accounted(
+                tsink::ShardWindowRowsPage {
+                    shard,
+                    shard_count,
+                    window_start,
+                    window_end,
+                    series_scanned: 1,
+                    rows_scanned: 1,
+                    truncated: false,
+                    next_row_offset: None,
+                    rows,
+                },
+                weak_reservation,
+            ))
+        }
+
+        fn scan_shard_window_rows_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+            self.inner.effective_storage_limits()
+        }
+
+        fn resource_configuration_snapshot(&self) -> tsink::ResourceConfigurationSnapshot {
+            self.inner.resource_configuration_snapshot()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct BlockingInternalReadStorage {
+        inner: Arc<dyn Storage>,
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl BlockingInternalReadStorage {
+        fn block_until_cancelled(&self, execution: &tsink::QueryExecution) -> tsink::Result<()> {
+            self.started.store(true, AtomicOrdering::Release);
+            loop {
+                match execution.checkpoint() {
+                    Ok(()) => std::thread::park_timeout(Duration::from_millis(1)),
+                    Err(error) => {
+                        self.finished.store(true, AtomicOrdering::Release);
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+    }
+
+    impl Storage for BlockingInternalReadStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn select_many_with_execution_result(
+            &self,
+            _series: &[MetricSeries],
+            _start: i64,
+            _end: i64,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectManyExecutionResult> {
+            self.block_until_cancelled(execution)?;
+            unreachable!("cancellation loop only returns an error")
+        }
+
+        fn select_many_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn select_series_in_shards_with_execution_result(
+            &self,
+            _selection: &SeriesSelection,
+            _scope: &MetadataShardScope,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.block_until_cancelled(execution)?;
+            unreachable!("cancellation loop only returns an error")
+        }
+
+        fn select_series_in_shards_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn compute_shard_window_digest_with_execution(
+            &self,
+            _shard: u32,
+            _shard_count: u32,
+            _window_start: i64,
+            _window_end: i64,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::ShardWindowDigest> {
+            self.block_until_cancelled(execution)?;
+            unreachable!("cancellation loop only returns an error")
+        }
+
+        fn compute_shard_window_digest_execution_accounting(
+            &self,
+        ) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn scan_shard_window_rows_with_execution_result(
+            &self,
+            _shard: u32,
+            _shard_count: u32,
+            _window_start: i64,
+            _window_end: i64,
+            _options: ShardWindowScanOptions,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::ShardWindowRowsExecutionResult> {
+            self.block_until_cancelled(execution)?;
+            unreachable!("cancellation loop only returns an error")
+        }
+
+        fn scan_shard_window_rows_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+            self.inner.effective_storage_limits()
+        }
+
+        fn resource_configuration_snapshot(&self) -> tsink::ResourceConfigurationSnapshot {
+            self.inner.resource_configuration_snapshot()
         }
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
@@ -9316,14 +9539,93 @@ mod tests {
                             )
                         }
                     };
-                let series =
-                    match storage.select_many(&payload.selectors, payload.start, payload.end) {
-                        Ok(series) => series,
-                        Err(err) => {
-                            return text_response(500, &format!("mock select_batch failed: {err}"));
+                let execution = match payload.query_limits {
+                    Some(limits) => match storage
+                        .begin_query_execution(limits, tsink::QueryCancellationToken::new())
+                    {
+                        Ok(Some(execution)) => Some(execution),
+                        Ok(None) => {
+                            return text_response(
+                                409,
+                                "mock select_batch storage has no query execution",
+                            )
                         }
-                    };
-                json_response(200, &InternalSelectBatchResponse { series })
+                        Err(err) => {
+                            return text_response(
+                                500,
+                                &format!("mock select_batch admission failed: {err}"),
+                            )
+                        }
+                    },
+                    None => None,
+                };
+                let (series, matched_selectors) = match execution.as_ref() {
+                    Some(execution) => {
+                        if let Err(err) = execution.observe_intermediate_vector_size(
+                            u64::try_from(payload.selectors.len()).unwrap_or(u64::MAX),
+                        ) {
+                            return text_response(
+                                500,
+                                &format!("mock select_batch accounting failed: {err}"),
+                            );
+                        }
+                        let mut selected = match storage.select_many_with_execution_result(
+                            &payload.selectors,
+                            payload.start,
+                            payload.end,
+                            execution,
+                        ) {
+                            Ok(selected) => selected,
+                            Err(err) => {
+                                return text_response(
+                                    500,
+                                    &format!("mock select_batch failed: {err}"),
+                                )
+                            }
+                        };
+                        if selected.series.len() != payload.selectors.len()
+                            || selected
+                                .series
+                                .iter()
+                                .zip(&payload.selectors)
+                                .any(|(item, selector)| item.series != *selector)
+                        {
+                            return text_response(
+                                500,
+                                "mock select_batch returned invalid identities or ordering",
+                            );
+                        }
+                        let Some(matched) = selected.matched_selectors.take() else {
+                            return text_response(
+                                500,
+                                "mock select_batch omitted matched-selector accounting",
+                            );
+                        };
+                        (std::mem::take(&mut selected.series), Some(matched))
+                    }
+                    None => {
+                        match storage.select_many(&payload.selectors, payload.start, payload.end) {
+                            Ok(series) => (series, None),
+                            Err(err) => {
+                                return text_response(
+                                    500,
+                                    &format!("mock select_batch failed: {err}"),
+                                )
+                            }
+                        }
+                    }
+                };
+                let accounting = match (execution.as_ref(), matched_selectors) {
+                    (Some(execution), Some(matched_selectors)) => {
+                        Some(crate::cluster::rpc::InternalSelectBatchAccounting {
+                            execution: execution.snapshot(),
+                            matched_selectors: Some(matched_selectors),
+                        })
+                    }
+                    (None, None) => None,
+                    _ => return text_response(500, "mock select_batch accounting mismatch"),
+                };
+                json_response(200, &InternalSelectBatchResponse { series, accounting })
             }
             "/internal/v1/select_series" => {
                 let payload: InternalSelectSeriesRequest =
@@ -9336,17 +9638,59 @@ mod tests {
                             );
                         }
                     };
-                let series_result = match payload.shard_scope.as_ref() {
-                    Some(scope) => storage.select_series_in_shards(&payload.selection, scope),
-                    None => storage.select_series(&payload.selection),
+                let execution = match payload.query_limits {
+                    Some(limits) => match storage
+                        .begin_query_execution(limits, tsink::QueryCancellationToken::new())
+                    {
+                        Ok(Some(execution)) => Some(execution),
+                        Ok(None) => {
+                            return text_response(
+                                409,
+                                "mock select_series storage has no query execution",
+                            )
+                        }
+                        Err(err) => {
+                            return text_response(
+                                500,
+                                &format!("mock select_series admission failed: {err}"),
+                            )
+                        }
+                    },
+                    None => None,
                 };
-                let series = match series_result {
-                    Ok(series) => series,
+                let selected = match (payload.shard_scope.as_ref(), execution.as_ref()) {
+                    (Some(scope), Some(execution)) => storage
+                        .select_series_in_shards_with_execution_result(
+                            &payload.selection,
+                            scope,
+                            execution,
+                        ),
+                    (Some(scope), None) => storage
+                        .select_series_in_shards(&payload.selection, scope)
+                        .map(tsink::SelectSeriesExecutionResult::unaccounted),
+                    (None, Some(execution)) => storage
+                        .select_series_with_execution(&payload.selection, execution)
+                        .map(tsink::SelectSeriesExecutionResult::unaccounted),
+                    (None, None) => storage
+                        .select_series(&payload.selection)
+                        .map(tsink::SelectSeriesExecutionResult::unaccounted),
+                };
+                let mut selected = match selected {
+                    Ok(selected) => selected,
                     Err(err) => {
                         return text_response(500, &format!("mock select_series failed: {err}"));
                     }
                 };
-                json_response(200, &InternalSelectSeriesResponse { series })
+                let series = std::mem::take(&mut selected.series);
+                let accounting = execution.as_ref().map(|execution| {
+                    crate::cluster::rpc::InternalSelectSeriesAccounting {
+                        execution: execution.snapshot(),
+                    }
+                });
+                let response =
+                    json_response(200, &InternalSelectSeriesResponse { series, accounting });
+                drop(selected);
+                response
             }
             "/internal/v1/query_exemplars" => {
                 let payload: InternalQueryExemplarsRequest =
@@ -9359,26 +9703,75 @@ mod tests {
                             )
                         }
                     };
-                let series = match exemplar_store.query(
-                    &payload.selectors,
-                    payload.start,
-                    payload.end,
-                    payload.limit,
-                ) {
-                    Ok(series) => series,
-                    Err(err) => {
-                        return text_response(500, &format!("mock query_exemplars failed: {err}"))
-                    }
+                let mut result_reservation = None;
+                let execution = match payload.query_limits {
+                    Some(limits) => match storage
+                        .begin_query_execution(limits, tsink::QueryCancellationToken::new())
+                    {
+                        Ok(Some(execution)) => Some(execution),
+                        Ok(None) => {
+                            return text_response(
+                                409,
+                                "mock query_exemplars accounting unavailable",
+                            )
+                        }
+                        Err(err) => {
+                            return text_response(
+                                500,
+                                &format!("mock query_exemplars admission failed: {err}"),
+                            )
+                        }
+                    },
+                    None => None,
                 };
-                json_response(
+                let series = match execution.as_ref() {
+                    Some(execution) => match exemplar_store.query_with_execution_result(
+                        &payload.selectors,
+                        payload.start,
+                        payload.end,
+                        payload.limit,
+                        execution,
+                    ) {
+                        Ok(result) => {
+                            let (series, reservation) = result.into_parts();
+                            result_reservation = Some(reservation);
+                            series
+                        }
+                        Err(err) => {
+                            return text_response(
+                                500,
+                                &format!("mock query_exemplars failed: {err}"),
+                            )
+                        }
+                    },
+                    None => match exemplar_store.query(
+                        &payload.selectors,
+                        payload.start,
+                        payload.end,
+                        payload.limit,
+                    ) {
+                        Ok(series) => series,
+                        Err(err) => {
+                            return text_response(
+                                500,
+                                &format!("mock query_exemplars failed: {err}"),
+                            )
+                        }
+                    },
+                };
+                let accounting = execution.as_ref().map(tsink::QueryExecution::snapshot);
+                let response = json_response(
                     200,
                     &InternalQueryExemplarsResponse {
                         series: series
                             .into_iter()
                             .map(exemplar_series_to_internal)
                             .collect(),
+                        accounting,
                     },
-                )
+                );
+                drop(result_reservation);
+                response
             }
             "/internal/v1/list_metrics" => {
                 let payload: InternalListMetricsRequest =
@@ -9401,7 +9794,13 @@ mod tests {
                         return text_response(500, &format!("mock list_metrics failed: {err}"));
                     }
                 };
-                json_response(200, &InternalListMetricsResponse { series })
+                json_response(
+                    200,
+                    &InternalListMetricsResponse {
+                        series,
+                        accounting: None,
+                    },
+                )
             }
             "/internal/v1/snapshot_data" => {
                 let payload: InternalDataSnapshotRequest =
@@ -9497,18 +9896,43 @@ mod tests {
                             return text_response(400, &format!("invalid digest request: {err}"));
                         }
                     };
-                let digest = match compute_shard_window_digest(
-                    storage.as_ref(),
+                let Some(query_limits) = payload.query_limits else {
+                    return text_response(400, "digest query limits required");
+                };
+                let execution = match storage
+                    .begin_query_execution(query_limits, tsink::QueryCancellationToken::new())
+                {
+                    Ok(Some(execution)) => execution,
+                    Ok(None) => return text_response(500, "digest query admission unavailable"),
+                    Err(err) => {
+                        return text_response(500, &format!("mock digest admission failed: {err}"))
+                    }
+                };
+                let digest = match storage.compute_shard_window_digest_with_execution(
                     payload.shard,
                     64,
-                    payload.ring_version,
                     payload.window_start,
                     payload.window_end,
+                    &execution,
                 ) {
                     Ok(digest) => digest,
                     Err(err) => return text_response(500, &format!("mock digest failed: {err}")),
                 };
-                json_response(200, &digest)
+                json_response(
+                    200,
+                    &InternalAccountedDigestWindowResponse {
+                        digest: crate::cluster::rpc::InternalDigestWindowResponse {
+                            shard: digest.shard,
+                            ring_version: payload.ring_version,
+                            window_start: digest.window_start,
+                            window_end: digest.window_end,
+                            series_count: digest.series_count,
+                            point_count: digest.point_count,
+                            fingerprint: digest.fingerprint,
+                        },
+                        accounting: execution.snapshot(),
+                    },
+                )
             }
             "/internal/v1/repair_backfill" => {
                 let payload: InternalRepairBackfillRequest =
@@ -9521,23 +9945,72 @@ mod tests {
                             );
                         }
                     };
-                let response = match collect_internal_repair_backfill_rows(
-                    storage.as_ref(),
-                    payload.ring_version,
+                let Some(query_limits) = payload.query_limits else {
+                    return text_response(400, "repair_backfill query limits required");
+                };
+                if storage.scan_shard_window_rows_execution_accounting()
+                    != tsink::QueryExecutionAccounting::Complete
+                {
+                    return text_response(409, "repair_backfill accounting unavailable");
+                }
+                let execution = match storage
+                    .begin_query_execution(query_limits, tsink::QueryCancellationToken::new())
+                {
+                    Ok(Some(execution)) => execution,
+                    Ok(None) => return text_response(409, "repair_backfill admission unavailable"),
+                    Err(err) => {
+                        return text_response(500, &format!("mock repair admission failed: {err}"));
+                    }
+                };
+                let before = execution.snapshot();
+                let result = match storage.scan_shard_window_rows_with_execution_result(
                     payload.shard,
                     64,
                     payload.window_start,
                     payload.window_end,
-                    payload.max_series,
-                    payload.max_rows,
-                    payload.row_offset,
+                    ShardWindowScanOptions {
+                        max_series: payload.max_series,
+                        max_rows: payload.max_rows,
+                        row_offset: payload.row_offset,
+                    },
+                    &execution,
                 ) {
-                    Ok(response) => response,
+                    Ok(result) => result,
                     Err(err) => {
                         return text_response(500, &format!("mock repair_backfill failed: {err}"));
                     }
                 };
-                json_response(200, &response)
+                if crate::cluster::repair::validate_internal_repair_backfill_execution_accounting(
+                    result.page.series_scanned,
+                    result.page.rows_scanned,
+                    result.page.rows.len(),
+                    crate::cluster::rpc::modeled_repair_rows_returned_bytes(&result.page.rows),
+                    Some(result.reserved_memory_bytes()),
+                    before,
+                    execution.snapshot(),
+                )
+                .is_err()
+                {
+                    return text_response(500, "mock repair_backfill accounting invalid");
+                }
+                let response = InternalRepairBackfillResponse {
+                    shard: result.page.shard,
+                    ring_version: payload.ring_version,
+                    window_start: result.page.window_start,
+                    window_end: result.page.window_end,
+                    series_scanned: result.page.series_scanned,
+                    rows_scanned: result.page.rows_scanned,
+                    truncated: result.page.truncated,
+                    next_row_offset: result.page.next_row_offset,
+                    rows: result.page.rows.iter().map(InternalRow::from).collect(),
+                };
+                json_response(
+                    200,
+                    &InternalAccountedRepairBackfillResponse {
+                        backfill: response,
+                        accounting: execution.snapshot(),
+                    },
+                )
             }
             _ => text_response(404, "not found"),
         }
@@ -10819,6 +11292,7 @@ mod tests {
                 stale_ring_version,
             )),
             selection: SeriesSelection::new(),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let select_series_response = dispatch_internal_request(
@@ -10831,7 +11305,12 @@ mod tests {
             select_series_payload,
         )
         .await;
-        assert_eq!(select_series_response.status, 200);
+        assert_eq!(
+            select_series_response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&select_series_response.body)
+        );
         let select_series_body: InternalSelectSeriesResponse =
             serde_json::from_slice(&select_series_response.body).expect("valid JSON");
         assert!(select_series_body
@@ -10845,6 +11324,7 @@ mod tests {
                 cluster_context.as_ref(),
                 stale_ring_version,
             )),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let list_metrics_response = dispatch_internal_request(
@@ -10985,6 +11465,44 @@ mod tests {
         assert_eq!(body.points[0].value.as_f64(), Some(9.0));
         assert_eq!(body.points[1].timestamp, 1_700_000_000_141);
         assert_eq!(body.points[1].value.as_f64(), Some(10.0));
+
+        let bounded_batch_payload = serde_json::to_vec(&InternalSelectBatchRequest {
+            ring_version: active_ring_version.expect("active ring version should be captured"),
+            selectors: vec![MetricSeries {
+                name: metric.clone(),
+                labels: labels.clone(),
+            }],
+            start: 1_700_000_000_140,
+            end: 1_700_000_000_142,
+            query_limits: Some(QueryWorkLimits::default()),
+        })
+        .expect("bounded batch payload should serialize");
+        let bounded_batch_response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select_batch",
+            bounded_batch_payload,
+        )
+        .await;
+        assert_eq!(bounded_batch_response.status, 200);
+        let bounded_batch: InternalSelectBatchResponse =
+            serde_json::from_slice(&bounded_batch_response.body)
+                .expect("bounded batch response should decode");
+        assert_eq!(bounded_batch.series.len(), 1);
+        assert_eq!(bounded_batch.series[0].points, body.points);
+        let bounded_accounting = bounded_batch
+            .accounting
+            .expect("bounded handoff response should aggregate accounting");
+        assert_eq!(bounded_accounting.matched_selectors, Some(vec![true]));
+        let bounded_snapshot = bounded_accounting.execution;
+        assert_eq!(bounded_snapshot.series_matched, 1);
+        assert_eq!(bounded_snapshot.samples_scanned, 2);
+        assert_eq!(bounded_snapshot.samples_returned, 2);
+        assert!(bounded_snapshot.returned_bytes > 0);
+        assert!(bounded_snapshot.intermediate_vector_size >= 1);
         assert!(remote_request_count.load(AtomicOrdering::Relaxed) > 0);
 
         shutdown_tx
@@ -11119,6 +11637,7 @@ mod tests {
                 active_ring_version,
             )),
             selection: SeriesSelection::new(),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let select_series_response = dispatch_internal_request(
@@ -11131,7 +11650,12 @@ mod tests {
             select_series_payload,
         )
         .await;
-        assert_eq!(select_series_response.status, 200);
+        assert_eq!(
+            select_series_response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&select_series_response.body)
+        );
         let select_series_body: InternalSelectSeriesResponse =
             serde_json::from_slice(&select_series_response.body).expect("valid JSON");
         assert!(select_series_body
@@ -11149,6 +11673,7 @@ mod tests {
                 cluster_context.as_ref(),
                 active_ring_version,
             )),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let list_metrics_response = dispatch_internal_request(
@@ -11295,6 +11820,7 @@ mod tests {
             ring_version: DEFAULT_INTERNAL_RING_VERSION + 1,
             shard_scope: None,
             selection: SeriesSelection::new(),
+            query_limits: None,
         })
         .expect("payload should serialize");
 
@@ -11323,6 +11849,7 @@ mod tests {
         let payload = serde_json::to_vec(&InternalListMetricsRequest {
             ring_version: DEFAULT_INTERNAL_RING_VERSION + 1,
             shard_scope: None,
+            query_limits: None,
         })
         .expect("payload should serialize");
 
@@ -11380,6 +11907,7 @@ mod tests {
             shard,
             window_start: 1_700_000_000_000,
             window_end: 1_700_000_001_000,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11402,6 +11930,335 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_digest_window_requires_finite_limits_and_has_exact_boundaries() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let shard_count = cluster_context.runtime.ring.shard_count();
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard =
+            (stable_series_identity_hash(metric.as_str(), &labels) % u64::from(shard_count)) as u32;
+        let (second_metric, second_labels) = (0..100_000u32)
+            .find_map(|index| {
+                let candidate_metric = format!("digest_boundary_metric_{index}");
+                let candidate_labels = vec![Label::new("candidate", format!("digest-{index}"))];
+                let candidate_shard =
+                    (stable_series_identity_hash(candidate_metric.as_str(), &candidate_labels)
+                        % u64::from(shard_count)) as u32;
+                (candidate_shard == shard
+                    && (candidate_metric != metric || candidate_labels != labels))
+                    .then_some((candidate_metric, candidate_labels))
+            })
+            .expect("a second digest series should map to the same shard");
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric.clone(),
+                    labels.clone(),
+                    DataPoint::new(1_700_000_000_450, 4.0),
+                ),
+                Row::with_labels(metric, labels, DataPoint::new(1_700_000_000_451, 5.0)),
+                Row::with_labels(
+                    second_metric,
+                    second_labels,
+                    DataPoint::new(
+                        1_700_000_000_452,
+                        tsink::Value::String("bounded-repair-value-".repeat(256)),
+                    ),
+                ),
+            ])
+            .expect("seed insert should succeed");
+        let dispatch = |query_limits: Option<QueryWorkLimits>| {
+            let storage = Arc::clone(&storage);
+            let internal_api = internal_api.clone();
+            let cluster_context = Arc::clone(&cluster_context);
+            let engine = &engine;
+            async move {
+                let payload = serde_json::to_vec(&InternalDigestWindowRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard,
+                    window_start: 1_700_000_000_000,
+                    window_end: 1_700_000_001_000,
+                    query_limits,
+                })
+                .expect("digest payload should serialize");
+                dispatch_internal_request(
+                    &storage,
+                    engine,
+                    &internal_api,
+                    Some(cluster_context.as_ref()),
+                    "POST",
+                    "/internal/v1/digest_window",
+                    payload,
+                )
+                .await
+            }
+        };
+
+        let budget_before = storage.query_budget_snapshot();
+        let missing = dispatch(None).await;
+        assert_eq!(missing.status, 400);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&missing.body).expect("missing-limit error should decode");
+        assert_eq!(error.code, "query_limits_required");
+        assert_eq!(
+            error.error,
+            "internal digest_window requires finite query_limits"
+        );
+        assert_eq!(
+            storage.query_budget_snapshot().queries_started_total,
+            budget_before.queries_started_total
+        );
+
+        let incomplete = dispatch(Some(QueryWorkLimits::default())).await;
+        assert_eq!(incomplete.status, 400);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&incomplete.body).expect("invalid-limit error should decode");
+        assert_eq!(error.code, "invalid_query_limits");
+        assert_eq!(
+            error.error,
+            "internal digest_window query_limits must make every work limit finite"
+        );
+
+        let finite_limits = tsink::ResourceLimits::test().query.per_query;
+        let calibration = dispatch(Some(finite_limits)).await;
+        assert_eq!(
+            calibration.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&calibration.body)
+        );
+        let calibration_body: InternalAccountedDigestWindowResponse =
+            serde_json::from_slice(&calibration.body).expect("bounded digest should decode");
+        assert_eq!(calibration_body.digest.shard, shard);
+        assert!(calibration_body.digest.series_count >= 1);
+        assert!(calibration_body.digest.point_count >= 1);
+        let snapshot = calibration_body.accounting;
+        assert!(snapshot.series_matched >= calibration_body.digest.series_count);
+        assert!(snapshot.samples_scanned >= calibration_body.digest.point_count);
+        assert!(snapshot.series_matched > 1);
+        assert!(snapshot.samples_scanned > 1);
+        assert!(snapshot.returned_bytes > 1);
+        let calibration_budget = storage.query_budget_snapshot();
+        assert_eq!(
+            calibration_budget.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            calibration_budget.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(calibration_budget.active_queries, 0);
+        assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
+        let exact_memory = calibration_budget.peak_shared_reserved_memory_bytes;
+        assert!(exact_memory > 1);
+
+        let exact_series = dispatch(Some(QueryWorkLimits {
+            max_series_matched: Some(snapshot.series_matched),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(exact_series.status, 200);
+
+        let below_series = dispatch(Some(QueryWorkLimits {
+            max_series_matched: Some(snapshot.series_matched - 1),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(below_series.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_series.body).expect("series rejection should decode");
+        assert_eq!(error.code, "query_limit_series_matched");
+        assert!(!error.retryable);
+
+        let exact_scanned = dispatch(Some(QueryWorkLimits {
+            max_samples_scanned: Some(snapshot.samples_scanned),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(exact_scanned.status, 200);
+
+        let below_scanned = dispatch(Some(QueryWorkLimits {
+            max_samples_scanned: Some(snapshot.samples_scanned - 1),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(below_scanned.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_scanned.body).expect("scan rejection should decode");
+        assert_eq!(error.code, "query_limit_samples_scanned");
+        assert!(!error.retryable);
+
+        let exact_returned = dispatch(Some(QueryWorkLimits {
+            max_returned_bytes: Some(snapshot.returned_bytes),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(exact_returned.status, 200);
+
+        let below_returned = dispatch(Some(QueryWorkLimits {
+            max_returned_bytes: Some(snapshot.returned_bytes - 1),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(below_returned.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_returned.body).expect("byte rejection should decode");
+        assert_eq!(error.code, "query_limit_returned_bytes");
+        assert!(!error.retryable);
+
+        let exact_memory_response = dispatch(Some(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(exact_memory_response.status, 200);
+
+        let below_memory = dispatch(Some(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory - 1),
+            ..finite_limits
+        }))
+        .await;
+        assert_eq!(below_memory.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_memory.body).expect("memory rejection should decode");
+        assert_eq!(error.code, "query_limit_per_query_memory_bytes");
+        assert!(!error.retryable);
+
+        let final_budget = storage.query_budget_snapshot();
+        assert_eq!(final_budget.active_queries, 0);
+        assert_eq!(final_budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(final_budget.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_digest_window_fails_closed_for_unaccounted_or_false_accounting() {
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard = (stable_series_identity_hash(&metric, &labels)
+            % u64::from(cluster_context.runtime.ring.shard_count())) as u32;
+        let payload = serde_json::to_vec(&InternalDigestWindowRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard,
+            window_start: 1_700_000_000_000,
+            window_end: 1_700_000_001_000,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
+        })
+        .expect("digest payload should serialize");
+
+        let unaccounted: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage {
+            inner: make_storage(),
+        });
+        let unaccounted_engine = make_engine(&unaccounted);
+        let response = dispatch_internal_request(
+            &unaccounted,
+            &unaccounted_engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/digest_window",
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(response.status, 409);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("capability error should decode");
+        assert_eq!(error.code, "query_accounting_unavailable");
+        assert!(!error.retryable);
+
+        let inner = make_storage();
+        let observed_inner = Arc::clone(&inner);
+        let lying: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let lying_engine = make_engine(&lying);
+        let response = dispatch_internal_request(
+            &lying,
+            &lying_engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/digest_window",
+            payload,
+        )
+        .await;
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("accounting error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert_eq!(
+            error.error,
+            "bounded digest_window storage returned invalid accounting"
+        );
+        assert!(!error.retryable);
+        let snapshot = observed_inner.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_digest_window_propagates_deadline_to_blocking_storage() {
+        let inner = make_storage();
+        let observed_inner = Arc::clone(&inner);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let storage: Arc<dyn Storage> = Arc::new(BlockingInternalReadStorage {
+            inner,
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard = (stable_series_identity_hash(&metric, &labels)
+            % u64::from(cluster_context.runtime.ring.shard_count())) as u32;
+        let payload = serde_json::to_vec(&InternalDigestWindowRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard,
+            window_start: 10,
+            window_end: 20,
+            query_limits: Some(QueryWorkLimits {
+                max_wall_time: Some(Duration::from_millis(10)),
+                ..tsink::ResourceLimits::test().query.per_query
+            }),
+        })
+        .expect("digest payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/digest_window",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 503);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("deadline error should decode");
+        assert_eq!(error.code, "query_deadline_exceeded");
+        assert!(!error.retryable);
+        assert!(started.load(AtomicOrdering::Acquire));
+        assert!(finished.load(AtomicOrdering::Acquire));
+        let snapshot = observed_inner.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.deadline_exceeded_total, 1);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
     async fn internal_digest_window_rejects_non_owner_shard() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -11418,6 +12275,7 @@ mod tests {
             shard,
             window_start: 1_700_000_000_000,
             window_end: 1_700_000_001_000,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11524,6 +12382,7 @@ mod tests {
             shard,
             window_start: 1_700_000_000_000,
             window_end: 1_700_000_001_000,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11579,6 +12438,7 @@ mod tests {
             max_series: Some(1),
             max_rows: Some(1),
             row_offset: None,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11612,6 +12472,7 @@ mod tests {
             max_series: Some(1),
             max_rows: Some(1),
             row_offset: Some(next_row_offset),
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11638,6 +12499,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_repair_backfill_requires_finite_limits_and_has_exact_boundaries() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let shard_count = cluster_context.runtime.ring.shard_count();
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard =
+            (stable_series_identity_hash(metric.as_str(), &labels) % u64::from(shard_count)) as u32;
+        let (second_metric, second_labels) = (0..100_000u32)
+            .find_map(|index| {
+                let candidate_metric = format!("repair_boundary_metric_{index}");
+                let candidate_labels = vec![Label::new("candidate", format!("repair-{index}"))];
+                let candidate_shard =
+                    (stable_series_identity_hash(candidate_metric.as_str(), &candidate_labels)
+                        % u64::from(shard_count)) as u32;
+                (candidate_shard == shard
+                    && (candidate_metric != metric || candidate_labels != labels))
+                    .then_some((candidate_metric, candidate_labels))
+            })
+            .expect("a second repair series should map to the same shard");
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric.clone(),
+                    labels.clone(),
+                    DataPoint::new(1_700_000_000_450, 4.0),
+                ),
+                Row::with_labels(metric, labels, DataPoint::new(1_700_000_000_451, 5.0)),
+                Row::with_labels(
+                    second_metric,
+                    second_labels,
+                    DataPoint::new(1_700_000_000_452, 6.0),
+                ),
+            ])
+            .expect("seed inserts should succeed");
+        let dispatch = |query_limits: Option<QueryWorkLimits>| {
+            let storage = Arc::clone(&storage);
+            let internal_api = internal_api.clone();
+            let cluster_context = Arc::clone(&cluster_context);
+            let engine = &engine;
+            async move {
+                let payload = serde_json::to_vec(&InternalRepairBackfillRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard,
+                    window_start: 1_700_000_000_000,
+                    window_end: 1_700_000_001_000,
+                    max_series: Some(8),
+                    max_rows: Some(64),
+                    row_offset: None,
+                    query_limits,
+                })
+                .expect("repair payload should serialize");
+                dispatch_internal_request(
+                    &storage,
+                    engine,
+                    &internal_api,
+                    Some(cluster_context.as_ref()),
+                    "POST",
+                    "/internal/v1/repair_backfill",
+                    payload,
+                )
+                .await
+            }
+        };
+
+        let budget_before = storage.query_budget_snapshot();
+        let missing = dispatch(None).await;
+        assert_eq!(missing.status, 400);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&missing.body).expect("missing-limit error should decode");
+        assert_eq!(error.code, "query_limits_required");
+        assert_eq!(
+            error.error,
+            "internal repair_backfill requires finite query_limits"
+        );
+        assert_eq!(
+            storage.query_budget_snapshot().queries_started_total,
+            budget_before.queries_started_total
+        );
+
+        let incomplete = dispatch(Some(QueryWorkLimits::default())).await;
+        assert_eq!(incomplete.status, 400);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&incomplete.body).expect("invalid-limit error should decode");
+        assert_eq!(error.code, "invalid_query_limits");
+        assert_eq!(
+            error.error,
+            "internal repair_backfill query_limits must make every work limit finite"
+        );
+
+        let finite_limits = tsink::ResourceLimits::test().query.per_query;
+        let calibration = dispatch(Some(finite_limits)).await;
+        assert_eq!(
+            calibration.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&calibration.body)
+        );
+        let calibration_body: InternalAccountedRepairBackfillResponse =
+            serde_json::from_slice(&calibration.body).expect("bounded repair should decode");
+        assert_eq!(calibration_body.backfill.shard, shard);
+        assert_eq!(calibration_body.backfill.rows.len(), 3);
+        let snapshot = calibration_body.accounting;
+        assert!(snapshot.memory_reserved_bytes > 0);
+        assert!(snapshot.series_matched > 1);
+        assert!(snapshot.samples_scanned > 1);
+        assert!(snapshot.samples_returned > 1);
+        assert!(snapshot.returned_bytes > 1);
+        let calibration_budget = storage.query_budget_snapshot();
+        assert_eq!(
+            calibration_budget.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            calibration_budget.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(calibration_budget.active_queries, 0);
+        assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
+        let exact_memory = calibration_budget.peak_shared_reserved_memory_bytes;
+        assert!(exact_memory > 1);
+
+        for (limits, expected_code) in [
+            (
+                QueryWorkLimits {
+                    max_series_matched: Some(snapshot.series_matched - 1),
+                    ..finite_limits
+                },
+                "query_limit_series_matched",
+            ),
+            (
+                QueryWorkLimits {
+                    max_samples_scanned: Some(snapshot.samples_scanned - 1),
+                    ..finite_limits
+                },
+                "query_limit_samples_scanned",
+            ),
+            (
+                QueryWorkLimits {
+                    max_samples_returned: Some(snapshot.samples_returned - 1),
+                    ..finite_limits
+                },
+                "query_limit_samples_returned",
+            ),
+            (
+                QueryWorkLimits {
+                    max_returned_bytes: Some(snapshot.returned_bytes - 1),
+                    ..finite_limits
+                },
+                "query_limit_returned_bytes",
+            ),
+            (
+                QueryWorkLimits {
+                    max_memory_bytes: Some(exact_memory - 1),
+                    ..finite_limits
+                },
+                "query_limit_per_query_memory_bytes",
+            ),
+        ] {
+            let response = dispatch(Some(limits)).await;
+            assert_eq!(response.status, 413, "{expected_code}");
+            let error: InternalErrorResponse =
+                serde_json::from_slice(&response.body).expect("limit error should decode");
+            assert_eq!(error.code, expected_code);
+            assert!(!error.retryable);
+        }
+
+        for limits in [
+            QueryWorkLimits {
+                max_series_matched: Some(snapshot.series_matched),
+                ..finite_limits
+            },
+            QueryWorkLimits {
+                max_samples_scanned: Some(snapshot.samples_scanned),
+                ..finite_limits
+            },
+            QueryWorkLimits {
+                max_samples_returned: Some(snapshot.samples_returned),
+                ..finite_limits
+            },
+            QueryWorkLimits {
+                max_returned_bytes: Some(snapshot.returned_bytes),
+                ..finite_limits
+            },
+            QueryWorkLimits {
+                max_memory_bytes: Some(exact_memory),
+                ..finite_limits
+            },
+        ] {
+            let response = dispatch(Some(limits)).await;
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+
+        let final_budget = storage.query_budget_snapshot();
+        assert_eq!(final_budget.active_queries, 0);
+        assert_eq!(final_budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(final_budget.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_repair_backfill_fails_closed_for_unaccounted_or_false_accounting() {
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard = (stable_series_identity_hash(&metric, &labels)
+            % u64::from(cluster_context.runtime.ring.shard_count())) as u32;
+        let payload = serde_json::to_vec(&InternalRepairBackfillRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard,
+            window_start: 10,
+            window_end: 20,
+            max_series: Some(8),
+            max_rows: Some(64),
+            row_offset: None,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
+        })
+        .expect("repair payload should serialize");
+
+        let unaccounted: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage {
+            inner: make_storage(),
+        });
+        let unaccounted_engine = make_engine(&unaccounted);
+        let response = dispatch_internal_request(
+            &unaccounted,
+            &unaccounted_engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/repair_backfill",
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(response.status, 409);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("capability error should decode");
+        assert_eq!(error.code, "query_accounting_unavailable");
+        assert!(!error.retryable);
+
+        let inner = make_storage();
+        let observed_inner = Arc::clone(&inner);
+        let lying: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let lying_engine = make_engine(&lying);
+        let response = dispatch_internal_request(
+            &lying,
+            &lying_engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/repair_backfill",
+            payload,
+        )
+        .await;
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("accounting error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert_eq!(
+            error.error,
+            "bounded repair_backfill storage returned invalid accounting"
+        );
+        assert!(!error.retryable);
+        let snapshot = observed_inner.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert!(snapshot.peak_shared_reserved_memory_bytes > 0);
+        assert!(
+            snapshot.peak_shared_reserved_memory_bytes < 32 * 1024,
+            "the handler must reject the weak retained reservation before allocating a response copy"
+        );
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_repair_backfill_propagates_deadline_to_blocking_storage() {
+        let inner = make_storage();
+        let observed_inner = Arc::clone(&inner);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let storage: Arc<dyn Storage> = Arc::new(BlockingInternalReadStorage {
+            inner,
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let shard = (stable_series_identity_hash(&metric, &labels)
+            % u64::from(cluster_context.runtime.ring.shard_count())) as u32;
+        let payload = serde_json::to_vec(&InternalRepairBackfillRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard,
+            window_start: 10,
+            window_end: 20,
+            max_series: Some(8),
+            max_rows: Some(64),
+            row_offset: None,
+            query_limits: Some(QueryWorkLimits {
+                max_wall_time: Some(Duration::from_millis(10)),
+                ..tsink::ResourceLimits::test().query.per_query
+            }),
+        })
+        .expect("repair payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/repair_backfill",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 503);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("deadline error should decode");
+        assert_eq!(error.code, "query_deadline_exceeded");
+        assert!(!error.retryable);
+        assert!(started.load(AtomicOrdering::Acquire));
+        assert!(finished.load(AtomicOrdering::Acquire));
+        let snapshot = observed_inner.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.deadline_exceeded_total, 1);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
     async fn internal_repair_backfill_rejects_non_owner_shard() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -11657,6 +12861,7 @@ mod tests {
             max_series: Some(8),
             max_rows: Some(64),
             row_offset: None,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11766,6 +12971,7 @@ mod tests {
             max_series: Some(8),
             max_rows: Some(64),
             row_offset: None,
+            query_limits: Some(tsink::ResourceLimits::test().query.per_query),
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11800,6 +13006,7 @@ mod tests {
         let payload = serde_json::to_vec(&InternalListMetricsRequest {
             ring_version: 0,
             shard_scope: None,
+            query_limits: None,
         })
         .expect("payload should serialize");
 
@@ -11842,6 +13049,14 @@ mod tests {
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
             selection: SeriesSelection::new(),
+            query_limits: Some(tsink::QueryWorkLimits {
+                max_memory_bytes: Some(8 * 1024 * 1024),
+                max_series_matched: Some(100),
+                max_returned_bytes: Some(1024 * 1024),
+                max_pattern_expansion: Some(10_000),
+                max_intermediate_vector_size: Some(100),
+                ..tsink::QueryWorkLimits::default()
+            }),
         })
         .expect("payload should serialize");
         let select_series_response = dispatch_internal_request(
@@ -11854,10 +13069,22 @@ mod tests {
             select_series_payload,
         )
         .await;
-        assert_eq!(select_series_response.status, 200);
+        assert_eq!(
+            select_series_response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&select_series_response.body)
+        );
         let select_series_body: InternalSelectSeriesResponse =
             serde_json::from_slice(&select_series_response.body).expect("valid JSON");
         assert!(!select_series_body.series.is_empty());
+        let accounting = select_series_body
+            .accounting
+            .expect("bounded select_series should return execution accounting");
+        assert!(
+            accounting.execution.series_matched
+                >= u64::try_from(select_series_body.series.len()).unwrap_or(u64::MAX)
+        );
 
         let list_metrics_payload = serde_json::to_vec(&InternalListMetricsRequest {
             ring_version: DEFAULT_INTERNAL_RING_VERSION,
@@ -11865,6 +13092,7 @@ mod tests {
                 cluster_context.as_ref(),
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let list_metrics_response = dispatch_internal_request(
@@ -11884,6 +13112,429 @@ mod tests {
             .series
             .iter()
             .any(|series| series.name == metric && series.labels == labels));
+        assert!(list_metrics_body.accounting.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_list_metrics_has_exact_bounded_accounting_and_zero_residual() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric.clone(),
+                labels.clone(),
+                DataPoint::new(1_700_000_000_300, 3.0),
+            )])
+            .expect("seed insert should succeed");
+        let dispatch = |query_limits: Option<QueryWorkLimits>| {
+            let storage = Arc::clone(&storage);
+            let internal_api = internal_api.clone();
+            let cluster_context = Arc::clone(&cluster_context);
+            let engine = &engine;
+            async move {
+                let payload = serde_json::to_vec(&InternalListMetricsRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard_scope: Some(local_owned_metadata_scope(
+                        cluster_context.as_ref(),
+                        DEFAULT_INTERNAL_RING_VERSION,
+                    )),
+                    query_limits,
+                })
+                .expect("list_metrics payload should serialize");
+                dispatch_internal_request(
+                    &storage,
+                    engine,
+                    &internal_api,
+                    Some(cluster_context.as_ref()),
+                    "POST",
+                    "/internal/v1/list_metrics",
+                    payload,
+                )
+                .await
+            }
+        };
+
+        let budget_before = storage.query_budget_snapshot();
+        let legacy = dispatch(None).await;
+        assert_eq!(legacy.status, 200);
+        let legacy_body: InternalListMetricsResponse =
+            serde_json::from_slice(&legacy.body).expect("legacy response should decode");
+        assert!(legacy_body.accounting.is_none());
+        let legacy_budget = storage.query_budget_snapshot();
+        assert_eq!(
+            legacy_budget.queries_started_total,
+            budget_before.queries_started_total
+        );
+
+        let calibration = dispatch(Some(QueryWorkLimits::default())).await;
+        assert_eq!(
+            calibration.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&calibration.body)
+        );
+        let calibration_body: InternalListMetricsResponse =
+            serde_json::from_slice(&calibration.body).expect("bounded response should decode");
+        assert!(calibration_body
+            .series
+            .iter()
+            .any(|series| series.name == metric && series.labels == labels));
+        let accounting = calibration_body
+            .accounting
+            .expect("bounded response should report complete accounting");
+        let snapshot = accounting.execution;
+        assert!(snapshot.series_matched >= 1);
+        assert!(snapshot.returned_bytes > 0);
+        assert!(snapshot.intermediate_vector_size >= 1);
+        let calibration_budget = storage.query_budget_snapshot();
+        assert_eq!(
+            calibration_budget.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            calibration_budget.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(calibration_budget.active_queries, 0);
+        assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
+        let exact_memory = calibration_budget.peak_shared_reserved_memory_bytes;
+        assert!(exact_memory > 1);
+
+        let exact_work = dispatch(Some(QueryWorkLimits {
+            max_series_matched: Some(snapshot.series_matched),
+            max_returned_bytes: Some(snapshot.returned_bytes),
+            max_pattern_expansion: Some(snapshot.pattern_expansion),
+            max_intermediate_vector_size: Some(snapshot.intermediate_vector_size),
+            ..QueryWorkLimits::default()
+        }))
+        .await;
+        assert_eq!(exact_work.status, 200);
+        let exact_work_body: InternalListMetricsResponse =
+            serde_json::from_slice(&exact_work.body).expect("exact response should decode");
+        assert_eq!(
+            exact_work_body
+                .accounting
+                .expect("exact response should report accounting")
+                .execution,
+            snapshot
+        );
+
+        let exact_memory_response = dispatch(Some(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory),
+            ..QueryWorkLimits::default()
+        }))
+        .await;
+        assert_eq!(exact_memory_response.status, 200);
+
+        let below_memory = dispatch(Some(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory - 1),
+            ..QueryWorkLimits::default()
+        }))
+        .await;
+        assert_eq!(below_memory.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_memory.body).expect("memory rejection should decode");
+        assert_eq!(error.code, "query_limit_per_query_memory_bytes");
+        assert!(!error.retryable);
+
+        let below_returned_bytes = dispatch(Some(QueryWorkLimits {
+            max_returned_bytes: Some(snapshot.returned_bytes - 1),
+            ..QueryWorkLimits::default()
+        }))
+        .await;
+        assert_eq!(below_returned_bytes.status, 413);
+        let error: InternalErrorResponse = serde_json::from_slice(&below_returned_bytes.body)
+            .expect("returned-byte rejection should decode");
+        assert_eq!(error.code, "query_limit_returned_bytes");
+        assert!(!error.retryable);
+
+        let final_budget = storage.query_budget_snapshot();
+        assert_eq!(final_budget.active_queries, 0);
+        assert_eq!(final_budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(final_budget.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_internal_list_metrics_rejects_false_complete_storage_accounting() {
+        let inner = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        inner
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels,
+                DataPoint::new(1_700_000_000_300, 3.0),
+            )])
+            .expect("seed insert should succeed");
+        let storage: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let engine = make_engine(&storage);
+        let payload = serde_json::to_vec(&InternalListMetricsRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard_scope: Some(local_owned_metadata_scope(
+                cluster_context.as_ref(),
+                DEFAULT_INTERNAL_RING_VERSION,
+            )),
+            query_limits: Some(QueryWorkLimits::default()),
+        })
+        .expect("payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/list_metrics",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert!(!error.retryable);
+        assert!(error.error.contains("reserved only"));
+    }
+
+    #[tokio::test]
+    async fn dropping_bounded_internal_read_handlers_cancels_blocking_storage_work() {
+        for path in [
+            "/internal/v1/select_batch",
+            "/internal/v1/select_series",
+            "/internal/v1/list_metrics",
+            "/internal/v1/digest_window",
+            "/internal/v1/repair_backfill",
+        ] {
+            let inner = make_storage();
+            let started = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
+            let storage: Arc<dyn Storage> = Arc::new(BlockingInternalReadStorage {
+                inner,
+                started: Arc::clone(&started),
+                finished: Arc::clone(&finished),
+            });
+            let engine = make_engine(&storage);
+            let internal_api = internal_api();
+            let temp_dir = TempDir::new().expect("tempdir should build");
+            let cluster_context = cluster_context_with_control(&temp_dir);
+            let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+            let digest_shard = (stable_series_identity_hash(&metric, &labels)
+                % u64::from(cluster_context.runtime.ring.shard_count()))
+                as u32;
+            let payload = match path {
+                "/internal/v1/select_batch" => serde_json::to_vec(&InternalSelectBatchRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    selectors: vec![MetricSeries {
+                        name: metric,
+                        labels,
+                    }],
+                    start: 10,
+                    end: 20,
+                    query_limits: Some(QueryWorkLimits::default()),
+                })
+                .expect("select_batch payload should serialize"),
+                "/internal/v1/select_series" => serde_json::to_vec(&InternalSelectSeriesRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard_scope: Some(local_owned_metadata_scope(
+                        cluster_context.as_ref(),
+                        DEFAULT_INTERNAL_RING_VERSION,
+                    )),
+                    selection: SeriesSelection::new(),
+                    query_limits: Some(QueryWorkLimits::default()),
+                })
+                .expect("select_series payload should serialize"),
+                "/internal/v1/list_metrics" => serde_json::to_vec(&InternalListMetricsRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard_scope: Some(local_owned_metadata_scope(
+                        cluster_context.as_ref(),
+                        DEFAULT_INTERNAL_RING_VERSION,
+                    )),
+                    query_limits: Some(QueryWorkLimits::default()),
+                })
+                .expect("list_metrics payload should serialize"),
+                "/internal/v1/digest_window" => serde_json::to_vec(&InternalDigestWindowRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    shard: digest_shard,
+                    window_start: 10,
+                    window_end: 20,
+                    query_limits: Some(tsink::ResourceLimits::test().query.per_query),
+                })
+                .expect("digest_window payload should serialize"),
+                "/internal/v1/repair_backfill" => {
+                    serde_json::to_vec(&InternalRepairBackfillRequest {
+                        ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                        shard: digest_shard,
+                        window_start: 10,
+                        window_end: 20,
+                        max_series: Some(8),
+                        max_rows: Some(64),
+                        row_offset: None,
+                        query_limits: Some(tsink::ResourceLimits::test().query.per_query),
+                    })
+                    .expect("repair_backfill payload should serialize")
+                }
+                _ => unreachable!("test route should be recognized"),
+            };
+            let task_storage = Arc::clone(&storage);
+            let task_context = Arc::clone(&cluster_context);
+            let task = tokio::spawn(async move {
+                dispatch_internal_request(
+                    &task_storage,
+                    &engine,
+                    &internal_api,
+                    Some(task_context.as_ref()),
+                    "POST",
+                    path,
+                    payload,
+                )
+                .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !started.load(AtomicOrdering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("internal bounded read should enter blocking storage");
+            task.abort();
+            assert!(task
+                .await
+                .expect_err("aborted internal bounded read should not return")
+                .is_cancelled());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !finished.load(AtomicOrdering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("blocking storage should observe internal handler cancellation");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshot = storage.query_budget_snapshot();
+                    if snapshot.active_queries == 0 && snapshot.shared_reserved_memory_bytes == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("internal bounded read resources should be released");
+
+            let snapshot = storage.query_budget_snapshot();
+            assert_eq!(snapshot.active_queries, 0, "{path}");
+            assert_eq!(snapshot.shared_reserved_memory_bytes, 0, "{path}");
+            assert_eq!(snapshot.queries_started_total, 1, "{path}");
+            assert_eq!(snapshot.queries_completed_total, 1, "{path}");
+            assert_eq!(snapshot.cancellations_total, 1, "{path}");
+            assert_eq!(snapshot.accounting_invariant_violations_total, 0, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_internal_select_series_rejects_a_false_complete_result_reservation() {
+        let inner = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        inner
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels,
+                DataPoint::new(1_700_000_000_300, 3.0),
+            )])
+            .expect("seed insert should succeed");
+        let storage: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let engine = make_engine(&storage);
+        let payload = serde_json::to_vec(&InternalSelectSeriesRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            shard_scope: Some(local_owned_metadata_scope(
+                cluster_context.as_ref(),
+                DEFAULT_INTERNAL_RING_VERSION,
+            )),
+            selection: SeriesSelection::new(),
+            query_limits: Some(QueryWorkLimits {
+                max_memory_bytes: Some(8 * 1024 * 1024),
+                max_series_matched: Some(100),
+                max_returned_bytes: Some(1024 * 1024),
+                max_pattern_expansion: Some(10_000),
+                max_intermediate_vector_size: Some(100),
+                ..QueryWorkLimits::default()
+            }),
+        })
+        .expect("payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select_series",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert!(!error.retryable);
+        assert!(error.error.contains("reserved only"));
+    }
+
+    #[tokio::test]
+    async fn bounded_internal_select_batch_rejects_false_complete_work_counters() {
+        let inner = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let storage: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let engine = make_engine(&storage);
+        let payload = serde_json::to_vec(&InternalSelectBatchRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            selectors: vec![MetricSeries {
+                name: metric,
+                labels,
+            }],
+            start: 10,
+            end: 20,
+            query_limits: Some(QueryWorkLimits {
+                max_memory_bytes: Some(8 * 1024 * 1024),
+                max_series_matched: Some(1),
+                max_returned_bytes: Some(1024 * 1024),
+                max_intermediate_vector_size: Some(1),
+                ..QueryWorkLimits::default()
+            }),
+        })
+        .expect("payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select_batch",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert!(!error.retryable);
+        assert!(error.error.contains("matched-series"));
     }
 
     #[tokio::test]
@@ -11927,6 +13578,7 @@ mod tests {
             selectors: selectors.clone(),
             start: 1_700_000_000_300,
             end: 1_700_000_000_320,
+            query_limits: None,
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -11943,6 +13595,7 @@ mod tests {
 
         let body: InternalSelectBatchResponse =
             serde_json::from_slice(&response.body).expect("response should decode");
+        assert!(body.accounting.is_none());
         assert_eq!(body.series.len(), 2);
         assert_eq!(body.series[0].series, selectors[0]);
         assert_eq!(
@@ -11954,6 +13607,278 @@ mod tests {
             body.series[1].points,
             vec![DataPoint::new(1_700_000_000_310, 3.0)]
         );
+    }
+
+    #[tokio::test]
+    async fn internal_select_batch_reports_empty_existing_series_and_exact_accounting_boundary() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (existing_metric, existing_labels) =
+            find_series_owned_by_local(cluster_context.as_ref());
+        let (missing_metric, missing_labels) = find_distinct_series_owned_by_local(
+            cluster_context.as_ref(),
+            &existing_metric,
+            &existing_labels,
+        );
+        storage
+            .insert_rows(&[Row::with_labels(
+                existing_metric.clone(),
+                existing_labels.clone(),
+                DataPoint::new(1_700_000_000_100, 1.0),
+            )])
+            .expect("seed insert should succeed");
+
+        let selectors = vec![
+            MetricSeries {
+                name: existing_metric,
+                labels: existing_labels,
+            },
+            MetricSeries {
+                name: missing_metric,
+                labels: missing_labels,
+            },
+        ];
+        let dispatch = |query_limits: QueryWorkLimits| {
+            let storage = Arc::clone(&storage);
+            let selectors = selectors.clone();
+            let internal_api = internal_api.clone();
+            let cluster_context = Arc::clone(&cluster_context);
+            let engine = &engine;
+            async move {
+                let payload = serde_json::to_vec(&InternalSelectBatchRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    selectors,
+                    start: 1_700_000_000_200,
+                    end: 1_700_000_000_220,
+                    query_limits: Some(query_limits),
+                })
+                .expect("payload should serialize");
+                dispatch_internal_request(
+                    &storage,
+                    engine,
+                    &internal_api,
+                    Some(cluster_context.as_ref()),
+                    "POST",
+                    "/internal/v1/select_batch",
+                    payload,
+                )
+                .await
+            }
+        };
+
+        let budget_before = storage.query_budget_snapshot();
+        let response = dispatch(QueryWorkLimits::default()).await;
+        assert_eq!(response.status, 200);
+        let body: InternalSelectBatchResponse =
+            serde_json::from_slice(&response.body).expect("response should decode");
+        assert!(body.series.iter().all(|item| item.points.is_empty()));
+        let accounting = body
+            .accounting
+            .expect("bounded response should report accounting");
+        assert_eq!(accounting.matched_selectors, Some(vec![true, false]));
+        let snapshot = accounting.execution;
+        assert_eq!(snapshot.series_matched, 1);
+        assert_eq!(snapshot.samples_scanned, 1);
+        assert_eq!(snapshot.samples_returned, 0);
+        assert!(snapshot.returned_bytes > 0);
+        assert!(snapshot.intermediate_vector_size >= 2);
+        let budget_after = storage.query_budget_snapshot();
+        assert_eq!(
+            budget_after.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            budget_after.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(budget_after.active_queries, 0);
+        assert_eq!(budget_after.shared_reserved_memory_bytes, 0);
+        let peak_memory = budget_after.peak_shared_reserved_memory_bytes;
+        assert!(peak_memory > 0);
+
+        let exact = dispatch(QueryWorkLimits {
+            max_series_matched: Some(snapshot.series_matched),
+            max_returned_bytes: Some(snapshot.returned_bytes),
+            max_intermediate_vector_size: Some(snapshot.intermediate_vector_size),
+            ..QueryWorkLimits::default()
+        })
+        .await;
+        assert_eq!(exact.status, 200);
+        let exact_body: InternalSelectBatchResponse =
+            serde_json::from_slice(&exact.body).expect("exact response should decode");
+        let exact_accounting = exact_body
+            .accounting
+            .expect("exact response should report accounting");
+        assert_eq!(exact_accounting.execution, snapshot);
+        assert_eq!(exact_accounting.matched_selectors, Some(vec![true, false]));
+
+        let exact_memory = dispatch(QueryWorkLimits {
+            max_memory_bytes: Some(peak_memory),
+            ..QueryWorkLimits::default()
+        })
+        .await;
+        assert_eq!(exact_memory.status, 200);
+        let below_memory = dispatch(QueryWorkLimits {
+            max_memory_bytes: Some(peak_memory.saturating_sub(1)),
+            ..QueryWorkLimits::default()
+        })
+        .await;
+        assert_eq!(below_memory.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_memory.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_per_query_memory_bytes");
+        assert!(!error.retryable);
+        assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let one_over = dispatch(QueryWorkLimits {
+            max_returned_bytes: Some(snapshot.returned_bytes - 1),
+            ..QueryWorkLimits::default()
+        })
+        .await;
+        assert_eq!(one_over.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&one_over.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_returned_bytes");
+        assert!(!error.retryable);
+    }
+
+    #[tokio::test]
+    async fn internal_select_batch_keeps_legacy_backend_compatibility_but_rejects_false_accounting()
+    {
+        let storage: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage {
+            inner: make_storage(),
+        });
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let request = |query_limits| {
+            serde_json::to_vec(&InternalSelectBatchRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                selectors: Vec::new(),
+                start: 10,
+                end: 20,
+                query_limits,
+            })
+            .expect("payload should serialize")
+        };
+
+        let legacy = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            None,
+            "POST",
+            "/internal/v1/select_batch",
+            request(None),
+        )
+        .await;
+        assert_eq!(legacy.status, 200);
+        let legacy_body: InternalSelectBatchResponse =
+            serde_json::from_slice(&legacy.body).expect("legacy response should decode");
+        assert!(legacy_body.accounting.is_none());
+
+        let bounded = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            None,
+            "POST",
+            "/internal/v1/select_batch",
+            request(Some(QueryWorkLimits::default())),
+        )
+        .await;
+        assert_eq!(bounded.status, 409);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&bounded.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_unavailable");
+        assert!(!error.retryable);
+    }
+
+    #[tokio::test]
+    async fn internal_select_batch_rejects_n_plus_one_samples_with_stable_error() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    metric.clone(),
+                    labels.clone(),
+                    DataPoint::new(1_700_000_000_310, 3.0),
+                ),
+                Row::with_labels(
+                    metric.clone(),
+                    labels.clone(),
+                    DataPoint::new(1_700_000_000_311, 4.0),
+                ),
+            ])
+            .expect("seed insert should succeed");
+
+        let request = |max_samples_returned| {
+            serde_json::to_vec(&InternalSelectBatchRequest {
+                ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                selectors: vec![MetricSeries {
+                    name: metric.clone(),
+                    labels: labels.clone(),
+                }],
+                start: 1_700_000_000_300,
+                end: 1_700_000_000_320,
+                query_limits: Some(QueryWorkLimits {
+                    max_samples_scanned: Some(2),
+                    max_samples_returned: Some(max_samples_returned),
+                    ..QueryWorkLimits::default()
+                }),
+            })
+            .expect("payload should serialize")
+        };
+
+        let exact = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select_batch",
+            request(2),
+        )
+        .await;
+        assert_eq!(exact.status, 200);
+        let exact_body: InternalSelectBatchResponse =
+            serde_json::from_slice(&exact.body).expect("response should decode");
+        let exact_accounting = exact_body
+            .accounting
+            .expect("bounded response should report accounting");
+        assert_eq!(exact_accounting.matched_selectors, Some(vec![true]));
+        let exact_snapshot = exact_accounting.execution;
+        assert_eq!(exact_snapshot.series_matched, 1);
+        assert_eq!(exact_snapshot.samples_scanned, 2);
+        assert_eq!(exact_snapshot.samples_returned, 2);
+        assert!(exact_snapshot.intermediate_vector_size >= 2);
+
+        let one_over = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select_batch",
+            request(1),
+        )
+        .await;
+        assert_eq!(one_over.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&one_over.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_samples_returned");
+        assert!(!error.retryable);
     }
 
     #[tokio::test]
@@ -11988,6 +13913,7 @@ mod tests {
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
             selection: SeriesSelection::new(),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let select_series_response = dispatch_internal_request(
@@ -12018,6 +13944,7 @@ mod tests {
                 cluster_context.as_ref(),
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let list_metrics_response = dispatch_internal_request(
@@ -12057,6 +13984,7 @@ mod tests {
             ring_version: DEFAULT_INTERNAL_RING_VERSION,
             shard_scope: Some(shard_scope.clone()),
             selection: SeriesSelection::new(),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -12076,6 +14004,7 @@ mod tests {
         let payload = serde_json::to_vec(&InternalListMetricsRequest {
             ring_version: DEFAULT_INTERNAL_RING_VERSION,
             shard_scope: Some(shard_scope),
+            query_limits: None,
         })
         .expect("payload should serialize");
         let response = dispatch_internal_request(
@@ -14398,12 +16327,28 @@ mod tests {
         )
         .await;
         assert_eq!(query_response.status, 200);
+        assert_eq!(
+            response_header(&query_response, READ_CONSISTENCY_HEADER),
+            Some("eventual")
+        );
+        assert_eq!(
+            response_header(&query_response, READ_PARTIAL_RESPONSE_POLICY_HEADER),
+            Some("allow")
+        );
+        assert_eq!(
+            response_header(&query_response, READ_PARTIAL_RESPONSE_HEADER),
+            Some("false")
+        );
         let body: JsonValue =
             serde_json::from_slice(&query_response.body).expect("query response should decode");
         assert_eq!(
             body["data"][0]["exemplars"][0]["labels"]["trace_id"],
             "cluster-trace"
         );
+        assert_eq!(body["partialResponse"]["consistency"], "eventual");
+        assert_eq!(body["partialResponse"]["enabled"], false);
+        assert_eq!(body["partialResponse"]["policy"], "allow");
+        assert_eq!(body["partialResponse"]["warningCount"], 0);
 
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
@@ -16615,6 +18560,13 @@ mod tests {
             .any(|label| label.name == tenant::TENANT_LABEL));
         assert_eq!(series.samples.len(), 1);
         assert_eq!(series.samples[0].value, 1.0);
+        let budget = storage.query_budget_snapshot();
+        assert_eq!(budget.queries_started_total, 1);
+        assert_eq!(budget.queries_completed_total, 1);
+        assert_eq!(budget.peak_active_queries, 1);
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
     }
 
     #[tokio::test]
@@ -17468,6 +19420,8 @@ mod tests {
         assert!(body.contains("tsink_memory_rejections_total"));
         assert!(body.contains("tsink_memory_persisted_mmap_bytes"));
         assert!(body.contains("tsink_memory_registry_bytes"));
+        assert!(body.contains("tsink_memory_remote_catalog_staging_bytes"));
+        assert!(body.contains("tsink_memory_wal_writer_buffer_bytes"));
         assert!(body.contains("tsink_memory_wal_series_definition_cache_bytes"));
         assert!(body.contains("tsink_memory_write_transient_bytes"));
         assert!(body.contains("tsink_memory_write_transient_peak_bytes"));
@@ -17543,6 +19497,14 @@ mod tests {
         assert!(body.contains("tsink_cluster_control_current_term"));
         assert!(body.contains("tsink_cluster_control_peer_status"));
         assert!(body.contains("tsink_cluster_control_persistence_health"));
+        assert!(body.contains("tsink_metric_metadata_store_entries"));
+        assert!(
+            body.contains("tsink_metric_metadata_store_memory_bytes{kind=\"peak_query_result\"}")
+        );
+        assert!(body.contains("tsink_metric_metadata_store_rejections_total{reason=\"query\"}"));
+        assert!(
+            body.contains("tsink_metric_metadata_store_limit{kind=\"startup_transient_bytes\"}")
+        );
         assert!(body.contains("tsink_cluster_handoff_total"));
         assert!(body.contains("tsink_cluster_handoff_shard_phase"));
         assert!(body.contains("tsink_cluster_repair_digest_runs_total"));
@@ -17789,6 +19751,11 @@ mod tests {
         assert!(body.contains("tsink_rules_scheduler_runs_total"));
         assert!(body.contains("tsink_rules_configured{kind=\"rules\"} 1"));
         assert!(body.contains("tsink_rules_runtime_limits{kind=\"scheduler_tick_ms\"}"));
+        assert!(body.contains("tsink_rules_store_limits{kind=\"max_groups\"}"));
+        assert!(body.contains("tsink_rules_store_bytes{kind=\"retained_state\"}"));
+        assert!(body.contains("tsink_rules_store_peak_bytes{kind=\"runtime_update_transient\"}"));
+        assert!(body.contains("tsink_rules_store_rejections_total{kind=\"snapshot\"}"));
+        assert!(body.contains("tsink_rules_store_persistence_failures_total"));
     }
 
     #[tokio::test]
@@ -20362,6 +22329,13 @@ mod tests {
             body["data"]["resourceConfiguration"]["selectedProfile"],
             "embedded"
         );
+        assert_eq!(body["data"]["metricMetadataStore"]["available"], true);
+        assert!(body["data"]["metricMetadataStore"]["entries"].is_number());
+        assert!(body["data"]["metricMetadataStore"]["memory"]["peakRetainedBytes"].is_number());
+        assert!(
+            body["data"]["metricMetadataStore"]["limits"]["maxStartupTransientBytes"].is_number()
+        );
+        assert!(body["data"]["metricMetadataStore"]["rejections"]["queryTotal"].is_number());
         assert!(body["data"]["effectiveStorageLimits"]["maxConcurrentWriters"].is_number());
         assert!(body["data"]["effectiveStorageLimits"]["writeTimeoutNanos"].is_number());
         assert_eq!(
@@ -20386,6 +22360,8 @@ mod tests {
         assert!(body["data"]["memory"]["registryBytes"].is_number());
         assert!(body["data"]["memory"]["persistedIndexBytes"].is_number());
         assert!(body["data"]["memory"]["persistedMmapBytes"].is_number());
+        assert!(body["data"]["memory"]["remoteCatalogStagingBytes"].is_number());
+        assert!(body["data"]["memory"]["walWriterBufferBytes"].is_number());
         assert!(body["data"]["memory"]["walSeriesDefinitionCacheBytes"].is_number());
         assert!(body["data"]["memory"]["writeTransientBytes"].is_number());
         assert!(body["data"]["memory"]["peakWriteTransientBytes"].is_number());
@@ -21129,8 +23105,10 @@ mod tests {
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
         let exemplar_store = make_exemplar_store(None);
-        let mut usage_limits = crate::usage::UsageLedgerLimits::default();
-        usage_limits.recent_records = 1;
+        let usage_limits = crate::usage::UsageLedgerLimits {
+            recent_records: 1,
+            ..crate::usage::UsageLedgerLimits::default()
+        };
         let usage_accounting =
             UsageAccounting::open_with_limits_and_disk_budget(None, usage_limits, None)
                 .expect("usage accounting should open");

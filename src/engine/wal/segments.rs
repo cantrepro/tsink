@@ -1,5 +1,7 @@
-use super::codec::{decode_samples_payload, decode_series_definition};
-use super::replay::{parse_frame_header, read_header, HeaderRead};
+use super::codec::{
+    decode_samples_payload, decode_series_definition, validate_frame_payload_structure,
+};
+use super::replay::{parse_frame_header, read_header, HeaderRead, ParsedFrameHeader};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,8 @@ struct WalOpenRecoveryState {
     quarantine_active_segment: bool,
 }
 
+const LEGACY_WAL_IDENTITY_FIXED_MEMORY_BYTES: usize = 16 * 1024;
+
 impl FramedWal {
     pub(in crate::engine) fn write_buffer_capacity_bytes(&self) -> usize {
         self.writer.lock().capacity()
@@ -71,11 +75,47 @@ impl FramedWal {
         Self::open_with_options(dir, sync_mode, buffer_size, DEFAULT_WAL_SEGMENT_MAX_BYTES)
     }
 
+    #[cfg(test)]
     pub(in crate::engine) fn open_with_buffer_size_and_disk_budget(
         dir: impl AsRef<Path>,
         sync_mode: WalSyncMode,
         buffer_size: usize,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Result<Self> {
+        Self::open_with_buffer_size_and_disk_budget_and_replay_mode(
+            dir,
+            sync_mode,
+            buffer_size,
+            local_disk_budget,
+            WalReplayMode::Strict,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn open_with_buffer_size_and_disk_budget_and_replay_mode(
+        dir: impl AsRef<Path>,
+        sync_mode: WalSyncMode,
+        buffer_size: usize,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        replay_mode: WalReplayMode,
+    ) -> Result<Self> {
+        Self::open_with_buffer_size_and_disk_budget_and_replay_mode_and_creation(
+            dir,
+            sync_mode,
+            buffer_size,
+            local_disk_budget,
+            replay_mode,
+            true,
+        )
+    }
+
+    pub(in crate::engine) fn open_with_buffer_size_and_disk_budget_and_replay_mode_and_creation(
+        dir: impl AsRef<Path>,
+        sync_mode: WalSyncMode,
+        buffer_size: usize,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        replay_mode: WalReplayMode,
+        allow_namespace_creation: bool,
     ) -> Result<Self> {
         Self::open_with_options_and_disk_budget(
             dir,
@@ -83,6 +123,8 @@ impl FramedWal {
             buffer_size,
             DEFAULT_WAL_SEGMENT_MAX_BYTES,
             local_disk_budget,
+            replay_mode,
+            allow_namespace_creation,
         )
     }
 
@@ -98,6 +140,8 @@ impl FramedWal {
             buffer_size,
             segment_max_bytes,
             None,
+            WalReplayMode::Strict,
+            true,
         )
     }
 
@@ -107,12 +151,35 @@ impl FramedWal {
         buffer_size: usize,
         segment_max_bytes: u64,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        replay_mode: WalReplayMode,
+        allow_namespace_creation: bool,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        if allow_namespace_creation {
+            fs::create_dir_all(&dir)?;
+        } else {
+            let metadata = fs::symlink_metadata(&dir).map_err(|source| TsinkError::IoWithPath {
+                path: dir.clone(),
+                source,
+            })?;
+            if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+                || !metadata.file_type().is_dir()
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "non-creating WAL open requires an existing plain directory: {}",
+                    dir.display()
+                )));
+            }
+        }
 
         let mut segments = collect_wal_segment_files(&dir)?;
         if segments.is_empty() {
+            if !allow_namespace_creation {
+                return Err(TsinkError::DataCorruption(format!(
+                    "non-creating WAL open requires an existing canonical segment: {}",
+                    dir.display()
+                )));
+            }
             let path = segment_path(&dir, 0);
             File::create(&path)?;
             sync_dir_path(&dir)?;
@@ -126,39 +193,53 @@ impl FramedWal {
         let published_highwater_path = published_highwater_path(&dir);
         let published_highwater_tmp_path = published_highwater_tmp_path(&dir);
         let existing_published_highwater = read_published_highwater(&published_highwater_path)?;
+        if existing_published_highwater.is_none() && !allow_namespace_creation {
+            return Err(TsinkError::DataCorruption(format!(
+                "non-creating WAL open requires the canonical publish-boundary marker: {}",
+                published_highwater_path.display()
+            )));
+        }
         if let Some(published_highwater) = existing_published_highwater {
             discard_unpublished_suffixes(&segments, published_highwater)?;
         }
         let recovery = scan_segments_for_open(&segments)?;
         let mut active_last_seq = recovery.active_segment_last_seq;
         let last_highwater = recovery.last_highwater;
+        if recovery.quarantine_active_segment && replay_mode == WalReplayMode::Strict {
+            return Err(TsinkError::DataCorruption(format!(
+                "strict WAL open detected corruption in active segment {} at {}",
+                active.id,
+                active.path.display()
+            )));
+        }
 
         let published_highwater = existing_published_highwater.unwrap_or(last_highwater);
-        let writer_file = if recovery.quarantine_active_segment {
-            let quarantined_segment = active.id;
-            let next_segment = quarantined_segment.saturating_add(1);
-            let next_path = segment_path(&dir, next_segment);
-            let (file, segment_created, _) = open_segment_for_append(&next_path)?;
-            if segment_created {
-                sync_dir_path(&dir)?;
-            }
-            warn!(
-                segment = quarantined_segment,
-                path = %active.path.display(),
-                next_segment,
-                "WAL open quarantined corrupted active segment"
-            );
-            active = WalSegmentFile {
-                id: next_segment,
-                path: next_path,
+        let writer_file =
+            if recovery.quarantine_active_segment && replay_mode == WalReplayMode::Salvage {
+                let quarantined_segment = active.id;
+                let next_segment = quarantined_segment.saturating_add(1);
+                let next_path = segment_path(&dir, next_segment);
+                let (file, segment_created, _) = open_segment_for_append(&next_path)?;
+                if segment_created {
+                    sync_dir_path(&dir)?;
+                }
+                warn!(
+                    segment = quarantined_segment,
+                    path = %active.path.display(),
+                    next_segment,
+                    "WAL open quarantined corrupted active segment"
+                );
+                active = WalSegmentFile {
+                    id: next_segment,
+                    path: next_path,
+                };
+                segments.push(active.clone());
+                active_last_seq = 0;
+                file
+            } else {
+                let (file, _, _) = open_segment_for_append(&active.path)?;
+                file
             };
-            segments.push(active.clone());
-            active_last_seq = 0;
-            file
-        } else {
-            let (file, _, _) = open_segment_for_append(&active.path)?;
-            file
-        };
         let accounting = WalRuntimeAccounting::from_segments(&segments)?;
         let writer = BufWriter::with_capacity(buffer_size.max(1), writer_file);
 
@@ -178,7 +259,7 @@ impl FramedWal {
             last_appended_highwater: Mutex::new(last_highwater),
             last_published_highwater: Mutex::new(published_highwater),
             last_durable_highwater: Mutex::new(last_highwater),
-            configured_replay_mode: Mutex::new(WalReplayMode::Strict),
+            configured_replay_mode: Mutex::new(replay_mode),
             sync_mode,
             last_sync: Mutex::new(Instant::now()),
             segment_max_bytes: segment_max_bytes.max(1),
@@ -186,7 +267,11 @@ impl FramedWal {
             #[cfg(test)]
             append_sync_hook: Mutex::new(None),
             #[cfg(test)]
+            published_highwater_post_rename_hook: Mutex::new(None),
+            #[cfg(test)]
             cached_series_definition_rebuild_hook: Mutex::new(None),
+            #[cfg(test)]
+            durability_failpoint_hook: Mutex::new(None),
         };
 
         if existing_published_highwater.is_none() {
@@ -274,6 +359,8 @@ impl FramedWal {
             );
             let _ = old_writer.into_parts();
             writer.get_ref().sync_data()?;
+            #[cfg(test)]
+            self.invoke_durability_failpoint(WalDurabilityFailpoint::ResetAfterTruncate)?;
 
             for segment in collect_wal_segment_files(&self.dir)? {
                 if segment.path == active_path {
@@ -394,11 +481,32 @@ impl FramedWal {
     }
 
     pub fn ensure_min_highwater(&self, min_highwater: WalHighWatermark) -> Result<()> {
+        self.ensure_min_highwater_inner(min_highwater, true)
+    }
+
+    pub(in crate::engine) fn ensure_min_highwater_without_segment_creation(
+        &self,
+        min_highwater: WalHighWatermark,
+    ) -> Result<()> {
+        self.ensure_min_highwater_inner(min_highwater, false)
+    }
+
+    fn ensure_min_highwater_inner(
+        &self,
+        min_highwater: WalHighWatermark,
+        allow_segment_creation: bool,
+    ) -> Result<()> {
         let mut writer = self.writer.lock();
         let mut active_segment = self.active_segment.load(Ordering::SeqCst);
         let mut next_seq = self.next_seq.load(Ordering::SeqCst);
 
         if active_segment < min_highwater.segment {
+            if !allow_segment_creation {
+                return Err(TsinkError::DataCorruption(format!(
+                    "WAL active segment {active_segment} is below required persisted high-watermark segment {} and validation cannot create recovery paths",
+                    min_highwater.segment
+                )));
+            }
             let path = segment_path(&self.dir, min_highwater.segment);
             let (replacement, segment_created, initial_len) = open_segment_for_append(&path)?;
             let capacity = writer.capacity();
@@ -488,36 +596,92 @@ fn discard_unpublished_suffixes(
     segments: &[WalSegmentFile],
     published_highwater: WalHighWatermark,
 ) -> Result<()> {
-    for segment in segments {
-        let truncate_len = match segment.id.cmp(&published_highwater.segment) {
-            std::cmp::Ordering::Less => continue,
-            std::cmp::Ordering::Equal => {
-                published_prefix_len(&segment.path, published_highwater.frame)?
-            }
-            std::cmp::Ordering::Greater => Some(0),
-        };
+    struct TruncationPlan {
+        segment_id: u64,
+        path: PathBuf,
+        file: File,
+        current_len: u64,
+        truncate_len: u64,
+    }
 
-        let Some(truncate_len) = truncate_len else {
-            continue;
+    // Build and validate the complete plan before changing any segment. In particular, a corrupt
+    // published frame in a later segment must not leave an earlier segment partially truncated.
+    let mut plans = Vec::with_capacity(segments.len());
+    let mut saw_boundary_segment = false;
+    for segment in segments {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment.path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: segment.path.clone(),
+                source,
+            })?;
+        let metadata = file.metadata().map_err(|source| TsinkError::IoWithPath {
+            path: segment.path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(TsinkError::DataCorruption(format!(
+                "WAL segment is not a regular file during publish-boundary preflight: {}",
+                segment.path.display()
+            )));
+        }
+        let current_len = metadata.len();
+        let truncate_len = match segment.id.cmp(&published_highwater.segment) {
+            std::cmp::Ordering::Less => {
+                validate_published_segment_prefix(
+                    &file,
+                    &segment.path,
+                    PublishedSegmentBoundary::EntireFile,
+                )?;
+                current_len
+            }
+            std::cmp::Ordering::Equal => {
+                saw_boundary_segment = true;
+                validate_published_segment_prefix(
+                    &file,
+                    &segment.path,
+                    PublishedSegmentBoundary::Frame(published_highwater.frame),
+                )?
+            }
+            // No byte in a segment after the published segment can be visible. Opening every
+            // later path above is still part of preflight so a later access failure cannot occur
+            // after an earlier truncation.
+            std::cmp::Ordering::Greater => 0,
         };
-        let current_len = match fs::metadata(&segment.path) {
-            Ok(metadata) => metadata.len(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
-        };
-        if current_len <= truncate_len {
+        plans.push(TruncationPlan {
+            segment_id: segment.id,
+            path: segment.path.clone(),
+            file,
+            current_len,
+            truncate_len,
+        });
+    }
+    if !saw_boundary_segment {
+        return Err(TsinkError::DataCorruption(format!(
+            "WAL publish boundary references missing segment {}",
+            published_highwater.segment
+        )));
+    }
+
+    for plan in plans {
+        if plan.current_len <= plan.truncate_len {
             continue;
         }
-
-        let file = OpenOptions::new().write(true).open(&segment.path)?;
-        file.set_len(truncate_len)?;
-        file.sync_data()?;
+        plan.file
+            .set_len(plan.truncate_len)
+            .and_then(|()| plan.file.sync_data())
+            .map_err(|source| TsinkError::IoWithPath {
+                path: plan.path.clone(),
+                source,
+            })?;
         warn!(
-            segment = segment.id,
-            path = %segment.path.display(),
+            segment = plan.segment_id,
+            path = %plan.path.display(),
             published_segment = published_highwater.segment,
             published_frame = published_highwater.frame,
-            discarded_bytes = current_len.saturating_sub(truncate_len),
+            discarded_bytes = plan.current_len.saturating_sub(plan.truncate_len),
             "WAL open discarded unpublished suffix"
         );
     }
@@ -525,75 +689,152 @@ fn discard_unpublished_suffixes(
     Ok(())
 }
 
-/// Returns the byte length of the physical prefix ending at `published_frame`.
+#[derive(Debug, Clone, Copy)]
+enum PublishedSegmentBoundary {
+    EntireFile,
+    Frame(u64),
+}
+
+/// Validates the complete published portion of one segment and returns its retained byte length.
 ///
-/// A publish marker defines a prefix, not merely the latest frame to expose. Keeping
-/// later frames around would let a future publish marker retroactively commit a write
-/// that crashed before publication. An empty file is valid because WAL reset removes
-/// checkpointed frames while retaining their monotonic high-watermark.
-fn published_prefix_len(path: &Path, published_frame: u64) -> Result<Option<u64>> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    let mut reader = BufReader::new(file);
+/// A marker defines a prefix, not merely the latest frame to expose. Every retained frame is
+/// checksummed and grammar-validated before any segment is truncated. An empty boundary segment
+/// remains valid because WAL reset removes checkpointed frames while retaining the monotonic
+/// high-watermark.
+fn validate_published_segment_prefix(
+    file: &File,
+    path: &Path,
+    boundary: PublishedSegmentBoundary,
+) -> Result<u64> {
+    let mut reader = BufReader::new(file.try_clone().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?);
     let mut prefix_len = 0u64;
-    let mut saw_frame_at_or_before_boundary = false;
+    let mut previous_frame_seq = None;
 
     loop {
         let header = match read_header(&mut reader)? {
             HeaderRead::Eof => {
-                if !saw_frame_at_or_before_boundary {
-                    return Ok(Some(0));
-                }
-                return Err(TsinkError::DataCorruption(format!(
-                    "WAL publish boundary frame {published_frame} is missing from {}",
-                    path.display()
-                )));
+                return match boundary {
+                    PublishedSegmentBoundary::EntireFile => Ok(prefix_len),
+                    PublishedSegmentBoundary::Frame(_) if previous_frame_seq.is_none() => Ok(0),
+                    PublishedSegmentBoundary::Frame(published_frame) => {
+                        Err(TsinkError::DataCorruption(format!(
+                            "WAL publish boundary frame {published_frame} is missing from {}",
+                            path.display()
+                        )))
+                    }
+                };
             }
-            HeaderRead::Truncated => return Ok(None),
+            HeaderRead::Truncated => {
+                return Err(TsinkError::DataCorruption(format!(
+                    "published WAL prefix has a truncated frame header: {}",
+                    path.display()
+                )))
+            }
             HeaderRead::FrameHeader(header) => header,
         };
 
-        let Some(parsed_header) = parse_frame_header(&header)? else {
-            return Ok(None);
-        };
-        if parsed_header.frame_seq > published_frame {
-            if saw_frame_at_or_before_boundary {
+        let parsed_header = parse_frame_header(&header)?.ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "published WAL prefix has a frame magic mismatch: {}",
+                path.display()
+            ))
+        })?;
+        if parsed_header.frame_seq == 0
+            || previous_frame_seq.is_some_and(|previous| parsed_header.frame_seq <= previous)
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "published WAL prefix has a non-increasing frame sequence {} after {:?}: {}",
+                parsed_header.frame_seq,
+                previous_frame_seq,
+                path.display()
+            )));
+        }
+        if let PublishedSegmentBoundary::Frame(published_frame) = boundary {
+            if parsed_header.frame_seq > published_frame {
+                if previous_frame_seq.is_none() {
+                    // Reset can leave an empty logical prefix followed by an abandoned append.
+                    return Ok(0);
+                }
                 return Err(TsinkError::DataCorruption(format!(
                     "WAL publish boundary frame {published_frame} is missing before frame {} in {}",
                     parsed_header.frame_seq,
                     path.display()
                 )));
             }
-            return Ok(Some(0));
         }
         if parsed_header.payload_len > MAX_FRAME_PAYLOAD_BYTES {
-            return Ok(None);
+            return Err(TsinkError::DataCorruption(format!(
+                "published WAL frame {} exceeds the {}-byte payload limit: {}",
+                parsed_header.frame_seq,
+                MAX_FRAME_PAYLOAD_BYTES,
+                path.display()
+            )));
         }
 
         let mut payload = vec![0u8; parsed_header.payload_len];
-        if let Err(err) = reader.read_exact(&mut payload) {
-            if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Ok(None);
-            }
-            return Err(err.into());
+        if let Err(source) = reader.read_exact(&mut payload) {
+            return if source.kind() == std::io::ErrorKind::UnexpectedEof {
+                Err(TsinkError::DataCorruption(format!(
+                    "published WAL frame {} has a truncated payload: {}",
+                    parsed_header.frame_seq,
+                    path.display()
+                )))
+            } else {
+                Err(TsinkError::IoWithPath {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            };
         }
+        if checksum32(&payload) != parsed_header.expected_crc32 {
+            return Err(TsinkError::DataCorruption(format!(
+                "published WAL frame {} has a checksum mismatch: {}",
+                parsed_header.frame_seq,
+                path.display()
+            )));
+        }
+        validate_frame_payload_structure(parsed_header.frame_type, &payload).map_err(|err| {
+            TsinkError::DataCorruption(format!(
+                "published WAL frame {} has an invalid payload: {err}: {}",
+                parsed_header.frame_seq,
+                path.display()
+            ))
+        })?;
 
-        saw_frame_at_or_before_boundary = true;
-        prefix_len = prefix_len.saturating_add(
-            (FRAME_HEADER_LEN as u64).saturating_add(parsed_header.payload_len as u64),
-        );
-        if parsed_header.frame_seq == published_frame {
-            return Ok(Some(prefix_len));
+        previous_frame_seq = Some(parsed_header.frame_seq);
+        prefix_len = prefix_len
+            .checked_add(FRAME_HEADER_LEN as u64)
+            .and_then(|bytes| bytes.checked_add(parsed_header.payload_len as u64))
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(format!(
+                    "published WAL prefix length overflow: {}",
+                    path.display()
+                ))
+            })?;
+        if matches!(
+            boundary,
+            PublishedSegmentBoundary::Frame(published_frame)
+                if parsed_header.frame_seq == published_frame
+        ) {
+            return Ok(prefix_len);
         }
     }
 }
 
-pub(super) fn write_published_highwater_marker(
+pub(super) fn write_published_highwater_marker<F>(
     dir: &Path,
     path: &Path,
     tmp_path: &Path,
     highwater: WalHighWatermark,
     sync: bool,
-) -> Result<()> {
+    post_rename: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     let write_result = (|| -> Result<()> {
         let bytes = encode_published_highwater(highwater);
         let mut file = OpenOptions::new()
@@ -607,6 +848,7 @@ pub(super) fn write_published_highwater_marker(
         }
         drop(file);
         crate::engine::fs_utils::rename_tmp(tmp_path, path)?;
+        post_rename()?;
         if sync {
             sync_dir_path(dir)?;
         }
@@ -758,6 +1000,402 @@ fn parse_segment_file_name(file_name: &str) -> Option<u64> {
     }
 
     u64::from_str_radix(hex, 16).ok()
+}
+
+/// Establishes a manifestless directory's identity from the exact, persisted framed-WAL
+/// namespace without opening the WAL for recovery. This deliberately performs no creation,
+/// truncation, quarantine, rename, or cleanup.
+///
+/// A non-empty WAL is accepted only after every segment's first frame has a canonical current
+/// header and one deterministic candidate frame has passed its payload checksum and codec
+/// decoder. The exact one-file, zero-length namespace is also the durable bootstrap/fully
+/// rolled-back state produced before the first successful append; no arbitrary bytes are
+/// accepted as that state.
+pub(in crate::engine) fn validate_legacy_wal_identity(
+    dir: &Path,
+    startup_memory_budget: usize,
+) -> Result<bool> {
+    let dir_metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: dir.to_path_buf(),
+                source,
+            })
+        }
+    };
+    if crate::engine::fs_utils::is_link_or_reparse_point(&dir_metadata)
+        || !dir_metadata.file_type().is_dir()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL identity root is link-like or not a directory: {}",
+            dir.display()
+        )));
+    }
+    let initial_dir_identity =
+        same_file::Handle::from_path(dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+
+    let mut observed_entries = 0usize;
+    let mut saw_segment = false;
+    let mut saw_legacy_zero_alias = false;
+    let mut saw_canonical_zero = false;
+    let mut saw_published_marker = false;
+    let mut nonempty_candidate: Option<(u64, PathBuf, u64)> = None;
+
+    for entry in fs::read_dir(dir).map_err(|source| TsinkError::IoWithPath {
+        path: dir.to_path_buf(),
+        source,
+    })? {
+        observed_entries = observed_entries.checked_add(1).ok_or_else(|| {
+            TsinkError::Other("legacy WAL namespace entry counter overflow".to_string())
+        })?;
+        if observed_entries > crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy WAL identity exceeds its {}-entry work bound: {}",
+                crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                dir.display()
+            )));
+        }
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy WAL contains a non-UTF-8 entry: {}",
+                path.display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?;
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy WAL entry is link-like or not a regular file: {}",
+                path.display()
+            )));
+        }
+
+        if matches!(
+            name,
+            WAL_PUBLISHED_HIGHWATER_FILE_NAME | WAL_PUBLISHED_HIGHWATER_TMP_FILE_NAME
+        ) {
+            validate_legacy_published_marker(&path, metadata.len())?;
+            if name == WAL_PUBLISHED_HIGHWATER_FILE_NAME {
+                saw_published_marker = true;
+            }
+            continue;
+        }
+
+        let segment_id = if name == WAL_FILE_NAME {
+            saw_legacy_zero_alias = true;
+            Some(0)
+        } else {
+            parse_segment_file_name(name).filter(|segment_id| {
+                segment_path(dir, *segment_id)
+                    .file_name()
+                    .and_then(|candidate| candidate.to_str())
+                    == Some(name)
+            })
+        }
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy WAL contains an unknown or non-canonical entry: {}",
+                path.display()
+            ))
+        })?;
+        if segment_id == 0 && name != WAL_FILE_NAME {
+            saw_canonical_zero = true;
+        }
+        if saw_legacy_zero_alias && saw_canonical_zero {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy WAL contains duplicate segment-zero aliases: {}",
+                dir.display()
+            )));
+        }
+
+        saw_segment = true;
+        if metadata.len() == 0 {
+            continue;
+        }
+        let parsed = probe_legacy_wal_frame(&path, metadata.len())?;
+        if nonempty_candidate
+            .as_ref()
+            .is_none_or(|(candidate_id, _, _)| segment_id < *candidate_id)
+        {
+            nonempty_candidate = Some((segment_id, path, metadata.len()));
+        }
+        // Parse here, before candidate selection, so arbitrary bytes in any named segment cannot
+        // be hidden behind a different valid segment.
+        let _ = parsed;
+    }
+
+    if !saw_segment {
+        return Ok(false);
+    }
+    if let Some((_, path, file_len)) = nonempty_candidate {
+        validate_legacy_wal_frame_payload(&path, file_len, startup_memory_budget)?;
+    } else if !saw_published_marker {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy empty WAL bootstrap identity requires a checksummed publish marker: {}",
+            dir.display()
+        )));
+    }
+
+    let current_dir_metadata =
+        fs::symlink_metadata(dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&current_dir_metadata)
+        || !current_dir_metadata.file_type().is_dir()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL identity root changed type while validating: {}",
+            dir.display()
+        )));
+    }
+    let current_dir_identity =
+        same_file::Handle::from_path(dir).map_err(|source| TsinkError::IoWithPath {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    if initial_dir_identity != current_dir_identity {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL identity root changed while validating: {}",
+            dir.display()
+        )));
+    }
+
+    Ok(true)
+}
+
+fn validate_legacy_published_marker(path: &Path, file_len: u64) -> Result<()> {
+    if file_len != PUBLISHED_HIGHWATER_RECORD_LEN as u64 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL publish marker has length {file_len}, expected {PUBLISHED_HIGHWATER_RECORD_LEN}: {}",
+            path.display()
+        )));
+    }
+    let mut file = open_legacy_wal_file_no_follow(path, file_len)?;
+    let mut bytes = [0u8; PUBLISHED_HIGHWATER_RECORD_LEN];
+    file.read_exact(&mut bytes)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    decode_published_highwater(&bytes).map_err(|err| {
+        TsinkError::DataCorruption(format!(
+            "legacy WAL publish marker failed read-only identity validation at {}: {err}",
+            path.display()
+        ))
+    })?;
+    validate_opened_legacy_wal_file_identity(file, path, file_len)
+}
+
+fn probe_legacy_wal_frame(path: &Path, file_len: u64) -> Result<ParsedFrameHeader> {
+    let mut file = open_legacy_wal_file_no_follow(path, file_len)?;
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    file.read_exact(&mut header).map_err(|err| {
+        TsinkError::DataCorruption(format!(
+            "legacy WAL segment has a truncated first frame at {}: {err}",
+            path.display()
+        ))
+    })?;
+    let parsed = parse_frame_header(&header)
+        .map_err(|err| {
+            TsinkError::DataCorruption(format!(
+                "legacy WAL segment first frame is malformed at {}: {err}",
+                path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy WAL segment first frame magic is invalid: {}",
+                path.display()
+            ))
+        })?;
+    if header[5..8] != [0u8; 3] {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first frame has nonzero reserved header bytes: {}",
+            path.display()
+        )));
+    }
+    if parsed.frame_seq == 0 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first frame sequence is zero: {}",
+            path.display()
+        )));
+    }
+    if !matches!(
+        parsed.frame_type,
+        FRAME_TYPE_SERIES_DEF | FRAME_TYPE_SAMPLES
+    ) {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first frame type {} is unknown: {}",
+            parsed.frame_type,
+            path.display()
+        )));
+    }
+    if parsed.payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first frame payload {} exceeds the {}-byte format limit: {}",
+            parsed.payload_len,
+            MAX_FRAME_PAYLOAD_BYTES,
+            path.display()
+        )));
+    }
+    let required_len = (FRAME_HEADER_LEN as u64)
+        .checked_add(parsed.payload_len as u64)
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy WAL segment first frame length overflows: {}",
+                path.display()
+            ))
+        })?;
+    if required_len > file_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first frame is truncated: {}",
+            path.display()
+        )));
+    }
+    validate_opened_legacy_wal_file_identity(file, path, file_len)?;
+    Ok(parsed)
+}
+
+fn validate_legacy_wal_frame_payload(
+    path: &Path,
+    file_len: u64,
+    startup_memory_budget: usize,
+) -> Result<()> {
+    let parsed = probe_legacy_wal_frame(path, file_len)?;
+    let required = parsed
+        .payload_len
+        .checked_add(LEGACY_WAL_IDENTITY_FIXED_MEMORY_BYTES)
+        .ok_or_else(|| {
+            TsinkError::Other("legacy WAL identity memory model overflow".to_string())
+        })?;
+    crate::disk_budget::admit_startup_memory(startup_memory_budget, required)?;
+
+    let mut file = open_legacy_wal_file_no_follow(path, file_len)?;
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(parsed.payload_len)
+        .map_err(|err| {
+            TsinkError::Other(format!(
+                "unable to allocate {} bytes for legacy WAL identity validation at {}: {err}",
+                parsed.payload_len,
+                path.display()
+            ))
+        })?;
+    payload.resize(parsed.payload_len, 0);
+    file.read_exact(&mut payload).map_err(|err| {
+        TsinkError::DataCorruption(format!(
+            "legacy WAL segment first-frame payload became truncated at {}: {err}",
+            path.display()
+        ))
+    })?;
+    if checksum32(&payload) != parsed.expected_crc32 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL segment first-frame checksum mismatch: {}",
+            path.display()
+        )));
+    }
+    validate_frame_payload_structure(parsed.frame_type, &payload).map_err(|err| {
+        TsinkError::DataCorruption(format!(
+            "legacy WAL segment first-frame payload failed codec validation at {}: {err}",
+            path.display()
+        ))
+    })?;
+    validate_opened_legacy_wal_file_identity(file, path, file_len)
+}
+
+fn open_legacy_wal_file_no_follow(path: &Path, expected_len: u64) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_len
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL file changed type or length while opening: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn validate_opened_legacy_wal_file_identity(
+    file: File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<()> {
+    let opened_identity =
+        same_file::Handle::from_file(file).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let current_metadata = fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&current_metadata)
+        || !current_metadata.file_type().is_file()
+        || current_metadata.len() != expected_len
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL file changed type or length while validating: {}",
+            path.display()
+        )));
+    }
+    let current_identity =
+        same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if opened_identity != current_identity {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy WAL file path changed while validating: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {

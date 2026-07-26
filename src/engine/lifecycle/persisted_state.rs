@@ -101,6 +101,9 @@ impl ChunkStorage {
         }
 
         let state_update = self.apply_segment_root_removal_state_update(roots)?;
+        if !state_update.removed_any {
+            return Ok(false);
+        }
         self.install_visible_persisted_state(PersistedVisibleStateInstall {
             refresh_series_ids: state_update.affected_series,
             mark_refreshed_series_materialized: false,

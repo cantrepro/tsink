@@ -17,6 +17,9 @@ mod tests;
 mod value_family;
 
 pub(crate) use creation_rate::{SeriesCreationRateLimiter, SeriesCreationRateReservation};
+pub(crate) use persistence::{
+    modeled_registry_payload_for_inspection, validate_registry_payload_for_inspection,
+};
 
 pub type SeriesId = u64;
 pub type DictionaryId = u32;
@@ -39,6 +42,10 @@ const REGISTRY_INCREMENTAL_JOURNAL_MAX_SERIES: usize = 1_024;
 const REGISTRY_INCREMENTAL_JOURNAL_MAX_STORED_BYTES: usize = 4 * 1024 * 1024;
 static REGISTRY_INCREMENTAL_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SERIES_REGISTRY_SHARD_COUNT: usize = 64;
+// Match the query planner's conservative sparse-Roaring model: one identifier plus container,
+// index, and allocator bookkeeping for every value that can inhabit the cloned bitmap.
+const SERIES_REGISTRY_POSTINGS_CLONE_BYTES_PER_SERIES: usize = std::mem::size_of::<SeriesId>() * 4;
+const SERIES_REGISTRY_POSTINGS_CLONE_ALLOCATION_BYTES: usize = 256;
 
 #[derive(Debug)]
 pub struct LoadedSeriesRegistry {
@@ -115,16 +122,9 @@ struct AllSeriesPostingsShard {
     estimated_postings_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
-struct MissingLabelPostingsCacheEntry {
-    bitmap: RoaringTreemap,
-    postings_generation: u64,
-}
-
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct LabelNamePostingsState {
     present: RoaringTreemap,
-    missing_cache: Option<MissingLabelPostingsCacheEntry>,
     bucket_count: usize,
 }
 
@@ -146,7 +146,6 @@ pub struct SeriesRegistry {
     next_series_id: AtomicU64,
     pending_series_reservations: AtomicUsize,
     estimated_total_bytes: AtomicUsize,
-    postings_generation: AtomicU64,
     metric_dict: RwLock<StringDictionary>,
     label_name_dict: RwLock<StringDictionary>,
     label_value_dict: RwLock<StringDictionary>,
@@ -170,7 +169,6 @@ impl SeriesRegistry {
             next_series_id: AtomicU64::new(1),
             pending_series_reservations: AtomicUsize::new(0),
             estimated_total_bytes: AtomicUsize::new(0),
-            postings_generation: AtomicU64::new(0),
             metric_dict: RwLock::new(StringDictionary::default()),
             label_name_dict: RwLock::new(StringDictionary::default()),
             label_value_dict: RwLock::new(StringDictionary::default()),
@@ -210,6 +208,19 @@ impl SeriesRegistry {
         } else {
             bitmap.serialized_size()
         }
+    }
+
+    fn modeled_postings_clone_and_insert_bytes(
+        bitmap: Option<&RoaringTreemap>,
+        inserted_series: usize,
+    ) -> usize {
+        let existing = bitmap
+            .map(|bitmap| usize::try_from(bitmap.len()).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        existing
+            .saturating_add(inserted_series)
+            .saturating_mul(SERIES_REGISTRY_POSTINGS_CLONE_BYTES_PER_SERIES)
+            .saturating_add(SERIES_REGISTRY_POSTINGS_CLONE_ALLOCATION_BYTES)
     }
 
     fn recompute_series_bytes(&self) -> usize {
@@ -265,6 +276,11 @@ impl SeriesRegistry {
         self.next_series_id.load(Ordering::Acquire).max(1)
     }
 
+    #[cfg(test)]
+    pub(crate) fn next_series_id_value_for_test(&self) -> SeriesId {
+        self.next_series_id_value()
+    }
+
     fn load_series_registry_shard_idx(&self, series_id: SeriesId) -> Option<usize> {
         self.series_id_shards[Self::series_id_index_shard_idx(series_id)]
             .read()
@@ -305,10 +321,6 @@ impl SeriesRegistry {
                 Err(observed) => current = observed,
             }
         }
-    }
-
-    fn bump_postings_generation(&self) {
-        self.postings_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn sub_estimated_memory_bytes(&self, bytes: usize) {

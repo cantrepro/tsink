@@ -281,7 +281,7 @@ impl SeriesRegistry {
             let value = label_value_dict.get_value(pair.value_id)?;
             labels.push(Label::new(name, value));
         }
-        labels.sort();
+        labels.sort_unstable();
         Some(SeriesKey { metric, labels })
     }
 

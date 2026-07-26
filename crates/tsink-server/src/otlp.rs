@@ -13,59 +13,19 @@ use std::fmt;
 use tsink::label::{MAX_LABEL_NAME_LEN, MAX_LABEL_VALUE_LEN, MAX_METRIC_NAME_LEN};
 use tsink::{DataPoint, Label, TimestampPrecision};
 
-#[allow(clippy::all, dead_code)]
-pub mod generated {
-    pub mod opentelemetry {
-        pub mod proto {
-            pub mod collector {
-                pub mod metrics {
-                    pub mod v1 {
-                        include!(concat!(
-                            env!("OUT_DIR"),
-                            "/opentelemetry.proto.collector.metrics.v1.rs"
-                        ));
-                    }
-                }
-            }
-            pub mod common {
-                pub mod v1 {
-                    include!(concat!(
-                        env!("OUT_DIR"),
-                        "/opentelemetry.proto.common.v1.rs"
-                    ));
-                }
-            }
-            pub mod metrics {
-                pub mod v1 {
-                    include!(concat!(
-                        env!("OUT_DIR"),
-                        "/opentelemetry.proto.metrics.v1.rs"
-                    ));
-                }
-            }
-            pub mod resource {
-                pub mod v1 {
-                    include!(concat!(
-                        env!("OUT_DIR"),
-                        "/opentelemetry.proto.resource.v1.rs"
-                    ));
-                }
-            }
-        }
-    }
-}
-
-pub use generated::opentelemetry::proto::collector::metrics::v1::{
+#[allow(unused_imports)]
+pub use tsink_protocol::otlp::generated;
+pub use tsink_protocol::otlp::generated::opentelemetry::proto::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-pub use generated::opentelemetry::proto::common::v1::{
+pub use tsink_protocol::otlp::generated::opentelemetry::proto::common::v1::{
     any_value, AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
 };
-pub use generated::opentelemetry::proto::metrics::v1::{
+pub use tsink_protocol::otlp::generated::opentelemetry::proto::metrics::v1::{
     exemplar, metric, number_data_point, AggregationTemporality, Exemplar, Gauge, Histogram,
     Metric, NumberDataPoint, Sum, Summary,
 };
-pub use generated::opentelemetry::proto::resource::v1::Resource;
+pub use tsink_protocol::otlp::generated::opentelemetry::proto::resource::v1::Resource;
 
 const OTLP_NO_RECORDED_VALUE_MASK: u32 = 0x1;
 const TENANT_LABEL: &str = "__tenant_id";

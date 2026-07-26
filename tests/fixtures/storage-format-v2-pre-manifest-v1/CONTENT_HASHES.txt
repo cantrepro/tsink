@@ -1,0 +1,23 @@
+# xxh64(seed=0) content_hash  size_bytes  data_relative_path
+ef46db3751d8e999  0  .tsink.lock
+3fddb5e71dc0d9d5  102  lane_blob/segments/L0/seg-0000000000000002/chunk_index.bin
+8bbfddefeb5e73a6  249  lane_blob/segments/L0/seg-0000000000000002/chunks.bin
+97fece718e92d4b1  180  lane_blob/segments/L0/seg-0000000000000002/manifest.bin
+b4c693410f4aa433  107  lane_blob/segments/L0/seg-0000000000000002/postings.bin
+6b387d3dee694a34  150  lane_blob/segments/L0/seg-0000000000000002/series.bin
+48402fd3158ce75f  314  lane_blob/tombstones.json
+ed139e95df06fa4e  50  lane_blob/tombstones.json.store/shards/shard-005-0000000000000004.bin
+339b900f6739cb0d  128  lane_numeric/segments/L0/seg-0000000000000001/chunk_index.bin
+202ef6808753ec20  229  lane_numeric/segments/L0/seg-0000000000000001/chunks.bin
+d404d718dd6aba7e  180  lane_numeric/segments/L0/seg-0000000000000001/manifest.bin
+ca06712ec327b813  124  lane_numeric/segments/L0/seg-0000000000000001/postings.bin
+3e175ee47ff0b85d  182  lane_numeric/segments/L0/seg-0000000000000001/series.bin
+5d461070a42a395c  314  lane_numeric/tombstones.json
+ed139e95df06fa4e  50  lane_numeric/tombstones.json.store/shards/shard-005-0000000000000003.bin
+c73af918b19fe314  227  series_index.bin
+2416c4a22a94b5d9  142  series_index.catalog.d/manifest.json
+c7254730c522be4f  393  series_index.catalog.d/segment-blob-00-0000000000000002.json
+fac7bc5b7ffd90e8  395  series_index.catalog.d/segment-numeric-00-0000000000000001.json
+81f647bce72cc25a  1231  series_index.catalog.json
+7f5f2b28e4fba131  193  wal/wal-0000000000000000.log
+702398f212ee499d  24  wal/wal.published

@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::engine::storage_engine::test_hooks::FallibleCommitHook;
 
 pub(super) fn add_included_memory_component_bytes(
     accounting_enabled: bool,
@@ -361,9 +363,20 @@ pub(in crate::engine::storage_engine) struct SealedChunkPublishContext<'a> {
     #[cfg(test)]
     pub(in crate::engine::storage_engine) pre_publish_hook:
         &'a RwLock<Option<Arc<IngestCommitHook>>>,
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) post_chunk_seal_hook:
+        &'a RwLock<Option<Arc<FallibleCommitHook>>>,
 }
 
 impl<'a> SealedChunkPublishContext<'a> {
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn invoke_post_chunk_seal_hook(self) -> Result<()> {
+        match self.post_chunk_seal_hook.read().clone() {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    }
+
     pub(in crate::engine::storage_engine) fn append_finalized_chunks_to_sealed_shard<I>(
         self,
         shard_idx: usize,

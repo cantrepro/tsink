@@ -408,6 +408,11 @@ Returns the current configuration and runtime state for all configured rule grou
 }
 ```
 
+`data.storeLimits` reports the active finite sidecar envelope. The `metrics` object also reports
+current and peak retained/durable/startup/replacement/runtime/status/snapshot-file byte accounting,
+fixed-category rejection counters, and persistence failures. These fields use fixed names and do
+not contain tenant, group, rule, label, or attacker-controlled diagnostic values.
+
 **Rule state field summary**
 
 | `state` | Meaning |
@@ -441,6 +446,36 @@ The following environment variables tune the rules runtime. They are read once a
 | `TSINK_RULES_SCHEDULER_TICK_MS` | `1000` | Background scheduler tick interval in milliseconds. Must be > 0. This only controls how often the scheduler wakes up to check for due rules — actual rule evaluation still follows each rule's configured interval. |
 | `TSINK_RULES_MAX_RECORDING_ROWS_PER_EVAL` | `10000` | Maximum number of rows a single recording rule evaluation is allowed to write. Evaluations producing more rows are rejected with an error. |
 | `TSINK_RULES_MAX_ALERT_INSTANCES_PER_RULE` | `10000` | Maximum number of concurrent active alert instances for a single alerting rule. Evaluations that exceed this limit are rejected with an error. |
+
+Embedded runtimes can additionally pass a validated `RulesRuntimeConfig` to
+`RulesRuntime::open_with_config`. Its `RulesStoreLimits` member controls the complete sidecar
+envelope; these values are not separate environment variables.
+
+| `RulesStoreLimits` field | Default |
+|---|---:|
+| `max_groups` | 256 |
+| `max_rules_per_group` | 256 |
+| `max_rules_total` | 4,096 |
+| `max_alert_instances_per_rule` | 10,000 |
+| `max_labels_per_set` | 64 |
+| `max_label_set_bytes` | 64 KiB |
+| `max_name_bytes` | 1 KiB |
+| `max_expression_bytes` | 256 KiB |
+| `max_annotation_bytes` | 64 KiB |
+| `max_total_retained_state_bytes` | 16 MiB |
+| `max_durable_file_bytes` | 32 MiB |
+| `max_startup_transient_bytes` | 128 MiB |
+| `max_replacement_transient_bytes` | 64 MiB |
+| `max_runtime_update_transient_bytes` | 48 MiB |
+| `max_snapshot_status_bytes` | 64 MiB |
+
+Configuration and runtime updates are admitted against their transient and final retained peaks
+before durable persistence. The new durable representation is written successfully before live
+state changes. Startup rejects oversized, deeply nested, corrupt, or trailing-growth files with
+bounded diagnostics. Status responses account for both the caller-owned snapshot and its encoded
+HTTP body; durable snapshot files instead use the durable-file ceiling and a separate observed
+peak. A returned `RulesStatusSnapshot` is caller-owned, so code retaining several snapshots must
+apply its own aggregate bound.
 
 ---
 

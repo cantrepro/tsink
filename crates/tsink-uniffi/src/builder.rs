@@ -324,7 +324,9 @@ mod tests {
         assert_eq!(limits.max_write_batch_rows, Some(23));
         assert_eq!(limits.max_write_batch_input_bytes, Some(8_192));
         let memory = db.observability_snapshot().memory;
+        assert_eq!(memory.wal_writer_buffer_bytes, 0);
         assert_eq!(memory.wal_series_definition_cache_bytes, 0);
+        assert_eq!(memory.remote_catalog_staging_bytes, 0);
         assert_eq!(memory.write_transient_bytes, 0);
         assert!(memory.write_transient_bytes_estimated);
 

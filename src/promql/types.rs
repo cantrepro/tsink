@@ -239,12 +239,43 @@ pub fn histogram_counter_reset_detected(
         .any(|((_, current_count), (_, previous_count))| current_count < previous_count))
 }
 
+#[must_use]
+pub fn histogram_bucket_count(histogram: &NativeHistogram) -> usize {
+    histogram
+        .negative_spans
+        .iter()
+        .chain(&histogram.positive_spans)
+        .fold(0usize, |count, span| {
+            count.saturating_add(span.length as usize)
+        })
+        .saturating_add(usize::from(histogram_zero_count_value(histogram) > 0.0))
+}
+
 pub fn histogram_buckets(histogram: &NativeHistogram) -> Result<Vec<HistogramBucket>, String> {
     if !histogram.custom_values.is_empty() {
         return Err("custom bucket native histograms are not supported yet".to_string());
     }
 
-    let mut buckets = Vec::new();
+    // Validate both encoded sides before trusting the span lengths for an
+    // allocation. A malformed in-memory histogram can otherwise advertise a
+    // huge span while providing only a tiny count vector.
+    let negative_bucket_count = validated_bucket_count(
+        &histogram.negative_spans,
+        &histogram.negative_deltas,
+        &histogram.negative_counts,
+    )?;
+    let positive_bucket_count = validated_bucket_count(
+        &histogram.positive_spans,
+        &histogram.positive_deltas,
+        &histogram.positive_counts,
+    )?;
+    let zero_bucket_count = usize::from(histogram_zero_count_value(histogram) > 0.0);
+    let bucket_count = negative_bucket_count
+        .checked_add(positive_bucket_count)
+        .and_then(|count| count.checked_add(zero_bucket_count))
+        .ok_or_else(|| "native histogram bucket count exceeds the addressable limit".to_string())?;
+
+    let mut buckets = Vec::with_capacity(bucket_count);
     let negative = decoded_bucket_values(
         &histogram.negative_spans,
         &histogram.negative_deltas,
@@ -288,10 +319,13 @@ pub fn histogram_buckets(histogram: &NativeHistogram) -> Result<Vec<HistogramBuc
         });
     }
 
-    buckets.sort_by(|left, right| {
+    buckets.sort_unstable_by(|left, right| {
         left.lower
             .total_cmp(&right.lower)
             .then_with(|| left.upper.total_cmp(&right.upper))
+            .then_with(|| left.count.total_cmp(&right.count))
+            .then_with(|| left.lower_inclusive.cmp(&right.lower_inclusive))
+            .then_with(|| left.upper_inclusive.cmp(&right.upper_inclusive))
     });
     Ok(buckets)
 }
@@ -416,7 +450,50 @@ fn decoded_bucket_values(
     deltas: &[i64],
     counts: &[f64],
 ) -> Result<Vec<(i32, f64)>, String> {
-    let bucket_count = spans.iter().map(|span| span.length as usize).sum::<usize>();
+    let bucket_count = validated_bucket_count(spans, deltas, counts)?;
+
+    if bucket_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::with_capacity(bucket_count);
+    let mut next_index = None::<i32>;
+    let mut count_index = 0usize;
+    let mut previous_delta_count = 0.0;
+    for span in spans {
+        let start = match next_index {
+            Some(previous_end) => previous_end.saturating_add(span.offset),
+            None => span.offset,
+        };
+        for idx in 0..span.length {
+            let count = if !counts.is_empty() {
+                counts[count_index]
+            } else {
+                previous_delta_count += deltas[count_index] as f64;
+                previous_delta_count
+            };
+            values.push((
+                start.saturating_add(i32::try_from(idx).unwrap_or(i32::MAX)),
+                count,
+            ));
+            count_index = count_index.saturating_add(1);
+        }
+        next_index = Some(start.saturating_add(i32::try_from(span.length).unwrap_or(i32::MAX)));
+    }
+
+    Ok(values)
+}
+
+fn validated_bucket_count(
+    spans: &[crate::HistogramBucketSpan],
+    deltas: &[i64],
+    counts: &[f64],
+) -> Result<usize, String> {
+    let bucket_count = spans.iter().try_fold(0usize, |count, span| {
+        count.checked_add(span.length as usize).ok_or_else(|| {
+            "native histogram bucket count exceeds the addressable limit".to_string()
+        })
+    })?;
 
     if !counts.is_empty() && !deltas.is_empty() {
         return Err(
@@ -426,54 +503,25 @@ fn decoded_bucket_values(
     }
     if counts.is_empty() && deltas.is_empty() {
         if bucket_count == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         return Err("native histogram bucket layout is missing encoded counts".to_string());
     }
 
-    let raw_counts = if !counts.is_empty() {
-        if counts.len() != bucket_count {
-            return Err(format!(
-                "native histogram bucket count mismatch: expected {bucket_count}, got {}",
-                counts.len()
-            ));
-        }
-        counts.to_vec()
-    } else {
-        if deltas.len() != bucket_count {
-            return Err(format!(
-                "native histogram bucket delta mismatch: expected {bucket_count}, got {}",
-                deltas.len()
-            ));
-        }
-        let mut out = Vec::with_capacity(bucket_count);
-        let mut previous = 0.0;
-        for delta in deltas {
-            let current = previous + *delta as f64;
-            out.push(current);
-            previous = current;
-        }
-        out
-    };
-
-    let mut values = Vec::with_capacity(bucket_count);
-    let mut next_index = None::<i32>;
-    let mut count_iter = raw_counts.into_iter();
-    for span in spans {
-        let start = match next_index {
-            Some(previous_end) => previous_end.saturating_add(span.offset),
-            None => span.offset,
-        };
-        for idx in 0..span.length {
-            values.push((
-                start.saturating_add(i32::try_from(idx).unwrap_or(i32::MAX)),
-                count_iter.next().unwrap_or_default(),
-            ));
-        }
-        next_index = Some(start.saturating_add(i32::try_from(span.length).unwrap_or(i32::MAX)));
+    if !counts.is_empty() && counts.len() != bucket_count {
+        return Err(format!(
+            "native histogram bucket count mismatch: expected {bucket_count}, got {}",
+            counts.len()
+        ));
+    }
+    if !deltas.is_empty() && deltas.len() != bucket_count {
+        return Err(format!(
+            "native histogram bucket delta mismatch: expected {bucket_count}, got {}",
+            deltas.len()
+        ));
     }
 
-    Ok(values)
+    Ok(bucket_count)
 }
 
 fn positive_bucket_bounds(schema: i32, index: i32) -> Result<(f64, f64), String> {
@@ -573,5 +621,74 @@ impl Series {
             (false, false) => "mixed",
             (true, true) => "empty",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn histogram_bucket_materialization_uses_the_exact_final_capacity() {
+        let histogram = NativeHistogram {
+            count: Some(crate::HistogramCount::Int(6)),
+            sum: 6.0,
+            schema: 1,
+            zero_threshold: 0.25,
+            zero_count: Some(crate::HistogramCount::Int(1)),
+            negative_spans: vec![crate::HistogramBucketSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_deltas: Vec::new(),
+            negative_counts: vec![1.0, 1.0],
+            positive_spans: vec![crate::HistogramBucketSpan {
+                offset: 0,
+                length: 3,
+            }],
+            positive_deltas: Vec::new(),
+            positive_counts: vec![1.0, 1.0, 1.0],
+            reset_hint: crate::HistogramResetHint::No,
+            custom_values: Vec::new(),
+        };
+
+        assert_eq!(histogram_bucket_count(&histogram), 6);
+        let buckets = histogram_buckets(&histogram).unwrap();
+        assert_eq!(buckets.len(), 6);
+        assert_eq!(buckets.capacity(), 6);
+        assert!(buckets.windows(2).all(|window| {
+            window[0]
+                .lower
+                .total_cmp(&window[1].lower)
+                .then_with(|| window[0].upper.total_cmp(&window[1].upper))
+                .is_le()
+        }));
+    }
+
+    #[test]
+    fn histogram_bucket_materialization_rejects_unbacked_spans_before_allocating() {
+        let histogram = NativeHistogram {
+            count: Some(crate::HistogramCount::Int(1)),
+            sum: 1.0,
+            schema: 1,
+            zero_threshold: 0.0,
+            zero_count: Some(crate::HistogramCount::Int(0)),
+            negative_spans: vec![crate::HistogramBucketSpan {
+                offset: 0,
+                length: u32::MAX,
+            }],
+            negative_deltas: Vec::new(),
+            negative_counts: vec![1.0],
+            positive_spans: Vec::new(),
+            positive_deltas: Vec::new(),
+            positive_counts: Vec::new(),
+            reset_hint: crate::HistogramResetHint::No,
+            custom_values: Vec::new(),
+        };
+
+        let error = histogram_buckets(&histogram).unwrap_err();
+        assert!(error.starts_with("native histogram bucket count mismatch: expected "));
+        assert!(error.ends_with(", got 1"));
+        assert!(error.len() < 128);
     }
 }

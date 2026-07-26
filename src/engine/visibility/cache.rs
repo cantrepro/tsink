@@ -1,4 +1,5 @@
 use super::*;
+use super::super::core_impl::VisibilityCacheMapView;
 
 #[path = "cache/materialized_series.rs"]
 mod materialized_series;
@@ -8,9 +9,14 @@ mod summaries;
 impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn with_series_visibility_summaries<R>(
         &self,
-        f: impl FnOnce(&HashMap<SeriesId, SeriesVisibilitySummary>) -> R,
+        f: impl FnOnce(VisibilityCacheMapView<'_, SeriesVisibilitySummary>) -> R,
     ) -> R {
         let summaries = self.visibility.series_visibility_summaries.read();
-        f(&summaries)
+        let epochs = self.visibility.series_visibility_cache_epochs.read();
+        f(VisibilityCacheMapView::new(
+            &summaries,
+            &epochs,
+            self.remote_tombstone_epoch(),
+        ))
     }
 }

@@ -47,55 +47,38 @@ impl HttpRequest {
         let Some(query) = self.path.split_once('?').map(|(_, q)| q) else {
             return Vec::new();
         };
-        query
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .filter_map(|pair| {
-                let (key, value) = if let Some((k, v)) = pair.split_once('=') {
-                    (k, v)
-                } else {
-                    (pair, "")
-                };
-                if decoded_component_matches(key, name) {
-                    Some(percent_decode(value))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn form_params(&self) -> Vec<(String, String)> {
-        let Ok(body_str) = std::str::from_utf8(&self.body) else {
-            return Vec::new();
-        };
-        body_str
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .map(|pair| {
-                let (key, value) = if let Some((k, v)) = pair.split_once('=') {
-                    (k, v)
-                } else {
-                    (pair, "")
-                };
-                (percent_decode(key), percent_decode(value))
-            })
-            .collect()
+        let mut values = Vec::with_capacity(count_named_params(query, name));
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if decoded_component_matches(key, name) {
+                values.push(percent_decode(value));
+            }
+        }
+        values
     }
 
     /// Get a parameter from query string or form body (for GET/POST PromQL endpoints).
     pub fn param(&self, name: &str) -> Option<String> {
-        if let Some(val) = self.query_param(name) {
-            return Some(val);
-        }
-        if self.has_form_urlencoded_body() {
-            for (k, v) in self.form_params() {
-                if k == name {
-                    return Some(v);
-                }
+        self.raw_param(name).map(percent_decode)
+    }
+
+    /// Finds the first encoded value for a query/form parameter without allocating.
+    ///
+    /// Admission paths can inspect and reserve for this raw value before percent-decoding it.
+    pub(crate) fn raw_param(&self, name: &str) -> Option<&str> {
+        if let Some(query) = self.path.split_once('?').map(|(_, query)| query) {
+            if let Some(value) = raw_named_param(query, name) {
+                return Some(value);
             }
         }
-        None
+        if !self.has_form_urlencoded_body() {
+            return None;
+        }
+        let body = std::str::from_utf8(&self.body).ok()?;
+        raw_named_param(body, name)
     }
 
     /// Get all values for a parameter from query string and form body.
@@ -105,6 +88,7 @@ impl HttpRequest {
             let Ok(body_str) = std::str::from_utf8(&self.body) else {
                 return values;
             };
+            values.reserve_exact(count_named_params(body_str, name));
             for pair in body_str.split('&') {
                 if pair.is_empty() {
                     continue;
@@ -120,6 +104,26 @@ impl HttpRequest {
             }
         }
         values
+    }
+
+    /// Counts parameter occurrences without decoding or allocating their values.
+    ///
+    /// Admission paths use this before allocating the corresponding decoded value vector. Encoded
+    /// keys are compared by streaming their decoded bytes without allocating.
+    pub fn param_count(&self, name: &str) -> usize {
+        let query_count = self
+            .path
+            .split_once('?')
+            .map(|(_, query)| count_named_params(query, name))
+            .unwrap_or(0);
+        let form_count = if self.has_form_urlencoded_body() {
+            std::str::from_utf8(&self.body)
+                .map(|body| count_named_params(body, name))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        query_count.saturating_add(form_count)
     }
 
     fn has_form_urlencoded_body(&self) -> bool {
@@ -334,7 +338,49 @@ fn find_sequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn decoded_component_matches(raw: &str, expected: &str) -> bool {
     raw == expected
         || ((raw.as_bytes().contains(&b'%') || raw.as_bytes().contains(&b'+'))
-            && percent_decode(raw) == expected)
+            && percent_decoded_bytes_match(raw.as_bytes(), expected.as_bytes()))
+}
+
+fn percent_decoded_bytes_match(raw: &[u8], expected: &[u8]) -> bool {
+    let mut raw_index = 0usize;
+    let mut expected_index = 0usize;
+    while raw_index < raw.len() {
+        let decoded = if raw[raw_index] == b'+' {
+            raw_index += 1;
+            b' '
+        } else if raw[raw_index] == b'%' && raw_index.saturating_add(2) < raw.len() {
+            match (hex_digit(raw[raw_index + 1]), hex_digit(raw[raw_index + 2])) {
+                (Some(high), Some(low)) => {
+                    raw_index += 3;
+                    high << 4 | low
+                }
+                _ => {
+                    raw_index += 1;
+                    b'%'
+                }
+            }
+        } else {
+            let byte = raw[raw_index];
+            raw_index += 1;
+            byte
+        };
+        if expected.get(expected_index).copied() != Some(decoded) {
+            return false;
+        }
+        expected_index += 1;
+    }
+    expected_index == expected.len()
+}
+
+fn count_named_params(encoded: &str, expected: &str) -> usize {
+    encoded
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            decoded_component_matches(key, expected)
+        })
+        .count()
 }
 
 pub fn status_reason(code: u16) -> &'static str {
@@ -368,7 +414,40 @@ pub fn json_response(status: u16, value: &impl serde::Serialize) -> HttpResponse
     }
 }
 
-fn percent_decode(input: &str) -> String {
+fn raw_named_param<'a>(encoded: &'a str, name: &str) -> Option<&'a str> {
+    for pair in encoded.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if decoded_component_matches(key, name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub(crate) fn percent_decoded_len(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut decoded_len = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index.saturating_add(2) < bytes.len()
+            && hex_digit(bytes[index + 1]).is_some()
+            && hex_digit(bytes[index + 2]).is_some()
+        {
+            index = index.saturating_add(3);
+            decoded_len = decoded_len.saturating_add(1);
+            continue;
+        }
+        index = index.saturating_add(1);
+        decoded_len = decoded_len.saturating_add(1);
+    }
+    decoded_len
+}
+
+pub(crate) fn percent_decode(input: &str) -> String {
     let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -427,6 +506,7 @@ mod tests {
                 "process_cpu_seconds_total".to_string(),
             ]
         );
+        assert_eq!(request.param_count("match[]"), 3);
     }
 
     #[tokio::test]

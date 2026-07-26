@@ -11,14 +11,36 @@ mod policy;
 
 #[cfg(test)]
 pub(super) use catalog::persist_segment_catalog;
+#[allow(unused_imports)]
 pub(super) use catalog::{
-    load_segment_catalog, persist_segment_catalog_budgeted, shared_segment_catalog_path,
-    SEGMENT_CATALOG_FILE_NAME,
+    choose_next_segment_catalog_generation_with_namespace_count,
+    cleanup_old_segment_catalog_generations, count_segment_catalog_generation_namespace,
+    encode_legacy_segment_catalog_entry_fragment, encode_segment_catalog_generation_frame,
+    encode_segment_catalog_generation_header, encode_segment_catalog_pointer,
+    ensure_segment_catalog_generation_directory, finalized_segment_catalog_pointer,
+    load_segment_catalog, load_shared_segment_catalog_pointer,
+    modeled_legacy_segment_catalog_publication_bytes,
+    modeled_segment_catalog_generation_entry_read_bytes,
+    modeled_shared_segment_catalog_publication_bytes, persist_segment_catalog_budgeted,
+    persist_segment_catalog_budgeted_with_memory_admission,
+    persist_shared_segment_catalog_budgeted,
+    persist_shared_segment_catalog_budgeted_with_memory_admission,
+    persist_shared_segment_catalog_budgeted_with_stage_hook, read_segment_catalog_generation_page,
+    require_shared_segment_catalog_pointer, shared_segment_catalog_generation_directory,
+    shared_segment_catalog_generation_path, shared_segment_catalog_path,
+    shared_segment_catalog_pointer_path, validate_restore_segment_catalog,
+    SegmentCatalogGenerationReadCursor, SegmentCatalogPointer, SegmentCatalogPublishStage,
+    SEGMENT_CATALOG_FILE_NAME, SEGMENT_CATALOG_GENERATION_DIRECTORY_NAME,
+    SEGMENT_CATALOG_LEGACY_STREAM_PREFIX, SEGMENT_CATALOG_LEGACY_STREAM_SUFFIX,
+    SEGMENT_CATALOG_MAX_ENTRIES, SEGMENT_CATALOG_MAX_FRAME_BYTES,
+    SEGMENT_CATALOG_MAX_GENERATION_BYTES, SEGMENT_CATALOG_MAX_LEGACY_JSON_BYTES,
+    SEGMENT_CATALOG_POINTER_BYTES, SEGMENT_CATALOG_PUBLICATION_MEMORY_OPERATION,
 };
 #[allow(unused_imports)]
 pub(super) use discovery::{
     build_segment_inventory_fail_on_invalid, build_segment_inventory_runtime_strict,
     build_segment_inventory_startup_recoverable, preflight_segment_inventory_startup_memory,
+    preflight_segment_runtime_refresh_memory, SegmentRuntimeRefreshMemoryPreflight,
     StartupRecoveredSegmentInventory,
 };
 pub(super) use inventory::{

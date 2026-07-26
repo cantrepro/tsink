@@ -516,12 +516,30 @@ impl<'a> RetentionMaintenanceContext<'a> {
         staging_base: &Path,
         local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
     ) -> Result<()> {
-        let Some(local_disk_budget) = local_disk_budget else {
-            return crate::engine::fs_utils::create_dir_all_and_sync_parents(staging_base);
+        let parent = staging_base.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "retention rewrite staging path has no parent: {}",
+                staging_base.display()
+            ))
+        })?;
+        let governed = local_disk_budget
+            .map(|budget| budget.governs_entry(staging_base))
+            .transpose()?
+            .unwrap_or(false);
+        let create = || -> Result<()> {
+            if governed {
+                local_disk_budget
+                    .expect("a governed staging path requires a local disk budget")
+                    .create_dir_all_and_sync_parents(parent)?;
+            } else {
+                crate::engine::fs_utils::create_dir_all_and_sync_parents(parent)?;
+            }
+            crate::engine::fs_utils::create_staging_dir_exclusive(staging_base)?;
+            crate::engine::fs_utils::sync_parent_dir(staging_base)
         };
-        if !local_disk_budget.governs_entry(staging_base)? {
-            return crate::engine::fs_utils::create_dir_all_and_sync_parents(staging_base);
-        }
+        let Some(local_disk_budget) = local_disk_budget.filter(|_| governed) else {
+            return create();
+        };
 
         let staging_paths = [staging_base.to_path_buf()];
         let missing_parents =
@@ -546,7 +564,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
         local_disk_budget.with_reconciled_maintenance_reservation(
             crate::DiskCategory::Temporary,
             peak_bytes,
-            || local_disk_budget.create_dir_all_and_sync_parents(staging_base),
+            create,
         )
     }
 
@@ -1548,6 +1566,33 @@ mod tests {
         assert_eq!(snapshot.active_reservations, 0);
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.rejections_total, 1);
+    }
+
+    #[test]
+    fn rewrite_staging_root_never_reuses_a_raced_directory() {
+        let temp = TempDir::new().unwrap();
+        let staging_root = temp
+            .path()
+            .join(".tmp-tsink-post-flush-retention-rewrite-lane_numeric-raced");
+        std::fs::create_dir(&staging_root).unwrap();
+        std::fs::write(staging_root.join("foreign"), b"foreign").unwrap();
+
+        let error =
+            RetentionMaintenanceContext::<'static>::create_retention_rewrite_staging_base_with_budget(
+                &staging_root,
+                None,
+            )
+            .expect_err("rewrite staging must use create-exclusive semantics");
+
+        assert!(matches!(
+            error,
+            TsinkError::IoWithPath { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(staging_root.join("foreign")).unwrap(),
+            b"foreign"
+        );
     }
 
     #[test]

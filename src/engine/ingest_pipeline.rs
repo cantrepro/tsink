@@ -25,6 +25,11 @@ use phases::{CommittedWrite, PendingPoint};
 use prepare::WritePreparer;
 use resolve::WriteResolver;
 
+#[cfg(test)]
+pub(super) fn modeled_write_rejection_result_bytes_for_tests(rows_len: usize) -> Result<usize> {
+    resolve::modeled_write_rejection_result_bytes(rows_len)
+}
+
 // Internal coordinator for live writes and WAL replay.
 pub(super) struct IngestPipeline<'a> {
     storage: &'a ChunkStorage,
@@ -81,6 +86,13 @@ impl<'a> IngestPipeline<'a> {
             0,
         )?;
         resolver.reserve_write_scratch(scratch)
+    }
+
+    pub(super) fn admit_write_rejection_result(
+        &self,
+        rows_len: usize,
+    ) -> Result<WriteTransientMemoryReservation> {
+        self.resolver().reserve_write_rejection_result(rows_len)
     }
 
     pub(super) fn insert_rows_with_admission(
@@ -333,7 +345,8 @@ impl<'a> IngestPipeline<'a> {
                 .checked_add(pending_points.len())
                 .ok_or(TsinkError::WriteBatchSizeOverflow)?;
             self.applier()
-                .ingest_replayed_pending_points(pending_points)?;
+                .ingest_replayed_pending_points(pending_points, transient_memory)?;
+            transient_memory.reset_to_base();
         }
 
         Ok(saturating_u64_from_usize(replayed_points))

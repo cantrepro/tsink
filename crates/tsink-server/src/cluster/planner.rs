@@ -304,6 +304,10 @@ impl ShardAwareQueryPlanner {
         Self::new(self.local_node_id.clone(), ring, membership)
     }
 
+    pub(crate) fn endpoint_for_node(&self, node_id: &str) -> Option<&str> {
+        self.endpoints_by_node.get(node_id).map(String::as_str)
+    }
+
     #[allow(dead_code)]
     pub fn plan_select_series(
         &self,

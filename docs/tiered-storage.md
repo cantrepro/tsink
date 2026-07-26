@@ -92,7 +92,10 @@ When tiered storage is configured, the object-store root adopts this layout:
 
 ```
 {object_store_root}/
-  segment_catalog.json          ← shared inventory file
+  segment_catalog.json          ← v2 compatibility inventory
+  segment_catalog.current       ← fixed-size v3 commit pointer
+  segment_catalog.d/
+    catalog-<generation>.bin    ← immutable framed v3 inventory
   hot/
     lane_numeric/
       segments/
@@ -110,7 +113,9 @@ When tiered storage is configured, the object-store root adopts this layout:
     lane_blob/    ...
 ```
 
-Each `seg-<id>` directory contains the segment's data files and a `manifest.json`. The segment catalog at the root provides a fast, authoritative index of all segments and their tiers without walking the full directory tree.
+Each `seg-<id>` directory contains the segment's binary data files and a `manifest.bin`. The
+side-by-side v2 and v3 catalogs provide a fast, authoritative index of all segments and their tiers
+without walking the full directory tree.
 
 ---
 
@@ -147,7 +152,9 @@ Tier moves are **copy-then-delete**:
 3. The segment catalog is updated and swapped into the visible persisted index.
 4. Only after the new location is visible to queries is the source directory retired.
 
-This guarantees that no query ever sees a gap: either the old location or the new location is always visible, never neither.
+Within the supported single-writer model, catalog publication keeps either the old location or the
+verified new location visible to queries throughout a successful move. Startup recovery converges
+an interrupted replacement before normal catalog mutation resumes.
 
 Moves are also **idempotent**: if a destination already exists with matching content, the move is a no-op.
 
@@ -155,13 +162,29 @@ Moves are also **idempotent**: if a destination already exists with matching con
 
 ## Segment catalog
 
-The catalog (`segment_catalog.json` in the object-store root) is a JSON snapshot of the full `SegmentInventory`. It records each segment's lane, tier, level, ID, timestamp bounds, point count, and relative path.
+The object-store root retains `segment_catalog.json`, the version-2 JSON compatibility snapshot,
+alongside the version-3 catalog. The v3 commit record is the fixed-size
+`segment_catalog.current` pointer; it names one immutable framed generation under
+`segment_catalog.d/`. Both formats record each segment's lane, tier, level, ID, timestamp bounds,
+point count, and canonical relative path.
 
-- **ReadWrite nodes** write the catalog atomically after each maintenance pass.
-- **Compute-only nodes** read the catalog periodically (controlled by `remote_segment_refresh_interval`) and never write it.
-- The catalog is version-stamped (current version: 2) and validated on load. Entries with path traversal sequences (`..`, absolute paths) are rejected.
+- **ReadWrite nodes** publish a new v3 generation, then the v2 compatibility snapshot, then the v3
+  pointer. The pointer replacement is the v3 commit point.
+- **Compute-only nodes** read the catalog periodically (controlled by
+  `remote_segment_refresh_interval`) and never write it.
+- A finite compute-only refresh requires v3 and reads its bounded frames across maintenance passes.
+  It validates the complete generation before changing visibility, and applies bounded additions
+  before bounded removals.
+- If the pointer changes while a finite reader is validating or applying a generation, that cycle
+  restarts on the new pointer. Continuous publication can therefore delay convergence; the refresh
+  cadence and maintenance envelope must allow a quiet progress window.
+- Missing or invalid v3 is a structured finite-refresh failure: the node keeps its last visible
+  catalog, backs off, and does not scan tier directories. Startup recovery and explicit
+  `ExpertUnlimited` operation retain the v2/physical-scan compatibility path.
 
-If the catalog is absent or stale, the engine falls back to a full directory scan.
+The v3 format caps the namespace at 16,384 entries and each relative path at 256 bytes. Checksums,
+declared lengths, strict identity ordering, and canonical paths are validated before the staged
+inventory is published.
 
 ---
 
@@ -296,5 +319,5 @@ See the [Python bindings guide](python-bindings.md) for complete API details.
 - **Object-store root can be any path** — in production this is typically a FUSE mount or network filesystem. tsink itself uses standard filesystem calls and has no direct S3/GCS SDK dependency.
 - **Tier moves are not reversible automatically** — once a segment is in the cold tier there is no built-in promotion back to warm or hot. Adjust `hot_retention_window` / `warm_retention_window` to control placement.
 - **Concurrent access** — multiple ReadWrite nodes pointing at the same `object_store_root` are not supported. Use the cluster mode (which distributes shards) instead of sharing a single tier root.
-- **Recovery at startup** — on startup, the engine reads the catalog (if present) or scans all tier directories. Corrupt or unreadable segments are quarantined rather than causing a startup failure. Quarantined paths are logged.
+- **Recovery at startup** — on startup, the engine reads the catalog (if present) or scans all tier directories. Invalid or corrupt persisted segments are quarantined and logged. Unrelated filesystem I/O failures, such as permission errors, still fail startup.
 - **Capacity planning** — each tier directory grows monotonically until the post-flush sweep runs. Retention enforcement and compaction both reduce segment count; ensure the object-store volume has sufficient capacity for `warm_retention_window + cold_retention_window` worth of data.

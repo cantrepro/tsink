@@ -171,7 +171,8 @@ Returns self-instrumentation counters and gauges in Prometheus text exposition f
 
 Key exported metric families include `tsink_memory_*`, `tsink_series_total`,
 `tsink_uptime_seconds`, `tsink_wal_*`, `tsink_compaction_*`, `tsink_cluster_*`,
-`tsink_ingest_*`, `tsink_query_*`, `tsink_query_budget_*`, and `tsink_exemplar_*`.
+`tsink_ingest_*`, `tsink_query_*`, `tsink_query_budget_*`,
+`tsink_metric_metadata_store_*`, `tsink_exemplar_*`, and `tsink_rules_store_*`.
 
 ---
 
@@ -327,7 +328,7 @@ Returns metric metadata (type, help, unit).
 | Parameter | Required | Default | Description |
 |---|---|---|---|
 | `metric` | No | — | Filter by metric name. |
-| `limit` | No | `1000` | Maximum number of results (max `10000`). |
+| `limit` | No | `1000` | Maximum number of results. Values above the hard maximum of `10000` are rejected; they are not clamped. |
 
 **Response:** `200 application/json`
 
@@ -342,6 +343,13 @@ Returns metric metadata (type, help, unit).
 }
 ```
 
+The request is tenant-scoped and runs under one core query execution. The store result, JSON body,
+and response-header allocation remain charged until response handoff. The returned-byte limit is
+applied to the exact encoded JSON body, and results are never silently truncated. Query-budget and
+metadata-store failures use a Prometheus error envelope plus a stable
+`X-Tsink-Read-Error-Code`; retryable admission or store-unavailable responses include
+`Retry-After: 1`.
+
 ---
 
 ### `GET|POST /api/v1/query_exemplars`
@@ -353,8 +361,9 @@ Returns exemplars for the series matched by a PromQL expression.
 | Parameter | Required | Description |
 |---|---|---|
 | `query` | Yes | PromQL expression (vector or matrix selector). |
-| `start` | No | Start timestamp. |
-| `end` | No | End timestamp. |
+| `start` | Yes | Start timestamp. |
+| `end` | Yes | End timestamp; must not precede `start`. |
+| `limit` | No | Positive maximum exemplar count. Defaults to the configured store query maximum; larger values are rejected. |
 
 **Response:** `200 application/json`
 
@@ -376,6 +385,13 @@ Returns exemplars for the series matched by a PromQL expression.
 }
 ```
 
+The response includes `X-Tsink-Exemplar-Limit` with the effective result limit. Local and
+distributed execution share one tenant-scoped query budget across parsing, selector expansion,
+store/RPC results, deduplication, and exact response encoding. Peers are queried sequentially so
+transport and decoded-result envelopes do not multiply with cluster size. Invalid, over-limit,
+cancelled, deadline-exceeded, unavailable, or accounting-invalid outcomes return stable
+`X-Tsink-Read-Error-Code` values and never return a silently partial exemplar set.
+
 ---
 
 ## Status
@@ -384,7 +400,8 @@ Returns exemplars for the series matched by a PromQL expression.
 
 Returns a comprehensive JSON status snapshot covering effective storage and query limits, memory
 usage, WAL state, compaction levels, cluster topology, admission guardrails, ingestion protocol
-status, exemplar store metrics, rules and rollup state, edge-sync state, and tenant policy.
+status, metric-metadata and exemplar sidecar metrics, rules and rollup state, edge-sync state, and
+tenant policy.
 
 `data.effectiveStorageLimits` reports the controls enforced by the built storage backend. Optional
 fields are JSON `null` when the built-in backend has no finite limit; when
@@ -475,9 +492,16 @@ Prometheus Remote Read. Accepts snappy-compressed protobuf (`ReadRequest`); resp
 | `Content-Encoding` | `snappy` |
 | `X-Prometheus-Remote-Read-Version` | `0.1.0` |
 
-Only `Samples` response type is supported. Chunked streaming is not yet available.
+Only `Samples` response type is supported. Chunked streaming is not yet available. Each completed
+query result is encoded immediately instead of retaining every result object in the request. The
+complete uncompressed protobuf response has a hard 64 MiB ceiling, and Snappy output allocation is
+preflighted from that bounded size. Exceeding the envelope returns `413` with
+`X-Tsink-Read-Error-Code: query_limit_returned_bytes`; no truncated success response is returned.
+Local reads also charge each encoded query-result frame to that query's core returned-byte budget.
 
-**Error codes:** `400` invalid request, `413` queries-per-request quota exceeded, `503` admission unavailable.
+**Error codes:** `400` invalid request, `413` queries-per-request or returned-byte limit exceeded,
+`429` query concurrency/shared-memory admission unavailable, `500` internal storage or encoding
+failure, `503` closed/shutting-down storage, deadline/cancellation, or admission unavailable.
 
 ---
 

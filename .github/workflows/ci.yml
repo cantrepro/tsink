@@ -3,6 +3,11 @@ name: CI
 on:
   push:
     branches: [master, develop]
+  pull_request:
+    branches: [master, develop]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +43,31 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  no-default-features:
+    name: No default features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --no-default-features --locked
+      - name: Test workspace
+        run: cargo test --workspace --no-default-features --locked
 
   test:
     name: Tests (${{ matrix.os }})
@@ -48,15 +77,31 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            test_command: cargo test --workspace --all-features
+            test_command: cargo test --workspace --all-features --locked
           - os: windows-latest
-            test_command: cargo test --workspace --all-features
+            test_command: cargo test --workspace --all-features --locked
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: ${{ matrix.test_command }}
+
+  package:
+    name: Package dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify core package
+        run: cargo package -p tsink --locked
+      - name: Assemble downstream packages
+        run: |
+          # Their normalized manifests depend on the same-version core crate,
+          # which is not available from crates.io until the core is published.
+          cargo package -p tsink-server --locked --no-verify
+          cargo package -p tsink-uniffi --locked --no-verify
 
   measure-bpp:
     name: Measure BPP (quick)

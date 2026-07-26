@@ -2,7 +2,9 @@ use super::super::tiering::{self, PersistedSegmentTier, SegmentInventory, Segmen
 use super::super::{ChunkStorage, HashSet, PathBuf, Result, StorageRuntimeMode};
 use super::*;
 
+mod bounded_remote;
 mod bounded_scan;
+mod bounded_tombstones;
 mod context;
 mod pipeline;
 mod publication;
@@ -11,6 +13,12 @@ pub(in crate::engine::storage_engine) use self::bounded_scan::BackgroundCatalogR
 use self::context::CatalogRefreshContext;
 
 impl ChunkStorage {
+    pub(in super::super) fn reset_bounded_catalog_refresh_continuations(&self) {
+        self.reset_bounded_unknown_dirty_catalog_refresh();
+        self.reset_bounded_remote_catalog_refresh();
+        self.reset_bounded_tiered_catalog_publication();
+    }
+
     fn shared_remote_segment_inventory(&self, inventory: &SegmentInventory) -> SegmentInventory {
         let Some(config) = &self.persisted.tiered_storage else {
             return inventory.clone();
@@ -36,7 +44,9 @@ impl ChunkStorage {
                         PersistedSegmentTier::Hot,
                         &entry.manifest,
                     ),
-                    ..entry.clone()
+                    lane: entry.lane,
+                    tier: entry.tier,
+                    manifest: entry.manifest.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -65,6 +75,11 @@ impl ChunkStorage {
         let publication = self.begin_persisted_catalog_publication();
         match publication.publish_transition(transition)? {
             PersistedCatalogRefreshApply::Applied => Ok(()),
+            PersistedCatalogRefreshApply::Deferred => {
+                self.catalog_refresh_context()
+                    .set_persisted_index_dirty(true);
+                Ok(())
+            }
             PersistedCatalogRefreshApply::SkippedStaleVisibleState => {
                 unreachable!("direct segment catalog refresh should not use a visibility fence")
             }
@@ -103,9 +118,188 @@ impl ChunkStorage {
         &self,
     ) -> Result<Option<PlannedPersistedCatalogRefresh>> {
         let ctx = self.catalog_refresh_context();
-        let diff = ctx.take_known_persisted_segment_changes();
+        let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
+            || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
+        if finite_maintenance && !ctx.has_known_persisted_segment_changes() {
+            return Ok(None);
+        }
+        // `take_one` moves the root PathBuf payload but allocates one destination B-tree node.
+        // Install its fixed selection lease before taking the pending-diff mutex.
+        let mut finite_selection_reservation = if finite_maintenance {
+            Some(self.remote_catalog_memory_reservation(4096)?)
+        } else {
+            None
+        };
+        let diff = if finite_maintenance {
+            ctx.take_one_known_persisted_segment_change()
+        } else {
+            ctx.take_known_persisted_segment_changes()
+        };
         if diff.is_empty() {
             return Ok(None);
+        }
+
+        if finite_maintenance {
+            let selected = diff;
+
+            let item_limit = self.runtime.maintenance_max_items_per_pass;
+            let byte_limit = self.runtime.maintenance_max_bytes_per_pass;
+            if item_limit == 0 {
+                ctx.restore_known_persisted_segment_change_if_unmodified(selected);
+                return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                    operation: "finite known-dirty catalog transition",
+                    item_limit,
+                    byte_limit,
+                    selected_items: 1,
+                    selected_bytes: 0,
+                });
+            }
+
+            let selected_root = selected
+                .added_roots
+                .first()
+                .or_else(|| selected.removed_roots.first())
+                .expect("finite known-dirty selection contains one root");
+            let root_path_bytes = selected_root
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(12)
+                .saturating_add(64 * 1024);
+            let initial_staging_bytes = root_path_bytes.saturating_add(
+                bounded_scan::CATALOG_SCAN_MANIFEST_INSPECTION_BYTES.min(usize::MAX as u64)
+                    as usize,
+            );
+            let mut staging_reservation = finite_selection_reservation
+                .take()
+                .expect("finite selection reservation created above");
+            if let Err(err) = self.resize_remote_catalog_memory_reservation(
+                &mut staging_reservation,
+                initial_staging_bytes.max(4096),
+            ) {
+                ctx.restore_known_persisted_segment_change_if_unmodified(selected);
+                return Err(err);
+            }
+
+            let prepared = (|| -> Result<(Vec<IndexedSegment>, u64)> {
+                if selected.added_roots.contains(selected_root) {
+                    let runtime = tiering::preflight_segment_runtime_refresh_memory(selected_root)?;
+                    let descriptor_bytes = u64::try_from(
+                        selected_root
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .len()
+                            .saturating_mul(2)
+                            .saturating_add(
+                                bounded_scan::CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD as usize,
+                            ),
+                    )
+                    .unwrap_or(u64::MAX);
+                    let predecode_staging_bytes =
+                        bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(
+                            selected_root,
+                        )
+                        .saturating_add(
+                            bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_transition_descriptor_bytes(
+                                selected_root,
+                            ),
+                        )
+                        .saturating_add(descriptor_bytes.min(usize::MAX as u64) as usize)
+                        .saturating_add(runtime.reservation_bytes);
+                    self.resize_remote_catalog_memory_reservation(
+                        &mut staging_reservation,
+                        predecode_staging_bytes,
+                    )?;
+                    let manifest = crate::engine::segment::read_segment_manifest(selected_root)?;
+                    let mutation_bytes =
+                        bounded_scan::modeled_removal_bytes(selected_root, &manifest)
+                            .min(usize::MAX as u64) as usize;
+                    let staging_bytes =
+                        bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(
+                            selected_root,
+                        )
+                        .saturating_add(
+                            bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_transition_descriptor_bytes(
+                                selected_root,
+                            ),
+                        )
+                        .saturating_add(descriptor_bytes.min(usize::MAX as u64) as usize)
+                        .saturating_add(runtime.reservation_bytes)
+                        .saturating_add(mutation_bytes);
+                    let selected_work_bytes = 4096u64
+                        .saturating_add(descriptor_bytes)
+                        .saturating_add(bounded_scan::CATALOG_SCAN_MANIFEST_INSPECTION_BYTES)
+                        .saturating_add(runtime.source_bytes)
+                        .max(u64::try_from(staging_bytes).unwrap_or(u64::MAX));
+                    if selected_work_bytes > byte_limit {
+                        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                            operation: "finite known-dirty catalog transition",
+                            limit: byte_limit,
+                            required: selected_work_bytes,
+                        });
+                    }
+                    self.resize_remote_catalog_memory_reservation(
+                        &mut staging_reservation,
+                        staging_bytes,
+                    )?;
+                    let loaded =
+                        ChunkStorage::load_segment_index_for_runtime_refresh(selected_root)?;
+                    Ok((vec![loaded], selected_work_bytes))
+                } else {
+                    let manifest = self
+                        .persisted
+                        .persisted_index
+                        .read()
+                        .segments_by_root
+                        .get(selected_root)
+                        .map(|state| state.manifest.clone());
+                    let mutation_bytes = manifest.as_ref().map_or(
+                        bounded_scan::CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD,
+                        |manifest| bounded_scan::modeled_removal_bytes(selected_root, manifest),
+                    );
+                    let staging_bytes =
+                        bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(
+                            selected_root,
+                        )
+                        .saturating_add(
+                            bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_transition_descriptor_bytes(
+                                selected_root,
+                            ),
+                        )
+                        .saturating_add(mutation_bytes.min(usize::MAX as u64) as usize);
+                    let selected_work_bytes = 4096u64.saturating_add(
+                        mutation_bytes.max(u64::try_from(staging_bytes).unwrap_or(u64::MAX)),
+                    );
+                    if selected_work_bytes > byte_limit {
+                        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                            operation: "finite known-dirty catalog transition",
+                            limit: byte_limit,
+                            required: selected_work_bytes,
+                        });
+                    }
+                    self.resize_remote_catalog_memory_reservation(
+                        &mut staging_reservation,
+                        staging_bytes,
+                    )?;
+                    Ok((Vec::new(), selected_work_bytes))
+                }
+            })();
+            let (loaded_segments, selected_work_bytes) = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    ctx.restore_known_persisted_segment_change_if_unmodified(selected);
+                    return Err(err);
+                }
+            };
+            return Ok(Some(PlannedPersistedCatalogRefresh::KnownDirty(
+                PlannedKnownDirtyCatalogRefresh {
+                    diff: selected,
+                    loaded_segments,
+                    finite_staging_reservation: Some(staging_reservation),
+                    finite_recovery_items: Some(item_limit.saturating_sub(1)),
+                    finite_recovery_bytes: Some(byte_limit.saturating_sub(selected_work_bytes)),
+                },
+            )));
         }
 
         match ctx.load_known_dirty_catalog_refresh_segments_phase(&diff) {
@@ -113,6 +307,9 @@ impl ChunkStorage {
                 PlannedKnownDirtyCatalogRefresh {
                     diff,
                     loaded_segments,
+                    finite_staging_reservation: None,
+                    finite_recovery_items: None,
+                    finite_recovery_bytes: None,
                 },
             ))),
             Err(err) => {
@@ -132,27 +329,59 @@ impl ChunkStorage {
         };
 
         let restore_diff = planned.restore_known_dirty_diff();
+        let restore_diff_conditionally = planned.restore_known_dirty_diff_conditionally();
         let publication = self.begin_persisted_catalog_publication();
         let apply_result = match publication.apply_planned_refresh(planned) {
             Ok(result) => result,
             Err(err) => {
                 if let Some(restore_diff) = restore_diff {
-                    ctx.restore_known_persisted_segment_changes(restore_diff);
+                    if restore_diff_conditionally {
+                        ctx.restore_known_persisted_segment_change_if_unmodified(restore_diff);
+                    } else {
+                        ctx.restore_known_persisted_segment_changes(restore_diff);
+                    }
                 }
                 ctx.set_persisted_index_dirty(true);
                 return Err(err);
             }
         };
+        if apply_result.is_deferred() {
+            // The transition's visible-state mutation has already committed and the retained
+            // writer cursor now owns publication of the complete resulting snapshot. Restoring
+            // this consumed diff would reapply the same loaded roots on every wake, bump the
+            // visibility generation, and starve the cursor forever. A terminal cursor pass
+            // persists a complete registry catalog; only an actual error restores the diff.
+            ctx.set_persisted_index_dirty(true);
+            return Ok(true);
+        }
         if !apply_result.is_applied() {
             unreachable!("known dirty catalog refresh should not use a visibility fence");
         }
 
-        ctx.set_persisted_index_dirty(ctx.has_known_persisted_segment_changes());
+        ctx.synchronize_persisted_index_dirty_with_pending();
         Ok(true)
     }
 
     pub(in super::super) fn refresh_dirty_persisted_segments_claimed(&self) -> Result<()> {
         if self.apply_known_dirty_persisted_refresh_if_pending()? {
+            return Ok(());
+        }
+
+        if self.finite_tiered_catalog_publication_enabled()
+            && self.bounded_tiered_catalog_publication_is_pending()
+        {
+            let publication = self.begin_persisted_catalog_publication();
+            let completed = self.advance_bounded_tiered_catalog_publication(false)?;
+            if completed {
+                let inventory = self.persisted_segment_inventory();
+                self.persist_series_registry_index_with_catalog_update(
+                    &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
+                        registry_catalog::inventory_sources(&inventory),
+                    ),
+                )?;
+                self.synchronize_persisted_index_dirty_with_pending();
+            }
+            drop(publication);
             return Ok(());
         }
 
@@ -177,13 +406,14 @@ impl ChunkStorage {
         {
             if self.refresh_unknown_dirty_catalog_bounded()? {
                 let ctx = self.catalog_refresh_context();
-                ctx.set_persisted_index_dirty(ctx.has_known_persisted_segment_changes());
+                ctx.synchronize_persisted_index_dirty_with_pending();
             }
             return Ok(());
         }
 
-        // ExpertUnlimited preserves the explicit complete-snapshot behavior. Tiered mode also
-        // remains here because its local/shared segment catalogs are still monolithic.
+        // ExpertUnlimited preserves the explicit complete-snapshot behavior. A finite tiered
+        // writer still enters through this inventory transition, but its catalog publication is
+        // advanced by the bounded writer cursor rather than encoded synchronously.
         self.reset_bounded_unknown_dirty_catalog_refresh();
         let loaded = self.load_scanned_catalog_refresh()?;
         let planned = self
@@ -191,13 +421,23 @@ impl ChunkStorage {
             .plan_loaded_inventory_catalog_refresh_phase(loaded)?;
         let publication = self.begin_persisted_catalog_publication();
         if publication.apply_planned_refresh(planned)?.is_applied() {
-            self.catalog_refresh_context()
-                .set_persisted_index_dirty(false);
+            self.synchronize_persisted_index_dirty_with_pending();
         }
         Ok(())
     }
 
     fn refresh_remote_catalog_claimed(&self) -> Result<()> {
+        let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
+            || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
+        if finite_maintenance {
+            if self.refresh_remote_catalog_bounded()? {
+                self.catalog_refresh_context()
+                    .mark_remote_catalog_refresh_success();
+            }
+            return Ok(());
+        }
+
+        self.reset_bounded_remote_catalog_refresh();
         let ctx = self.catalog_refresh_context();
         let planned = ctx.plan_loaded_inventory_catalog_refresh_phase(
             ctx.load_remote_catalog_refresh_phase()?,

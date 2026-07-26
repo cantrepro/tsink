@@ -6,6 +6,7 @@ pub(super) struct StartupPlan {
     storage_options: ChunkStorageOptions,
     paths: config::StoragePathLayout,
     local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    data_directory_manifest: Option<data_directory_manifest::OpenedDataDirectoryManifest>,
     runtime_inputs: StartupRuntimeInputs,
 }
 
@@ -30,9 +31,15 @@ impl StartupPlanningPhase {
         // same configured modeled-memory ceiling up front so even the initial disk reconciliation
         // is admitted rather than temporarily escaping the configured bound.
         let startup_memory_budget = builder.memory_limit_bytes();
+        // Reject corrupt, newer, and unknown manifestless directories before acquiring a process
+        // lock can create `.tsink.lock`. The same inspection is repeated while that lock is held
+        // before any recovery cleanup may mutate durable state.
+        data_directory_manifest::preflight_before_process_lock(builder)?;
         let data_path_process_lock = acquire_startup_data_path_process_lock(builder)?;
         let paths = config::StoragePathLayout::from(builder);
         let local_disk_budget = resolve_local_disk_budget(builder, startup_memory_budget)?;
+        let data_directory_manifest =
+            data_directory_manifest::prepare_before_recovery(builder, local_disk_budget.as_ref())?;
         validate_tiered_storage_disk_scope(builder, local_disk_budget.as_deref())?;
         validate_disk_limit_relationships(builder, local_disk_budget.as_deref())?;
         validate_owned_local_storage_namespaces(
@@ -111,6 +118,7 @@ impl StartupPlanningPhase {
             startup_memory_budget,
             paths,
             local_disk_budget,
+            data_directory_manifest,
             runtime_inputs: StartupRuntimeInputs {
                 background_threads_enabled: storage_options.background_threads_enabled,
                 background_fail_fast: storage_options.background_fail_fast,
@@ -132,6 +140,9 @@ fn validate_owned_local_storage_namespaces(
     };
 
     if let Some(data_path) = data_path {
+        budget.validate_managed_file_path(
+            &data_path.join(data_directory_manifest::DATA_DIRECTORY_MANIFEST_FILE_NAME),
+        )?;
         let coordinator_dir =
             data_path.join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME);
         budget.validate_managed_directory_path(&coordinator_dir)?;
@@ -230,6 +241,7 @@ fn cleanup_owned_local_storage_orphans(
     })?;
 
     let fixed_targets = [
+        data_path.join(data_directory_manifest::DATA_DIRECTORY_MANIFEST_FILE_NAME),
         series_index_path.to_path_buf(),
         SeriesRegistry::incremental_path(series_index_path),
         registry_catalog::catalog_path(series_index_path),
@@ -1112,6 +1124,12 @@ impl StartupPlan {
 
     pub(super) fn local_disk_budget(&self) -> Option<&Arc<crate::LocalDiskBudget>> {
         self.local_disk_budget.as_ref()
+    }
+
+    pub(super) fn data_directory_manifest(
+        &self,
+    ) -> Option<&data_directory_manifest::OpenedDataDirectoryManifest> {
+        self.data_directory_manifest.as_ref()
     }
 
     pub(super) fn lane_flags(&self) -> (bool, bool) {

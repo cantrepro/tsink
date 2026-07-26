@@ -15,3 +15,4 @@ mod cache;
 mod fence;
 #[path = "visibility/tombstones.rs"]
 mod tombstones;
+pub(in crate::engine::storage_engine) use tombstones::TombstoneReadContext;

@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -31,7 +30,7 @@ fn postings_track_all_series_for_same_label_pair() {
 }
 
 #[test]
-fn missing_label_cache_invalidates_after_new_series_changes() {
+fn missing_label_postings_are_unretained_and_refresh_after_new_series_changes() {
     let registry = SeriesRegistry::new();
     registry
         .resolve_or_insert("cpu", &[Label::new("host", "a"), Label::new("job", "api")])
@@ -41,10 +40,11 @@ fn missing_label_cache_invalidates_after_new_series_changes() {
         .unwrap();
     let job_name_id = registry.label_name_id("job").unwrap();
 
-    let cached_missing = registry.missing_label_postings_for_id(job_name_id);
-    assert_eq!(cached_missing.len(), 1);
-    assert!(cached_missing.contains(missing_before.series_id));
-    let initial_generation = registry.postings_generation.load(Ordering::Acquire);
+    let memory_before_query = registry.memory_usage_bytes();
+    let initial_missing = registry.missing_label_postings_for_id(job_name_id);
+    assert_eq!(initial_missing.len(), 1);
+    assert!(initial_missing.contains(missing_before.series_id));
+    assert_eq!(registry.memory_usage_bytes(), memory_before_query);
 
     let missing_after = registry
         .resolve_or_insert("cpu", &[Label::new("host", "c")])
@@ -56,41 +56,18 @@ fn missing_label_cache_invalidates_after_new_series_changes() {
         )
         .unwrap();
 
-    let shard_idx = SeriesRegistry::label_postings_shard_idx(job_name_id);
-    let cached_after_writes = registry.label_postings_shards[shard_idx]
-        .read()
-        .label_name_states
-        .get(&job_name_id)
-        .and_then(|state| state.missing_cache.clone())
-        .unwrap();
-    assert_eq!(
-        cached_after_writes.bitmap.iter().collect::<Vec<_>>(),
-        vec![missing_before.series_id],
-        "new series invalidates the cache instead of mutating unrelated postings shards",
-    );
-    assert_eq!(cached_after_writes.postings_generation, initial_generation);
-    assert!(registry.postings_generation.load(Ordering::Acquire) > initial_generation);
-
+    let memory_before_refresh = registry.memory_usage_bytes();
     let refreshed_missing = registry.missing_label_postings_for_id(job_name_id);
     assert_eq!(refreshed_missing.len(), 2);
     assert!(refreshed_missing.contains(missing_before.series_id));
     assert!(refreshed_missing.contains(missing_after.series_id));
     assert!(!refreshed_missing.contains(with_job.series_id));
-    let refreshed_cache = registry.label_postings_shards[shard_idx]
-        .read()
-        .label_name_states
-        .get(&job_name_id)
-        .and_then(|state| state.missing_cache.clone())
-        .unwrap();
-    assert_eq!(
-        refreshed_cache.postings_generation,
-        registry.postings_generation.load(Ordering::Acquire),
-    );
+    assert_eq!(registry.memory_usage_bytes(), memory_before_refresh);
     assert_memory_usage_reconciled(&registry);
 }
 
 #[test]
-fn rollback_invalidates_missing_label_cache_for_untouched_shards() {
+fn missing_label_postings_refresh_after_rollback_without_retained_state() {
     let registry = SeriesRegistry::new();
     registry
         .resolve_or_insert("cpu", &[Label::new("host", "a"), Label::new("job", "api")])
@@ -106,50 +83,28 @@ fn rollback_invalidates_missing_label_cache_for_untouched_shards() {
     let rolled_back = registry
         .resolve_or_insert("cpu", &[Label::new("host", "c")])
         .unwrap();
+    let memory_before_query = registry.memory_usage_bytes();
     let missing_with_rolled_back = registry.missing_label_postings_for_id(job_name_id);
     assert!(missing_with_rolled_back.contains(rolled_back.series_id));
-    let shard_idx = SeriesRegistry::label_postings_shard_idx(job_name_id);
-    let cached_before_rollback = registry.label_postings_shards[shard_idx]
-        .read()
-        .label_name_states
-        .get(&job_name_id)
-        .and_then(|state| state.missing_cache.clone())
-        .unwrap();
     assert_eq!(
-        cached_before_rollback.bitmap.iter().collect::<Vec<_>>(),
+        missing_with_rolled_back.iter().collect::<Vec<_>>(),
         vec![missing_before.series_id, rolled_back.series_id],
-        "refreshing the cache should surface new series before rollback",
+        "the uncached result should surface new series before rollback",
     );
-    let rollback_generation = registry.postings_generation.load(Ordering::Acquire);
+    assert_eq!(registry.memory_usage_bytes(), memory_before_query);
 
     registry.rollback_created_series(std::slice::from_ref(&rolled_back));
-
-    let cached_after_rollback = registry.label_postings_shards[shard_idx]
-        .read()
-        .label_name_states
-        .get(&job_name_id)
-        .and_then(|state| state.missing_cache.clone())
-        .unwrap();
-    assert_eq!(
-        cached_after_rollback.bitmap.iter().collect::<Vec<_>>(),
-        vec![missing_before.series_id, rolled_back.series_id],
-        "rollback should invalidate the cache rather than mutating an unrelated shard in place",
-    );
-    assert_eq!(
-        cached_after_rollback.postings_generation,
-        rollback_generation
-    );
-    assert!(registry.postings_generation.load(Ordering::Acquire) > rollback_generation);
-
+    let memory_before_refresh = registry.memory_usage_bytes();
     let refreshed_missing = registry.missing_label_postings_for_id(job_name_id);
     assert_eq!(refreshed_missing.len(), 1);
     assert!(refreshed_missing.contains(missing_before.series_id));
     assert!(!refreshed_missing.contains(rolled_back.series_id));
+    assert_eq!(registry.memory_usage_bytes(), memory_before_refresh);
     assert_memory_usage_reconciled(&registry);
 }
 
 #[test]
-fn active_missing_label_caches_do_not_block_unrelated_new_series_registration() {
+fn missing_label_queries_do_not_block_unrelated_new_series_registration() {
     let registry = Arc::new(SeriesRegistry::new());
     registry
         .resolve_or_insert(

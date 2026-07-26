@@ -137,11 +137,8 @@ pub(in crate::engine::storage_engine) struct WritePrepareWalContext<'a> {
 
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct WritePrepareMemoryBudgetContext<'a> {
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) tombstone_staged_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) write_transient: &'a Arc<WriteTransientMemoryAccounting>,
-    pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) memory_reservation_admission:
+        MemoryReservationAdmissionContext<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +183,9 @@ pub(in crate::engine::storage_engine) struct WriteApplyShardMutationContext<'a> 
 #[derive(Clone, Copy)]
 pub(in crate::engine::storage_engine) struct WriteApplyMemoryAccountingContext<'a> {
     pub(in crate::engine::storage_engine) shards: ShardMemoryAccountingContext<'a>,
+    pub(in crate::engine::storage_engine) write_transient: &'a Arc<WriteTransientMemoryAccounting>,
+    pub(in crate::engine::storage_engine) memory_reservation_admission:
+        MemoryReservationAdmissionContext<'a>,
 }
 
 #[derive(Clone, Copy)]

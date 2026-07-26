@@ -2,7 +2,7 @@ use tsink::promql::ast::{
     AggregationOp, AtModifier, BinaryOp, Expr, MatchOp, VectorMatchCardinality,
 };
 use tsink::promql::lexer::{Lexer, Token, TokenKind};
-use tsink::promql::{parse, PromqlError};
+use tsink::promql::{parse, PromqlError, MAX_PARSE_DEPTH, MAX_PARSE_INPUT_BYTES, MAX_PARSE_TOKENS};
 
 fn lex(input: &str) -> Vec<Token> {
     Lexer::new(input).tokenize().unwrap()
@@ -227,6 +227,73 @@ fn lexer_26_skips_hash_comments() {
     assert!(matches!(&tokens[0].kind, TokenKind::Ident(name) if name == "up"));
     assert!(matches!(tokens[1].kind, TokenKind::Plus));
     assert!(matches!(tokens[2].kind, TokenKind::Number(v) if (v - 1.0).abs() < 1e-12));
+}
+
+#[test]
+fn lexer_27_accepts_exact_input_byte_limit() {
+    let input = "a".repeat(MAX_PARSE_INPUT_BYTES);
+    let tokens = Lexer::new(&input).tokenize().unwrap();
+
+    assert!(matches!(
+        &tokens[0].kind,
+        TokenKind::Ident(metric) if metric.len() == MAX_PARSE_INPUT_BYTES
+    ));
+    assert!(matches!(tokens[1].kind, TokenKind::Eof));
+    assert!(parse(&input).is_ok());
+}
+
+#[test]
+fn lexer_28_rejects_one_byte_over_input_limit() {
+    let input = "a".repeat(MAX_PARSE_INPUT_BYTES + 1);
+    let err = Lexer::new(&input).tokenize().unwrap_err();
+
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!(
+                    "PromQL query input exceeds the {MAX_PARSE_INPUT_BYTES}-byte limit (got {} bytes)",
+                    MAX_PARSE_INPUT_BYTES + 1
+                )
+    ));
+}
+
+#[test]
+fn lexer_29_accepts_exact_non_eof_token_limit() {
+    let input = "+".repeat(MAX_PARSE_TOKENS);
+    let tokens = Lexer::new(&input).tokenize().unwrap();
+
+    assert_eq!(tokens.len(), MAX_PARSE_TOKENS + 1);
+    assert!(tokens[..MAX_PARSE_TOKENS]
+        .iter()
+        .all(|token| matches!(token.kind, TokenKind::Plus)));
+    assert!(matches!(tokens[MAX_PARSE_TOKENS].kind, TokenKind::Eof));
+}
+
+#[test]
+fn lexer_30_rejects_one_token_over_limit() {
+    let input = "+".repeat(MAX_PARSE_TOKENS + 1);
+    let err = Lexer::new(&input).tokenize().unwrap_err();
+
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the {MAX_PARSE_TOKENS}-token limit")
+    ));
+}
+
+#[test]
+fn parser_accepts_valid_query_at_exact_token_limit() {
+    let label_count = (MAX_PARSE_TOKENS - 6) / 2;
+    let labels = std::iter::repeat_n("a", label_count)
+        .collect::<Vec<_>>()
+        .join(",");
+    let input = format!("sum by ({labels})(up)");
+    let tokens = Lexer::new(&input).tokenize().unwrap();
+
+    assert_eq!(tokens.len() - 1, MAX_PARSE_TOKENS);
+    assert!(parse(&input).is_ok());
 }
 
 #[test]
@@ -727,5 +794,146 @@ fn parser_38_parses_atan2_as_binary_operator() {
             assert!(matches!(*b.lhs, Expr::Binary(ref lhs) if lhs.op == BinaryOp::Atan2));
         }
         other => panic!("unexpected expression: {other:?}"),
+    }
+}
+
+#[test]
+fn parser_39_accepts_exact_parenthesis_depth_limit() {
+    let nesting = MAX_PARSE_DEPTH - 1;
+    let input = format!("{}up{}", "(".repeat(nesting), ")".repeat(nesting));
+
+    assert!(parse(&input).is_ok());
+}
+
+#[test]
+fn parser_40_rejects_one_parenthesis_level_over_depth_limit() {
+    let input = format!(
+        "{}up{}",
+        "(".repeat(MAX_PARSE_DEPTH),
+        ")".repeat(MAX_PARSE_DEPTH)
+    );
+    let err = parse(&input).unwrap_err();
+
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_41_accepts_exact_unary_depth_limit() {
+    let input = format!("{}up", "-".repeat(MAX_PARSE_DEPTH - 1));
+
+    assert!(parse(&input).is_ok());
+}
+
+#[test]
+fn parser_42_rejects_one_unary_level_over_depth_limit() {
+    let input = format!("{}up", "-".repeat(MAX_PARSE_DEPTH));
+    let err = parse(&input).unwrap_err();
+
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_43_accepts_exact_right_associative_depth_limit() {
+    let input = std::iter::repeat_n("up", MAX_PARSE_DEPTH)
+        .collect::<Vec<_>>()
+        .join("^");
+
+    assert!(parse(&input).is_ok());
+}
+
+#[test]
+fn parser_44_rejects_one_right_associative_level_over_depth_limit() {
+    let input = std::iter::repeat_n("up", MAX_PARSE_DEPTH + 1)
+        .collect::<Vec<_>>()
+        .join("^");
+    let err = parse(&input).unwrap_err();
+
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_45_bounds_left_associative_ast_depth() {
+    let exact = std::iter::repeat_n("up", MAX_PARSE_DEPTH)
+        .collect::<Vec<_>>()
+        .join("+");
+    assert!(parse(&exact).is_ok());
+
+    let over = format!("{exact}+up");
+    let err = parse(&over).unwrap_err();
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_46_bounds_repeated_subquery_depth() {
+    let exact = format!("up{}", "[1m:]".repeat(MAX_PARSE_DEPTH - 1));
+    assert!(parse(&exact).is_ok());
+
+    let over = format!("{exact}[1m:]");
+    let err = parse(&over).unwrap_err();
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_47_bounds_composed_ast_depth() {
+    let unary_at_limit = format!("{}up", "-".repeat(MAX_PARSE_DEPTH - 1));
+    assert!(parse(&unary_at_limit).is_ok());
+
+    let err = parse(&format!("{unary_at_limit}+up")).unwrap_err();
+    assert!(matches!(
+        err,
+        PromqlError::Parse(message)
+            if message
+                == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+    ));
+}
+
+#[test]
+fn parser_48_rejects_adversarial_depth_shapes_without_stack_overflow() {
+    const ADVERSARIAL_DEPTH: usize = 4_096;
+    let queries = [
+        format!(
+            "{}up{}",
+            "(".repeat(ADVERSARIAL_DEPTH),
+            ")".repeat(ADVERSARIAL_DEPTH)
+        ),
+        format!("{}up", "-".repeat(ADVERSARIAL_DEPTH)),
+        std::iter::repeat_n("up", ADVERSARIAL_DEPTH)
+            .collect::<Vec<_>>()
+            .join("^"),
+    ];
+
+    for query in queries {
+        let err = parse(&query).unwrap_err();
+        assert!(matches!(
+            err,
+            PromqlError::Parse(message)
+                if message
+                    == format!("PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}")
+        ));
     }
 }

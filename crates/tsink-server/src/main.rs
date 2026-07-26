@@ -114,7 +114,7 @@ const CLI_ENDPOINTS_HELP: &str = r#"Endpoints:
 #[derive(Debug, Parser)]
 #[command(
     name = "tsink-server",
-    bin_name = "tsink-server server",
+    bin_name = "tsink-server",
     version,
     about = env!("CARGO_PKG_DESCRIPTION"),
     long_about = None,
@@ -937,6 +937,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
 
         let help = err.to_string();
+        assert!(help.contains("Usage: tsink-server [OPTIONS]"));
+        assert!(!help.contains("Usage: tsink-server server"));
         assert!(help.contains("Enable experimental cluster mode"));
         assert!(help.contains("/api/v1/admin/cluster/* endpoints are EXPERIMENTAL"));
         assert!(help.contains("tsink's primary product"));

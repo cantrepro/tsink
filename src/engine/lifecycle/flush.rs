@@ -589,6 +589,9 @@ impl ChunkStorage {
             .and_then(|()| publication.publish_transition(flush_transition));
         #[cfg(not(test))]
         let publish_result = publication.publish_transition(flush_transition);
+        let catalog_publication_deferred = publish_result
+            .as_ref()
+            .is_ok_and(|result| result.is_deferred());
         if let Err(err) = publish_result {
             // A transition can fail after installing the loaded indexes but before publishing
             // catalog/registry state. Remove any installed roots while the visibility fence is
@@ -630,6 +633,9 @@ impl ChunkStorage {
             }
             return Err(err);
         }
+        if catalog_publication_deferred {
+            publish_ctx.0.store(true, Ordering::SeqCst);
+        }
         self.mark_persisted_chunk_watermarks(&flushed_watermarks);
         {
             let mut pending = self.chunks.pending_sealed_chunks.write();
@@ -648,18 +654,28 @@ impl ChunkStorage {
 
         if let Some(planned_dirty_refresh) = planned_dirty_refresh {
             let restore_diff = planned_dirty_refresh.restore_known_dirty_diff();
+            let restore_diff_conditionally =
+                planned_dirty_refresh.restore_known_dirty_diff_conditionally();
             match publication.apply_planned_refresh(planned_dirty_refresh) {
                 Ok(result) if result.is_applied() => {
-                    publish_ctx
-                        .0
-                        .store(self.has_known_persisted_segment_changes(), Ordering::SeqCst);
+                    self.synchronize_persisted_index_dirty_with_pending();
+                }
+                Ok(result) if result.is_deferred() => {
+                    // The planned diff is already installed in visible persisted state. The
+                    // retained finite writer cursor owns the resulting complete catalog image;
+                    // replaying this diff would invalidate that cursor on every retry.
+                    publish_ctx.0.store(true, Ordering::SeqCst);
                 }
                 Ok(_) => {
                     unreachable!("flush should only preplan known dirty catalog refreshes");
                 }
                 Err(err) => {
                     if let Some(restore_diff) = restore_diff {
-                        self.restore_known_persisted_segment_changes(restore_diff);
+                        if restore_diff_conditionally {
+                            self.restore_known_persisted_segment_change_if_unmodified(restore_diff);
+                        } else {
+                            self.restore_known_persisted_segment_changes(restore_diff);
+                        }
                     }
                     publish_ctx.0.store(true, Ordering::SeqCst);
                     tracing::warn!(

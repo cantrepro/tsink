@@ -1963,6 +1963,15 @@ fn snapshot_uses_permit_before_run_lock_with_historical_ingest() {
     let snapshot_path = artifact_dir.path().join("snapshot");
     let restore_path = artifact_dir.path().join("restore");
     let storage = single_writer_persistent_rollup_storage(data_dir.path());
+    let fixture_manifest_builder = StorageBuilder::new()
+        .with_data_path(data_dir.path())
+        .with_chunk_points(8)
+        .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        .with_partition_duration(Duration::MAX);
+    super::super::data_directory_manifest::install_current_manifest_for_test(
+        &fixture_manifest_builder,
+    )
+    .unwrap();
     let labels = vec![Label::new("host", "a")];
     let policy = cpu_rollup_policy("cpu_1s_avg", 1_000);
     seed_materialized_cpu_rollup(storage.as_ref(), &labels, &policy);
@@ -2029,6 +2038,8 @@ fn snapshot_uses_permit_before_run_lock_with_historical_ingest() {
     let restored = StorageBuilder::new()
         .with_data_path(&restore_path)
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        .with_chunk_points(8)
+        .with_partition_duration(Duration::MAX)
         .build()
         .unwrap();
     assert_eq!(

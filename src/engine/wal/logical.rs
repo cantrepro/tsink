@@ -106,6 +106,13 @@ impl LogicalWalWrite<'_> {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if let Err(err) = self
+            .wal
+            .invoke_durability_failpoint(WalDurabilityFailpoint::Flush)
+        {
+            return Err(self.rollback_after_failure("flush logical write rollback", err));
+        }
         if let Err(err) = self.writer.flush() {
             self.publication.failed = true;
             return Err(self.rollback_after_io_failure("flush logical write", err));
@@ -120,8 +127,9 @@ impl LogicalWalWrite<'_> {
 
         let committed_highwater = self.persist_pending()?;
         if committed_highwater == WalHighWatermark::default() {
-            self.settle_disk_after_success()?;
+            let settlement_result = self.settle_disk_after_success();
             self.publication.closed = true;
+            settlement_result?;
             return Ok(committed_highwater);
         }
 
@@ -143,14 +151,21 @@ impl LogicalWalWrite<'_> {
             self.publication.synced || rotated,
             rotated,
         );
-        self.wal
-            .publish_committed_highwater(committed_highwater, self.publication.synced || rotated)?;
+        if let Err(err) = self
+            .wal
+            .publish_committed_highwater(committed_highwater, self.publication.synced || rotated)
+        {
+            return Err(self.finish_indeterminate_publication(err));
+        }
         self.wal
             .apply_cached_series_definition_frames_if_initialized(std::mem::take(
                 &mut self.publication.cached_series_definition_frames,
             ));
-        self.settle_disk_after_success()?;
+        // Publication is already externally observable. A later accounting/stat failure must
+        // never let `Drop` truncate bytes below the published marker.
+        let settlement_result = self.settle_disk_after_success();
         self.publication.closed = true;
+        settlement_result?;
 
         Ok(committed_highwater)
     }
@@ -203,16 +218,51 @@ impl LogicalWalWrite<'_> {
                 self.publication.synced,
                 false,
             );
-            self.wal
-                .publish_committed_highwater(committed_highwater, self.publication.synced)?;
+            if let Err(err) = self
+                .wal
+                .publish_committed_highwater(committed_highwater, self.publication.synced)
+            {
+                return Err(self.finish_indeterminate_publication(err));
+            }
             self.wal
                 .apply_cached_series_definition_frames_if_initialized(std::mem::take(
                     &mut self.publication.cached_series_definition_frames,
                 ));
         }
-        self.settle_disk_after_success()?;
+        // The marker may already name this prefix, so close the rollback guard regardless of
+        // whether exact disk-accounting settlement succeeds.
+        let settlement_result = self.settle_disk_after_success();
         self.publication.closed = true;
+        settlement_result?;
         Ok(committed_highwater)
+    }
+
+    /// Closes a write whose WAL frames were retained but whose logical publish marker failed.
+    ///
+    /// `publish_appended_write` has already advanced the in-process append sequence at this
+    /// point. Rolling the file back from `Drop` would make that state disagree with the physical
+    /// WAL, and a rename followed by a directory-sync failure may already have exposed the new
+    /// marker. Preserve the complete prefix instead: an old marker will ignore it on restart, a
+    /// new marker can replay it, and a later successful publication may durably include it. That
+    /// is precisely the indeterminate crash outcome represented by the caller's `Volatile`
+    /// acknowledgement.
+    fn finish_indeterminate_publication(&mut self, publication_error: TsinkError) -> TsinkError {
+        self.wal
+            .apply_cached_series_definition_frames_if_initialized(std::mem::take(
+                &mut self.publication.cached_series_definition_frames,
+            ));
+        let settlement_result = self.settle_disk_after_success();
+        self.publication.closed = true;
+
+        match settlement_result {
+            Ok(()) => publication_error,
+            Err(settlement_error) => TsinkError::Wal {
+                operation: "settle indeterminate logical WAL publication".to_string(),
+                details: format!(
+                    "publication failed: {publication_error}; disk settlement failed: {settlement_error}"
+                ),
+            },
+        }
     }
 
     pub(in crate::engine) fn abort(mut self) -> Result<()> {
@@ -221,8 +271,9 @@ impl LogicalWalWrite<'_> {
         }
 
         if !self.progress.has_frames() {
-            self.settle_disk_after_success()?;
+            let settlement_result = self.settle_disk_after_success();
             self.publication.closed = true;
+            settlement_result?;
             return Ok(());
         }
         let rollback_result = self
@@ -248,6 +299,17 @@ impl LogicalWalWrite<'_> {
                 payload.len()
             )));
         }
+
+        #[cfg(test)]
+        self.wal.invoke_durability_failpoint(match frame_type {
+            FRAME_TYPE_SERIES_DEF => WalDurabilityFailpoint::SeriesDefinitionAppend,
+            FRAME_TYPE_SAMPLES => WalDurabilityFailpoint::SamplesAppend,
+            _ => {
+                return Err(TsinkError::DataCorruption(format!(
+                    "unknown WAL frame type {frame_type}"
+                )))
+            }
+        })?;
 
         let payload_crc32 = checksum32(payload);
         let mut header = [0u8; FRAME_HEADER_LEN];
@@ -546,6 +608,7 @@ impl FramedWal {
             &self.published_highwater_tmp_path,
             highwater,
             sync,
+            || self.invoke_published_highwater_post_rename_hook(),
         )
     }
 
@@ -608,6 +671,19 @@ impl FramedWal {
     #[cfg(test)]
     pub(in crate::engine) fn clear_append_sync_hook(&self) {
         *self.append_sync_hook.lock() = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn set_published_highwater_post_rename_hook<F>(&self, hook: F)
+    where
+        F: Fn() -> Result<()> + Send + Sync + 'static,
+    {
+        *self.published_highwater_post_rename_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn clear_published_highwater_post_rename_hook(&self) {
+        *self.published_highwater_post_rename_hook.lock() = None;
     }
 
     fn append_frame(&self, frame_type: u8, payload: &[u8]) -> Result<()> {
@@ -683,6 +759,15 @@ impl FramedWal {
     fn invoke_append_sync_hook(&self) -> Result<()> {
         #[cfg(test)]
         if let Some(hook) = self.append_sync_hook.lock().clone() {
+            hook()?;
+        }
+
+        Ok(())
+    }
+
+    fn invoke_published_highwater_post_rename_hook(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.published_highwater_post_rename_hook.lock().clone() {
             hook()?;
         }
 

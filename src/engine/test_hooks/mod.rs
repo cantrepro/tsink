@@ -17,6 +17,7 @@ pub(super) struct PersistTestHooks {
     pub(super) post_series_definitions_append_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) post_samples_append_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) pre_sealed_chunk_publish_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) post_chunk_seal_hook: RwLock<Option<Arc<FallibleCommitHook>>>,
     pub(super) crash_after_samples_persisted: AtomicBool,
     pub(super) crash_before_publish_persisted: AtomicBool,
     pub(super) full_inventory_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
@@ -26,8 +27,11 @@ pub(super) struct PersistTestHooks {
     pub(super) metadata_all_series_postings_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_persisted_postings_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_direct_candidate_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) metadata_matcher_regex_compile_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_live_series_snapshot_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_live_series_pre_prune_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) metadata_live_series_post_remove_pre_unpublish_hook:
+        RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_visibility_refresh_post_preflight_hook:
         RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_time_range_summary_hook: RwLock<Option<Arc<IngestCommitHook>>>,
@@ -36,6 +40,7 @@ pub(super) struct PersistTestHooks {
     pub(super) metadata_time_range_persisted_exact_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) shard_metadata_fallback_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) snapshot_pre_wal_copy_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) snapshot_pre_publication_hook: RwLock<Option<Arc<FallibleCommitHook>>>,
     pub(super) query_merge_in_memory_source_snapshot_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) query_append_sort_in_memory_source_snapshot_hook:
         RwLock<Option<Arc<IngestCommitHook>>>,

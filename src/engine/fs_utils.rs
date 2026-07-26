@@ -6,6 +6,13 @@ use std::sync::Arc;
 
 use crate::{Result, TsinkError};
 
+#[path = "fs_utils/secure_snapshot.rs"]
+mod secure_snapshot;
+pub(crate) use secure_snapshot::{
+    admit_secure_snapshot_operation_retained_bytes, SecureSnapshotNamespaceFence,
+    SecureSnapshotSourceFile, SecureSnapshotSourceTree, SecureSnapshotStagingDirectory,
+};
+
 static STAGE_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Recovery-owned namespace scans must complete within a fixed work envelope before callers
@@ -536,11 +543,19 @@ where
 type DirectorySyncHook = dyn Fn(&Path) -> Result<()> + Send + Sync + 'static;
 
 #[cfg(test)]
+type FileSyncHook = dyn Fn(&Path) -> Result<()> + Send + Sync + 'static;
+
+#[cfg(test)]
 type TmpWriteFailureHook =
     dyn Fn(&Path, &mut std::fs::File, &[u8]) -> Option<TsinkError> + Send + Sync + 'static;
 
 #[cfg(test)]
 pub(crate) struct DirectorySyncHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) struct FileSyncHookGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -568,6 +583,15 @@ impl Drop for DirectorySyncHookGuard {
 }
 
 #[cfg(test)]
+impl Drop for FileSyncHookGuard {
+    fn drop(&mut self) {
+        *file_sync_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
 fn directory_sync_hook_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc<DirectorySyncHook>>>
 {
     static DIRECTORY_SYNC_HOOK: std::sync::OnceLock<
@@ -577,10 +601,25 @@ fn directory_sync_hook_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc
 }
 
 #[cfg(test)]
+fn file_sync_hook_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc<FileSyncHook>>> {
+    static FILE_SYNC_HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<FileSyncHook>>>,
+    > = std::sync::OnceLock::new();
+    FILE_SYNC_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
 fn directory_sync_test_lock() -> &'static std::sync::Mutex<()> {
     static DIRECTORY_SYNC_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
         std::sync::OnceLock::new();
     DIRECTORY_SYNC_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+fn file_sync_test_lock() -> &'static std::sync::Mutex<()> {
+    static FILE_SYNC_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    FILE_SYNC_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -602,6 +641,18 @@ fn tmp_write_failure_test_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 fn invoke_directory_sync_hook(path: &Path) -> Result<()> {
     let hook = directory_sync_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn invoke_file_sync_hook(path: &Path) -> Result<()> {
+    let hook = file_sync_hook_slot()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
@@ -657,6 +708,33 @@ where
         Ok(())
     }));
     DirectorySyncHookGuard { _lock: lock }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_file_sync_matching_once<F>(
+    matcher: F,
+    message: impl Into<String>,
+) -> FileSyncHookGuard
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let lock = file_sync_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let failed = Arc::new(AtomicBool::new(false));
+    let message = message.into();
+    *file_sync_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::new(move |candidate| {
+        if matcher(candidate) && !failed.swap(true, Ordering::SeqCst) {
+            return Err(TsinkError::Other(message.clone()));
+        }
+        Ok(())
+    }));
+    FileSyncHookGuard { _lock: lock }
 }
 
 #[cfg(test)]
@@ -876,15 +954,137 @@ fn rename_path_with_retry(source: &Path, destination: &Path) -> std::io::Result<
     std::fs::rename(source, destination)
 }
 
-/// Renames one path without synchronizing either parent directory.
+/// Renames one path only if `destination` is still absent, without synchronizing parents.
 ///
-/// Callers that need to distinguish publication from a later durability error use this before an
-/// explicit parent sync. Most callers should prefer [`rename_and_sync_parents`].
-pub(crate) fn rename_path(source: &Path, destination: &Path) -> Result<()> {
-    rename_path_with_retry(source, destination).map_err(|source_err| TsinkError::IoWithPath {
-        path: source.to_path_buf(),
-        source: source_err,
+/// This is for transactions that must distinguish publication from a later parent-sync failure
+/// and perform their own rollback. Most callers should use
+/// [`rename_noreplace_and_sync_parents`].
+pub(crate) fn rename_path_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    rename_path_noreplace_with_retry(source, destination).map_err(|source_err| {
+        TsinkError::IoWithPath {
+            path: destination.to_path_buf(),
+            source: source_err,
+        }
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_path_noreplace_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename source contains an interior NUL byte",
+        )
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename destination contains an interior NUL byte",
+        )
+    })?;
+    // Invoke the kernel directly rather than importing glibc's newer `renameat2` symbol, which
+    // would unnecessarily raise the minimum glibc required by otherwise-compatible binaries.
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_path_noreplace_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename source contains an interior NUL byte",
+        )
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename destination contains an interior NUL byte",
+        )
+    })?;
+    let renamed =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if renamed == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_path_noreplace_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains an interior NUL byte: {}", path.display()),
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    retry_windows_fs_operation(|| {
+        let moved = unsafe {
+            move_file_ex_w(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android")),
+    not(target_vendor = "apple")
+))]
+fn rename_path_noreplace_with_retry(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no configured atomic no-replace directory rename primitive",
+    ))
 }
 
 pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
@@ -935,6 +1135,158 @@ pub(crate) fn remove_path_if_exists_and_sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Captures the stable filesystem identity of one plain directory.
+///
+/// Callers use this before a create/rename publication so later error cleanup can distinguish the
+/// owned directory from an unrelated entry installed at the same pathname.
+#[cfg(test)]
+pub(crate) fn capture_plain_directory_identity(
+    path: &Path,
+    operation: &str,
+) -> Result<same_file::Handle> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(TsinkError::DataCorruption(format!(
+            "{operation} root is link-like or not a directory: {}",
+            path.display()
+        )));
+    }
+    let identity = same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !path_matches_plain_directory_identity(path, &identity)? {
+        return Err(TsinkError::DataCorruption(format!(
+            "{operation} root identity changed while it was captured: {}",
+            path.display()
+        )));
+    }
+    Ok(identity)
+}
+
+/// Returns whether `path` is still the same plain directory as `expected`.
+#[cfg(test)]
+pub(crate) fn path_matches_plain_directory_identity(
+    path: &Path,
+    expected: &same_file::Handle,
+) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let current = same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(&current == expected)
+}
+
+/// Removes one owned directory tree through an exact, bounded, no-follow deletion plan.
+///
+/// Every descendant is admitted before the first unlink. Execution then removes only the planned
+/// entries, deepest first, without enumerating again; a late descendant makes the final directory
+/// removal fail instead of expanding work or deleting the injected entry.
+#[cfg(test)]
+pub(crate) fn remove_owned_directory_tree_bounded_and_sync_parent(
+    path: &Path,
+    max_entries: usize,
+    max_depth: u32,
+    operation: &str,
+) -> Result<bool> {
+    remove_owned_directory_tree_bounded_and_sync_parent_inner(
+        path,
+        None,
+        max_entries,
+        max_depth,
+        operation,
+    )
+}
+
+/// Removes one owned directory tree through identity-checked bounded cleanup.
+#[cfg(test)]
+pub(crate) fn remove_owned_directory_tree_bounded_and_sync_parent_with_identity(
+    path: &Path,
+    expected: &same_file::Handle,
+    max_entries: usize,
+    max_depth: u32,
+    operation: &str,
+) -> Result<bool> {
+    remove_owned_directory_tree_bounded_and_sync_parent_inner(
+        path,
+        Some(expected),
+        max_entries,
+        max_depth,
+        operation,
+    )
+}
+
+#[cfg(test)]
+fn remove_owned_directory_tree_bounded_and_sync_parent_inner(
+    path: &Path,
+    expected: Option<&same_file::Handle>,
+    max_entries: usize,
+    max_depth: u32,
+    operation: &str,
+) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(TsinkError::DataCorruption(format!(
+            "{operation} owned root changed into a link-like or non-directory entry: {}",
+            path.display()
+        )));
+    }
+    if let Some(identity) = expected {
+        if !path_matches_plain_directory_identity(path, identity)? {
+            return Err(TsinkError::DataCorruption(format!(
+                "refusing {operation} because the owned root identity changed: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let mut entry_budget = RecoveryNamespaceBudget::new(max_entries);
+    let plan = validate_recursive_namespace_with_admission(
+        &[path.to_path_buf()],
+        &mut entry_budget,
+        max_depth,
+        operation,
+        0,
+        |_| Ok(()),
+    )?;
+    if let Some(identity) = expected {
+        if !path_matches_plain_directory_identity(path, identity)? {
+            return Err(TsinkError::DataCorruption(format!(
+                "refusing {operation} because the owned root identity changed after cleanup planning: {}",
+                path.display()
+            )));
+        }
+    }
+    plan.remove()?;
+    sync_parent_dir(path)?;
+    Ok(true)
+}
+
 /// Removes an owned path and credits the bytes that actually disappeared from a managed budget.
 ///
 /// A zero-byte recovery reservation keeps a concurrent full-tree reconciliation from racing the
@@ -944,6 +1296,20 @@ pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted(
     path: &Path,
     budget: Option<&Arc<crate::LocalDiskBudget>>,
     category: crate::DiskCategory,
+) -> Result<()> {
+    remove_path_if_exists_and_sync_parent_budgeted_with_reconciliation_memory_limit(
+        path,
+        budget,
+        category,
+        usize::MAX,
+    )
+}
+
+pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted_with_reconciliation_memory_limit(
+    path: &Path,
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+    reconciliation_memory_limit: usize,
 ) -> Result<()> {
     let Some(budget) = budget else {
         return remove_path_if_exists_and_sync_parent(path);
@@ -955,7 +1321,9 @@ pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted(
     let reservation = budget.reserve(category, 0, crate::DiskReservationKind::Recovery)?;
     let removal_result = remove_path_if_exists_and_sync_parent(path);
     let settlement_result = reservation.commit(0, 0);
-    let reconciliation_result = budget.reconcile_when_idle().map(|_| ());
+    let reconciliation_result = budget
+        .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+        .map(|_| ());
 
     let mut errors = Vec::new();
     if let Err(err) = &removal_result {
@@ -983,7 +1351,7 @@ pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted(
     }
 }
 
-pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
+fn next_stage_dir_candidate(target: &Path, purpose: &str) -> Result<PathBuf> {
     let Some(parent) = target.parent() else {
         return Err(TsinkError::InvalidConfiguration(format!(
             "{purpose} target has no parent directory: {}",
@@ -997,9 +1365,13 @@ pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
         .filter(|name| !name.is_empty())
         .unwrap_or("snapshot");
 
+    let nonce = STAGE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(".tmp-tsink-{purpose}-{target_name}-{nonce:016x}")))
+}
+
+pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
     for _ in 0..256 {
-        let nonce = STAGE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".tmp-tsink-{purpose}-{target_name}-{nonce:016x}"));
+        let candidate = next_stage_dir_candidate(target, purpose)?;
         if !path_exists_no_follow(&candidate)? {
             return Ok(candidate);
         }
@@ -1011,60 +1383,54 @@ pub(crate) fn stage_dir_path(target: &Path, purpose: &str) -> Result<PathBuf> {
     )))
 }
 
+/// Atomically allocates and creates an absent staging directory beside `target`.
+///
+/// A separate `stage_dir_path` followed by `create_dir_all` is a check-then-create race:
+/// another process can install a directory or link at the selected path and cause a caller to
+/// populate or later clean up an entry it did not create. This helper uses the operating system's
+/// exclusive single-directory create operation and retries only when that exact candidate already
+/// exists. The target parent must already exist.
+#[cfg(test)]
+pub(crate) fn create_unique_staging_dir(target: &Path, purpose: &str) -> Result<PathBuf> {
+    for _ in 0..256 {
+        let candidate = next_stage_dir_candidate(target, purpose)?;
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(TsinkError::Other(format!(
+        "failed to atomically create a unique staging directory for {}",
+        target.display()
+    )))
+}
+
+/// Creates one already-planned staging directory with create-exclusive semantics.
+///
+/// This does not choose another name when the planned entry exists. It is intended for coordinated
+/// replacement transactions that admitted and recorded the exact staging path before entering
+/// their mutation closure.
+pub(crate) fn create_staging_dir_exclusive(path: &Path) -> Result<()> {
+    std::fs::create_dir(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
-    copy_dir_recursive_at_depth(source, destination, 0)
+    let measurement = measure_restore_directory(source)?;
+    copy_dir_contents_bounded(source, destination, measurement)
 }
 
-fn copy_dir_recursive_at_depth(source: &Path, destination: &Path, depth: u32) -> Result<()> {
-    if depth > crate::MAX_SNAPSHOT_RESTORE_DEPTH {
-        return Err(TsinkError::InvalidConfiguration(format!(
-            "snapshot restore directory depth {depth} exceeds limit {} at {}",
-            crate::MAX_SNAPSHOT_RESTORE_DEPTH,
-            source.display()
-        )));
-    }
-    let metadata = std::fs::symlink_metadata(source)?;
-    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
-        return Err(TsinkError::InvalidConfiguration(format!(
-            "expected directory while copying {}, found non-directory",
-            source.display()
-        )));
-    }
-
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let entry_source = entry.path();
-        let entry_destination = destination.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&entry_source)?;
-        if is_link_or_reparse_point(&metadata) {
-            return Err(TsinkError::InvalidConfiguration(format!(
-                "unsupported link-like entry while copying snapshot: {}",
-                entry_source.display()
-            )));
-        }
-        let entry_type = metadata.file_type();
-
-        if entry_type.is_dir() {
-            let child_depth = depth.checked_add(1).ok_or_else(|| {
-                TsinkError::Other(
-                    "snapshot restore directory depth exceeds the supported range".to_string(),
-                )
-            })?;
-            copy_dir_recursive_at_depth(&entry_source, &entry_destination, child_depth)?;
-        } else if entry_type.is_file() {
-            std::fs::copy(&entry_source, &entry_destination)?;
-        } else {
-            return Err(TsinkError::InvalidConfiguration(format!(
-                "unsupported non-file entry while copying snapshot: {}",
-                entry_source.display()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
+#[cfg(test)]
 pub(crate) fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) => {
@@ -1334,23 +1700,7 @@ fn copy_dir_contents_bounded_inner(
         }
 
         let mut source_file =
-            std::fs::File::open(&entry_source).map_err(|source_err| TsinkError::IoWithPath {
-                path: entry_source.clone(),
-                source: source_err,
-            })?;
-        let opened_metadata =
-            source_file
-                .metadata()
-                .map_err(|source_err| TsinkError::IoWithPath {
-                    path: entry_source.clone(),
-                    source: source_err,
-                })?;
-        if !opened_metadata.file_type().is_file() || opened_metadata.len() != admitted_file_bytes {
-            return Err(TsinkError::InvalidConfiguration(format!(
-                "snapshot file changed after admission: {}",
-                entry_source.display()
-            )));
-        }
+            open_snapshot_source_regular_file(&entry_source, admitted_file_bytes)?;
 
         let mut destination_file = OpenOptions::new()
             .write(true)
@@ -1389,18 +1739,25 @@ fn copy_dir_contents_bounded_inner(
                 entry_source.display()
             )));
         }
-        std::fs::set_permissions(&entry_destination, metadata.permissions()).map_err(
-            |source_err| TsinkError::IoWithPath {
+        validate_opened_snapshot_source_file_identity(
+            source_file,
+            &entry_source,
+            admitted_file_bytes,
+        )?;
+        destination_file
+            .set_permissions(metadata.permissions())
+            .map_err(|source_err| TsinkError::IoWithPath {
                 path: entry_destination.clone(),
                 source: source_err,
-            },
-        )?;
+            })?;
         destination_file
             .flush()
             .map_err(|source_err| TsinkError::IoWithPath {
                 path: entry_destination.clone(),
                 source: source_err,
             })?;
+        #[cfg(test)]
+        invoke_file_sync_hook(&entry_destination)?;
         destination_file
             .sync_all()
             .map_err(|source_err| TsinkError::IoWithPath {
@@ -1422,6 +1779,82 @@ fn consume_restore_entry(remaining_entries: &mut u64, path: &Path) -> Result<()>
             path.display()
         ))
     })?;
+    Ok(())
+}
+
+fn open_snapshot_source_regular_file(path: &Path, expected_len: u64) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source_err| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: source_err,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source_err| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: source_err,
+        })?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_len
+    {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot source changed type or length while opening: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn validate_opened_snapshot_source_file_identity(
+    file: std::fs::File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<()> {
+    let opened_identity =
+        same_file::Handle::from_file(file).map_err(|source_err| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: source_err,
+        })?;
+    let current_metadata =
+        std::fs::symlink_metadata(path).map_err(|source_err| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: source_err,
+        })?;
+    if is_link_or_reparse_point(&current_metadata)
+        || !current_metadata.file_type().is_file()
+        || current_metadata.len() != expected_len
+    {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot source changed type or length while validating: {}",
+            path.display()
+        )));
+    }
+    let current_identity =
+        same_file::Handle::from_path(path).map_err(|source_err| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source: source_err,
+        })?;
+    if opened_identity != current_identity {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot source path changed while copying: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1541,6 +1974,8 @@ where
         let write_result = (|| -> Result<()> {
             writer.write_all(bytes)?;
             writer.flush()?;
+            #[cfg(test)]
+            invoke_file_sync_hook(&tmp_path)?;
             writer.get_ref().sync_all()?;
             Ok(())
         })();
@@ -1621,6 +2056,8 @@ where
             }
             exact_writer.flush()?;
         }
+        #[cfg(test)]
+        invoke_file_sync_hook(&tmp_path)?;
         writer.get_ref().sync_all()?;
         Ok(())
     })();
@@ -1688,6 +2125,34 @@ fn rename_tmp_impl(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
 
 pub(crate) fn rename_and_sync_parents(source: &Path, destination: &Path) -> Result<()> {
     rename_path_with_retry(source, destination)?;
+
+    let source_parent = source.parent();
+    let destination_parent = destination.parent();
+    match (source_parent, destination_parent) {
+        (Some(source_parent), Some(destination_parent)) if source_parent == destination_parent => {
+            sync_dir(destination_parent)?
+        }
+        (Some(source_parent), Some(destination_parent)) => {
+            sync_dir(source_parent)?;
+            sync_dir(destination_parent)?;
+        }
+        (None, Some(destination_parent)) => sync_dir(destination_parent)?,
+        (Some(source_parent), None) => sync_dir(source_parent)?,
+        (None, None) => {}
+    }
+
+    Ok(())
+}
+
+/// Atomically renames `source` only if `destination` is still absent, then synchronizes parents.
+///
+/// This is the publication primitive for caller-selected snapshot and salvage destinations. It
+/// prevents a path created after preflight from being overwritten. Linux/Android use
+/// `renameat2(RENAME_NOREPLACE)`, Apple platforms use `renamex_np(RENAME_EXCL)`, and Windows uses
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`. Other Unix targets fail explicitly instead
+/// of falling back to a racy check-then-rename sequence.
+pub(crate) fn rename_noreplace_and_sync_parents(source: &Path, destination: &Path) -> Result<()> {
+    rename_path_noreplace(source, destination)?;
 
     let source_parent = source.parent();
     let destination_parent = destination.parent();
@@ -1890,6 +2355,24 @@ pub(crate) fn write_file_atomically_and_sync_parent_budgeted(
     category: crate::DiskCategory,
     kind: crate::DiskReservationKind,
 ) -> Result<()> {
+    write_file_atomically_and_sync_parent_budgeted_with_reconciliation_memory_limit(
+        path,
+        bytes,
+        budget,
+        category,
+        kind,
+        usize::MAX,
+    )
+}
+
+pub(crate) fn write_file_atomically_and_sync_parent_budgeted_with_reconciliation_memory_limit(
+    path: &Path,
+    bytes: &[u8],
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+    kind: crate::DiskReservationKind,
+    reconciliation_memory_limit: usize,
+) -> Result<()> {
     let Some(budget) = budget else {
         return write_file_atomically_and_sync_parent(path, bytes);
     };
@@ -1907,7 +2390,9 @@ pub(crate) fn write_file_atomically_and_sync_parent_budgeted(
             // complete new file, then obtain an exact exclusive scan for overwrites.
             let settlement = reservation.commit(new_bytes, 0);
             let reconciliation = if previous_bytes > 0 {
-                budget.reconcile_when_idle().map(|_| ())
+                budget
+                    .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1924,7 +2409,87 @@ pub(crate) fn write_file_atomically_and_sync_parent_budgeted(
             // when a lower-level write fails. Charge the full admitted peak first, then reconcile
             // if no other writer currently owns a reservation. This never understates a survivor.
             let settlement = reservation.commit_as(crate::DiskCategory::Temporary, new_bytes, 0);
-            let reconciliation = budget.reconcile_when_idle().map(|_| ());
+            let reconciliation = budget
+                .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+                .map(|_| ());
+            match (settlement, reconciliation) {
+                (Ok(()), Ok(())) => Err(write_err),
+                (settlement, reconciliation) => {
+                    let mut errors = vec![format!("write failed: {write_err}")];
+                    if let Err(err) = settlement {
+                        errors.push(format!("disk settlement failed: {err}"));
+                    }
+                    if let Err(err) = reconciliation {
+                        errors.push(format!("disk reconciliation failed: {err}"));
+                    }
+                    Err(TsinkError::Other(format!(
+                        "atomic file write failed: {}",
+                        errors.join("; ")
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Atomically writes an owned payload and releases it before any exact disk-budget scan.
+///
+/// Catalog publication uses this form so the encoded payload/atomic-write peak and the bounded
+/// reconciliation peak are sequential rather than additive. The borrowed compatibility helper
+/// above intentionally preserves its existing lifetime contract for other callers.
+pub(crate) fn write_owned_file_atomically_and_sync_parent_budgeted_with_reconciliation_memory_limit(
+    path: &Path,
+    bytes: Vec<u8>,
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+    kind: crate::DiskReservationKind,
+    reconciliation_memory_limit: usize,
+) -> Result<()> {
+    let Some(budget) = budget else {
+        return write_file_atomically_and_sync_parent(path, &bytes);
+    };
+    if !budget.governs_entry(path)? {
+        return write_file_atomically_and_sync_parent(path, &bytes);
+    }
+
+    // Only existence matters here: replacements need an exact post-write scan, while creations
+    // can commit their complete size directly. Avoid recursively measuring an unexpected
+    // directory at the target name, which would otherwise introduce an unbounded pre-write scan.
+    let previous_entry_existed = path_exists_no_follow(path)?;
+    let new_bytes = bytes.len() as u64;
+    let reservation = budget.reserve(category, new_bytes, kind)?;
+    let write_result = write_file_atomically_and_sync_parent(path, &bytes);
+    drop(bytes);
+
+    match write_result {
+        Ok(()) => {
+            // Do not subtract an aggregate category total for the replaced path: an external
+            // writer may have changed that entry since the last scan. Conservatively charge the
+            // complete new file, then obtain an exact exclusive scan for overwrites.
+            let settlement = reservation.commit(new_bytes, 0);
+            let reconciliation = if previous_entry_existed {
+                budget
+                    .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            match (settlement, reconciliation) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+                (Err(settlement_err), Err(reconciliation_err)) => Err(TsinkError::Other(format!(
+                    "atomic file write disk settlement failed: {settlement_err}; reconciliation failed: {reconciliation_err}"
+                ))),
+            }
+        }
+        Err(write_err) => {
+            // The legacy atomic helper can fail after the rename or leave an owned temporary file
+            // when a lower-level write fails. Charge the full admitted peak first, then reconcile
+            // if no other writer currently owns a reservation. This never understates a survivor.
+            let settlement = reservation.commit_as(crate::DiskCategory::Temporary, new_bytes, 0);
+            let reconciliation = budget
+                .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+                .map(|_| ());
             match (settlement, reconciliation) {
                 (Ok(()), Ok(())) => Err(write_err),
                 (settlement, reconciliation) => {
@@ -2042,6 +2607,61 @@ mod tests {
     }
 
     #[test]
+    fn bounded_owned_tree_cleanup_accepts_exact_cap_and_rejects_before_deleting_cap_plus_one() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let exact = temp_dir.path().join("exact");
+        std::fs::create_dir(&exact).unwrap();
+        std::fs::write(exact.join("one"), b"one").unwrap();
+        std::fs::write(exact.join("two"), b"two").unwrap();
+
+        assert!(remove_owned_directory_tree_bounded_and_sync_parent(
+            &exact,
+            2,
+            1,
+            "exact cleanup test",
+        )
+        .expect("the exact descendant cap must be accepted"));
+        assert!(!exact.exists());
+
+        let over = temp_dir.path().join("over");
+        std::fs::create_dir(&over).unwrap();
+        std::fs::write(over.join("one"), b"one").unwrap();
+        std::fs::write(over.join("two"), b"two").unwrap();
+        let err =
+            remove_owned_directory_tree_bounded_and_sync_parent(&over, 1, 1, "over cleanup test")
+                .expect_err("cap plus one must fail before the first unlink");
+        assert!(err.to_string().contains("1-entry global work bound"));
+        assert_eq!(std::fs::read(over.join("one")).unwrap(), b"one");
+        assert_eq!(std::fs::read(over.join("two")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn identity_checked_owned_cleanup_preserves_a_replacement_at_the_same_path() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let root = temp_dir.path().join("owned");
+        let moved_owned = temp_dir.path().join("moved-owned");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("owned"), b"owned").unwrap();
+        let identity = capture_plain_directory_identity(&root, "identity cleanup test").unwrap();
+
+        std::fs::rename(&root, &moved_owned).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("foreign"), b"foreign").unwrap();
+
+        let err = remove_owned_directory_tree_bounded_and_sync_parent_with_identity(
+            &root,
+            &identity,
+            2,
+            1,
+            "identity cleanup test",
+        )
+        .expect_err("cleanup must reject a different directory at the owned path");
+        assert!(err.to_string().contains("owned root identity changed"));
+        assert_eq!(std::fs::read(root.join("foreign")).unwrap(), b"foreign");
+        assert_eq!(std::fs::read(moved_owned.join("owned")).unwrap(), b"owned");
+    }
+
+    #[test]
     fn write_file_atomically_creates_missing_parent_directories() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let path = temp_dir.path().join("nested/state/series-index.bin");
@@ -2105,6 +2725,83 @@ mod tests {
         assert_eq!(
             std::fs::read(&path).expect("second payload should exist"),
             b"second"
+        );
+    }
+
+    #[test]
+    fn unique_staging_directory_allocation_is_create_exclusive() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let target = temp_dir.path().join("snapshot");
+
+        let first = create_unique_staging_dir(&target, "snapshot")
+            .expect("first staging directory should be created");
+        let second = create_unique_staging_dir(&target, "snapshot")
+            .expect("second staging directory should be created");
+
+        assert_ne!(first, second);
+        for staging in [&first, &second] {
+            let metadata =
+                std::fs::symlink_metadata(staging).expect("staging directory should exist");
+            assert!(metadata.file_type().is_dir());
+            assert!(!is_link_or_reparse_point(&metadata));
+            assert_eq!(
+                staging.parent(),
+                Some(temp_dir.path()),
+                "staging must be a sibling of its target"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_staging_directory_creation_never_reuses_a_raced_entry() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let target = temp_dir.path().join("restore");
+        let staging =
+            stage_dir_path(&target, "restore-staging").expect("staging path should be planned");
+        std::fs::create_dir(&staging).expect("racer should create the planned entry");
+        std::fs::write(staging.join("foreign"), b"foreign").expect("foreign payload should write");
+
+        let err = create_staging_dir_exclusive(&staging)
+            .expect_err("create-exclusive must reject the raced entry");
+
+        assert!(matches!(
+            err,
+            TsinkError::IoWithPath { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(staging.join("foreign")).expect("foreign payload must survive"),
+            b"foreign"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn no_replace_rename_preserves_a_raced_destination() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let source = temp_dir.path().join("owned-staging");
+        let destination = temp_dir.path().join("raced-destination");
+        std::fs::create_dir(&source).expect("source should exist");
+        std::fs::write(source.join("owned"), b"owned").expect("owned payload should write");
+        std::fs::create_dir(&destination).expect("raced destination should exist");
+        std::fs::write(destination.join("foreign"), b"foreign")
+            .expect("foreign payload should write");
+
+        rename_path_noreplace(&source, &destination)
+            .expect_err("no-replace rename must reject the raced destination");
+
+        assert_eq!(
+            std::fs::read(source.join("owned")).expect("source must survive"),
+            b"owned"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("foreign")).expect("destination must survive"),
+            b"foreign"
         );
     }
 

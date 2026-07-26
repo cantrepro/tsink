@@ -8,8 +8,8 @@ use tempfile::TempDir;
 use tsink::{
     Aggregation, AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder, BatchWriteResult,
     DataPoint, Label, QueryBudget, QueryBudgetLimits, QueryExecution, QueryOptions,
-    QueryWorkLimits, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus, Storage,
-    StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement,
+    QueryWorkLimits, ResourceLimits, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus,
+    Storage, StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement,
     WriteBatchLimits, WriteMode, WriteRejectionCategory,
 };
 
@@ -904,7 +904,7 @@ struct CancellableReadStorage {
 impl CancellableReadStorage {
     fn new() -> Self {
         Self {
-            query_budget: QueryBudget::new(Default::default()).unwrap(),
+            query_budget: QueryBudget::new(ResourceLimits::test().query).unwrap(),
             select_calls: AtomicUsize::new(0),
             read_started: Notify::new(),
             read_finished: Notify::new(),
@@ -1048,8 +1048,13 @@ async fn dropped_read_futures_cancel_running_work_and_release_queued_bytes() -> 
     .expect("the canceled queued command must be drained and released");
 
     let query_snapshot = storage.query_budget.snapshot();
+    assert_eq!(query_snapshot.limits, ResourceLimits::test().query);
     assert_eq!(query_snapshot.active_queries, 0);
+    assert_eq!(query_snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(query_snapshot.queries_started_total, 1);
+    assert_eq!(query_snapshot.queries_completed_total, 1);
     assert_eq!(query_snapshot.cancellations_total, 1);
+    assert_eq!(query_snapshot.accounting_invariant_violations_total, 0);
     assert_eq!(storage.select_calls.load(Ordering::SeqCst), 1);
 
     let snapshot = async_storage.async_runtime_snapshot();

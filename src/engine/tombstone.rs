@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,13 @@ pub(crate) const TOMBSTONES_FILE_NAME: &str = "tombstones.json";
 const TOMBSTONES_FILE_VERSION: u16 = 1;
 const TOMBSTONE_STORE_VERSION: u16 = 2;
 const TOMBSTONE_STORE_SHARD_COUNT: usize = 256;
+/// Fixed fanout for the immutable query-visible remote tombstone overlay.
+///
+/// This intentionally matches the durable v2 store fanout. A refresh can therefore rebuild one
+/// logical shard incrementally while every unaffected shard remains shared with the previous
+/// snapshot. The fixed fanout also makes the terminal snapshot assembly and pointer swap
+/// independent of the number of tombstoned series.
+pub(crate) const LIVE_TOMBSTONE_SHARD_COUNT: usize = TOMBSTONE_STORE_SHARD_COUNT;
 const TOMBSTONE_STORE_MAGIC: &[u8; 8] = b"TSINKTM2";
 const TOMBSTONE_SHARD_MAGIC: &[u8; 8] = b"TSINKTS2";
 const TOMBSTONE_STORE_DIR_SUFFIX: &str = ".store";
@@ -28,7 +35,7 @@ const TOMBSTONE_TRANSACTION_HEADER_LEN: usize = 8 + 2 + 4;
 const TOMBSTONE_TRANSACTION_CHECKSUM_LEN: usize = 4;
 const MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOMBSTONE_SHARD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_TOMBSTONE_TRANSACTION_PATH_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_TOMBSTONE_TRANSACTION_PATH_BYTES: usize = 256 * 1024;
 const TOMBSTONE_TRANSACTION_ENCODE_ALLOCATOR_SLACK: usize = 16 * 1024;
 const TOMBSTONE_CLEANUP_ENTRY_PATH_BYTES: usize = MAX_TOMBSTONE_TRANSACTION_PATH_BYTES;
 const TOMBSTONE_CLEANUP_ENTRY_NAME_BYTES: usize = 4 * 1024;
@@ -130,7 +137,149 @@ pub(crate) struct TombstoneRange {
     pub(crate) end: i64,
 }
 
-pub(crate) type TombstoneMap = HashMap<SeriesId, Vec<TombstoneRange>>;
+/// Ordered query-visible and persistence staging map.
+///
+/// Recovery snapshot publication advances by `SeriesId` across bounded maintenance wakes. A
+/// `HashMap` iterator cannot be resumed after releasing the visibility fence without retaining a
+/// whole-map clone, so the ordered map is part of that bounded-work contract.
+pub(crate) type TombstoneMap = BTreeMap<SeriesId, Vec<TombstoneRange>>;
+
+/// Immutable, fixed-fanout overlay used by finite compute-only refresh.
+///
+/// The mutable `TombstoneMap` remains the durable local/base view. Remote refreshes publish one
+/// of these overlays by replacing a single `Arc`; readers union at most the one base vector and
+/// one overlay vector for the requested series.
+#[derive(Debug)]
+pub(crate) struct ImmutableTombstoneShard {
+    entries: TombstoneMap,
+    memory_usage_bytes: usize,
+}
+
+impl ImmutableTombstoneShard {
+    pub(crate) fn from_map_with_memory_usage(
+        entries: TombstoneMap,
+        memory_usage_bytes: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            entries,
+            memory_usage_bytes: memory_usage_bytes.saturating_add(Self::fixed_allocation_bytes()),
+        })
+    }
+
+    fn fixed_allocation_bytes() -> usize {
+        std::mem::size_of::<Self>().saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+    }
+
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes
+    }
+}
+
+impl std::ops::Deref for ImmutableTombstoneShard {
+    type Target = TombstoneMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImmutableTombstoneSnapshot {
+    shards: Box<[Arc<ImmutableTombstoneShard>]>,
+    entry_count: usize,
+    memory_usage_bytes: usize,
+    max_series_id: Option<SeriesId>,
+}
+
+impl ImmutableTombstoneSnapshot {
+    fn fixed_allocation_bytes() -> usize {
+        std::mem::size_of::<Self>()
+            // Arc strong/weak counters for the snapshot allocation.
+            .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+            // The boxed fixed-fanout table stores one Arc pointer per shard.
+            .saturating_add(
+                LIVE_TOMBSTONE_SHARD_COUNT
+                    .saturating_mul(std::mem::size_of::<Arc<ImmutableTombstoneShard>>()),
+            )
+    }
+
+    pub(crate) fn empty_memory_usage_bytes() -> usize {
+        Self::fixed_allocation_bytes().saturating_add(
+            LIVE_TOMBSTONE_SHARD_COUNT
+                .saturating_mul(ImmutableTombstoneShard::fixed_allocation_bytes()),
+        )
+    }
+
+    pub(crate) fn empty() -> Arc<Self> {
+        let shards = (0..LIVE_TOMBSTONE_SHARD_COUNT)
+            .map(|_| ImmutableTombstoneShard::from_map_with_memory_usage(TombstoneMap::new(), 0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Arc::new(Self {
+            shards,
+            entry_count: 0,
+            memory_usage_bytes: Self::empty_memory_usage_bytes(),
+            max_series_id: None,
+        })
+    }
+
+    pub(crate) fn shard_index(series_id: SeriesId) -> usize {
+        usize::try_from(series_id % LIVE_TOMBSTONE_SHARD_COUNT as u64)
+            .expect("fixed tombstone shard index fits usize")
+    }
+
+    pub(crate) fn from_shards(shards: Vec<Arc<ImmutableTombstoneShard>>) -> Self {
+        assert_eq!(
+            shards.len(),
+            LIVE_TOMBSTONE_SHARD_COUNT,
+            "immutable tombstone snapshots have fixed fanout"
+        );
+        let mut entry_count = 0usize;
+        let mut memory_usage_bytes = Self::fixed_allocation_bytes();
+        let mut max_series_id = None;
+        for shard in &shards {
+            entry_count = entry_count.saturating_add(shard.len());
+            memory_usage_bytes = memory_usage_bytes.saturating_add(shard.memory_usage_bytes());
+            max_series_id = max_series_id.max(shard.keys().next_back().copied());
+        }
+        Self {
+            shards: shards.into_boxed_slice(),
+            entry_count,
+            memory_usage_bytes,
+            max_series_id,
+        }
+    }
+
+    pub(crate) fn shard(&self, shard_index: usize) -> &Arc<ImmutableTombstoneShard> {
+        &self.shards[shard_index]
+    }
+
+    pub(crate) fn ranges(&self, series_id: SeriesId) -> Option<&[TombstoneRange]> {
+        self.shards[Self::shard_index(series_id)]
+            .get(&series_id)
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entry_count == 0
+    }
+
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes
+    }
+
+    pub(crate) fn max_series_id(&self) -> Option<SeriesId> {
+        self.max_series_id
+    }
+}
+
+/// Conservative retained allocation charged for each `BTreeMap` entry.
+///
+/// `std::collections::BTreeMap` does not expose node capacity. Charging one generously sized node
+/// per entry covers the least-dense legal tree plus allocator metadata without relying on private
+/// standard-library constants. The deliberately stable value also makes admission boundaries
+/// deterministic across allocator and compiler versions.
+pub(crate) const TOMBSTONE_BTREE_ENTRY_ALLOCATION_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TombstoneFileV1 {
@@ -318,7 +467,7 @@ pub(crate) enum TombstoneLaneRole {
 }
 
 impl TombstoneLaneRole {
-    fn is_shared_remote(self) -> bool {
+    pub(crate) fn is_shared_remote(self) -> bool {
         matches!(
             self,
             Self::HotNumeric
@@ -337,6 +486,26 @@ pub(crate) struct TombstoneLane {
     /// Configured root whose own aliasing is allowed; every derived component below it is not.
     pub(crate) namespace_root: PathBuf,
     pub(crate) manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteTombstoneManifestFingerprint {
+    pub(crate) exists: bool,
+    pub(crate) logical_bytes: u64,
+    pub(crate) xxh64: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum RemoteTombstoneManifestKind {
+    Missing,
+    Legacy,
+    Sharded(Vec<Option<String>>),
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteTombstoneManifestSnapshot {
+    pub(crate) fingerprint: RemoteTombstoneManifestFingerprint,
+    pub(crate) kind: RemoteTombstoneManifestKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +546,13 @@ pub(crate) enum TombstoneRecoveryOutcome {
     NoTransaction,
     RolledBackPrepared,
     RolledForwardCommitted,
+}
+
+pub(crate) struct PreparedCommittedTombstoneReload {
+    pub(crate) tombstones: TombstoneMap,
+    pub(crate) recovery_memory_upper_bound: usize,
+    pub(crate) work_items: usize,
+    pub(crate) work_bytes: u64,
 }
 
 impl TombstoneRecoveryOutcome {
@@ -883,6 +1059,131 @@ fn cleanup_tombstone_atomic_temps_before_recovery(
         )?;
     }
     Ok(())
+}
+
+fn preflight_recovery_namespace_directory(
+    directory: &Path,
+    item_limit: usize,
+    byte_limit: u64,
+    selected_items: &mut usize,
+    selected_bytes: &mut u64,
+) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: directory.to_path_buf(),
+                source,
+            })
+        }
+    };
+    if !metadata.file_type().is_dir()
+        || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "tombstone recovery namespace must be a directory and may not be link-like: {}",
+            directory.display()
+        )));
+    }
+    // The read-only preflight and the subsequent cleanup each open and enumerate this directory.
+    *selected_items = selected_items.saturating_add(2);
+    *selected_bytes = selected_bytes.saturating_add(8 * 1024);
+    if *selected_items > item_limit {
+        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "committed tombstone recovery namespace",
+            item_limit,
+            byte_limit,
+            selected_items: *selected_items,
+            selected_bytes: *selected_bytes,
+        });
+    }
+    if *selected_bytes > byte_limit {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "committed tombstone recovery namespace",
+            limit: byte_limit,
+            required: *selected_bytes,
+        });
+    }
+    let entries = std::fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let path_bytes = entry.path().as_os_str().as_encoded_bytes().len();
+        let entry_work_bytes = u64::try_from(path_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
+            .saturating_add(8 * 1024);
+        *selected_items = selected_items.saturating_add(2);
+        *selected_bytes = selected_bytes.saturating_add(entry_work_bytes);
+        if *selected_items > item_limit {
+            return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                operation: "committed tombstone recovery namespace",
+                item_limit,
+                byte_limit,
+                selected_items: *selected_items,
+                selected_bytes: *selected_bytes,
+            });
+        }
+        if *selected_bytes > byte_limit {
+            return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                operation: "committed tombstone recovery namespace",
+                limit: byte_limit,
+                required: *selected_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Read-only dependency-window preflight for the namespace enumeration that recovery repeats
+/// before its first temporary-file deletion or manifest mutation.
+pub(crate) fn preflight_tombstone_recovery_namespace_work(
+    data_path: &Path,
+    lanes: &[TombstoneLane],
+    item_limit: usize,
+    byte_limit: u64,
+    base_items: usize,
+    base_bytes: u64,
+) -> Result<(usize, u64)> {
+    let mut selected_items = base_items;
+    let mut selected_bytes = base_bytes;
+    preflight_recovery_namespace_directory(
+        &tombstone_transaction_dir(data_path),
+        item_limit,
+        byte_limit,
+        &mut selected_items,
+        &mut selected_bytes,
+    )?;
+    for lane in lanes {
+        let manifest_parent = lane.manifest_path.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "tombstone manifest has no parent: {}",
+                lane.manifest_path.display()
+            ))
+        })?;
+        preflight_recovery_namespace_directory(
+            manifest_parent,
+            item_limit,
+            byte_limit,
+            &mut selected_items,
+            &mut selected_bytes,
+        )?;
+        let shards_dir = tombstone_shards_dir(&lane.manifest_path);
+        preflight_recovery_namespace_directory(
+            &shards_dir,
+            item_limit,
+            byte_limit,
+            &mut selected_items,
+            &mut selected_bytes,
+        )?;
+    }
+    Ok((selected_items, selected_bytes))
 }
 
 pub(crate) fn validate_tombstone_lanes(lanes: &[TombstoneLane]) -> Result<()> {
@@ -1442,6 +1743,158 @@ pub(crate) fn merge_tombstone_range(ranges: &mut Vec<TombstoneRange>, new_range:
     *ranges = merged;
 }
 
+/// Unions two normalized tombstone-range vectors in linear time.
+///
+/// Durable shard and legacy-manifest decoders normalize every per-series vector before it reaches
+/// runtime publication. Keeping this operation batched avoids repeatedly sorting and reallocating a
+/// growing destination when a bounded remote refresh adopts a large shard.
+pub(crate) fn merge_normalized_tombstone_ranges(
+    ranges: &mut Vec<TombstoneRange>,
+    additional: &[TombstoneRange],
+) -> usize {
+    if additional.is_empty() {
+        return 0;
+    }
+    if ranges.is_empty() {
+        ranges.extend_from_slice(additional);
+        return additional.len();
+    }
+
+    debug_assert!(ranges
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+    debug_assert!(additional
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+
+    let retained = std::mem::take(ranges);
+    let mut left = retained.into_iter().peekable();
+    let mut right = additional.iter().copied().peekable();
+    let mut merged = Vec::<TombstoneRange>::with_capacity(left.len().saturating_add(right.len()));
+    let mut consumed = 0usize;
+
+    while left.peek().is_some() || right.peek().is_some() {
+        let next = match (left.peek(), right.peek()) {
+            (Some(left_range), Some(right_range))
+                if (left_range.start, left_range.end) <= (right_range.start, right_range.end) =>
+            {
+                left.next().expect("peeked left tombstone range")
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => {
+                right.next().expect("peeked right tombstone range")
+            }
+            (Some(_), None) => left.next().expect("peeked left tombstone range"),
+            (None, None) => unreachable!("loop requires at least one remaining range"),
+        };
+        consumed = consumed.saturating_add(1);
+        if let Some(last) = merged.last_mut() {
+            if last.end >= next.start {
+                last.end = last.end.max(next.end);
+                continue;
+            }
+        }
+        merged.push(next);
+    }
+
+    *ranges = merged;
+    consumed
+}
+
+/// Returns the normalized union of two borrowed vectors with exactly one destination allocation.
+pub(crate) fn union_normalized_tombstone_ranges(
+    left: &[TombstoneRange],
+    right: &[TombstoneRange],
+) -> Vec<TombstoneRange> {
+    debug_assert!(left
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+    debug_assert!(right
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+
+    let mut left = left.iter().copied().peekable();
+    let mut right = right.iter().copied().peekable();
+    let mut merged = Vec::<TombstoneRange>::with_capacity(left.len().saturating_add(right.len()));
+    while left.peek().is_some() || right.peek().is_some() {
+        let next = match (left.peek(), right.peek()) {
+            (Some(left_range), Some(right_range))
+                if (left_range.start, left_range.end) <= (right_range.start, right_range.end) =>
+            {
+                left.next().expect("peeked left tombstone range")
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => {
+                right.next().expect("peeked right tombstone range")
+            }
+            (Some(_), None) => left.next().expect("peeked left tombstone range"),
+            (None, None) => unreachable!("loop requires at least one remaining range"),
+        };
+        if let Some(last) = merged.last_mut() {
+            if last.end >= next.start {
+                last.end = last.end.max(next.end);
+                continue;
+            }
+        }
+        merged.push(next);
+    }
+    merged
+}
+
+/// Owned counterpart used while a finite refresh drains its private decoded fragments.
+///
+/// Taking ownership avoids retaining or cloning the decoded per-series vector while the new
+/// immutable shard is assembled. The destination still allocates one admitted linear merge
+/// buffer, and both inputs are consumed into it.
+pub(crate) fn merge_normalized_tombstone_ranges_owned(
+    ranges: &mut Vec<TombstoneRange>,
+    additional: Vec<TombstoneRange>,
+) -> usize {
+    if additional.is_empty() {
+        return 0;
+    }
+    if ranges.is_empty() {
+        let consumed = additional.len();
+        *ranges = additional;
+        return consumed;
+    }
+
+    debug_assert!(ranges
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+    debug_assert!(additional
+        .windows(2)
+        .all(|pair| pair[0].start < pair[0].end && pair[0].end < pair[1].start));
+
+    let retained = std::mem::take(ranges);
+    let consumed = retained.len().saturating_add(additional.len());
+    let mut left = retained.into_iter().peekable();
+    let mut right = additional.into_iter().peekable();
+    let mut merged = Vec::<TombstoneRange>::with_capacity(consumed);
+
+    while left.peek().is_some() || right.peek().is_some() {
+        let next = match (left.peek(), right.peek()) {
+            (Some(left_range), Some(right_range))
+                if (left_range.start, left_range.end) <= (right_range.start, right_range.end) =>
+            {
+                left.next().expect("peeked left tombstone range")
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => {
+                right.next().expect("peeked right tombstone range")
+            }
+            (Some(_), None) => left.next().expect("peeked left tombstone range"),
+            (None, None) => unreachable!("loop requires at least one remaining range"),
+        };
+        if let Some(last) = merged.last_mut() {
+            if last.end >= next.start {
+                last.end = last.end.max(next.end);
+                continue;
+            }
+        }
+        merged.push(next);
+    }
+    *ranges = merged;
+    consumed
+}
+
 pub(crate) fn timestamp_is_tombstoned(timestamp: i64, ranges: &[TombstoneRange]) -> bool {
     let idx = ranges.partition_point(|range| range.start <= timestamp);
     if idx == 0 {
@@ -1467,6 +1920,14 @@ pub(crate) fn interval_fully_tombstoned(
     ranges[idx - 1].end > end_inclusive
 }
 
+pub(crate) fn exclusive_interval_fully_tombstoned(
+    start: i64,
+    end: i64,
+    ranges: &[TombstoneRange],
+) -> bool {
+    start < end && interval_fully_tombstoned(start, end.saturating_sub(1), ranges)
+}
+
 fn normalize_tombstone_map(map: &mut TombstoneMap) -> Result<()> {
     for ranges in map.values_mut() {
         *ranges = normalize_tombstone_ranges(ranges.iter().copied())?;
@@ -1478,14 +1939,26 @@ fn normalize_tombstone_map(map: &mut TombstoneMap) -> Result<()> {
 fn normalize_tombstone_ranges(
     ranges: impl IntoIterator<Item = TombstoneRange>,
 ) -> Result<Vec<TombstoneRange>> {
-    let mut normalized = Vec::new();
+    let mut ordered = Vec::new();
     for range in ranges {
         if range.start >= range.end {
             return Err(TsinkError::DataCorruption(
                 "invalid tombstone range: start must be strictly less than end".to_string(),
             ));
         }
-        merge_tombstone_range(&mut normalized, range);
+        ordered.push(range);
+    }
+    ordered.sort_by_key(|range| (range.start, range.end));
+
+    let mut normalized = Vec::<TombstoneRange>::with_capacity(ordered.len());
+    for range in ordered {
+        if let Some(last) = normalized.last_mut() {
+            if last.end >= range.start {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        normalized.push(range);
     }
     Ok(normalized)
 }
@@ -1710,8 +2183,7 @@ impl TombstoneShardPreflight {
         encoded_bytes
             .saturating_add(
                 self.entry_count
-                    .saturating_mul(std::mem::size_of::<(SeriesId, Vec<TombstoneRange>)>())
-                    .saturating_mul(4),
+                    .saturating_mul(TOMBSTONE_BTREE_ENTRY_ALLOCATION_BYTES),
             )
             .saturating_add(
                 self.total_range_count
@@ -1775,6 +2247,11 @@ fn preflight_shard_bytes(
             "tombstone range count",
         )?)
         .map_err(|_| TsinkError::DataCorruption("unsupported tombstone range count".to_string()))?;
+        if range_count == 0 {
+            return Err(TsinkError::DataCorruption(format!(
+                "tombstone series {series_id} has no ranges"
+            )));
+        }
         if range_count > encoded.len().saturating_sub(position) / 16 {
             return Err(TsinkError::DataCorruption(format!(
                 "tombstone range count {range_count} exceeds its encoded bytes"
@@ -1813,9 +2290,6 @@ fn decode_shard_map(bytes: &[u8], shard_index: usize) -> Result<TombstoneMap> {
     let encoded = &bytes[TOMBSTONE_SHARD_MAGIC.len()..];
     let mut position = 2 + 8;
     let mut tombstones = TombstoneMap::new();
-    tombstones.try_reserve(preflight.entry_count).map_err(|_| {
-        TsinkError::Other("unable to allocate bounded tombstone shard map".to_string())
-    })?;
     for _ in 0..preflight.entry_count {
         let series_id = read_bincode_u64(encoded, &mut position, "tombstone series id")?;
         let range_count = usize::try_from(read_bincode_u64(
@@ -1847,9 +2321,9 @@ fn empty_store_manifest() -> TombstoneStoreManifestV2 {
     }
 }
 
-fn shard_entries_from_map(mut map: TombstoneMap) -> Vec<TombstoneSeriesEntryV1> {
+fn shard_entries_from_map(map: TombstoneMap) -> Vec<TombstoneSeriesEntryV1> {
     let mut entries = map
-        .drain()
+        .into_iter()
         .map(|(series_id, ranges)| TombstoneSeriesEntryV1 { series_id, ranges })
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.series_id);
@@ -1907,8 +2381,8 @@ fn read_shard_map_with_memory_admission(
 }
 
 fn tombstone_map_allocation_bytes(map: &TombstoneMap) -> usize {
-    map.capacity()
-        .saturating_mul(std::mem::size_of::<(SeriesId, Vec<TombstoneRange>)>())
+    map.len()
+        .saturating_mul(TOMBSTONE_BTREE_ENTRY_ALLOCATION_BYTES)
         .saturating_add(map.values().fold(0usize, |total, ranges| {
             total.saturating_add(
                 ranges
@@ -2255,6 +2729,162 @@ fn load_legacy_tombstones_from_bytes(bytes: &[u8]) -> Result<TombstoneMap> {
     Ok(tombstones)
 }
 
+pub(crate) fn remote_tombstone_manifest_file_len(lane: &TombstoneLane) -> Result<Option<usize>> {
+    validate_tombstone_lane_namespace(lane)?;
+    let metadata = match std::fs::symlink_metadata(&lane.manifest_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: lane.manifest_path.clone(),
+                source,
+            })
+        }
+    };
+    if !metadata.file_type().is_file()
+        || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+        || metadata.len() > MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES as u64
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "remote tombstone manifest has invalid type or length: {}",
+            lane.manifest_path.display()
+        )));
+    }
+    usize::try_from(metadata.len()).map(Some).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "remote tombstone manifest size is unsupported: {}",
+            lane.manifest_path.display()
+        ))
+    })
+}
+
+fn remote_tombstone_manifest_fingerprint(
+    bytes: Option<&[u8]>,
+) -> RemoteTombstoneManifestFingerprint {
+    match bytes {
+        Some(bytes) => RemoteTombstoneManifestFingerprint {
+            exists: true,
+            logical_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            xxh64: xxhash_rust::xxh64::xxh64(bytes, 0),
+        },
+        None => RemoteTombstoneManifestFingerprint {
+            exists: false,
+            logical_bytes: 0,
+            xxh64: 0,
+        },
+    }
+}
+
+fn read_remote_tombstone_manifest_bytes(
+    lane: &TombstoneLane,
+    expected_len: Option<usize>,
+) -> Result<Option<Vec<u8>>> {
+    validate_tombstone_lane_namespace(lane)?;
+    match expected_len {
+        Some(expected_len) => read_required_regular_file_bounded_exact(
+            &lane.manifest_path,
+            MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES,
+            expected_len,
+        )
+        .map(Some),
+        None => match std::fs::symlink_metadata(&lane.manifest_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(_) => Err(TsinkError::DataCorruption(format!(
+                "remote tombstone manifest appeared after its missing-file probe: {}",
+                lane.manifest_path.display()
+            ))),
+            Err(source) => Err(TsinkError::IoWithPath {
+                path: lane.manifest_path.clone(),
+                source,
+            }),
+        },
+    }
+}
+
+pub(crate) fn load_remote_tombstone_manifest_snapshot(
+    lane: &TombstoneLane,
+    expected_len: Option<usize>,
+) -> Result<RemoteTombstoneManifestSnapshot> {
+    let bytes = read_remote_tombstone_manifest_bytes(lane, expected_len)?;
+    let fingerprint = remote_tombstone_manifest_fingerprint(bytes.as_deref());
+    let kind = match bytes {
+        None => RemoteTombstoneManifestKind::Missing,
+        Some(bytes) => match load_store_manifest_from_bytes(&bytes)? {
+            Some(manifest) => RemoteTombstoneManifestKind::Sharded(manifest.shards),
+            // Finite remote refresh must not decode or repartition a complete legacy map in one
+            // maintenance item. The caller rejects this compatibility format and asks operators
+            // to migrate it through the explicit unlimited/startup path.
+            None => RemoteTombstoneManifestKind::Legacy,
+        },
+    };
+    Ok(RemoteTombstoneManifestSnapshot { fingerprint, kind })
+}
+
+pub(crate) fn revalidate_remote_tombstone_manifest(
+    lane: &TombstoneLane,
+    expected_len: Option<usize>,
+) -> Result<RemoteTombstoneManifestFingerprint> {
+    let bytes = read_remote_tombstone_manifest_bytes(lane, expected_len)?;
+    Ok(remote_tombstone_manifest_fingerprint(bytes.as_deref()))
+}
+
+pub(crate) fn remote_tombstone_shard_file_len(
+    lane: &TombstoneLane,
+    shard_index: usize,
+    file_name: &str,
+) -> Result<usize> {
+    validate_tombstone_lane_namespace(lane)?;
+    validate_tombstone_shard_file_name(shard_index, file_name)?;
+    let shard_path = tombstone_shards_dir(&lane.manifest_path).join(file_name);
+    validate_tombstone_shard_path(&shard_path)?;
+    let metadata =
+        std::fs::symlink_metadata(&shard_path).map_err(|source| TsinkError::IoWithPath {
+            path: shard_path.clone(),
+            source,
+        })?;
+    if !metadata.file_type().is_file()
+        || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+        || metadata.len() > MAX_TOMBSTONE_SHARD_BYTES as u64
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "referenced remote tombstone shard has invalid type or length: {}",
+            shard_path.display()
+        )));
+    }
+    usize::try_from(metadata.len()).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "referenced remote tombstone shard length is unsupported: {}",
+            shard_path.display()
+        ))
+    })
+}
+
+pub(crate) fn load_remote_tombstone_shard_with_memory_admission(
+    lane: &TombstoneLane,
+    shard_index: usize,
+    file_name: &str,
+    expected_len: usize,
+    admit_memory: impl FnMut(usize) -> Result<()>,
+) -> Result<TombstoneMap> {
+    validate_tombstone_shard_file_name(shard_index, file_name)?;
+    let shard_path = tombstone_shards_dir(&lane.manifest_path).join(file_name);
+    validate_tombstone_shard_path(&shard_path)?;
+    let mut admit_memory = admit_memory;
+    admit_memory(expected_len.saturating_mul(10).saturating_add(4096))?;
+    let bytes = read_required_regular_file_bounded_exact(
+        &shard_path,
+        MAX_TOMBSTONE_SHARD_BYTES,
+        expected_len,
+    )?;
+    let preflight = preflight_shard_bytes(&bytes, Some(shard_index))?;
+    admit_memory(
+        preflight
+            .decoded_memory_upper_bound(bytes.len())
+            .saturating_mul(2),
+    )?;
+    decode_shard_map(&bytes, shard_index)
+}
+
 pub(crate) fn load_tombstones_with_memory_admission(
     path: &Path,
     mut admit_memory: impl FnMut(usize) -> Result<()>,
@@ -2318,7 +2948,7 @@ pub(crate) fn load_tombstones(path: &Path) -> Result<TombstoneMap> {
 
 /// Conservative peak for one lane while its encoded files, decoded map, and normalization
 /// scratch coexist. V2 files have fixed-width framing, so eight encoded bytes per retained byte
-/// covers the hash-map/vector allocation model; legacy JSON uses a wider factor for punctuation-
+/// covers the ordered-map/vector allocation model; legacy JSON uses a wider factor for punctuation-
 /// dense arrays. Callers combine this with the already-accounted live tombstone map.
 pub(crate) fn tombstone_manifest_probe_memory_upper_bound(path: &Path) -> Result<usize> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -2374,16 +3004,7 @@ pub(crate) fn tombstone_transaction_staging_memory_upper_bound_with_admission(
     updates: &TombstoneMap,
     mut admit_memory: impl FnMut(usize) -> Result<()>,
 ) -> Result<usize> {
-    let update_map_bytes = updates
-        .capacity()
-        .saturating_mul(std::mem::size_of::<(SeriesId, Vec<TombstoneRange>)>())
-        .saturating_add(updates.values().fold(0usize, |total, ranges| {
-            total.saturating_add(
-                ranges
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<TombstoneRange>()),
-            )
-        }));
+    let update_map_bytes = tombstone_map_allocation_bytes(updates);
     let mut total = update_map_bytes.saturating_mul(4).saturating_add(16 * 1024);
     admit_memory(total)?;
     if lanes.is_empty() {
@@ -2483,7 +3104,21 @@ pub(crate) fn tombstone_transaction_staging_memory_upper_bound_with_admission(
 }
 
 #[cfg(test)]
-pub(crate) fn persist_tombstones(path: &Path, tombstones: &TombstoneMap) -> Result<()> {
+fn ordered_tombstone_map<'a, M>(map: &'a M) -> TombstoneMap
+where
+    &'a M: IntoIterator<Item = (&'a SeriesId, &'a Vec<TombstoneRange>)>,
+{
+    map.into_iter()
+        .map(|(&series_id, ranges)| (series_id, ranges.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn persist_tombstones<'a, M>(path: &Path, tombstones: &'a M) -> Result<()>
+where
+    &'a M: IntoIterator<Item = (&'a SeriesId, &'a Vec<TombstoneRange>)>,
+{
+    let tombstones = ordered_tombstone_map(tombstones);
     let data_path = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -2493,7 +3128,7 @@ pub(crate) fn persist_tombstones(path: &Path, tombstones: &TombstoneMap) -> Resu
         namespace_root: data_path.clone(),
         manifest_path: path.to_path_buf(),
     }];
-    persist_tombstone_snapshot_transactionally(&data_path, &lanes, tombstones, None)
+    persist_tombstone_snapshot_transactionally(&data_path, &lanes, &tombstones, None)
         .map_err(TombstonePersistenceError::into_tsink_error)
 }
 
@@ -3569,6 +4204,214 @@ fn tombstone_recovery_memory_upper_bound(
     ))
 }
 
+/// Preloads the complete authoritative map named by a durable `Committing` coordinator.
+///
+/// This is intentionally read-only. Callers retain the returned map and its reservation while
+/// rolling the coordinator forward, so no manifest mutation can expose a committed candidate
+/// whose live in-memory visibility can still fail allocation or shard I/O afterward.
+pub(crate) fn prepare_committed_tombstone_reload_with_memory_admission(
+    data_path: &Path,
+    lanes: &[TombstoneLane],
+    item_limit: usize,
+    byte_limit: u64,
+    base_work_bytes: u64,
+    mut admit_memory: impl FnMut(usize) -> Result<()>,
+) -> Result<Option<PreparedCommittedTombstoneReload>> {
+    let data_path = resolve_trusted_namespace_root(data_path)?;
+    let lanes = normalize_tombstone_lanes(lanes)?;
+    let data_path = data_path.as_path();
+    let lanes = lanes.as_slice();
+    validate_tombstone_lanes(lanes)?;
+    validate_tombstone_coordinator_namespace(data_path)?;
+
+    let coordinator_path = tombstone_transaction_path(data_path);
+    let coordinator_metadata = match std::fs::symlink_metadata(&coordinator_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: coordinator_path,
+                source,
+            })
+        }
+    };
+    if !coordinator_metadata.file_type().is_file()
+        || crate::engine::fs_utils::is_link_or_reparse_point(&coordinator_metadata)
+        || coordinator_metadata.len() > MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES as u64
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "tombstone transaction coordinator has invalid type or length: {}",
+            coordinator_path.display()
+        )));
+    }
+    let encoded_record_bytes = usize::try_from(coordinator_metadata.len()).map_err(|_| {
+        TsinkError::DataCorruption(
+            "tombstone transaction coordinator length is unsupported".to_string(),
+        )
+    })?;
+    let record_decode_peak = encoded_record_bytes
+        .saturating_mul(8)
+        .saturating_add(16 * 1024);
+    admit_memory(record_decode_peak)?;
+    let encoded_record = read_required_regular_file_bounded_exact(
+        &coordinator_path,
+        MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES,
+        encoded_record_bytes,
+    )?;
+    let record = decode_tombstone_transaction_record(&encoded_record)?;
+    let recovery_memory_upper_bound =
+        tombstone_recovery_memory_upper_bound(&record, encoded_record_bytes)?;
+    admit_memory(recovery_memory_upper_bound)?;
+    validate_transaction_record_against_lanes(&record, lanes)?;
+    if record.phase != TombstoneTransactionPhase::Committing {
+        return Ok(None);
+    }
+
+    // This helper preloads the candidate and then the caller runs the coordinator recovery while
+    // retaining that map. Bound cumulative finite-pass work, not only the largest live buffer:
+    // coordinator decoding occurs in both phases and recovery inspects its recorded manifests.
+    let mut work_bytes = base_work_bytes.saturating_add(
+        u64::try_from(
+            record_decode_peak
+                .saturating_mul(2)
+                .saturating_add(recovery_memory_upper_bound),
+        )
+        .unwrap_or(u64::MAX),
+    );
+    if work_bytes > byte_limit {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "committed tombstone reload",
+            limit: byte_limit,
+            required: work_bytes,
+        });
+    }
+
+    let mut merged = TombstoneMap::new();
+    // Count both coordinator reads, both candidate-shard inspections, and the fixed per-lane
+    // manifest/durability operations before opening the first payload. Series entries and ranges
+    // are added from each bounded shard preflight below; namespace enumeration is preflighted by
+    // the caller against the same totals before recovery mutates anything.
+    let candidate_shard_count = record
+        .lanes
+        .iter()
+        .try_fold(0usize, |total, lane| {
+            total.checked_add(lane.candidate_shards.len())
+        })
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(
+                "committed tombstone reload work-item count overflow".to_string(),
+            )
+        })?;
+    let mut work_items = 2usize
+        .saturating_add(candidate_shard_count.saturating_mul(2))
+        .saturating_add(record.lanes.len().saturating_mul(4));
+    if work_items > item_limit {
+        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "committed tombstone reload",
+            item_limit,
+            byte_limit,
+            selected_items: work_items,
+            selected_bytes: work_bytes,
+        });
+    }
+    for (lane, record_lane) in lanes.iter().zip(&record.lanes) {
+        for shard in &record_lane.candidate_shards {
+            let shard_index = usize::from(shard.shard_index);
+            let expected_len = usize::try_from(shard.logical_bytes).map_err(|_| {
+                TsinkError::DataCorruption(format!(
+                    "candidate tombstone shard length is unsupported: {}",
+                    shard.file_name
+                ))
+            })?;
+            let shard_work_bytes = u64::try_from(expected_len)
+                .unwrap_or(u64::MAX)
+                // One decoded preload plus the recovery phase's second digest read.
+                .saturating_mul(65)
+                .saturating_add(8 * 1024);
+            work_bytes = work_bytes.saturating_add(shard_work_bytes);
+            if work_bytes > byte_limit {
+                return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                    operation: "committed tombstone reload",
+                    limit: byte_limit,
+                    required: work_bytes,
+                });
+            }
+            let shard_path = tombstone_shards_dir(&lane.manifest_path).join(&shard.file_name);
+            validate_tombstone_shard_path(&shard_path)?;
+            let merged_bytes = tombstone_map_allocation_bytes(&merged);
+            admit_memory(
+                recovery_memory_upper_bound
+                    .saturating_add(merged_bytes)
+                    .saturating_add(expected_len.saturating_mul(64))
+                    .saturating_add(4096),
+            )?;
+            let bytes = read_required_regular_file_bounded_exact(
+                &shard_path,
+                MAX_TOMBSTONE_SHARD_BYTES,
+                expected_len,
+            )?;
+            if xxhash_rust::xxh64::xxh64(&bytes, 0) != shard.xxh64 {
+                return Err(TsinkError::DataCorruption(format!(
+                    "candidate tombstone shard digest mismatch: {}",
+                    shard_path.display()
+                )));
+            }
+            let preflight = preflight_shard_bytes(&bytes, Some(shard_index))?;
+            let shard_work_items = preflight
+                .entry_count
+                .checked_add(preflight.total_range_count)
+                .ok_or_else(|| {
+                    TsinkError::DataCorruption(
+                        "committed tombstone reload work-item count overflow".to_string(),
+                    )
+                })?;
+            work_items = work_items.checked_add(shard_work_items).ok_or_else(|| {
+                TsinkError::DataCorruption(
+                    "committed tombstone reload work-item count overflow".to_string(),
+                )
+            })?;
+            if work_items > item_limit {
+                return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                    operation: "committed tombstone reload",
+                    item_limit,
+                    byte_limit,
+                    selected_items: work_items,
+                    selected_bytes: work_bytes,
+                });
+            }
+            admit_memory(
+                recovery_memory_upper_bound
+                    .saturating_add(merged_bytes)
+                    .saturating_add(preflight.decoded_memory_upper_bound(bytes.len())),
+            )?;
+            let loaded = decode_shard_map(&bytes, shard_index)?;
+            drop(bytes);
+            let loaded_bytes = tombstone_map_allocation_bytes(&loaded);
+            admit_memory(
+                recovery_memory_upper_bound
+                    .saturating_add(merged_bytes.saturating_mul(2))
+                    .saturating_add(loaded_bytes.saturating_mul(2))
+                    .saturating_add(4096),
+            )?;
+            for (series_id, ranges) in loaded {
+                for range in ranges {
+                    merge_tombstone_range(merged.entry(series_id).or_default(), range);
+                }
+            }
+            admit_memory(
+                recovery_memory_upper_bound.saturating_add(tombstone_map_allocation_bytes(&merged)),
+            )?;
+        }
+    }
+
+    Ok(Some(PreparedCommittedTombstoneReload {
+        tombstones: merged,
+        recovery_memory_upper_bound,
+        work_items,
+        work_bytes,
+    }))
+}
+
 pub(crate) fn recover_tombstone_transaction_with_memory_admission(
     data_path: &Path,
     lanes: &[TombstoneLane],
@@ -4234,17 +5077,23 @@ pub(crate) fn persist_tombstone_snapshot_transactionally_with_memory_admission(
 }
 
 #[cfg(test)]
-pub(crate) fn persist_tombstone_updates(path: &Path, updates: &TombstoneMap) -> Result<()> {
+pub(crate) fn persist_tombstone_updates<'a, M>(path: &Path, updates: &'a M) -> Result<()>
+where
+    &'a M: IntoIterator<Item = (&'a SeriesId, &'a Vec<TombstoneRange>)>,
+{
     persist_tombstone_updates_with_disk_budget(path, updates, None)
 }
 
 #[cfg(test)]
-pub(crate) fn persist_tombstone_updates_with_disk_budget(
+pub(crate) fn persist_tombstone_updates_with_disk_budget<'a, M>(
     path: &Path,
-    updates: &TombstoneMap,
+    updates: &'a M,
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-) -> Result<()> {
-    let mut normalized_updates = updates.clone();
+) -> Result<()>
+where
+    &'a M: IntoIterator<Item = (&'a SeriesId, &'a Vec<TombstoneRange>)>,
+{
+    let mut normalized_updates = ordered_tombstone_map(updates);
     normalize_tombstone_map(&mut normalized_updates)?;
     let data_path = local_disk_budget
         .map(|budget| budget.root().to_path_buf())
@@ -5085,7 +5934,7 @@ mod tests {
         );
         assert_eq!(
             load_tombstones(&path).unwrap(),
-            HashMap::from([
+            TombstoneMap::from([
                 (1, vec![TombstoneRange { start: 10, end: 20 }]),
                 (2, vec![TombstoneRange { start: 30, end: 40 }]),
             ])

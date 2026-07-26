@@ -561,6 +561,7 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
 
     let reopened = StorageBuilder::new()
         .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
         .with_wal_enabled(false)
         .with_memory_limit(1_000_000)
         .with_current_time_override_for_tests(0)
@@ -590,6 +591,7 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
     let tightened_budget = 1;
     let startup_error = match StorageBuilder::new()
         .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
         .with_wal_enabled(false)
         .with_memory_limit(tightened_budget)
         .with_current_time_override_for_tests(0)
@@ -606,6 +608,7 @@ fn restart_memory_reconciliation_counts_persisted_registry_and_index_state() {
 
     let verified = StorageBuilder::new()
         .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
         .with_wal_enabled(false)
         .with_memory_limit(1_000_000)
         .with_current_time_override_for_tests(0)
@@ -659,8 +662,10 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
 
     let baseline = StorageBuilder::new()
         .with_data_path(temp_dir.path())
+        .with_chunk_points(1)
         .with_wal_enabled(false)
         .with_memory_limit(1_000_000)
+        .with_background_threads_enabled_for_tests(false)
         .with_current_time_override_for_tests(0)
         .build()
         .unwrap();
@@ -676,9 +681,11 @@ fn restart_query_budget_counts_persisted_mmap_and_rejects_new_writes() {
     let reopened = loop {
         match StorageBuilder::new()
             .with_data_path(temp_dir.path())
+            .with_chunk_points(1)
             .with_wal_enabled(false)
             .with_memory_limit(admitted_budget)
             .with_write_timeout(Duration::ZERO)
+            .with_background_threads_enabled_for_tests(false)
             .with_current_time_override_for_tests(0)
             .build()
         {

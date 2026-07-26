@@ -18,7 +18,7 @@ Sections are ordered from the highest-leverage tunables (memory, write pipeline)
 8. [Query performance](#8-query-performance)
 9. [Rollups for read-heavy workloads](#9-rollups-for-read-heavy-workloads)
 10. [Server-level concurrency limits](#10-server-level-concurrency-limits)
-11. [Cgroup-aware scheduling](#11-cgroup-aware-scheduling)
+11. [Cgroup-aware fallback sizing](#11-cgroup-aware-fallback-sizing)
 12. [Monitoring performance](#12-monitoring-performance)
 13. [Quick-reference table](#13-quick-reference-table)
 
@@ -87,11 +87,12 @@ The budget charges the following modeled categories:
 | Persisted chunk refs and timestamp search indexes | `tsink_memory_persisted_index_bytes` |
 | mmap-mapped segment payloads | `tsink_memory_persisted_mmap_bytes` |
 | Tombstone state | `tsink_memory_tombstone_bytes` |
+| Finite compute-only catalog reads and read-write catalog publication | `tsink_memory_remote_catalog_staging_bytes` |
 
 `tsink_memory_persisted_mmap_bytes` is virtual mapped length, not resident pages. Query working
 sets, decompression buffers, pending write/WAL staging, WAL buffers and replay, rollup and remote
-refresh staging, thread stacks, allocator/runtime overhead, and host adapters remain excluded and
-unmeasured. `tsink_memory_excluded_bytes_known` is therefore `0`; do not use
+catalog application/writer staging, thread stacks, allocator/runtime overhead, and host adapters
+remain excluded and unmeasured. `tsink_memory_excluded_bytes_known` is therefore `0`; do not use
 `tsink_memory_excluded_bytes` as a complete total.
 
 ### Backpressure behaviour
@@ -128,7 +129,8 @@ let storage = StorageBuilder::new()
 tsink-server --max-writers 8
 ```
 
-The default is the cgroup-visible CPU count (see [cgroup-aware scheduling](#11-cgroup-aware-scheduling)).
+The `Embedded` profile defaults to 4 concurrent writers and the server's `Server` profile defaults
+to 16. An explicit `with_max_writers(0)` selects the cgroup-aware fallback described below.
 
 ### Tuning guidance
 
@@ -371,7 +373,6 @@ The tsink-server adds an HTTP-layer admission tier on top of the engine-level `m
 | `TSINK_SERVER_WRITE_RESOURCE_ACQUIRE_TIMEOUT_MS` | `25` | ms to wait for a write slot before returning 429 |
 | `TSINK_SERVER_READ_MAX_INFLIGHT_REQUESTS` | `64` | Max concurrent read HTTP requests |
 | `TSINK_SERVER_READ_MAX_INFLIGHT_QUERIES` | `128` | Max total in-flight query slots |
-| `TSINK_SERVER_READ_MAX_INFLIGHT_ROWS` | *(unlimited)* | Optionally cap total rows returned across concurrent reads |
 
 ### Tuning for high write throughput
 
@@ -395,15 +396,18 @@ export TSINK_SERVER_READ_RESOURCE_ACQUIRE_TIMEOUT_MS=200
 
 ---
 
-## 11. Cgroup-aware scheduling
+## 11. Cgroup-aware fallback sizing
 
-tsink reads container CPU and memory limits from the cgroup v2 interface (`/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max`) at startup and uses those values to size the default worker pools.
+tsink can read container CPU and memory limits from the cgroup v2 interface
+(`/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max`). Standard resource profiles use their
+documented finite worker counts instead of changing shape with the host.
 
 Internally:
 
 - `available_cpus()` returns the smaller of the cgroup CPU quota (rounded up) and the host CPU count.
-- `max_writers` defaults to `available_cpus()`.
-- The async storage read worker pool also defaults to `available_cpus()`.
+- `with_max_writers(0)` selects the cgroup-aware worker count explicitly.
+- `ExpertUnlimited` retains the legacy cgroup-aware writer fallback. Standard profiles keep their
+  fixed writer and async-reader counts unless overridden.
 
 ### Overriding the detected CPU count
 
@@ -413,11 +417,17 @@ If the autodetection is wrong or you want to pin the worker count regardless of 
 export TSINK_MAX_CPUS=4
 ```
 
-This overrides `available_cpus()` globally. All worker pools that default to CPU count will respect this override.
+This overrides `available_cpus()` globally. Only controls that explicitly select the
+cgroup-derived fallback respect it; it does not rewrite a standard profile's finite worker counts.
 
 ### Memory limit awareness
 
-The cgroup memory limit is exposed through `cgroup::get_memory_limit()` but is not currently applied automatically as the storage memory budget — you must set `--memory-limit` or `with_memory_limit()` explicitly. A reasonable starting point is 60–70 % of the container memory limit:
+The cgroup memory limit is exposed through `cgroup::get_memory_limit()` but is not applied
+automatically to the storage memory budget. `Embedded` starts at a 512 MiB modeled-memory limit and
+`Server` at 2 GiB; use `--memory-limit` or `with_memory_limit()` when the container requires a
+different envelope. A reasonable calibration starting point is 60–70 % of the container memory
+limit, while remembering that this limit covers the documented modeled scope rather than process
+RSS:
 
 ```bash
 # cgroup limit = 4 GiB → use 2.5 GiB for tsink data

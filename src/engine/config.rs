@@ -208,16 +208,9 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
             maintenance_max_bytes_per_pass: builder.maintenance_max_bytes_per_pass(),
             background_threads_enabled: {
                 let enabled = has_data_path || needs_compute_only_refresh_worker;
-                #[cfg(test)]
-                {
-                    builder
-                        .background_threads_enabled_override_for_tests()
-                        .unwrap_or(enabled)
-                }
-                #[cfg(not(test))]
-                {
-                    enabled
-                }
+                builder
+                    .background_threads_enabled_override()
+                    .unwrap_or(enabled)
             },
             background_fail_fast: builder.background_fail_fast(),
             metadata_shard_count: builder.metadata_shard_count().filter(|count| *count > 0),

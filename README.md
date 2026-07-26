@@ -21,8 +21,10 @@ The current Rust crate provides:
 - labeled metric storage backed by a write-ahead log and persisted segments;
 - direct reads and an embedded PromQL parser and evaluator;
 - write acknowledgements that distinguish volatile, WAL-appended, and durable results;
-- configurable memory, cardinality, WAL, retention, and concurrency controls;
-- snapshots and native Python bindings.
+- finite resource profiles plus configurable memory, disk, cardinality, query, and concurrency
+  controls;
+- snapshots, bounded offline data-directory inspection, explicit Unix destination-only full-WAL-
+  reset salvage for narrowly supported damage, and native Python bindings.
 
 ## Embedded Rust quick start
 
@@ -39,16 +41,13 @@ Then open a local data directory, write a metric, and query it in-process:
 
 ```rust
 use tsink::promql::Engine;
-use tsink::{DataPoint, Label, Row, StorageBuilder, TimestampPrecision};
+use tsink::{DataPoint, Label, ResourceProfile, Row, StorageBuilder, TimestampPrecision};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::Embedded)
         .with_data_path("./tsink-data")
         .with_timestamp_precision(TimestampPrecision::Milliseconds)
-        // Today's builder exposes individual limits; set the ones your host requires.
-        .with_memory_limit(64 * 1024 * 1024)
-        .with_cardinality_limit(50_000)
-        .with_wal_size_limit(64 * 1024 * 1024)
         .build()?;
 
     let timestamp = 1_700_000_000_000_i64;
@@ -84,8 +83,10 @@ tsink is aimed at applications where a separate TSDB would be disproportionate:
 - Rust or Python applications that need direct metric queries or PromQL;
 - protocol integration tests that need a small local metrics backend.
 
-The intended first adoption beachhead is integration testing, but the dedicated
-deterministic test fixture described below is still roadmap work.
+The intended first adoption beachhead is integration testing. The foundational
+`tsink-test` crate now provides isolated in-process storage and direct PromQL helpers;
+protocol endpoints, a manual clock, and deterministic maintenance controls remain
+roadmap work.
 
 ## Maturity and compatibility
 
@@ -95,22 +96,46 @@ paths you depend on and pin versions. In particular:
 | Area | Current status |
 |---|---|
 | Resource bounds | Finite `Test`, `Embedded`, `Edge`, and `Server` profiles, deterministic sparse overrides, and [versioned effective-limit inspection](docs/resource-limits.md) are shipped. The embedded core defaults to `Embedded`, the server defaults to `Server`, and legacy unbounded storage/query behavior requires explicit `ExpertUnlimited`. Profile constants remain provisional pending the final clean measurement matrix, and modeled memory is not a hard process-RSS envelope. |
-| Test support | A dedicated `tsink-test` crate, public manual clock, and deterministic maintenance loop are **not shipped**. |
+| Test support | The initial `tsink-test` crate ships temporary, in-memory, and caller-owned persistent fixtures; canonical atomic writes; focused metric, sequence, classic-histogram, and native-histogram data helpers; an optional real protobuf/Snappy Prometheus remote-write payload builder; explicit-time direct PromQL and bounded error-returning assertions; same-directory restart; explicit close; and bounded diagnostics. Protocol listeners, a public manual clock, and deterministic maintenance controls are **not shipped**. |
 | Prometheus and OTLP compatibility | Implementations exist, but generated capability matrices and a differential compatibility suite are **not shipped**. Do not interpret “PromQL” or a protocol endpoint as a claim of complete upstream compatibility. |
 | Write results | `write_batch` reports indexed structured outcomes with explicit `Atomic` or `BestEffort` policy; `insert_rows_with_result` retains the compatibility batch acknowledgement. Principal HTTP adapters expose acknowledgement and known partial/indeterminate effects. Server sidecars and experimental cluster routing are not one cross-component transaction. |
-| API and storage stability | Public APIs and on-disk upgrade guarantees are still being hardened for 1.0. Test recovery and upgrades against the versions you deploy. |
+| API and storage stability | Public APIs and on-disk upgrade guarantees are still being hardened for 1.0. Test recovery and upgrades against the versions you deploy; the current [format, inspection, and salvage contract](docs/storage-format.md) is intentionally narrow and fail-closed. |
 | Clustering | Cluster mode is **experimental**; it is not the primary product path or a production-readiness claim. |
 
-### Metrics integration tests without Docker — roadmap
+### In-process metrics tests without Docker
 
-The roadmap calls for a `tsink-test` library that can run protocol endpoints on
-ephemeral loopback ports, advance a manual clock, drive maintenance explicitly, and
-assert PromQL results without Docker or arbitrary sleeps. That package and API do not
-exist in the current workspace, so there is no testkit quick start to copy yet.
+The initial `tsink-test` crate exercises the same embedded engine directly and starts
+no daemon or listener:
 
-If this is your use case, the
+```rust
+use tsink::{DataPoint, Row, TimestampPrecision};
+use tsink_test::TsinkTestDb;
+
+let mut db = TsinkTestDb::builder()
+    .temporary()
+    .timestamp_precision(TimestampPrecision::Seconds)
+    .start()?;
+
+let write = db.write_atomic(&[
+    Row::new("requests_total", DataPoint::new(10, 3.0)),
+])?;
+assert_eq!(write.accepted, 1);
+
+let value = db.promql_instant("requests_total", 10).unwrap();
+assert_eq!(value.as_instant_vector().unwrap()[0].value, 3.0);
+db.close()?;
+# Ok::<(), tsink::TsinkError>(())
+```
+
+This foundational surface supports temporary, in-memory, and explicit persistent
+directories plus same-directory restart and direct error-returning PromQL assertions at explicit
+times. Focused constructors cover labels, series, arbitrary samples, gauges, counters, checked
+evenly spaced sequences, classic histograms, and first-class native histograms. Its optional
+`prometheus` feature produces endpoint-ready remote-write bodies through the shared real protobuf
+model without depending on the server binary. It does not yet expose remote-write/OTLP listeners,
+virtual time, or deterministic maintenance driving. Those remain Phase 4 work. The
 [design-partner guide](docs/design-partner-guide.md) explains how to record the
-constraints that should shape it.
+constraints that should shape them.
 
 ## Optional server adapter
 

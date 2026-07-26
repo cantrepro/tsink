@@ -101,9 +101,13 @@ impl SeriesMetadataMerger {
     }
 
     pub fn insert(&mut self, series: MetricSeries) -> Result<(), MergeLimitError> {
+        self.insert_counted(series).map(|_| ())
+    }
+
+    pub fn insert_counted(&mut self, series: MetricSeries) -> Result<bool, MergeLimitError> {
         let identity = SeriesIdentity::from_series(&series);
         if self.merged.contains_key(&identity) {
-            return Ok(());
+            return Ok(false);
         }
 
         let next = self.merged.len().saturating_add(1);
@@ -114,7 +118,7 @@ impl SeriesMetadataMerger {
             });
         }
         self.merged.insert(identity, series);
-        Ok(())
+        Ok(true)
     }
 
     pub fn extend(
@@ -130,6 +134,13 @@ impl SeriesMetadataMerger {
     pub fn into_series(self) -> Vec<MetricSeries> {
         self.merged.into_values().collect()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeriesPointsMergeOutcome {
+    pub inserted_series: bool,
+    pub inserted_points: usize,
+    pub inserted_point_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -153,11 +164,23 @@ impl SeriesPointsMerger {
         series: &MetricSeries,
         points: impl IntoIterator<Item = DataPoint>,
     ) -> Result<(), MergeLimitError> {
-        let identity = self.ensure_series(series)?;
+        self.merge_series_points_counted(series, points).map(|_| ())
+    }
+
+    pub fn merge_series_points_counted(
+        &mut self,
+        series: &MetricSeries,
+        points: impl IntoIterator<Item = DataPoint>,
+    ) -> Result<SeriesPointsMergeOutcome, MergeLimitError> {
+        let (identity, inserted_series) = self.ensure_series(series)?;
         let bucket = self
             .points_by_series
             .get_mut(&identity)
             .expect("series bucket should exist");
+        let mut outcome = SeriesPointsMergeOutcome {
+            inserted_series,
+            ..SeriesPointsMergeOutcome::default()
+        };
 
         for point in points {
             let point_identity = PointIdentity::from_point(&point);
@@ -182,11 +205,15 @@ impl SeriesPointsMerger {
                 });
             }
 
+            outcome.inserted_points = outcome.inserted_points.saturating_add(1);
+            outcome.inserted_point_bytes = outcome
+                .inserted_point_bytes
+                .saturating_add(modeled_point_returned_bytes(&point));
             bucket.insert(point_identity, point);
             self.unique_points_total = next_total_points;
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     pub fn into_points(self) -> BTreeMap<SeriesIdentity, Vec<DataPoint>> {
@@ -209,10 +236,13 @@ impl SeriesPointsMerger {
             .map_or(0, BTreeMap::len)
     }
 
-    fn ensure_series(&mut self, series: &MetricSeries) -> Result<SeriesIdentity, MergeLimitError> {
+    fn ensure_series(
+        &mut self,
+        series: &MetricSeries,
+    ) -> Result<(SeriesIdentity, bool), MergeLimitError> {
         let identity = SeriesIdentity::from_series(series);
         if self.points_by_series.contains_key(&identity) {
-            return Ok(identity);
+            return Ok((identity, false));
         }
 
         let next = self.points_by_series.len().saturating_add(1);
@@ -225,8 +255,16 @@ impl SeriesPointsMerger {
 
         self.points_by_series
             .insert(identity.clone(), BTreeMap::new());
-        Ok(identity)
+        Ok((identity, true))
     }
+}
+
+fn modeled_point_returned_bytes(point: &DataPoint) -> u64 {
+    u64::try_from(std::mem::size_of::<DataPoint>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(tsink::value::modeled_query_value_payload_bytes(
+            &point.value,
+        ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -398,6 +436,39 @@ mod tests {
             .map(|point| point.timestamp)
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn points_merger_reports_capacity_independent_inserted_bytes() {
+        let metric = series("payloads", &[("host", "a")]);
+        let compact = vec![
+            DataPoint::new(10, Value::Bytes(vec![1, 2, 3])),
+            DataPoint::new(11, Value::String("abc".to_string())),
+        ];
+        let mut roomy_bytes = Vec::with_capacity(128);
+        roomy_bytes.extend([1, 2, 3]);
+        let mut roomy_text = String::with_capacity(128);
+        roomy_text.push_str("abc");
+        let roomy = vec![
+            DataPoint::new(10, Value::Bytes(roomy_bytes)),
+            DataPoint::new(11, Value::String(roomy_text)),
+        ];
+        assert_eq!(compact, roomy);
+
+        let mut compact_merger = SeriesPointsMerger::new(ReadMergeLimits::default());
+        let compact_outcome = compact_merger
+            .merge_series_points_counted(&metric, compact)
+            .expect("compact points should merge");
+        let mut roomy_merger = SeriesPointsMerger::new(ReadMergeLimits::default());
+        let roomy_outcome = roomy_merger
+            .merge_series_points_counted(&metric, roomy)
+            .expect("roomy points should merge");
+
+        assert_eq!(compact_outcome.inserted_points, 2);
+        assert_eq!(
+            compact_outcome.inserted_point_bytes,
+            roomy_outcome.inserted_point_bytes
+        );
     }
 
     #[test]

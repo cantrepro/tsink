@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,20 @@ fn series_def_frame_header(seq: u64, payload_len: usize, crc32: u32) -> [u8; FRA
 fn next_u64(state: &mut u64) -> u64 {
     *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
     *state
+}
+
+fn wal_directory_image(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let entry_path = entry.path();
+            (
+                PathBuf::from(entry.file_name()),
+                std::fs::read(entry_path).unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn sample_histogram() -> NativeHistogram {
@@ -299,6 +313,108 @@ fn wal_reopen_discards_persisted_writes_that_never_crossed_publish_boundary() {
         .map(|batch| batch.series_id)
         .collect::<Vec<_>>();
     assert_eq!(committed_series_ids, vec![8]);
+}
+
+#[test]
+fn strict_wal_open_rejects_corrupt_published_frame_without_mutating_namespace() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "published".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let segment_path = wal.path();
+    drop(wal);
+
+    let mut bytes = fs::read(&segment_path).unwrap();
+    assert!(bytes.len() > FRAME_HEADER_LEN);
+    bytes[FRAME_HEADER_LEN] ^= 0x5a;
+    fs::write(&segment_path, bytes).unwrap();
+    let before = wal_directory_image(temp_dir.path());
+
+    let err = match FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend) {
+        Ok(_) => panic!("strict WAL open must reject a corrupt published frame"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, TsinkError::DataCorruption(ref message) if message.contains("published WAL frame") && message.contains("checksum mismatch")),
+        "{err}"
+    );
+    assert_eq!(wal_directory_image(temp_dir.path()), before);
+}
+
+#[test]
+fn strict_wal_open_truncates_corrupt_unpublished_suffix_after_full_preflight() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "published".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let segment_path = wal.path();
+    let published_len = fs::metadata(&segment_path).unwrap().len();
+    drop(wal);
+
+    let mut file = OpenOptions::new().append(true).open(&segment_path).unwrap();
+    file.write_all(b"corrupt-unpublished-tail").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    assert!(fs::metadata(&segment_path).unwrap().len() > published_len);
+
+    let reopened = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+
+    assert_eq!(fs::metadata(&segment_path).unwrap().len(), published_len);
+    assert_eq!(
+        reopened.current_published_highwater(),
+        WalHighWatermark {
+            segment: 0,
+            frame: 1,
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_truncation_preflight_failure_in_later_segment_leaves_earlier_suffix_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "published".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let boundary_segment = wal.path();
+    drop(wal);
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&boundary_segment)
+        .unwrap();
+    file.write_all(b"unpublished-tail").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    let before = fs::read(&boundary_segment).unwrap();
+
+    let inaccessible = segment_path(temp_dir.path(), 1);
+    fs::write(&inaccessible, b"later").unwrap();
+    fs::set_permissions(&inaccessible, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend);
+    fs::set_permissions(&inaccessible, fs::Permissions::from_mode(0o600)).unwrap();
+
+    if result.is_ok() {
+        // Privileged test runners can bypass mode bits; the two-phase behavior is covered by the
+        // normal unprivileged CI path.
+        return;
+    }
+    assert_eq!(fs::read(&boundary_segment).unwrap(), before);
 }
 
 #[test]
@@ -1519,7 +1635,7 @@ fn replay_salvage_mode_skips_checksum_mismatch_and_continues_with_later_frames()
 }
 
 #[test]
-fn wal_open_quarantines_corrupt_active_segment_before_new_appends() {
+fn salvage_wal_open_quarantines_corrupt_active_segment_before_new_appends() {
     let temp_dir = TempDir::new().unwrap();
     let wal_path = temp_dir.path().join(WAL_FILE_NAME);
     let mut file = OpenOptions::new()
@@ -1564,7 +1680,14 @@ fn wal_open_quarantines_corrupt_active_segment_before_new_appends() {
     write_frame(&mut file, 3, &payload_c, checksum32(&payload_c));
     file.flush().unwrap();
 
-    let reopened = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let reopened = FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        1,
+        None,
+        WalReplayMode::Salvage,
+    )
+    .unwrap();
     let recovery_segment = segment_path(temp_dir.path(), 1);
     assert_eq!(
         reopened.current_highwater(),
@@ -1595,6 +1718,46 @@ fn wal_open_quarantines_corrupt_active_segment_before_new_appends() {
         })
         .collect::<Vec<_>>();
     assert_eq!(replayed_series_ids, vec![1, 3, 4]);
+}
+
+#[test]
+fn strict_wal_open_rejects_corrupt_active_segment_without_mutating_namespace() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_path = temp_dir.path().join(WAL_FILE_NAME);
+    let payload = encode_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "cpu".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&series_def_frame_header(
+        1,
+        payload.len(),
+        checksum32(&payload),
+    ));
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(b"W2FR\x02\x00\x00\x00\x00");
+    fs::write(&wal_path, &bytes).unwrap();
+    let before = fs::read(&wal_path).unwrap();
+
+    let err = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        1,
+        None,
+        WalReplayMode::Strict,
+    ) {
+        Ok(_) => panic!("strict WAL open must reject a corrupt active segment"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, TsinkError::DataCorruption(ref message) if message.contains("strict WAL open detected corruption")),
+        "{err}"
+    );
+    assert_eq!(fs::read(&wal_path).unwrap(), before);
+    assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -1891,7 +2054,9 @@ fn failed_append_does_not_advance_next_seq() {
         segment_max_bytes: DEFAULT_WAL_SEGMENT_MAX_BYTES,
         local_disk_budget: None,
         append_sync_hook: parking_lot::Mutex::new(None),
+        published_highwater_post_rename_hook: parking_lot::Mutex::new(None),
         cached_series_definition_rebuild_hook: parking_lot::Mutex::new(None),
+        durability_failpoint_hook: parking_lot::Mutex::new(None),
     };
 
     let err = wal.append_series_definition(&SeriesDefinitionFrame {

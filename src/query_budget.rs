@@ -31,7 +31,11 @@ pub struct QueryWorkLimits {
     pub max_samples_scanned: Option<u64>,
     /// Maximum samples returned by one query.
     pub max_samples_returned: Option<u64>,
-    /// Maximum encoded or modeled result bytes returned by one query.
+    /// Maximum encoded or canonically modeled logical result bytes returned by one query.
+    ///
+    /// Modeled in-process results use content lengths, not allocator capacity or slack, so
+    /// logically equal values receive the same charge. Protocol adapters may additionally charge
+    /// the exact bytes they encode.
     pub max_returned_bytes: Option<u64>,
     /// Maximum regex/pattern candidate expansion performed by one query.
     pub max_pattern_expansion: Option<u64>,
@@ -924,6 +928,18 @@ pub struct QueryExecution {
     lease: Arc<QueryLease>,
 }
 
+#[derive(Debug)]
+pub(crate) enum QueryMemoryCoalesceError {
+    Budget(QueryBudgetError),
+    InvalidReservations,
+}
+
+impl From<QueryBudgetError> for QueryMemoryCoalesceError {
+    fn from(error: QueryBudgetError) -> Self {
+        Self::Budget(error)
+    }
+}
+
 impl fmt::Debug for QueryExecution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1095,6 +1111,51 @@ impl QueryExecution {
         self.lease.reserve_memory(bytes)
     }
 
+    /// Coalesces reservations from this execution into one exact retained-memory guard.
+    ///
+    /// Existing bytes stay charged while any required growth is admitted. Consumed guards are
+    /// then disarmed and only excess bytes are released, so callers can hand an allocation from
+    /// intermediate accounting to result accounting without a zero-accounting gap or a
+    /// duplicate full-size reservation.
+    pub(crate) fn coalesce_memory_reservations(
+        &self,
+        mut reservations: Vec<QueryMemoryReservation>,
+        retained_bytes: u64,
+    ) -> std::result::Result<QueryMemoryReservation, QueryMemoryCoalesceError> {
+        self.checkpoint()?;
+        if reservations.iter().any(|reservation| {
+            reservation.released || !Arc::ptr_eq(&reservation.lease, &self.lease)
+        }) {
+            return Err(QueryMemoryCoalesceError::InvalidReservations);
+        }
+        let Some(reserved_bytes) = reservations.iter().try_fold(0u64, |bytes, reservation| {
+            bytes.checked_add(reservation.bytes)
+        }) else {
+            return Err(QueryMemoryCoalesceError::InvalidReservations);
+        };
+
+        let mut additional = if retained_bytes > reserved_bytes {
+            Some(self.reserve_memory(retained_bytes - reserved_bytes)?)
+        } else {
+            None
+        };
+        for reservation in &mut reservations {
+            reservation.released = true;
+        }
+        if let Some(additional) = additional.as_mut() {
+            additional.released = true;
+        }
+        if reserved_bytes > retained_bytes {
+            self.lease.release_memory(reserved_bytes - retained_bytes);
+        }
+
+        Ok(QueryMemoryReservation {
+            lease: Arc::clone(&self.lease),
+            bytes: retained_bytes,
+            released: false,
+        })
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> QueryExecutionSnapshot {
         QueryExecutionSnapshot {
@@ -1213,6 +1274,73 @@ mod tests {
         let query = budget.begin_query().unwrap();
         query.charge_samples_scanned(u64::MAX).unwrap();
         assert_eq!(query.snapshot().samples_scanned, u64::MAX);
+    }
+
+    #[test]
+    fn coalescing_same_query_reservations_releases_only_the_excess_without_a_gap() {
+        let budget = QueryBudget::new(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(16),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(16),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        })
+        .unwrap();
+        let query = budget.begin_query().unwrap();
+        let first = query.reserve_memory(4).unwrap();
+        let second = query.reserve_memory(5).unwrap();
+        assert_eq!(query.snapshot().memory_reserved_bytes, 9);
+
+        let retained = query
+            .coalesce_memory_reservations(vec![first, second], 6)
+            .unwrap();
+        assert_eq!(retained.bytes(), 6);
+        assert_eq!(query.snapshot().memory_reserved_bytes, 6);
+        assert_eq!(budget.snapshot().shared_reserved_memory_bytes, 6);
+
+        drop(retained);
+        assert_eq!(query.snapshot().memory_reserved_bytes, 0);
+        drop(query);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn coalescing_growth_is_admitted_while_source_guards_remain_live() {
+        for (limit, succeeds) in [(10, true), (9, false)] {
+            let budget = QueryBudget::new(QueryBudgetLimits {
+                max_shared_memory_bytes: Some(limit),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            })
+            .unwrap();
+            let query = budget.begin_query().unwrap();
+            let first = query.reserve_memory(4).unwrap();
+            let second = query.reserve_memory(5).unwrap();
+            let result = query.coalesce_memory_reservations(vec![first, second], 10);
+            if succeeds {
+                let retained = result.unwrap();
+                assert_eq!(query.snapshot().memory_reserved_bytes, 10);
+                drop(retained);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(QueryMemoryCoalesceError::Budget(
+                        QueryBudgetError::LimitExceeded(exceeded)
+                    )) if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+                ));
+            }
+            assert_eq!(query.snapshot().memory_reserved_bytes, 0);
+            drop(query);
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+            assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        }
     }
 
     #[test]

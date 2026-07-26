@@ -25,6 +25,12 @@ const STARTUP_SEGMENT_METADATA_EXPANSION_FACTOR: usize = 16;
 const STARTUP_SEGMENT_ROOT_BOOKKEEPING_WORDS: usize = 16;
 const STARTUP_SEGMENT_ROOT_PATH_COPIES: usize = 4;
 
+#[derive(Clone, Copy)]
+pub(in crate::engine::storage_engine) struct SegmentRuntimeRefreshMemoryPreflight {
+    pub(in crate::engine::storage_engine) source_bytes: u64,
+    pub(in crate::engine::storage_engine) reservation_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::engine::storage_engine) struct StartupRecoveredSegmentInventory {
     pub(in crate::engine::storage_engine) inventory: SegmentInventory,
@@ -184,6 +190,115 @@ fn startup_segment_retained_and_decode_reservation(
             .saturating_add(decoded.saturating_mul(STARTUP_SEGMENT_METADATA_EXPANSION_FACTOR));
     }
     Ok(Some(reservation))
+}
+
+/// Models one runtime segment load without decoding any heap-backed segment structure.
+///
+/// The finite remote-catalog path uses this fixed-file/header pass after admitting its small path
+/// inspection envelope and before admitting the complete load/publication envelope. Full
+/// fingerprint validation and decoding still happen after the returned reservation is installed.
+pub(in crate::engine::storage_engine) fn preflight_segment_runtime_refresh_memory(
+    root: &Path,
+) -> Result<SegmentRuntimeRefreshMemoryPreflight> {
+    let manifest_stored_bytes =
+        usize::try_from(std::fs::metadata(root.join("manifest.bin"))?.len()).unwrap_or(usize::MAX);
+    if manifest_stored_bytes > MAX_SEGMENT_MANIFEST_FILE_BYTES {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "remote segment catalog memory admission",
+            limit: MAX_SEGMENT_MANIFEST_FILE_BYTES as u64,
+            required: u64::try_from(manifest_stored_bytes).unwrap_or(u64::MAX),
+        });
+    }
+
+    let mut source_bytes = u64::try_from(manifest_stored_bytes).unwrap_or(u64::MAX);
+    let mut retained_and_decode = 0usize;
+    for (file_name, is_chunks) in [
+        ("chunks.bin", true),
+        ("chunk_index.bin", false),
+        ("series.bin", false),
+        ("postings.bin", false),
+    ] {
+        let path = root.join(file_name);
+        let mut opened = File::open(&path)?;
+        let stored_u64 = opened.metadata()?.len();
+        let stored = usize::try_from(stored_u64).unwrap_or(usize::MAX);
+        source_bytes = source_bytes.checked_add(stored_u64).ok_or(
+            TsinkError::MaintenanceWorkItemTooLarge {
+                operation: "finite remote segment catalog apply",
+                limit: u64::MAX,
+                required: u64::MAX,
+            },
+        )?;
+        if is_chunks {
+            if stored > MAX_SEGMENT_CHUNKS_FILE_BYTES {
+                return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                    operation: "remote segment catalog memory admission",
+                    limit: MAX_SEGMENT_CHUNKS_FILE_BYTES as u64,
+                    required: stored_u64,
+                });
+            }
+            retained_and_decode = retained_and_decode.saturating_add(stored);
+            continue;
+        }
+        if stored > MAX_DECODED_FRAMED_FILE_BYTES {
+            return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                operation: "remote segment catalog memory admission",
+                limit: MAX_DECODED_FRAMED_FILE_BYTES as u64,
+                required: stored_u64,
+            });
+        }
+
+        let mut prefix = [0u8; 12];
+        let prefix_len = stored.min(prefix.len());
+        opened.read_exact(&mut prefix[..prefix_len])?;
+        let decoded = if prefix_len >= 8
+            && u16::from_le_bytes([prefix[6], prefix[7]]) & FILE_FLAG_ZSTD_BODY != 0
+        {
+            if prefix_len < prefix.len() {
+                return Err(TsinkError::DataCorruption(format!(
+                    "remote segment metadata header is truncated: {}",
+                    path.display()
+                )));
+            }
+            let body_len =
+                u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
+            let decoded = 8usize.checked_add(body_len).ok_or_else(|| {
+                TsinkError::DataCorruption(format!(
+                    "remote segment metadata decoded length overflows: {}",
+                    path.display()
+                ))
+            })?;
+            if decoded > MAX_DECODED_FRAMED_FILE_BYTES {
+                return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                    operation: "remote segment catalog memory admission",
+                    limit: MAX_DECODED_FRAMED_FILE_BYTES as u64,
+                    required: u64::try_from(decoded).unwrap_or(u64::MAX),
+                });
+            }
+            decoded
+        } else {
+            stored
+        };
+        retained_and_decode = retained_and_decode
+            .saturating_add(stored)
+            .saturating_add(decoded.saturating_mul(STARTUP_SEGMENT_METADATA_EXPANSION_FACTOR));
+    }
+
+    let root_reservation = std::mem::size_of::<SegmentInventoryEntry>()
+        .saturating_add(
+            root.as_os_str()
+                .len()
+                .saturating_mul(STARTUP_SEGMENT_ROOT_PATH_COPIES),
+        )
+        .saturating_add(
+            STARTUP_SEGMENT_ROOT_BOOKKEEPING_WORDS.saturating_mul(std::mem::size_of::<usize>()),
+        );
+    Ok(SegmentRuntimeRefreshMemoryPreflight {
+        source_bytes,
+        reservation_bytes: root_reservation
+            .saturating_add(manifest_stored_bytes.saturating_mul(2))
+            .saturating_add(retained_and_decode),
+    })
 }
 
 pub(in crate::engine::storage_engine) fn build_segment_inventory_runtime_strict(

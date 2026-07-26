@@ -6,6 +6,7 @@ use crate::cluster::membership::{ClusterNode, MembershipView};
 use crate::cluster::replication::stable_series_identity_hash;
 use crate::cluster::ring::ShardRing;
 use crate::cluster::rpc::{
+    InternalAccountedDigestWindowResponse, InternalAccountedRepairBackfillResponse,
     InternalControlCommand, InternalDigestWindowRequest, InternalDigestWindowResponse,
     InternalRepairBackfillRequest, InternalRepairBackfillResponse, RpcClient,
 };
@@ -14,7 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tsink::{DataPoint, Label, Storage, TsinkError};
+use tsink::{
+    DataPoint, Label, QueryCancellationToken, QueryExecution, QueryExecutionSnapshot,
+    QueryMemoryReservation, QueryWorkLimits, ResourceLimits, ShardWindowDigest, Storage,
+    TsinkError,
+};
 
 const DIGEST_INTERVAL_SECS_ENV: &str = "TSINK_CLUSTER_DIGEST_INTERVAL_SECS";
 const DIGEST_WINDOW_SECS_ENV: &str = "TSINK_CLUSTER_DIGEST_WINDOW_SECS";
@@ -638,6 +643,11 @@ enum RepairProbeResponse {
     Backfill(InternalRepairBackfillResponse),
 }
 
+struct FetchedRepairBackfillResponse {
+    response: InternalRepairBackfillResponse,
+    _transport_reservation: Option<QueryMemoryReservation>,
+}
+
 type RepairProbeFn =
     dyn Fn(&str, RepairProbeRequest) -> Result<RepairProbeResponse, String> + Send + Sync;
 
@@ -676,6 +686,16 @@ impl Drop for RunInflightGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *inflight = false;
+    }
+}
+
+struct InternalMaintenanceExecutionCancellationGuard {
+    token: QueryCancellationToken,
+}
+
+impl Drop for InternalMaintenanceExecutionCancellationGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
     }
 }
 
@@ -1547,6 +1567,7 @@ impl DigestExchangeRuntime {
         }
 
         outcome.compared_shards = outcome.compared_shards.saturating_add(1);
+        let digest_query_limits = internal_maintenance_query_limits(storage.as_ref());
         let local_digest = match compute_shard_window_digest_async(
             Arc::clone(&storage),
             shard,
@@ -1554,6 +1575,7 @@ impl DigestExchangeRuntime {
             ring_version,
             window_start,
             window_end,
+            digest_query_limits,
         )
         .await
         {
@@ -1578,6 +1600,7 @@ impl DigestExchangeRuntime {
                 shard,
                 window_start,
                 window_end,
+                query_limits: Some(digest_query_limits),
             };
             let estimated_request_bytes = estimated_json_bytes(&request);
             let estimated_response_bytes = estimated_digest_response_upper_bound(&request);
@@ -1610,10 +1633,8 @@ impl DigestExchangeRuntime {
             let remote_digest_result = if let Some(digest_probe) = self.digest_probe.as_ref() {
                 digest_probe(&peer_target.endpoint, &request)
             } else {
-                self.rpc_client
-                    .digest_window(&peer_target.endpoint, &request)
+                self.fetch_peer_digest_accounted(&storage, &peer_target.endpoint, &request)
                     .await
-                    .map_err(|err| err.to_string())
             };
 
             match remote_digest_result {
@@ -1824,6 +1845,19 @@ impl DigestExchangeRuntime {
                 return RepairAttemptStatus::SkippedTimeBudget;
             }
 
+            let remaining_wall_time = repair_deadline.saturating_duration_since(Instant::now());
+            if remaining_wall_time.is_zero() {
+                outcome.repairs_skipped_time_budget =
+                    outcome.repairs_skipped_time_budget.saturating_add(1);
+                outcome.repair_time_budget_exhausted = true;
+                self.set_repair_resume_cursor(&cursor_key, next_row_offset);
+                return RepairAttemptStatus::SkippedTimeBudget;
+            }
+            let query_limits =
+                internal_maintenance_query_limits(storage).tightened_by(QueryWorkLimits {
+                    max_wall_time: Some(remaining_wall_time),
+                    ..QueryWorkLimits::default()
+                });
             let backfill_request = InternalRepairBackfillRequest {
                 ring_version,
                 shard,
@@ -1832,9 +1866,10 @@ impl DigestExchangeRuntime {
                 max_series: Some(repair_budget.remaining_series),
                 max_rows: Some(repair_budget.remaining_rows),
                 row_offset: next_row_offset,
+                query_limits: Some(query_limits),
             };
-            let backfill_response = match self
-                .fetch_peer_repair_backfill(peer_endpoint, &backfill_request)
+            let fetched_backfill = match self
+                .fetch_peer_repair_backfill(storage, peer_endpoint, &backfill_request)
                 .await
             {
                 Ok(response) => response,
@@ -1848,6 +1883,10 @@ impl DigestExchangeRuntime {
                     return RepairAttemptStatus::Failed;
                 }
             };
+            let FetchedRepairBackfillResponse {
+                response: backfill_response,
+                _transport_reservation: _response_reservation,
+            } = fetched_backfill;
             if backfill_response.ring_version != ring_version
                 || backfill_response.shard != shard
                 || backfill_response.window_start != window_start
@@ -1989,19 +2028,80 @@ impl DigestExchangeRuntime {
 
     async fn fetch_peer_repair_backfill(
         &self,
+        storage: &dyn Storage,
         endpoint: &str,
         request: &InternalRepairBackfillRequest,
-    ) -> Result<InternalRepairBackfillResponse, String> {
+    ) -> Result<FetchedRepairBackfillResponse, String> {
         if let Some(repair_probe) = self.repair_probe.as_ref() {
             return match repair_probe(endpoint, RepairProbeRequest::Backfill(request.clone())) {
-                Ok(RepairProbeResponse::Backfill(response)) => Ok(response),
+                Ok(RepairProbeResponse::Backfill(response)) => Ok(FetchedRepairBackfillResponse {
+                    response,
+                    _transport_reservation: None,
+                }),
                 Err(err) => Err(err),
             };
         }
-        self.rpc_client
-            .repair_backfill(endpoint, request)
+        let query_limits = request
+            .query_limits
+            .ok_or_else(|| "internal repair request omitted query limits".to_string())?;
+        let (execution, _cancellation_guard) =
+            begin_internal_maintenance_execution(storage, query_limits)?;
+        let accounted = self
+            .rpc_client
+            .repair_backfill_accounted(endpoint, request, &execution)
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|error| error.to_string())?;
+        let InternalAccountedRepairBackfillResponse {
+            backfill: response,
+            accounting: remote_snapshot,
+        } = accounted.response;
+        validate_internal_repair_backfill_execution_accounting(
+            response.series_scanned,
+            response.rows_scanned,
+            response.rows.len(),
+            crate::cluster::rpc::modeled_internal_repair_rows_returned_bytes(&response.rows),
+            None,
+            QueryExecutionSnapshot::default(),
+            remote_snapshot,
+        )
+        .map_err(|_| "bounded repair response returned invalid execution accounting".to_string())?;
+        charge_remote_execution(&execution, remote_snapshot)?;
+        Ok(FetchedRepairBackfillResponse {
+            response,
+            _transport_reservation: Some(accounted.reservation),
+        })
+    }
+
+    async fn fetch_peer_digest_accounted(
+        &self,
+        storage: &Arc<dyn Storage>,
+        endpoint: &str,
+        request: &InternalDigestWindowRequest,
+    ) -> Result<InternalDigestWindowResponse, String> {
+        let query_limits = request
+            .query_limits
+            .ok_or_else(|| "internal digest request omitted query limits".to_string())?;
+        let (execution, _cancellation_guard) =
+            begin_internal_maintenance_execution(storage.as_ref(), query_limits)?;
+        let accounted = self
+            .rpc_client
+            .digest_window_accounted(endpoint, request, &execution)
+            .await
+            .map_err(|error| error.to_string())?;
+        let InternalAccountedDigestWindowResponse {
+            digest: response,
+            accounting: remote_snapshot,
+        } = accounted.response;
+        validate_internal_digest_execution_accounting(
+            response.series_count,
+            response.point_count,
+            QueryExecutionSnapshot::default(),
+            remote_snapshot,
+        )
+        .map_err(|_| "bounded digest response returned invalid execution accounting".to_string())?;
+        charge_remote_execution(&execution, remote_snapshot)?;
+        drop(accounted.reservation);
+        Ok(response)
     }
 
     fn is_repair_cancelled(&self, expected_cancel_generation: u64) -> bool {
@@ -2092,14 +2192,26 @@ fn estimated_json_bytes<T: serde::Serialize>(value: &T) -> usize {
 }
 
 fn estimated_digest_response_upper_bound(request: &InternalDigestWindowRequest) -> usize {
-    estimated_json_bytes(&InternalDigestWindowResponse {
-        shard: request.shard,
-        ring_version: request.ring_version,
-        window_start: request.window_start,
-        window_end: request.window_end,
-        series_count: u64::MAX,
-        point_count: u64::MAX,
-        fingerprint: u64::MAX,
+    estimated_json_bytes(&InternalAccountedDigestWindowResponse {
+        digest: InternalDigestWindowResponse {
+            shard: request.shard,
+            ring_version: request.ring_version,
+            window_start: request.window_start,
+            window_end: request.window_end,
+            series_count: u64::MAX,
+            point_count: u64::MAX,
+            fingerprint: u64::MAX,
+        },
+        accounting: QueryExecutionSnapshot {
+            memory_reserved_bytes: u64::MAX,
+            series_matched: u64::MAX,
+            samples_scanned: u64::MAX,
+            samples_returned: u64::MAX,
+            returned_bytes: u64::MAX,
+            pattern_expansion: u64::MAX,
+            steps: u64::MAX,
+            intermediate_vector_size: u64::MAX,
+        },
     })
 }
 
@@ -2639,6 +2751,147 @@ fn transition_stale_bridge_ring_version(activation_ring_version: u64) -> u64 {
     activation_ring_version.saturating_sub(1).max(1)
 }
 
+pub(crate) fn internal_maintenance_query_limits_are_finite(limits: QueryWorkLimits) -> bool {
+    limits.max_series_matched.is_some()
+        && limits.max_samples_scanned.is_some()
+        && limits.max_samples_returned.is_some()
+        && limits.max_returned_bytes.is_some()
+        && limits.max_pattern_expansion.is_some()
+        && limits.max_steps.is_some()
+        && limits.max_intermediate_vector_size.is_some()
+        && limits.max_memory_bytes.is_some()
+        && limits.max_wall_time.is_some()
+}
+
+fn internal_maintenance_query_limits(storage: &dyn Storage) -> QueryWorkLimits {
+    let fallback = ResourceLimits::server().query.per_query;
+    let configured = storage
+        .resource_configuration_snapshot()
+        .resolved_limits
+        .query
+        .per_query;
+    fallback.tightened_by(configured)
+}
+
+fn begin_internal_maintenance_execution(
+    storage: &dyn Storage,
+    limits: QueryWorkLimits,
+) -> Result<
+    (
+        QueryExecution,
+        InternalMaintenanceExecutionCancellationGuard,
+    ),
+    String,
+> {
+    if !internal_maintenance_query_limits_are_finite(limits) {
+        return Err("internal maintenance query limits are not finite".to_string());
+    }
+    let cancellation = QueryCancellationToken::new();
+    let guard = InternalMaintenanceExecutionCancellationGuard {
+        token: cancellation.clone(),
+    };
+    let execution = storage
+        .begin_query_execution(limits, cancellation)
+        .map_err(|error| format!("internal maintenance query admission failed: {error}"))?
+        .ok_or_else(|| {
+            "storage does not expose internal maintenance query admission".to_string()
+        })?;
+    Ok((execution, guard))
+}
+
+pub(crate) fn validate_internal_digest_execution_accounting(
+    series_count: u64,
+    point_count: u64,
+    before: QueryExecutionSnapshot,
+    after: QueryExecutionSnapshot,
+) -> Result<(), &'static str> {
+    if after.series_matched.saturating_sub(before.series_matched) < series_count {
+        return Err("matched-series accounting is smaller than the digest result");
+    }
+    if after.samples_scanned.saturating_sub(before.samples_scanned) < point_count {
+        return Err("scanned-sample accounting is smaller than the digest result");
+    }
+    let digest_bytes = u64::try_from(std::mem::size_of::<ShardWindowDigest>()).unwrap_or(u64::MAX);
+    if after.returned_bytes.saturating_sub(before.returned_bytes) < digest_bytes {
+        return Err("returned-byte accounting is smaller than the digest result");
+    }
+    if after.intermediate_vector_size < series_count {
+        return Err("intermediate-vector accounting is smaller than the digest result");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_internal_repair_backfill_execution_accounting(
+    series_scanned: u64,
+    rows_scanned: u64,
+    rows_len: usize,
+    minimum_returned_bytes: u64,
+    result_reserved_memory_bytes: Option<u64>,
+    before: QueryExecutionSnapshot,
+    after: QueryExecutionSnapshot,
+) -> Result<(), &'static str> {
+    let rows_len = u64::try_from(rows_len).unwrap_or(u64::MAX);
+    if rows_scanned != rows_len {
+        return Err("row accounting does not match the repair result length");
+    }
+    if series_scanned > rows_scanned {
+        return Err("series accounting exceeds the repair result length");
+    }
+    if after.series_matched.saturating_sub(before.series_matched) < series_scanned {
+        return Err("matched-series accounting is smaller than the repair result");
+    }
+    if after.samples_scanned.saturating_sub(before.samples_scanned) < rows_scanned {
+        return Err("scanned-sample accounting is smaller than the repair result");
+    }
+    if after
+        .samples_returned
+        .saturating_sub(before.samples_returned)
+        < rows_len
+    {
+        return Err("returned-sample accounting is smaller than the repair result");
+    }
+    if after.returned_bytes.saturating_sub(before.returned_bytes) < minimum_returned_bytes {
+        return Err("returned-byte accounting is smaller than the repair result");
+    }
+    if after.intermediate_vector_size < series_scanned {
+        return Err("intermediate-vector accounting is smaller than the repair result");
+    }
+    if rows_len != 0 && result_reserved_memory_bytes.is_some_and(|bytes| bytes == 0) {
+        return Err("repair result omitted its retained-memory reservation");
+    }
+    Ok(())
+}
+
+fn charge_remote_execution(
+    execution: &QueryExecution,
+    snapshot: QueryExecutionSnapshot,
+) -> Result<(), String> {
+    execution
+        .checkpoint()
+        .map_err(|error| format!("internal maintenance transport was interrupted: {error}"))?;
+    execution
+        .charge_series_matched(snapshot.series_matched)
+        .map_err(|error| format!("internal maintenance series accounting failed: {error}"))?;
+    execution
+        .charge_samples_scanned(snapshot.samples_scanned)
+        .map_err(|error| format!("internal maintenance scan accounting failed: {error}"))?;
+    execution
+        .charge_samples_returned(snapshot.samples_returned)
+        .map_err(|error| format!("internal maintenance result accounting failed: {error}"))?;
+    execution
+        .charge_returned_bytes(snapshot.returned_bytes)
+        .map_err(|error| format!("internal maintenance byte accounting failed: {error}"))?;
+    execution
+        .charge_pattern_expansion(snapshot.pattern_expansion)
+        .map_err(|error| format!("internal maintenance pattern accounting failed: {error}"))?;
+    execution
+        .charge_steps(snapshot.steps)
+        .map_err(|error| format!("internal maintenance step accounting failed: {error}"))?;
+    execution
+        .observe_intermediate_vector_size(snapshot.intermediate_vector_size)
+        .map_err(|error| format!("internal maintenance vector accounting failed: {error}"))
+}
+
 async fn compute_shard_window_digest_async(
     storage: Arc<dyn Storage>,
     shard: u32,
@@ -2646,21 +2899,51 @@ async fn compute_shard_window_digest_async(
     ring_version: u64,
     window_start: i64,
     window_end: i64,
+    query_limits: QueryWorkLimits,
 ) -> Result<InternalDigestWindowResponse, String> {
+    if storage.compute_shard_window_digest_execution_accounting()
+        != tsink::QueryExecutionAccounting::Complete
+    {
+        return Err("storage does not provide complete digest query accounting".to_string());
+    }
+    let (execution, _cancellation_guard) =
+        begin_internal_maintenance_execution(storage.as_ref(), query_limits)?;
+    let worker_execution = execution.clone();
     let task = tokio::task::spawn_blocking(move || {
-        compute_shard_window_digest(
-            storage.as_ref(),
-            shard,
-            shard_count,
-            ring_version,
-            window_start,
-            window_end,
+        let before = worker_execution.snapshot();
+        let digest = storage
+            .compute_shard_window_digest_with_execution(
+                shard,
+                shard_count,
+                window_start,
+                window_end,
+                &worker_execution,
+            )
+            .map_err(|error| format!("storage shard-window digest failed: {error}"))?;
+        validate_internal_digest_execution_accounting(
+            digest.series_count,
+            digest.point_count,
+            before,
+            worker_execution.snapshot(),
         )
+        .map_err(|_| "storage shard-window digest accounting is invalid".to_string())?;
+        Ok::<_, String>(digest)
     });
-    task.await
-        .map_err(|err| format!("digest compute task failed: {err}"))?
+    let digest = task
+        .await
+        .map_err(|_| "digest compute task failed".to_string())??;
+    Ok(InternalDigestWindowResponse {
+        shard: digest.shard,
+        ring_version: ring_version.max(1),
+        window_start: digest.window_start,
+        window_end: digest.window_end,
+        series_count: digest.series_count,
+        point_count: digest.point_count,
+        fingerprint: digest.fingerprint,
+    })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_shard_window_digest(
     storage: &dyn Storage,
     shard: u32,
@@ -2762,6 +3045,42 @@ mod tests {
     use tsink::{Row, StorageBuilder, TimestampPrecision};
 
     const TEST_DIGEST_SHARD_COUNT: u32 = 4;
+
+    #[test]
+    fn repair_remote_accounting_rejects_underreported_heap_payload() {
+        let rows = vec![crate::cluster::rpc::InternalRow {
+            metric: "remote_blob_metric".to_string(),
+            labels: vec![Label::new("source", "lying-peer")],
+            data_point: DataPoint::new(10, tsink::Value::Bytes(vec![9; 32 * 1024])),
+        }];
+        let required_returned_bytes =
+            crate::cluster::rpc::modeled_internal_repair_rows_returned_bytes(&rows);
+        let falsely_reported_bytes =
+            u64::try_from(std::mem::size_of::<tsink::Row>()).unwrap_or(u64::MAX);
+        assert!(required_returned_bytes > falsely_reported_bytes);
+
+        let error = validate_internal_repair_backfill_execution_accounting(
+            1,
+            1,
+            rows.len(),
+            required_returned_bytes,
+            None,
+            QueryExecutionSnapshot::default(),
+            QueryExecutionSnapshot {
+                series_matched: 1,
+                samples_scanned: 1,
+                samples_returned: 1,
+                returned_bytes: falsely_reported_bytes,
+                intermediate_vector_size: 1,
+                ..QueryExecutionSnapshot::default()
+            },
+        )
+        .expect_err("a remote peer must account the full heap-backed row payload");
+        assert_eq!(
+            error,
+            "returned-byte accounting is smaller than the repair result"
+        );
+    }
 
     fn build_test_storage(shard_count: u32) -> Arc<dyn Storage> {
         StorageBuilder::new()

@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 
-use crate::{DataPoint, Label, SeriesMatcher, SeriesSelection};
-use regex::Regex;
+use crate::{
+    DataPoint, Label, MetricSeries, QueryExecution, QueryExecutionAccounting,
+    QueryMemoryReservation, SelectSeriesExecutionResult, SeriesMatcher, SeriesPoints,
+    SeriesSelection, TsinkError,
+};
 
 use crate::promql::ast::{MatchOp, MatrixSelector, VectorSelector};
 use crate::promql::error::{PromqlError, Result};
@@ -9,6 +12,135 @@ use crate::promql::types::{is_stale_nan_value, value_to_f64, PromqlValue, Sample
 
 use super::time::duration_to_units;
 use super::{resolve_at_modifier, Engine, QueryParams};
+
+pub(crate) struct PreparedPromqlMatchers<'a> {
+    matchers: &'a [crate::promql::ast::LabelMatcher],
+    regexes: Vec<Option<crate::query_matcher::ExecutionBoundedRegex>>,
+    _slots_reservation: QueryMemoryReservation,
+}
+
+impl<'a> PreparedPromqlMatchers<'a> {
+    pub(crate) fn new(
+        matchers: &'a [crate::promql::ast::LabelMatcher],
+        execution: &QueryExecution,
+    ) -> Result<Self> {
+        crate::query_matcher::validate_matcher_shapes(
+            matchers.len(),
+            matchers
+                .iter()
+                .map(|matcher| (matcher.name.as_str(), matcher.value.as_str())),
+        )
+        .map_err(|error| PromqlError::Parse(error.to_string()))?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        let slots_bytes = super::modeled_vec_capacity_bytes::<
+            Option<crate::query_matcher::ExecutionBoundedRegex>,
+        >(matchers.len());
+        let slots_reservation = execution
+            .reserve_memory(slots_bytes)
+            .map_err(TsinkError::from)?;
+        let mut regexes = Vec::with_capacity(matchers.len());
+        for matcher in matchers {
+            execution.checkpoint().map_err(TsinkError::from)?;
+            let regex = match matcher.op {
+                MatchOp::RegexMatch | MatchOp::RegexNoMatch => Some(
+                    crate::query_matcher::prepare_bounded_regex_with_execution(
+                        &matcher.value,
+                        crate::query_matcher::RegexAnchoring::Anchored,
+                        execution,
+                    )
+                    .map_err(promql_regex_preparation_error)?,
+                ),
+                MatchOp::Equal | MatchOp::NotEqual => None,
+            };
+            regexes.push(regex);
+        }
+        Ok(Self {
+            matchers,
+            regexes,
+            _slots_reservation: slots_reservation,
+        })
+    }
+
+    pub(crate) fn matches(&self, metric: &str, labels: &[Label]) -> bool {
+        self.matches_where(metric, labels, |_| true)
+    }
+
+    pub(crate) fn matches_metric_name(&self, metric: &str) -> bool {
+        self.matches_where(metric, &[], |matcher| matcher.name == "__name__")
+    }
+
+    fn matches_where(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        include: impl Fn(&crate::promql::ast::LabelMatcher) -> bool,
+    ) -> bool {
+        for (matcher, prepared_regex) in self.matchers.iter().zip(&self.regexes) {
+            if !include(matcher) {
+                continue;
+            }
+            let actual = if matcher.name == "__name__" {
+                metric
+            } else {
+                labels
+                    .iter()
+                    .find(|label| label.name == matcher.name)
+                    .map(|label| label.value.as_str())
+                    .unwrap_or("")
+            };
+
+            let matched = match matcher.op {
+                MatchOp::Equal => actual == matcher.value,
+                MatchOp::NotEqual => actual != matcher.value,
+                MatchOp::RegexMatch => prepared_regex
+                    .as_ref()
+                    .expect("regex matcher was prepared")
+                    .regex()
+                    .is_match(actual),
+                MatchOp::RegexNoMatch => !prepared_regex
+                    .as_ref()
+                    .expect("negative regex matcher was prepared")
+                    .regex()
+                    .is_match(actual),
+            };
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn promql_regex_preparation_error(
+    error: crate::query_matcher::BoundedRegexPreparationError,
+) -> PromqlError {
+    match error {
+        crate::query_matcher::BoundedRegexPreparationError::Regex(error) => {
+            PromqlError::Regex(error.to_string())
+        }
+        crate::query_matcher::BoundedRegexPreparationError::Query(error) => {
+            PromqlError::Storage(TsinkError::from(error))
+        }
+    }
+}
+
+pub(super) struct RetainedMetricRows {
+    pub(super) rows: super::MetricPrefetchRows,
+    reservation: Option<QueryMemoryReservation>,
+}
+
+impl RetainedMetricRows {
+    fn unreserved(rows: super::MetricPrefetchRows) -> Self {
+        Self {
+            rows,
+            reservation: None,
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (super::MetricPrefetchRows, Option<QueryMemoryReservation>) {
+        (self.rows, self.reservation)
+    }
+}
 
 pub(crate) fn eval_vector_selector(
     engine: &Engine,
@@ -30,12 +162,8 @@ pub(crate) fn eval_vector_selector(
     if let Some(metric) = &selector.metric_name {
         if let Some(labels) = exact_equal_labels(metric, &selector.matchers) {
             if has_exact_series(engine, metric, &labels, params)? {
-                let points = engine.storage().select_with_execution(
-                    metric,
-                    &labels,
-                    start,
-                    end,
-                    params.execution,
+                let points = load_exact_series_points_with_retained_execution(
+                    engine, metric, &labels, start, end, params,
                 )?;
                 if let Some(point) = points
                     .iter()
@@ -53,11 +181,27 @@ pub(crate) fn eval_vector_selector(
             }
         }
 
-        collect_instant_samples_for_metric(engine, metric, selector, start, end, params, &mut out)?;
+        let prepared_matchers = PreparedPromqlMatchers::new(&selector.matchers, params.execution)?;
+        collect_instant_samples_for_metric(
+            engine,
+            metric,
+            &prepared_matchers,
+            start,
+            end,
+            params,
+            &mut out,
+        )?;
     } else {
+        let prepared_matchers = PreparedPromqlMatchers::new(&selector.matchers, params.execution)?;
         for metric in candidate_metrics(engine, selector, params)? {
             collect_instant_samples_for_metric(
-                engine, &metric, selector, start, end, params, &mut out,
+                engine,
+                &metric,
+                &prepared_matchers,
+                start,
+                end,
+                params,
+                &mut out,
             )?;
         }
     }
@@ -86,12 +230,8 @@ pub(crate) fn eval_matrix_selector(
     if let Some(metric) = &selector.vector.metric_name {
         if let Some(labels) = exact_equal_labels(metric, &selector.vector.matchers) {
             if has_exact_series(engine, metric, &labels, params)? {
-                let points = engine.storage().select_with_execution(
-                    metric,
-                    &labels,
-                    start,
-                    end,
-                    params.execution,
+                let points = load_exact_series_points_with_retained_execution(
+                    engine, metric, &labels, start, end, params,
                 )?;
                 params.reserve_range_series_upper(metric, &labels, &points)?;
                 let samples = points
@@ -117,11 +257,29 @@ pub(crate) fn eval_matrix_selector(
             }
         }
 
-        collect_range_series_for_metric(engine, metric, selector, start, end, params, &mut out)?;
+        let prepared_matchers =
+            PreparedPromqlMatchers::new(&selector.vector.matchers, params.execution)?;
+        collect_range_series_for_metric(
+            engine,
+            metric,
+            &prepared_matchers,
+            start,
+            end,
+            params,
+            &mut out,
+        )?;
     } else {
+        let prepared_matchers =
+            PreparedPromqlMatchers::new(&selector.vector.matchers, params.execution)?;
         for metric in candidate_metrics_for_matrix(engine, selector, params)? {
             collect_range_series_for_metric(
-                engine, &metric, selector, start, end, params, &mut out,
+                engine,
+                &metric,
+                &prepared_matchers,
+                start,
+                end,
+                params,
+                &mut out,
             )?;
         }
     }
@@ -138,13 +296,14 @@ fn candidate_metrics(
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine.storage().select_series_with_execution(
+    let mut selected = select_series_with_retained_execution_result(
+        engine,
         &selection_from_promql_matchers(&selector.matchers),
         params.execution,
     )?;
-    params.reserve_metric_names(all.iter().map(|series| series.name.as_str()))?;
+    params.reserve_metric_names(selected.series.iter().map(|series| series.name.as_str()))?;
     let mut metrics = BTreeSet::new();
-    for series in all {
+    for series in std::mem::take(&mut selected.series) {
         metrics.insert(series.name);
     }
     Ok(metrics.into_iter().collect())
@@ -159,30 +318,156 @@ fn candidate_metrics_for_matrix(
         return Ok(vec![metric.clone()]);
     }
 
-    let all = engine.storage().select_series_with_execution(
+    let mut selected = select_series_with_retained_execution_result(
+        engine,
         &selection_from_promql_matchers(&selector.vector.matchers),
         params.execution,
     )?;
-    params.reserve_metric_names(all.iter().map(|series| series.name.as_str()))?;
+    params.reserve_metric_names(selected.series.iter().map(|series| series.name.as_str()))?;
     let mut metrics = BTreeSet::new();
-    for series in all {
+    for series in std::mem::take(&mut selected.series) {
         metrics.insert(series.name);
     }
     Ok(metrics.into_iter().collect())
 }
 
+pub(super) fn select_series_with_retained_execution_result(
+    engine: &Engine,
+    selection: &SeriesSelection,
+    execution: &QueryExecution,
+) -> Result<SelectSeriesExecutionResult> {
+    let accounting = engine.storage().select_series_execution_accounting();
+    let bounded =
+        engine.storage().query_budget().is_some() || execution.limits() != Default::default();
+    if bounded && accounting != QueryExecutionAccounting::Complete {
+        return Err(TsinkError::UnsupportedOperation {
+            operation: "bounded PromQL metadata selection",
+            reason: "storage does not provide complete select_series execution accounting"
+                .to_string(),
+        }
+        .into());
+    }
+
+    let mut selected = engine
+        .storage()
+        .select_series_with_execution_result(selection, execution)?;
+    if accounting == QueryExecutionAccounting::Complete {
+        let reservation = selected.take_memory_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "completely accounted PromQL metadata selection omitted its result reservation"
+                    .to_string(),
+            )
+        })?;
+        if !selected.series.is_empty() && reservation.bytes() == 0 {
+            return Err(TsinkError::Other(
+                "completely accounted PromQL metadata selection retained zero bytes for a non-empty result"
+                    .to_string(),
+            )
+            .into());
+        }
+        return Ok(SelectSeriesExecutionResult::accounted(
+            std::mem::take(&mut selected.series),
+            reservation,
+        ));
+    }
+    Ok(selected)
+}
+
+fn load_exact_series_points_with_retained_execution(
+    engine: &Engine,
+    metric: &str,
+    labels: &[Label],
+    start: i64,
+    end: i64,
+    params: &QueryParams<'_>,
+) -> Result<Vec<DataPoint>> {
+    let accounting = engine.storage().select_many_execution_accounting();
+    let bounded = engine.storage().query_budget().is_some()
+        || params.execution.limits() != Default::default();
+    if bounded && accounting != QueryExecutionAccounting::Complete {
+        return Err(TsinkError::UnsupportedOperation {
+            operation: "bounded PromQL point selection",
+            reason: "storage does not provide complete select_many execution accounting"
+                .to_string(),
+        }
+        .into());
+    }
+
+    let selector = MetricSeries {
+        name: metric.to_string(),
+        labels: labels.to_vec(),
+    };
+    params.execution.checkpoint().map_err(TsinkError::from)?;
+    let mut selected = engine.storage().select_many_with_execution_result(
+        std::slice::from_ref(&selector),
+        start,
+        end,
+        params.execution,
+    )?;
+    params.execution.checkpoint().map_err(TsinkError::from)?;
+    if selected.series.len() != 1 || selected.series[0].series != selector {
+        return Err(TsinkError::Other(
+            "PromQL exact-series selection returned identities or ordering outside the request"
+                .to_string(),
+        )
+        .into());
+    }
+
+    if accounting == QueryExecutionAccounting::Complete {
+        let matched = selected.matched_selectors.take().ok_or_else(|| {
+            TsinkError::Other(
+                "completely accounted PromQL batch selection omitted selector-existence bits"
+                    .to_string(),
+            )
+        })?;
+        if matched.len() != 1 {
+            return Err(TsinkError::Other(format!(
+                "completely accounted PromQL exact-series selection returned {} existence bits",
+                matched.len()
+            ))
+            .into());
+        }
+        if !matched[0] && !selected.series[0].points.is_empty() {
+            return Err(TsinkError::Other(
+                "PromQL exact-series selection returned points for a missing selector".to_string(),
+            )
+            .into());
+        }
+        let reservation = selected.take_memory_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "completely accounted PromQL batch selection omitted its result reservation"
+                    .to_string(),
+            )
+        })?;
+        if reservation.bytes() == 0 {
+            return Err(TsinkError::Other(
+                "completely accounted PromQL batch selection retained zero bytes for a non-empty result"
+                    .to_string(),
+            )
+            .into());
+        }
+        params.memory.adopt(reservation);
+    }
+
+    Ok(selected
+        .series
+        .pop()
+        .expect("validated one exact-series result")
+        .points)
+}
+
 fn collect_instant_samples_for_metric(
     engine: &Engine,
     metric: &str,
-    selector: &VectorSelector,
+    prepared_matchers: &PreparedPromqlMatchers<'_>,
     start: i64,
     end: i64,
     params: &QueryParams<'_>,
     out: &mut Vec<Sample>,
 ) -> Result<()> {
-    let all_series = fetch_metric_series(engine, metric, start, end, params)?;
-    for (labels, points) in all_series {
-        if !matchers_match(metric, &labels, &selector.matchers)? {
+    let mut all_series = fetch_metric_series(engine, metric, start, end, params)?;
+    for (labels, points) in all_series.rows.drain(..) {
+        if !prepared_matchers.matches(metric, &labels) {
             continue;
         }
         if let Some(point) = latest_instant_point(points, start, end) {
@@ -211,15 +496,15 @@ fn collect_instant_samples_for_metric(
 fn collect_range_series_for_metric(
     engine: &Engine,
     metric: &str,
-    selector: &MatrixSelector,
+    prepared_matchers: &PreparedPromqlMatchers<'_>,
     start: i64,
     end: i64,
     params: &QueryParams<'_>,
     out: &mut Vec<Series>,
 ) -> Result<()> {
-    let all_series = fetch_metric_series(engine, metric, start, end, params)?;
-    for (labels, points) in all_series {
-        if !matchers_match(metric, &labels, &selector.vector.matchers)? {
+    let mut all_series = fetch_metric_series(engine, metric, start, end, params)?;
+    for (labels, points) in all_series.rows.drain(..) {
+        if !prepared_matchers.matches(metric, &labels) {
             continue;
         }
 
@@ -259,7 +544,7 @@ fn fetch_metric_series(
     start: i64,
     end: i64,
     params: &QueryParams<'_>,
-) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+) -> Result<RetainedMetricRows> {
     if let Some(cache) = params.prefetch {
         if let Some(all) = cache.get(metric) {
             params.memory.reserve(
@@ -298,14 +583,138 @@ fn fetch_metric_series(
                         .collect(),
                 ));
             }
-            return Ok(filtered);
+            return Ok(RetainedMetricRows::unreserved(filtered));
         }
     }
 
-    engine
+    load_metric_rows_with_retained_execution(engine, metric, start, end, params.execution)
+}
+
+pub(super) fn load_metric_rows_with_retained_execution(
+    engine: &Engine,
+    metric: &str,
+    start: i64,
+    end: i64,
+    execution: &QueryExecution,
+) -> Result<RetainedMetricRows> {
+    let selection = SeriesSelection::new()
+        .with_metric(metric.to_string())
+        .with_time_range(start, end);
+    let mut metadata = select_series_with_retained_execution_result(engine, &selection, execution)?;
+    if metadata.series.is_empty() {
+        return Ok(RetainedMetricRows::unreserved(Vec::new()));
+    }
+
+    let mut selectors = std::mem::take(&mut metadata.series);
+    selectors.sort_unstable_by(|left, right| {
+        left.labels
+            .cmp(&right.labels)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let accounting = engine.storage().select_many_execution_accounting();
+    let bounded =
+        engine.storage().query_budget().is_some() || execution.limits() != Default::default();
+    if bounded && accounting != QueryExecutionAccounting::Complete {
+        return Err(TsinkError::UnsupportedOperation {
+            operation: "bounded PromQL point selection",
+            reason: "storage does not provide complete select_many execution accounting"
+                .to_string(),
+        }
+        .into());
+    }
+
+    execution.checkpoint().map_err(TsinkError::from)?;
+    let mut selected = engine
         .storage()
-        .select_all_with_execution(metric, start, end, params.execution)
-        .map_err(Into::into)
+        .select_many_with_execution_result(&selectors, start, end, execution)?;
+    execution.checkpoint().map_err(TsinkError::from)?;
+    if selected.series.len() != selectors.len()
+        || selected
+            .series
+            .iter()
+            .zip(&selectors)
+            .any(|(item, selector)| item.series != *selector)
+    {
+        return Err(TsinkError::Other(
+            "PromQL batch selection returned identities or ordering outside the request"
+                .to_string(),
+        )
+        .into());
+    }
+
+    let mut result_reservation = match accounting {
+        QueryExecutionAccounting::Complete => {
+            let matched = selected.matched_selectors.take().ok_or_else(|| {
+                TsinkError::Other(
+                    "completely accounted PromQL batch selection omitted selector-existence bits"
+                        .to_string(),
+                )
+            })?;
+            if matched.len() != selectors.len() {
+                return Err(TsinkError::Other(format!(
+                    "completely accounted PromQL batch selection returned {} existence bits for {} selectors",
+                    matched.len(),
+                    selectors.len()
+                ))
+                .into());
+            }
+            let reservation = selected.take_memory_reservation().ok_or_else(|| {
+                TsinkError::Other(
+                    "completely accounted PromQL batch selection omitted its result reservation"
+                        .to_string(),
+                )
+            })?;
+            if !selected.series.is_empty() && reservation.bytes() == 0 {
+                return Err(TsinkError::Other(
+                    "completely accounted PromQL batch selection retained zero bytes for a non-empty result"
+                        .to_string(),
+                )
+                .into());
+            }
+            Some(reservation)
+        }
+        QueryExecutionAccounting::Unaccounted => None,
+    };
+
+    execution
+        .observe_intermediate_vector_size(u64::try_from(selected.series.len()).unwrap_or(u64::MAX))
+        .map_err(TsinkError::from)?;
+    let output_slots =
+        super::modeled_vec_capacity_bytes::<super::LabelPoints>(selected.series.len());
+    let mut output_reservation = execution
+        .reserve_memory(output_slots)
+        .map_err(TsinkError::from)?;
+    let mut rows = Vec::with_capacity(selected.series.len());
+    for SeriesPoints { series, points } in std::mem::take(&mut selected.series) {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        if points.is_empty() {
+            continue;
+        }
+        rows.push((series.labels, points));
+    }
+
+    let retained_bytes = super::modeled_prefetch_rows_bytes(&rows);
+    let reservation = match result_reservation.as_mut() {
+        Some(reservation) => {
+            reservation
+                .resize(retained_bytes)
+                .map_err(TsinkError::from)?;
+            drop(output_reservation);
+            result_reservation.expect("complete accounting retained a reservation")
+        }
+        None => {
+            output_reservation
+                .resize(retained_bytes)
+                .map_err(TsinkError::from)?;
+            output_reservation
+        }
+    };
+
+    Ok(RetainedMetricRows {
+        rows,
+        reservation: Some(reservation),
+    })
 }
 
 fn latest_point_as_sample(
@@ -411,21 +820,15 @@ fn has_exact_series(
     labels: &[Label],
     params: &QueryParams<'_>,
 ) -> Result<bool> {
-    let mut expected = labels.to_vec();
-    expected.sort();
-
     let mut selection = SeriesSelection::new().with_metric(metric.to_string());
     for label in labels {
         selection = selection.with_matcher(SeriesMatcher::equal(&label.name, &label.value));
     }
 
-    for series in engine
-        .storage()
-        .select_series_with_execution(&selection, params.execution)?
-    {
-        let mut labels = series.labels;
-        labels.sort();
-        if labels == expected {
+    let selected =
+        select_series_with_retained_execution_result(engine, &selection, params.execution)?;
+    for series in &selected.series {
+        if labels_equal_unordered(&series.labels, labels) {
             return Ok(true);
         }
     }
@@ -433,38 +836,10 @@ fn has_exact_series(
     Ok(false)
 }
 
-pub(crate) fn matchers_match(
-    metric: &str,
-    labels: &[Label],
-    matchers: &[crate::promql::ast::LabelMatcher],
-) -> Result<bool> {
-    for matcher in matchers {
-        let actual = if matcher.name == "__name__" {
-            metric
-        } else {
-            labels
-                .iter()
-                .find(|label| label.name == matcher.name)
-                .map(|label| label.value.as_str())
-                .unwrap_or("")
-        };
-
-        let matched = match matcher.op {
-            MatchOp::Equal => actual == matcher.value,
-            MatchOp::NotEqual => actual != matcher.value,
-            MatchOp::RegexMatch => anchored_regex(&matcher.value)?.is_match(actual),
-            MatchOp::RegexNoMatch => !anchored_regex(&matcher.value)?.is_match(actual),
-        };
-
-        if !matched {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
-}
-
-fn anchored_regex(pattern: &str) -> Result<Regex> {
-    let anchored = format!("^(?:{pattern})$");
-    Regex::new(&anchored).map_err(PromqlError::from)
+fn labels_equal_unordered(left: &[Label], right: &[Label]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|label| {
+            left.iter().filter(|candidate| *candidate == label).count()
+                == right.iter().filter(|candidate| *candidate == label).count()
+        })
 }

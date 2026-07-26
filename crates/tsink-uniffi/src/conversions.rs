@@ -894,6 +894,8 @@ impl From<tsink_core::MemoryObservabilitySnapshot> for UMemoryObservabilitySnaps
             persisted_index_bytes: usize_to_u64(snapshot.persisted_index_bytes),
             persisted_mmap_bytes: usize_to_u64(snapshot.persisted_mmap_bytes),
             tombstone_bytes: usize_to_u64(snapshot.tombstone_bytes),
+            remote_catalog_staging_bytes: usize_to_u64(snapshot.remote_catalog_staging_bytes),
+            wal_writer_buffer_bytes: usize_to_u64(snapshot.wal_writer_buffer_bytes),
             wal_series_definition_cache_bytes: usize_to_u64(
                 snapshot.wal_series_definition_cache_bytes,
             ),
@@ -1394,7 +1396,9 @@ mod tests {
     #[test]
     fn memory_snapshot_conversion_preserves_wal_cache_and_transient_accounting() {
         let snapshot = tsink_core::MemoryObservabilitySnapshot {
+            wal_writer_buffer_bytes: 512,
             wal_series_definition_cache_bytes: 1_024,
+            remote_catalog_staging_bytes: 1_536,
             write_transient_bytes: 2_048,
             peak_write_transient_bytes: 4_096,
             write_transient_reservations_total: 7,
@@ -1404,7 +1408,9 @@ mod tests {
         };
 
         let converted: UMemoryObservabilitySnapshot = snapshot.into();
+        assert_eq!(converted.wal_writer_buffer_bytes, 512);
         assert_eq!(converted.wal_series_definition_cache_bytes, 1_024);
+        assert_eq!(converted.remote_catalog_staging_bytes, 1_536);
         assert_eq!(converted.write_transient_bytes, 2_048);
         assert_eq!(converted.peak_write_transient_bytes, 4_096);
         assert_eq!(converted.write_transient_reservations_total, 7);

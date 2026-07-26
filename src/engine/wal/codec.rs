@@ -101,6 +101,83 @@ pub(super) fn decode_series_definition(payload: &[u8]) -> Result<SeriesDefinitio
     })
 }
 
+/// Validates a WAL identity frame without materializing series strings, labels, sample batches,
+/// or copied codec payloads. Recovery performs full decoding later; this read-only pass only needs
+/// to prove that the checksummed frame follows the current deterministic payload grammar.
+pub(super) fn validate_frame_payload_structure(frame_type: u8, payload: &[u8]) -> Result<()> {
+    match frame_type {
+        FRAME_TYPE_SERIES_DEF => validate_series_definition_payload_structure(payload),
+        FRAME_TYPE_SAMPLES => validate_samples_payload_structure(payload),
+        _ => Err(TsinkError::DataCorruption(format!(
+            "unknown WAL frame type {frame_type}"
+        ))),
+    }
+}
+
+fn validate_series_definition_payload_structure(payload: &[u8]) -> Result<()> {
+    let mut pos = 0usize;
+    let _series_id = read_u64(payload, &mut pos)?;
+    validate_string_u16(payload, &mut pos, "WAL series metric")?;
+    let labels_len = read_u16(payload, &mut pos)? as usize;
+    for _ in 0..labels_len {
+        validate_string_u16(payload, &mut pos, "WAL label name")?;
+        validate_string_u16(payload, &mut pos, "WAL label value")?;
+    }
+    if pos != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "series-definition payload has trailing bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_samples_payload_structure(payload: &[u8]) -> Result<()> {
+    let mut pos = 0usize;
+    let count = read_u16(payload, &mut pos)? as usize;
+    if count == 0 {
+        return Err(TsinkError::DataCorruption(
+            "WAL samples payload contains no batches".to_string(),
+        ));
+    }
+    for _ in 0..count {
+        let _series_id = read_u64(payload, &mut pos)?;
+        let _lane = decode_lane(read_u8(payload, &mut pos)?)?;
+        let _ts_codec = decode_ts_codec(read_u8(payload, &mut pos)?)?;
+        let _value_codec = decode_value_codec(read_u8(payload, &mut pos)?)?;
+        let reserved = read_u8(payload, &mut pos)?;
+        if reserved != 0 {
+            return Err(TsinkError::DataCorruption(
+                "WAL samples payload has nonzero reserved flags".to_string(),
+            ));
+        }
+        let point_count = read_u16(payload, &mut pos)?;
+        if point_count == 0 {
+            return Err(TsinkError::DataCorruption(
+                "WAL samples payload contains an empty batch".to_string(),
+            ));
+        }
+        let _base_ts = read_i64(payload, &mut pos)?;
+        let ts_len = read_u32(payload, &mut pos)? as usize;
+        let value_len = read_u32(payload, &mut pos)? as usize;
+        let _ts_payload = read_bytes(payload, &mut pos, ts_len)?;
+        let _value_payload = read_bytes(payload, &mut pos, value_len)?;
+    }
+    if pos != payload.len() {
+        return Err(TsinkError::DataCorruption(
+            "samples payload has trailing bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_string_u16(payload: &[u8], pos: &mut usize, context: &str) -> Result<()> {
+    let len = read_u16(payload, pos)? as usize;
+    let bytes = read_bytes(payload, pos, len)?;
+    std::str::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|err| TsinkError::DataCorruption(format!("{context} is not UTF-8: {err}")))
+}
+
 pub(super) fn encode_samples_payload(batches: &[SamplesBatchFrame]) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
 

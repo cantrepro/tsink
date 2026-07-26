@@ -5,19 +5,35 @@ use crate::promql::ast::{
 };
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::lexer::{Lexer, Token, TokenKind};
-use regex::Regex;
+use crate::promql::MAX_PARSE_DEPTH;
 
 pub fn parse(input: &str) -> Result<Expr> {
     let tokens = Lexer::new(input).tokenize()?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        recursion_depth: 0,
+    };
     let expr = parser.parse_expr(0)?;
     parser.expect(TokenExpect::Eof)?;
-    Ok(expr)
+    Ok(expr.expr)
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    recursion_depth: usize,
+}
+
+struct ParsedExpr {
+    expr: Expr,
+    depth: usize,
+}
+
+impl ParsedExpr {
+    fn leaf(expr: Expr) -> Self {
+        Self { expr, depth: 1 }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +68,11 @@ impl TokenExpect {
 }
 
 impl Parser {
-    fn parse_expr(&mut self, min_prec: u8) -> Result<Expr> {
+    fn parse_expr(&mut self, min_prec: u8) -> Result<ParsedExpr> {
+        self.with_additional_depth(1, |parser| parser.parse_expr_inner(min_prec))
+    }
+
+    fn parse_expr_inner(&mut self, min_prec: u8) -> Result<ParsedExpr> {
         let mut lhs = self.parse_unary()?;
 
         while let Some((op, prec, right_assoc)) = self.peek_binary_op() {
@@ -65,13 +85,18 @@ impl Parser {
             let next_min_prec = if right_assoc { prec } else { prec + 1 };
             let rhs = self.parse_expr(next_min_prec)?;
 
-            lhs = Expr::Binary(BinaryExpr {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                return_bool,
-                matching,
-            });
+            let depth = lhs.depth.max(rhs.depth).saturating_add(1);
+            self.ensure_expr_depth(depth)?;
+            lhs = ParsedExpr {
+                expr: Expr::Binary(BinaryExpr {
+                    op,
+                    lhs: Box::new(lhs.expr),
+                    rhs: Box::new(rhs.expr),
+                    return_bool,
+                    matching,
+                }),
+                depth,
+            };
         }
 
         Ok(lhs)
@@ -166,52 +191,68 @@ impl Parser {
         })
     }
 
-    fn parse_unary(&mut self) -> Result<Expr> {
-        if matches!(self.peek().kind, TokenKind::Plus) {
+    fn parse_unary(&mut self) -> Result<ParsedExpr> {
+        let mut ops = Vec::new();
+        loop {
+            let op = if matches!(self.peek().kind, TokenKind::Plus) {
+                UnaryOp::Pos
+            } else if matches!(self.peek().kind, TokenKind::Minus) {
+                UnaryOp::Neg
+            } else {
+                break;
+            };
+
+            self.ensure_additional_depth(ops.len().saturating_add(1))?;
             self.advance();
-            let expr = self.parse_unary()?;
-            return Ok(Expr::Unary(UnaryExpr {
-                op: UnaryOp::Pos,
-                expr: Box::new(expr),
-            }));
+            ops.push(op);
         }
 
-        if matches!(self.peek().kind, TokenKind::Minus) {
-            self.advance();
-            let expr = self.parse_unary()?;
-            return Ok(Expr::Unary(UnaryExpr {
-                op: UnaryOp::Neg,
-                expr: Box::new(expr),
-            }));
+        let mut expr = self.with_additional_depth(ops.len(), |parser| {
+            let expr = parser.parse_primary()?;
+            parser.parse_postfix(expr)
+        })?;
+        for op in ops.into_iter().rev() {
+            let depth = expr.depth.saturating_add(1);
+            self.ensure_expr_depth(depth)?;
+            expr = ParsedExpr {
+                expr: Expr::Unary(UnaryExpr {
+                    op,
+                    expr: Box::new(expr.expr),
+                }),
+                depth,
+            };
         }
-
-        let expr = self.parse_primary()?;
-        self.parse_postfix(expr)
+        Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr> {
+    fn parse_primary(&mut self) -> Result<ParsedExpr> {
         match self.peek().kind.clone() {
             TokenKind::Number(v) => {
                 self.advance();
-                Ok(Expr::NumberLiteral(v))
+                Ok(ParsedExpr::leaf(Expr::NumberLiteral(v)))
             }
             TokenKind::String(v) => {
                 self.advance();
-                Ok(Expr::StringLiteral(v))
+                Ok(ParsedExpr::leaf(Expr::StringLiteral(v)))
             }
             TokenKind::Inf => {
                 self.advance();
-                Ok(Expr::NumberLiteral(f64::INFINITY))
+                Ok(ParsedExpr::leaf(Expr::NumberLiteral(f64::INFINITY)))
             }
             TokenKind::Nan => {
                 self.advance();
-                Ok(Expr::NumberLiteral(f64::NAN))
+                Ok(ParsedExpr::leaf(Expr::NumberLiteral(f64::NAN)))
             }
             TokenKind::LParen => {
                 self.advance();
                 let expr = self.parse_expr(0)?;
                 self.expect(TokenExpect::RParen)?;
-                Ok(Expr::Paren(Box::new(expr)))
+                let depth = expr.depth.saturating_add(1);
+                self.ensure_expr_depth(depth)?;
+                Ok(ParsedExpr {
+                    expr: Expr::Paren(Box::new(expr.expr)),
+                    depth,
+                })
             }
             TokenKind::LBrace => self.parse_vector_selector(None),
             TokenKind::Ident(name) => {
@@ -242,7 +283,7 @@ impl Parser {
         )
     }
 
-    fn parse_aggregation(&mut self, op: AggregationOp) -> Result<Expr> {
+    fn parse_aggregation(&mut self, op: AggregationOp) -> Result<ParsedExpr> {
         let mut grouping = self.parse_grouping()?;
         self.expect(TokenExpect::LParen)?;
 
@@ -256,11 +297,11 @@ impl Parser {
                 let p = self.parse_expr(0)?;
                 self.expect(TokenExpect::Comma)?;
                 let e = self.parse_expr(0)?;
-                (Some(Box::new(p)), Box::new(e))
+                (Some(p), e)
             }
             _ => {
                 let e = self.parse_expr(0)?;
-                (None, Box::new(e))
+                (None, e)
             }
         };
 
@@ -269,12 +310,20 @@ impl Parser {
             grouping = self.parse_grouping()?;
         }
 
-        Ok(Expr::Aggregation(AggregationExpr {
-            op,
-            expr,
-            param,
-            grouping,
-        }))
+        let depth = param
+            .as_ref()
+            .map_or(expr.depth, |param| param.depth.max(expr.depth))
+            .saturating_add(1);
+        self.ensure_expr_depth(depth)?;
+        Ok(ParsedExpr {
+            expr: Expr::Aggregation(AggregationExpr {
+                op,
+                expr: Box::new(expr.expr),
+                param: param.map(|param| Box::new(param.expr)),
+                grouping,
+            }),
+            depth,
+        })
     }
 
     fn parse_grouping(&mut self) -> Result<Option<Grouping>> {
@@ -322,12 +371,15 @@ impl Parser {
         Ok(labels)
     }
 
-    fn parse_call(&mut self, func: String) -> Result<Expr> {
+    fn parse_call(&mut self, func: String) -> Result<ParsedExpr> {
         self.expect(TokenExpect::LParen)?;
         let mut args = Vec::new();
+        let mut max_arg_depth = 0usize;
         if !matches!(self.peek().kind, TokenKind::RParen) {
             loop {
-                args.push(self.parse_expr(0)?);
+                let arg = self.parse_expr(0)?;
+                max_arg_depth = max_arg_depth.max(arg.depth);
+                args.push(arg.expr);
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.advance();
                     continue;
@@ -337,14 +389,26 @@ impl Parser {
         }
         self.expect(TokenExpect::RParen)?;
 
-        Ok(Expr::Call(CallExpr { func, args }))
+        let depth = max_arg_depth.saturating_add(1);
+        self.ensure_expr_depth(depth)?;
+        Ok(ParsedExpr {
+            expr: Expr::Call(CallExpr { func, args }),
+            depth,
+        })
     }
 
-    fn parse_vector_selector(&mut self, metric_name: Option<String>) -> Result<Expr> {
+    fn parse_vector_selector(&mut self, metric_name: Option<String>) -> Result<ParsedExpr> {
         let mut matchers = Vec::new();
         if matches!(self.peek().kind, TokenKind::LBrace) {
             matchers = self.parse_label_matchers()?;
         }
+        crate::query_matcher::validate_matcher_shapes(
+            matchers.len(),
+            matchers
+                .iter()
+                .map(|matcher| (matcher.name.as_str(), matcher.value.as_str())),
+        )
+        .map_err(|error| PromqlError::Parse(error.to_string()))?;
         if metric_name.is_none() && !has_non_empty_matcher(&matchers)? {
             return Err(PromqlError::Parse(
                 "vector selector must contain a metric name or at least one matcher that does not match the empty string".to_string(),
@@ -357,10 +421,10 @@ impl Parser {
             offset: 0,
             at: None,
         };
-        Ok(Expr::VectorSelector(vector))
+        Ok(ParsedExpr::leaf(Expr::VectorSelector(vector)))
     }
 
-    fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr> {
+    fn parse_postfix(&mut self, mut expr: ParsedExpr) -> Result<ParsedExpr> {
         loop {
             if matches!(self.peek().kind, TokenKind::LBracket) {
                 expr = self.parse_bracket_postfix(expr)?;
@@ -370,14 +434,14 @@ impl Parser {
             if matches!(self.peek().kind, TokenKind::Offset) {
                 self.advance();
                 let offset = self.expect_signed_duration()?;
-                apply_offset_modifier(&mut expr, offset)?;
+                apply_offset_modifier(&mut expr.expr, offset)?;
                 continue;
             }
 
             if matches!(self.peek().kind, TokenKind::At) {
                 self.advance();
                 let at = self.parse_at_modifier()?;
-                apply_at_modifier(&mut expr, at)?;
+                apply_at_modifier(&mut expr.expr, at)?;
                 continue;
             }
 
@@ -387,7 +451,33 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_bracket_postfix(&mut self, expr: Expr) -> Result<Expr> {
+    fn ensure_additional_depth(&self, additional: usize) -> Result<()> {
+        if self.recursion_depth.saturating_add(additional) > MAX_PARSE_DEPTH {
+            return Err(parse_depth_error());
+        }
+        Ok(())
+    }
+
+    fn ensure_expr_depth(&self, depth: usize) -> Result<()> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(parse_depth_error());
+        }
+        Ok(())
+    }
+
+    fn with_additional_depth<T>(
+        &mut self,
+        additional: usize,
+        parse: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.ensure_additional_depth(additional)?;
+        self.recursion_depth += additional;
+        let result = parse(self);
+        self.recursion_depth -= additional;
+        result
+    }
+
+    fn parse_bracket_postfix(&mut self, expr: ParsedExpr) -> Result<ParsedExpr> {
         self.advance();
         let range = self.expect_duration()?;
 
@@ -400,19 +490,27 @@ impl Parser {
             };
             self.expect(TokenExpect::RBracket)?;
 
-            return Ok(Expr::Subquery(SubqueryExpr {
-                expr: Box::new(expr),
-                range,
-                step,
-                offset: 0,
-                at: None,
-            }));
+            let depth = expr.depth.saturating_add(1);
+            self.ensure_expr_depth(depth)?;
+            return Ok(ParsedExpr {
+                expr: Expr::Subquery(SubqueryExpr {
+                    expr: Box::new(expr.expr),
+                    range,
+                    step,
+                    offset: 0,
+                    at: None,
+                }),
+                depth,
+            });
         }
 
         self.expect(TokenExpect::RBracket)?;
-        match expr {
+        match expr.expr {
             Expr::VectorSelector(vector) => {
-                Ok(Expr::MatrixSelector(MatrixSelector { vector, range }))
+                Ok(ParsedExpr::leaf(Expr::MatrixSelector(MatrixSelector {
+                    vector,
+                    range,
+                })))
             }
             other => Err(PromqlError::Type(format!(
                 "range selectors can only apply to vectors, got {other:?}"
@@ -622,6 +720,12 @@ impl Parser {
     }
 }
 
+fn parse_depth_error() -> PromqlError {
+    PromqlError::Parse(format!(
+        "PromQL query exceeds the parse depth limit of {MAX_PARSE_DEPTH}"
+    ))
+}
+
 fn has_non_empty_matcher(matchers: &[LabelMatcher]) -> Result<bool> {
     for matcher in matchers {
         if !label_matcher_matches_empty(matcher)? {
@@ -640,9 +744,12 @@ fn label_matcher_matches_empty(matcher: &LabelMatcher) -> Result<bool> {
     }
 }
 
-fn anchored_regex(pattern: &str) -> Result<Regex> {
-    let anchored = format!("^(?:{pattern})$");
-    Regex::new(&anchored).map_err(PromqlError::from)
+fn anchored_regex(pattern: &str) -> Result<regex::Regex> {
+    crate::query_matcher::build_bounded_regex(
+        pattern,
+        crate::query_matcher::RegexAnchoring::Anchored,
+    )
+    .map_err(|error| PromqlError::Regex(error.to_string()))
 }
 
 fn apply_offset_modifier(expr: &mut Expr, offset: i64) -> Result<()> {
@@ -762,8 +869,12 @@ fn merge_vector_matching(
 #[cfg(test)]
 mod tests {
     use crate::promql::ast::{AggregationOp, BinaryOp, Expr, MatchOp};
+    use crate::{
+        MAX_QUERY_REGEX_DIAGNOSTIC_BYTES, MAX_SERIES_MATCHER_VALUE_BYTES,
+        MAX_SERIES_SELECTION_MATCHERS, QUERY_REGEX_NEST_LIMIT,
+    };
 
-    use super::parse;
+    use super::{parse, PromqlError};
 
     #[test]
     fn parses_selector_and_matrix_with_offset() {
@@ -817,5 +928,49 @@ mod tests {
             }
             other => panic!("unexpected expr: {other:?}"),
         }
+    }
+
+    fn selector_with_matcher_count(count: usize) -> String {
+        let matchers = (0..count)
+            .map(|index| format!("label_{index}=\"\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("metric{{{matchers}}}")
+    }
+
+    #[test]
+    fn promql_matcher_shape_limits_accept_exact_boundaries_and_reject_one_over() {
+        assert!(parse(&selector_with_matcher_count(MAX_SERIES_SELECTION_MATCHERS)).is_ok());
+        assert!(matches!(
+            parse(&selector_with_matcher_count(
+                MAX_SERIES_SELECTION_MATCHERS + 1
+            )),
+            Err(PromqlError::Parse(_))
+        ));
+
+        let exact_value = format!(
+            "metric{{label=\"{}\"}}",
+            "v".repeat(MAX_SERIES_MATCHER_VALUE_BYTES)
+        );
+        assert!(parse(&exact_value).is_ok());
+        let one_over_value = format!(
+            "metric{{label=\"{}\"}}",
+            "v".repeat(MAX_SERIES_MATCHER_VALUE_BYTES + 1)
+        );
+        assert!(matches!(parse(&one_over_value), Err(PromqlError::Parse(_))));
+    }
+
+    #[test]
+    fn promql_regex_diagnostic_is_bounded_and_does_not_echo_pattern() {
+        let pattern = format!(
+            "{}private-promql-marker{}",
+            "(".repeat(QUERY_REGEX_NEST_LIMIT as usize + 1),
+            ")".repeat(QUERY_REGEX_NEST_LIMIT as usize + 1)
+        );
+        let error = parse(&format!("{{label=~\"{pattern}\"}}"))
+            .expect_err("over-nested PromQL regex must fail");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.len() <= MAX_QUERY_REGEX_DIAGNOSTIC_BYTES);
+        assert!(!diagnostic.contains("private-promql-marker"));
     }
 }

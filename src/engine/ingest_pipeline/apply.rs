@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::super::super::{
     Result, SamplesBatchFrame, SeriesId, SeriesValueFamily, TsinkError, Value, ValueLane,
-    WriteApplyContext, WriteSeriesValidationContext,
+    WriteApplyContext, WriteSeriesValidationContext, WriteTransientMemoryReservation,
 };
 use super::super::lane_name;
 use super::phases::{
@@ -99,10 +99,12 @@ impl<'a> WriteApplier<'a> {
             Err(err) => return Err(Box::new((staged, err))),
         };
 
+        let transient_memory = staged.prepared.resolved.transient_memory.clone();
         if let Err(err) = self.engine.shard_mutation.ingest_pending_points(
             self.engine.memory,
             self.engine.publication,
             std::mem::take(&mut staged.prepared.resolved.pending_points),
+            &transient_memory,
         ) {
             return Err(Box::new((staged, err)));
         }
@@ -296,6 +298,7 @@ impl<'a> WriteApplier<'a> {
     pub(super) fn ingest_replayed_pending_points(
         &self,
         pending_points: Vec<PendingPoint>,
+        transient_memory: &WriteTransientMemoryReservation,
     ) -> Result<()> {
         if pending_points.is_empty() {
             return Ok(());
@@ -318,8 +321,10 @@ impl<'a> WriteApplier<'a> {
             .engine
             .shard_mutation
             .reserve_series_lanes(self.engine.memory, &pending_points)?;
-        // Recovery is replaying already-committed WAL writes, so it must rebuild the in-memory
-        // state without re-running admission-control or retention rejections from live ingest.
+        // Recovery is replaying already-committed WAL writes, so it rebuilds the in-memory state
+        // without re-running live policy/rate or retention admission. The finite write-transient
+        // reservation still applies so active-state reconstruction cannot bypass the configured
+        // storage-memory envelope.
         let assigned_series_families = match self
             .engine
             .registry
@@ -338,6 +343,7 @@ impl<'a> WriteApplier<'a> {
             self.engine.memory,
             self.engine.publication,
             pending_points,
+            transient_memory,
         ) {
             self.engine
                 .registry

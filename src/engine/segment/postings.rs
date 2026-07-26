@@ -1,16 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct SegmentPostingsIndex {
     pub(crate) series_postings: RoaringTreemap,
     pub(crate) metric_postings: BTreeMap<String, RoaringTreemap>,
     pub(crate) label_name_postings: BTreeMap<String, RoaringTreemap>,
     pub(crate) label_postings: BTreeMap<(String, String), RoaringTreemap>,
-    missing_label_postings_cache: Arc<RwLock<BTreeMap<String, RoaringTreemap>>>,
 }
 
 impl SegmentPostingsIndex {
@@ -47,21 +44,13 @@ impl SegmentPostingsIndex {
                 .saturating_add(label_value.capacity())
                 .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
         }
-        for (label_name, series_ids) in self.missing_label_postings_cache.read().iter() {
-            bytes = bytes
-                .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>())
-                .saturating_add(label_name.capacity())
-                .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
-        }
         bytes
     }
 
     /// Measures only the postings entries that a bounded persisted-index mutation can change.
     ///
     /// `series_postings` is included because every series insertion/removal can change it. The
-    /// missing-label cache is also included in full: such a mutation invalidates the entire cache,
-    /// and clearing that cache already has work proportional to its entries. The remaining maps
-    /// are measured only at the exact metric/label keys named by the mutation.
+    /// remaining maps are measured only at the exact metric/label keys named by the mutation.
     pub(crate) fn scoped_memory_usage_bytes(
         &self,
         metrics: &BTreeSet<String>,
@@ -94,12 +83,6 @@ impl SegmentPostingsIndex {
                     .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
             }
         }
-        for (label_name, series_ids) in self.missing_label_postings_cache.read().iter() {
-            bytes = bytes
-                .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>())
-                .saturating_add(label_name.capacity())
-                .saturating_add(Self::bitmap_memory_usage_bytes(series_ids));
-        }
         bytes
     }
 
@@ -108,27 +91,11 @@ impl SegmentPostingsIndex {
     }
 
     pub(crate) fn missing_label_postings_for_name(&self, label_name: &str) -> RoaringTreemap {
-        if let Some(cached) = self
-            .missing_label_postings_cache
-            .read()
-            .get(label_name)
-            .cloned()
-        {
-            return cached;
-        }
-
         let mut missing = self.series_postings.clone();
         if let Some(present) = self.label_name_postings.get(label_name) {
             missing -= present;
         }
-        self.missing_label_postings_cache
-            .write()
-            .insert(label_name.to_string(), missing.clone());
         missing
-    }
-
-    pub(crate) fn clear_missing_label_postings_cache(&self) {
-        self.missing_label_postings_cache.write().clear();
     }
 
     pub(crate) fn series_id_postings_for_label_name(
@@ -165,5 +132,40 @@ impl SegmentPostingsIndex {
             }
             visitor(label_value, series_ids);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_label_postings_are_query_transient_and_reflect_mutation_without_invalidation() {
+        let mut postings = SegmentPostingsIndex::default();
+        postings.series_postings.extend([1, 2, 3]);
+        postings
+            .label_name_postings
+            .insert("job".to_string(), [1].into_iter().collect());
+
+        let before_query = postings.memory_usage_bytes();
+        assert_eq!(
+            postings
+                .missing_label_postings_for_name("job")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(postings.memory_usage_bytes(), before_query);
+
+        postings.series_postings.insert(4);
+        let before_refresh = postings.memory_usage_bytes();
+        assert_eq!(
+            postings
+                .missing_label_postings_for_name("job")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(postings.memory_usage_bytes(), before_refresh);
     }
 }

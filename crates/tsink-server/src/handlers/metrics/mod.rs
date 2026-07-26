@@ -11,6 +11,7 @@ struct MetricsCollectionError {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_metrics(
     storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
     exemplar_store: &Arc<ExemplarStore>,
     rules_runtime: Option<&RulesRuntime>,
     server_start: Instant,
@@ -75,6 +76,35 @@ pub(super) fn render_metrics(
     let read_admission_metrics = admission::read_admission_metrics_snapshot();
     let write_admission_metrics = admission::write_admission_metrics_snapshot();
     let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
+    let metadata_store_metrics = match metadata_store.metrics_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("metrics collection error in metric_metadata_store: {err}");
+            collection_errors.push(MetricsCollectionError {
+                collector: "metric_metadata_store",
+            });
+            MetricMetadataStoreMetricsSnapshot {
+                limits: metadata_store.config(),
+                entries: 0,
+                retained_bytes: 0,
+                peak_retained_bytes: 0,
+                durable_file_bytes: 0,
+                transient_bytes: 0,
+                peak_transient_bytes: 0,
+                query_result_bytes: 0,
+                peak_query_result_bytes: 0,
+                rejections_total: 0,
+                entry_rejections_total: 0,
+                record_rejections_total: 0,
+                update_batch_rejections_total: 0,
+                retained_rejections_total: 0,
+                durable_file_rejections_total: 0,
+                transient_rejections_total: 0,
+                query_rejections_total: 0,
+                persistence_rejections_total: 0,
+            }
+        }
+    };
     let exemplar_metrics = match exemplar_store.metrics_snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -91,6 +121,7 @@ pub(super) fn render_metrics(
                 query_exemplars_total: 0,
                 stored_series: 0,
                 stored_exemplars: 0,
+                ..ExemplarStoreMetricsSnapshot::default()
             }
         }
     };
@@ -164,6 +195,12 @@ pub(super) fn render_metrics(
          # HELP tsink_memory_tombstone_bytes Estimated budgeted bytes used by tombstone state\n\
          # TYPE tsink_memory_tombstone_bytes gauge\n\
          tsink_memory_tombstone_bytes {memory_tombstones}\n\
+         # HELP tsink_memory_remote_catalog_staging_bytes Modeled budgeted bytes retained by finite catalog reader and read-write publication staging\n\
+         # TYPE tsink_memory_remote_catalog_staging_bytes gauge\n\
+         tsink_memory_remote_catalog_staging_bytes {memory_remote_catalog_staging}\n\
+         # HELP tsink_memory_wal_writer_buffer_bytes Budgeted bytes retained by the live WAL writer buffer\n\
+         # TYPE tsink_memory_wal_writer_buffer_bytes gauge\n\
+         tsink_memory_wal_writer_buffer_bytes {memory_wal_writer_buffer}\n\
          # HELP tsink_memory_wal_series_definition_cache_bytes Modeled budgeted bytes retained by the WAL series-definition cache\n\
          # TYPE tsink_memory_wal_series_definition_cache_bytes gauge\n\
          tsink_memory_wal_series_definition_cache_bytes {memory_wal_series_definition_cache}\n\
@@ -195,7 +232,7 @@ pub(super) fn render_metrics(
          # HELP tsink_memory_backpressure_events_total Writes that entered modeled storage-memory backpressure\n\
          # TYPE tsink_memory_backpressure_events_total counter\n\
          tsink_memory_backpressure_events_total {memory_backpressure_events_total}\n\
-         # HELP tsink_memory_rejections_total Writes rejected by the modeled storage-memory budget\n\
+         # HELP tsink_memory_rejections_total Modeled storage-memory admissions rejected with MemoryBudgetExceeded\n\
          # TYPE tsink_memory_rejections_total counter\n\
          tsink_memory_rejections_total {memory_rejections_total}\n\
          # HELP tsink_series_total Number of known metric series\n\
@@ -579,6 +616,8 @@ pub(super) fn render_metrics(
         memory_persisted_index = memory_obs.persisted_index_bytes,
         memory_persisted_mmap = memory_obs.persisted_mmap_bytes,
         memory_tombstones = memory_obs.tombstone_bytes,
+        memory_remote_catalog_staging = memory_obs.remote_catalog_staging_bytes,
+        memory_wal_writer_buffer = memory_obs.wal_writer_buffer_bytes,
         memory_wal_series_definition_cache = memory_obs.wal_series_definition_cache_bytes,
         memory_write_transient = memory_obs.write_transient_bytes,
         memory_write_transient_peak = memory_obs.peak_write_transient_bytes,
@@ -749,7 +788,13 @@ pub(super) fn render_metrics(
     );
     append_cluster_audit_metrics(&mut body, &cluster_audit_health);
     append_cluster_control_persistence_metrics(&mut body, &cluster_control_persistence);
-    append_exemplar_metrics(&mut body, &exemplar_metrics, exemplar_store.config());
+    append_metric_metadata_store_metrics(&mut body, &metadata_store_metrics);
+    append_exemplar_metrics(
+        &mut body,
+        &exemplar_metrics,
+        exemplar_store.config(),
+        exemplar_store.resource_limits(),
+    );
     append_rules_metrics(&mut body, &rules_snapshot);
     append_rollup_metrics(&mut body, &obs.rollups, &obs.query);
     append_cardinality_metrics(&mut body, &obs.cardinality);
@@ -1607,6 +1652,133 @@ fn append_rules_metrics(body: &mut String, snapshot: &rules::RulesStatusSnapshot
         "tsink_rules_runtime_limits{{kind=\"max_alert_instances_per_rule\"}} {}\n",
         snapshot.max_alert_instances_per_rule
     ));
+    body.push_str(
+        "# HELP tsink_rules_store_limits Finite rules sidecar count and byte limits\n\
+         # TYPE tsink_rules_store_limits gauge\n",
+    );
+    for (kind, value) in [
+        ("max_groups", snapshot.store_limits.max_groups),
+        (
+            "max_rules_per_group",
+            snapshot.store_limits.max_rules_per_group,
+        ),
+        ("max_rules_total", snapshot.store_limits.max_rules_total),
+        (
+            "max_alert_instances_per_rule",
+            snapshot.store_limits.max_alert_instances_per_rule,
+        ),
+        (
+            "max_labels_per_set",
+            snapshot.store_limits.max_labels_per_set,
+        ),
+        (
+            "max_label_set_bytes",
+            snapshot.store_limits.max_label_set_bytes,
+        ),
+        ("max_name_bytes", snapshot.store_limits.max_name_bytes),
+        (
+            "max_expression_bytes",
+            snapshot.store_limits.max_expression_bytes,
+        ),
+        (
+            "max_annotation_bytes",
+            snapshot.store_limits.max_annotation_bytes,
+        ),
+        (
+            "max_total_retained_state_bytes",
+            snapshot.store_limits.max_total_retained_state_bytes,
+        ),
+        (
+            "max_durable_file_bytes",
+            snapshot.store_limits.max_durable_file_bytes,
+        ),
+        (
+            "max_startup_transient_bytes",
+            snapshot.store_limits.max_startup_transient_bytes,
+        ),
+        (
+            "max_replacement_transient_bytes",
+            snapshot.store_limits.max_replacement_transient_bytes,
+        ),
+        (
+            "max_runtime_update_transient_bytes",
+            snapshot.store_limits.max_runtime_update_transient_bytes,
+        ),
+        (
+            "max_snapshot_status_bytes",
+            snapshot.store_limits.max_snapshot_status_bytes,
+        ),
+    ] {
+        body.push_str(&format!(
+            "tsink_rules_store_limits{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_rules_store_bytes Current modeled rules sidecar bytes\n\
+         # TYPE tsink_rules_store_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_rules_store_bytes{{kind=\"retained_state\"}} {}\n",
+        snapshot.metrics.retained_state_bytes
+    ));
+    body.push_str(&format!(
+        "tsink_rules_store_bytes{{kind=\"durable_file\"}} {}\n",
+        snapshot.metrics.durable_file_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_rules_store_peak_bytes Peak modeled rules sidecar bytes by bounded operation\n\
+         # TYPE tsink_rules_store_peak_bytes gauge\n",
+    );
+    for (kind, value) in [
+        ("retained_state", snapshot.metrics.peak_retained_state_bytes),
+        (
+            "startup_transient",
+            snapshot.metrics.peak_startup_transient_bytes,
+        ),
+        (
+            "replacement_transient",
+            snapshot.metrics.peak_replacement_transient_bytes,
+        ),
+        (
+            "runtime_update_transient",
+            snapshot.metrics.peak_runtime_update_transient_bytes,
+        ),
+        (
+            "snapshot_status",
+            snapshot.metrics.peak_snapshot_status_bytes,
+        ),
+        ("snapshot_file", snapshot.metrics.peak_snapshot_file_bytes),
+    ] {
+        body.push_str(&format!(
+            "tsink_rules_store_peak_bytes{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_rules_store_rejections_total Rules sidecar limit rejections by bounded operation\n\
+         # TYPE tsink_rules_store_rejections_total counter\n",
+    );
+    for (kind, value) in [
+        ("all", snapshot.metrics.limit_rejections_total),
+        ("startup", snapshot.metrics.startup_rejections_total),
+        ("replacement", snapshot.metrics.replacement_rejections_total),
+        (
+            "runtime_update",
+            snapshot.metrics.runtime_update_rejections_total,
+        ),
+        ("snapshot", snapshot.metrics.snapshot_rejections_total),
+    ] {
+        body.push_str(&format!(
+            "tsink_rules_store_rejections_total{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_rules_store_persistence_failures_total Rules sidecar durable write failures\n\
+         # TYPE tsink_rules_store_persistence_failures_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_rules_store_persistence_failures_total {}\n",
+        snapshot.metrics.persistence_failures_total
+    ));
 }
 
 fn append_rollup_metrics(
@@ -1777,10 +1949,97 @@ fn append_rollup_metrics(
     }
 }
 
+fn append_metric_metadata_store_metrics(
+    body: &mut String,
+    snapshot: &MetricMetadataStoreMetricsSnapshot,
+) {
+    body.push_str(
+        "# HELP tsink_metric_metadata_store_entries Metric-family metadata records retained by the sidecar store\n\
+         # TYPE tsink_metric_metadata_store_entries gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_metric_metadata_store_entries {}\n",
+        snapshot.entries
+    ));
+    body.push_str(
+        "# HELP tsink_metric_metadata_store_memory_bytes Modeled current and peak heap bytes owned by metric-metadata operations\n\
+         # TYPE tsink_metric_metadata_store_memory_bytes gauge\n",
+    );
+    for (kind, bytes) in [
+        ("retained", snapshot.retained_bytes),
+        ("peak_retained", snapshot.peak_retained_bytes),
+        ("transient", snapshot.transient_bytes),
+        ("peak_transient", snapshot.peak_transient_bytes),
+        ("query_result", snapshot.query_result_bytes),
+        ("peak_query_result", snapshot.peak_query_result_bytes),
+    ] {
+        body.push_str(&format!(
+            "tsink_metric_metadata_store_memory_bytes{{kind=\"{kind}\"}} {bytes}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_metric_metadata_store_durable_file_bytes Bytes in the current durable metric-metadata sidecar file\n\
+         # TYPE tsink_metric_metadata_store_durable_file_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_metric_metadata_store_durable_file_bytes {}\n",
+        snapshot.durable_file_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_metric_metadata_store_rejections_total Metric-metadata operations rejected by bounded-resource category\n\
+         # TYPE tsink_metric_metadata_store_rejections_total counter\n",
+    );
+    for (reason, count) in [
+        ("all", snapshot.rejections_total),
+        ("entry", snapshot.entry_rejections_total),
+        ("record", snapshot.record_rejections_total),
+        ("update_batch", snapshot.update_batch_rejections_total),
+        ("retained", snapshot.retained_rejections_total),
+        ("durable_file", snapshot.durable_file_rejections_total),
+        ("transient", snapshot.transient_rejections_total),
+        ("query", snapshot.query_rejections_total),
+        ("persistence", snapshot.persistence_rejections_total),
+    ] {
+        body.push_str(&format!(
+            "tsink_metric_metadata_store_rejections_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_metric_metadata_store_limit Configured hard limits for the metric-metadata sidecar\n\
+         # TYPE tsink_metric_metadata_store_limit gauge\n",
+    );
+    for (kind, limit) in [
+        ("entries", snapshot.limits.max_entries),
+        ("record_bytes", snapshot.limits.max_record_bytes),
+        (
+            "update_batch_entries",
+            snapshot.limits.max_update_batch_entries,
+        ),
+        ("update_batch_bytes", snapshot.limits.max_update_batch_bytes),
+        ("retained_bytes", snapshot.limits.max_retained_bytes),
+        ("durable_file_bytes", snapshot.limits.max_durable_file_bytes),
+        (
+            "startup_transient_bytes",
+            snapshot.limits.max_startup_transient_bytes,
+        ),
+        (
+            "write_transient_bytes",
+            snapshot.limits.max_write_transient_bytes,
+        ),
+        ("query_records", snapshot.limits.max_query_records),
+        ("query_result_bytes", snapshot.limits.max_query_result_bytes),
+    ] {
+        body.push_str(&format!(
+            "tsink_metric_metadata_store_limit{{kind=\"{kind}\"}} {limit}\n"
+        ));
+    }
+}
+
 fn append_exemplar_metrics(
     body: &mut String,
     snapshot: &ExemplarStoreMetricsSnapshot,
     config: ExemplarStoreConfig,
+    resource_limits: crate::exemplar_store::ExemplarStoreResourceLimits,
 ) {
     body.push_str(
         "# HELP tsink_exemplars_accepted_total Exemplars accepted into the bounded exemplar store\n\
@@ -1843,6 +2102,61 @@ fn append_exemplar_metrics(
         snapshot.stored_exemplars
     ));
     body.push_str(
+        "# HELP tsink_exemplar_store_memory_bytes Current and peak modeled bytes owned by exemplar-store state and operations\n\
+         # TYPE tsink_exemplar_store_memory_bytes gauge\n",
+    );
+    for (kind, bytes) in [
+        ("retained", snapshot.retained_bytes),
+        ("peak_retained", snapshot.peak_retained_bytes),
+        ("transient", snapshot.transient_bytes),
+        ("peak_transient", snapshot.peak_transient_bytes),
+    ] {
+        body.push_str(&format!(
+            "tsink_exemplar_store_memory_bytes{{kind=\"{kind}\"}} {bytes}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_exemplar_store_durable_file_bytes Current and peak bytes in the durable exemplar sidecar file\n\
+         # TYPE tsink_exemplar_store_durable_file_bytes gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_exemplar_store_durable_file_bytes{{kind=\"current\"}} {}\n",
+        snapshot.durable_file_bytes
+    ));
+    body.push_str(&format!(
+        "tsink_exemplar_store_durable_file_bytes{{kind=\"peak\"}} {}\n",
+        snapshot.peak_durable_file_bytes
+    ));
+    body.push_str(
+        "# HELP tsink_exemplar_store_resource_rejections_total Exemplar-store operations rejected by bounded-resource category\n\
+         # TYPE tsink_exemplar_store_resource_rejections_total counter\n",
+    );
+    for (reason, count) in [
+        ("all", snapshot.resource_rejections_total),
+        ("shape", snapshot.shape_rejections_total),
+        ("batch", snapshot.batch_rejections_total),
+        ("retained", snapshot.retained_rejections_total),
+        ("transient", snapshot.transient_rejections_total),
+        ("durable", snapshot.durable_rejections_total),
+        ("startup", snapshot.startup_rejections_total),
+        ("snapshot", snapshot.snapshot_rejections_total),
+    ] {
+        body.push_str(&format!(
+            "tsink_exemplar_store_resource_rejections_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP tsink_exemplar_store_last_rejection Last stable exemplar-store rejection code observed by this live store\n\
+         # TYPE tsink_exemplar_store_last_rejection gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_exemplar_store_last_rejection{{code=\"{}\"}} 1\n",
+        snapshot.last_rejection_code.map_or(
+            "none",
+            crate::exemplar_store::ExemplarStoreErrorCode::as_str
+        )
+    ));
+    body.push_str(
         "# HELP tsink_exemplar_limits Configured exemplar request, query, and storage guardrails\n\
          # TYPE tsink_exemplar_limits gauge\n",
     );
@@ -1866,6 +2180,81 @@ fn append_exemplar_metrics(
         "tsink_exemplar_limits{{kind=\"max_query_selectors\"}} {}\n",
         config.max_query_selectors
     ));
+    for (kind, limit) in [
+        (
+            "max_total_series",
+            u64::try_from(resource_limits.max_total_series).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_metric_name_bytes",
+            u64::try_from(resource_limits.max_metric_name_bytes).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_labels_per_series",
+            u64::try_from(resource_limits.max_labels_per_series).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_labels_per_exemplar",
+            u64::try_from(resource_limits.max_labels_per_exemplar).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_label_name_bytes",
+            u64::try_from(resource_limits.max_label_name_bytes).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_label_value_bytes",
+            u64::try_from(resource_limits.max_label_value_bytes).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_series_identity_bytes",
+            u64::try_from(resource_limits.max_series_identity_bytes).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_exemplar_label_bytes",
+            u64::try_from(resource_limits.max_exemplar_label_bytes).unwrap_or(u64::MAX),
+        ),
+        (
+            "max_retained_bytes",
+            resource_limits.max_total_retained_bytes,
+        ),
+        (
+            "max_update_batch_bytes",
+            resource_limits.max_update_batch_bytes,
+        ),
+        (
+            "max_write_transient_bytes",
+            resource_limits.max_write_transient_bytes,
+        ),
+        (
+            "max_replacement_peak_bytes",
+            resource_limits.max_replacement_peak_bytes,
+        ),
+        (
+            "max_persistence_serialization_bytes",
+            resource_limits.max_persistence_serialization_bytes,
+        ),
+        (
+            "max_durable_file_bytes",
+            resource_limits.max_durable_file_bytes,
+        ),
+        (
+            "max_startup_transient_bytes",
+            resource_limits.max_startup_transient_bytes,
+        ),
+        ("max_snapshot_bytes", resource_limits.max_snapshot_bytes),
+        (
+            "max_snapshot_transient_bytes",
+            resource_limits.max_snapshot_transient_bytes,
+        ),
+        (
+            "max_concurrent_transient_bytes",
+            resource_limits.max_concurrent_transient_bytes,
+        ),
+    ] {
+        body.push_str(&format!(
+            "tsink_exemplar_limits{{kind=\"{kind}\"}} {limit}\n"
+        ));
+    }
 }
 
 fn append_prometheus_payload_metrics(
@@ -2691,6 +3080,72 @@ mod tests {
         assert!(body.contains("tsink_series_creation_admitted_total 11\n"));
         assert!(body.contains("tsink_series_creation_committed_total 9\n"));
         assert!(body.contains("tsink_series_creation_rejections_total 3\n"));
+    }
+
+    #[test]
+    fn exemplar_metrics_render_resource_ownership_limits_and_stable_rejection_code() {
+        let mut body = String::new();
+        append_exemplar_metrics(
+            &mut body,
+            &ExemplarStoreMetricsSnapshot {
+                retained_bytes: 101,
+                peak_retained_bytes: 202,
+                durable_file_bytes: 303,
+                peak_durable_file_bytes: 404,
+                transient_bytes: 0,
+                peak_transient_bytes: 505,
+                resource_rejections_total: 8,
+                shape_rejections_total: 1,
+                batch_rejections_total: 2,
+                retained_rejections_total: 3,
+                transient_rejections_total: 4,
+                durable_rejections_total: 5,
+                startup_rejections_total: 6,
+                snapshot_rejections_total: 7,
+                last_rejection_code: Some(
+                    crate::exemplar_store::ExemplarStoreErrorCode::RetainedBytes,
+                ),
+                ..ExemplarStoreMetricsSnapshot::default()
+            },
+            ExemplarStoreConfig {
+                max_total_exemplars: 11,
+                max_exemplars_per_series: 12,
+                max_exemplars_per_request: 13,
+                max_query_results: 14,
+                max_query_selectors: 15,
+            },
+            crate::exemplar_store::ExemplarStoreResourceLimits {
+                max_total_series: 16,
+                max_total_retained_bytes: 17,
+                max_update_batch_bytes: 18,
+                max_write_transient_bytes: 19,
+                max_replacement_peak_bytes: 20,
+                max_persistence_serialization_bytes: 21,
+                max_durable_file_bytes: 22,
+                max_startup_transient_bytes: 23,
+                max_snapshot_bytes: 24,
+                max_snapshot_transient_bytes: 25,
+                max_concurrent_transient_bytes: 26,
+                ..crate::exemplar_store::ExemplarStoreResourceLimits::default()
+            },
+        );
+
+        for expected in [
+            "tsink_exemplar_store_memory_bytes{kind=\"retained\"} 101\n",
+            "tsink_exemplar_store_memory_bytes{kind=\"peak_retained\"} 202\n",
+            "tsink_exemplar_store_memory_bytes{kind=\"transient\"} 0\n",
+            "tsink_exemplar_store_memory_bytes{kind=\"peak_transient\"} 505\n",
+            "tsink_exemplar_store_durable_file_bytes{kind=\"current\"} 303\n",
+            "tsink_exemplar_store_durable_file_bytes{kind=\"peak\"} 404\n",
+            "tsink_exemplar_store_resource_rejections_total{reason=\"all\"} 8\n",
+            "tsink_exemplar_store_resource_rejections_total{reason=\"snapshot\"} 7\n",
+            "tsink_exemplar_store_last_rejection{code=\"exemplar_retained_bytes_limit\"} 1\n",
+            "tsink_exemplar_limits{kind=\"max_total_series\"} 16\n",
+            "tsink_exemplar_limits{kind=\"max_retained_bytes\"} 17\n",
+            "tsink_exemplar_limits{kind=\"max_concurrent_transient_bytes\"} 26\n",
+        ] {
+            assert!(body.contains(expected), "missing metric line: {expected}");
+        }
     }
 
     #[test]

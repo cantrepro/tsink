@@ -63,12 +63,36 @@ impl ChunkStorage {
         );
     }
 
+    pub(in super::super) fn set_metadata_matcher_regex_compile_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(
+            &self.persist_test_hooks.metadata_matcher_regex_compile_hook,
+            hook,
+        );
+    }
+
     pub(in super::super) fn set_metadata_live_series_pre_prune_hook<F>(&self, hook: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
         super::set_commit_hook(
             &self.persist_test_hooks.metadata_live_series_pre_prune_hook,
+            hook,
+        );
+    }
+
+    pub(in super::super) fn set_metadata_live_series_post_remove_pre_unpublish_hook<F>(
+        &self,
+        hook: F,
+    ) where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(
+            &self
+                .persist_test_hooks
+                .metadata_live_series_post_remove_pre_unpublish_hook,
             hook,
         );
     }
@@ -155,8 +179,20 @@ impl ChunkStorage {
         super::clear_commit_hook(&self.persist_test_hooks.metadata_direct_candidate_scan_hook);
     }
 
+    pub(in super::super) fn clear_metadata_matcher_regex_compile_hook(&self) {
+        super::clear_commit_hook(&self.persist_test_hooks.metadata_matcher_regex_compile_hook);
+    }
+
     pub(in super::super) fn clear_metadata_live_series_pre_prune_hook(&self) {
         super::clear_commit_hook(&self.persist_test_hooks.metadata_live_series_pre_prune_hook);
+    }
+
+    pub(in super::super) fn clear_metadata_live_series_post_remove_pre_unpublish_hook(&self) {
+        super::clear_commit_hook(
+            &self
+                .persist_test_hooks
+                .metadata_live_series_post_remove_pre_unpublish_hook,
+        );
     }
 
     pub(in super::super) fn clear_metadata_visibility_refresh_post_preflight_hook(&self) {
@@ -259,6 +295,10 @@ impl ChunkStorage {
 
     pub(in super::super) fn invoke_metadata_direct_candidate_scan_hook(&self) {
         super::invoke_commit_hook(&self.persist_test_hooks.metadata_direct_candidate_scan_hook);
+    }
+
+    pub(in super::super) fn invoke_metadata_matcher_regex_compile_hook(&self) {
+        super::invoke_commit_hook(&self.persist_test_hooks.metadata_matcher_regex_compile_hook);
     }
 
     pub(in super::super) fn invoke_metadata_time_range_summary_hook(&self) {

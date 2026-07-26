@@ -17,13 +17,7 @@ pub(crate) async fn handle_admin_rules_apply(
         Err(err) => return text_response(400, &err),
     };
     match rules_runtime.apply_groups(groups) {
-        Ok(snapshot) => json_response(
-            200,
-            &json!({
-                "status": "success",
-                "data": snapshot,
-            }),
-        ),
+        Ok(snapshot) => rules_snapshot_response(rules_runtime, snapshot),
         Err(err) => rules_apply_error_response(err),
     }
 }
@@ -47,13 +41,7 @@ pub(crate) async fn handle_admin_rules_run(rules_runtime: Option<&RulesRuntime>)
         return text_response(503, "rules runtime is not available");
     };
     match rules_runtime.trigger_run().await {
-        Ok(snapshot) => json_response(
-            200,
-            &json!({
-                "status": "success",
-                "data": snapshot,
-            }),
-        ),
+        Ok(snapshot) => rules_snapshot_response(rules_runtime, snapshot),
         Err(RulesRunTriggerError::AlreadyRunning) => {
             text_response(409, "rules scheduler is already running")
         }
@@ -70,14 +58,18 @@ pub(crate) async fn handle_admin_rules_status(
         return text_response(503, "rules runtime is not available");
     };
     match rules_runtime.snapshot() {
-        Ok(snapshot) => json_response(
-            200,
-            &json!({
-                "status": "success",
-                "data": snapshot,
-            }),
-        ),
+        Ok(snapshot) => rules_snapshot_response(rules_runtime, snapshot),
         Err(err) => text_response(500, &format!("rules status failed: {err}")),
+    }
+}
+
+fn rules_snapshot_response(
+    rules_runtime: &RulesRuntime,
+    mut snapshot: rules::RulesStatusSnapshot,
+) -> HttpResponse {
+    match rules_runtime.encode_success_snapshot(&mut snapshot) {
+        Ok(body) => HttpResponse::new(200, body).with_header("Content-Type", "application/json"),
+        Err(err) => text_response(500, &format!("rules status serialization failed: {err}")),
     }
 }
 

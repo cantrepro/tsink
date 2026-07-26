@@ -7,10 +7,11 @@ use crate::engine::query::TieredQueryPlan;
 use crate::engine::series::SeriesId;
 use crate::query_matcher::CompiledSeriesMatcher;
 use crate::storage::{
-    MetadataShardScope, QueryRowsPage, QueryRowsScanOptions, ShardWindowDigest,
-    ShardWindowRowsPage, ShardWindowScanOptions,
+    MetadataShardScope, QueryRowsExecutionResult, QueryRowsPage, QueryRowsScanOptions,
+    ShardWindowDigest, ShardWindowRowsExecutionResult, ShardWindowRowsPage, ShardWindowScanOptions,
 };
-use crate::{DataPoint, Label, MetricSeries, Result, SeriesSelection};
+use crate::value::modeled_query_value_payload_bytes;
+use crate::{DataPoint, Label, MetricSeries, Result, Row, SeriesSelection, TsinkError, Value};
 
 use super::core_impl::VisibilityCacheReadContext;
 use super::query_read::{
@@ -83,7 +84,7 @@ impl ChunkStorage {
         execution.charge_samples_scanned(samples_scanned)?;
         let returned = saturating_u64_from_usize(points.len());
         execution.observe_intermediate_vector_size(returned)?;
-        let bytes = modeled_points_bytes(points);
+        let bytes = modeled_points_returned_bytes(points);
         execution.charge_samples_returned(returned)?;
         execution.charge_returned_bytes(bytes)?;
         Ok(())
@@ -102,7 +103,6 @@ impl ChunkStorage {
         let size = saturating_u64_from_usize(series.len());
         execution.observe_intermediate_vector_size(size)?;
         let bytes = modeled_metric_series_bytes(series);
-        let _reservation = execution.reserve_memory(bytes)?;
         execution.charge_returned_bytes(bytes)?;
         Ok(())
     }
@@ -116,21 +116,8 @@ impl ChunkStorage {
     ) -> Result<()> {
         execution.checkpoint()?;
         execution.charge_samples_returned(1)?;
-        execution.charge_returned_bytes(modeled_row_parts_bytes(metric, labels, point))?;
+        execution.charge_returned_bytes(modeled_row_parts_returned_bytes(metric, labels, point))?;
         Ok(())
-    }
-
-    pub(in crate::engine::storage_engine) fn reserve_rows_materialization(
-        &self,
-        execution: &QueryExecution,
-        metric: &str,
-        labels: &[Label],
-        points: &[DataPoint],
-    ) -> Result<crate::QueryMemoryReservation> {
-        let bytes = points.iter().fold(0u64, |bytes, point| {
-            bytes.saturating_add(modeled_row_parts_bytes(metric, labels, point))
-        });
-        execution.reserve_memory(bytes).map_err(Into::into)
     }
 
     pub(in crate::engine::storage_engine) fn count_existing_series(
@@ -223,6 +210,14 @@ pub(super) fn modeled_points_bytes(points: &[DataPoint]) -> u64 {
     })
 }
 
+pub(super) fn modeled_points_returned_bytes(points: &[DataPoint]) -> u64 {
+    points.iter().fold(0u64, |bytes, point| {
+        bytes
+            .saturating_add(u64::try_from(std::mem::size_of::<DataPoint>()).unwrap_or(u64::MAX))
+            .saturating_add(modeled_query_value_payload_bytes(&point.value))
+    })
+}
+
 /// Fixed allocator/slack allowance used by the query-memory model for one non-empty heap
 /// collection allocation.
 ///
@@ -254,6 +249,16 @@ pub(super) fn modeled_vec_capacity_bytes<T>(capacity: usize) -> u64 {
     }
 }
 
+pub(super) fn modeled_vec_growth_capacity_upper(elements: usize) -> usize {
+    if elements == 0 {
+        return 0;
+    }
+    elements
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .max(4)
+}
+
 pub(super) fn modeled_points_retained_bytes(points: &Vec<DataPoint>) -> u64 {
     modeled_vec_capacity_bytes::<DataPoint>(points.capacity()).saturating_add(points.iter().fold(
         0u64,
@@ -279,7 +284,7 @@ pub(super) fn modeled_point_result_upper_bound_bytes(points: &[DataPoint], eleme
     saturating_u64_from_usize(elements)
         .saturating_mul(u64::try_from(std::mem::size_of::<DataPoint>()).unwrap_or(u64::MAX))
         .saturating_add(points.iter().fold(0u64, |bytes, point| {
-            bytes.saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX))
+            bytes.saturating_add(modeled_query_value_payload_bytes(&point.value))
         }))
 }
 
@@ -352,17 +357,136 @@ pub(super) fn modeled_metric_series_shape_retained_bytes(
         .saturating_mul(2)
         .saturating_mul(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES);
     metric_allocation
-        .saturating_add(modeled_vec_capacity_bytes::<Label>(label_count))
+        .saturating_add(modeled_vec_capacity_bytes::<Label>(
+            modeled_vec_growth_capacity_upper(label_count),
+        ))
         .saturating_add(saturating_u64_from_usize(label_text_bytes))
         .saturating_add(label_string_allocations)
 }
 
-fn modeled_row_parts_bytes(metric: &str, labels: &[Label], point: &DataPoint) -> u64 {
+pub(super) fn modeled_string_capacity_bytes(capacity: usize) -> u64 {
+    if capacity == 0 {
+        0
+    } else {
+        saturating_u64_from_usize(capacity)
+            .saturating_add(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_value_retained_bytes(value: &Value) -> u64 {
+    let heap_bytes = u64::try_from(value_heap_bytes(value)).unwrap_or(u64::MAX);
+    match value {
+        Value::Bytes(bytes) => heap_bytes.saturating_add(if bytes.capacity() != 0 {
+            QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES
+        } else {
+            0
+        }),
+        Value::String(text) => heap_bytes.saturating_add(if text.capacity() != 0 {
+            QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES
+        } else {
+            0
+        }),
+        Value::Histogram(histogram) => {
+            let vector_allocations = [
+                histogram.negative_spans.capacity(),
+                histogram.negative_deltas.capacity(),
+                histogram.negative_counts.capacity(),
+                histogram.positive_spans.capacity(),
+                histogram.positive_deltas.capacity(),
+                histogram.positive_counts.capacity(),
+                histogram.custom_values.capacity(),
+            ]
+            .into_iter()
+            .filter(|capacity| *capacity != 0)
+            .count();
+            heap_bytes.saturating_add(
+                saturating_u64_from_usize(vector_allocations.saturating_add(1))
+                    .saturating_mul(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+            )
+        }
+        Value::F64(_) | Value::I64(_) | Value::U64(_) | Value::Bool(_) => 0,
+    }
+}
+
+pub(super) fn modeled_metric_series_retained_bytes(series: &MetricSeries) -> u64 {
+    modeled_string_capacity_bytes(series.name.capacity())
+        .saturating_add(modeled_vec_capacity_bytes::<Label>(
+            series.labels.capacity(),
+        ))
+        .saturating_add(series.labels.iter().fold(0u64, |bytes, label| {
+            bytes
+                .saturating_add(modeled_string_capacity_bytes(label.name.capacity()))
+                .saturating_add(modeled_string_capacity_bytes(label.value.capacity()))
+        }))
+}
+
+fn modeled_row_owned_retained_bytes(row: &Row) -> u64 {
+    modeled_string_capacity_bytes(row.metric_capacity())
+        .saturating_add(modeled_vec_capacity_bytes::<Label>(row.labels_capacity()))
+        .saturating_add(row.labels().iter().fold(0u64, |bytes, label| {
+            bytes
+                .saturating_add(modeled_string_capacity_bytes(label.name.capacity()))
+                .saturating_add(modeled_string_capacity_bytes(label.value.capacity()))
+        }))
+        .saturating_add(modeled_value_retained_bytes(&row.data_point().value))
+}
+
+fn modeled_row_parts_retained_upper_bytes(
+    metric: &String,
+    labels: &Vec<Label>,
+    point: &DataPoint,
+) -> u64 {
+    modeled_string_capacity_bytes(metric.capacity())
+        .saturating_add(modeled_vec_capacity_bytes::<Label>(labels.capacity()))
+        .saturating_add(labels.iter().fold(0u64, |bytes, label| {
+            bytes
+                .saturating_add(modeled_string_capacity_bytes(label.name.capacity()))
+                .saturating_add(modeled_string_capacity_bytes(label.value.capacity()))
+        }))
+        .saturating_add(modeled_value_retained_bytes(&point.value))
+}
+
+fn modeled_rows_append_upper_bytes(
+    rows: &Vec<Row>,
+    metric: &String,
+    labels: &Vec<Label>,
+    points: &[DataPoint],
+) -> u64 {
+    let next_len = rows.len().saturating_add(points.len());
+    let row_capacity = rows
+        .capacity()
+        .max(modeled_vec_growth_capacity_upper(next_len));
+    modeled_vec_capacity_bytes::<Row>(row_capacity)
+        .saturating_add(rows.iter().fold(0u64, |bytes, row| {
+            bytes.saturating_add(modeled_row_owned_retained_bytes(row))
+        }))
+        .saturating_add(points.iter().fold(0u64, |bytes, point| {
+            bytes.saturating_add(modeled_row_parts_retained_upper_bytes(
+                metric, labels, point,
+            ))
+        }))
+}
+
+/// Returns the complete retained-memory model for an owned query row vector.
+///
+/// This is public so execution-aware adapters can verify that a backend claiming complete
+/// accounting retained a reservation for every live allocation in its returned page.
+#[doc(hidden)]
+#[must_use]
+pub fn modeled_query_rows_retained_bytes(rows: &Vec<Row>) -> u64 {
+    modeled_vec_capacity_bytes::<Row>(rows.capacity()).saturating_add(
+        rows.iter().fold(0u64, |bytes, row| {
+            bytes.saturating_add(modeled_row_owned_retained_bytes(row))
+        }),
+    )
+}
+
+fn modeled_row_parts_returned_bytes(metric: &str, labels: &[Label], point: &DataPoint) -> u64 {
     u64::try_from(std::mem::size_of::<crate::Row>())
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(metric.len()).unwrap_or(u64::MAX))
         .saturating_add(modeled_labels_bytes(labels))
-        .saturating_add(modeled_points_bytes(std::slice::from_ref(point)))
+        .saturating_add(modeled_points_returned_bytes(std::slice::from_ref(point)))
 }
 
 const SHARD_WINDOW_FNV_OFFSET_BASIS: u64 = crate::storage::SHARD_WINDOW_FNV_OFFSET_BASIS;
@@ -384,11 +508,7 @@ fn validate_query_rows_scan_options(options: QueryRowsScanOptions) -> Result<()>
     crate::storage::validate_query_rows_scan_options(options)
 }
 
-fn shard_window_series_identity_key(metric: &str, labels: &[Label]) -> String {
-    crate::storage::shard_window_series_identity_key(metric, labels)
-}
-
-fn shard_window_hash_data_point(point: &DataPoint) -> u64 {
+fn shard_window_hash_data_point(point: &DataPoint) -> Result<u64> {
     crate::storage::shard_window_hash_data_point(point)
 }
 
@@ -396,6 +516,88 @@ fn shard_window_fnv1a_update(hash: &mut u64, bytes: &[u8]) {
     crate::storage::shard_window_fnv1a_update(hash, bytes)
 }
 
-fn sort_data_points_for_shard_window(points: &mut [DataPoint]) {
-    crate::storage::sort_data_points_for_shard_window(points)
+struct ShardWindowSortablePoint {
+    point: DataPoint,
+    json_key: Vec<u8>,
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("JSON byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn shard_window_value_json_bytes(value: &Value) -> Result<usize> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
+}
+
+pub(super) fn sort_data_points_for_shard_window_with_execution(
+    points: &mut Vec<DataPoint>,
+    execution: &QueryExecution,
+) -> Result<()> {
+    execution.checkpoint()?;
+    execution.observe_intermediate_vector_size(u64::try_from(points.len()).unwrap_or(u64::MAX))?;
+
+    let pair_capacity = modeled_vec_growth_capacity_upper(points.len());
+    let mut scratch_bytes = modeled_vec_capacity_bytes::<ShardWindowSortablePoint>(pair_capacity);
+    for point in points.iter() {
+        execution.checkpoint()?;
+        let json_bytes = shard_window_value_json_bytes(&point.value)?;
+        scratch_bytes = scratch_bytes.saturating_add(modeled_vec_capacity_bytes::<u8>(
+            modeled_vec_growth_capacity_upper(json_bytes),
+        ));
+    }
+
+    let mut scratch_reservation = execution.reserve_memory(scratch_bytes)?;
+    let point_count = points.len();
+    let mut sortable = Vec::with_capacity(point_count);
+    for point in points.drain(..) {
+        execution.checkpoint()?;
+        let json_bytes = shard_window_value_json_bytes(&point.value)?;
+        let mut json_key = Vec::with_capacity(json_bytes);
+        serde_json::to_writer(&mut json_key, &point.value)?;
+        if json_key.len() != json_bytes {
+            return Err(TsinkError::Other(
+                "shard-window JSON key length changed during serialization".to_string(),
+            ));
+        }
+        sortable.push(ShardWindowSortablePoint { point, json_key });
+    }
+
+    let actual_scratch_bytes = modeled_vec_capacity_bytes::<ShardWindowSortablePoint>(
+        sortable.capacity(),
+    )
+    .saturating_add(sortable.iter().fold(0u64, |bytes, item| {
+        bytes.saturating_add(modeled_vec_capacity_bytes::<u8>(item.json_key.capacity()))
+    }));
+    scratch_reservation.resize(actual_scratch_bytes)?;
+
+    execution.checkpoint()?;
+    sortable.sort_unstable_by(|left, right| {
+        left.point
+            .timestamp
+            .cmp(&right.point.timestamp)
+            .then_with(|| left.json_key.cmp(&right.json_key))
+    });
+    execution.checkpoint()?;
+    for item in sortable {
+        execution.checkpoint()?;
+        points.push(item.point);
+    }
+    Ok(())
 }

@@ -75,8 +75,14 @@ pub(super) async fn route_request(
             handle_internal_select_series(storage, &request, internal_api, cluster_context).await
         }
         ("POST", "/internal/v1/query_exemplars") => {
-            handle_internal_query_exemplars(exemplar_store, &request, internal_api, cluster_context)
-                .await
+            handle_internal_query_exemplars(
+                storage,
+                exemplar_store,
+                &request,
+                internal_api,
+                cluster_context,
+            )
+            .await
         }
         ("GET" | "POST", "/internal/v1/list_metrics") => {
             handle_internal_list_metrics(storage, &request, internal_api, cluster_context).await
@@ -140,6 +146,7 @@ pub(super) async fn route_request(
         }
         ("GET", "/metrics") => handle_metrics(
             storage,
+            metadata_store,
             exemplar_store,
             rules_runtime,
             server_start,
@@ -195,6 +202,7 @@ pub(super) async fn route_request(
         }
         ("GET", "/api/v1/metadata") => {
             handle_metadata(
+                storage,
                 metadata_store,
                 &request,
                 tenant_registry,
@@ -205,6 +213,7 @@ pub(super) async fn route_request(
         }
         ("GET" | "POST", "/api/v1/query_exemplars") => {
             handle_query_exemplars(
+                storage,
                 exemplar_store,
                 &request,
                 timestamp_precision,
@@ -285,6 +294,7 @@ pub(super) async fn route_request(
         ("GET", "/api/v1/status/tsdb") => {
             handle_tsdb_status(
                 storage,
+                metadata_store,
                 exemplar_store,
                 &request,
                 cluster_context,
@@ -314,6 +324,7 @@ pub(super) async fn route_request(
         ("GET", "/api/v1/admin/support_bundle") if admin_api_enabled => {
             handle_admin_support_bundle(
                 storage,
+                metadata_store,
                 exemplar_store,
                 rules_runtime,
                 &request,

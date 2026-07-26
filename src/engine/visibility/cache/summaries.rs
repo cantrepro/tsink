@@ -3,12 +3,29 @@ use super::*;
 struct VisibilityRefreshQueryBudget<'a> {
     execution: &'a QueryExecution,
     retained_staging_bytes: u64,
+    active_tombstone_union_bytes: u64,
     reservation: &'a mut crate::QueryMemoryReservation,
 }
 
 impl VisibilityRefreshQueryBudget<'_> {
     fn checkpoint(&self) -> Result<()> {
         self.execution.checkpoint().map_err(Into::into)
+    }
+
+    fn admit_tombstone_union(&mut self, range_count: usize) -> Result<()> {
+        self.execution
+            .observe_intermediate_vector_size(u64::try_from(range_count).unwrap_or(u64::MAX))?;
+        self.active_tombstone_union_bytes =
+            super::super::super::query_exec::modeled_vec_capacity_bytes::<tombstone::TombstoneRange>(
+                range_count,
+            );
+        let required = self
+            .retained_staging_bytes
+            .saturating_add(self.active_tombstone_union_bytes);
+        if required > self.reservation.bytes() {
+            self.reservation.resize(required)?;
+        }
+        Ok(())
     }
 
     fn admit_actual_range_rebuild(&mut self, raw_ranges: usize) -> Result<()> {
@@ -24,15 +41,32 @@ impl VisibilityRefreshQueryBudget<'_> {
             )
             .saturating_mul(2)
             .saturating_add(4096);
-        let required = self.retained_staging_bytes.saturating_add(scratch_bytes);
+        let required = self
+            .retained_staging_bytes
+            .saturating_add(self.active_tombstone_union_bytes)
+            .saturating_add(scratch_bytes);
         if required > self.reservation.bytes() {
             self.reservation.resize(required)?;
         }
         Ok(())
     }
+
+    fn finish_tombstone_union(&mut self) {
+        self.active_tombstone_union_bytes = 0;
+    }
 }
 
 impl ChunkStorage {
+    fn visibility_query_id_vector_bytes(series_count: u64, copies: u64) -> u64 {
+        let series_count = usize::try_from(series_count).unwrap_or(usize::MAX);
+        crate::engine::storage_engine::query_exec::modeled_vec_capacity_bytes::<SeriesId>(
+            crate::engine::storage_engine::query_exec::modeled_vec_growth_capacity_upper(
+                series_count,
+            ),
+        )
+        .saturating_mul(copies)
+    }
+
     pub(in crate::engine::storage_engine) fn missing_visibility_summary_series_ids<I>(
         &self,
         series_ids: I,
@@ -74,49 +108,70 @@ impl ChunkStorage {
         })
     }
 
-    fn repair_max_bounded_observed_timestamp_from_cache(
+    fn partition_series_by_retention_for_query<I>(
         &self,
-        bounded_cache: &HashMap<SeriesId, Option<i64>>,
-    ) {
-        let repaired = bounded_cache
-            .values()
-            .copied()
-            .flatten()
-            .max()
-            .unwrap_or(i64::MIN);
-        self.visibility
-            .max_bounded_observed_timestamp
-            .store(repaired, Ordering::Release);
+        series_ids: I,
+        retention_cutoff: i64,
+        execution: &QueryExecution,
+    ) -> Result<(Vec<SeriesId>, Vec<SeriesId>)>
+    where
+        I: IntoIterator<Item = SeriesId>,
+    {
+        self.with_series_visibility_summaries(|summaries| {
+            let mut live = Vec::new();
+            let mut dead = Vec::new();
+            for series_id in series_ids {
+                execution.checkpoint()?;
+                if summaries
+                    .get(&series_id)
+                    .and_then(|summary| summary.latest_visible_timestamp)
+                    .is_some_and(|latest| latest >= retention_cutoff)
+                {
+                    live.push(series_id);
+                } else {
+                    dead.push(series_id);
+                }
+            }
+            Ok((live, dead))
+        })
     }
 
-    fn series_visibility_summary_map_memory_usage_bytes(
-        summaries: &HashMap<SeriesId, SeriesVisibilitySummary>,
+    pub(in crate::engine::storage_engine) fn series_visibility_summary_payload_bytes(
+        summary: &SeriesVisibilitySummary,
     ) -> usize {
-        let mut bytes =
-            Self::hash_map_memory_usage_bytes::<SeriesId, SeriesVisibilitySummary>(summaries);
-        for summary in summaries.values() {
-            bytes = bytes.saturating_add(
-                summary
-                    .ranges
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<SeriesVisibilityRangeSummary>()),
-            );
-        }
-        bytes
+        summary
+            .ranges
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SeriesVisibilityRangeSummary>())
+    }
+
+    pub(in crate::engine::storage_engine) fn series_visibility_state_map_memory_usage_bytes(
+        summaries: &HashMap<SeriesId, SeriesVisibilitySummary>,
+        cache: &HashMap<SeriesId, Option<i64>>,
+        bounded_cache: &HashMap<SeriesId, Option<i64>>,
+        epochs: &HashMap<SeriesId, u64>,
+    ) -> usize {
+        Self::hash_map_memory_usage_bytes(summaries)
+            .saturating_add(Self::hash_map_memory_usage_bytes(cache))
+            .saturating_add(Self::hash_map_memory_usage_bytes(bounded_cache))
+            .saturating_add(Self::hash_map_memory_usage_bytes(epochs))
     }
 
     pub(in crate::engine::storage_engine) fn series_visibility_state_memory_usage_bytes(
         summaries: &HashMap<SeriesId, SeriesVisibilitySummary>,
         cache: &HashMap<SeriesId, Option<i64>>,
         bounded_cache: &HashMap<SeriesId, Option<i64>>,
+        epochs: &HashMap<SeriesId, u64>,
     ) -> usize {
-        Self::series_visibility_summary_map_memory_usage_bytes(summaries)
-            .saturating_add(Self::hash_map_memory_usage_bytes::<SeriesId, Option<i64>>(
-                cache,
-            ))
-            .saturating_add(Self::hash_map_memory_usage_bytes::<SeriesId, Option<i64>>(
-                bounded_cache,
-            ))
+        Self::series_visibility_state_map_memory_usage_bytes(
+            summaries,
+            cache,
+            bounded_cache,
+            epochs,
+        )
+        .saturating_add(summaries.values().fold(0usize, |bytes, summary| {
+            bytes.saturating_add(Self::series_visibility_summary_payload_bytes(summary))
+        }))
     }
 
     fn normalize_series_visibility_ranges(ranges: &mut Vec<SeriesVisibilityRangeSummary>) {
@@ -316,52 +371,64 @@ impl ChunkStorage {
         // The caller holds recency_state_lock from before it snapshots active/sealed state. Ingest
         // publishes points before taking that lock to merge timestamps, so it either precedes
         // this rebuild and is included or follows this replacement and merges afterward.
-        let current_bounded = self
-            .visibility
-            .max_bounded_observed_timestamp
-            .load(Ordering::Acquire);
-        let mut repair_needed = false;
-        let mut next_bounded = current_bounded;
+        let mut next_bounded = i64::MIN;
         let mut summaries = self.visibility.series_visibility_summaries.write();
         let mut cache = self.visibility.series_visible_max_timestamps.write();
         let mut bounded_cache = self
             .visibility
             .series_visible_bounded_max_timestamps
             .write();
-        self.with_visibility_state_memory_delta(
-            &mut summaries,
-            &mut cache,
-            &mut bounded_cache,
-            |summaries, cache, bounded_cache| {
-                for (series_id, summary) in updates {
-                    let latest = summary.latest_visible_timestamp;
-                    let latest_bounded = summary.latest_bounded_visible_timestamp;
-                    let previous_bounded = bounded_cache.get(&series_id).copied().flatten();
-                    if previous_bounded == Some(current_bounded)
-                        && latest_bounded.unwrap_or(i64::MIN) < current_bounded
-                    {
-                        repair_needed = true;
-                    }
-
-                    summaries.insert(series_id, summary);
-                    cache.insert(series_id, latest);
-                    bounded_cache.insert(series_id, latest_bounded);
-                    if let Some(latest_bounded) = latest_bounded {
-                        next_bounded = next_bounded.max(latest_bounded);
-                    }
-                }
-            },
+        let mut epochs = self.visibility.series_visibility_cache_epochs.write();
+        let current_epoch = self.remote_tombstone_epoch();
+        let map_bytes_before = Self::series_visibility_state_map_memory_usage_bytes(
+            &summaries,
+            &cache,
+            &bounded_cache,
+            &epochs,
+        );
+        let mut payload_bytes_before = 0usize;
+        let mut payload_bytes_after = 0usize;
+        for (series_id, summary) in updates {
+            #[cfg(test)]
+            self.visibility
+                .visibility_cache_accounting_entries_visited
+                .fetch_add(1, Ordering::AcqRel);
+            let latest = summary.latest_visible_timestamp;
+            let latest_bounded = summary.latest_bounded_visible_timestamp;
+            payload_bytes_before = payload_bytes_before.saturating_add(
+                summaries
+                    .get(&series_id)
+                    .map_or(0, Self::series_visibility_summary_payload_bytes),
+            );
+            payload_bytes_after = payload_bytes_after
+                .saturating_add(Self::series_visibility_summary_payload_bytes(&summary));
+            summaries.insert(series_id, summary);
+            cache.insert(series_id, latest);
+            bounded_cache.insert(series_id, latest_bounded);
+            epochs.insert(series_id, current_epoch);
+            if let Some(latest_bounded) = latest_bounded {
+                next_bounded = next_bounded.max(latest_bounded);
+            }
+        }
+        let map_bytes_after = Self::series_visibility_state_map_memory_usage_bytes(
+            &summaries,
+            &cache,
+            &bounded_cache,
+            &epochs,
+        );
+        self.account_included_memory_component_delta_bytes(
+            &self.memory.metadata_used_bytes,
+            map_bytes_before.saturating_add(payload_bytes_before),
+            map_bytes_after.saturating_add(payload_bytes_after),
         );
 
         drop(summaries);
         drop(cache);
 
-        if repair_needed {
-            self.repair_max_bounded_observed_timestamp_from_cache(&bounded_cache);
-        } else if next_bounded != current_bounded {
+        if next_bounded != i64::MIN {
             self.visibility
                 .max_bounded_observed_timestamp
-                .store(next_bounded, Ordering::Release);
+                .fetch_max(next_bounded, Ordering::AcqRel);
         }
         self.bump_live_series_pruning_generation();
     }
@@ -373,38 +440,52 @@ impl ChunkStorage {
         I: IntoIterator<Item = SeriesId>,
     {
         let _recency_guard = self.visibility.recency_state_lock.lock();
-        let current_bounded = self
-            .visibility
-            .max_bounded_observed_timestamp
-            .load(Ordering::Acquire);
-        let mut repair_needed = false;
         let mut summaries = self.visibility.series_visibility_summaries.write();
         let mut cache = self.visibility.series_visible_max_timestamps.write();
         let mut bounded_cache = self
             .visibility
             .series_visible_bounded_max_timestamps
             .write();
-        self.with_visibility_state_memory_delta(
-            &mut summaries,
-            &mut cache,
-            &mut bounded_cache,
-            |summaries, cache, bounded_cache| {
-                for series_id in series_ids {
-                    summaries.remove(&series_id);
-                    cache.remove(&series_id);
-                    if bounded_cache.remove(&series_id).flatten() == Some(current_bounded) {
-                        repair_needed = true;
-                    }
-                }
-            },
+        let mut epochs = self.visibility.series_visibility_cache_epochs.write();
+        let map_bytes_before = Self::series_visibility_state_map_memory_usage_bytes(
+            &summaries,
+            &cache,
+            &bounded_cache,
+            &epochs,
+        );
+        let mut payload_bytes_before = 0usize;
+        for series_id in series_ids {
+            #[cfg(test)]
+            self.visibility
+                .visibility_cache_accounting_entries_visited
+                .fetch_add(1, Ordering::AcqRel);
+            if let Some(summary) = summaries.remove(&series_id) {
+                payload_bytes_before = payload_bytes_before
+                    .saturating_add(Self::series_visibility_summary_payload_bytes(&summary));
+            }
+            cache.remove(&series_id);
+            epochs.remove(&series_id);
+            bounded_cache.remove(&series_id);
+        }
+        let map_bytes_after = Self::series_visibility_state_map_memory_usage_bytes(
+            &summaries,
+            &cache,
+            &bounded_cache,
+            &epochs,
+        );
+        self.account_included_memory_component_delta_bytes(
+            &self.memory.metadata_used_bytes,
+            map_bytes_before.saturating_add(payload_bytes_before),
+            map_bytes_after,
         );
 
         drop(summaries);
         drop(cache);
 
-        if repair_needed {
-            self.repair_max_bounded_observed_timestamp_from_cache(&bounded_cache);
-        }
+        // This aggregate is deliberately a monotonic upper bound. Keeping a removed or
+        // epoch-stale bounded timestamp can temporarily reject additional old writes, but it
+        // cannot admit a write that violates retention. Recomputing it here would turn a
+        // one-series cache mutation into an unbounded scan of stale physical cache entries.
         self.bump_live_series_pruning_generation();
     }
 
@@ -435,6 +516,8 @@ impl ChunkStorage {
         include_id_vectors: bool,
     ) -> Result<(usize, usize, usize)> {
         let persisted_index = self.persisted.persisted_index.read();
+        let local_tombstones = self.visibility.tombstones.read();
+        let remote_tombstones = self.visibility.remote_tombstones.read();
         let mut changed_count = 0usize;
         let mut retained_updates = 0usize;
         let mut largest_series_rebuild = 0usize;
@@ -447,14 +530,23 @@ impl ChunkStorage {
             let active_ranges = {
                 let active = self.active_shard(series_id).read();
                 if let Some(state) = active.get(&series_id) {
-                    let mut count = 0usize;
-                    for _ in state.points_in_partition_order() {
-                        if let Some(execution) = execution {
+                    if let Some(execution) = execution {
+                        let mut count = 0usize;
+                        for _ in state.points_in_partition_order() {
                             execution.checkpoint()?;
+                            count = count.saturating_add(1);
                         }
-                        count = count.saturating_add(1);
+                        count
+                    } else {
+                        let count = state.point_count();
+                        #[cfg(test)]
+                        assert_eq!(
+                            count,
+                            state.points_in_partition_order().count(),
+                            "constant-time active-point accounting must match traversal",
+                        );
+                        count
                     }
-                    count
                 } else {
                     0
                 }
@@ -490,13 +582,26 @@ impl ChunkStorage {
             let raw_ranges = active_ranges
                 .saturating_add(sealed_ranges)
                 .saturating_add(persisted_ranges);
-            largest_intermediate_vector = largest_intermediate_vector.max(raw_ranges);
+            let tombstone_union_ranges = match (
+                local_tombstones.get(&series_id),
+                remote_tombstones.ranges(series_id),
+            ) {
+                (Some(local), Some(remote)) => local.len().saturating_add(remote.len()),
+                _ => 0,
+            };
+            largest_intermediate_vector = largest_intermediate_vector
+                .max(raw_ranges)
+                .max(tombstone_union_ranges);
             // Normalization can hold the source and merged vectors together. The retained
             // summary is capped, but the source scan is not, so charge its exact item count.
             largest_series_rebuild = largest_series_rebuild.max(
                 raw_ranges
                     .saturating_mul(std::mem::size_of::<SeriesVisibilityRangeSummary>())
                     .saturating_mul(2)
+                    .saturating_add(
+                        tombstone_union_ranges
+                            .saturating_mul(std::mem::size_of::<tombstone::TombstoneRange>()),
+                    )
                     .saturating_add(4096),
             );
             retained_updates = retained_updates.saturating_add(
@@ -554,9 +659,65 @@ impl ChunkStorage {
             Some(&mut VisibilityRefreshQueryBudget {
                 execution,
                 retained_staging_bytes: u64::try_from(retained_staging_bytes).unwrap_or(u64::MAX),
+                active_tombstone_union_bytes: 0,
                 reservation: &mut reservation,
             }),
         )
+    }
+
+    pub(in crate::engine::storage_engine) fn refresh_missing_visibility_summaries_for_query(
+        &self,
+        series_ids: &RoaringTreemap,
+        execution: &QueryExecution,
+    ) -> Result<()> {
+        execution.checkpoint()?;
+        let series_count = series_ids.len();
+        execution.observe_intermediate_vector_size(series_count)?;
+        // The missing-ID collection is allocated before the detailed refresh can inspect it.
+        // Admit its worst-case growth first; the refresh accounts its update, cache, and
+        // per-series range-rebuild staging separately while this reservation remains live.
+        let _missing_ids_reservation =
+            execution.reserve_memory(Self::visibility_query_id_vector_bytes(series_count, 1))?;
+        let missing_series_ids = self.missing_visibility_summary_series_ids(series_ids.iter());
+        if !missing_series_ids.is_empty() {
+            self.refresh_series_visible_timestamp_cache_for_query(missing_series_ids, execution)?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::engine::storage_engine) fn live_series_postings_for_query(
+        &self,
+        series_ids: RoaringTreemap,
+        prune_dead: bool,
+        execution: &QueryExecution,
+    ) -> Result<RoaringTreemap> {
+        execution.checkpoint()?;
+        if series_ids.is_empty() {
+            return Ok(RoaringTreemap::new());
+        }
+
+        let series_count = series_ids.len();
+        execution.observe_intermediate_vector_size(series_count)?;
+        self.refresh_missing_visibility_summaries_for_query(&series_ids, execution)?;
+
+        // Retention partitioning can hold the live and dead ID vectors together. The candidate
+        // bitmap reservation covers the input and output postings, but not these owned vectors.
+        // Keep this guard through stable dead-series pruning, whose removal path can reuse one
+        // vector lifetime for its companion result.
+        let _partition_reservation =
+            execution.reserve_memory(Self::visibility_query_id_vector_bytes(series_count, 2))?;
+        execution.checkpoint()?;
+        let generation_before = prune_dead.then(|| self.live_series_pruning_generation());
+        let retention_cutoff = self.active_retention_cutoff().unwrap_or(i64::MIN);
+        let (live_series_ids, dead_series_ids) =
+            self.partition_series_by_retention_for_query(series_ids, retention_cutoff, execution)?;
+        execution.checkpoint()?;
+        let live_series_ids = live_series_ids.into_iter().collect();
+
+        self.prune_dead_materialized_series_ids_if_stable(dead_series_ids, generation_before);
+        execution.checkpoint()?;
+
+        Ok(live_series_ids)
     }
 
     pub(in crate::engine::storage_engine) fn refresh_series_visible_timestamp_cache_locked<I>(
@@ -591,7 +752,8 @@ impl ChunkStorage {
         }
 
         let _recency_guard = self.visibility.recency_state_lock.lock();
-        let tombstones = self.visibility.tombstones.read();
+        let local_tombstones = self.visibility.tombstones.read();
+        let remote_tombstones = self.visibility.remote_tombstones.read();
         let persisted_index = self.persisted.persisted_index.read();
         let bounded_cutoff = self.current_future_skew_cutoff();
         let mut updates = Vec::with_capacity(series_ids.len());
@@ -600,18 +762,37 @@ impl ChunkStorage {
             if let Some(query_budget) = query_budget.as_deref() {
                 query_budget.checkpoint()?;
             }
+            let local_ranges = local_tombstones.get(&series_id).map(Vec::as_slice);
+            let remote_ranges = remote_tombstones.ranges(series_id);
+            let merged_ranges;
+            let tombstone_ranges = match (local_ranges, remote_ranges) {
+                (None, None) => None,
+                (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
+                (Some(local), Some(remote)) => {
+                    if let Some(query_budget) = query_budget.as_deref_mut() {
+                        query_budget
+                            .admit_tombstone_union(local.len().saturating_add(remote.len()))?;
+                    }
+                    merged_ranges = tombstone::union_normalized_tombstone_ranges(local, remote);
+                    Some(merged_ranges.as_slice())
+                }
+            };
             let summary = self.rebuild_series_visibility_summary_locked(
                 series_id,
                 &persisted_index,
-                tombstones.get(&series_id).map(Vec::as_slice),
+                tombstone_ranges,
                 bounded_cutoff,
                 query_budget.as_deref_mut(),
             )?;
+            if let Some(query_budget) = query_budget.as_deref_mut() {
+                query_budget.finish_tombstone_union();
+            }
             updates.push((series_id, summary));
         }
 
         drop(persisted_index);
-        drop(tombstones);
+        drop(remote_tombstones);
+        drop(local_tombstones);
 
         if let Some(query_budget) = query_budget.as_deref() {
             query_budget.checkpoint()?;

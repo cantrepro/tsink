@@ -78,6 +78,59 @@ fn persist_to_path_returns_error_when_parent_sync_fails() {
 }
 
 #[test]
+fn snapshot_registry_encoder_admits_exact_modeled_peak_before_allocation() {
+    let registry = SeriesRegistry::new();
+    for index in 0..32 {
+        registry
+            .resolve_or_insert(
+                "cpu",
+                &[
+                    Label::new("host", format!("host-{index}")),
+                    Label::new("region", format!("region-{}", index % 4)),
+                ],
+            )
+            .unwrap();
+    }
+
+    let mut required = 0usize;
+    let bytes = registry
+        .encoded_registry_bytes_for_snapshot_with_admission(|modeled| {
+            required = modeled;
+            Ok(())
+        })
+        .expect("exact modeled peak should be admitted");
+    assert!(required >= bytes.capacity());
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("snapshot-series-index.bin");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        SeriesRegistry::load_from_path(&path)
+            .unwrap()
+            .series_count(),
+        registry.series_count()
+    );
+
+    let one_below = required.saturating_sub(1);
+    let mut observed = 0usize;
+    let err = registry
+        .encoded_registry_bytes_for_snapshot_with_admission(|modeled| {
+            observed = modeled;
+            if modeled > one_below {
+                Err(TsinkError::InvalidConfiguration(
+                    "snapshot registry transient rejected".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("N-1 bytes must reject before proportional encoding allocations");
+    assert_eq!(observed, required);
+    assert!(err
+        .to_string()
+        .contains("snapshot registry transient rejected"));
+}
+
+#[test]
 fn merge_from_imports_incremental_series_without_rebinding_ids() {
     let base = SeriesRegistry::new();
     base.resolve_or_insert("cpu", &[Label::new("host", "a")])

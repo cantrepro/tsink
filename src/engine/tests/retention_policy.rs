@@ -2227,7 +2227,7 @@ fn compute_only_storage_reads_remote_hot_warm_and_cold_segments_and_rejects_writ
 }
 
 #[test]
-fn compute_only_storage_refreshes_remote_tombstones_without_segment_inventory_changes() {
+fn expert_unlimited_compute_only_refreshes_remote_tombstones_without_segment_changes() {
     let object_store_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];
     let expected_series = MetricSeries {
@@ -2242,8 +2242,28 @@ fn compute_only_storage_refreshes_remote_tombstones_without_segment_inventory_ch
 
     let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
     write_numeric_segment(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let initial_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &initial_inventory,
+        None,
+    )
+    .unwrap();
 
     let storage = builder_at_time(10)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_object_store_path(object_store_dir.path())
         .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
         .with_remote_segment_refresh_interval(Duration::from_millis(1))
@@ -2325,6 +2345,25 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
 
     let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
     write_numeric_segment(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let initial_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &initial_inventory,
+        None,
+    )
+    .unwrap();
 
     let storage = builder_at_time(31)
         .with_object_store_path(object_store_dir.path())
@@ -2345,17 +2384,6 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
     );
 
-    let invalid_segment_root = object_store_dir
-        .path()
-        .join("cold")
-        .join(BLOB_LANE_ROOT)
-        .join("segments")
-        .join("L0")
-        .join("seg-00000000000000ff");
-    // A segment-shaped directory without a manifest forces the inventory scan to fail
-    // deterministically, which keeps the visible catalog stale until the retry succeeds.
-    std::fs::create_dir_all(&invalid_segment_root).unwrap();
-
     let warm_lane = object_store_dir.path().join("warm").join(NUMERIC_LANE_ROOT);
     write_numeric_segment(
         &warm_lane,
@@ -2365,6 +2393,25 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         2,
         &[(30, 30.0), (31, 31.0)],
     );
+    let updated_inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let corrupt_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &updated_inventory,
+        None,
+    )
+    .unwrap();
+    let corrupt_generation_path = super::super::tiering::shared_segment_catalog_generation_path(
+        &tiered_storage,
+        corrupt_pointer.generation,
+    );
+    let mut corrupt_generation = std::fs::read(&corrupt_generation_path).unwrap();
+    *corrupt_generation.last_mut().unwrap() ^= 1;
+    std::fs::write(&corrupt_generation_path, corrupt_generation).unwrap();
 
     let expected_stale_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
     assert!(
@@ -2423,7 +2470,12 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
     assert_eq!(repeated_snapshot.remote.consecutive_refresh_failures, 1);
     assert!(repeated_snapshot.remote.backoff_active);
 
-    std::fs::remove_dir_all(&invalid_segment_root).unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &updated_inventory,
+        None,
+    )
+    .unwrap();
 
     let expected_recovered_points = vec![
         DataPoint::new(1, 1.0),
@@ -2473,8 +2525,8 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
 
 #[cfg(unix)]
 #[test]
-fn compute_only_storage_suppresses_repeated_refresh_attempts_while_cached_segments_remain_readable()
-{
+fn expert_unlimited_compute_only_suppresses_repeated_refresh_attempts_while_cached_segments_remain_readable(
+) {
     use std::os::unix::fs::PermissionsExt;
 
     let object_store_dir = TempDir::new().unwrap();
@@ -2489,6 +2541,7 @@ fn compute_only_storage_suppresses_repeated_refresh_attempts_while_cached_segmen
     write_numeric_segment(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0), (2, 2.0)]);
 
     let storage = builder_at_time(4)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_object_store_path(object_store_dir.path())
         .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
         .with_remote_segment_refresh_interval(Duration::from_millis(1))

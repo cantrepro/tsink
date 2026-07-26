@@ -297,6 +297,10 @@ pub struct UMemoryObservabilitySnapshot {
     pub persisted_mmap_bytes: u64,
     pub tombstone_bytes: u64,
     #[uniffi(default)]
+    pub remote_catalog_staging_bytes: u64,
+    #[uniffi(default)]
+    pub wal_writer_buffer_bytes: u64,
+    #[uniffi(default)]
     pub wal_series_definition_cache_bytes: u64,
     #[uniffi(default)]
     pub write_transient_bytes: u64,

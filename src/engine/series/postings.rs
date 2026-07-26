@@ -1,5 +1,4 @@
 use std::collections::{btree_map::Entry as BTreeEntry, BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 
 use super::*;
 
@@ -221,60 +220,11 @@ impl SeriesRegistry {
     }
 
     pub fn missing_label_postings_for_id(&self, name_id: DictionaryId) -> RoaringTreemap {
-        let shard_idx = Self::label_postings_shard_idx(name_id);
-        loop {
-            let observed_generation = self.postings_generation.load(Ordering::Acquire);
-            {
-                let shard = self.label_postings_shards[shard_idx].read();
-                if let Some(state) = shard.label_name_states.get(&name_id) {
-                    if let Some(cache) = &state.missing_cache {
-                        if cache.postings_generation == observed_generation {
-                            return cache.bitmap.clone();
-                        }
-                    }
-                }
-            }
-
-            let mut missing = self.all_series_postings();
-            if let Some(present) = self.label_name_postings_for_id(name_id) {
-                missing -= &present;
-            }
-
-            let mut shard = self.label_postings_shards[shard_idx].write();
-            let state = shard.label_name_states.entry(name_id).or_default();
-            let current_generation = self.postings_generation.load(Ordering::Acquire);
-            if let Some(cache) = &state.missing_cache {
-                if cache.postings_generation == current_generation {
-                    return cache.bitmap.clone();
-                }
-            }
-            if current_generation != observed_generation {
-                continue;
-            }
-
-            let before = state
-                .missing_cache
-                .as_ref()
-                .map(|cache| Self::bitmap_memory_usage_bytes(&cache.bitmap))
-                .unwrap_or(0);
-            state.missing_cache = Some(MissingLabelPostingsCacheEntry {
-                bitmap: missing.clone(),
-                postings_generation: current_generation,
-            });
-            let after = Self::bitmap_memory_usage_bytes(&missing);
-            if after >= before {
-                let added = after.saturating_sub(before);
-                shard.estimated_postings_bytes =
-                    shard.estimated_postings_bytes.saturating_add(added);
-                self.add_estimated_memory_bytes(added);
-            } else {
-                let removed = before.saturating_sub(after);
-                shard.estimated_postings_bytes =
-                    shard.estimated_postings_bytes.saturating_sub(removed);
-                self.sub_estimated_memory_bytes(removed);
-            }
-            return missing;
+        let mut missing = self.all_series_postings();
+        if let Some(present) = self.label_name_postings_for_id(name_id) {
+            missing -= &present;
         }
+        missing
     }
 
     pub fn postings_bucket_count_for_label_name_id(&self, name_id: DictionaryId) -> usize {
@@ -564,9 +514,7 @@ impl SeriesRegistry {
                     .estimated_postings_bytes
                     .saturating_sub(label_name_removed);
                 removed_bytes = removed_bytes.saturating_add(label_name_removed);
-                remove_state = state.present.is_empty()
-                    && state.bucket_count == 0
-                    && state.missing_cache.is_none();
+                remove_state = state.present.is_empty() && state.bucket_count == 0;
             }
             if remove_state {
                 empty_states.push(name_id);

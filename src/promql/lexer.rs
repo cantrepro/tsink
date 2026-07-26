@@ -1,4 +1,5 @@
 use crate::promql::error::{PromqlError, Result};
+use crate::promql::{MAX_PARSE_INPUT_BYTES, MAX_PARSE_TOKENS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -121,6 +122,13 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>> {
+        if self.input.len() > MAX_PARSE_INPUT_BYTES {
+            return Err(PromqlError::Parse(format!(
+                "PromQL query input exceeds the {MAX_PARSE_INPUT_BYTES}-byte limit (got {} bytes)",
+                self.input.len()
+            )));
+        }
+
         let mut tokens = Vec::new();
 
         loop {
@@ -136,6 +144,12 @@ impl<'a> Lexer<'a> {
                     literal: String::new(),
                 });
                 break;
+            }
+
+            if tokens.len() >= MAX_PARSE_TOKENS {
+                return Err(PromqlError::Parse(format!(
+                    "PromQL query exceeds the {MAX_PARSE_TOKENS}-token limit"
+                )));
             }
 
             let kind = match self.peek_byte() {

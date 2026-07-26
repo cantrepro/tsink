@@ -134,7 +134,12 @@ fn test_concurrent_different_metrics() {
                     &metric_name,
                     DataPoint::new((i + 1) as i64, thread_id as f64 * 100.0 + i as f64),
                 )];
-                storage.insert_rows(&rows).unwrap();
+                if let Err(error) = storage.insert_rows(&rows) {
+                    panic!(
+                        "writer {thread_id} failed at row {i}: {error:?}; health={:?}",
+                        storage.observability_snapshot().health
+                    );
+                }
             }
         });
         handles.push(handle);

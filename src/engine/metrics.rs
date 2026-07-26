@@ -169,6 +169,9 @@ impl StorageObservabilityCounters {
         consecutive_failures: u32,
     ) {
         self.remote
+            .catalog_refreshes_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.remote
             .catalog_refresh_errors_total
             .fetch_add(1, Ordering::Relaxed);
         self.remote.accessible.store(false, Ordering::Relaxed);
@@ -425,6 +428,40 @@ mod compaction_planning_tests {
                 .planning_budget_exhaustions_total
                 .load(Ordering::Relaxed),
             1
+        );
+    }
+
+    #[test]
+    fn failed_remote_catalog_refresh_counts_as_an_attempt() {
+        let counters = StorageObservabilityCounters::default();
+        counters.record_remote_catalog_refresh_error(
+            "remote catalog refresh",
+            &TsinkError::Other("injected failure".to_string()),
+            10,
+            20,
+            1,
+        );
+
+        assert_eq!(
+            counters
+                .remote
+                .catalog_refreshes_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .remote
+                .catalog_refresh_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .remote
+                .last_refresh_attempt_unix_ms
+                .load(Ordering::Relaxed),
+            10
         );
     }
 }

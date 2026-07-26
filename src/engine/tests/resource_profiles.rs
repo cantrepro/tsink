@@ -38,28 +38,109 @@ fn standard_profiles_are_finite_and_self_consistent() {
 
         let snapshot = StorageBuilder::new()
             .with_resource_profile(profile)
+            .with_data_path("profile-data")
+            .with_object_store_path("profile-object")
             .resource_configuration_snapshot();
+        let as_u64 = |value: usize| u64::try_from(value).expect("profile value fits u64");
+        let duration_nanos = |value: Duration| {
+            u64::try_from(value.as_nanos()).expect("profile duration fits nanoseconds")
+        };
         assert_eq!(snapshot.selected_profile, name);
         assert!(snapshot.reported_by_backend);
-        assert!(snapshot
-            .resolved_limits
-            .storage
-            .accounted_memory_bytes
-            .is_some());
-        assert!(snapshot.resolved_limits.storage.cardinality.is_some());
-        assert!(snapshot
-            .resolved_limits
-            .query
-            .max_concurrent_queries
-            .is_some());
-        assert!(snapshot
-            .resolved_limits
-            .maintenance_max_items_per_pass
-            .is_some());
-        assert!(snapshot
-            .resolved_limits
-            .maintenance_max_bytes_per_pass
-            .is_some());
+        let storage = snapshot.resolved_limits.storage;
+        assert!(storage.persistent);
+        assert!(storage.wal_enabled);
+        assert_eq!(
+            storage.accounted_memory_bytes,
+            Some(limits.accounted_memory_bytes)
+        );
+        assert_eq!(storage.cardinality, Some(limits.cardinality));
+        assert_eq!(
+            storage.max_labels_per_series,
+            Some(limits.max_labels_per_series)
+        );
+        assert_eq!(
+            storage.max_series_identity_bytes,
+            Some(limits.max_series_identity_bytes)
+        );
+        assert_eq!(
+            storage.max_new_series_per_window,
+            Some(limits.max_new_series_per_window)
+        );
+        assert_eq!(
+            storage.new_series_window_nanos,
+            Some(duration_nanos(limits.new_series_window))
+        );
+        assert_eq!(
+            storage.max_write_batch_rows,
+            Some(as_u64(
+                limits.write_batch.max_rows.expect("finite write rows")
+            ))
+        );
+        assert_eq!(
+            storage.max_write_batch_input_bytes,
+            Some(as_u64(
+                limits
+                    .write_batch
+                    .max_modeled_input_bytes
+                    .expect("finite write input")
+            ))
+        );
+        assert_eq!(storage.wal_bytes, Some(limits.wal_bytes));
+        assert_eq!(
+            storage.wal_write_buffer_bytes,
+            Some(limits.wal_write_buffer_bytes)
+        );
+        assert_eq!(storage.local_disk_bytes, Some(limits.local_disk_bytes));
+        assert_eq!(
+            storage.filesystem_free_headroom_bytes,
+            Some(limits.filesystem_free_headroom_bytes)
+        );
+        assert_eq!(
+            storage.maintenance_temp_reserve_bytes,
+            Some(limits.maintenance_temp_reserve_bytes)
+        );
+        assert_eq!(
+            storage.max_concurrent_writers,
+            Some(limits.max_concurrent_writers)
+        );
+        assert_eq!(
+            storage.write_timeout_nanos,
+            Some(duration_nanos(limits.write_timeout))
+        );
+        assert_eq!(
+            storage.max_remote_tier_fetch_concurrency,
+            limits.query.max_concurrent_queries
+        );
+        assert_eq!(
+            storage.flush_interval_nanos,
+            Some(duration_nanos(limits.background.flush_interval))
+        );
+        assert_eq!(
+            storage.compaction_interval_nanos,
+            Some(duration_nanos(limits.background.compaction_interval))
+        );
+        assert_eq!(
+            storage.persisted_refresh_poll_interval_nanos,
+            Some(duration_nanos(limits.background.persisted_refresh_interval))
+        );
+        assert_eq!(
+            storage.rollup_interval_nanos,
+            Some(duration_nanos(limits.background.rollup_interval))
+        );
+        assert_eq!(
+            storage.max_active_partition_heads_per_series,
+            Some(limits.max_active_partition_heads_per_series)
+        );
+        assert_eq!(snapshot.resolved_limits.query, limits.query);
+        assert_eq!(
+            snapshot.resolved_limits.maintenance_max_items_per_pass,
+            Some(as_u64(limits.background.maintenance_max_items_per_pass))
+        );
+        assert_eq!(
+            snapshot.resolved_limits.maintenance_max_bytes_per_pass,
+            Some(limits.background.maintenance_max_bytes_per_pass)
+        );
     }
 }
 
@@ -154,6 +235,15 @@ fn invalid_custom_profile_relationships_are_rejected() {
         .build()
         .is_err());
 
+    let mut ignored_cadence = ResourceLimits::test();
+    ignored_cadence.background.flush_interval = Duration::from_secs(1);
+    let error = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::Custom(ignored_cadence))
+        .build()
+        .err()
+        .expect("a custom cadence that the runtime cannot honor must fail");
+    assert!(error.to_string().contains("fixed background cadences"));
+
     let mut stranded_chunk = ResourceLimits::test();
     stranded_chunk.background.maintenance_max_bytes_per_pass =
         stranded_chunk.accounted_memory_bytes - 1;
@@ -192,6 +282,34 @@ fn invalid_custom_profile_relationships_are_rejected() {
         .err()
         .expect("effective finite overrides must not strand an admitted batch");
     assert!(error.to_string().contains("one admitted batch"));
+}
+
+#[test]
+fn custom_profiles_reject_internal_unlimited_sentinels() {
+    let mut memory = ResourceLimits::test();
+    memory.accounted_memory_bytes = usize::MAX as u64;
+    memory.background.maintenance_max_bytes_per_pass = u64::MAX;
+    let error = memory
+        .validate()
+        .expect_err("a finite custom profile must not resolve to an unlimited memory sentinel");
+    assert!(
+        error.to_string().contains("accounted_memory_bytes")
+            && error.to_string().contains("ExpertUnlimited"),
+        "{error}"
+    );
+
+    let mut maintenance_items = ResourceLimits::test();
+    maintenance_items.background.maintenance_max_items_per_pass = usize::MAX;
+    let error = maintenance_items.validate().expect_err(
+        "a finite custom profile must not resolve to the unlimited maintenance-item sentinel",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("background.maintenance_max_items_per_pass")
+            && error.to_string().contains("ExpertUnlimited"),
+        "{error}"
+    );
 }
 
 #[test]

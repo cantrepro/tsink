@@ -50,10 +50,8 @@ pub(in crate::engine::storage_engine) struct WriteResolveContext<'a> {
     pub(in crate::engine::storage_engine) write_transient: &'a Arc<WriteTransientMemoryAccounting>,
     pub(in crate::engine::storage_engine) series_creation_rate_limiter:
         &'a Arc<SeriesCreationRateLimiter>,
-    pub(in crate::engine::storage_engine) used_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) tombstone_staged_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) budget_bytes: &'a AtomicU64,
-    pub(in crate::engine::storage_engine) memory_rejections_total: &'a AtomicU64,
+    pub(in crate::engine::storage_engine) memory_reservation_admission:
+        MemoryReservationAdmissionContext<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +165,8 @@ impl ChunkStorage {
             series_visible_bounded_max_timestamps: &self
                 .visibility
                 .series_visible_bounded_max_timestamps,
+            series_visibility_cache_epochs: &self.visibility.series_visibility_cache_epochs,
+            remote_tombstone_epoch: &self.visibility.remote_tombstone_epoch,
         }
     }
 
@@ -229,6 +229,8 @@ impl ChunkStorage {
             series_visible_bounded_max_timestamps: &self
                 .visibility
                 .series_visible_bounded_max_timestamps,
+            series_visibility_cache_epochs: &self.visibility.series_visibility_cache_epochs,
+            remote_tombstone_epoch: &self.visibility.remote_tombstone_epoch,
             recency_state_lock: &self.visibility.recency_state_lock,
             max_observed_timestamp: &self.visibility.max_observed_timestamp,
             max_bounded_observed_timestamp: &self.visibility.max_bounded_observed_timestamp,
@@ -263,6 +265,8 @@ impl ChunkStorage {
             memory: self.shard_memory_accounting_context(),
             #[cfg(test)]
             pre_publish_hook: &self.persist_test_hooks.pre_sealed_chunk_publish_hook,
+            #[cfg(test)]
+            post_chunk_seal_hook: &self.persist_test_hooks.post_chunk_seal_hook,
         }
     }
 
@@ -303,10 +307,7 @@ impl ChunkStorage {
             wal_enabled: self.persisted.wal.is_some(),
             write_transient: &self.memory.write_transient,
             series_creation_rate_limiter: &self.catalog.series_creation_rate_limiter,
-            used_bytes: &self.memory.used_bytes,
-            tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
-            budget_bytes: &self.memory.budget_bytes,
-            memory_rejections_total: &self.memory.rejections_total,
+            memory_reservation_admission: self.memory_reservation_admission_context(),
         }
     }
 
@@ -338,11 +339,7 @@ impl ChunkStorage {
                 wal_size_limit_bytes: self.runtime.wal_size_limit_bytes,
             },
             memory_budget: WritePrepareMemoryBudgetContext {
-                used_bytes: &self.memory.used_bytes,
-                tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
-                budget_bytes: &self.memory.budget_bytes,
-                write_transient: &self.memory.write_transient,
-                memory_rejections_total: &self.memory.rejections_total,
+                memory_reservation_admission: self.memory_reservation_admission_context(),
             },
             admission: WriteAdmissionControlContext {
                 lifecycle: self.coordination.lifecycle.as_ref(),
@@ -388,6 +385,8 @@ impl ChunkStorage {
             },
             memory: WriteApplyMemoryAccountingContext {
                 shards: self.shard_memory_accounting_context(),
+                write_transient: &self.memory.write_transient,
+                memory_reservation_admission: self.memory_reservation_admission_context(),
             },
             publication: WriteApplyPublicationContext {
                 registry_bookkeeping: self.registry_bookkeeping_context(),

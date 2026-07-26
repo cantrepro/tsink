@@ -274,6 +274,117 @@ fn segment_publish_returns_error_and_rolls_back_when_parent_sync_fails() {
         !writer.staging_layout.root.exists(),
         "failed publish rollback should not restore the staging directory"
     );
+
+    writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect("the same segment identity should be publishable after cleanup");
+    let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].manifest.series_count, 1);
+    assert_eq!(loaded[0].manifest.point_count, 2);
+}
+
+#[test]
+fn segment_file_creation_failpoint_cleans_staging_and_retry_recovers() {
+    let tmp = TempDir::new().unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let failure = crate::engine::fs_utils::fail_tmp_write_after_bytes_once(
+        writer.staging_layout.chunks_path.clone(),
+        0,
+        std::io::ErrorKind::Other,
+        "injected segment file creation failure",
+    );
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("the first segment data-file creation should fail");
+    drop(failure);
+    assert!(
+        err.to_string()
+            .contains("injected segment file creation failure"),
+        "unexpected segment creation error: {err}"
+    );
+    assert!(!writer.layout.root.exists());
+    assert!(!writer.staging_layout.root.exists());
+
+    writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect("retry after owned staging cleanup should publish");
+    let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].manifest.series_count, 1);
+    assert_eq!(loaded[0].manifest.point_count, 2);
+}
+
+#[test]
+fn segment_index_write_failpoint_cleans_staging_and_retry_recovers() {
+    let tmp = TempDir::new().unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let failure = crate::engine::fs_utils::fail_tmp_write_after_bytes_once(
+        writer.staging_layout.chunk_index_path.clone(),
+        8,
+        std::io::ErrorKind::Other,
+        "injected segment index write failure",
+    );
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("the segment chunk-index write should fail");
+    drop(failure);
+    assert!(
+        err.to_string()
+            .contains("injected segment index write failure"),
+        "unexpected segment index error: {err}"
+    );
+    assert!(!writer.layout.root.exists());
+    assert!(!writer.staging_layout.root.exists());
+
+    writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect("retry after index-write cleanup should publish");
+    let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].manifest.series_count, 1);
+    assert_eq!(loaded[0].manifest.point_count, 2);
+}
+
+#[test]
+fn segment_file_sync_failpoint_cleans_staging_and_retry_recovers() {
+    let tmp = TempDir::new().unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let staging_root = writer.staging_layout.root.clone();
+    let failure = crate::engine::fs_utils::fail_file_sync_matching_once(
+        move |candidate| {
+            candidate.parent() == Some(staging_root.as_path())
+                && candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".chunks.bin.tmp-"))
+        },
+        "injected segment file sync failure",
+    );
+
+    let err = writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect_err("the first segment data-file sync should fail");
+    drop(failure);
+    assert!(
+        err.to_string()
+            .contains("injected segment file sync failure"),
+        "unexpected segment file-sync error: {err}"
+    );
+    assert!(!writer.layout.root.exists());
+    assert!(!writer.staging_layout.root.exists());
+
+    writer
+        .write_segment(&registry, &chunks_by_series)
+        .expect("retry after file-sync cleanup should publish");
+    let loaded = load_segments_for_level(tmp.path(), 0).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].manifest.series_count, 1);
+    assert_eq!(loaded[0].manifest.point_count, 2);
 }
 
 #[test]
@@ -322,6 +433,61 @@ fn metadata_helpers_round_trip_manifest_series_and_fingerprint() {
     assert_eq!(fingerprint.manifest, manifest);
     assert_eq!(fingerprint.files.len(), 4);
     assert_eq!(fingerprint.files[0].kind, 1);
+}
+
+#[test]
+fn legacy_segment_identity_shared_dictionary_budget_is_exact_without_materialization() {
+    const SERIES_COUNT: usize = 512;
+
+    let tmp = TempDir::new().unwrap();
+    let data_path = tmp.path().join("data");
+    let lane_path = data_path.join("lane_numeric");
+    let registry = SeriesRegistry::new();
+    let shared_metric = format!("metric_{}", "m".repeat(8 * 1024));
+    let shared_label_name = format!("label_{}", "n".repeat(240));
+    let mut chunks_by_series = HashMap::new();
+    for index in 0..SERIES_COUNT {
+        let series = registry
+            .resolve_or_insert(
+                &shared_metric,
+                &[Label::new(
+                    shared_label_name.clone(),
+                    format!("value_{index:04}"),
+                )],
+            )
+            .unwrap();
+        chunks_by_series.insert(
+            series.series_id,
+            vec![make_numeric_chunk(
+                series.series_id,
+                &[(index as i64, index as f64)],
+            )],
+        );
+    }
+
+    let writer = SegmentWriter::new(&lane_path, 0, 1).unwrap();
+    writer.write_segment(&registry, &chunks_by_series).unwrap();
+    let required =
+        super::loader::legacy_segment_identity_required_memory_for_test(&writer.layout().root)
+            .unwrap();
+    let expanded_shared_string_bytes = shared_metric
+        .len()
+        .saturating_add(shared_label_name.len())
+        .saturating_mul(SERIES_COUNT);
+    assert!(
+        expanded_shared_string_bytes > required,
+        "fixture must be adversarial to per-series dictionary-string cloning"
+    );
+
+    let rejected = super::validate_legacy_segment_identity(&data_path, required - 1).unwrap_err();
+    assert!(matches!(
+        rejected,
+        TsinkError::MemoryBudgetExceeded {
+            budget,
+            required: reported
+        } if budget == required - 1 && reported == required
+    ));
+    assert!(super::validate_legacy_segment_identity(&data_path, required).unwrap());
 }
 
 #[test]

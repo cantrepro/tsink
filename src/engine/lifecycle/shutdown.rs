@@ -244,6 +244,11 @@ impl ChunkStorage {
     fn execute_close_pipeline(&self) -> Result<()> {
         let shutdown = self.lifecycle_shutdown_context();
         let _background_maintenance_guard = shutdown.background_maintenance_gate()?;
+        // A finite remote refresh may retain admitted tombstone fragments across wakes. Once the
+        // background gate is exclusive, no worker can still use those continuations; release them
+        // before any later close stage can time out so a failed/retried close does not pin memory.
+        self.reset_bounded_catalog_refresh_continuations();
+        self.reset_background_metadata_reconciliation_cursor();
         let mut deferred_dirty_refresh = false;
         let _write_permits = shutdown.acquire_close_write_permits()?;
         // All ingest and rollup materialization paths acquire their writer permit before this

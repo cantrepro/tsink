@@ -386,6 +386,167 @@ fn select_series_racing_revival_write_does_not_prune_materialized_series() {
 }
 
 #[test]
+fn stale_pruner_cannot_remove_id_reinserted_after_competing_prune() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = Arc::new(live_numeric_storage(
+        temp_dir.path(),
+        TimestampPrecision::Seconds,
+        8,
+        20,
+        Duration::from_secs(5),
+        None,
+    ));
+    let metric = "stale_pruner_reinsert";
+    let labels = vec![Label::new("host", "a")];
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(20, 1.0),
+        )])
+        .unwrap();
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing(metric, &labels)
+        .unwrap()
+        .series_id;
+    let stale_generation = storage.live_series_pruning_generation();
+
+    let checked_generation = Arc::new(Barrier::new(2));
+    let release_stale_pruner = Arc::new(Barrier::new(2));
+    storage.set_metadata_live_series_pre_prune_hook({
+        let checked_generation = Arc::clone(&checked_generation);
+        let release_stale_pruner = Arc::clone(&release_stale_pruner);
+        move || {
+            checked_generation.wait();
+            release_stale_pruner.wait();
+        }
+    });
+
+    let stale_storage = Arc::clone(&storage);
+    let stale_pruner = thread::spawn(move || {
+        stale_storage
+            .prune_dead_materialized_series_ids_if_stable(vec![series_id], Some(stale_generation));
+    });
+
+    checked_generation.wait();
+    // The first pruner already passed its optimistic generation check. Remove with a competing
+    // pruner, then revive the ID before allowing the stale pruner to acquire the set lock.
+    storage.clear_metadata_live_series_pre_prune_hook();
+    storage.prune_dead_materialized_series_ids_if_stable(vec![series_id], Some(stale_generation));
+    assert!(storage.materialized_series_snapshot().is_empty());
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(21, 2.0),
+        )])
+        .unwrap();
+    release_stale_pruner.wait();
+    stale_pruner.join().unwrap();
+
+    assert_eq!(storage.materialized_series_snapshot(), vec![series_id]);
+    assert_eq!(
+        storage.list_metrics().unwrap(),
+        vec![MetricSeries {
+            name: metric.to_string(),
+            labels,
+        }],
+    );
+}
+
+#[test]
+fn prune_republishes_secondary_metadata_after_reinsert_before_unpublish() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let shard_count = 8;
+    let storage = Arc::new(live_numeric_storage(
+        temp_dir.path(),
+        TimestampPrecision::Seconds,
+        8,
+        20,
+        Duration::from_secs(5),
+        Some(shard_count),
+    ));
+    let metric = "prune_reinsert_before_unpublish";
+    let labels = vec![Label::new("host", "a")];
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(20, 1.0),
+        )])
+        .unwrap();
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing(metric, &labels)
+        .unwrap()
+        .series_id;
+    let target_shard =
+        (stable_series_identity_hash(metric, &labels) % u64::from(shard_count)) as u32;
+    let scope = MetadataShardScope::new(shard_count, vec![target_shard]);
+    let generation_before = storage.live_series_pruning_generation();
+
+    let removed = Arc::new(Barrier::new(2));
+    let release_unpublish = Arc::new(Barrier::new(2));
+    storage.set_metadata_live_series_post_remove_pre_unpublish_hook({
+        let removed = Arc::clone(&removed);
+        let release_unpublish = Arc::clone(&release_unpublish);
+        move || {
+            removed.wait();
+            release_unpublish.wait();
+        }
+    });
+
+    let pruning_storage = Arc::clone(&storage);
+    let pruning = thread::spawn(move || {
+        pruning_storage
+            .prune_dead_materialized_series_ids_if_stable(vec![series_id], Some(generation_before));
+    });
+
+    removed.wait();
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(21, 2.0),
+        )])
+        .unwrap();
+    assert_eq!(storage.materialized_series_snapshot(), vec![series_id]);
+    release_unpublish.wait();
+    pruning.join().unwrap();
+    storage.clear_metadata_live_series_post_remove_pre_unpublish_hook();
+
+    assert_eq!(storage.materialized_series_snapshot(), vec![series_id]);
+    assert_eq!(runtime_metadata_delta_series_ids(&storage), vec![series_id]);
+    assert_eq!(
+        storage.list_metrics_in_shards(&scope).unwrap(),
+        vec![MetricSeries {
+            name: metric.to_string(),
+            labels: labels.clone(),
+        }],
+    );
+    assert_eq!(
+        storage.list_metrics().unwrap(),
+        vec![MetricSeries {
+            name: metric.to_string(),
+            labels,
+        }],
+    );
+}
+
+#[test]
 fn select_series_treats_missing_labels_as_empty_strings() {
     let storage = ChunkStorage::new(2, None);
     let missing_zone = vec![Label::new("host", "a")];
@@ -2932,6 +3093,7 @@ fn select_series_time_range_respects_retention_cutoff_exactly() {
                 DataPoint::new(40, 2.0),
             )])
             .unwrap();
+        storage.close().unwrap();
     }
 
     let storage = StorageBuilder::new()

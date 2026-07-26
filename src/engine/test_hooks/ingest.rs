@@ -37,6 +37,17 @@ impl ChunkStorage {
         super::clear_commit_hook(&self.persist_test_hooks.pre_sealed_chunk_publish_hook);
     }
 
+    pub(in super::super) fn set_ingest_post_chunk_seal_hook<F>(&self, hook: F)
+    where
+        F: Fn() -> Result<()> + Send + Sync + 'static,
+    {
+        *self.persist_test_hooks.post_chunk_seal_hook.write() = Some(Arc::new(hook));
+    }
+
+    pub(in super::super) fn clear_ingest_post_chunk_seal_hook(&self) {
+        self.persist_test_hooks.post_chunk_seal_hook.write().take();
+    }
+
     pub(in super::super) fn set_ingest_crash_after_wal_persist_before_ingest(&self) {
         super::set_crash_flag(&self.persist_test_hooks.crash_after_samples_persisted);
     }

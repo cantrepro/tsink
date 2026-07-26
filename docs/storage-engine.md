@@ -99,14 +99,21 @@ best-effort sub-operations and its final `Drop` releases it on every exit path.
 Both public insert methods return one batch error, rather than per-row outcomes, when the input is
 rejected; none of those rows is accepted. Apply stages fallible active-state rotations and chunk
 encoding for every affected shard before publishing any of them, so a later-shard failure cannot
-leave an earlier shard installed. See [ADR 0001](adr/0001-write-contract.md) for the atomic batch,
+leave an earlier shard installed. Before the first active-state clone, the write-transient lease
+admits a conservative six-copy envelope for each current state and for the prepared retained-growth
+allowance; it remains charged through publication and is released on success, rejection, unwind,
+and replay-frame completion. See [ADR 0001](adr/0001-write-contract.md) for the atomic batch,
 acknowledgement, and empty-batch contract.
 
 `Storage::write_batch` is the canonical result-bearing entry point. `Atomic` uses the pipeline once
 and reports every row accepted or every row rejected. `BestEffort` uses ordered singleton pipeline
 calls, preserves each original index, and reports the weakest acknowledgement among accepted rows.
-The default trait implementation is unsupported so third-party backends cannot accidentally claim
-these semantics through a legacy adapter.
+Safe pre-commit admission failures return complete rejected outcomes. Configured top-level
+row/input bounds instead return an outer error before allocating an oversized outcome vector and
+commit nothing. After a full write-memory rejection, the built-in engine separately admits the
+bounded result envelope; if that response also cannot fit, it returns the outer memory error
+without allocating outcomes. The default trait implementation is unsupported so third-party
+backends cannot accidentally claim these semantics through a legacy adapter.
 
 ---
 
@@ -314,47 +321,48 @@ A root-changing maintenance page first publishes its bounded intent in the manif
 the named removes/upserts, and then marks that intent complete. The aggregate series fingerprint is
 cleared before mutation, so an interrupted page cannot falsely enable the registry fast path;
 retry replays the same intent idempotently. Complete foreground/startup checkpoints rebuild that
-fingerprint and retain the v2 JSON compatibility snapshot. Tiered storage still publishes complete
-local and shared segment-catalog snapshots; that monolithic catalog format remains proportional to
-the live catalog.
+fingerprint and retain the v2 JSON compatibility snapshot. A tiered writer publishes one complete
+immutable framed generation and the v2 compatibility snapshot before committing the v3 pointer;
+that writer-side publication remains proportional to the live catalog.
 
 ---
 
 ## On-Disk Segment Format
 
-Every segment is a **directory** containing exactly four files. Format version: **2** (magic bytes embedded in each file header).
+Every segment is a **directory** containing five files. Format version: **2** (magic bytes embedded in each file header).
 
 ```
 {lane_numeric|lane_blob}/
-  L0/                    ← compaction level directory
-    {segment_id}/        ← one segment directory
-      manifest           ← segment metadata and file integrity table
-      chunks             ← binary payload of all chunk records
-      chunk_index        ← sorted lookup index per (series, time range)
-      series             ← metric/label dictionary and series definitions
-      postings           ← inverted index for label-based series selection
+  segments/
+    L0/                              ← compaction level directory
+      seg-{segment_id as 16 hex}/    ← one segment directory
+        manifest.bin                 ← segment metadata and file integrity table
+        chunks.bin                   ← binary payload of all chunk records
+        chunk_index.bin              ← sorted lookup index per (series, time range)
+        series.bin                   ← metric/label dictionary and series definitions
+        postings.bin                 ← inverted index for label-based series selection
 ```
 
-### `manifest` (magic `TSM2`)
+### `manifest.bin` (magic `TSM2`)
 
 80-byte header followed by four 20-byte file entries:
 
 | Field | Description |
 |---|---|
-| `segment_id` | Monotonically incrementing u64 allocated at flush time. |
+| `segment_id` | Monotonically incrementing u64 from the shared allocator used by flush and compaction outputs. |
 | `level` | Compaction level (0, 1, or 2). |
 | `chunk_count` | Total number of chunk records. |
 | `point_count` | Total number of data points. |
 | `series_count` | Number of distinct series. |
 | `min_ts` / `max_ts` | Inclusive time range of all chunks. |
 | `wal_highwater` | `(segment, frame)` high-watermark of the last WAL frame included. |
-| File entries × 4 | `kind`, `file_len` (bytes), `hash64` (xxHash or FNV-1a) for integrity verification. |
+| File entries × 4 | `kind`, `file_len` (bytes), `hash64` (xxHash64) for integrity verification. |
 
-### `chunks` (magic `CHK2`)
+### `chunks.bin` (magic `CHK2`)
 
 Binary concatenation of variable-length chunk records. Each record contains a header with codec IDs, point count and timestamp bounds, followed by the encoded (and optionally zstd-compressed) payload.
 
-### `chunk_index` (magic `CID2`)
+### `chunk_index.bin` (magic `CID2`)
 
 Fixed-size entries sorted by `(series_id, min_ts, max_ts, chunk_offset)`. Each entry records:
 
@@ -364,11 +372,11 @@ Fixed-size entries sorted by `(series_id, min_ts, max_ts, chunk_offset)`. Each e
 
 Range queries binary-search this index instead of scanning the chunks file.
 
-### `series` (magic `SRS2`)
+### `series.bin` (magic `SRS2`)
 
 A compact string dictionary (metric names, label names, label values) followed by series definition records. Each record maps a `series_id` to a `metric_id` and a list of `LabelPairId` values into the dictionary.
 
-### `postings` (magic `PST2`)
+### `postings.bin` (magic `PST2`)
 
 Three inverted-index sections:
 
@@ -525,7 +533,9 @@ Moves, rewrites, and expiry are published through the two-phase post-flush repla
 keeps outputs and converges source retirement. A pending marker fences compaction, snapshot export,
 and inventory scans until runtime or startup recovery completes.
 
-A `segment_catalog.bin` file on the object store serves as the authoritative inventory of remote segments so the local node can rebuild its view on startup or after a remote catalog refresh (default every **5 seconds**).
+The object store retains `segment_catalog.json` as the v2 compatibility inventory. Finite
+compute-only refresh uses the authoritative fixed-size `segment_catalog.current` pointer and its
+immutable framed generation under `segment_catalog.d/` (default refresh interval: **5 seconds**).
 
 The ordinary local registry sidecar is incremental: a root/action page touches only its bounded
 manifest intent and the named segment entry files. Its namespace is capped at 16,382 live entries,
@@ -537,9 +547,13 @@ A finite non-tiered unknown-dirty runtime refresh scans in charged lane/level pa
 deduplicated snapshot within the maintenance byte ceiling and fixed 16,384-entry namespace. It
 publishes no partial inventory. Once scanning reaches its terminal probe, stable add and prune
 cursors publish exact root deltas; failure retries the same intent, visibility changes restart the
-cycle, and startup recovery discards an interrupted cursor and hydrates strictly from disk. The
-tiered local/shared segment catalog remains a monolithic crash-safe snapshot. Tiered publication,
-`ExpertUnlimited`, startup, and close therefore retain complete-inventory behavior.
+cycle, and startup recovery discards an interrupted cursor and hydrates strictly from disk.
+
+For finite compute-only refresh, the v3 generation is read and validated in charged pages before
+bounded additions and removals change visibility. Missing or corrupt v3 fails closed without a
+physical tier scan, and a pointer change restarts the cycle while preserving the last valid visible
+state. Startup and `ExpertUnlimited` retain the v2/physical-scan compatibility path. Tiered writer
+publication remains a synchronous complete-inventory operation.
 
 The object-store root has a single-writer invariant. One read-write engine holds
 `.tsink-writer.lock` for its lifetime and revalidates that pathname's file identity before shared
@@ -552,7 +566,12 @@ protocol.
 
 ## Tombstones and Deletion
 
-Deleting a series or a time range writes a `TombstoneRange { start, end }` record to `tombstones.json` (version 1 format) or the sharded `tombstones.store/` store (version 2, 256 shards). A local two-phase coordinator makes multi-lane publication crash recoverable. With tiered storage, one complete remote manifest is published first as the compute-only visibility anchor; the API does not acknowledge the delete as committed before that anchor is durable. Tombstones are **not** applied inline at write time; instead:
+Deleting a series or a time range writes a `TombstoneRange { start, end }` record to
+`tombstones.json` (version 1 format) or the sharded `tombstones.json.store/` store (version 2,
+256 shards). A local two-phase coordinator makes multi-lane publication crash recoverable. With
+tiered storage, one complete remote manifest is published first as the compute-only visibility
+anchor; the API does not acknowledge the delete as committed before that anchor is durable.
+Tombstones are **not** applied inline at write time; instead:
 
 - **Query path** — active and sealed chunks are filtered at read time against the in-memory tombstone map.
 - **Compaction path** — tombstone ranges are applied during the merge step so compacted output segments no longer contain deleted data.
@@ -567,9 +586,13 @@ they are eventually reclaimed. The full protocol is specified in
 ## Memory Budget and Backpressure
 
 The modeled storage budget covers active and sealed chunks, registry and metadata state, persisted
-indexes and mapping lengths, tombstones, and conservative transient write/replay reservations.
-Retained components use incremental deltas; transient leases use one shared atomic current counter
-so concurrent writers cannot all pass a stale budget check.
+indexes and mapping lengths, tombstones, finite compute-only v3 catalog reader/cursor/map staging,
+finite read-write v3/v2/pointer publication, the live WAL writer buffer and definition cache, and
+conservative transient write/replay reservations.
+`remote_catalog_staging_bytes` exposes that catalog component and it participates in foreground
+write and tombstone admission. Retained
+components use incremental deltas; transient leases use atomic current counters behind one shared
+admission gate so concurrent cross-component reservations cannot all pass a stale budget check.
 
 When the total exceeds `memory_budget_bytes`:
 
@@ -579,10 +602,14 @@ When the total exceeds `memory_budget_bytes`:
 
 A separate `cardinality_limit` caps the number of unique series that can be registered. Writes that would exceed the limit are rejected.
 
-The caller-owned input slice and the fixed WAL `BufWriter` remain outside this budget. Effective
-limits report the writer-buffer capacity, while memory observability reports current/peak transient
-bytes, admitted leases, rejected leases, and the named excluded categories. This is modeled engine
-memory, not a process-RSS cap.
+The caller-owned input slice remains outside this budget. Effective limits report the configured
+writer-buffer capacity, while memory observability reports the live capacity actually charged,
+current/peak transient bytes, remote catalog reader staging, admitted leases, rejected leases, and
+the named excluded categories. Finite compute-only v3 validation and one-root application, plus publication-owned
+catalog staging, are included in `remote_catalog_staging_bytes`. The already-materialized input to
+a read-write complete-inventory publication remains under the narrower
+`catalog_input_inventory_materialization` exclusion. This is modeled engine memory, not a
+process-RSS cap.
 
 ---
 
@@ -623,30 +650,44 @@ A fully configured storage instance on disk:
 
 ```
 {data_path}/
+  tsink-manifest.json    ← checksummed root format identity and immutable parameters
   wal/
     wal-0.log            ← WAL segments (oldest to active)
     wal-1.log
     wal.published        ← flush high-watermark checkpoint
   lane_numeric/
-    L0/
-      {segment_id}/      ← newly flushed segments
-        manifest
-        chunks
-        chunk_index
-        series
-        postings
-    L1/
-      {segment_id}/      ← L0→L1 compacted segments
-    L2/
-      {segment_id}/      ← L1→L2 compacted segments
+    segments/
+      L0/
+        seg-{segment_id}/ ← newly flushed segments
+          manifest.bin
+          chunks.bin
+          chunk_index.bin
+          series.bin
+          postings.bin
+      L1/
+        seg-{segment_id}/ ← L0→L1 compacted segments
+      L2/
+        seg-{segment_id}/ ← L1→L2 compacted segments
+    tombstones.json       ← legacy tombstone snapshot when present
+    tombstones.json.store/ ← sharded tombstone records
     .compaction-replacements/   ← crash-recovery marker for in-progress compactions
   lane_blob/
-    L0/  L1/  L2/        ← same structure, blob-lane segments
+    segments/L0/  L1/  L2/ ← same structure, blob-lane segments
+    tombstones.json.store/ ← sharded tombstone records
   series_index.bin       ← series registry full checkpoint
   series_index.delta.d/  ← incremental registry deltas
-  tombstones.store/      ← sharded tombstone records
-  tsink.lock             ← exclusive process lock (prevents double-open)
+  series_index.catalog.json ← compatibility aggregate registry fingerprint catalog
+  series_index.catalog.d/ ← bounded per-segment registry fingerprints
+  segment_catalog.json   ← tiered segment inventory when configured
+  .tombstone-transactions/ ← crash-recovery record for multi-lane deletes
+  .post-flush-replacements/ ← crash-recovery records for segment replacement
+  .rollups/              ← rollup policies and materialization state
+  .tsink.lock            ← exclusive process lock (prevents double-open)
 ```
+
+The root manifest and supported upgrade behavior are specified in
+[Storage Format and Upgrade Policy](storage-format.md). Startup validates this identity before any
+recovery mutation; snapshots and restores preserve it byte-for-byte.
 
 When tiered storage is enabled, warm and cold segments are under the configured `object_store_root`:
 
@@ -655,5 +696,7 @@ When tiered storage is enabled, warm and cold segments are under the configured 
   hot/lane_numeric/      ← mirrored hot segments (optional)
   warm/lane_numeric/     ← warm-tier segments
   cold/lane_numeric/     ← cold-tier segments
-  segment_catalog.bin    ← remote segment inventory
+  segment_catalog.json   ← v2 compatibility inventory
+  segment_catalog.current ← v3 commit pointer
+  segment_catalog.d/     ← immutable framed v3 generations
 ```

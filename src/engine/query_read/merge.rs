@@ -382,7 +382,7 @@ impl ChunkStorage {
             }
             super::pagination::SortedSeriesDedupeMode::None => {}
         }
-        self.apply_tombstone_filter(series_id, out);
+        self.apply_tombstone_filter_for_query(series_id, out, execution)?;
         if let Some(reservation) = working_reservation.as_mut() {
             reservation.resize(modeled_points_bytes(out))?;
         }
@@ -426,8 +426,11 @@ impl ChunkStorage {
                 .clone(),
         );
 
-        let page = self.tombstone_read_context().with_series_tombstone_ranges(
+        let page = self
+            .tombstone_read_context()
+            .with_series_tombstone_ranges_for_query(
             series_id,
+            execution,
             |tombstone_ranges| -> Result<RawSeriesScanPage> {
                 let mut collector = SortedSeriesPageCollector::new(
                     self.active_retention_cutoff(),

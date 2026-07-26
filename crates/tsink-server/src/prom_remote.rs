@@ -1,34 +1,29 @@
-//! Generated Prometheus remote read/write protobuf types.
+//! Shared Prometheus remote read/write protobuf types.
 //!
 //! Vendored schema sources:
-//! - `proto/prometheus/remote.proto`
-//! - `proto/prometheus/types.proto`
-//! - `proto/gogoproto/gogo.proto`
-
-#[allow(clippy::all, dead_code)]
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
-}
+//! - `tsink-protocol/proto/prometheus/remote.proto`
+//! - `tsink-protocol/proto/prometheus/types.proto`
+//! - `tsink-protocol/proto/gogoproto/gogo.proto`
 
 #[allow(unused_imports)]
-pub use generated::chunk;
+pub use tsink_protocol::prometheus::chunk;
 #[allow(unused_imports)]
-pub use generated::chunk::Encoding as ChunkEncoding;
+pub use tsink_protocol::prometheus::chunk::Encoding as ChunkEncoding;
 #[allow(unused_imports)]
-pub use generated::histogram;
+pub use tsink_protocol::prometheus::histogram;
 #[allow(unused_imports)]
-pub use generated::histogram::ResetHint as HistogramResetHint;
+pub use tsink_protocol::prometheus::histogram::ResetHint as HistogramResetHint;
 #[allow(unused_imports)]
-pub use generated::label_matcher;
-pub use generated::label_matcher::Type as MatcherType;
+pub use tsink_protocol::prometheus::label_matcher;
+pub use tsink_protocol::prometheus::label_matcher::Type as MatcherType;
 #[allow(unused_imports)]
-pub use generated::metric_metadata;
-pub use generated::metric_metadata::MetricType;
+pub use tsink_protocol::prometheus::metric_metadata;
+pub use tsink_protocol::prometheus::metric_metadata::MetricType;
 #[allow(unused_imports)]
-pub use generated::read_request;
-pub use generated::read_request::ResponseType as ReadResponseType;
+pub use tsink_protocol::prometheus::read_request;
+pub use tsink_protocol::prometheus::read_request::ResponseType as ReadResponseType;
 #[allow(unused_imports)]
-pub use generated::{
+pub use tsink_protocol::prometheus::{
     BucketSpan, Chunk, ChunkedReadResponse, ChunkedSeries, Exemplar, Histogram, Label,
     LabelMatcher, Labels, MetricMetadata, Query, QueryResult, ReadHints, ReadRequest, ReadResponse,
     Sample, TimeSeries, WriteRequest,

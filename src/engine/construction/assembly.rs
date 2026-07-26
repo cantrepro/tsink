@@ -38,6 +38,13 @@ impl StorageStateAssembly {
             pending_persisted_segment_diff,
             observability,
         } = resources;
+        // Charge the capacity retained by the live WAL writer, not the nominal builder value.
+        // The buffer already exists at this point and coexists with runtime hydration, so seed the
+        // shared counter before any hydrated state can be published.
+        let wal_writer_buffer_bytes = wal
+            .as_ref()
+            .map(FramedWal::write_buffer_capacity_bytes)
+            .unwrap_or(0);
 
         Ok(Self {
             catalog: Self::build_catalog_state(options),
@@ -59,7 +66,7 @@ impl StorageStateAssembly {
                 pending_persisted_segment_diff,
             ),
             runtime: Self::build_runtime_config_state(options),
-            memory: Self::build_memory_accounting_state(options),
+            memory: Self::build_memory_accounting_state(options, wal_writer_buffer_bytes),
             coordination: Self::build_coordination_state(lifecycle, compaction_lock),
             background: Self::build_background_worker_supervision_state(
                 options.compaction_interval,
@@ -164,20 +171,34 @@ impl StorageStateAssembly {
         }
     }
 
-    fn build_memory_accounting_state(options: &ChunkStorageOptions) -> MemoryAccountingState {
+    fn build_memory_accounting_state(
+        options: &ChunkStorageOptions,
+        wal_writer_buffer_bytes: usize,
+    ) -> MemoryAccountingState {
+        let initial_tombstone_bytes =
+            crate::engine::tombstone::ImmutableTombstoneSnapshot::empty_memory_usage_bytes();
+        let initial_wal_writer_buffer_bytes =
+            u64::try_from(wal_writer_buffer_bytes).unwrap_or(u64::MAX);
+        let initial_accounted_bytes =
+            u64::try_from(wal_writer_buffer_bytes.saturating_add(initial_tombstone_bytes))
+                .unwrap_or(u64::MAX);
+        let initial_tombstone_bytes = u64::try_from(initial_tombstone_bytes).unwrap_or(u64::MAX);
         MemoryAccountingState {
             accounting_enabled: options.memory_budget_bytes != u64::MAX,
-            used_bytes: AtomicU64::new(0),
+            used_bytes: AtomicU64::new(initial_accounted_bytes),
             used_bytes_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
-            shared_used_bytes: AtomicU64::new(0),
+            shared_used_bytes: AtomicU64::new(initial_accounted_bytes),
             registry_used_bytes: AtomicU64::new(0),
             metadata_used_bytes: AtomicU64::new(0),
             persisted_index_used_bytes: AtomicU64::new(0),
             persisted_mmap_used_bytes: AtomicU64::new(0),
-            tombstone_used_bytes: AtomicU64::new(0),
+            tombstone_used_bytes: AtomicU64::new(initial_tombstone_bytes),
             tombstone_staged_bytes: AtomicU64::new(0),
+            remote_catalog_staging: Arc::new(RemoteCatalogMemoryAccounting::default()),
+            wal_writer_buffer_used_bytes: AtomicU64::new(initial_wal_writer_buffer_bytes),
             wal_series_definition_cache_used_bytes: AtomicU64::new(0),
             write_transient: Arc::new(WriteTransientMemoryAccounting::default()),
+            reservation_admission_lock: Mutex::new(()),
             budget_bytes: AtomicU64::new(options.memory_budget_bytes),
             active_backpressured_writers: AtomicU64::new(0),
             backpressure_events_total: AtomicU64::new(0),
@@ -196,6 +217,12 @@ impl StorageStateAssembly {
             startup_metadata_reconcile_pending: AtomicBool::new(false),
             background_retention_maintenance_cursor: Mutex::new(
                 BackgroundRetentionMaintenanceCursor::default(),
+            ),
+            background_metadata_reconciliation_cursor: Mutex::new(
+                BackgroundMetadataReconciliationCursor::default(),
+            ),
+            background_tombstone_recovery_snapshot_cursor: Mutex::new(
+                BackgroundTombstoneRecoverySnapshotCursor::default(),
             ),
             background_catalog_refresh_cursor: Mutex::new(BackgroundCatalogRefreshCursor::default()),
             lifecycle,

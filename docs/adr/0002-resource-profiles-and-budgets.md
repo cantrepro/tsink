@@ -115,6 +115,12 @@ adapt their cancellation mechanisms to the same core contract rather than introd
 the root crate. Explicit pagination is distinct from a resource rejection: a direct query never
 silently truncates because it reached a profile budget.
 
+Protocol adapters may need an additional representation envelope after core work completes.
+Prometheus remote read therefore encodes one query result at a time, caps the aggregate
+uncompressed protobuf at 64 MiB, and preflights the bounded Snappy allocation. Local encoded frames
+also count against the owning query's returned-byte limit. The retained wire buffers are a named
+server-adapter boundary, not part of the core shared-memory gauge.
+
 ## Implementation sequence
 
 1. Publish an inventory document and an effective snapshot for controls that are already enforced.

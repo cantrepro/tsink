@@ -68,7 +68,10 @@ The tool ships as a separate binary in the `tsink-server` crate. Build it alongs
 cargo build -p tsink-server --bin tsink-migrate --release
 ```
 
-A convenience wrapper is provided at [`scripts/tsink_migrate.sh`](../scripts/tsink_migrate.sh) that proxies arguments directly:
+Repository checkouts also contain a convenience
+[`scripts/tsink_migrate.sh`](https://github.com/cantrepro/tsink/blob/master/scripts/tsink_migrate.sh)
+wrapper that proxies arguments directly. The wrapper is a development convenience and is not
+included in the published crate:
 
 ```bash
 ./scripts/tsink_migrate.sh <command> --config plan.json --start-ms <ms> --end-ms <ms>
@@ -129,6 +132,7 @@ The plan is a JSON object. All paths in the plan are interpreted relative to the
   "exemplar_url":    "http://tsink:9201/api/v1/query_exemplars",
   "status_url":      "http://tsink:9201/api/v1/status/tsdb",
   "tenant":          "default",
+  "minimum_write_acknowledgement": "durable",
   "headers":         { "Authorization": "Bearer <token>" }
 }
 ```
@@ -142,6 +146,7 @@ The plan is a JSON object. All paths in the plan are interpreted relative to the
 | `exemplar_url` | optional | Used when exemplar verification is configured. |
 | `status_url` | optional | tsink `/api/v1/status/tsdb` endpoint. When provided, `cutover-check` probes whether required ingest payload types (metadata, exemplars, histograms, OTLP, InfluxDB, StatsD, Graphite) are enabled on the target. |
 | `tenant` | optional | Target tenant name. Sent as `X-Tsink-Tenant` on every request. Defaults to `default`. |
+| `minimum_write_acknowledgement` | optional | Minimum accepted `X-Tsink-Write-Acknowledgement` level for every backfill batch. Levels are ordered `volatile < appended < durable`; the default is `durable`. A weaker value is an explicit durability downgrade and is recorded in the backfill report. |
 | `headers` | optional | Additional HTTP headers for every request to tsink (for per-tenant auth tokens, etc.). |
 
 ### 4.3 Selectors
@@ -195,8 +200,8 @@ Controls how data is batched during backfill writes.
 
 | Field | Default | Description |
 |---|---|---|
-| `max_series_per_write` | `250` | Maximum number of series per remote write request. |
-| `max_points_per_write` | `25000` | Maximum total data points across all series per request. |
+| `max_series_per_write` | `250` | Maximum number of time-series entries per remote write request. Must be greater than zero. |
+| `max_points_per_write` | `25000` | Maximum total samples, native histograms, and exemplars per request. Must be greater than zero. A single larger source series is split into label-preserving fragments so this remains a hard limit. |
 | `http_timeout_secs` | `30` | HTTP request timeout for all source and target calls. |
 
 ### 4.6 Comparison tolerances
@@ -227,7 +232,28 @@ tsink-migrate backfill --config plan.json --start-ms 1700000000000 --end-ms 1700
 
 Fetches all series matching the plan selectors from the source within `[start-ms, end-ms]` and writes them to tsink in batched Prometheus remote write requests. Additionally backfills metric metadata (if `metadata_url` is configured on the source) and exemplars (if `exemplar_url` is configured and the source is Prometheus).
 
-**Exit code:** `0` on success, `1` on any transport or write error.
+**Exit code:** `0` only when every non-empty remote-write batch returns exactly one canonical tsink
+acknowledgement header (`X-Tsink-Write-Acknowledgement`) at or above the target's configured
+`minimum_write_acknowledgement`. The levels are `volatile < appended < durable`, and the default
+minimum is `durable`. Configure `appended` or `volatile` only when you deliberately accept the
+corresponding durability downgrade; that floor and the weakest acknowledgement actually observed
+are included in console, JSON, and Markdown reports. Missing, malformed, duplicate, too-weak,
+partial, or indeterminate acknowledgement evidence exits with `1`. Metadata-only batches must also
+report `X-Tsink-Metadata-Accepted` equal to the number submitted and a valid
+`X-Tsink-Metadata-Applied` count no greater than that number; an applied count of zero is valid when
+an idempotent replay finds the same metadata already stored. Missing, malformed, duplicate, or
+inconsistent metadata evidence exits with `1`. Batches containing exemplars must report every
+submitted exemplar in `X-Tsink-Exemplars-Accepted` and zero in
+`X-Tsink-Exemplars-Dropped`; batches containing native histograms must report the submitted count
+in `X-Tsink-Histograms-Accepted`. Missing or inconsistent payload counts, including any dropped
+exemplar, also fail the backfill. The tool does not report an unproven batch as migrated. Other
+transport and write errors also exit with `1`.
+
+The current server envelope conservatively reports metadata and exemplar sidecar participation as
+`volatile`, even when a particular sidecar is file-backed, because it does not expose a separate
+sidecar durability result. A plan that includes metadata or exemplars therefore cannot meet the
+default `durable` floor. Setting the floor to `volatile` is an explicit acceptance of that
+documented guarantee; the resulting report does not claim crash-durable sidecar migration.
 
 **Console output on success:**
 ```
@@ -240,6 +266,8 @@ tsink-migrate backfill: pass
   exemplars: 0
   metadata: 2
   write_batches: 3
+  minimum_write_acknowledgement: durable
+  weakest_observed_write_acknowledgement: durable
 ```
 
 ### 5.2 verify

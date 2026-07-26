@@ -395,6 +395,22 @@ impl ChunkStorage {
 
         close_result
     }
+
+    /// Ends an internal snapshot-validation lifecycle without running the normal persistence,
+    /// flush, retention, or compaction close pipeline.
+    ///
+    /// Validation startup never starts background workers, but joining remains part of the
+    /// contract so a future topology change cannot release process leases before an owned worker
+    /// exits.
+    pub(in super::super) fn finish_snapshot_validation_lifecycle(&self) -> Result<()> {
+        self.coordination
+            .lifecycle
+            .store(STORAGE_CLOSED, Ordering::SeqCst);
+        self.notify_background_threads();
+        let join_result = self.join_background_threads();
+        self.release_data_path_process_lock();
+        join_result
+    }
 }
 
 #[cfg(test)]

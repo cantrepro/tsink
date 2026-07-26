@@ -11,10 +11,9 @@ const KNOWN_EXCLUDED_MEMORY_CATEGORIES: &[&str] = &[
     "query_working_sets",
     "decompression_buffers",
     "caller_owned_write_inputs",
-    "wal_writer_buffer_finite_unbudgeted",
     "public_wal_helper_result_collections",
     "rollup_working_state",
-    "remote_refresh_staging",
+    "catalog_input_inventory_materialization",
     "thread_stacks",
     "allocator_and_runtime_overhead",
     "adapter_and_server_state",
@@ -63,28 +62,28 @@ impl WriteTransientMemoryAccounting {
     fn reserve_additional(
         &self,
         additional: u64,
-        used_bytes: &AtomicU64,
-        tombstone_staged_bytes: &AtomicU64,
-        budget_bytes: &AtomicU64,
-        memory_rejections_total: &AtomicU64,
+        admission: MemoryReservationAdmissionContext<'_>,
     ) -> Result<()> {
         if additional == 0 {
             return Ok(());
         }
 
+        let _admission_guard = admission.reservation_admission_lock.lock();
         loop {
             let current = self.current_bytes.load(Ordering::Acquire);
-            let used = used_bytes.load(Ordering::Acquire);
-            let tombstone_staged = tombstone_staged_bytes.load(Ordering::Acquire);
-            let budget = budget_bytes.load(Ordering::Acquire);
+            let used = admission.used_bytes.load(Ordering::Acquire);
+            let tombstone_staged = admission.tombstone_staged_bytes.load(Ordering::Acquire);
+            let remote_catalog_staged = admission.remote_catalog_staging.current_bytes_u64();
+            let budget = admission.budget_bytes.load(Ordering::Acquire);
             let required = used
                 .checked_add(tombstone_staged)
+                .and_then(|bytes| bytes.checked_add(remote_catalog_staged))
                 .and_then(|bytes| bytes.checked_add(current))
                 .and_then(|bytes| bytes.checked_add(additional))
                 .ok_or(TsinkError::WriteBatchSizeOverflow)?;
             if budget != u64::MAX && required > budget {
                 Self::increment(&self.rejections_total);
-                Self::increment(memory_rejections_total);
+                Self::increment(admission.memory_rejections_total);
                 return Err(TsinkError::MemoryBudgetExceeded {
                     budget: budget.min(usize::MAX as u64) as usize,
                     required: required.min(usize::MAX as u64) as usize,
@@ -111,20 +110,11 @@ impl WriteTransientMemoryAccounting {
     pub(in crate::engine::storage_engine) fn new_reservation(
         self: &Arc<Self>,
         requested_bytes: usize,
-        used_bytes: &AtomicU64,
-        tombstone_staged_bytes: &AtomicU64,
-        budget_bytes: &AtomicU64,
-        memory_rejections_total: &AtomicU64,
+        admission: MemoryReservationAdmissionContext<'_>,
     ) -> Result<WriteTransientMemoryReservation> {
         let requested =
             u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
-        self.reserve_additional(
-            requested,
-            used_bytes,
-            tombstone_staged_bytes,
-            budget_bytes,
-            memory_rejections_total,
-        )?;
+        self.reserve_additional(requested, admission)?;
         Self::increment(&self.reservations_total);
         Ok(WriteTransientMemoryReservation {
             lease: Arc::new(WriteTransientMemoryLease {
@@ -136,9 +126,11 @@ impl WriteTransientMemoryAccounting {
     }
 
     pub(in crate::engine::storage_engine) fn current_bytes(&self) -> usize {
-        self.current_bytes
-            .load(Ordering::Acquire)
-            .min(usize::MAX as u64) as usize
+        self.current_bytes_u64().min(usize::MAX as u64) as usize
+    }
+
+    fn current_bytes_u64(&self) -> u64 {
+        self.current_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -170,10 +162,7 @@ impl WriteTransientMemoryReservation {
     pub(in super::super) fn ensure(
         &self,
         requested_bytes: usize,
-        used_bytes: &AtomicU64,
-        tombstone_staged_bytes: &AtomicU64,
-        budget_bytes: &AtomicU64,
-        memory_rejections_total: &AtomicU64,
+        admission: MemoryReservationAdmissionContext<'_>,
     ) -> Result<()> {
         let requested =
             u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
@@ -183,13 +172,9 @@ impl WriteTransientMemoryReservation {
                 return Ok(());
             }
             let additional = requested - current;
-            self.lease.accounting.reserve_additional(
-                additional,
-                used_bytes,
-                tombstone_staged_bytes,
-                budget_bytes,
-                memory_rejections_total,
-            )?;
+            self.lease
+                .accounting
+                .reserve_additional(additional, admission)?;
             match self.lease.reserved_bytes.compare_exchange(
                 current,
                 requested,
@@ -222,12 +207,148 @@ impl Drop for WriteTransientMemoryLease {
     }
 }
 
+/// Shared accounting for finite remote catalog reads and read-write catalog publication staging.
+#[derive(Debug, Default)]
+pub(in super::super) struct RemoteCatalogMemoryAccounting {
+    current_bytes: AtomicU64,
+}
+
+/// Shared inputs for globally serialized storage-memory reservation admission.
+#[derive(Clone, Copy)]
+pub(in super::super) struct MemoryReservationAdmissionContext<'a> {
+    pub(in super::super) reservation_admission_lock: &'a Mutex<()>,
+    pub(in super::super) used_bytes: &'a AtomicU64,
+    pub(in super::super) tombstone_staged_bytes: &'a AtomicU64,
+    pub(in super::super) remote_catalog_staging: &'a RemoteCatalogMemoryAccounting,
+    pub(in super::super) write_transient: &'a WriteTransientMemoryAccounting,
+    pub(in super::super) budget_bytes: &'a AtomicU64,
+    pub(in super::super) memory_rejections_total: &'a AtomicU64,
+}
+
+/// One retained catalog staging lease. Resizing admits growth before allocation, while shrinking
+/// and final drop immediately return bytes to the global storage-memory envelope.
+pub(in super::super) struct RemoteCatalogMemoryReservation {
+    accounting: Arc<RemoteCatalogMemoryAccounting>,
+    reserved_bytes: u64,
+}
+
+impl RemoteCatalogMemoryAccounting {
+    fn current_bytes_u64(&self) -> u64 {
+        self.current_bytes.load(Ordering::Acquire)
+    }
+
+    pub(in super::super) fn current_bytes(&self) -> usize {
+        self.current_bytes_u64().min(usize::MAX as u64) as usize
+    }
+
+    fn reserve_additional(
+        &self,
+        additional: u64,
+        admission: MemoryReservationAdmissionContext<'_>,
+    ) -> Result<()> {
+        if additional == 0 {
+            return Ok(());
+        }
+
+        let _admission_guard = admission.reservation_admission_lock.lock();
+        loop {
+            let current = self.current_bytes.load(Ordering::Acquire);
+            let used = admission.used_bytes.load(Ordering::Acquire);
+            let tombstone_staged = admission.tombstone_staged_bytes.load(Ordering::Acquire);
+            let transient = admission.write_transient.current_bytes_u64();
+            let budget = admission.budget_bytes.load(Ordering::Acquire);
+            let required = used
+                .checked_add(tombstone_staged)
+                .and_then(|bytes| bytes.checked_add(transient))
+                .and_then(|bytes| bytes.checked_add(current))
+                .and_then(|bytes| bytes.checked_add(additional))
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            if budget != u64::MAX && required > budget {
+                WriteTransientMemoryAccounting::increment(admission.memory_rejections_total);
+                return Err(TsinkError::MemoryBudgetExceeded {
+                    budget: budget.min(usize::MAX as u64) as usize,
+                    required: required.min(usize::MAX as u64) as usize,
+                });
+            }
+            let next = current
+                .checked_add(additional)
+                .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(in super::super) fn new_reservation(
+        self: &Arc<Self>,
+        requested_bytes: usize,
+        admission: MemoryReservationAdmissionContext<'_>,
+    ) -> Result<RemoteCatalogMemoryReservation> {
+        let requested =
+            u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+        self.reserve_additional(requested, admission)?;
+        Ok(RemoteCatalogMemoryReservation {
+            accounting: Arc::clone(self),
+            reserved_bytes: requested,
+        })
+    }
+}
+
+impl RemoteCatalogMemoryReservation {
+    pub(in super::super) fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes.min(usize::MAX as u64) as usize
+    }
+
+    pub(in super::super) fn resize(
+        &mut self,
+        requested_bytes: usize,
+        admission: MemoryReservationAdmissionContext<'_>,
+    ) -> Result<()> {
+        let requested =
+            u64::try_from(requested_bytes).map_err(|_| TsinkError::WriteBatchSizeOverflow)?;
+        if requested <= self.reserved_bytes {
+            let released = self.reserved_bytes - requested;
+            if released > 0 {
+                self.accounting
+                    .current_bytes
+                    .fetch_sub(released, Ordering::AcqRel);
+                self.reserved_bytes = requested;
+            }
+            return Ok(());
+        }
+
+        self.accounting
+            .reserve_additional(requested - self.reserved_bytes, admission)?;
+        self.reserved_bytes = requested;
+        Ok(())
+    }
+}
+
+impl Drop for RemoteCatalogMemoryReservation {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.accounting
+                .current_bytes
+                .fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+        }
+    }
+}
+
 /// A conservative admission charge for tombstone decode/RMW staging. The durable delete and
 /// snapshot/recovery callers also drain writer permits, while ordinary write admission includes
 /// this counter so future call sites cannot silently ignore an active staging envelope.
 pub(in super::super) struct TombstoneMemoryReservation<'a> {
     used_bytes: &'a AtomicU64,
     staged_bytes: &'a AtomicU64,
+    remote_catalog_staging: &'a RemoteCatalogMemoryAccounting,
+    write_transient: &'a WriteTransientMemoryAccounting,
+    reservation_admission_lock: &'a Mutex<()>,
     budget_bytes: &'a AtomicU64,
     rejections_total: &'a AtomicU64,
     reserved_bytes: u64,
@@ -255,11 +376,18 @@ impl TombstoneMemoryReservation<'_> {
         }
 
         let additional = requested - self.reserved_bytes;
+        let _admission_guard = self.reservation_admission_lock.lock();
         loop {
             let budget = self.budget_bytes.load(Ordering::Acquire);
             let used = self.used_bytes.load(Ordering::Acquire);
             let staged = self.staged_bytes.load(Ordering::Acquire);
-            let required = used.saturating_add(staged).saturating_add(additional);
+            let remote_catalog_staged = self.remote_catalog_staging.current_bytes_u64();
+            let write_transient = self.write_transient.current_bytes_u64();
+            let required = used
+                .saturating_add(staged)
+                .saturating_add(remote_catalog_staged)
+                .saturating_add(write_transient)
+                .saturating_add(additional);
             if budget != u64::MAX && required > budget {
                 let _ = self.rejections_total.fetch_update(
                     Ordering::AcqRel,
@@ -297,17 +425,44 @@ impl Drop for TombstoneMemoryReservation<'_> {
 }
 
 impl ChunkStorage {
+    pub(in super::super) fn memory_reservation_admission_context(
+        &self,
+    ) -> MemoryReservationAdmissionContext<'_> {
+        MemoryReservationAdmissionContext {
+            reservation_admission_lock: &self.memory.reservation_admission_lock,
+            used_bytes: &self.memory.used_bytes,
+            tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
+            remote_catalog_staging: self.memory.remote_catalog_staging.as_ref(),
+            write_transient: self.memory.write_transient.as_ref(),
+            budget_bytes: &self.memory.budget_bytes,
+            memory_rejections_total: &self.memory.rejections_total,
+        }
+    }
+
+    pub(in super::super) fn remote_catalog_memory_reservation(
+        &self,
+        requested_bytes: usize,
+    ) -> Result<RemoteCatalogMemoryReservation> {
+        self.memory
+            .remote_catalog_staging
+            .new_reservation(requested_bytes, self.memory_reservation_admission_context())
+    }
+
+    pub(in super::super) fn resize_remote_catalog_memory_reservation(
+        &self,
+        reservation: &mut RemoteCatalogMemoryReservation,
+        requested_bytes: usize,
+    ) -> Result<()> {
+        reservation.resize(requested_bytes, self.memory_reservation_admission_context())
+    }
+
     pub(in super::super) fn reserve_write_transient_memory(
         &self,
         requested_bytes: usize,
     ) -> Result<WriteTransientMemoryReservation> {
-        self.memory.write_transient.new_reservation(
-            requested_bytes,
-            &self.memory.used_bytes,
-            &self.memory.tombstone_staged_bytes,
-            &self.memory.budget_bytes,
-            &self.memory.rejections_total,
-        )
+        self.memory
+            .write_transient
+            .new_reservation(requested_bytes, self.memory_reservation_admission_context())
     }
 
     pub(in super::super) fn ensure_write_transient_memory(
@@ -315,13 +470,7 @@ impl ChunkStorage {
         reservation: &WriteTransientMemoryReservation,
         requested_bytes: usize,
     ) -> Result<()> {
-        reservation.ensure(
-            requested_bytes,
-            &self.memory.used_bytes,
-            &self.memory.tombstone_staged_bytes,
-            &self.memory.budget_bytes,
-            &self.memory.rejections_total,
-        )
+        reservation.ensure(requested_bytes, self.memory_reservation_admission_context())
     }
 
     pub(in super::super) fn memory_budget_value(&self) -> usize {
@@ -336,6 +485,9 @@ impl ChunkStorage {
         TombstoneMemoryReservation {
             used_bytes: &self.memory.used_bytes,
             staged_bytes: &self.memory.tombstone_staged_bytes,
+            remote_catalog_staging: self.memory.remote_catalog_staging.as_ref(),
+            write_transient: self.memory.write_transient.as_ref(),
+            reservation_admission_lock: &self.memory.reservation_admission_lock,
             budget_bytes: &self.memory.budget_bytes,
             rejections_total: &self.memory.rejections_total,
             reserved_bytes: 0,
@@ -433,34 +585,6 @@ impl ChunkStorage {
         let result = mutate(state);
         let after = measure(state);
         self.account_included_memory_component_delta_bytes(component, before, after);
-        result
-    }
-
-    pub(in super::super) fn with_visibility_state_memory_delta<R>(
-        &self,
-        summaries: &mut HashMap<SeriesId, SeriesVisibilitySummary>,
-        cache: &mut HashMap<SeriesId, Option<i64>>,
-        bounded_cache: &mut HashMap<SeriesId, Option<i64>>,
-        mutate: impl FnOnce(
-            &mut HashMap<SeriesId, SeriesVisibilitySummary>,
-            &mut HashMap<SeriesId, Option<i64>>,
-            &mut HashMap<SeriesId, Option<i64>>,
-        ) -> R,
-    ) -> R {
-        if !self.memory.accounting_enabled {
-            return mutate(summaries, cache, bounded_cache);
-        }
-
-        let before =
-            Self::series_visibility_state_memory_usage_bytes(summaries, cache, bounded_cache);
-        let result = mutate(summaries, cache, bounded_cache);
-        let after =
-            Self::series_visibility_state_memory_usage_bytes(summaries, cache, bounded_cache);
-        self.account_included_memory_component_delta_bytes(
-            &self.memory.metadata_used_bytes,
-            before,
-            after,
-        );
         result
     }
 
@@ -586,6 +710,8 @@ impl ChunkStorage {
             .saturating_add(context::MemoryAccountingContext::component_value(
                 &self.memory.tombstone_staged_bytes,
             )),
+            remote_catalog_staging_bytes: self.memory.remote_catalog_staging.current_bytes(),
+            wal_writer_buffer_bytes: memory_accounting.wal_writer_buffer_used_value(),
             wal_series_definition_cache_bytes: context::MemoryAccountingContext::component_value(
                 &self.memory.wal_series_definition_cache_used_bytes,
             ),
@@ -732,10 +858,9 @@ impl ChunkStorage {
     pub(in super::super) fn tombstone_map_memory_usage_bytes(
         tombstones: &crate::engine::tombstone::TombstoneMap,
     ) -> usize {
-        let mut bytes = Self::hash_map_memory_usage_bytes::<
-            SeriesId,
-            Vec<crate::engine::tombstone::TombstoneRange>,
-        >(tombstones);
+        let mut bytes = tombstones
+            .len()
+            .saturating_mul(crate::engine::tombstone::TOMBSTONE_BTREE_ENTRY_ALLOCATION_BYTES);
         for ranges in tombstones.values() {
             bytes =
                 bytes.saturating_add(ranges.capacity().saturating_mul(std::mem::size_of::<

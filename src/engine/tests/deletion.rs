@@ -982,7 +982,7 @@ fn indeterminate_tombstone_rollback_retains_pending_rollup_marker_and_live_shard
         .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME)
         .join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_FILE_NAME)
         .exists());
-    let expected_tombstones = HashMap::from([(
+    let expected_tombstones = crate::engine::tombstone::TombstoneMap::from([(
         deleted_series_id,
         vec![TombstoneRange {
             start: 1_000,
@@ -1132,6 +1132,60 @@ fn catalog_refresh_recovers_committing_tombstone_before_manifest_reload() {
         .is_empty());
 
     drop(guard);
+    let first_manifest = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join(TOMBSTONES_FILE_NAME);
+    assert!(
+        !first_manifest.exists(),
+        "the injected interruption precedes every manifest publication"
+    );
+    let live_before = storage.tombstone_read_context().snapshot();
+    let exact_reload_bytes = storage
+        .with_rollup_run_lock(|| {
+            storage.with_visibility_write_stage(|| {
+                storage.committed_tombstone_reload_preflight_bytes_for_tests()
+            })
+        })
+        .unwrap();
+    assert!(exact_reload_bytes > 0);
+    let error = storage
+        .with_rollup_run_lock(|| {
+            storage.with_visibility_write_stage(|| {
+                storage.recover_and_reload_tombstones_with_byte_limit_for_tests(
+                    u64::try_from(exact_reload_bytes - 1).unwrap(),
+                )
+            })
+        })
+        .expect_err("N-1 recovery bytes must reject before durable roll-forward");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            limit,
+            required,
+            ..
+        } if limit == u64::try_from(exact_reload_bytes - 1).unwrap()
+            && required == u64::try_from(exact_reload_bytes).unwrap()
+    ));
+    assert!(coordinator.is_file());
+    assert!(!first_manifest.exists());
+    assert_eq!(storage.tombstone_read_context().snapshot(), live_before);
+
+    assert!(
+        storage
+            .with_rollup_run_lock(|| {
+                storage.with_visibility_write_stage(|| {
+                    storage.recover_and_reload_tombstones_with_byte_limit_for_tests(
+                        u64::try_from(exact_reload_bytes).unwrap(),
+                    )
+                })
+            })
+            .unwrap(),
+        "exact preflight bytes must roll forward and install the retained authoritative map"
+    );
+    assert!(!coordinator.exists());
+    assert!(first_manifest.exists());
+    assert_eq!(storage.tombstone_read_context().snapshot(), live_before);
+
     storage
         .persisted
         .persisted_index_dirty
@@ -1646,6 +1700,7 @@ fn acknowledged_tiered_delete_publishes_shared_anchor_before_local_failure() {
         .build()
         .unwrap();
     let compute_only = builder_at_time(3)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_object_store_path(object_store_dir.path())
         .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
         .with_remote_segment_refresh_interval(Duration::from_millis(1))
@@ -1754,6 +1809,7 @@ fn tiered_delete_before_shared_anchor_is_indeterminate_and_not_remotely_visible(
         .build()
         .unwrap();
     let compute_only = builder_at_time(3)
+        .with_resource_profile(crate::ResourceProfile::ExpertUnlimited)
         .with_object_store_path(object_store_dir.path())
         .with_runtime_mode(StorageRuntimeMode::ComputeOnly)
         .with_remote_segment_refresh_interval(Duration::from_millis(1))

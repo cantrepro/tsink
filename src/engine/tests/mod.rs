@@ -62,6 +62,7 @@ pub(in crate::engine::storage_engine::tests) use self::fixtures::{
 mod admission_control;
 mod capacity;
 mod deletion;
+mod durability_failpoints;
 mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
@@ -111,6 +112,10 @@ pub(crate) fn assert_engine_memory_usage_reconciled(storage: &ChunkStorage) {
         reconciled.persisted_mmap_bytes
     );
     assert_eq!(incremental.tombstone_bytes, reconciled.tombstone_bytes);
+    assert_eq!(
+        incremental.wal_writer_buffer_bytes,
+        reconciled.wal_writer_buffer_bytes
+    );
     assert_eq!(
         incremental.wal_series_definition_cache_bytes,
         reconciled.wal_series_definition_cache_bytes

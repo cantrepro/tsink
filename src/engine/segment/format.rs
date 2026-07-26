@@ -871,6 +871,215 @@ pub(super) fn parse_series_file(bytes: &[u8]) -> Result<ParsedSeriesFile> {
     parse_series_file_with_decoded_limit(bytes, MAX_DECODED_FRAMED_FILE_BYTES)
 }
 
+/// Validates every registry-rebuild-relevant reference and canonical table boundary in
+/// `series.bin` without materializing dictionaries, labels, or `PersistedSeries` values.
+///
+/// This is used by legacy data-directory identity detection, where cloning shared dictionary
+/// strings once per series would make startup memory proportional to the expanded registry rather
+/// than the bounded file representation.
+pub(super) fn validate_series_file_structure_with_decoded_limit(
+    bytes: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<usize> {
+    let bytes = decode_optional_zstd_framed_file_with_limit(
+        bytes,
+        SERIES_MAGIC,
+        FORMAT_VERSION,
+        "series.bin",
+        max_decoded_bytes.min(MAX_DECODED_FRAMED_FILE_BYTES),
+    )?;
+    if bytes.len() < SERIES_HEADER_LEN {
+        return Err(TsinkError::DataCorruption(
+            "series.bin is too short".to_string(),
+        ));
+    }
+
+    let mut pos = 0usize;
+    let magic = read_array::<4>(&bytes, &mut pos)?;
+    if magic != SERIES_MAGIC {
+        return Err(TsinkError::DataCorruption(
+            "series.bin magic mismatch".to_string(),
+        ));
+    }
+    let version = read_u16(&bytes, &mut pos)?;
+    if version != FORMAT_VERSION {
+        return Err(TsinkError::DataCorruption(format!(
+            "unsupported series.bin version {version}"
+        )));
+    }
+    let flags = read_u16(&bytes, &mut pos)?;
+    if flags & !(SERIES_FLAG_VALUE_FAMILY | SERIES_FLAG_LEGACY_VALUE_FAMILY) != 0 {
+        return Err(TsinkError::DataCorruption(format!(
+            "invalid series.bin flags {flags:#06x}"
+        )));
+    }
+    let metric_count = read_u32(&bytes, &mut pos)? as usize;
+    let label_name_count = read_u32(&bytes, &mut pos)? as usize;
+    let label_value_count = read_u32(&bytes, &mut pos)? as usize;
+    let series_count = persisted_count(read_u64(&bytes, &mut pos)?, "series.bin series")?;
+
+    let dictionary_count = metric_count
+        .checked_add(label_name_count)
+        .and_then(|count| count.checked_add(label_value_count))
+        .ok_or_else(|| {
+            TsinkError::DataCorruption("series.bin dictionary count overflow".to_string())
+        })?;
+    let minimum_dictionary_bytes =
+        checked_record_bytes(dictionary_count, 8, "series.bin dictionary headers")?;
+    let minimum_series_bytes =
+        checked_record_bytes(series_count, SERIES_ENTRY_LEN, "series.bin entries")?;
+    let minimum_remaining = minimum_dictionary_bytes
+        .checked_add(minimum_series_bytes)
+        .ok_or_else(|| {
+            TsinkError::DataCorruption("series.bin minimum length overflow".to_string())
+        })?;
+    if minimum_remaining > bytes.len().saturating_sub(pos) {
+        return Err(TsinkError::DataCorruption(format!(
+            "series.bin declared counts require at least {minimum_remaining} bytes, but only {} remain",
+            bytes.len().saturating_sub(pos)
+        )));
+    }
+
+    validate_dictionary_structure(&bytes, &mut pos, metric_count)?;
+    validate_dictionary_structure(&bytes, &mut pos, label_name_count)?;
+    validate_dictionary_structure(&bytes, &mut pos, label_value_count)?;
+
+    let entries_bytes =
+        checked_record_bytes(series_count, SERIES_ENTRY_LEN, "series.bin entry table")?;
+    let entries_end = pos.checked_add(entries_bytes).ok_or_else(|| {
+        TsinkError::DataCorruption("series.bin entry table end overflow".to_string())
+    })?;
+    if entries_end > bytes.len() {
+        return Err(TsinkError::DataCorruption(
+            "series.bin entry table exceeds file size".to_string(),
+        ));
+    }
+
+    let has_value_family =
+        flags & (SERIES_FLAG_VALUE_FAMILY | SERIES_FLAG_LEGACY_VALUE_FAMILY) != 0;
+    let mut entry_pos = pos;
+    let mut expected_pair_offset = entries_end;
+    let mut previous_series_id = None;
+    for _ in 0..series_count {
+        let series_id = read_u64(&bytes, &mut entry_pos)?;
+        if previous_series_id.is_some_and(|previous| series_id <= previous) {
+            return Err(TsinkError::DataCorruption(format!(
+                "series.bin series ids are not strictly increasing at {series_id}"
+            )));
+        }
+        previous_series_id = Some(series_id);
+
+        let lane = decode_lane(read_u8(&bytes, &mut entry_pos)?)?;
+        if has_value_family {
+            let value_family = decode_series_value_family(read_u8(&bytes, &mut entry_pos)?)?;
+            let compatible = matches!(
+                (lane, value_family),
+                (
+                    ValueLane::Numeric,
+                    SeriesValueFamily::F64
+                        | SeriesValueFamily::I64
+                        | SeriesValueFamily::U64
+                        | SeriesValueFamily::Bool
+                ) | (
+                    ValueLane::Blob,
+                    SeriesValueFamily::Blob | SeriesValueFamily::Histogram
+                )
+            );
+            if !compatible {
+                return Err(TsinkError::DataCorruption(format!(
+                    "series.bin series {series_id} has a value family incompatible with its lane"
+                )));
+            }
+        } else {
+            let _reserved = read_u8(&bytes, &mut entry_pos)?;
+        }
+        let pair_count = read_u16(&bytes, &mut entry_pos)? as usize;
+        let metric_id = read_u32(&bytes, &mut entry_pos)? as usize;
+        if metric_id >= metric_count {
+            return Err(TsinkError::DataCorruption(format!(
+                "series.bin series {series_id} references missing metric id {metric_id}"
+            )));
+        }
+        let pair_offset =
+            persisted_offset(read_u64(&bytes, &mut entry_pos)?, "series.bin label-pair")?;
+        if pair_offset != expected_pair_offset {
+            return Err(TsinkError::DataCorruption(format!(
+                "series label-pair offset {pair_offset} is not canonical; expected {expected_pair_offset}"
+            )));
+        }
+        let pair_bytes =
+            checked_record_bytes(pair_count, SERIES_LABEL_PAIR_LEN, "series label-pair block")?;
+        let pair_end = pair_offset.checked_add(pair_bytes).ok_or_else(|| {
+            TsinkError::DataCorruption("series label-pair end offset overflow".to_string())
+        })?;
+        if pair_end > bytes.len() {
+            return Err(TsinkError::DataCorruption(
+                "series label pair block exceeds file size".to_string(),
+            ));
+        }
+
+        let mut pair_pos = pair_offset;
+        let mut previous_name_id = None;
+        for _ in 0..pair_count {
+            let name_id = read_u32(&bytes, &mut pair_pos)? as usize;
+            let value_id = read_u32(&bytes, &mut pair_pos)? as usize;
+            if name_id >= label_name_count {
+                return Err(TsinkError::DataCorruption(format!(
+                    "series.bin series {series_id} references missing label-name id {name_id}"
+                )));
+            }
+            if value_id >= label_value_count {
+                return Err(TsinkError::DataCorruption(format!(
+                    "series.bin series {series_id} references missing label-value id {value_id}"
+                )));
+            }
+            if previous_name_id.is_some_and(|previous| name_id <= previous) {
+                return Err(TsinkError::DataCorruption(format!(
+                    "series.bin series {series_id} label-name ids are not strictly increasing"
+                )));
+            }
+            previous_name_id = Some(name_id);
+        }
+        if pair_pos != pair_end {
+            return Err(TsinkError::DataCorruption(
+                "series label pair block length mismatch".to_string(),
+            ));
+        }
+        expected_pair_offset = pair_end;
+    }
+    if entry_pos != entries_end {
+        return Err(TsinkError::DataCorruption(
+            "series.bin entry table length mismatch".to_string(),
+        ));
+    }
+    if expected_pair_offset != bytes.len() {
+        return Err(TsinkError::DataCorruption(
+            "series.bin has trailing or unreferenced label-pair bytes".to_string(),
+        ));
+    }
+    Ok(series_count)
+}
+
+fn validate_dictionary_structure(bytes: &[u8], pos: &mut usize, count: usize) -> Result<()> {
+    ensure_fixed_records_fit(bytes.len(), *pos, count, 8, "series dictionary headers")?;
+    for expected_id in 0..count {
+        let id = read_u32(bytes, pos)? as usize;
+        if id != expected_id {
+            return Err(TsinkError::DataCorruption(format!(
+                "dictionary id {id} is not dense at expected {expected_id}"
+            )));
+        }
+        let len = read_u32(bytes, pos)? as usize;
+        let value = read_bytes(bytes, pos, len)?;
+        std::str::from_utf8(value).map_err(|err| {
+            TsinkError::DataCorruption(format!(
+                "series.bin dictionary entry {expected_id} is not UTF-8: {err}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 pub(super) fn parse_series_file_with_decoded_limit(
     bytes: &[u8],
     max_decoded_bytes: usize,

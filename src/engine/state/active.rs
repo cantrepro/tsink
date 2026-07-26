@@ -292,7 +292,6 @@ impl ActiveSeriesState {
         self.partition_heads.is_empty()
     }
 
-    #[cfg(test)]
     pub(in crate::engine::storage_engine) fn point_count(&self) -> usize {
         self.partition_heads
             .values()

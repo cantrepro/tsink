@@ -31,15 +31,19 @@ This document describes the high-level design of tsink, the component interactio
 
 ## 1. Deployment modes
 
-tsink ships as three interconnected Rust crates in a single workspace.
+tsink ships as five interconnected Rust crates in a single workspace.
 
-| Crate                                   | Purpose                                                                            |
-| --------------------------------------- | ---------------------------------------------------------------------------------- |
-| `tsink` (root `src/`)                   | Embeddable library — the complete storage engine with no async runtime dependency. |
-| `tsink-server` (`crates/tsink-server/`) | Standalone HTTP server binary with protocol ingest, clustering, and RBAC.          |
-| `tsink-uniffi` (`crates/tsink-uniffi/`) | UniFFI-generated Python bindings that wrap the library crate.                      |
+| Crate                                       | Purpose                                                                            |
+| ------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `tsink` (root `src/`)                       | Embeddable library — the complete storage engine with no async runtime dependency. |
+| `tsink-protocol` (`crates/tsink-protocol/`) | Reusable generated Prometheus and OTLP protobuf models; no server or engine.        |
+| `tsink-server` (`crates/tsink-server/`)     | Standalone HTTP server binary with protocol ingest, clustering, and RBAC.          |
+| `tsink-test` (`crates/tsink-test/`)         | In-process test fixtures and optional protocol test-data helpers.                  |
+| `tsink-uniffi` (`crates/tsink-uniffi/`)     | UniFFI-generated Python bindings that wrap the library crate.                      |
 
-All three share the same engine code. The server and Python bindings call into the same `Storage` trait that application code uses directly.
+The server, testkit, and Python bindings use the same `Storage` trait that application code calls
+directly. `tsink-protocol` owns shared wire models without depending on the engine, and the default
+testkit does not depend on it unless a protocol feature is enabled.
 
 ---
 
@@ -65,7 +69,9 @@ src/
   promql/                — PromQL lexer, parser, AST, evaluator
 
 crates/
+  tsink-protocol/        — shared Prometheus and OTLP protobuf models
   tsink-server/src/      — HTTP server, protocol adapters, cluster logic
+  tsink-test/src/        — in-process test fixtures and assertion helpers
   tsink-uniffi/src/      — UniFFI bindings
 ```
 
@@ -106,7 +112,10 @@ All interaction with the engine goes through the `Storage` trait. Key methods:
 `AsyncStorage` wraps `Storage` without requiring Tokio. It spawns OS threads internally:
 
 - One dedicated write worker receives `WriteCommand` messages over an `async-channel`.
-- A pool of read workers (sized by `cgroup::default_workers_limit()`) handles `ReadCommand` messages concurrently.
+- A pool of read workers handles `ReadCommand` messages concurrently. Standard profiles use their
+  finite configured count (the default Embedded profile uses four). The `ExpertUnlimited` profile's
+  runtime fallback selects `cgroup::default_workers_limit()`; an explicit
+  `with_read_workers(0)` request is normalized to one worker.
 - Each channel has a 1,024-command default bound plus independent atomic payload-byte admission
   (64 MiB for writes and 16 MiB for reads). The byte ledger also covers producers waiting to enter
   a full channel and releases each reservation when a worker receives the command.
@@ -229,8 +238,12 @@ the whole batch succeeds. See [ADR 0001: Core batch write contract](adr/0001-wri
 The canonical `write_batch` surface adds explicit `Atomic` and `BestEffort` modes. It returns one
 indexed outcome per row, structured rejection categories, and the weakest acknowledgement among
 accepted rows. Best effort deliberately submits singleton atomic writes in order; it is never an
-implicit fallback from an atomic call. Legacy `Storage` implementations must opt in rather than
-inheriting assumed semantics.
+implicit fallback from an atomic call. Safe pre-commit admission failures produce a complete
+rejected outcome set; configured top-level row/input bounds return an outer error before allocating
+an oversized outcome vector and commit nothing. If full write-memory admission fails, the engine
+separately admits the bounded rejection-result envelope; inability to admit even that response is
+also an outer memory error. Legacy `Storage` implementations must opt in rather than inheriting
+assumed semantics.
 
 Apply holds every affected active-shard lock and runs fallible rotations and encoding against
 staged active-series states. Only after all affected shards succeed are those states and any sealed
@@ -278,16 +291,18 @@ select / select_all / select_with_options
 
 The `flush_visibility_lock` is the consistency fence: writers hold a write lock during flush publication; readers hold a shared read lock for the duration of snapshot capture, guaranteeing a consistent view.
 
-One public read owns one `QueryExecution`. Nested reads use the `*_with_execution` methods rather
+One logical core query owns one `QueryExecution`; each query inside a batched Prometheus remote-read
+request gets its own sequential execution. Nested reads use the `*_with_execution` methods rather
 than acquiring additional permits. Candidate planning, exact metadata scans, chunk decode/merge,
 result materialization, and built-in aggregation charge the applicable matched-series,
 pattern-expansion, scanned/returned-sample, returned-byte, intermediate-vector, and modeled-memory
 limits. Long loops checkpoint cooperative cancellation and the effective wall-time deadline. Permit
 and memory leases are RAII-owned, so owned entrypoints release them on every success or error path.
-A caller-supplied execution remains admitted until its last clone and reservation are dropped. All
-query limits remain optional at the low-level API. The core's `Embedded` and server's `Server`
-profiles populate finite values; the all-`None` legacy configuration is selected explicitly with
-`ExpertUnlimited`.
+A caller-supplied execution remains admitted until its last clone and reservation are dropped. The
+remote-read adapter encodes each query result before releasing its execution and uses a separate
+64 MiB aggregate protobuf envelope with bounded Snappy output allocation. All query limits remain
+optional at the low-level API. The core's `Embedded` and server's `Server` profiles populate finite
+values; the all-`None` legacy configuration is selected explicitly with `ExpertUnlimited`.
 
 ---
 
@@ -389,28 +404,35 @@ Each sealed chunk builds a `TimestampSearchIndex` — an array of anchor entries
 
 ```text
 <data_path>/
-  lane_numeric/          — float/int/bool/histogram chunks
-    l0/                  — freshly flushed segments
-    l1/                  — first compaction level
-    l2/                  — final compaction level
-  lane_blob/             — bytes-value chunks (same level layout)
+  lane_numeric/          — float/int/uint/bool chunks
+    segments/
+      L0/                — freshly flushed segments
+      L1/                — first compaction level
+      L2/                — final compaction level
+    tombstones.json      — legacy tombstone snapshot when present
+    tombstones.json.store/ — sharded binary tombstone store (256 shards)
+  lane_blob/             — bytes/string/native-histogram chunks (same segment/tombstone layout)
   wal/                   — WAL segment files
   series_index.bin       — binary RIDX v2 series registry snapshot
   series_index.delta.d/  — incremental series registry delta checkpoints
   series_index.catalog.json — fingerprint catalog for fast registry reload
-  tombstones.json.store/ — sharded binary tombstone store (256 shards)
+  series_index.catalog.d/ — bounded per-segment registry fingerprint store
+  segment_catalog.json   — tiered segment inventory when configured
+  .tombstone-transactions/ — crash-recovery record for multi-lane deletes
+  .post-flush-replacements/ — crash-recovery records for segment replacement
   .rollups/              — rollup policies/base state JSON plus bounded state-journal generations
-  .process.lock          — exclusive-open process lock
+  .tsink.lock            — exclusive-open process lock
 ```
 
 ### Segment manifest
 
 Each segment directory contains:
 
-- Encoded chunk files (one per series × value lane).
+- Five aggregate binary files for the segment: `manifest.bin`, `chunks.bin`,
+  `chunk_index.bin`, `series.bin`, and `postings.bin`.
 - A `SegmentManifest` (`segment_id, level, chunk/point/series counts, min/max timestamps, wal_highwater`).
 - A `SegmentPostingsIndex` for label/metric lookups within the segment.
-- Checksums; corrupted segments are quarantined automatically.
+- Checksums; invalid persisted segments are quarantined during startup recovery.
 
 ### In-memory index
 
@@ -479,8 +501,11 @@ Compaction is tombstone-aware: tombstoned time ranges are excluded from the outp
 | Tier | Location                                         | Access                                     |
 | ---- | ------------------------------------------------ | ------------------------------------------ |
 | Hot  | Local filesystem (`lane_numeric/`, `lane_blob/`) | Direct mmap reads.                         |
-| Warm | Configurable local path or object store          | Loaded on demand.                          |
-| Cold | Object store                                     | Loaded on demand; full fetch before query. |
+| Warm | Configured mounted filesystem path               | Loaded on demand.                          |
+| Cold | Configured mounted filesystem path               | Loaded on demand; full fetch before query. |
+
+The mounted path may be local, FUSE-backed, or a network filesystem. The core does not speak a
+native S3/GCS object-store API.
 
 ### Tier lifecycle
 
@@ -688,7 +713,7 @@ Two methods are supported:
 1. **Bearer tokens** — loaded from a file or via an exec command; verified on every request.
 2. **OIDC JWT** — RS256, ES256, or HS256 tokens issued by a configured identity provider; JWKS fetched at startup with 60 s clock skew tolerance.
 
-### RBAC (`src/rbac.rs`)
+### RBAC (`crates/tsink-server/src/rbac.rs`)
 
 `RbacRegistry` assigns roles to principals. Actions are `Read | Write`; resource kinds are `Tenant | Admin | System`. Service accounts carry 32-byte random tokens (base64url-encoded, HMAC-backed) with configurable rotation schedules.
 
@@ -786,15 +811,15 @@ Key engine knobs and their defaults:
 | Option                                  | Default                 | Notes                                                                                  |
 | --------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
 | `timestamp_precision`                   | Nanoseconds             | Timestamp unit: ns, µs, ms, or s.                                                      |
-| `retention_window`                      | 14 days                 | Data older than this is eligible for expiry.                                           |
+| `retention_window`                      | 14 days                 | Age window used when retention enforcement is explicitly enabled.                      |
 | `future_skew_window`                    | 15 min                  | Observability/bounded-recency window; it does not reject future writes by itself.      |
 | `max_future_skew_window`                | unset                   | Optional admission cutoff configured with `with_max_future_skew`.                     |
 | `partition_window`                      | 1 hour                  | Time-bucket width for active partition heads.                                          |
 | `max_active_partition_heads_per_series` | 8                       | Maximum concurrent open partitions per series.                                         |
-| `max_writers`                           | cgroup CPU count        | Write parallelism gate (`Semaphore` permits).                                          |
+| `max_writers`                           | 4                       | `Embedded` write parallelism gate (`Semaphore` permits); `Server` uses 16.              |
 | `write_timeout`                         | 30 s                    | Per-acquisition wait for writer admission and close coordination.                     |
-| `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Accounted storage-memory budget.                                                       |
-| `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                                                           |
+| `memory_budget_bytes`                   | 512 MiB                 | `Embedded` modeled storage-memory budget; this is not a process-RSS cap.                |
+| `cardinality_limit`                     | 1,000,000               | `Embedded` maximum unique series count.                                                 |
 | `chunk_points`                          | 2048                    | Points per sealed chunk.                                                               |
 | `compaction_interval`                   | 5 s                     | Background compaction frequency.                                                       |
 | `flush_interval`                        | 250 ms                  | Background flush frequency.                                                            |
@@ -802,4 +827,8 @@ Key engine knobs and their defaults:
 | rollup interval                         | 5 s                     | Background rollup frequency.                                                           |
 | `background_fail_fast`                  | `true`                  | A background durability failure fences new writes.                                     |
 
-Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.
+The values above are the default `Embedded` profile; `Test`, `Edge`, and `Server` have their own
+finite constants, and `ExpertUnlimited` must be selected explicitly for legacy unbounded limits.
+`cgroup.rs` still exposes CPU/memory detection. `TSINK_MAX_CPUS` affects controls that explicitly
+request the cgroup-aware worker fallback, such as `with_max_writers(0)`, but does not rewrite a
+standard profile.

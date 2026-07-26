@@ -1,11 +1,13 @@
-use crate::query_matcher::{compile_series_matchers, CompiledSeriesMatcher};
+use crate::query_matcher::{
+    compile_series_matchers, compile_series_matchers_with_execution, CompiledSeriesMatcher,
+};
 use crate::storage::Storage;
-use crate::validation::validate_metric;
-use crate::{MetricSeries, Result, SeriesSelection};
+use crate::{MetricSeries, QueryExecution, QueryMemoryReservation, Result, SeriesSelection};
 
 pub(crate) struct PreparedSeriesSelection {
     pub(crate) time_range: Option<(i64, i64)>,
     pub(crate) compiled_matchers: Vec<CompiledSeriesMatcher>,
+    _matcher_preparation_reservation: Option<QueryMemoryReservation>,
 }
 
 pub(crate) trait SeriesSelectionBackend {
@@ -28,10 +30,7 @@ pub(crate) trait SeriesSelectionBackend {
 }
 
 pub(crate) fn validate_series_selection(selection: &SeriesSelection) -> Result<Option<(i64, i64)>> {
-    if let Some(metric) = selection.metric.as_deref() {
-        validate_metric(metric)?;
-    }
-    selection.normalized_time_range()
+    selection.validate_shape_and_time().map_err(Into::into)
 }
 
 pub(crate) fn prepare_series_selection(
@@ -42,6 +41,25 @@ pub(crate) fn prepare_series_selection(
     Ok(PreparedSeriesSelection {
         time_range,
         compiled_matchers,
+        _matcher_preparation_reservation: None,
+    })
+}
+
+pub(crate) fn prepare_series_selection_with_execution(
+    selection: &SeriesSelection,
+    execution: &QueryExecution,
+    before_regex_compile: Option<&dyn Fn()>,
+) -> Result<PreparedSeriesSelection> {
+    let time_range = validate_series_selection(selection)?;
+    let (compiled_matchers, reservation) = compile_series_matchers_with_execution(
+        &selection.matchers,
+        execution,
+        before_regex_compile,
+    )?;
+    Ok(PreparedSeriesSelection {
+        time_range,
+        compiled_matchers,
+        _matcher_preparation_reservation: Some(reservation),
     })
 }
 
@@ -72,11 +90,11 @@ fn retain_series_matching_selection(
     series.retain(|entry| series_matches_selection(entry, selection, prepared));
 }
 
-pub(crate) fn execute_series_selection<B: SeriesSelectionBackend>(
+pub(crate) fn execute_prepared_series_selection<B: SeriesSelectionBackend>(
     backend: &B,
     selection: &SeriesSelection,
+    prepared: PreparedSeriesSelection,
 ) -> Result<Vec<MetricSeries>> {
-    let prepared = prepare_series_selection(selection)?;
     let mut candidates = backend.candidate_items(selection, &prepared)?;
 
     if let Some((start, end)) = prepared.time_range {
@@ -87,6 +105,14 @@ pub(crate) fn execute_series_selection<B: SeriesSelectionBackend>(
     retain_series_matching_selection(&mut series, selection, &prepared);
     series.sort();
     Ok(series)
+}
+
+pub(crate) fn execute_series_selection<B: SeriesSelectionBackend>(
+    backend: &B,
+    selection: &SeriesSelection,
+) -> Result<Vec<MetricSeries>> {
+    let prepared = prepare_series_selection(selection)?;
+    execute_prepared_series_selection(backend, selection, prepared)
 }
 
 struct ScanSeriesSelectionBackend<'a, S: Storage + ?Sized> {

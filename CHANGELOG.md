@@ -9,6 +9,13 @@ compatibility and is not yet covered by a stable support promise.
 
 ### Added
 
+- The initial `tsink-test` workspace crate: isolated temporary, in-memory, and caller-owned
+  persistent fixtures using `ResourceProfile::Test` by default; canonical atomic batch results;
+  direct explicit-time PromQL; deterministic order-insensitive value assertions, approximate scalar
+  assertions, empty/non-empty checks, and structured expected-error matching; same-directory
+  restart; explicit error-returning close; and bounded failure diagnostics with capped nearby-series
+  context. Protocol listeners, manual-clock semantics, and deterministic maintenance controls
+  remain future testkit work.
 - A repository progress ledger and product-positioning documentation for the embedded metrics
   engine roadmap.
 - A declared Rust 1.89 minimum supported Rust version (MSRV) and an MSRV CI check.
@@ -24,9 +31,18 @@ compatibility and is not yet covered by a stable support promise.
 - Optional pre-clone write row/input bounds and atomic modeled-memory reservations for foreground
   preparation, WAL encoding, retries, rollup writes, and streamed startup replay. Core, async,
   UniFFI, effective-limit, and observability surfaces expose the controls and current/peak/counter
-  state; the finite WAL writer buffer is inspected explicitly.
+  state; the live WAL writer-buffer capacity is included in the shared modeled-memory budget.
 - A durability contract covering core WAL modes, lifecycle behavior, server sidecars, cluster
   acknowledgements, and platform limits.
+- A strict bounded read-only data-directory inspector and `tsink-inspect` JSON CLI, plus explicit
+  Unix destination-only salvage for an attested offline source. The deliberately narrow v1 path
+  requires empty registry/no persisted or auxiliary state, discards every WAL byte, persists exact
+  recovery evidence in the destination, uses pinned componentwise no-follow traversal with bounded
+  namespace memory and reversible opaque-path rendering, byte-compares and re-syncs the final
+  staging generation, publishes with an atomic handle-relative no-replace rename, and reattests the
+  requested identities, complete namespace generation, and exact bytes after publication. The
+  inspector recognizes a reset WAL publication marker only when fully verified clean segment
+  manifests cover its persisted high-water mark.
 - Structured write-rejection, acknowledgement, partial-effect, and indeterminate-outcome metrics
   and HTTP response headers across the principal ingest adapters.
 - Shared local-disk quota admission and exact restart/category accounting for the experimental
@@ -60,9 +76,84 @@ compatibility and is not yet covered by a stable support promise.
   overrides win independently of call order, and a versioned resolved snapshot is exposed through
   sync, async, UniFFI/Python, observability, and server status surfaces. Initial constants remain
   provisional pending the final clean resource-measurement matrix.
+- Hard PromQL parser ceilings of 64 KiB of UTF-8 input, 16,384 non-EOF tokens, and 64 nested
+  expression levels, including iterative handling and bounded construction of long unary,
+  operator, and subquery chains.
 
 ### Changed
 
+- Finite `Custom(ResourceLimits)` profiles now reject values that do not fit the target platform,
+  would collapse to an internal `usize::MAX` unlimited sentinel, or request background cadences
+  the fixed runtime topology cannot honor; unbounded behavior continues to require explicit
+  `ExpertUnlimited` selection.
+- Finite compute-only segment-catalog validation now admits its generation path, one-frame
+  page/decode peak, retained cursor, and staged root map to the global storage-memory budget.
+  `MemoryObservabilitySnapshot::remote_catalog_staging_bytes` exposes the live charge; pointer
+  churn replaces it, and errors, invalidation, completion, reset, and close release it. Remote
+  application and read-write catalog-publication staging remain an explicit exclusion.
+- Release automation now accepts only a published GitHub Release or manual dispatch whose selected
+  ref is a real `VERSION`/`vVERSION` tag at the immutable trigger commit, rejects a tag that moved
+  after the event, and requires the first two changelog sections to be an empty `Unreleased`
+  section followed by the promoted version. It runs all-feature, no-default-feature, MSRV,
+  server-version, documentation, and package gates and always builds the Python artifacts,
+  installing native wheels before upload. Release/manual runs for the same tag share one
+  concurrency group, and missing wheel or sdist output is a hard failure. crates.io publication
+  remains disabled until the mandatory storage/crash/compatibility and final-artifact integrity
+  gates exist; PyPI publication remains disabled while cross-compiled wheel targets lack
+  equivalent runtime smoke coverage.
+- PromQL `info()` discovery and series reads now reuse the caller's admitted `QueryExecution`.
+  They no longer acquire a nested query permit or escape request-tightened series and memory
+  accounting.
+- Local Prometheus remote-read now admits one `QueryExecution` per protobuf query and reuses it
+  across series discovery and every point read. Cumulative work-limit failures retain structured
+  query-budget HTTP status, error-code, and retry semantics instead of being flattened into a 400.
+  Query results are encoded and released sequentially into a hard 64 MiB aggregate protobuf
+  envelope, local frames are charged to returned-byte limits, Snappy allocation is bounded, and
+  overflow fails atomically as `query_limit_returned_bytes`. Backend request, internal, and
+  unavailable failures now retain distinct 400, 500, and 503 classes.
+- Execution-aware point and metadata reads now expose detailed results that retain their modeled
+  memory reservations until the result guard is dropped; point batches also carry exact
+  selector-existence bits. Built-in local storage, tenant/default-tenant wrappers, and distributed
+  storage propagate or replace these guards. Bounded PromQL and internal/distributed server paths
+  fail closed when a compatibility backend reports `QueryExecutionAccounting::Unaccounted`.
+  PromQL multi-series, range-prefetch, and `info()` reads now adopt detailed point reservations
+  through their label/point transforms and cache lifetime, validate batch identities/existence
+  evidence, and reject an unaccounted bounded point backend before reading it.
+- Modeled returned-byte accounting is now canonical logical work based on fixed result slots and
+  content lengths, including byte strings, UTF-8 strings, labels, and native-histogram arrays. It is
+  independent of allocator capacity and spare space; retained query memory continues to use
+  collection capacities and documented allocation allowances.
+- Bounded distributed metadata and point reads now execute peers sequentially with residual
+  cumulative scan/pattern/step/deadline limits, reserve planning and deduplication state, and
+  validate peer work/existence evidence. Internal RPC request JSON, exact HTTP headers, growing raw
+  responses, and conservative decode envelopes are query-memory-accounted. Final returned
+  sample/byte limits apply to the deduplicated logical union and are distinct from each peer's hard
+  physical HTTP response cap. An exactly exhausted scan allowance intentionally rejects before the
+  next peer; compatibility caller-owned results, caller/backend internals, and external
+  allocator/runtime/kernel/TLS buffers remain outside this portable model.
+- `tsink-server --help` now prints the executable's real invocation instead of an unsupported
+  `tsink-server server` form.
+- Python binding renames now cover the resource-profile, resolved-limit, async-limit, and effective
+  resource-configuration types, preserving the documented public names without leaked internal
+  `U` prefixes.
+- `tsink-migrate backfill` now fails closed unless every non-empty remote-write batch returns a
+  canonical acknowledgement with no partial or indeterminate evidence. The default minimum is now
+  `durable`; an explicit weaker floor is reported together with the weakest acknowledgement
+  observed. Metadata-only batches also require exact accepted-count evidence and a valid
+  applied-count range, including idempotent replays that apply zero new records. Exemplar and
+  native-histogram batches require exact accepted counts, and any reported dropped exemplar fails
+  the migration. A single oversized mixed-payload series is split into label-preserving fragments,
+  making the configured point count a hard per-request limit.
+- Explicit rollup runs and policy application now take their returned observability snapshot while
+  still holding the rollup-run serialization lock, preventing a background traversal from resetting
+  completion status between the committed run and its response.
+- Canonical built-in writes now preserve indexed rejection results when whole-batch transient
+  memory or other safe pre-commit admission fails and the bounded response envelope itself can be
+  admitted. Configured top-level row/input bounds, response-memory rejection, and checked size
+  overflow remain outer errors so rejecting an oversized or memory-starved request cannot allocate
+  the very outcome vector that the resource gate refused. Atomic post-admission failures move the
+  original bounded rejection into the final row after cloning only the first N-1 outcomes, so peak
+  owned diagnostic storage does not exceed the modeled N-message envelope.
 - Reproducible named-profile measurements retain the original 64 MiB Test, 256 MiB Edge, and
   512 MiB Embedded accounted-memory and maintenance-pass ceilings. After exact write-head growth
   accounting and fill-aware timed flushes removed the prior cap-chasing behavior, all three named

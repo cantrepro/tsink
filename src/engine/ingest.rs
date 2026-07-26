@@ -22,6 +22,19 @@ impl ChunkStorage {
         self.ingest_pipeline().admit_write_rows(rows)
     }
 
+    pub(super) fn admit_write_rejection_result_impl(
+        &self,
+        rows_len: usize,
+    ) -> Result<super::WriteTransientMemoryReservation> {
+        self.ingest_pipeline()
+            .admit_write_rejection_result(rows_len)
+    }
+
+    #[cfg(test)]
+    pub(super) fn modeled_write_rejection_result_bytes_for_tests(rows_len: usize) -> Result<usize> {
+        pipeline::modeled_write_rejection_result_bytes_for_tests(rows_len)
+    }
+
     pub(super) fn insert_rows_with_admission_impl(
         &self,
         rows: &[Row],

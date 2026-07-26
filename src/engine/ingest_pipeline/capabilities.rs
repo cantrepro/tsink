@@ -1,18 +1,27 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use super::super::super::{
-    ActiveSeriesState, Chunk, ChunkStorage, MemoryDeltaBytes, Result, SeriesId, SeriesRegistry,
-    SeriesResolution, SeriesValueFamily, TsinkError, Value, ValueLane, WalHighWatermark,
-    WriteApplyContext, WriteApplyMemoryAccountingContext, WriteApplyPublicationContext,
-    WriteApplyRegistryContext, WriteApplyShardMutationContext, WriteApplyWalContext,
-    WriteCommitStageContext, WriteCommitWalCompletionContext, WriteSeriesValidationContext,
+    state, value_heap_bytes, ActiveSeriesState, Chunk, ChunkBuilder, ChunkPoint, ChunkStorage,
+    MemoryDeltaBytes, Result, SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily,
+    TsinkError, Value, ValueLane, WalHighWatermark, WriteApplyContext,
+    WriteApplyMemoryAccountingContext, WriteApplyPublicationContext, WriteApplyRegistryContext,
+    WriteApplyShardMutationContext, WriteApplyWalContext, WriteCommitStageContext,
+    WriteCommitWalCompletionContext, WriteSeriesValidationContext, WriteTransientMemoryReservation,
     IN_MEMORY_SHARD_COUNT,
 };
 use super::super::lane_name;
 use super::phases::{PendingPoint, PreparedWalWrite, StagedWalWrite};
 use crate::WriteAcknowledgement;
+
+// Atomic apply first clones each affected live state, and a rotation can then clone/finalize one
+// head while timestamp/value codec candidates and the final encoded payload coexist. Six additional
+// modeled copies of both the live state and admitted retained-growth envelope conservatively cover
+// those phases; the fixed allowance covers the staged map node and allocator bookkeeping. This
+// remains modeled Rust-owned memory, not a process-RSS claim.
+const ACTIVE_STATE_STAGING_PEAK_COPIES: usize = 6;
+const ACTIVE_STATE_STAGING_ENTRY_ALLOWANCE_BYTES: usize = 64;
 
 fn collect_pending_series_lanes(points: &[PendingPoint]) -> Result<BTreeMap<SeriesId, ValueLane>> {
     let mut series_lanes = BTreeMap::new();
@@ -211,6 +220,80 @@ impl<'a> WriteApplyMemoryAccountingContext<'a> {
     fn account_shard_delta(self, shard_idx: usize, delta: MemoryDeltaBytes) {
         self.shards.account_memory_delta(shard_idx, delta);
     }
+
+    fn reserve_active_state_staging_overlap(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+        reservation_before_staging: usize,
+        accumulated_overlap: usize,
+        state: &ActiveSeriesState,
+    ) -> Result<usize> {
+        if !self.shards.accounting_enabled {
+            return Ok(accumulated_overlap);
+        }
+        let state_overlap = self
+            .active_state_bytes(state)
+            .checked_mul(ACTIVE_STATE_STAGING_PEAK_COPIES)
+            .and_then(|bytes| bytes.checked_add(ACTIVE_STATE_STAGING_ENTRY_ALLOWANCE_BYTES))
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let accumulated_overlap = accumulated_overlap
+            .checked_add(state_overlap)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let required = reservation_before_staging
+            .checked_add(accumulated_overlap)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        reservation.ensure(required, self.memory_reservation_admission)?;
+        Ok(accumulated_overlap)
+    }
+
+    fn reserve_active_state_growth_staging_overlap(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+        reservation_before_staging: usize,
+    ) -> Result<usize> {
+        if !self.shards.accounting_enabled {
+            return Ok(0);
+        }
+        let retained_growth_allowance =
+            reservation_before_staging.saturating_sub(reservation.base_reserved_bytes());
+        let staging_overlap = retained_growth_allowance
+            .checked_mul(ACTIVE_STATE_STAGING_PEAK_COPIES)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let required = reservation_before_staging
+            .checked_add(staging_overlap)
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        reservation.ensure(required, self.memory_reservation_admission)?;
+        Ok(staging_overlap)
+    }
+
+    pub(super) fn reserve_compatibility_write_transient(
+        self,
+    ) -> Result<WriteTransientMemoryReservation> {
+        self.write_transient
+            .new_reservation(0, self.memory_reservation_admission)
+    }
+
+    fn reserve_compatibility_point_growth(
+        self,
+        reservation: &WriteTransientMemoryReservation,
+        value: &Value,
+        point_cap: usize,
+    ) -> Result<()> {
+        if !self.shards.accounting_enabled {
+            return Ok(());
+        }
+        let initial_builder_bytes = ChunkBuilder::initial_point_capacity(point_cap)
+            .checked_mul(std::mem::size_of::<ChunkPoint>())
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        let required = initial_builder_bytes
+            .checked_add(std::mem::size_of::<ActiveSeriesState>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<state::ActivePartitionHead>()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(WalHighWatermark, usize)>()))
+            .and_then(|bytes| bytes.checked_add(value_heap_bytes(value)))
+            .and_then(|bytes| bytes.checked_add(ACTIVE_STATE_STAGING_ENTRY_ALLOWANCE_BYTES))
+            .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+        reservation.ensure(required, self.memory_reservation_admission)
+    }
 }
 
 impl<'a> WriteApplyPublicationContext<'a> {
@@ -339,6 +422,7 @@ impl<'a> WriteApplyShardMutationContext<'a> {
         memory: WriteApplyMemoryAccountingContext<'a>,
         publication: WriteApplyPublicationContext<'a>,
         points: Vec<PendingPoint>,
+        transient_memory: &WriteTransientMemoryReservation,
     ) -> Result<()> {
         if points.is_empty() {
             return Ok(());
@@ -366,13 +450,29 @@ impl<'a> WriteApplyShardMutationContext<'a> {
             ));
         }
 
+        let reservation_before_staging = transient_memory.reserved_bytes();
+        let mut staging_overlap_bytes = memory.reserve_active_state_growth_staging_overlap(
+            transient_memory,
+            reservation_before_staging,
+        )?;
         let mut staged_shards = Vec::with_capacity(shard_guards.len());
         for (_, shard_points, active) in &mut shard_guards {
             staged_shards.push(self.stage_pending_points_for_shard(
                 memory,
                 active,
                 std::mem::take(shard_points),
+                transient_memory,
+                reservation_before_staging,
+                &mut staging_overlap_bytes,
             )?);
+        }
+
+        #[cfg(test)]
+        if staged_shards
+            .iter()
+            .any(|staged| !staged.finalized.is_empty())
+        {
+            publication.sealed_chunks.invoke_post_chunk_seal_hook()?;
         }
 
         // Timestamp bounds are infallible atomic updates. Record them only after every staged
@@ -436,6 +536,9 @@ impl<'a> WriteApplyShardMutationContext<'a> {
         memory: WriteApplyMemoryAccountingContext<'a>,
         active: &BTreeMap<SeriesId, ActiveSeriesState>,
         shard_points: Vec<PendingPoint>,
+        transient_memory: &WriteTransientMemoryReservation,
+        reservation_before_staging: usize,
+        staging_overlap_bytes: &mut usize,
     ) -> Result<StagedShardIngest> {
         let mut active_states = BTreeMap::<SeriesId, ActiveSeriesState>::new();
         let mut finalized = Vec::<(SeriesId, Chunk)>::new();
@@ -444,11 +547,33 @@ impl<'a> WriteApplyShardMutationContext<'a> {
             Vec::<(SeriesId, i64)>::with_capacity(shard_points.len());
 
         for point in shard_points {
-            let state = active_states.entry(point.series_id).or_insert_with(|| {
-                active.get(&point.series_id).cloned().unwrap_or_else(|| {
-                    ActiveSeriesState::new(point.series_id, point.lane, self.chunk_point_cap)
-                })
-            });
+            let state = match active_states.entry(point.series_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    if let Some(existing) = active.get(&point.series_id) {
+                        *staging_overlap_bytes = memory.reserve_active_state_staging_overlap(
+                            transient_memory,
+                            reservation_before_staging,
+                            *staging_overlap_bytes,
+                            existing,
+                        )?;
+                        entry.insert(existing.clone())
+                    } else {
+                        let state = ActiveSeriesState::new(
+                            point.series_id,
+                            point.lane,
+                            self.chunk_point_cap,
+                        );
+                        *staging_overlap_bytes = memory.reserve_active_state_staging_overlap(
+                            transient_memory,
+                            reservation_before_staging,
+                            *staging_overlap_bytes,
+                            &state,
+                        )?;
+                        entry.insert(state)
+                    }
+                }
+            };
 
             if state.lane != point.lane {
                 return Err(TsinkError::ValueTypeMismatch {
@@ -510,6 +635,12 @@ impl<'a> WriteApplyContext<'a> {
         value: Value,
     ) -> Result<()> {
         let family = SeriesValueFamily::from_value(&value, lane)?;
+        let transient_memory = self.memory.reserve_compatibility_write_transient()?;
+        self.memory.reserve_compatibility_point_growth(
+            &transient_memory,
+            &value,
+            self.shard_mutation.chunk_point_cap,
+        )?;
         let family_missing = self
             .series_validation
             .validate_series_family_from_registry(series_id, family, value.kind())?;
@@ -530,6 +661,7 @@ impl<'a> WriteApplyContext<'a> {
                 value,
                 wal_highwater: WalHighWatermark::default(),
             }],
+            &transient_memory,
         );
         if let Err(err) = append_result {
             self.registry

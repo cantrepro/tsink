@@ -2,7 +2,9 @@ use base64::Engine;
 use prost::Message;
 use regex::Regex;
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 use reqwest::Method;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use snap::raw::{Decoder as SnappyDecoder, Encoder as SnappyEncoder};
@@ -52,6 +54,16 @@ use prom_write::{
 };
 
 const TSINK_TENANT_HEADER: &str = "X-Tsink-Tenant";
+const TSINK_WRITE_ACKNOWLEDGEMENT_HEADER: &str = "X-Tsink-Write-Acknowledgement";
+const TSINK_WRITE_ERROR_CODE_HEADER: &str = "X-Tsink-Write-Error-Code";
+const TSINK_WRITE_OUTCOME_HEADER: &str = "X-Tsink-Write-Outcome";
+const TSINK_WRITE_PARTIAL_HEADER: &str = "X-Tsink-Write-Partial";
+const TSINK_ROWS_ACCEPTED_HEADER: &str = "X-Tsink-Rows-Accepted";
+const TSINK_METADATA_ACCEPTED_HEADER: &str = "X-Tsink-Metadata-Accepted";
+const TSINK_METADATA_APPLIED_HEADER: &str = "X-Tsink-Metadata-Applied";
+const TSINK_EXEMPLARS_ACCEPTED_HEADER: &str = "X-Tsink-Exemplars-Accepted";
+const TSINK_EXEMPLARS_DROPPED_HEADER: &str = "X-Tsink-Exemplars-Dropped";
+const TSINK_HISTOGRAMS_ACCEPTED_HEADER: &str = "X-Tsink-Histograms-Accepted";
 const MAX_ISSUES_PER_CHECK: usize = 8;
 
 fn main() {
@@ -239,12 +251,42 @@ struct TargetConfig {
     #[serde(default)]
     headers: BTreeMap<String, String>,
     tenant: Option<String>,
+    #[serde(default)]
+    minimum_write_acknowledgement: WriteAcknowledgement,
     write_url: String,
     read_url: String,
     query_range_url: Option<String>,
     metadata_url: Option<String>,
     exemplar_url: Option<String>,
     status_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum WriteAcknowledgement {
+    Volatile,
+    Appended,
+    #[default]
+    Durable,
+}
+
+impl WriteAcknowledgement {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "volatile" => Some(Self::Volatile),
+            "appended" => Some(Self::Appended),
+            "durable" => Some(Self::Durable),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Volatile => "volatile",
+            Self::Appended => "appended",
+            Self::Durable => "durable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -308,6 +350,26 @@ struct HttpClient {
     inner: Client,
 }
 
+#[derive(Debug)]
+struct HttpResponseBytes {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl HttpResponseBytes {
+    fn into_success_body(self, method: &Method, url: &str) -> Result<Vec<u8>, String> {
+        if !self.status.is_success() {
+            return Err(format!(
+                "{method} {url} returned {}: {}",
+                self.status.as_u16(),
+                String::from_utf8_lossy(&self.body)
+            ));
+        }
+        Ok(self.body)
+    }
+}
+
 impl HttpClient {
     fn new(timeout_secs: u64) -> Result<Self, String> {
         let inner = Client::builder()
@@ -324,7 +386,9 @@ impl HttpClient {
         tenant: Option<&str>,
         query: &[(String, String)],
     ) -> Result<JsonValue, String> {
-        let body = self.request_bytes(Method::GET, url, headers, tenant, query, None, None)?;
+        let body = self
+            .request_bytes(Method::GET, url, headers, tenant, query, None, None)?
+            .into_success_body(&Method::GET, url)?;
         serde_json::from_slice(&body).map_err(|err| format!("invalid JSON from {url}: {err}"))
     }
 
@@ -335,7 +399,8 @@ impl HttpClient {
         tenant: Option<&str>,
         query: &[(String, String)],
     ) -> Result<Vec<u8>, String> {
-        self.request_bytes(Method::GET, url, headers, tenant, query, None, None)
+        self.request_bytes(Method::GET, url, headers, tenant, query, None, None)?
+            .into_success_body(&Method::GET, url)
     }
 
     fn post_bytes(
@@ -346,7 +411,7 @@ impl HttpClient {
         body: Vec<u8>,
         content_type: &str,
         extra_headers: &[(&str, &str)],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<HttpResponseBytes, String> {
         self.request_bytes(
             Method::POST,
             url,
@@ -368,7 +433,7 @@ impl HttpClient {
         query: &[(String, String)],
         body: Option<(Vec<u8>, &str)>,
         extra_headers: Option<&[(&str, &str)]>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<HttpResponseBytes, String> {
         let mut request = self.inner.request(method.clone(), url);
         if !query.is_empty() {
             request = request.query(query);
@@ -395,18 +460,16 @@ impl HttpClient {
         .map_err(|err| format!("{method} {url} failed: {err}"))?;
 
         let status = response.status();
+        let headers = response.headers().clone();
         let body = response
             .bytes()
             .map_err(|err| format!("failed reading response body from {url}: {err}"))?
             .to_vec();
-        if !status.is_success() {
-            return Err(format!(
-                "{method} {url} returned {}: {}",
-                status.as_u16(),
-                String::from_utf8_lossy(&body)
-            ));
-        }
-        Ok(body)
+        Ok(HttpResponseBytes {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -430,7 +493,7 @@ impl CommandReport {
     fn console_summary(&self) -> String {
         match self {
             Self::Backfill(report) => format!(
-                "tsink-migrate backfill: {}\n  source_kind: {:?}\n  selectors: {}\n  series: {}\n  samples: {}\n  histograms: {}\n  exemplars: {}\n  metadata: {}\n  write_batches: {}",
+                "tsink-migrate backfill: {}\n  source_kind: {:?}\n  selectors: {}\n  series: {}\n  samples: {}\n  histograms: {}\n  exemplars: {}\n  metadata: {}\n  write_batches: {}\n  minimum_write_acknowledgement: {}\n  weakest_observed_write_acknowledgement: {}",
                 report.status,
                 report.source_kind,
                 report.selector_count,
@@ -440,6 +503,11 @@ impl CommandReport {
                 report.exemplars_written,
                 report.metadata_written,
                 report.write_batches,
+                report.minimum_write_acknowledgement.as_str(),
+                report
+                    .weakest_observed_write_acknowledgement
+                    .map(WriteAcknowledgement::as_str)
+                    .unwrap_or("not_applicable"),
             ),
             Self::Verify(report) => format!(
                 "tsink-migrate verify: {}\n  raw_checks: {}\n  metadata_checks: {}\n  exemplar_checks: {}\n  issues: {}",
@@ -461,7 +529,7 @@ impl CommandReport {
     fn markdown_summary(&self) -> String {
         match self {
             Self::Backfill(report) => format!(
-                "# tsink Migration Backfill\n\n- Result: `{}`\n- Source kind: `{}`\n- Window: `{}` to `{}`\n- Selectors: `{}`\n- Series written: `{}`\n- Samples written: `{}`\n- Histograms written: `{}`\n- Exemplars written: `{}`\n- Metadata entries written: `{}`\n- Write batches: `{}`\n\n## Notes\n{}\n",
+                "# tsink Migration Backfill\n\n- Result: `{}`\n- Source kind: `{}`\n- Window: `{}` to `{}`\n- Selectors: `{}`\n- Series written: `{}`\n- Samples written: `{}`\n- Histograms written: `{}`\n- Exemplars written: `{}`\n- Metadata entries written: `{}`\n- Write batches: `{}`\n- Minimum write acknowledgement: `{}`\n- Weakest observed write acknowledgement: `{}`\n\n## Notes\n{}\n",
                 report.status,
                 report.source_kind.as_str(),
                 report.start_ms,
@@ -473,6 +541,11 @@ impl CommandReport {
                 report.exemplars_written,
                 report.metadata_written,
                 report.write_batches,
+                report.minimum_write_acknowledgement.as_str(),
+                report
+                    .weakest_observed_write_acknowledgement
+                    .map(WriteAcknowledgement::as_str)
+                    .unwrap_or("not_applicable"),
                 markdown_bullets(&report.notes),
             ),
             Self::Verify(report) => format!(
@@ -522,6 +595,8 @@ struct BackfillReport {
     exemplars_written: usize,
     metadata_written: usize,
     write_batches: usize,
+    minimum_write_acknowledgement: WriteAcknowledgement,
+    weakest_observed_write_acknowledgement: Option<WriteAcknowledgement>,
     notes: Vec<String>,
 }
 
@@ -694,6 +769,7 @@ fn load_plan(path: &Path) -> Result<MigrationPlan, String> {
     if plan.selectors.is_empty() {
         return Err("migration plan must contain at least one selector".to_string());
     }
+    validate_batch_config(&plan.batch)?;
     plan.plan_dir = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -799,14 +875,39 @@ fn run_backfill(plan: &MigrationPlan, args: &RunArgs) -> Result<BackfillReport, 
     }
 
     let series_written = series.len();
-    let samples_written = series.values().map(|entry| entry.samples.len()).sum();
-    let histograms_written = series.values().map(|entry| entry.histograms.len()).sum();
-    let exemplars_written = series.values().map(|entry| entry.exemplars.len()).sum();
+    let samples_written = series.values().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.samples.len())
+            .ok_or_else(|| "backfill sample count overflowed usize".to_string())
+    })?;
+    let histograms_written = series.values().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.histograms.len())
+            .ok_or_else(|| "backfill histogram count overflowed usize".to_string())
+    })?;
+    let exemplars_written = series.values().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.exemplars.len())
+            .ok_or_else(|| "backfill exemplar count overflowed usize".to_string())
+    })?;
     let metadata_written = metadata.len();
 
-    let batches = build_write_batches(&series, &metadata, &plan.batch);
+    if plan.target.minimum_write_acknowledgement < WriteAcknowledgement::Durable {
+        notes.push(format!(
+            "minimum_write_acknowledgement={} was explicitly configured below durable; this report proves only that configured acknowledgement floor",
+            plan.target.minimum_write_acknowledgement.as_str()
+        ));
+    }
+
+    let batches = build_write_batches(&series, &metadata, &plan.batch)?;
+    let mut weakest_observed_write_acknowledgement = None;
     for batch in &batches {
-        send_write_request(&client, &plan.target, batch)?;
+        let acknowledgement = send_write_request(&client, &plan.target, batch)?;
+        weakest_observed_write_acknowledgement = Some(
+            weakest_observed_write_acknowledgement
+                .map(|current: WriteAcknowledgement| current.min(acknowledgement))
+                .unwrap_or(acknowledgement),
+        );
     }
 
     Ok(BackfillReport {
@@ -821,6 +922,8 @@ fn run_backfill(plan: &MigrationPlan, args: &RunArgs) -> Result<BackfillReport, 
         exemplars_written,
         metadata_written,
         write_batches: batches.len(),
+        minimum_write_acknowledgement: plan.target.minimum_write_acknowledgement,
+        weakest_observed_write_acknowledgement,
         notes,
     })
 }
@@ -1845,6 +1948,7 @@ fn remote_read_request(
             ("X-Prometheus-Remote-Read-Version", "0.1.0"),
         ],
     )?;
+    let response = response.into_success_body(&Method::POST, url)?;
     let decoded = SnappyDecoder::new()
         .decompress_vec(&response)
         .map_err(|err| format!("snappy decode failed: {err}"))?;
@@ -2008,10 +2112,11 @@ fn build_write_batches(
     series: &BTreeMap<SeriesKey, WritableSeries>,
     metadata: &[MetricMetadata],
     batch: &BatchConfig,
-) -> Vec<WriteRequest> {
+) -> Result<Vec<WriteRequest>, String> {
+    validate_batch_config(batch)?;
+
     let mut out = Vec::new();
-    let metadata_chunk = batch.max_series_per_write.max(1);
-    for chunk in metadata.chunks(metadata_chunk) {
+    for chunk in metadata.chunks(batch.max_series_per_write) {
         out.push(WriteRequest {
             timeseries: Vec::new(),
             metadata: chunk.to_vec(),
@@ -2024,42 +2129,141 @@ fn build_write_batches(
     };
     let mut current_points = 0usize;
     for series in series.values() {
-        let points = series.samples.len() + series.histograms.len() + series.exemplars.len();
-        if !current.timeseries.is_empty()
-            && (current.timeseries.len() >= batch.max_series_per_write
-                || current_points + points > batch.max_points_per_write)
-        {
-            out.push(current);
-            current = WriteRequest {
-                timeseries: Vec::new(),
-                metadata: Vec::new(),
-            };
-            current_points = 0;
+        for fragment in split_writable_series(series, batch.max_points_per_write)? {
+            let fragment_points = time_series_point_count(&fragment)?;
+            if fragment_points > batch.max_points_per_write {
+                return Err(format!(
+                    "internal migration batching error: series fragment contains {fragment_points} points, exceeding max_points_per_write={}",
+                    batch.max_points_per_write
+                ));
+            }
+            let combined_points = current_points
+                .checked_add(fragment_points)
+                .ok_or_else(|| "remote-write batch point count overflowed usize".to_string())?;
+            if !current.timeseries.is_empty()
+                && (current.timeseries.len() >= batch.max_series_per_write
+                    || combined_points > batch.max_points_per_write)
+            {
+                out.push(current);
+                current = WriteRequest {
+                    timeseries: Vec::new(),
+                    metadata: Vec::new(),
+                };
+                current_points = 0;
+            }
+            current_points = current_points
+                .checked_add(fragment_points)
+                .ok_or_else(|| "remote-write batch point count overflowed usize".to_string())?;
+            current.timeseries.push(fragment);
         }
-        current_points += points;
-        current.timeseries.push(TimeSeries {
-            labels: series.labels.clone(),
-            samples: series.samples.clone(),
-            exemplars: series.exemplars.clone(),
-            histograms: series.histograms.clone(),
-        });
     }
     if !current.timeseries.is_empty() {
         out.push(current);
     }
-    out
+    Ok(out)
+}
+
+fn validate_batch_config(batch: &BatchConfig) -> Result<(), String> {
+    if batch.max_series_per_write == 0 {
+        return Err("batch.max_series_per_write must be greater than zero".to_string());
+    }
+    if batch.max_points_per_write == 0 {
+        return Err("batch.max_points_per_write must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
+fn split_writable_series(
+    series: &WritableSeries,
+    max_points_per_fragment: usize,
+) -> Result<Vec<TimeSeries>, String> {
+    if max_points_per_fragment == 0 {
+        return Err("max_points_per_fragment must be greater than zero".to_string());
+    }
+    let total_points = writable_series_point_count(series)?;
+    if total_points == 0 {
+        return Ok(vec![TimeSeries {
+            labels: series.labels.clone(),
+            samples: Vec::new(),
+            exemplars: Vec::new(),
+            histograms: Vec::new(),
+        }]);
+    }
+
+    let mut fragments = Vec::new();
+    let mut sample_index = 0usize;
+    let mut histogram_index = 0usize;
+    let mut exemplar_index = 0usize;
+    while sample_index < series.samples.len()
+        || histogram_index < series.histograms.len()
+        || exemplar_index < series.exemplars.len()
+    {
+        let mut remaining = max_points_per_fragment;
+
+        let sample_count = (series.samples.len() - sample_index).min(remaining);
+        let sample_end = sample_index
+            .checked_add(sample_count)
+            .ok_or_else(|| "remote-write sample fragment index overflowed usize".to_string())?;
+        remaining = remaining
+            .checked_sub(sample_count)
+            .ok_or_else(|| "remote-write sample fragment capacity underflowed".to_string())?;
+
+        let histogram_count = (series.histograms.len() - histogram_index).min(remaining);
+        let histogram_end = histogram_index
+            .checked_add(histogram_count)
+            .ok_or_else(|| "remote-write histogram fragment index overflowed usize".to_string())?;
+        remaining = remaining
+            .checked_sub(histogram_count)
+            .ok_or_else(|| "remote-write histogram fragment capacity underflowed".to_string())?;
+
+        let exemplar_count = (series.exemplars.len() - exemplar_index).min(remaining);
+        let exemplar_end = exemplar_index
+            .checked_add(exemplar_count)
+            .ok_or_else(|| "remote-write exemplar fragment index overflowed usize".to_string())?;
+
+        fragments.push(TimeSeries {
+            labels: series.labels.clone(),
+            samples: series.samples[sample_index..sample_end].to_vec(),
+            histograms: series.histograms[histogram_index..histogram_end].to_vec(),
+            exemplars: series.exemplars[exemplar_index..exemplar_end].to_vec(),
+        });
+
+        sample_index = sample_end;
+        histogram_index = histogram_end;
+        exemplar_index = exemplar_end;
+    }
+    Ok(fragments)
+}
+
+fn writable_series_point_count(series: &WritableSeries) -> Result<usize, String> {
+    series
+        .samples
+        .len()
+        .checked_add(series.histograms.len())
+        .and_then(|total| total.checked_add(series.exemplars.len()))
+        .ok_or_else(|| "remote-write source series point count overflowed usize".to_string())
+}
+
+fn time_series_point_count(series: &TimeSeries) -> Result<usize, String> {
+    series
+        .samples
+        .len()
+        .checked_add(series.histograms.len())
+        .and_then(|total| total.checked_add(series.exemplars.len()))
+        .ok_or_else(|| "remote-write series fragment point count overflowed usize".to_string())
 }
 
 fn send_write_request(
     client: &HttpClient,
     target: &TargetConfig,
     batch: &WriteRequest,
-) -> Result<(), String> {
+) -> Result<WriteAcknowledgement, String> {
+    let expectation = remote_write_expectation(batch)?;
     let encoded = batch.encode_to_vec();
     let compressed = SnappyEncoder::new()
         .compress_vec(&encoded)
         .map_err(|err| format!("snappy encode failed: {err}"))?;
-    client.post_bytes(
+    let response = client.post_bytes(
         &target.write_url,
         &target.headers,
         target.tenant.as_deref(),
@@ -2070,7 +2274,188 @@ fn send_write_request(
             ("X-Prometheus-Remote-Write-Version", "0.1.0"),
         ],
     )?;
-    Ok(())
+    validate_remote_write_response(
+        &target.write_url,
+        &response,
+        expectation,
+        target.minimum_write_acknowledgement,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteWriteExpectation {
+    RowBearing {
+        submitted_exemplars: usize,
+        submitted_histograms: usize,
+    },
+    MetadataOnly {
+        submitted: usize,
+    },
+}
+
+fn remote_write_expectation(batch: &WriteRequest) -> Result<RemoteWriteExpectation, String> {
+    let submitted_exemplars = batch.timeseries.iter().try_fold(0usize, |total, series| {
+        total
+            .checked_add(series.exemplars.len())
+            .ok_or_else(|| "remote-write exemplar count overflowed usize".to_string())
+    })?;
+    let submitted_histograms = batch.timeseries.iter().try_fold(0usize, |total, series| {
+        total
+            .checked_add(series.histograms.len())
+            .ok_or_else(|| "remote-write histogram count overflowed usize".to_string())
+    })?;
+    let row_bearing = submitted_exemplars > 0
+        || submitted_histograms > 0
+        || batch
+            .timeseries
+            .iter()
+            .any(|series| !series.samples.is_empty());
+    if row_bearing {
+        return Ok(RemoteWriteExpectation::RowBearing {
+            submitted_exemplars,
+            submitted_histograms,
+        });
+    }
+    if !batch.metadata.is_empty() {
+        return Ok(RemoteWriteExpectation::MetadataOnly {
+            submitted: batch.metadata.len(),
+        });
+    }
+    Err("refusing to submit an empty remote-write migration batch".to_string())
+}
+
+fn validate_remote_write_response(
+    url: &str,
+    response: &HttpResponseBytes,
+    expectation: RemoteWriteExpectation,
+    minimum_acknowledgement: WriteAcknowledgement,
+) -> Result<WriteAcknowledgement, String> {
+    let acknowledgement =
+        single_response_header(url, &response.headers, TSINK_WRITE_ACKNOWLEDGEMENT_HEADER)?;
+    let partial = single_response_header(url, &response.headers, TSINK_WRITE_PARTIAL_HEADER)?;
+    let outcome = single_response_header(url, &response.headers, TSINK_WRITE_OUTCOME_HEADER)?;
+    let accepted_rows = single_response_header(url, &response.headers, TSINK_ROWS_ACCEPTED_HEADER)?;
+    let error_code = single_response_header(url, &response.headers, TSINK_WRITE_ERROR_CODE_HEADER)?;
+
+    if partial.is_some() || outcome.is_some() || accepted_rows.is_some() {
+        return Err(format!(
+            "POST {url} did not prove a complete atomic write: partial={partial:?}, outcome={outcome:?}, rows_accepted={accepted_rows:?}"
+        ));
+    }
+    if let Some(error_code) = error_code {
+        return Err(format!(
+            "POST {url} returned write error evidence on an otherwise successful response: {error_code:?}"
+        ));
+    }
+    if response.status != StatusCode::OK {
+        return Err(format!(
+            "POST {url} returned unexpected status {}: {}",
+            response.status.as_u16(),
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+
+    let acknowledgement = acknowledgement.ok_or_else(|| {
+        format!(
+            "POST {url} did not return required {TSINK_WRITE_ACKNOWLEDGEMENT_HEADER} evidence for the non-empty write"
+        )
+    })?;
+    let acknowledgement = WriteAcknowledgement::parse(&acknowledgement).ok_or_else(|| {
+        format!(
+            "POST {url} returned malformed {TSINK_WRITE_ACKNOWLEDGEMENT_HEADER}: {acknowledgement:?}"
+        )
+    })?;
+    if acknowledgement < minimum_acknowledgement {
+        return Err(format!(
+            "POST {url} returned {TSINK_WRITE_ACKNOWLEDGEMENT_HEADER}={}, below configured minimum {}",
+            acknowledgement.as_str(),
+            minimum_acknowledgement.as_str()
+        ));
+    }
+
+    if let RemoteWriteExpectation::MetadataOnly { submitted } = expectation {
+        let accepted =
+            required_response_count(url, &response.headers, TSINK_METADATA_ACCEPTED_HEADER)?;
+        let applied =
+            required_response_count(url, &response.headers, TSINK_METADATA_APPLIED_HEADER)?;
+        if accepted != submitted {
+            return Err(format!(
+                "POST {url} returned {TSINK_METADATA_ACCEPTED_HEADER}={accepted}, expected {submitted}"
+            ));
+        }
+        if applied > submitted {
+            return Err(format!(
+                "POST {url} returned {TSINK_METADATA_APPLIED_HEADER}={applied}, which exceeds the {submitted} submitted metadata updates"
+            ));
+        }
+    }
+
+    if let RemoteWriteExpectation::RowBearing {
+        submitted_exemplars,
+        submitted_histograms,
+    } = expectation
+    {
+        if submitted_exemplars > 0 {
+            let accepted =
+                required_response_count(url, &response.headers, TSINK_EXEMPLARS_ACCEPTED_HEADER)?;
+            let dropped =
+                required_response_count(url, &response.headers, TSINK_EXEMPLARS_DROPPED_HEADER)?;
+            if accepted != submitted_exemplars {
+                return Err(format!(
+                    "POST {url} returned {TSINK_EXEMPLARS_ACCEPTED_HEADER}={accepted}, expected {submitted_exemplars}"
+                ));
+            }
+            if dropped != 0 {
+                return Err(format!(
+                    "POST {url} returned {TSINK_EXEMPLARS_DROPPED_HEADER}={dropped}; migration requires every submitted exemplar to be accepted"
+                ));
+            }
+        }
+        if submitted_histograms > 0 {
+            let accepted =
+                required_response_count(url, &response.headers, TSINK_HISTOGRAMS_ACCEPTED_HEADER)?;
+            if accepted != submitted_histograms {
+                return Err(format!(
+                    "POST {url} returned {TSINK_HISTOGRAMS_ACCEPTED_HEADER}={accepted}, expected {submitted_histograms}"
+                ));
+            }
+        }
+    }
+
+    Ok(acknowledgement)
+}
+
+fn single_response_header(
+    url: &str,
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, String> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!(
+            "POST {url} returned multiple {name} headers; the write outcome is ambiguous"
+        ));
+    }
+    value
+        .to_str()
+        .map(str::to_string)
+        .map(Some)
+        .map_err(|_| format!("POST {url} returned a non-UTF-8 {name} header"))
+}
+
+fn required_response_count(
+    url: &str,
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<usize, String> {
+    let value = single_response_header(url, headers, name)?
+        .ok_or_else(|| format!("POST {url} did not return required {name} evidence"))?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("POST {url} returned malformed {name}: {value:?}"))
 }
 
 fn effective_metadata_metrics(plan: &MigrationPlan) -> Result<Vec<String>, String> {
@@ -3413,6 +3798,7 @@ mod tests {
         ScopeMetrics, Sum as OtlpSum,
     };
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use reqwest::header::HeaderValue;
     use tempfile::tempdir;
 
     fn fixture_dir() -> PathBuf {
@@ -3430,6 +3816,816 @@ mod tests {
             .collect::<Vec<_>>();
         keys.sort();
         keys
+    }
+
+    fn mock_write_response(status: StatusCode, headers: HeaderMap) -> HttpResponseBytes {
+        HttpResponseBytes {
+            status,
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    const ROW_ONLY_EXPECTATION: RemoteWriteExpectation = RemoteWriteExpectation::RowBearing {
+        submitted_exemplars: 0,
+        submitted_histograms: 0,
+    };
+
+    #[test]
+    fn requires_durable_remote_write_acknowledgement_by_default() {
+        assert_eq!(
+            WriteAcknowledgement::default(),
+            WriteAcknowledgement::Durable
+        );
+
+        for acknowledgement in ["volatile", "appended"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                HeaderValue::from_static(acknowledgement),
+            );
+            let error = validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                ROW_ONLY_EXPECTATION,
+                WriteAcknowledgement::default(),
+            )
+            .expect_err("the default durable floor must reject weaker acknowledgements");
+            assert!(error.contains("below configured minimum durable"));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("durable"),
+        );
+        assert_eq!(
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                ROW_ONLY_EXPECTATION,
+                WriteAcknowledgement::default(),
+            )
+            .expect("a durable acknowledgement should meet the default floor"),
+            WriteAcknowledgement::Durable
+        );
+    }
+
+    #[test]
+    fn permits_an_explicitly_weaker_remote_write_acknowledgement_floor() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("appended"),
+        );
+        assert_eq!(
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                ROW_ONLY_EXPECTATION,
+                WriteAcknowledgement::Appended,
+            )
+            .expect("an explicit appended floor should accept appended acknowledgement"),
+            WriteAcknowledgement::Appended
+        );
+
+        let mut volatile_headers = HeaderMap::new();
+        volatile_headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("volatile"),
+        );
+        let error = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, volatile_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Appended,
+        )
+        .expect_err("an appended floor must still reject volatile acknowledgement");
+        assert!(error.contains("below configured minimum appended"));
+    }
+
+    #[test]
+    fn parses_default_and_explicit_write_acknowledgement_floors() {
+        let plan =
+            load_plan(&fixture_dir().join("prometheus-plan.json")).expect("plan should parse");
+        assert_eq!(
+            plan.target.minimum_write_acknowledgement,
+            WriteAcknowledgement::Durable
+        );
+
+        let target: TargetConfig = serde_json::from_value(json!({
+            "write_url": "http://target.example/api/v1/write",
+            "read_url": "http://target.example/api/v1/read",
+            "minimum_write_acknowledgement": "appended"
+        }))
+        .expect("an explicit canonical acknowledgement floor should parse");
+        assert_eq!(
+            target.minimum_write_acknowledgement,
+            WriteAcknowledgement::Appended
+        );
+
+        let invalid = serde_json::from_value::<TargetConfig>(json!({
+            "write_url": "http://target.example/api/v1/write",
+            "read_url": "http://target.example/api/v1/read",
+            "minimum_write_acknowledgement": "committed"
+        }))
+        .expect_err("an unknown acknowledgement floor must fail closed");
+        assert!(invalid.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn backfill_reports_the_required_and_observed_acknowledgements() {
+        let report = CommandReport::Backfill(BackfillReport {
+            status: "pass".to_string(),
+            source_kind: SourceKind::Prometheus,
+            start_ms: 1,
+            end_ms: 2,
+            selector_count: 1,
+            series_written: 1,
+            samples_written: 1,
+            histograms_written: 0,
+            exemplars_written: 0,
+            metadata_written: 0,
+            write_batches: 1,
+            minimum_write_acknowledgement: WriteAcknowledgement::Appended,
+            weakest_observed_write_acknowledgement: Some(WriteAcknowledgement::Durable),
+            notes: Vec::new(),
+        });
+
+        let json = serde_json::to_value(&report).expect("report JSON should serialize");
+        assert_eq!(
+            json["minimum_write_acknowledgement"],
+            JsonValue::String("appended".to_string())
+        );
+        assert_eq!(
+            json["weakest_observed_write_acknowledgement"],
+            JsonValue::String("durable".to_string())
+        );
+        assert!(report
+            .console_summary()
+            .contains("minimum_write_acknowledgement: appended"));
+        assert!(report
+            .markdown_summary()
+            .contains("Weakest observed write acknowledgement: `durable`"));
+    }
+
+    #[test]
+    fn write_batch_accepts_an_exact_point_boundary() {
+        let first_labels = vec![Label {
+            name: "__name__".to_string(),
+            value: "first_metric".to_string(),
+        }];
+        let second_labels = vec![Label {
+            name: "__name__".to_string(),
+            value: "second_metric".to_string(),
+        }];
+        let mut series = BTreeMap::new();
+        series.insert(
+            labels_to_key(&first_labels),
+            WritableSeries {
+                labels: first_labels,
+                samples: (0..2)
+                    .map(|timestamp| Sample {
+                        value: timestamp as f64,
+                        timestamp,
+                    })
+                    .collect(),
+                ..WritableSeries::default()
+            },
+        );
+        series.insert(
+            labels_to_key(&second_labels),
+            WritableSeries {
+                labels: second_labels,
+                samples: (2..5)
+                    .map(|timestamp| Sample {
+                        value: timestamp as f64,
+                        timestamp,
+                    })
+                    .collect(),
+                ..WritableSeries::default()
+            },
+        );
+
+        let batches = build_write_batches(
+            &series,
+            &[],
+            &BatchConfig {
+                max_series_per_write: 2,
+                max_points_per_write: 5,
+                http_timeout_secs: 30,
+            },
+        )
+        .expect("an exact boundary should batch successfully");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].timeseries.len(), 2);
+        assert_eq!(
+            batches[0]
+                .timeseries
+                .iter()
+                .map(time_series_point_count)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("point counts should fit")
+                .into_iter()
+                .sum::<usize>(),
+            5
+        );
+    }
+
+    #[test]
+    fn write_batch_splits_one_oversized_series_without_losing_payloads() {
+        let labels = vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "mixed_metric".to_string(),
+            },
+            Label {
+                name: "job".to_string(),
+                value: "migration".to_string(),
+            },
+        ];
+        let samples = (0..4)
+            .map(|timestamp| Sample {
+                value: timestamp as f64,
+                timestamp,
+            })
+            .collect::<Vec<_>>();
+        let histograms = (10..13)
+            .map(|timestamp| Histogram {
+                timestamp,
+                ..Histogram::default()
+            })
+            .collect::<Vec<_>>();
+        let exemplars = (20..22)
+            .map(|timestamp| Exemplar {
+                value: timestamp as f64,
+                timestamp,
+                ..Exemplar::default()
+            })
+            .collect::<Vec<_>>();
+        let mut series = BTreeMap::new();
+        series.insert(
+            labels_to_key(&labels),
+            WritableSeries {
+                labels: labels.clone(),
+                samples: samples.clone(),
+                histograms: histograms.clone(),
+                exemplars: exemplars.clone(),
+            },
+        );
+
+        let batches = build_write_batches(
+            &series,
+            &[],
+            &BatchConfig {
+                max_series_per_write: 8,
+                max_points_per_write: 3,
+                http_timeout_secs: 30,
+            },
+        )
+        .expect("an oversized series should be split into bounded fragments");
+        let fragments = batches
+            .iter()
+            .flat_map(|batch| batch.timeseries.iter())
+            .collect::<Vec<_>>();
+
+        assert_eq!(fragments.len(), 3);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .timeseries
+                .iter()
+                .map(time_series_point_count)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("fragment point counts should fit")
+                .into_iter()
+                .sum::<usize>()
+                <= 3
+        }));
+        assert!(fragments.iter().all(|fragment| fragment.labels == labels));
+        assert_eq!(
+            fragments
+                .iter()
+                .flat_map(|fragment| fragment.samples.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            samples
+        );
+        assert_eq!(
+            fragments
+                .iter()
+                .flat_map(|fragment| fragment.histograms.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            histograms
+        );
+        assert_eq!(
+            fragments
+                .iter()
+                .flat_map(|fragment| fragment.exemplars.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            exemplars
+        );
+    }
+
+    #[test]
+    fn write_batch_rejects_zero_limits() {
+        let series = BTreeMap::new();
+        let metadata = vec![MetricMetadata::default()];
+
+        let zero_series = build_write_batches(
+            &series,
+            &metadata,
+            &BatchConfig {
+                max_series_per_write: 0,
+                ..BatchConfig::default()
+            },
+        )
+        .expect_err("a zero series limit must fail closed");
+        assert!(zero_series.contains("max_series_per_write"));
+
+        let zero_points = build_write_batches(
+            &series,
+            &metadata,
+            &BatchConfig {
+                max_points_per_write: 0,
+                ..BatchConfig::default()
+            },
+        )
+        .expect_err("a zero point limit must fail closed");
+        assert!(zero_points.contains("max_points_per_write"));
+    }
+
+    #[test]
+    fn classifies_row_bearing_and_metadata_only_write_batches() {
+        let metadata_only = WriteRequest {
+            timeseries: Vec::new(),
+            metadata: vec![MetricMetadata::default()],
+        };
+        assert_eq!(
+            remote_write_expectation(&metadata_only).expect("metadata batch should classify"),
+            RemoteWriteExpectation::MetadataOnly { submitted: 1 }
+        );
+
+        let row_bearing = WriteRequest {
+            timeseries: vec![TimeSeries {
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 1,
+                }],
+                ..TimeSeries::default()
+            }],
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            remote_write_expectation(&row_bearing).expect("row batch should classify"),
+            ROW_ONLY_EXPECTATION
+        );
+
+        let sidecar_bearing = WriteRequest {
+            timeseries: vec![TimeSeries {
+                exemplars: vec![Exemplar::default(), Exemplar::default()],
+                histograms: vec![Histogram::default()],
+                ..TimeSeries::default()
+            }],
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            remote_write_expectation(&sidecar_bearing)
+                .expect("exemplar and histogram batch should classify"),
+            RemoteWriteExpectation::RowBearing {
+                submitted_exemplars: 2,
+                submitted_histograms: 1,
+            }
+        );
+
+        let empty = WriteRequest::default();
+        assert!(remote_write_expectation(&empty).is_err());
+    }
+
+    #[test]
+    fn accepts_complete_metadata_only_response_and_idempotent_replay() {
+        for applied in ["2", "0"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                HeaderValue::from_static("durable"),
+            );
+            headers.insert(
+                TSINK_METADATA_ACCEPTED_HEADER,
+                HeaderValue::from_static("2"),
+            );
+            headers.insert(
+                TSINK_METADATA_APPLIED_HEADER,
+                HeaderValue::from_static(applied),
+            );
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                RemoteWriteExpectation::MetadataOnly { submitted: 2 },
+                WriteAcknowledgement::Durable,
+            )
+            .expect("accepted metadata and an in-range changed count should prove completion");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_inconsistent_metadata_only_evidence() {
+        let canonical_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                HeaderValue::from_static("durable"),
+            );
+            headers.insert(
+                TSINK_METADATA_ACCEPTED_HEADER,
+                HeaderValue::from_static("2"),
+            );
+            headers.insert(TSINK_METADATA_APPLIED_HEADER, HeaderValue::from_static("2"));
+            headers
+        };
+        let validate = |headers| {
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                RemoteWriteExpectation::MetadataOnly { submitted: 2 },
+                WriteAcknowledgement::Durable,
+            )
+        };
+
+        let mut missing_acknowledgement = canonical_headers();
+        missing_acknowledgement.remove(TSINK_WRITE_ACKNOWLEDGEMENT_HEADER);
+        assert!(validate(missing_acknowledgement)
+            .expect_err("metadata-only writes still require acknowledgement evidence")
+            .contains("did not return required"));
+
+        let mut missing_accepted = canonical_headers();
+        missing_accepted.remove(TSINK_METADATA_ACCEPTED_HEADER);
+        assert!(validate(missing_accepted)
+            .expect_err("missing accepted count must fail")
+            .contains("did not return required"));
+
+        let mut missing_applied = canonical_headers();
+        missing_applied.remove(TSINK_METADATA_APPLIED_HEADER);
+        assert!(validate(missing_applied)
+            .expect_err("missing applied count must fail")
+            .contains("did not return required"));
+
+        let mut malformed = canonical_headers();
+        malformed.insert(
+            TSINK_METADATA_ACCEPTED_HEADER,
+            HeaderValue::from_static("two"),
+        );
+        assert!(validate(malformed)
+            .expect_err("malformed accepted count must fail")
+            .contains("malformed"));
+
+        let mut duplicate = canonical_headers();
+        duplicate.append(TSINK_METADATA_APPLIED_HEADER, HeaderValue::from_static("1"));
+        assert!(validate(duplicate)
+            .expect_err("duplicate applied counts must fail")
+            .contains("multiple"));
+
+        let mut accepted_mismatch = canonical_headers();
+        accepted_mismatch.insert(
+            TSINK_METADATA_ACCEPTED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        assert!(validate(accepted_mismatch)
+            .expect_err("an accepted count mismatch must fail")
+            .contains("expected 2"));
+
+        let mut applied_too_large = canonical_headers();
+        applied_too_large.insert(TSINK_METADATA_APPLIED_HEADER, HeaderValue::from_static("3"));
+        assert!(validate(applied_too_large)
+            .expect_err("an impossible applied count must fail")
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn validates_complete_exemplar_and_histogram_evidence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("durable"),
+        );
+        headers.insert(
+            TSINK_EXEMPLARS_ACCEPTED_HEADER,
+            HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            TSINK_EXEMPLARS_DROPPED_HEADER,
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            TSINK_HISTOGRAMS_ACCEPTED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, headers),
+            RemoteWriteExpectation::RowBearing {
+                submitted_exemplars: 2,
+                submitted_histograms: 1,
+            },
+            WriteAcknowledgement::Durable,
+        )
+        .expect("complete exemplar and histogram evidence should pass");
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_inconsistent_exemplar_evidence() {
+        let canonical_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                HeaderValue::from_static("durable"),
+            );
+            headers.insert(
+                TSINK_EXEMPLARS_ACCEPTED_HEADER,
+                HeaderValue::from_static("2"),
+            );
+            headers.insert(
+                TSINK_EXEMPLARS_DROPPED_HEADER,
+                HeaderValue::from_static("0"),
+            );
+            headers
+        };
+        let validate = |headers| {
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                RemoteWriteExpectation::RowBearing {
+                    submitted_exemplars: 2,
+                    submitted_histograms: 0,
+                },
+                WriteAcknowledgement::Durable,
+            )
+        };
+
+        let mut missing_accepted = canonical_headers();
+        missing_accepted.remove(TSINK_EXEMPLARS_ACCEPTED_HEADER);
+        assert!(validate(missing_accepted)
+            .expect_err("missing accepted exemplar count must fail")
+            .contains("did not return required"));
+
+        let mut missing_dropped = canonical_headers();
+        missing_dropped.remove(TSINK_EXEMPLARS_DROPPED_HEADER);
+        assert!(validate(missing_dropped)
+            .expect_err("missing dropped exemplar count must fail")
+            .contains("did not return required"));
+
+        let mut malformed = canonical_headers();
+        malformed.insert(
+            TSINK_EXEMPLARS_ACCEPTED_HEADER,
+            HeaderValue::from_static("two"),
+        );
+        assert!(validate(malformed)
+            .expect_err("malformed exemplar count must fail")
+            .contains("malformed"));
+
+        let mut duplicate = canonical_headers();
+        duplicate.append(
+            TSINK_EXEMPLARS_DROPPED_HEADER,
+            HeaderValue::from_static("0"),
+        );
+        assert!(validate(duplicate)
+            .expect_err("duplicate exemplar counts must fail")
+            .contains("multiple"));
+
+        let mut accepted_mismatch = canonical_headers();
+        accepted_mismatch.insert(
+            TSINK_EXEMPLARS_ACCEPTED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        assert!(validate(accepted_mismatch)
+            .expect_err("an accepted exemplar count mismatch must fail")
+            .contains("expected 2"));
+
+        let mut dropped = canonical_headers();
+        dropped.insert(
+            TSINK_EXEMPLARS_DROPPED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        assert!(validate(dropped)
+            .expect_err("a dropped exemplar must fail migration")
+            .contains("requires every submitted exemplar"));
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_inconsistent_histogram_evidence() {
+        let canonical_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                HeaderValue::from_static("durable"),
+            );
+            headers.insert(
+                TSINK_HISTOGRAMS_ACCEPTED_HEADER,
+                HeaderValue::from_static("2"),
+            );
+            headers
+        };
+        let validate = |headers| {
+            validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(StatusCode::OK, headers),
+                RemoteWriteExpectation::RowBearing {
+                    submitted_exemplars: 0,
+                    submitted_histograms: 2,
+                },
+                WriteAcknowledgement::Durable,
+            )
+        };
+
+        let mut missing = canonical_headers();
+        missing.remove(TSINK_HISTOGRAMS_ACCEPTED_HEADER);
+        assert!(validate(missing)
+            .expect_err("missing accepted histogram count must fail")
+            .contains("did not return required"));
+
+        let mut malformed = canonical_headers();
+        malformed.insert(
+            TSINK_HISTOGRAMS_ACCEPTED_HEADER,
+            HeaderValue::from_static("two"),
+        );
+        assert!(validate(malformed)
+            .expect_err("malformed histogram count must fail")
+            .contains("malformed"));
+
+        let mut duplicate = canonical_headers();
+        duplicate.append(
+            TSINK_HISTOGRAMS_ACCEPTED_HEADER,
+            HeaderValue::from_static("2"),
+        );
+        assert!(validate(duplicate)
+            .expect_err("duplicate histogram counts must fail")
+            .contains("multiple"));
+
+        let mut mismatch = canonical_headers();
+        mismatch.insert(
+            TSINK_HISTOGRAMS_ACCEPTED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        assert!(validate(mismatch)
+            .expect_err("an accepted histogram count mismatch must fail")
+            .contains("expected 2"));
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_remote_write_acknowledgement() {
+        let missing = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, HeaderMap::new()),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("missing acknowledgement evidence must fail");
+        assert!(missing.contains("did not return required"));
+
+        let mut unknown_headers = HeaderMap::new();
+        unknown_headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("committed"),
+        );
+        let unknown = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, unknown_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("an unknown acknowledgement must fail");
+        assert!(unknown.contains("malformed"));
+
+        let mut duplicate_headers = HeaderMap::new();
+        duplicate_headers.append(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("durable"),
+        );
+        duplicate_headers.append(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("volatile"),
+        );
+        let duplicate = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, duplicate_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("ambiguous acknowledgement evidence must fail");
+        assert!(duplicate.contains("multiple"));
+
+        let mut non_utf8_headers = HeaderMap::new();
+        non_utf8_headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header bytes should construct"),
+        );
+        let non_utf8 = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, non_utf8_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("non-UTF-8 acknowledgement evidence must fail");
+        assert!(non_utf8.contains("non-UTF-8"));
+    }
+
+    #[test]
+    fn rejects_partial_and_indeterminate_remote_write_signals() {
+        for (status, acknowledgement, partial, outcome, rows_accepted) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("durable"),
+                Some("true"),
+                Some("partial"),
+                Some("1"),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                Some("possible"),
+                Some("indeterminate_backend"),
+                None,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                Some("possible"),
+                Some("indeterminate_cluster"),
+                None,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(acknowledgement) = acknowledgement {
+                headers.insert(
+                    TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+                    HeaderValue::from_static(acknowledgement),
+                );
+            }
+            if let Some(partial) = partial {
+                headers.insert(
+                    TSINK_WRITE_PARTIAL_HEADER,
+                    HeaderValue::from_static(partial),
+                );
+            }
+            if let Some(outcome) = outcome {
+                headers.insert(
+                    TSINK_WRITE_OUTCOME_HEADER,
+                    HeaderValue::from_static(outcome),
+                );
+            }
+            if let Some(rows_accepted) = rows_accepted {
+                headers.insert(
+                    TSINK_ROWS_ACCEPTED_HEADER,
+                    HeaderValue::from_static(rows_accepted),
+                );
+            }
+
+            let error = validate_remote_write_response(
+                "http://target.example/api/v1/write",
+                &mock_write_response(status, headers),
+                ROW_ONLY_EXPECTATION,
+                WriteAcknowledgement::Durable,
+            )
+            .expect_err("partial or indeterminate write evidence must fail");
+            assert!(error.contains("did not prove a complete atomic write"));
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_success_status_and_write_error_evidence() {
+        let mut acknowledgement_headers = HeaderMap::new();
+        acknowledgement_headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("durable"),
+        );
+        let status_error = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::NO_CONTENT, acknowledgement_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("the remote-write endpoint contract requires HTTP 200");
+        assert!(status_error.contains("unexpected status 204"));
+
+        let mut error_headers = HeaderMap::new();
+        error_headers.insert(
+            TSINK_WRITE_ACKNOWLEDGEMENT_HEADER,
+            HeaderValue::from_static("durable"),
+        );
+        error_headers.insert(
+            TSINK_WRITE_ERROR_CODE_HEADER,
+            HeaderValue::from_static("write_invalid_outcome"),
+        );
+        let header_error = validate_remote_write_response(
+            "http://target.example/api/v1/write",
+            &mock_write_response(StatusCode::OK, error_headers),
+            ROW_ONLY_EXPECTATION,
+            WriteAcknowledgement::Durable,
+        )
+        .expect_err("write error evidence must override a nominal success");
+        assert!(header_error.contains("write error evidence"));
     }
 
     #[test]

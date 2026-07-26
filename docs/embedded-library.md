@@ -74,7 +74,7 @@ let storage = StorageBuilder::new()
 | Method | Default | Description |
 |---|---|---|
 | `with_data_path(path)` | *none* | Directory for WAL, segments, and metadata. Required for persistence. |
-| `with_object_store_path(path)` | *none* | Directory (or object-store prefix) for warm/cold tier segments. |
+| `with_object_store_path(path)` | *none* | Local, FUSE, or network-filesystem mount used for warm/cold tier segments; native object-store URIs are not supported. |
 
 ### Retention
 
@@ -108,14 +108,14 @@ let storage = StorageBuilder::new()
 | `with_cardinality_limit(series)` | 1,000,000 (`Embedded`) | Maximum number of unique series. New series are rejected once the limit is reached. |
 | `with_max_labels_per_series(labels)` | 128 | Maximum labels accepted in a submitted series identity. |
 | `with_max_series_identity_bytes(bytes)` | 64 KiB | Maximum cumulative metric and label UTF-8 bytes in one identity. |
-| `with_series_creation_rate_limit(series, window)` | unset | Fixed-window admission limit for successfully published new series. |
-| `with_write_batch_limits(limits)` | both fields unset | Optional pre-clone row-count and modeled logical-input-byte bounds for foreground, rollup, and WAL-replay writes. |
+| `with_series_creation_rate_limit(series, window)` | 100,000 / 60 s (`Embedded`) | Fixed-window admission limit for successfully published new series. |
+| `with_write_batch_limits(limits)` | 100,000 rows / 64 MiB (`Embedded`) | Pre-clone row-count and modeled logical-input-byte bounds for foreground, rollup, and WAL-replay writes. |
 
 ### Concurrency
 
 | Method | Default | Description |
 |---|---|---|
-| `with_max_writers(n)` | cgroup-detected CPU count | Parallel writer threads for ingestion. |
+| `with_max_writers(n)` | 4 (`Embedded`) | Concurrent writes admitted by the synchronous engine. |
 | `with_write_timeout(duration)` | 30 s | Maximum time a write waits for a writer slot before returning `WriteTimeout`. |
 
 ### WAL
@@ -123,8 +123,8 @@ let storage = StorageBuilder::new()
 | Method | Default | Description |
 |---|---|---|
 | `with_wal_enabled(bool)` | `true` | Enable or disable the write-ahead log. Disabling trades durability for speed. |
-| `with_wal_size_limit(bytes)` | *unlimited* | Cap total WAL size on disk. Exceeding this returns `WalSizeLimitExceeded`. |
-| `with_wal_buffer_size(size)` | 4 KiB | Finite userspace `BufWriter` capacity. It is reported by effective limits and WAL observability but is outside the storage-memory budget. |
+| `with_wal_size_limit(bytes)` | 512 MiB (`Embedded`) | Cap total WAL size on disk. Exceeding this returns `WalSizeLimitExceeded`. |
+| `with_wal_buffer_size(size)` | 4 KiB | Finite userspace `BufWriter` capacity. The live retained capacity is charged to the storage-memory budget and reported by effective limits, WAL observability, and memory observability. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | Durability policy — see [WAL sync modes](#wal-sync-modes). |
 | `with_wal_replay_mode(mode)` | `Strict` | Corruption handling during WAL replay — see [WAL replay modes](#wal-replay-modes). |
 
@@ -132,14 +132,15 @@ let storage = StorageBuilder::new()
 
 | Method | Default | Description |
 |---|---|---|
-| `with_local_disk_limit(bytes)` | *unlimited* | Cap bytes admitted beneath the persistent core data directory. Existing over-limit data remains readable, while new growth is rejected. |
-| `with_filesystem_free_headroom(bytes)` | 0 | Leave at least this much filesystem space available to the host. |
-| `with_maintenance_temp_reserve(bytes)` | 0 | Keep this portion of the logical quota available to compaction and other maintenance output. |
+| `with_local_disk_limit(bytes)` | 16 GiB (`Embedded`) | Cap bytes admitted beneath the persistent core data directory. Existing over-limit data remains readable, while new growth is rejected. |
+| `with_filesystem_free_headroom(bytes)` | 256 MiB (`Embedded`) | Leave at least this much filesystem space available to the host. |
+| `with_maintenance_temp_reserve(bytes)` | 1 GiB (`Embedded`) | Keep this portion of the logical quota available to compaction and other maintenance output. |
 
-Persistent storage always creates the accounting coordinator; the logical quota remains unlimited
-until configured. It accounts WAL, segments and indexes, registry/catalog state, tombstones, rollup
-state, recognized temporary output, and unknown files beneath the configured data path. Unknown
-files are counted but never deleted. The WAL limit remains an additional WAL-only sublimit.
+Persistent storage always creates the accounting coordinator. Standard profiles install a finite
+logical quota; only explicit `ExpertUnlimited` removes it. The coordinator accounts WAL, segments
+and indexes, registry/catalog state, tombstones, rollup state, recognized temporary output, and
+unknown files beneath the configured data path. Unknown files are counted but never deleted. The
+WAL limit remains an additional WAL-only sublimit.
 Object-store roots and external snapshot destinations outside the data directory are excluded;
 while a disk coordinator is active, snapshot destinations that resolve inside the managed tree are
 rejected. These `StorageBuilder` controls describe the embedded core envelope: they do not discover
@@ -161,7 +162,7 @@ core, metric metadata, exemplars, rules, usage ledger, and managed control-plane
 |---|---|---|
 | `with_runtime_mode(mode)` | `ReadWrite` | `ReadWrite` for local persistence, `ComputeOnly` for remote-only metadata. |
 | `with_background_fail_fast(bool)` | `true` | Halt the engine on unrecoverable background errors (compaction, flush). |
-| `with_metadata_shard_count(n)` | *auto* | Number of metadata shards for series routing. |
+| `with_metadata_shard_count(n)` | *none* | Enable a fixed metadata shard index for bounded shard-scoped discovery APIs. |
 
 Persistent instances own at most four named threads: flush, compaction, persisted refresh (which
 also serializes retention/tiering and remote-catalog refresh), and rollups. Their fixed concurrency
@@ -236,7 +237,12 @@ Its optional batch acknowledgement is the weakest guarantee among accepted rows 
 none were accepted. Both modes first admit the complete top-level submission, so `BestEffort`
 cannot bypass configured batch bounds one row at a time and `max_rows` also bounds its outcome
 vector. `modeled_write_batch_input_bytes(&rows)` returns the checked byte calculation used by
-`WriteBatchLimits`. Rejection messages are diagnostic and bounded; match on the structured category.
+`WriteBatchLimits`. A top-level row/input-bound violation returns its structured outer
+`TsinkError` before allocating indexed outcomes and commits nothing. Other safe pre-commit
+admission failures, including modeled-memory pressure, return a complete rejected outcome set when
+the separately admitted result envelope fits. If even that bounded response cannot fit the memory
+budget, the call returns the outer memory error without allocating outcomes. Rejection messages are
+diagnostic and bounded; match on the structured category.
 
 ### Write acknowledgement
 
@@ -400,6 +406,18 @@ Matcher operators:
 | `SeriesMatcher::regex_match(name, pattern)` | `=~` | `host=~"web-.*"` |
 | `SeriesMatcher::regex_no_match(name, pattern)` | `!~` | `env!~"staging\|dev"` |
 
+Selection shape is hard-bounded before regex compilation: 128 matchers, 256 bytes per matcher name,
+16 KiB per value/pattern, and 64 KiB across all matcher names and values. Regex compilation also
+uses fixed program, DFA-cache, and nesting limits. These ceilings apply even with
+`ResourceProfile::ExpertUnlimited`; their public constant names begin with
+`MAX_SERIES_SELECTION_`, `MAX_SERIES_MATCHER_`, and `QUERY_REGEX_`.
+
+For an adapter that needs to reject input before planning or cloning, call
+`selection.validate_shape()` for the allocation-free structural check or `selection.validate()`
+for bounded regex validation. When a `QueryExecution` is available, use
+`selection.prepare_with_execution(&execution)` and retain the returned guard until planning,
+fanout, and matcher use are finished.
+
 ---
 
 ## Deleting series
@@ -464,11 +482,34 @@ use std::path::Path;
 storage.snapshot(Path::new("/backups/tsink-2026-03-12"))?;
 ```
 
+The destination must not exist and must be outside the live managed data directory. Snapshotting
+briefly fences writers and maintenance, publishes through a synchronized sibling staging
+directory created with create-exclusive semantics, length-bounds and synchronizes every copied
+file, and uses an atomic no-replace rename so a destination created during the copy is not
+clobbered. The aggregate staged namespace is limited to 100,000 entries and depth 128 and is
+revalidated before publication. A pre-publication failure reports and retains the handle-attested
+staging tree rather than deleting it by pathname. After publication, a synchronization or
+attestation failure retains the visible destination. A foreign entry raced into a vacated staging
+pathname is never adopted for cleanup.
+
 Restore from a snapshot:
 
 ```rust
 StorageBuilder::restore_from_snapshot("/backups/tsink-2026-03-12", "/var/lib/tsink")?;
 ```
+
+Restore first copies into a create-exclusive validation sibling and opens that copy through strict
+production discovery, segment/catalog validation, registry recovery, tombstone hydration, WAL
+replay, and rollup loading. It requires non-degraded health and then shuts the validation instance
+down without normal flush/checkpoint persistence or workers. Only after that gate passes does it
+make a fresh publication copy. Replacement of an existing target uses distinct no-replace moves
+for backup and activation, so a path installed during activation is not overwritten. A successful
+replacement removes the exact pre-move backup; identity or descendant drift preserves and reports
+it. Existing targets and all owned cleanup stay within the 100,000-entry/depth-128 envelope.
+
+The snapshot and its containing namespace must remain offline and immutable for the complete call.
+The validation open uses the finite `Server` memory, cardinality, WAL, and disk envelope even when
+the snapshot was created under larger custom or `ExpertUnlimited` limits.
 
 ---
 
@@ -530,7 +571,7 @@ let async_storage = AsyncStorage::from_storage_with_options(
 | `queue_capacity` | 1024 | Maximum commands waiting inside each internal channel. |
 | `write_queue_byte_capacity` | 64 MiB | Maximum modeled owned write-input bytes queued or held by senders waiting for the write channel. |
 | `read_queue_byte_capacity` | 16 MiB | Maximum modeled owned read-input bytes queued or held by senders waiting for the read channel. |
-| `read_workers` | cgroup CPU count | Number of dedicated reader threads. |
+| `read_workers` | 4 (`Embedded`) | Number of dedicated reader threads. |
 
 All async methods mirror the sync API. `async_runtime_snapshot()` reports queue depths, current and
 peak modeled bytes, rejections, configured caps, and worker counts. Dropping a read future
@@ -689,7 +730,7 @@ Key error variants to handle:
 | `DiskQuotaExceeded` | Normal local growth would exceed the logical data-directory envelope. |
 | `InsufficientCompactionHeadroom` | Maintenance output cannot fit inside the logical envelope. |
 | `WriteTimeout` | No writer slot became available within `write_timeout`. |
-| `InvalidTimeRange` | `start > end` in a query. |
+| `InvalidTimeRange` | `start >= end` in a half-open storage query. |
 | `InvalidMetricName` / `InvalidLabel` | Metric or label name/value violates naming rules. |
 | `StorageClosed` | Operation attempted while storage is closing or after `close()`. |
 | `StorageShuttingDown` | The operation was fenced after a fail-fast background failure; canonical writes report `StorageDegraded`. |

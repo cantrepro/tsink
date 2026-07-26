@@ -33,8 +33,9 @@ pub(crate) use self::format::{MAX_SEGMENT_CHUNKS_FILE_BYTES, MAX_SEGMENT_MANIFES
 
 pub(crate) use self::loader::{
     load_segment_indexes_from_dirs_startup_recoverable_with_series, load_segment_series_metadata,
-    load_segments_runtime_strict, read_segment_manifest_fingerprint, verify_segment_fingerprint,
-    visit_segment_dirs_with_namespace_budget,
+    load_segments_runtime_strict, read_segment_manifest_fingerprint,
+    validate_legacy_segment_identity, validate_segment_payloads_for_restore,
+    verify_segment_fingerprint, visit_segment_dirs_with_namespace_budget,
 };
 pub(crate) use self::types::{SegmentContentFingerprint, SegmentFileFingerprint};
 pub(crate) use self::validation::{

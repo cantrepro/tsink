@@ -8,8 +8,11 @@ use crate::cluster::ring::ShardRing;
 use crate::cluster::ClusterRequestContext;
 use crate::tenant;
 use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,14 +36,94 @@ const RULES_MAX_ALERT_INSTANCES_PER_RULE_ENV: &str = "TSINK_RULES_MAX_ALERT_INST
 const DEFAULT_RULES_SCHEDULER_TICK_MS: u64 = 1_000;
 const DEFAULT_MAX_RECORDING_ROWS_PER_EVAL: usize = 10_000;
 const DEFAULT_MAX_ALERT_INSTANCES_PER_RULE: usize = 10_000;
+const RULES_ALLOCATION_ALLOWANCE_BYTES: usize = 64;
+const RULES_STARTUP_MAX_JSON_DEPTH: usize = 64;
+const RULES_MAX_DIAGNOSTIC_BYTES: usize = 512;
 const RECORDING_RULE_ATTEMPT_PENDING: &str =
     "recording rule evaluation attempt checkpointed; final outcome pending";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RulesStoreLimits {
+    pub max_groups: usize,
+    pub max_rules_per_group: usize,
+    pub max_rules_total: usize,
+    pub max_alert_instances_per_rule: usize,
+    pub max_labels_per_set: usize,
+    pub max_label_set_bytes: usize,
+    pub max_name_bytes: usize,
+    pub max_expression_bytes: usize,
+    pub max_annotation_bytes: usize,
+    pub max_total_retained_state_bytes: usize,
+    pub max_durable_file_bytes: usize,
+    pub max_startup_transient_bytes: usize,
+    pub max_replacement_transient_bytes: usize,
+    pub max_runtime_update_transient_bytes: usize,
+    pub max_snapshot_status_bytes: usize,
+}
+
+impl Default for RulesStoreLimits {
+    fn default() -> Self {
+        Self {
+            max_groups: 256,
+            max_rules_per_group: 256,
+            max_rules_total: 4_096,
+            max_alert_instances_per_rule: DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
+            max_labels_per_set: 64,
+            max_label_set_bytes: 64 * 1024,
+            max_name_bytes: 1024,
+            max_expression_bytes: 256 * 1024,
+            max_annotation_bytes: 64 * 1024,
+            max_total_retained_state_bytes: 16 * 1024 * 1024,
+            max_durable_file_bytes: 32 * 1024 * 1024,
+            max_startup_transient_bytes: 128 * 1024 * 1024,
+            max_replacement_transient_bytes: 64 * 1024 * 1024,
+            max_runtime_update_transient_bytes: 48 * 1024 * 1024,
+            max_snapshot_status_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl RulesStoreLimits {
+    pub fn validate(self) -> Result<Self, String> {
+        let positive = [
+            self.max_groups,
+            self.max_rules_per_group,
+            self.max_rules_total,
+            self.max_alert_instances_per_rule,
+            self.max_labels_per_set,
+            self.max_label_set_bytes,
+            self.max_name_bytes,
+            self.max_expression_bytes,
+            self.max_annotation_bytes,
+            self.max_total_retained_state_bytes,
+            self.max_durable_file_bytes,
+            self.max_startup_transient_bytes,
+            self.max_replacement_transient_bytes,
+            self.max_runtime_update_transient_bytes,
+            self.max_snapshot_status_bytes,
+        ];
+        if positive.contains(&0) {
+            return Err("rules store limits must all be greater than zero".to_string());
+        }
+        if self.max_rules_per_group > self.max_rules_total {
+            return Err("rules max_rules_per_group must not exceed max_rules_total".to_string());
+        }
+        if self.max_snapshot_status_bytes > crate::http::MAX_BODY_BYTES {
+            return Err(
+                "rules snapshot/status limit must not exceed the HTTP body limit".to_string(),
+            );
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RulesRuntimeConfig {
     pub scheduler_tick: Duration,
     pub max_recording_rows_per_eval: usize,
     pub max_alert_instances_per_rule: usize,
+    pub store_limits: RulesStoreLimits,
 }
 
 impl Default for RulesRuntimeConfig {
@@ -49,13 +132,14 @@ impl Default for RulesRuntimeConfig {
             scheduler_tick: Duration::from_millis(DEFAULT_RULES_SCHEDULER_TICK_MS),
             max_recording_rows_per_eval: DEFAULT_MAX_RECORDING_ROWS_PER_EVAL,
             max_alert_instances_per_rule: DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
+            store_limits: RulesStoreLimits::default(),
         }
     }
 }
 
 impl RulesRuntimeConfig {
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self {
+        Self {
             scheduler_tick: Duration::from_millis(parse_env_u64(
                 RULES_SCHEDULER_TICK_MS_ENV,
                 DEFAULT_RULES_SCHEDULER_TICK_MS,
@@ -71,7 +155,25 @@ impl RulesRuntimeConfig {
                 DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
                 true,
             )?,
-        })
+            store_limits: RulesStoreLimits::default(),
+        }
+        .validate()
+    }
+
+    pub fn validate(self) -> Result<Self, String> {
+        if self.scheduler_tick.is_zero()
+            || self.max_recording_rows_per_eval == 0
+            || self.max_alert_instances_per_rule == 0
+        {
+            return Err("rules runtime limits must all be greater than zero".to_string());
+        }
+        self.store_limits.validate()?;
+        if self.max_alert_instances_per_rule > self.store_limits.max_alert_instances_per_rule {
+            return Err(
+                "rules runtime alert limit exceeds the rules store alert limit".to_string(),
+            );
+        }
+        Ok(self)
     }
 }
 
@@ -323,9 +425,332 @@ struct PersistedRulesStore {
     state: PersistedRulesStoreState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RulesLimitSurface {
+    Configuration,
+    RetainedState,
+    DurableFile,
+    Startup,
+    Replacement,
+    RuntimeUpdate,
+    SnapshotStatus,
+    SnapshotFile,
+}
+
+impl RulesLimitSurface {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Configuration => "rules configuration exceeds a finite store limit",
+            Self::RetainedState => "rules retained state exceeds its finite byte limit",
+            Self::DurableFile => "rules durable state exceeds its finite file limit",
+            Self::Startup => "rules startup state exceeds its finite transient limit",
+            Self::Replacement => "rules replacement exceeds its finite transient limit",
+            Self::RuntimeUpdate => "rules runtime update exceeds its finite transient limit",
+            Self::SnapshotStatus => "rules snapshot/status exceeds its finite output limit",
+            Self::SnapshotFile => "rules snapshot file exceeds its finite transient limit",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RulesStoreError {
+    Limit(RulesLimitSurface),
+    Invalid(&'static str),
+    Persistence(tsink::TsinkError),
+    Internal(&'static str),
+}
+
+impl std::fmt::Display for RulesStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limit(surface) => formatter.write_str(surface.message()),
+            Self::Invalid(message) | Self::Internal(message) => formatter.write_str(message),
+            Self::Persistence(_) => formatter.write_str("rules state persistence failed"),
+        }
+    }
+}
+
+impl std::error::Error for RulesStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persistence(source) => Some(source),
+            Self::Limit(_) | Self::Invalid(_) | Self::Internal(_) => None,
+        }
+    }
+}
+
+impl From<tsink::TsinkError> for RulesStoreError {
+    fn from(error: tsink::TsinkError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RulesStoreAccountingSnapshot {
+    retained_state_bytes: u64,
+    peak_retained_state_bytes: u64,
+    durable_file_bytes: u64,
+    peak_startup_transient_bytes: u64,
+    peak_replacement_transient_bytes: u64,
+    peak_runtime_update_transient_bytes: u64,
+    peak_snapshot_status_bytes: u64,
+    peak_snapshot_file_bytes: u64,
+    limit_rejections_total: u64,
+    startup_rejections_total: u64,
+    replacement_rejections_total: u64,
+    runtime_update_rejections_total: u64,
+    snapshot_rejections_total: u64,
+    persistence_failures_total: u64,
+}
+
+#[derive(Debug, Default)]
+struct RulesStoreAccounting {
+    state: Mutex<RulesStoreAccountingSnapshot>,
+}
+
+impl RulesStoreAccounting {
+    fn snapshot(&self) -> RulesStoreAccountingSnapshot {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn initialize(&self, retained_state_bytes: usize, durable_file_bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.retained_state_bytes = saturating_u64(retained_state_bytes);
+        state.peak_retained_state_bytes = state
+            .peak_retained_state_bytes
+            .max(state.retained_state_bytes);
+        state.durable_file_bytes = saturating_u64(durable_file_bytes);
+    }
+
+    fn publish_state(&self, retained_state_bytes: usize, durable_file_bytes: Option<usize>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.retained_state_bytes = saturating_u64(retained_state_bytes);
+        state.peak_retained_state_bytes = state
+            .peak_retained_state_bytes
+            .max(state.retained_state_bytes);
+        if let Some(durable_file_bytes) = durable_file_bytes {
+            state.durable_file_bytes = saturating_u64(durable_file_bytes);
+        }
+    }
+
+    fn observe_peak(&self, surface: RulesLimitSurface, bytes: usize) {
+        let bytes = saturating_u64(bytes);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match surface {
+            RulesLimitSurface::Startup => {
+                state.peak_startup_transient_bytes = state.peak_startup_transient_bytes.max(bytes);
+            }
+            RulesLimitSurface::Replacement => {
+                state.peak_replacement_transient_bytes =
+                    state.peak_replacement_transient_bytes.max(bytes);
+            }
+            RulesLimitSurface::RuntimeUpdate => {
+                state.peak_runtime_update_transient_bytes =
+                    state.peak_runtime_update_transient_bytes.max(bytes);
+            }
+            RulesLimitSurface::SnapshotStatus => {
+                state.peak_snapshot_status_bytes = state.peak_snapshot_status_bytes.max(bytes);
+            }
+            RulesLimitSurface::SnapshotFile => {
+                state.peak_snapshot_file_bytes = state.peak_snapshot_file_bytes.max(bytes);
+            }
+            RulesLimitSurface::Configuration
+            | RulesLimitSurface::RetainedState
+            | RulesLimitSurface::DurableFile => {}
+        }
+    }
+
+    fn reject(&self, surface: RulesLimitSurface) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.limit_rejections_total = state.limit_rejections_total.saturating_add(1);
+        match surface {
+            RulesLimitSurface::Startup => {
+                state.startup_rejections_total = state.startup_rejections_total.saturating_add(1);
+            }
+            RulesLimitSurface::Replacement
+            | RulesLimitSurface::Configuration
+            | RulesLimitSurface::RetainedState
+            | RulesLimitSurface::DurableFile => {
+                state.replacement_rejections_total =
+                    state.replacement_rejections_total.saturating_add(1);
+            }
+            RulesLimitSurface::RuntimeUpdate => {
+                state.runtime_update_rejections_total =
+                    state.runtime_update_rejections_total.saturating_add(1);
+            }
+            RulesLimitSurface::SnapshotStatus | RulesLimitSurface::SnapshotFile => {
+                state.snapshot_rejections_total = state.snapshot_rejections_total.saturating_add(1);
+            }
+        }
+    }
+
+    fn persistence_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.persistence_failures_total = state.persistence_failures_total.saturating_add(1);
+    }
+
+    fn observe_snapshot_file_peak(&self, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.peak_snapshot_file_bytes = state.peak_snapshot_file_bytes.max(saturating_u64(bytes));
+    }
+}
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn modeled_allocation_bytes(payload_bytes: usize) -> usize {
+    if payload_bytes == 0 {
+        0
+    } else {
+        payload_bytes.saturating_add(RULES_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_vec_len_bytes<T>(len: usize) -> usize {
+    modeled_allocation_bytes(len.saturating_mul(std::mem::size_of::<T>()))
+}
+
+fn modeled_owned_string_bytes(value: &String) -> usize {
+    modeled_allocation_bytes(value.capacity())
+}
+
+fn modeled_owned_vec_bytes<T>(value: &Vec<T>) -> usize {
+    modeled_allocation_bytes(value.capacity().saturating_mul(std::mem::size_of::<T>()))
+}
+
+fn modeled_label_heap_bytes(label: &Label) -> usize {
+    modeled_owned_string_bytes(&label.name).saturating_add(modeled_owned_string_bytes(&label.value))
+}
+
+fn modeled_labels_bytes(labels: &Vec<Label>) -> usize {
+    modeled_owned_vec_bytes(labels).saturating_add(labels.iter().fold(0usize, |bytes, label| {
+        bytes.saturating_add(modeled_label_heap_bytes(label))
+    }))
+}
+
+fn modeled_string_map_bytes(values: &BTreeMap<String, String>) -> usize {
+    let node_inline = std::mem::size_of::<String>()
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(4));
+    values.iter().fold(0usize, |bytes, (name, value)| {
+        bytes
+            .saturating_add(modeled_allocation_bytes(node_inline))
+            .saturating_add(modeled_owned_string_bytes(name))
+            .saturating_add(modeled_owned_string_bytes(value))
+    })
+}
+
+fn modeled_rule_heap_bytes(rule: &RuleSpec) -> usize {
+    match rule {
+        RuleSpec::Recording(spec) => modeled_owned_string_bytes(&spec.record)
+            .saturating_add(modeled_owned_string_bytes(&spec.expr))
+            .saturating_add(modeled_string_map_bytes(&spec.labels)),
+        RuleSpec::Alert(spec) => modeled_owned_string_bytes(&spec.alert)
+            .saturating_add(modeled_owned_string_bytes(&spec.expr))
+            .saturating_add(modeled_string_map_bytes(&spec.labels))
+            .saturating_add(modeled_string_map_bytes(&spec.annotations)),
+    }
+}
+
+fn modeled_group_heap_bytes(group: &RuleGroupSpec) -> usize {
+    modeled_owned_string_bytes(&group.name)
+        .saturating_add(modeled_owned_string_bytes(&group.tenant_id))
+        .saturating_add(modeled_string_map_bytes(&group.labels))
+        .saturating_add(modeled_owned_vec_bytes(&group.rules))
+        .saturating_add(group.rules.iter().fold(0usize, |bytes, rule| {
+            bytes.saturating_add(modeled_rule_heap_bytes(rule))
+        }))
+}
+
+fn modeled_groups_bytes(groups: &Vec<RuleGroupSpec>) -> usize {
+    modeled_owned_vec_bytes(groups).saturating_add(groups.iter().fold(0usize, |bytes, group| {
+        bytes.saturating_add(modeled_group_heap_bytes(group))
+    }))
+}
+
+fn modeled_alert_instance_heap_bytes(instance: &AlertInstanceState) -> usize {
+    modeled_owned_string_bytes(&instance.key)
+        .saturating_add(modeled_owned_string_bytes(&instance.source_metric))
+        .saturating_add(modeled_labels_bytes(&instance.labels))
+        .saturating_add(modeled_owned_string_bytes(&instance.sample_type))
+        .saturating_add(
+            instance
+                .sample_value
+                .as_ref()
+                .map(modeled_owned_string_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_runtime_state_heap_bytes(state: &PersistedRuleRuntimeState) -> usize {
+    state
+        .last_error
+        .as_ref()
+        .map(modeled_owned_string_bytes)
+        .unwrap_or(0)
+        .saturating_add(modeled_owned_vec_bytes(&state.alert_instances))
+        .saturating_add(
+            state
+                .alert_instances
+                .iter()
+                .fold(0usize, |bytes, instance| {
+                    bytes.saturating_add(modeled_alert_instance_heap_bytes(instance))
+                }),
+        )
+}
+
+fn modeled_runtime_entry_bytes(rule_id: &String, state: &PersistedRuleRuntimeState) -> usize {
+    modeled_runtime_map_node_bytes()
+        .saturating_add(modeled_owned_string_bytes(rule_id))
+        .saturating_add(modeled_runtime_state_heap_bytes(state))
+}
+
+fn modeled_runtime_map_node_bytes() -> usize {
+    let node_inline = std::mem::size_of::<String>()
+        .saturating_add(std::mem::size_of::<PersistedRuleRuntimeState>())
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(4));
+    modeled_allocation_bytes(node_inline)
+}
+
+fn modeled_runtime_map_bytes(runtime: &BTreeMap<String, PersistedRuleRuntimeState>) -> usize {
+    runtime.iter().fold(0usize, |bytes, (rule_id, state)| {
+        bytes.saturating_add(modeled_runtime_entry_bytes(rule_id, state))
+    })
+}
+
+fn modeled_rules_state_bytes(state: &PersistedRulesStoreState) -> usize {
+    std::mem::size_of::<PersistedRulesStoreState>()
+        .saturating_add(modeled_groups_bytes(&state.groups))
+        .saturating_add(modeled_runtime_map_bytes(&state.runtime))
+}
+
 struct RulesStore {
     path: Option<PathBuf>,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
+    limits: RulesStoreLimits,
+    accounting: RulesStoreAccounting,
     state: RwLock<PersistedRulesStoreState>,
 }
 
@@ -339,96 +764,288 @@ impl RulesStore {
         data_path: Option<&Path>,
         local_disk_budget: Option<Arc<LocalDiskBudget>>,
     ) -> Result<Self, String> {
+        Self::open_with_limits(data_path, local_disk_budget, RulesStoreLimits::default())
+    }
+
+    fn open_with_limits(
+        data_path: Option<&Path>,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+        limits: RulesStoreLimits,
+    ) -> Result<Self, String> {
+        let limits = limits.validate()?;
         let path = data_path.map(|path| path.join(RULES_STORE_FILE_NAME));
         match (path.as_deref(), local_disk_budget.as_ref()) {
             (Some(path), Some(budget)) => {
-                budget.cleanup_atomic_write_temps(path).map_err(|err| {
-                    format!(
-                        "failed to clean rules temporary files for {}: {err}",
-                        path.display()
-                    )
-                })?;
-                budget.validate_managed_file_path(path).map_err(|err| {
-                    format!("failed to validate rules store {}: {err}", path.display())
-                })?;
+                budget
+                    .cleanup_atomic_write_temps(path)
+                    .map_err(|_| "failed to clean rules temporary files".to_string())?;
+                budget
+                    .validate_managed_file_path(path)
+                    .map_err(|_| "failed to validate rules store path".to_string())?;
             }
             (None, Some(_)) => {
                 return Err("rules cannot use a local disk budget without a data path".to_string())
             }
             _ => {}
         }
-        let state = if let Some(path) = path.as_ref() {
-            load_rules_store_state(path)?
+        let accounting = RulesStoreAccounting::default();
+        let loaded = if let Some(path) = path.as_ref() {
+            load_rules_store_state_bounded(path, &limits, &accounting)
+                .map_err(|error| error.to_string())?
         } else {
-            PersistedRulesStoreState::default()
+            LoadedRulesStoreState {
+                state: PersistedRulesStoreState::default(),
+                durable_file_bytes: 0,
+                startup_transient_bytes: 0,
+            }
         };
+        let retained_state_bytes = modeled_rules_state_bytes(&loaded.state);
+        accounting.initialize(retained_state_bytes, loaded.durable_file_bytes);
+        accounting.observe_peak(RulesLimitSurface::Startup, loaded.startup_transient_bytes);
         Ok(Self {
             path,
             local_disk_budget,
-            state: RwLock::new(state),
+            limits,
+            accounting,
+            state: RwLock::new(loaded.state),
         })
     }
 
     fn snapshot(&self) -> Result<PersistedRulesStoreState, String> {
-        Ok(self.read_state()?.clone())
+        let state = self.read_state()?;
+        let retained_bytes = modeled_rules_state_bytes(&state);
+        let peak_bytes = retained_bytes.saturating_mul(2);
+        self.enforce_limit(
+            RulesLimitSurface::SnapshotStatus,
+            peak_bytes,
+            self.limits.max_snapshot_status_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        let snapshot = state.clone();
+        self.enforce_limit(
+            RulesLimitSurface::SnapshotStatus,
+            retained_bytes.saturating_add(modeled_rules_state_bytes(&snapshot)),
+            self.limits.max_snapshot_status_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(snapshot)
     }
 
     fn apply_groups(&self, groups: Vec<RuleGroupSpec>) -> Result<(), RulesApplyError> {
-        validate_groups(&groups).map_err(RulesApplyError::Rejected)?;
-        let fingerprints =
-            configured_rule_fingerprints(&groups).map_err(RulesApplyError::Rejected)?;
         let mut state = self.write_state().map_err(RulesApplyError::Internal)?;
-        let mut candidate = state.clone();
-        let mut retained = BTreeMap::new();
-        for (rule_id, fingerprint) in fingerprints {
-            if let Some(existing) = candidate.runtime.get(&rule_id) {
-                if existing.fingerprint == fingerprint {
-                    retained.insert(rule_id, existing.clone());
-                    continue;
-                }
+        let old_state_bytes = modeled_rules_state_bytes(&state);
+        let rule_id_scratch_bytes = groups.iter().fold(0usize, |bytes, group| {
+            group.rules.iter().fold(bytes, |bytes, rule| {
+                let rule_id_len = group
+                    .tenant_id
+                    .len()
+                    .saturating_add(group.name.len())
+                    .saturating_add(rule_kind(rule).len())
+                    .saturating_add(rule_name(rule).len())
+                    .saturating_add(3);
+                bytes
+                    .saturating_add(modeled_allocation_bytes(
+                        std::mem::size_of::<String>()
+                            .saturating_add(std::mem::size_of::<usize>().saturating_mul(4)),
+                    ))
+                    .saturating_add(modeled_allocation_bytes(rule_id_len))
+            })
+        });
+        self.enforce_limit(
+            RulesLimitSurface::Replacement,
+            old_state_bytes
+                .saturating_add(modeled_groups_bytes(&groups))
+                .saturating_add(rule_id_scratch_bytes),
+            self.limits.max_replacement_transient_bytes,
+        )
+        .map_err(|error| RulesApplyError::Rejected(error.to_string()))?;
+        if let Err(error) = validate_groups_with_limits(&groups, &self.limits) {
+            if let RulesStoreError::Limit(surface) = error {
+                self.accounting.reject(surface);
             }
-            retained.insert(
-                rule_id,
-                PersistedRuleRuntimeState {
-                    fingerprint,
-                    ..PersistedRuleRuntimeState::default()
-                },
-            );
+            return Err(RulesApplyError::Rejected(error.to_string()));
         }
-        candidate.groups = groups;
-        candidate.runtime = retained;
-        self.persist_state(&candidate)
-            .map_err(RulesApplyError::Persistence)?;
+        let mut candidate_runtime_bytes = 0usize;
+        let mut max_rule_id_scratch_bytes = 0usize;
+        for group in &groups {
+            for rule in &group.rules {
+                let rule_id = rule_id(group, rule);
+                max_rule_id_scratch_bytes =
+                    max_rule_id_scratch_bytes.max(modeled_owned_string_bytes(&rule_id));
+                let fingerprint =
+                    rule_fingerprint(group, rule).map_err(RulesApplyError::Rejected)?;
+                let default;
+                let runtime_state = match state.runtime.get(&rule_id) {
+                    Some(existing) if existing.fingerprint == fingerprint => existing,
+                    _ => {
+                        default = PersistedRuleRuntimeState {
+                            fingerprint,
+                            ..PersistedRuleRuntimeState::default()
+                        };
+                        &default
+                    }
+                };
+                candidate_runtime_bytes = candidate_runtime_bytes
+                    .saturating_add(modeled_runtime_entry_bytes(&rule_id, runtime_state));
+            }
+        }
+        let candidate_state_upper = std::mem::size_of::<PersistedRulesStoreState>()
+            .saturating_add(modeled_groups_bytes(&groups))
+            .saturating_add(candidate_runtime_bytes);
+        self.enforce_limit(
+            RulesLimitSurface::RetainedState,
+            candidate_state_upper,
+            self.limits.max_total_retained_state_bytes,
+        )
+        .map_err(|error| RulesApplyError::Rejected(error.to_string()))?;
+        self.enforce_limit(
+            RulesLimitSurface::Replacement,
+            old_state_bytes
+                .saturating_add(candidate_state_upper)
+                .saturating_add(max_rule_id_scratch_bytes),
+            self.limits.max_replacement_transient_bytes,
+        )
+        .map_err(|error| RulesApplyError::Rejected(error.to_string()))?;
+
+        let mut retained = BTreeMap::new();
+        for group in &groups {
+            for rule in &group.rules {
+                let rule_id = rule_id(group, rule);
+                let fingerprint =
+                    rule_fingerprint(group, rule).map_err(RulesApplyError::Rejected)?;
+                if let Some(existing) = state.runtime.get(&rule_id) {
+                    if existing.fingerprint == fingerprint {
+                        retained.insert(rule_id, existing.clone());
+                        continue;
+                    }
+                }
+                retained.insert(
+                    rule_id,
+                    PersistedRuleRuntimeState {
+                        fingerprint,
+                        ..PersistedRuleRuntimeState::default()
+                    },
+                );
+            }
+        }
+        let candidate = PersistedRulesStoreState {
+            groups,
+            runtime: retained,
+        };
+        let candidate_state_bytes = modeled_rules_state_bytes(&candidate);
+        self.enforce_limit(
+            RulesLimitSurface::RetainedState,
+            candidate_state_bytes,
+            self.limits.max_total_retained_state_bytes,
+        )
+        .map_err(|error| RulesApplyError::Rejected(error.to_string()))?;
+        self.enforce_limit(
+            RulesLimitSurface::Replacement,
+            old_state_bytes.saturating_add(candidate_state_bytes),
+            self.limits.max_replacement_transient_bytes,
+        )
+        .map_err(|error| RulesApplyError::Rejected(error.to_string()))?;
+        let durable_file_bytes = self
+            .persist_serializable_state(
+                &candidate,
+                RulesLimitSurface::Replacement,
+                old_state_bytes.saturating_add(candidate_state_bytes),
+            )
+            .map_err(|error| match error {
+                RulesStoreError::Persistence(source) => RulesApplyError::Persistence(source),
+                other => RulesApplyError::Rejected(other.to_string()),
+            })?;
         *state = candidate;
+        self.accounting
+            .publish_state(candidate_state_bytes, durable_file_bytes);
         Ok(())
     }
 
     fn apply_runtime_updates(
         &self,
         updates: Vec<(String, PersistedRuleRuntimeState)>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, RulesStoreError> {
         if updates.is_empty() {
             return Ok(0);
         }
-        let mut state = self.write_state()?;
-        let configured = configured_rule_fingerprints(&state.groups)?;
-        let mut candidate = state.clone();
-        let mut applied = 0usize;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| RulesStoreError::Internal("rules store write lock poisoned"))?;
+        let current_state_bytes = modeled_rules_state_bytes(&state);
+        let update_input_bytes = modeled_owned_vec_bytes(&updates).saturating_add(
+            updates.iter().fold(0usize, |bytes, (rule_id, runtime)| {
+                bytes
+                    .saturating_add(modeled_owned_string_bytes(rule_id))
+                    .saturating_add(modeled_runtime_state_heap_bytes(runtime))
+            }),
+        );
+        let accepted_node_upper = modeled_runtime_map_node_bytes().saturating_mul(updates.len());
+        self.enforce_limit(
+            RulesLimitSurface::RuntimeUpdate,
+            current_state_bytes
+                .saturating_add(update_input_bytes)
+                .saturating_add(accepted_node_upper),
+            self.limits.max_runtime_update_transient_bytes,
+        )?;
+        let mut accepted = BTreeMap::new();
         for (rule_id, runtime_state) in updates {
-            let Some(expected_fingerprint) = configured.get(&rule_id).copied() else {
+            let Some(existing) = state.runtime.get(&rule_id) else {
                 continue;
             };
-            if expected_fingerprint != runtime_state.fingerprint {
+            if existing.fingerprint != runtime_state.fingerprint {
                 continue;
             }
-            candidate.runtime.insert(rule_id, runtime_state);
-            applied = applied.saturating_add(1);
+            validate_runtime_state_with_limits(&runtime_state, &self.limits).map_err(|error| {
+                if let RulesStoreError::Limit(surface) = error {
+                    self.accounting.reject(surface);
+                }
+                error
+            })?;
+            accepted.insert(rule_id, runtime_state);
         }
-        if applied > 0 {
-            self.persist_state(&candidate)
-                .map_err(|err| format!("rules state persistence failed: {err}"))?;
-            *state = candidate;
+        if accepted.is_empty() {
+            return Ok(0);
         }
+        let accepted_bytes = accepted.iter().fold(0usize, |bytes, (rule_id, runtime)| {
+            bytes.saturating_add(modeled_runtime_entry_bytes(rule_id, runtime))
+        });
+        let final_state_bytes = modeled_rules_state_bytes_with_runtime_overlay(&state, &accepted);
+        self.enforce_limit(
+            RulesLimitSurface::RuntimeUpdate,
+            final_state_bytes,
+            self.limits.max_total_retained_state_bytes,
+        )?;
+        let update_peak = current_state_bytes
+            .saturating_add(accepted_bytes)
+            .saturating_add(
+                modeled_vec_len_bytes::<(String, PersistedRuleRuntimeState)>(accepted.len()),
+            );
+        self.enforce_limit(
+            RulesLimitSurface::RuntimeUpdate,
+            update_peak,
+            self.limits.max_runtime_update_transient_bytes,
+        )?;
+        let overlay = PersistedRulesStateOverlay {
+            groups: &state.groups,
+            runtime: RuntimeStateOverlay {
+                current: &state.runtime,
+                replacements: &accepted,
+            },
+        };
+        let durable_file_bytes = self.persist_serializable_state(
+            &overlay,
+            RulesLimitSurface::RuntimeUpdate,
+            update_peak,
+        )?;
+        let applied = accepted.len();
+        for (rule_id, runtime_state) in accepted {
+            if let Some(existing) = state.runtime.get_mut(&rule_id) {
+                *existing = runtime_state;
+            }
+        }
+        self.accounting
+            .publish_state(final_state_bytes, durable_file_bytes);
         Ok(applied)
     }
 
@@ -444,22 +1061,100 @@ impl RulesStore {
             .map_err(|_| "rules store write lock poisoned".to_string())
     }
 
-    fn persist_state(&self, state: &PersistedRulesStoreState) -> tsink::Result<()> {
+    fn persist_serializable_state<S: Serialize>(
+        &self,
+        state: &S,
+        transient_surface: RulesLimitSurface,
+        resident_transient_bytes: usize,
+    ) -> Result<Option<usize>, RulesStoreError> {
         let Some(path) = self.path.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
-        write_rules_store_state(path, state, self.local_disk_budget.as_ref())
+        let encoded_len = measure_rules_store_state(state)?;
+        self.enforce_limit_for_operation(
+            RulesLimitSurface::DurableFile,
+            transient_surface,
+            encoded_len,
+            self.limits.max_durable_file_bytes,
+        )?;
+        self.enforce_limit(
+            transient_surface,
+            resident_transient_bytes.saturating_add(modeled_allocation_bytes(encoded_len)),
+            match transient_surface {
+                RulesLimitSurface::Replacement => self.limits.max_replacement_transient_bytes,
+                RulesLimitSurface::RuntimeUpdate => self.limits.max_runtime_update_transient_bytes,
+                RulesLimitSurface::SnapshotStatus => self.limits.max_snapshot_status_bytes,
+                _ => self.limits.max_replacement_transient_bytes,
+            },
+        )?;
+        let encoded = encode_rules_store_state_exact(state, encoded_len)?;
+        self.enforce_limit(
+            transient_surface,
+            resident_transient_bytes.saturating_add(modeled_owned_vec_bytes(&encoded)),
+            match transient_surface {
+                RulesLimitSurface::Replacement => self.limits.max_replacement_transient_bytes,
+                RulesLimitSurface::RuntimeUpdate => self.limits.max_runtime_update_transient_bytes,
+                RulesLimitSurface::SnapshotStatus => self.limits.max_snapshot_status_bytes,
+                _ => self.limits.max_replacement_transient_bytes,
+            },
+        )?;
+        let result =
+            write_encoded_rules_store_state(path, &encoded, self.local_disk_budget.as_ref());
+        if let Err(error) = result {
+            self.accounting.persistence_failure();
+            return Err(RulesStoreError::Persistence(error));
+        }
+        Ok(Some(encoded_len))
     }
 
     fn snapshot_into(&self, snapshot_path: &Path) -> Result<(), String> {
         let snapshot_file = snapshot_path.join(RULES_STORE_FILE_NAME);
         let state = self.read_state()?;
-        write_rules_store_state(&snapshot_file, &state, None).map_err(|err| {
-            format!(
-                "failed to write rules snapshot {}: {err}",
-                snapshot_file.display()
-            )
+        let state_bytes = modeled_rules_state_bytes(&state);
+        let encoded_len = measure_rules_store_state(&*state).map_err(|error| error.to_string())?;
+        self.enforce_limit_for_operation(
+            RulesLimitSurface::DurableFile,
+            RulesLimitSurface::SnapshotFile,
+            encoded_len,
+            self.limits.max_durable_file_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        self.accounting.observe_snapshot_file_peak(
+            state_bytes.saturating_add(modeled_allocation_bytes(encoded_len)),
+        );
+        let encoded = encode_rules_store_state_exact(&*state, encoded_len)
+            .map_err(|error| error.to_string())?;
+        self.accounting.observe_snapshot_file_peak(
+            state_bytes.saturating_add(modeled_owned_vec_bytes(&encoded)),
+        );
+        write_encoded_rules_store_state(&snapshot_file, &encoded, None).map_err(|_| {
+            self.accounting.persistence_failure();
+            "failed to write rules snapshot".to_string()
         })
+    }
+
+    fn enforce_limit(
+        &self,
+        surface: RulesLimitSurface,
+        observed: usize,
+        limit: usize,
+    ) -> Result<(), RulesStoreError> {
+        self.enforce_limit_for_operation(surface, surface, observed, limit)
+    }
+
+    fn enforce_limit_for_operation(
+        &self,
+        limit_surface: RulesLimitSurface,
+        operation_surface: RulesLimitSurface,
+        observed: usize,
+        limit: usize,
+    ) -> Result<(), RulesStoreError> {
+        self.accounting.observe_peak(operation_surface, observed);
+        if observed > limit {
+            self.accounting.reject(operation_surface);
+            return Err(RulesStoreError::Limit(limit_surface));
+        }
+        Ok(())
     }
 }
 
@@ -523,6 +1218,20 @@ pub struct RulesMetricsSnapshot {
     pub pending_alerts: u64,
     pub firing_alerts: u64,
     pub local_scheduler_active: bool,
+    pub retained_state_bytes: u64,
+    pub peak_retained_state_bytes: u64,
+    pub durable_file_bytes: u64,
+    pub peak_startup_transient_bytes: u64,
+    pub peak_replacement_transient_bytes: u64,
+    pub peak_runtime_update_transient_bytes: u64,
+    pub peak_snapshot_status_bytes: u64,
+    pub peak_snapshot_file_bytes: u64,
+    pub limit_rejections_total: u64,
+    pub startup_rejections_total: u64,
+    pub replacement_rejections_total: u64,
+    pub runtime_update_rejections_total: u64,
+    pub snapshot_rejections_total: u64,
+    pub persistence_failures_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,6 +1240,7 @@ pub struct RulesStatusSnapshot {
     pub scheduler_tick_ms: u64,
     pub max_recording_rows_per_eval: usize,
     pub max_alert_instances_per_rule: usize,
+    pub store_limits: RulesStoreLimits,
     pub cluster_enabled: bool,
     pub cluster_leader: bool,
     pub metrics: RulesMetricsSnapshot,
@@ -538,7 +1248,13 @@ pub struct RulesStatusSnapshot {
     pub groups: Vec<RuleGroupStatusSnapshot>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Serialize)]
+struct RulesSuccessEnvelope<'a> {
+    status: &'static str,
+    data: &'a RulesStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
 struct RulesRuntimeMetrics {
     scheduler_runs_total: u64,
     scheduler_skipped_not_leader_total: u64,
@@ -649,16 +1365,38 @@ impl RulesRuntime {
         usage_accounting: Option<Arc<UsageAccounting>>,
         local_disk_budget: Option<Arc<LocalDiskBudget>>,
     ) -> Result<Arc<Self>, String> {
+        Self::open_with_config(
+            data_path,
+            storage,
+            precision,
+            cluster_context,
+            usage_accounting,
+            local_disk_budget,
+            RulesRuntimeConfig::from_env()?,
+        )
+    }
+
+    pub fn open_with_config(
+        data_path: Option<&Path>,
+        storage: Arc<dyn Storage>,
+        precision: TimestampPrecision,
+        cluster_context: Option<Arc<ClusterRequestContext>>,
+        usage_accounting: Option<Arc<UsageAccounting>>,
+        local_disk_budget: Option<Arc<LocalDiskBudget>>,
+        config: RulesRuntimeConfig,
+    ) -> Result<Arc<Self>, String> {
+        let config = config.validate()?;
         Ok(Arc::new(Self {
-            store: Arc::new(RulesStore::open_with_disk_budget(
+            store: Arc::new(RulesStore::open_with_limits(
                 data_path,
                 local_disk_budget,
+                config.store_limits,
             )?),
             storage,
             precision,
             cluster_context,
             usage_accounting,
-            config: RulesRuntimeConfig::from_env()?,
+            config,
             metrics: Arc::new(Mutex::new(RulesRuntimeMetrics::default())),
             run_inflight: Arc::new(Mutex::new(false)),
         }))
@@ -683,12 +1421,25 @@ impl RulesRuntime {
         self.snapshot().map_err(RulesApplyError::Internal)
     }
 
+    /// Returns a bounded, caller-owned status snapshot.
+    ///
+    /// The returned allocations are no longer store-owned after this method returns; callers
+    /// that serialize or retain multiple snapshots must enforce their own aggregate envelope.
     pub fn snapshot(&self) -> Result<RulesStatusSnapshot, String> {
-        let store = self.store.snapshot()?;
         let metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let store = self.store.read_state()?;
+        let output_upper = modeled_rules_status_output_upper_bytes(&store, &metrics);
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                output_upper,
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|error| error.to_string())?;
         let cluster_leader = self.scheduler_enabled_here();
         let pending_alerts = store
             .runtime
@@ -713,11 +1464,13 @@ impl RulesRuntime {
             .iter()
             .map(|group| build_group_snapshot(group, &store.runtime))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(RulesStatusSnapshot {
+        let store_accounting = self.store.accounting.snapshot();
+        let mut snapshot = RulesStatusSnapshot {
             scheduler_tick_ms: u64::try_from(self.config.scheduler_tick.as_millis())
                 .unwrap_or(u64::MAX),
             max_recording_rows_per_eval: self.config.max_recording_rows_per_eval,
             max_alert_instances_per_rule: self.config.max_alert_instances_per_rule,
+            store_limits: self.config.store_limits,
             cluster_enabled: self.cluster_context.is_some(),
             cluster_leader,
             metrics: RulesMetricsSnapshot {
@@ -734,9 +1487,91 @@ impl RulesRuntime {
                 pending_alerts,
                 firing_alerts,
                 local_scheduler_active: cluster_leader,
+                retained_state_bytes: store_accounting.retained_state_bytes,
+                peak_retained_state_bytes: store_accounting.peak_retained_state_bytes,
+                durable_file_bytes: store_accounting.durable_file_bytes,
+                peak_startup_transient_bytes: store_accounting.peak_startup_transient_bytes,
+                peak_replacement_transient_bytes: store_accounting.peak_replacement_transient_bytes,
+                peak_runtime_update_transient_bytes: store_accounting
+                    .peak_runtime_update_transient_bytes,
+                peak_snapshot_status_bytes: store_accounting.peak_snapshot_status_bytes,
+                peak_snapshot_file_bytes: store_accounting.peak_snapshot_file_bytes,
+                limit_rejections_total: store_accounting.limit_rejections_total,
+                startup_rejections_total: store_accounting.startup_rejections_total,
+                replacement_rejections_total: store_accounting.replacement_rejections_total,
+                runtime_update_rejections_total: store_accounting.runtime_update_rejections_total,
+                snapshot_rejections_total: store_accounting.snapshot_rejections_total,
+                persistence_failures_total: store_accounting.persistence_failures_total,
             },
             groups: group_snapshots,
-        })
+        };
+        let actual_output_bytes = modeled_rules_status_actual_bytes(&snapshot);
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                actual_output_bytes,
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|error| error.to_string())?;
+        let latest_accounting = self.store.accounting.snapshot();
+        snapshot.metrics.peak_snapshot_status_bytes = latest_accounting.peak_snapshot_status_bytes;
+        snapshot.metrics.snapshot_rejections_total = latest_accounting.snapshot_rejections_total;
+        snapshot.metrics.limit_rejections_total = latest_accounting.limit_rejections_total;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn encode_success_snapshot(
+        &self,
+        snapshot: &mut RulesStatusSnapshot,
+    ) -> Result<Vec<u8>, String> {
+        // The peak is itself present in the response. Re-measure until updating that fixed-width
+        // scalar no longer changes the encoded length at a decimal boundary.
+        for _ in 0..8 {
+            let accounting = self.store.accounting.snapshot();
+            snapshot.metrics.peak_snapshot_status_bytes = accounting.peak_snapshot_status_bytes;
+            snapshot.metrics.snapshot_rejections_total = accounting.snapshot_rejections_total;
+            snapshot.metrics.limit_rejections_total = accounting.limit_rejections_total;
+
+            let snapshot_bytes = modeled_rules_status_actual_bytes(snapshot);
+            let envelope = RulesSuccessEnvelope {
+                status: "success",
+                data: snapshot,
+            };
+            let encoded_len = measure_json_value(&envelope).map_err(|error| error.to_string())?;
+            if encoded_len > crate::http::MAX_BODY_BYTES {
+                self.store
+                    .accounting
+                    .reject(RulesLimitSurface::SnapshotStatus);
+                return Err(RulesLimitSurface::SnapshotStatus.message().to_string());
+            }
+            self.store
+                .enforce_limit(
+                    RulesLimitSurface::SnapshotStatus,
+                    snapshot_bytes.saturating_add(modeled_vec_clone_upper_bytes::<u8>(encoded_len)),
+                    self.config.store_limits.max_snapshot_status_bytes,
+                )
+                .map_err(|error| error.to_string())?;
+            if self.store.accounting.snapshot().peak_snapshot_status_bytes
+                == snapshot.metrics.peak_snapshot_status_bytes
+            {
+                let encoded = encode_json_value_exact(&envelope, encoded_len)
+                    .map_err(|error| error.to_string())?;
+                self.store
+                    .enforce_limit(
+                        RulesLimitSurface::SnapshotStatus,
+                        snapshot_bytes.saturating_add(modeled_owned_vec_bytes(&encoded)),
+                        self.config.store_limits.max_snapshot_status_bytes,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if self.store.accounting.snapshot().peak_snapshot_status_bytes
+                    != snapshot.metrics.peak_snapshot_status_bytes
+                {
+                    continue;
+                }
+                return Ok(encoded);
+            }
+        }
+        Err("rules snapshot/status accounting did not stabilize".to_string())
     }
 
     pub fn snapshot_into(&self, snapshot_path: &Path) -> Result<(), String> {
@@ -787,12 +1622,12 @@ impl RulesRuntime {
 
         let snapshot = match self.store.snapshot() {
             Ok(snapshot) => snapshot,
-            Err(err) => {
+            Err(_err) => {
                 let mut metrics = self
                     .metrics
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                metrics.last_error = Some(format!("rules snapshot failed: {err}"));
+                metrics.last_error = Some("rules state snapshot failed".to_string());
                 return;
             }
         };
@@ -808,9 +1643,9 @@ impl RulesRuntime {
                 let rule_id = rule_id(group, rule);
                 let fingerprint = match rule_fingerprint(group, rule) {
                     Ok(fingerprint) => fingerprint,
-                    Err(err) => {
+                    Err(_err) => {
                         evaluation_failures = evaluation_failures.saturating_add(1);
-                        last_error = Some(err);
+                        last_error = Some("rules fingerprint calculation failed".to_string());
                         continue;
                     }
                 };
@@ -851,16 +1686,14 @@ impl RulesRuntime {
                         Ok(1) => attempt,
                         Ok(_) => {
                             evaluation_failures = evaluation_failures.saturating_add(1);
-                            last_error = Some(format!(
-                                "recording rule attempt checkpoint skipped for '{rule_id}' because its configuration changed"
-                            ));
+                            last_error =
+                                Some("recording rule attempt checkpoint was skipped".to_string());
                             continue;
                         }
-                        Err(err) => {
+                        Err(_err) => {
                             evaluation_failures = evaluation_failures.saturating_add(1);
-                            last_error = Some(format!(
-                                "recording rule attempt checkpoint failed for '{rule_id}': {err}"
-                            ));
+                            last_error =
+                                Some("recording rule attempt checkpoint failed".to_string());
                             continue;
                         }
                     }
@@ -940,9 +1773,9 @@ impl RulesRuntime {
             }
         }
 
-        if let Err(err) = self.store.apply_runtime_updates(updates) {
+        if let Err(_err) = self.store.apply_runtime_updates(updates) {
             evaluation_failures = evaluation_failures.saturating_add(1);
-            last_error = Some(format!("rules state persist failed: {err}"));
+            last_error = Some("rules state persist failed".to_string());
         }
 
         let mut metrics = self
@@ -969,19 +1802,21 @@ impl RulesRuntime {
         previous: PersistedRuleRuntimeState,
     ) -> Result<PersistedRuleRuntimeState, String> {
         let read_admission = admission::global_public_read_admission()
-            .map_err(|err| format!("read admission unavailable: {err}"))?;
+            .map_err(|_| "rules read admission is unavailable".to_string())?;
         let _read_lease = read_admission
             .admit_request(1)
             .await
             .map_err(format_read_admission_error)?;
-        let read_storage = self.promql_storage_for_tenant(&group.tenant_id)?;
+        let read_storage = self
+            .promql_storage_for_tenant(&group.tenant_id)
+            .map_err(|_| "rules query backend is unavailable".to_string())?;
         let engine = Engine::with_precision(read_storage, self.precision);
         let expr = rule_expr(rule).to_string();
         let value =
             tokio::task::spawn_blocking(move || engine.instant_query(&expr, eval_timestamp))
                 .await
-                .map_err(|err| format!("rule query task failed: {err}"))?
-                .map_err(|err| err.to_string())?;
+                .map_err(|_| "rules query task failed".to_string())?
+                .map_err(|_| "rules query evaluation failed".to_string())?;
 
         match rule {
             RuleSpec::Recording(spec) => {
@@ -1001,19 +1836,24 @@ impl RulesRuntime {
         eval_timestamp: i64,
         value: PromqlValue,
     ) -> Result<PersistedRuleRuntimeState, String> {
+        let result_count = match &value {
+            PromqlValue::Scalar(_, _) => 1,
+            PromqlValue::InstantVector(samples) => samples.len(),
+            PromqlValue::RangeVector(_) | PromqlValue::String(_, _) => 0,
+        };
+        if result_count > self.config.max_recording_rows_per_eval {
+            return Err("recording rule result exceeds its finite row limit".to_string());
+        }
         let rows = recording_rows_from_value(group, spec, eval_timestamp, value)?;
         let scoped_rows = tenant::scope_rows_for_tenant(rows, &group.tenant_id)?;
         let rows_len = scoped_rows.len();
         if rows_len > self.config.max_recording_rows_per_eval {
-            return Err(format!(
-                "recording rule '{}' produced {} rows which exceeds the configured limit {}",
-                spec.record, rows_len, self.config.max_recording_rows_per_eval
-            ));
+            return Err("recording rule result exceeds its finite row limit".to_string());
         }
 
         if rows_len > 0 {
             let write_admission = admission::global_public_write_admission()
-                .map_err(|err| format!("write admission unavailable: {err}"))?;
+                .map_err(|_| "rules write admission is unavailable".to_string())?;
             let request_slot = write_admission
                 .acquire_request_slot()
                 .await
@@ -1034,13 +1874,13 @@ impl RulesRuntime {
                         ring_version,
                     )
                     .await
-                    .map_err(|err| err.to_string())?;
+                    .map_err(|_| "recording rule distributed write failed".to_string())?;
             } else {
                 let storage = Arc::clone(&self.storage);
                 tokio::task::spawn_blocking(move || storage.insert_rows(&scoped_rows))
                     .await
-                    .map_err(|err| format!("recording rule write task failed: {err}"))?
-                    .map_err(|err| format!("recording rule write failed: {err}"))?;
+                    .map_err(|_| "recording rule write task failed".to_string())?
+                    .map_err(|_| "recording rule write failed".to_string())?;
             }
         }
 
@@ -1068,30 +1908,50 @@ impl RulesRuntime {
     ) -> Result<PersistedRuleRuntimeState, String> {
         let samples = alert_samples_from_value(value)?;
         if samples.len() > self.config.max_alert_instances_per_rule {
-            return Err(format!(
-                "alert rule '{}' produced {} active alerts which exceeds the configured limit {}",
-                spec.alert,
-                samples.len(),
-                self.config.max_alert_instances_per_rule
-            ));
+            return Err("alert rule result exceeds its finite instance limit".to_string());
         }
-
-        let previous_instances = previous
+        let limits = self.config.store_limits;
+        let mut projected_runtime_bytes =
+            modeled_vec_clone_upper_bytes::<AlertInstanceState>(samples.len());
+        for sample in &samples {
+            projected_runtime_bytes = projected_runtime_bytes.saturating_add(
+                preflight_alert_sample_state_bytes(group, spec, sample, &limits)?,
+            );
+        }
+        let previous_runtime_bytes = modeled_runtime_state_heap_bytes(&previous);
+        let previous_key_scratch_bytes = previous
             .alert_instances
-            .into_iter()
-            .map(|instance| {
-                (
-                    alert_instance_key(&instance.source_metric, &instance.labels),
-                    instance,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+            .iter()
+            .map(modeled_alert_key_recompute_scratch_bytes)
+            .max()
+            .unwrap_or(0);
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::RuntimeUpdate,
+                previous_runtime_bytes
+                    .saturating_add(projected_runtime_bytes)
+                    .saturating_add(previous_key_scratch_bytes),
+                limits.max_runtime_update_transient_bytes,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut previous_instances = previous.alert_instances;
+        for instance in &mut previous_instances {
+            instance.key = alert_instance_key(&instance.source_metric, &instance.labels);
+        }
+        previous_instances.sort_unstable_by(|left, right| left.key.cmp(&right.key));
         let for_units = duration_units(spec.for_secs, self.precision);
-        let mut instances = Vec::with_capacity(samples.len());
+        let mut instances = Vec::new();
+        instances
+            .try_reserve_exact(samples.len())
+            .map_err(|_| "failed to allocate bounded alert runtime state".to_string())?;
         for sample in samples {
             let (labels, sample_type, sample_value) = alert_instance_fields(group, spec, &sample)?;
             let key = alert_instance_key(&sample.metric, &labels);
-            let previous = previous_instances.get(&key);
+            let previous = previous_instances
+                .binary_search_by(|instance| instance.key.cmp(&key))
+                .ok()
+                .map(|index| &previous_instances[index]);
             let active_since = previous
                 .map(|instance| instance.active_since_timestamp)
                 .unwrap_or(eval_timestamp);
@@ -1119,7 +1979,7 @@ impl RulesRuntime {
                 sample_value,
             });
         }
-        instances.sort_by(|left, right| left.key.cmp(&right.key));
+        instances.sort_unstable_by(|left, right| left.key.cmp(&right.key));
 
         Ok(PersistedRuleRuntimeState {
             fingerprint: 0,
@@ -1165,6 +2025,170 @@ impl RulesRuntime {
             Ok(tenant::scoped_storage(Arc::clone(&self.storage), tenant_id))
         }
     }
+}
+
+fn clone_vec_capacity_upper(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if len <= 4 {
+        4
+    } else {
+        len.checked_next_power_of_two().unwrap_or(usize::MAX)
+    }
+}
+
+fn modeled_vec_clone_upper_bytes<T>(len: usize) -> usize {
+    modeled_allocation_bytes(clone_vec_capacity_upper(len).saturating_mul(std::mem::size_of::<T>()))
+}
+
+fn modeled_string_clone_upper_bytes(value: &str) -> usize {
+    modeled_allocation_bytes(value.len())
+}
+
+fn modeled_string_map_clone_upper_bytes(values: &BTreeMap<String, String>) -> usize {
+    let node_inline = std::mem::size_of::<String>()
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(4));
+    values.iter().fold(0usize, |bytes, (name, value)| {
+        bytes
+            .saturating_add(modeled_allocation_bytes(node_inline))
+            .saturating_add(modeled_string_clone_upper_bytes(name))
+            .saturating_add(modeled_string_clone_upper_bytes(value))
+    })
+}
+
+fn modeled_labels_clone_upper_bytes(labels: &[Label]) -> usize {
+    modeled_vec_clone_upper_bytes::<Label>(labels.len()).saturating_add(labels.iter().fold(
+        0usize,
+        |bytes, label| {
+            bytes
+                .saturating_add(modeled_string_clone_upper_bytes(&label.name))
+                .saturating_add(modeled_string_clone_upper_bytes(&label.value))
+        },
+    ))
+}
+
+fn modeled_alert_instance_clone_upper_bytes(instance: &AlertInstanceState) -> usize {
+    modeled_string_clone_upper_bytes(&instance.key)
+        .saturating_add(modeled_string_clone_upper_bytes(&instance.source_metric))
+        .saturating_add(modeled_labels_clone_upper_bytes(&instance.labels))
+        .saturating_add(modeled_string_clone_upper_bytes(&instance.sample_type))
+        .saturating_add(
+            instance
+                .sample_value
+                .as_deref()
+                .map(modeled_string_clone_upper_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_rules_status_output_upper_bytes(
+    state: &PersistedRulesStoreState,
+    metrics: &RulesRuntimeMetrics,
+) -> usize {
+    let mut bytes = std::mem::size_of::<RulesStatusSnapshot>()
+        .saturating_add(modeled_vec_clone_upper_bytes::<RuleGroupStatusSnapshot>(
+            state.groups.len(),
+        ))
+        .saturating_add(
+            metrics
+                .last_error
+                .as_deref()
+                .map(modeled_string_clone_upper_bytes)
+                .unwrap_or(0),
+        );
+    for group in &state.groups {
+        bytes = bytes
+            .saturating_add(modeled_string_clone_upper_bytes(&group.name))
+            .saturating_add(modeled_string_clone_upper_bytes(&group.tenant_id))
+            .saturating_add(modeled_string_map_clone_upper_bytes(&group.labels))
+            .saturating_add(modeled_vec_clone_upper_bytes::<RuleStatusSnapshot>(
+                group.rules.len(),
+            ));
+        for rule in &group.rules {
+            let rule_id_len = group
+                .tenant_id
+                .len()
+                .saturating_add(group.name.len())
+                .saturating_add(rule_kind(rule).len())
+                .saturating_add(rule_name(rule).len())
+                .saturating_add(3);
+            bytes = bytes
+                .saturating_add(modeled_allocation_bytes(rule_id_len))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_name(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_kind(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_expr(rule)))
+                .saturating_add(modeled_string_map_clone_upper_bytes(rule_labels(rule)))
+                .saturating_add(modeled_string_map_clone_upper_bytes(rule_annotations(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes("inactive"));
+        }
+    }
+    for runtime in state.runtime.values() {
+        bytes = bytes
+            .saturating_add(
+                runtime
+                    .last_error
+                    .as_deref()
+                    .map(modeled_string_clone_upper_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(modeled_vec_clone_upper_bytes::<AlertInstanceState>(
+                runtime.alert_instances.len(),
+            ))
+            .saturating_add(
+                runtime
+                    .alert_instances
+                    .iter()
+                    .fold(0usize, |bytes, instance| {
+                        bytes.saturating_add(modeled_alert_instance_clone_upper_bytes(instance))
+                    }),
+            );
+    }
+    bytes
+}
+
+fn modeled_rule_status_actual_bytes(rule: &RuleStatusSnapshot) -> usize {
+    std::mem::size_of::<RuleStatusSnapshot>()
+        .saturating_add(modeled_owned_string_bytes(&rule.id))
+        .saturating_add(modeled_owned_string_bytes(&rule.name))
+        .saturating_add(modeled_owned_string_bytes(&rule.kind))
+        .saturating_add(modeled_owned_string_bytes(&rule.expr))
+        .saturating_add(modeled_string_map_bytes(&rule.labels))
+        .saturating_add(modeled_string_map_bytes(&rule.annotations))
+        .saturating_add(
+            rule.last_error
+                .as_ref()
+                .map(modeled_owned_string_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_owned_string_bytes(&rule.state))
+        .saturating_add(modeled_owned_vec_bytes(&rule.alert_instances))
+        .saturating_add(rule.alert_instances.iter().fold(0usize, |bytes, instance| {
+            bytes.saturating_add(modeled_alert_instance_heap_bytes(instance))
+        }))
+}
+
+fn modeled_rules_status_actual_bytes(snapshot: &RulesStatusSnapshot) -> usize {
+    std::mem::size_of::<RulesStatusSnapshot>()
+        .saturating_add(
+            snapshot
+                .metrics
+                .last_error
+                .as_ref()
+                .map(modeled_owned_string_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_owned_vec_bytes(&snapshot.groups))
+        .saturating_add(snapshot.groups.iter().fold(0usize, |bytes, group| {
+            bytes
+                .saturating_add(modeled_owned_string_bytes(&group.name))
+                .saturating_add(modeled_owned_string_bytes(&group.tenant_id))
+                .saturating_add(modeled_string_map_bytes(&group.labels))
+                .saturating_add(modeled_owned_vec_bytes(&group.rules))
+                .saturating_add(group.rules.iter().fold(0usize, |bytes, rule| {
+                    bytes.saturating_add(modeled_rule_status_actual_bytes(rule))
+                }))
+        }))
 }
 
 fn build_group_snapshot(
@@ -1259,164 +2283,264 @@ fn recording_rule_attempt_state(
     previous
 }
 
-fn validate_groups(groups: &[RuleGroupSpec]) -> Result<(), String> {
-    let mut seen_rule_ids = BTreeSet::new();
+fn validate_label_set_limits(
+    labels: &BTreeMap<String, String>,
+    limits: &RulesStoreLimits,
+    annotations: bool,
+) -> Result<(), RulesStoreError> {
+    if labels.len() > limits.max_labels_per_set {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
+    }
+    let mut cumulative_bytes = 0usize;
+    for (name, value) in labels {
+        if name.is_empty()
+            || name.len() > limits.max_name_bytes
+            || name.len() > MAX_LABEL_NAME_LEN
+            || (!annotations && (name == tenant::TENANT_LABEL || name == "__name__"))
+        {
+            return Err(RulesStoreError::Invalid(
+                "rules contain an invalid label name",
+            ));
+        }
+        if value.is_empty() || value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(RulesStoreError::Invalid(
+                "rules contain an invalid label value",
+            ));
+        }
+        cumulative_bytes = cumulative_bytes
+            .saturating_add(name.len())
+            .saturating_add(value.len());
+    }
+    let limit = if annotations {
+        limits.max_annotation_bytes
+    } else {
+        limits.max_label_set_bytes
+    };
+    if cumulative_bytes > limit {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
+    }
+    Ok(())
+}
+
+fn validate_groups_with_limits(
+    groups: &Vec<RuleGroupSpec>,
+    limits: &RulesStoreLimits,
+) -> Result<(), RulesStoreError> {
+    if groups.len() > limits.max_groups {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
+    }
+    let mut rules_total = 0usize;
     for group in groups {
-        if group.name.trim().is_empty() {
-            return Err("rule group name must not be empty".to_string());
+        if group.name.is_empty() || group.tenant_id.is_empty() || group.interval_secs == 0 {
+            return Err(RulesStoreError::Invalid("rules contain an invalid group"));
         }
-        if group.interval_secs == 0 {
-            return Err(format!(
-                "rule group '{}' interval must be greater than zero",
-                group.name
-            ));
+        if group.name.len() > limits.max_name_bytes || group.tenant_id.len() > limits.max_name_bytes
+        {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
         }
-        tenant::scope_rows_for_tenant(Vec::new(), &group.tenant_id)?;
-        validate_rule_label_map(
-            &group.labels,
-            &format!("rule group '{}' labels", group.name),
-            true,
-        )?;
+        tenant::scope_rows_for_tenant(Vec::new(), &group.tenant_id)
+            .map_err(|_| RulesStoreError::Invalid("rules contain an invalid tenant identifier"))?;
         if group.rules.is_empty() {
-            return Err(format!(
-                "rule group '{}' must contain at least one rule",
-                group.name
-            ));
+            return Err(RulesStoreError::Invalid("rules groups must not be empty"));
         }
+        if group.rules.len() > limits.max_rules_per_group {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
+        }
+        rules_total = rules_total.saturating_add(group.rules.len());
+        if rules_total > limits.max_rules_total {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
+        }
+        validate_label_set_limits(&group.labels, limits, false)?;
         for rule in &group.rules {
-            let rule_id = rule_id(group, rule);
-            if !seen_rule_ids.insert(rule_id.clone()) {
-                return Err(format!("duplicate rule identifier '{rule_id}'"));
+            let name = rule_name(rule);
+            let expression = rule_expr(rule);
+            if name.is_empty()
+                || name.len() > limits.max_name_bytes
+                || expression.is_empty()
+                || expression.len() > limits.max_expression_bytes
+            {
+                return Err(RulesStoreError::Limit(RulesLimitSurface::Configuration));
             }
-            let context = format!("rule group '{}' rule '{}'", group.name, rule_name(rule));
+            if expression.trim().is_empty() {
+                return Err(RulesStoreError::Invalid(
+                    "rules contain an empty expression",
+                ));
+            }
             match rule {
                 RuleSpec::Recording(spec) => {
-                    validate_metric_name(&spec.record, &format!("{context} record name"))?;
-                    validate_expr(&spec.expr, &format!("{context} expr"))?;
-                    if spec.interval_secs == Some(0) {
-                        return Err(format!("{context} interval must be greater than zero"));
+                    if spec.record.len() > MAX_METRIC_NAME_LEN || spec.interval_secs == Some(0) {
+                        return Err(RulesStoreError::Invalid(
+                            "rules contain an invalid recording rule",
+                        ));
                     }
-                    validate_rule_label_map(&spec.labels, &format!("{context} labels"), true)?;
+                    validate_label_set_limits(&spec.labels, limits, false)?;
                 }
                 RuleSpec::Alert(spec) => {
-                    validate_label_value(&spec.alert, &format!("{context} alert name"))?;
-                    validate_expr(&spec.expr, &format!("{context} expr"))?;
-                    if spec.interval_secs == Some(0) {
-                        return Err(format!("{context} interval must be greater than zero"));
+                    if spec.alert.len() > MAX_LABEL_VALUE_LEN || spec.interval_secs == Some(0) {
+                        return Err(RulesStoreError::Invalid(
+                            "rules contain an invalid alert rule",
+                        ));
                     }
-                    validate_rule_label_map(&spec.labels, &format!("{context} labels"), true)?;
-                    validate_rule_label_map(
-                        &spec.annotations,
-                        &format!("{context} annotations"),
-                        false,
-                    )?;
+                    validate_label_set_limits(&spec.labels, limits, false)?;
+                    validate_label_set_limits(&spec.annotations, limits, true)?;
                 }
+            }
+        }
+    }
+
+    let mut seen_rule_ids = BTreeSet::new();
+    for group in groups {
+        for rule in &group.rules {
+            if tsink::promql::parse(rule_expr(rule)).is_err() {
+                return Err(RulesStoreError::Invalid(
+                    "rules contain an invalid expression",
+                ));
+            }
+            if !seen_rule_ids.insert(rule_id(group, rule)) {
+                return Err(RulesStoreError::Invalid(
+                    "rules contain a duplicate rule identifier",
+                ));
             }
         }
     }
     Ok(())
 }
 
-fn validate_expr(expr: &str, context: &str) -> Result<(), String> {
-    if expr.trim().is_empty() {
-        return Err(format!("{context} must not be empty"));
+fn validate_runtime_state_with_limits(
+    runtime: &PersistedRuleRuntimeState,
+    limits: &RulesStoreLimits,
+) -> Result<(), RulesStoreError> {
+    if runtime
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.len() > RULES_MAX_DIAGNOSTIC_BYTES)
+    {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::RuntimeUpdate));
     }
-    tsink::promql::parse(expr)
-        .map(|_| ())
-        .map_err(|err| format!("{context} is invalid: {err}"))
-}
-
-fn validate_metric_name(metric: &str, context: &str) -> Result<(), String> {
-    if metric.trim().is_empty() {
-        return Err(format!("{context} must not be empty"));
+    if runtime.alert_instances.len() > limits.max_alert_instances_per_rule {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::RuntimeUpdate));
     }
-    if metric.len() > MAX_METRIC_NAME_LEN {
-        return Err(format!("{context} must be <= {MAX_METRIC_NAME_LEN} bytes"));
-    }
-    Ok(())
-}
-
-fn validate_label_name(name: &str, context: &str) -> Result<(), String> {
-    if name.trim().is_empty() {
-        return Err(format!("{context} label name must not be empty"));
-    }
-    if name == tenant::TENANT_LABEL {
-        return Err(format!(
-            "{context} label '{}' is reserved for server-managed tenant isolation",
-            tenant::TENANT_LABEL
-        ));
-    }
-    if name == "__name__" {
-        return Err(format!("{context} label '__name__' is not supported"));
-    }
-    if name.len() > MAX_LABEL_NAME_LEN {
-        return Err(format!(
-            "{context} label '{name}' exceeds the {MAX_LABEL_NAME_LEN}-byte name limit"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_label_value(value: &str, context: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("{context} must not be empty"));
-    }
-    if value.len() > MAX_LABEL_VALUE_LEN {
-        return Err(format!("{context} must be <= {MAX_LABEL_VALUE_LEN} bytes"));
-    }
-    Ok(())
-}
-
-fn validate_rule_label_map(
-    labels: &BTreeMap<String, String>,
-    context: &str,
-    reject_reserved_labels: bool,
-) -> Result<(), String> {
-    for (name, value) in labels {
-        if reject_reserved_labels {
-            validate_label_name(name, context)?;
-        } else if name.trim().is_empty() {
-            return Err(format!("{context} label name must not be empty"));
+    for instance in &runtime.alert_instances {
+        if instance.key.len()
+            > limits
+                .max_label_set_bytes
+                .saturating_add(limits.max_name_bytes)
+            || instance.source_metric.len() > limits.max_name_bytes
+            || instance.sample_type.len() > limits.max_name_bytes
+            || instance
+                .sample_value
+                .as_ref()
+                .is_some_and(|value| value.len() > limits.max_annotation_bytes)
+            || instance.labels.len() > limits.max_labels_per_set
+        {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::RuntimeUpdate));
         }
-        validate_label_value(value, &format!("{context} label '{name}' value"))?;
-    }
-    Ok(())
-}
-
-fn configured_rule_fingerprints(groups: &[RuleGroupSpec]) -> Result<BTreeMap<String, u64>, String> {
-    let mut out = BTreeMap::new();
-    for group in groups {
-        for rule in &group.rules {
-            out.insert(rule_id(group, rule), rule_fingerprint(group, rule)?);
+        let mut label_bytes = 0usize;
+        for label in &instance.labels {
+            if label.name.is_empty()
+                || label.name.len() > limits.max_name_bytes
+                || label.name.len() > MAX_LABEL_NAME_LEN
+                || label.value.len() > MAX_LABEL_VALUE_LEN
+            {
+                return Err(RulesStoreError::Invalid(
+                    "rules runtime contains an invalid alert label",
+                ));
+            }
+            label_bytes = label_bytes
+                .saturating_add(label.name.len())
+                .saturating_add(label.value.len());
+        }
+        if label_bytes > limits.max_label_set_bytes {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::RuntimeUpdate));
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+fn validate_persisted_state_with_limits(
+    state: &PersistedRulesStoreState,
+    limits: &RulesStoreLimits,
+) -> Result<(), RulesStoreError> {
+    validate_groups_with_limits(&state.groups, limits)?;
+    if state.runtime.len() > limits.max_rules_total {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+    }
+    for (rule_id, runtime) in &state.runtime {
+        if rule_id.len() > limits.max_name_bytes.saturating_mul(3).saturating_add(32) {
+            return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+        }
+        validate_runtime_state_with_limits(runtime, limits)?;
+    }
+    if modeled_rules_state_bytes(state) > limits.max_total_retained_state_bytes {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::RetainedState));
+    }
+    Ok(())
+}
+
+fn modeled_rules_state_bytes_with_runtime_overlay(
+    state: &PersistedRulesStoreState,
+    replacements: &BTreeMap<String, PersistedRuleRuntimeState>,
+) -> usize {
+    let runtime_bytes = state
+        .runtime
+        .iter()
+        .fold(0usize, |bytes, (rule_id, runtime)| {
+            bytes.saturating_add(modeled_runtime_entry_bytes(
+                rule_id,
+                replacements.get(rule_id).unwrap_or(runtime),
+            ))
+        });
+    std::mem::size_of::<PersistedRulesStoreState>()
+        .saturating_add(modeled_groups_bytes(&state.groups))
+        .saturating_add(runtime_bytes)
 }
 
 fn rule_fingerprint(group: &RuleGroupSpec, rule: &RuleSpec) -> Result<u64, String> {
-    let encoded = serde_json::to_vec(&(group, rule))
-        .map_err(|err| format!("failed to encode rule fingerprint: {err}"))?;
-    Ok(fnv1a64(&encoded))
+    let mut writer = Fnv1aWriter {
+        hash: 0xcbf29ce484222325,
+    };
+    serde_json::to_writer(&mut writer, &(group, rule))
+        .map_err(|_| "failed to encode bounded rule fingerprint".to_string())?;
+    Ok(writer.hash)
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+struct Fnv1aWriter {
+    hash: u64,
+}
+
+impl Write for Fnv1aWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(0x100000001b3);
+        }
+        Ok(bytes.len())
     }
-    hash
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn rule_id(group: &RuleGroupSpec, rule: &RuleSpec) -> String {
     let kind = rule_kind(rule);
-    format!(
-        "{}/{}/{}/{}",
-        group.tenant_id,
-        group.name,
-        kind,
-        rule_name(rule)
-    )
+    let rule_name = rule_name(rule);
+    let capacity = group
+        .tenant_id
+        .len()
+        .saturating_add(group.name.len())
+        .saturating_add(kind.len())
+        .saturating_add(rule_name.len())
+        .saturating_add(3);
+    let mut id = String::with_capacity(capacity);
+    id.push_str(&group.tenant_id);
+    id.push('/');
+    id.push_str(&group.name);
+    id.push('/');
+    id.push_str(kind);
+    id.push('/');
+    id.push_str(rule_name);
+    id
 }
 
 fn rule_name(rule: &RuleSpec) -> &str {
@@ -1486,14 +2610,10 @@ fn recording_rows_from_value(
             .into_iter()
             .map(|sample| recording_row_from_sample(group, spec, eval_timestamp, sample))
             .collect(),
-        PromqlValue::RangeVector(_) => Err(format!(
-            "recording rule '{}' must evaluate to a scalar or instant vector",
-            spec.record
-        )),
-        PromqlValue::String(_, _) => Err(format!(
-            "recording rule '{}' cannot record string results",
-            spec.record
-        )),
+        PromqlValue::RangeVector(_) => {
+            Err("recording rule must evaluate to a scalar or instant vector".to_string())
+        }
+        PromqlValue::String(_, _) => Err("recording rule cannot record string results".to_string()),
     }
 }
 
@@ -1527,6 +2647,85 @@ fn alert_samples_from_value(value: PromqlValue) -> Result<Vec<Sample>, String> {
         }
         PromqlValue::String(_, _) => Err("alert rule cannot evaluate to a string".to_string()),
     }
+}
+
+fn modeled_alert_key_recompute_scratch_bytes(instance: &AlertInstanceState) -> usize {
+    let label_bytes = instance.labels.iter().fold(0usize, |bytes, label| {
+        bytes
+            .saturating_add(label.name.len())
+            .saturating_add(label.value.len())
+    });
+    let key_bytes_upper = instance
+        .source_metric
+        .len()
+        .saturating_add(label_bytes.saturating_mul(2))
+        .saturating_add(instance.labels.len().saturating_mul(32))
+        .max(instance.key.len());
+    modeled_allocation_bytes(key_bytes_upper)
+}
+
+fn preflight_alert_sample_state_bytes(
+    group: &RuleGroupSpec,
+    spec: &AlertRuleSpec,
+    sample: &Sample,
+    limits: &RulesStoreLimits,
+) -> Result<usize, String> {
+    if sample.metric.len() > limits.max_name_bytes
+        || sample.labels.len() > limits.max_labels_per_set
+    {
+        return Err("alert rule output exceeds a finite state limit".to_string());
+    }
+    let merged_count_upper = sample
+        .labels
+        .len()
+        .saturating_add(group.labels.len())
+        .saturating_add(spec.labels.len())
+        .saturating_add(1);
+    if merged_count_upper > limits.max_labels_per_set {
+        return Err("alert rule output exceeds a finite label-count limit".to_string());
+    }
+    let mut label_bytes = "alertname".len().saturating_add(spec.alert.len());
+    let mut clone_heap_bytes = modeled_string_clone_upper_bytes("alertname")
+        .saturating_add(modeled_string_clone_upper_bytes(&spec.alert));
+    for label in &sample.labels {
+        if label.name.is_empty()
+            || label.name.len() > limits.max_name_bytes
+            || label.name.len() > MAX_LABEL_NAME_LEN
+            || label.value.len() > MAX_LABEL_VALUE_LEN
+        {
+            return Err("alert rule output contains an invalid label".to_string());
+        }
+        label_bytes = label_bytes
+            .saturating_add(label.name.len())
+            .saturating_add(label.value.len());
+        clone_heap_bytes = clone_heap_bytes
+            .saturating_add(modeled_string_clone_upper_bytes(&label.name))
+            .saturating_add(modeled_string_clone_upper_bytes(&label.value));
+    }
+    for labels in [&group.labels, &spec.labels] {
+        for (name, value) in labels {
+            label_bytes = label_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
+            clone_heap_bytes = clone_heap_bytes
+                .saturating_add(modeled_string_clone_upper_bytes(name))
+                .saturating_add(modeled_string_clone_upper_bytes(value));
+        }
+    }
+    if label_bytes > limits.max_label_set_bytes {
+        return Err("alert rule output exceeds a finite label-byte limit".to_string());
+    }
+    let key_bytes_upper = sample
+        .metric
+        .len()
+        .saturating_add(label_bytes.saturating_mul(2))
+        .saturating_add(merged_count_upper.saturating_mul(32));
+    Ok(modeled_allocation_bytes(key_bytes_upper)
+        .saturating_add(modeled_string_clone_upper_bytes(&sample.metric))
+        .saturating_add(modeled_vec_clone_upper_bytes::<Label>(merged_count_upper))
+        .saturating_add(clone_heap_bytes)
+        .saturating_add(modeled_allocation_bytes(32))
+        .saturating_add(modeled_allocation_bytes(64)))
 }
 
 fn alert_instance_fields(
@@ -1566,8 +2765,16 @@ fn merged_rule_labels(
     }
     let mut out = Vec::with_capacity(merged.len());
     for (name, value) in merged {
-        validate_label_name(&name, "rule output")?;
-        validate_label_value(&value, &format!("rule output label '{name}'"))?;
+        if name.trim().is_empty()
+            || name == tenant::TENANT_LABEL
+            || name == "__name__"
+            || name.len() > MAX_LABEL_NAME_LEN
+        {
+            return Err("rule output contains an invalid label name".to_string());
+        }
+        if value.trim().is_empty() || value.len() > MAX_LABEL_VALUE_LEN {
+            return Err("rule output contains an invalid label value".to_string());
+        }
         out.push(Label::new(name, value));
     }
     out.sort();
@@ -1594,11 +2801,11 @@ fn parse_duration_secs(value: &str) -> Result<u64, String> {
     } else if value.len() > 1 {
         (&value[..value.len() - 1], &value[value.len() - 1..])
     } else {
-        return Err(format!("invalid duration: '{value}'"));
+        return Err("invalid rules duration".to_string());
     };
     let num: f64 = num_str
         .parse()
-        .map_err(|_| format!("invalid duration: '{value}'"))?;
+        .map_err(|_| "invalid rules duration".to_string())?;
     let secs = match unit {
         "ms" => num / 1_000.0,
         "s" => num,
@@ -1607,10 +2814,10 @@ fn parse_duration_secs(value: &str) -> Result<u64, String> {
         "d" => num * 86_400.0,
         "w" => num * 604_800.0,
         "y" => num * 365.25 * 86_400.0,
-        _ => return Err(format!("invalid duration unit: '{unit}'")),
+        _ => return Err("invalid rules duration unit".to_string()),
     };
     if !secs.is_finite() || secs <= 0.0 {
-        return Err(format!("invalid duration: '{value}'"));
+        return Err("invalid rules duration".to_string());
     }
     Ok(secs.ceil() as u64)
 }
@@ -1767,51 +2974,291 @@ fn parse_env_usize(var: &str, default: usize, enforce_positive: bool) -> Result<
     }
 }
 
-fn load_rules_store_state(path: &Path) -> Result<PersistedRulesStoreState, String> {
-    if !path.exists() {
-        return Ok(PersistedRulesStoreState::default());
-    }
-    let raw = std::fs::read(path)
-        .map_err(|err| format!("failed to read rules store {}: {err}", path.display()))?;
-    let persisted: PersistedRulesStore = serde_json::from_slice(&raw)
-        .map_err(|err| format!("failed to parse rules store {}: {err}", path.display()))?;
-    if persisted.magic != RULES_STORE_MAGIC {
-        return Err(format!(
-            "rules store {} has unsupported magic '{}'",
-            path.display(),
-            persisted.magic
-        ));
-    }
-    if persisted.schema_version != RULES_STORE_SCHEMA_VERSION {
-        return Err(format!(
-            "rules store {} has unsupported schema version {}",
-            path.display(),
-            persisted.schema_version
-        ));
-    }
-    Ok(persisted.state)
+struct LoadedRulesStoreState {
+    state: PersistedRulesStoreState,
+    durable_file_bytes: usize,
+    startup_transient_bytes: usize,
 }
 
-fn write_rules_store_state(
+#[derive(Serialize)]
+struct PersistedRulesStoreRef<'a, S: Serialize + ?Sized> {
+    magic: &'static str,
+    schema_version: u16,
+    state: &'a S,
+}
+
+#[derive(Serialize)]
+struct PersistedRulesStateOverlay<'a> {
+    groups: &'a [RuleGroupSpec],
+    runtime: RuntimeStateOverlay<'a>,
+}
+
+struct RuntimeStateOverlay<'a> {
+    current: &'a BTreeMap<String, PersistedRuleRuntimeState>,
+    replacements: &'a BTreeMap<String, PersistedRuleRuntimeState>,
+}
+
+impl Serialize for RuntimeStateOverlay<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.current.len()))?;
+        for (rule_id, current) in self.current {
+            map.serialize_entry(rule_id, self.replacements.get(rule_id).unwrap_or(current))?;
+        }
+        map.end()
+    }
+}
+
+struct JsonLengthWriter {
+    bytes: usize,
+}
+
+impl Write for JsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("rules JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_json_value<S: Serialize + ?Sized>(value: &S) -> Result<usize, RulesStoreError> {
+    let mut counter = JsonLengthWriter { bytes: 0 };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| RulesStoreError::Internal("failed to measure bounded rules JSON"))?;
+    Ok(counter.bytes)
+}
+
+fn encode_json_value_exact<S: Serialize + ?Sized>(
+    value: &S,
+    encoded_len: usize,
+) -> Result<Vec<u8>, RulesStoreError> {
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| RulesStoreError::Internal("failed to allocate bounded rules JSON"))?;
+    serde_json::to_writer(&mut encoded, value)
+        .map_err(|_| RulesStoreError::Internal("failed to encode bounded rules JSON"))?;
+    if encoded.len() != encoded_len {
+        return Err(RulesStoreError::Internal(
+            "bounded rules JSON length changed during encoding",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn measure_rules_store_state<S: Serialize + ?Sized>(state: &S) -> Result<usize, RulesStoreError> {
+    let persisted = PersistedRulesStoreRef {
+        magic: RULES_STORE_MAGIC,
+        schema_version: RULES_STORE_SCHEMA_VERSION,
+        state,
+    };
+    let mut counter = JsonLengthWriter { bytes: 0 };
+    serde_json::to_writer_pretty(&mut counter, &persisted)
+        .map_err(|_| RulesStoreError::Internal("failed to measure rules durable state"))?;
+    counter
+        .bytes
+        .checked_add(1)
+        .ok_or(RulesStoreError::Internal(
+            "rules durable state length overflowed",
+        ))
+}
+
+fn encode_rules_store_state_exact<S: Serialize + ?Sized>(
+    state: &S,
+    encoded_len: usize,
+) -> Result<Vec<u8>, RulesStoreError> {
+    let persisted = PersistedRulesStoreRef {
+        magic: RULES_STORE_MAGIC,
+        schema_version: RULES_STORE_SCHEMA_VERSION,
+        state,
+    };
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| RulesStoreError::Internal("failed to allocate rules durable state"))?;
+    serde_json::to_writer_pretty(&mut encoded, &persisted)
+        .map_err(|_| RulesStoreError::Internal("failed to encode rules durable state"))?;
+    encoded.push(b'\n');
+    if encoded.len() != encoded_len {
+        return Err(RulesStoreError::Internal(
+            "rules durable state length changed during encoding",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn write_encoded_rules_store_state(
     path: &Path,
-    state: &PersistedRulesStoreState,
+    encoded: &[u8],
     local_disk_budget: Option<&Arc<LocalDiskBudget>>,
 ) -> tsink::Result<()> {
-    let persisted = PersistedRulesStore {
-        magic: RULES_STORE_MAGIC.to_string(),
-        schema_version: RULES_STORE_SCHEMA_VERSION,
-        state: state.clone(),
-    };
-    let mut encoded = serde_json::to_vec_pretty(&persisted)?;
-    encoded.push(b'\n');
     if let Some(local_disk_budget) = local_disk_budget {
         return local_disk_budget.write_file_atomically_and_sync_parent(
             path,
-            &encoded,
+            encoded,
             DiskCategory::ServerState,
         );
     }
-    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, &encoded)
+    tsink::engine::fs_utils::write_file_atomically_and_sync_parent(path, encoded)
+}
+
+fn preflight_rules_json(raw: &[u8]) -> Result<usize, RulesStoreError> {
+    let mut depth = 0usize;
+    let mut structural_values = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in raw {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                structural_values = structural_values.saturating_add(1);
+                if depth > RULES_STARTUP_MAX_JSON_DEPTH {
+                    return Err(RulesStoreError::Invalid(
+                        "rules store JSON exceeds its nesting-depth limit",
+                    ));
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1).ok_or(RulesStoreError::Invalid(
+                    "rules store contains malformed JSON",
+                ))?;
+            }
+            b',' | b':' => {
+                structural_values = structural_values.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    if in_string || escaped || depth != 0 {
+        return Err(RulesStoreError::Invalid(
+            "rules store contains malformed JSON",
+        ));
+    }
+    Ok(raw
+        .len()
+        .saturating_mul(2)
+        .saturating_add(
+            structural_values.saturating_mul(
+                RULES_ALLOCATION_ALLOWANCE_BYTES
+                    .saturating_add(std::mem::size_of::<serde_json::Value>()),
+            ),
+        ))
+}
+
+fn read_rules_file_bounded(
+    path: &Path,
+    max_file_bytes: usize,
+    max_startup_transient_bytes: usize,
+) -> Result<Option<Vec<u8>>, RulesStoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RulesStoreError::Persistence(error.into())),
+    };
+    let file_len = usize::try_from(file.metadata().map_err(tsink::TsinkError::from)?.len())
+        .unwrap_or(usize::MAX);
+    if file_len > max_file_bytes {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::DurableFile));
+    }
+    if file_len > max_startup_transient_bytes {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+    }
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(file_len)
+        .map_err(|_| RulesStoreError::Internal("failed to allocate bounded rules startup state"))?;
+    raw.resize(file_len, 0);
+    file.read_exact(&mut raw).map_err(tsink::TsinkError::from)?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing).map_err(tsink::TsinkError::from)? != 0 {
+        return Err(RulesStoreError::Limit(RulesLimitSurface::DurableFile));
+    }
+    Ok(Some(raw))
+}
+
+fn load_rules_store_state_bounded(
+    path: &Path,
+    limits: &RulesStoreLimits,
+    accounting: &RulesStoreAccounting,
+) -> Result<LoadedRulesStoreState, RulesStoreError> {
+    let Some(raw) = read_rules_file_bounded(
+        path,
+        limits.max_durable_file_bytes,
+        limits.max_startup_transient_bytes,
+    )?
+    else {
+        return Ok(LoadedRulesStoreState {
+            state: PersistedRulesStoreState::default(),
+            durable_file_bytes: 0,
+            startup_transient_bytes: 0,
+        });
+    };
+    let decoded_upper = preflight_rules_json(&raw)?;
+    let preflight_peak = raw.len().saturating_add(decoded_upper);
+    accounting.observe_peak(RulesLimitSurface::Startup, preflight_peak);
+    if preflight_peak > limits.max_startup_transient_bytes {
+        accounting.reject(RulesLimitSurface::Startup);
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(&raw);
+    let persisted = PersistedRulesStore::deserialize(&mut deserializer)
+        .map_err(|_| RulesStoreError::Invalid("rules store contains invalid durable state"))?;
+    deserializer
+        .end()
+        .map_err(|_| RulesStoreError::Invalid("rules store contains trailing data"))?;
+    if persisted.magic != RULES_STORE_MAGIC
+        || persisted.schema_version != RULES_STORE_SCHEMA_VERSION
+    {
+        return Err(RulesStoreError::Invalid(
+            "rules store has an unsupported durable format",
+        ));
+    }
+    validate_persisted_state_with_limits(&persisted.state, limits).map_err(|error| {
+        if matches!(error, RulesStoreError::Limit(_)) {
+            accounting.reject(RulesLimitSurface::Startup);
+            RulesStoreError::Limit(RulesLimitSurface::Startup)
+        } else {
+            RulesStoreError::Invalid("rules store contains invalid bounded state")
+        }
+    })?;
+    let retained_state_bytes = modeled_rules_state_bytes(&persisted.state);
+    if retained_state_bytes > limits.max_total_retained_state_bytes {
+        accounting.reject(RulesLimitSurface::Startup);
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+    }
+    let actual_peak = raw.len().saturating_add(retained_state_bytes);
+    if actual_peak > limits.max_startup_transient_bytes {
+        accounting.reject(RulesLimitSurface::Startup);
+        return Err(RulesStoreError::Limit(RulesLimitSurface::Startup));
+    }
+    Ok(LoadedRulesStoreState {
+        state: persisted.state,
+        durable_file_bytes: raw.len(),
+        startup_transient_bytes: preflight_peak.max(actual_peak),
+    })
+}
+
+#[cfg(test)]
+fn load_rules_store_state(path: &Path) -> Result<PersistedRulesStoreState, String> {
+    let accounting = RulesStoreAccounting::default();
+    load_rules_store_state_bounded(path, &RulesStoreLimits::default(), &accounting)
+        .map(|loaded| loaded.state)
+        .map_err(|error| error.to_string())
 }
 
 pub fn empty_rules_snapshot() -> RulesStatusSnapshot {
@@ -1819,6 +3266,7 @@ pub fn empty_rules_snapshot() -> RulesStatusSnapshot {
         scheduler_tick_ms: DEFAULT_RULES_SCHEDULER_TICK_MS,
         max_recording_rows_per_eval: DEFAULT_MAX_RECORDING_ROWS_PER_EVAL,
         max_alert_instances_per_rule: DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
+        store_limits: RulesStoreLimits::default(),
         cluster_enabled: false,
         cluster_leader: true,
         metrics: RulesMetricsSnapshot {
@@ -1835,6 +3283,20 @@ pub fn empty_rules_snapshot() -> RulesStatusSnapshot {
             pending_alerts: 0,
             firing_alerts: 0,
             local_scheduler_active: true,
+            retained_state_bytes: 0,
+            peak_retained_state_bytes: 0,
+            durable_file_bytes: 0,
+            peak_startup_transient_bytes: 0,
+            peak_replacement_transient_bytes: 0,
+            peak_runtime_update_transient_bytes: 0,
+            peak_snapshot_status_bytes: 0,
+            peak_snapshot_file_bytes: 0,
+            limit_rejections_total: 0,
+            startup_rejections_total: 0,
+            replacement_rejections_total: 0,
+            runtime_update_rejections_total: 0,
+            snapshot_rejections_total: 0,
+            persistence_failures_total: 0,
         },
         groups: Vec::new(),
     }
@@ -1846,6 +3308,7 @@ mod tests {
     use crate::cluster::config::{ClusterConfig, DEFAULT_CLUSTER_SHARDS};
     use crate::cluster::{ClusterRequestContext, ClusterRuntime};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Barrier;
     use tempfile::tempdir;
     use tsink::StorageBuilder;
 
@@ -1912,15 +3375,10 @@ mod tests {
     }
 
     fn encoded_rules_store_len(state: &PersistedRulesStoreState) -> u64 {
-        let persisted = PersistedRulesStore {
-            magic: RULES_STORE_MAGIC.to_string(),
-            schema_version: RULES_STORE_SCHEMA_VERSION,
-            state: state.clone(),
-        };
-        let mut encoded =
-            serde_json::to_vec_pretty(&persisted).expect("rules state should serialize");
-        encoded.push(b'\n');
-        u64::try_from(encoded.len()).expect("encoded rules state length should fit u64")
+        u64::try_from(
+            measure_rules_store_state(state).expect("rules state length should be measurable"),
+        )
+        .expect("encoded rules state length should fit u64")
     }
 
     fn make_storage_with_path(path: &Path) -> Arc<dyn Storage> {
@@ -1970,6 +3428,891 @@ mod tests {
                 labels: BTreeMap::new(),
             })],
         }
+    }
+
+    fn sample_alert_group(name: &str, alert: &str) -> RuleGroupSpec {
+        RuleGroupSpec {
+            name: name.to_string(),
+            tenant_id: "team-a".to_string(),
+            interval_secs: 60,
+            labels: BTreeMap::new(),
+            rules: vec![RuleSpec::Alert(AlertRuleSpec {
+                alert: alert.to_string(),
+                expr: "source_metric > 0".to_string(),
+                interval_secs: None,
+                for_secs: 0,
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            })],
+        }
+    }
+
+    fn test_store_limits() -> RulesStoreLimits {
+        RulesStoreLimits {
+            max_groups: 8,
+            max_rules_per_group: 8,
+            max_rules_total: 32,
+            max_alert_instances_per_rule: 32,
+            max_labels_per_set: 8,
+            max_label_set_bytes: 8 * 1024,
+            max_name_bytes: 1024,
+            max_expression_bytes: 8 * 1024,
+            max_annotation_bytes: 8 * 1024,
+            max_total_retained_state_bytes: 8 * 1024 * 1024,
+            max_durable_file_bytes: 8 * 1024 * 1024,
+            max_startup_transient_bytes: 32 * 1024 * 1024,
+            max_replacement_transient_bytes: 32 * 1024 * 1024,
+            max_runtime_update_transient_bytes: 16 * 1024 * 1024,
+            max_snapshot_status_bytes: 16 * 1024 * 1024,
+        }
+    }
+
+    fn write_rules_fixture(path: &Path, state: &PersistedRulesStoreState) -> Vec<u8> {
+        let encoded_len =
+            measure_rules_store_state(state).expect("fixture state should be measurable");
+        let encoded = encode_rules_store_state_exact(state, encoded_len)
+            .expect("fixture state should encode");
+        std::fs::write(path.join(RULES_STORE_FILE_NAME), &encoded)
+            .expect("rules fixture should write");
+        encoded
+    }
+
+    fn alert_runtime_update(fingerprint: u64, instance_count: usize) -> PersistedRuleRuntimeState {
+        let mut alert_instances = Vec::new();
+        alert_instances.reserve_exact(instance_count);
+        for index in 0..instance_count {
+            let labels = vec![
+                Label::new("alertname", "HighUsage"),
+                Label::new("instance", format!("node-{index:02}")),
+            ];
+            alert_instances.push(AlertInstanceState {
+                key: alert_instance_key("source_metric", &labels),
+                source_metric: "source_metric".to_string(),
+                labels,
+                active_since_timestamp: 60_000,
+                last_seen_timestamp: 60_000,
+                firing_since_timestamp: Some(60_000),
+                state: AlertInstanceStatus::Firing,
+                sample_type: "scalar".to_string(),
+                sample_value: Some("1".to_string()),
+            });
+        }
+        PersistedRuleRuntimeState {
+            fingerprint,
+            last_eval_timestamp: Some(60_000),
+            last_eval_unix_ms: Some(60_000),
+            last_success_unix_ms: Some(60_000),
+            last_duration_ms: 1,
+            last_error: None,
+            last_sample_count: instance_count as u64,
+            last_recorded_rows: 0,
+            last_outcome: Some(RuleEvaluationOutcome::Success),
+            alert_instances,
+        }
+    }
+
+    fn configured_runtime_identity(store: &RulesStore) -> (String, u64) {
+        let state = store.read_state().expect("state should be readable");
+        let (rule_id, runtime) = state
+            .runtime
+            .iter()
+            .next()
+            .expect("configured rule runtime should exist");
+        (rule_id.clone(), runtime.fingerprint)
+    }
+
+    fn assert_rules_limit_rejection(error: RulesApplyError, expected: &'static str) {
+        match error {
+            RulesApplyError::Rejected(message) => assert_eq!(message, expected),
+            other => panic!("expected bounded rules rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_store_count_limits_are_exact_at_n_and_reject_n_plus_one() {
+        let one_group = sample_recording_group("group-a", "record_a");
+        let mut limits = test_store_limits();
+        limits.max_groups = 1;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![one_group.clone()])
+            .expect("group count N should pass");
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![
+                    one_group.clone(),
+                    sample_recording_group("group-b", "record_b"),
+                ])
+                .expect_err("group count N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+
+        let mut two_rules = one_group;
+        two_rules.rules.push(RuleSpec::Recording(RecordingRuleSpec {
+            record: "record_b".to_string(),
+            expr: "source_metric".to_string(),
+            interval_secs: None,
+            labels: BTreeMap::new(),
+        }));
+        let mut limits = test_store_limits();
+        limits.max_rules_per_group = 1;
+        limits.max_rules_total = 1;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![sample_recording_group("group-a", "record_a")])
+            .expect("rule count N should pass");
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![two_rules])
+                .expect_err("rule count N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+
+        let mut limits = test_store_limits();
+        limits.max_groups = 2;
+        limits.max_rules_per_group = 1;
+        limits.max_rules_total = 1;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![sample_recording_group("group-a", "record_a")])
+            .expect("total rule count N should pass");
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![
+                    sample_recording_group("group-a", "record_a"),
+                    sample_recording_group("group-b", "record_b"),
+                ])
+                .expect_err("total rule count N+1 across groups should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+    }
+
+    #[test]
+    fn rules_label_expression_and_annotation_byte_limits_are_exact() {
+        let exact_name = sample_recording_group("12345678", "record_a");
+        let mut limits = test_store_limits();
+        limits.max_name_bytes = 8;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![exact_name.clone()])
+            .expect("name bytes at N should pass");
+        let mut one_more_name_byte = exact_name;
+        one_more_name_byte.name.push('9');
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![one_more_name_byte])
+                .expect_err("name bytes N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+
+        let mut exact_labels = sample_alert_group("alerts", "HighUsage");
+        exact_labels.labels = BTreeMap::from([("a".to_string(), "b".to_string())]);
+        let mut limits = test_store_limits();
+        limits.max_labels_per_set = 1;
+        limits.max_label_set_bytes = 2;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![exact_labels.clone()])
+            .expect("label count and bytes at N should pass");
+        let mut one_more_label = exact_labels.clone();
+        one_more_label
+            .labels
+            .insert("c".to_string(), "d".to_string());
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![one_more_label])
+                .expect_err("label count N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+        let mut one_more_byte = exact_labels;
+        one_more_byte
+            .labels
+            .insert("a".to_string(), "bc".to_string());
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![one_more_byte])
+                .expect_err("label bytes N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+
+        let exact_expression = sample_alert_group("alerts", "HighUsage");
+        let expression_len = rule_expr(&exact_expression.rules[0]).len();
+        let mut limits = test_store_limits();
+        limits.max_expression_bytes = expression_len;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![exact_expression.clone()])
+            .expect("expression bytes at N should pass");
+        let mut one_more_expression_byte = exact_expression;
+        match &mut one_more_expression_byte.rules[0] {
+            RuleSpec::Alert(spec) => spec.expr.push(' '),
+            RuleSpec::Recording(_) => unreachable!("sample group is an alert"),
+        }
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![one_more_expression_byte])
+                .expect_err("expression bytes N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+
+        let mut exact_annotations = sample_alert_group("alerts", "HighUsage");
+        match &mut exact_annotations.rules[0] {
+            RuleSpec::Alert(spec) => {
+                spec.annotations = BTreeMap::from([("note".to_string(), "ok".to_string())]);
+            }
+            RuleSpec::Recording(_) => unreachable!("sample group is an alert"),
+        }
+        let mut limits = test_store_limits();
+        limits.max_annotation_bytes = 6;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![exact_annotations.clone()])
+            .expect("annotation bytes at N should pass");
+        match &mut exact_annotations.rules[0] {
+            RuleSpec::Alert(spec) => {
+                spec.annotations
+                    .insert("note".to_string(), "okay".to_string());
+            }
+            RuleSpec::Recording(_) => unreachable!("sample group is an alert"),
+        }
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![exact_annotations])
+                .expect_err("annotation bytes N+1 should fail"),
+            RulesLimitSurface::Configuration.message(),
+        );
+    }
+
+    #[test]
+    fn rules_limits_validate_and_hostile_configuration_errors_do_not_echo_input() {
+        let mut zero = test_store_limits();
+        zero.max_groups = 0;
+        assert!(zero.validate().is_err());
+
+        let mut inconsistent = test_store_limits();
+        inconsistent.max_rules_per_group = 2;
+        inconsistent.max_rules_total = 1;
+        assert!(inconsistent.validate().is_err());
+
+        let mut oversized_status = test_store_limits();
+        oversized_status.max_snapshot_status_bytes = crate::http::MAX_BODY_BYTES + 1;
+        assert!(oversized_status.validate().is_err());
+
+        let invalid_runtime = RulesRuntimeConfig {
+            scheduler_tick: Duration::ZERO,
+            store_limits: test_store_limits(),
+            max_alert_instances_per_rule: test_store_limits().max_alert_instances_per_rule,
+            ..RulesRuntimeConfig::default()
+        };
+        assert!(invalid_runtime.validate().is_err());
+        let inconsistent_runtime = RulesRuntimeConfig {
+            store_limits: RulesStoreLimits {
+                max_alert_instances_per_rule: 1,
+                ..test_store_limits()
+            },
+            max_alert_instances_per_rule: 2,
+            ..RulesRuntimeConfig::default()
+        };
+        assert!(inconsistent_runtime.validate().is_err());
+
+        let attacker = "hostile-expression-secret-marker{";
+        let mut hostile = sample_recording_group("hostile", "hostile_recording");
+        match &mut hostile.rules[0] {
+            RuleSpec::Recording(spec) => spec.expr = attacker.to_string(),
+            RuleSpec::Alert(_) => unreachable!("sample group is a recording rule"),
+        }
+        let store = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        let error = store
+            .apply_groups(vec![hostile])
+            .expect_err("invalid hostile expression should fail")
+            .to_string();
+        assert!(!error.contains(attacker));
+        assert!(error.len() <= RULES_MAX_DIAGNOSTIC_BYTES);
+        assert!(store
+            .read_state()
+            .expect("state should remain readable")
+            .groups
+            .is_empty());
+    }
+
+    #[test]
+    fn rules_retained_and_durable_byte_limits_are_exact() {
+        let group = sample_recording_group("bounded", "bounded_recording");
+        let measured = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        measured
+            .apply_groups(vec![group.clone()])
+            .expect("measurement state should apply");
+        let exact_retained = usize::try_from(measured.accounting.snapshot().retained_state_bytes)
+            .expect("retained byte measurement should fit usize");
+        assert!(exact_retained > 1);
+
+        let mut exact_limits = test_store_limits();
+        exact_limits.max_total_retained_state_bytes = exact_retained;
+        RulesStore::open_with_limits(None, None, exact_limits)
+            .expect("exact retained store should open")
+            .apply_groups(vec![group.clone()])
+            .expect("retained bytes N should pass");
+
+        let mut one_under_limits = exact_limits;
+        one_under_limits.max_total_retained_state_bytes = exact_retained - 1;
+        let one_under =
+            RulesStore::open_with_limits(None, None, one_under_limits).expect("store should open");
+        assert_rules_limit_rejection(
+            one_under
+                .apply_groups(vec![group.clone()])
+                .expect_err("retained bytes N-1 should fail"),
+            RulesLimitSurface::RetainedState.message(),
+        );
+        assert!(one_under
+            .read_state()
+            .expect("state should remain readable")
+            .groups
+            .is_empty());
+
+        let measured_dir = tempdir().expect("measurement directory should build");
+        let measured =
+            RulesStore::open_with_limits(Some(measured_dir.path()), None, test_store_limits())
+                .expect("durable measurement store should open");
+        measured
+            .apply_groups(vec![group.clone()])
+            .expect("durable measurement should apply");
+        let exact_durable = usize::try_from(measured.accounting.snapshot().durable_file_bytes)
+            .expect("durable byte measurement should fit usize");
+        assert!(exact_durable > 1);
+
+        let exact_dir = tempdir().expect("exact directory should build");
+        let mut exact_limits = test_store_limits();
+        exact_limits.max_durable_file_bytes = exact_durable;
+        RulesStore::open_with_limits(Some(exact_dir.path()), None, exact_limits)
+            .expect("exact durable store should open")
+            .apply_groups(vec![group.clone()])
+            .expect("durable bytes N should pass");
+
+        let one_under_dir = tempdir().expect("one-under directory should build");
+        let mut one_under_limits = exact_limits;
+        one_under_limits.max_durable_file_bytes = exact_durable - 1;
+        let one_under =
+            RulesStore::open_with_limits(Some(one_under_dir.path()), None, one_under_limits)
+                .expect("one-under durable store should open");
+        assert_rules_limit_rejection(
+            one_under
+                .apply_groups(vec![group])
+                .expect_err("durable bytes N-1 should fail"),
+            RulesLimitSurface::DurableFile.message(),
+        );
+        assert!(one_under
+            .read_state()
+            .expect("state should remain readable")
+            .groups
+            .is_empty());
+    }
+
+    #[test]
+    fn replacement_peak_is_larger_than_new_state_and_fails_without_publication() {
+        let initial = sample_recording_group("initial", "initial_recording");
+        let replacement = sample_recording_group("replacement", "replacement_recording");
+
+        let new_store = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        new_store
+            .apply_groups(vec![initial.clone()])
+            .expect("new state should apply");
+        let new_peak = usize::try_from(
+            new_store
+                .accounting
+                .snapshot()
+                .peak_replacement_transient_bytes,
+        )
+        .expect("new peak should fit usize");
+
+        let measured = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        measured
+            .apply_groups(vec![initial.clone()])
+            .expect("initial state should apply");
+        measured
+            .apply_groups(vec![replacement.clone()])
+            .expect("replacement should apply");
+        let replacement_peak = usize::try_from(
+            measured
+                .accounting
+                .snapshot()
+                .peak_replacement_transient_bytes,
+        )
+        .expect("replacement peak should fit usize");
+        assert!(replacement_peak > new_peak);
+
+        let mut limits = test_store_limits();
+        limits.max_replacement_transient_bytes = replacement_peak - 1;
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        store
+            .apply_groups(vec![initial.clone()])
+            .expect("new state must fit below replacement peak");
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(vec![replacement])
+                .expect_err("replacement peak N-1 should fail"),
+            RulesLimitSurface::Replacement.message(),
+        );
+        let state = store.read_state().expect("state should remain readable");
+        assert_eq!(state.groups[0].name, initial.name);
+    }
+
+    #[test]
+    fn retained_accounting_uses_owned_string_and_vector_capacities() {
+        let tight = sample_recording_group("capacity", "capacity_recording");
+        let tight_store = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        tight_store
+            .apply_groups(vec![tight])
+            .expect("tight state should apply");
+        let tight_bytes = tight_store.accounting.snapshot().retained_state_bytes;
+
+        let mut name = String::with_capacity(4 * 1024);
+        name.push_str("capacity");
+        let mut record = String::with_capacity(4 * 1024);
+        record.push_str("capacity_recording");
+        let mut rules = Vec::with_capacity(8);
+        rules.push(RuleSpec::Recording(RecordingRuleSpec {
+            record,
+            expr: "source_metric".to_string(),
+            interval_secs: None,
+            labels: BTreeMap::new(),
+        }));
+        let spare_group = RuleGroupSpec {
+            name,
+            tenant_id: "team-a".to_string(),
+            interval_secs: 60,
+            labels: BTreeMap::new(),
+            rules,
+        };
+        let mut groups = Vec::with_capacity(8);
+        groups.push(spare_group);
+        let spare_bytes = modeled_groups_bytes(&groups)
+            .saturating_add(std::mem::size_of::<PersistedRulesStoreState>());
+        assert!(saturating_u64(spare_bytes) > tight_bytes);
+
+        let mut limits = test_store_limits();
+        limits.max_total_retained_state_bytes =
+            usize::try_from(tight_bytes).expect("tight bytes should fit usize");
+        let store =
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open");
+        assert_rules_limit_rejection(
+            store
+                .apply_groups(groups)
+                .expect_err("spare caller capacity must be retained-accounted"),
+            RulesLimitSurface::RetainedState.message(),
+        );
+    }
+
+    #[test]
+    fn startup_read_decode_and_retained_peaks_are_bounded_exactly() {
+        let source = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        source
+            .apply_groups(vec![sample_recording_group("startup", "startup_recording")])
+            .expect("fixture state should apply");
+        let fixture_state = source
+            .read_state()
+            .expect("fixture state should be readable")
+            .clone();
+        let fixture_dir = tempdir().expect("fixture directory should build");
+        let raw = write_rules_fixture(fixture_dir.path(), &fixture_state);
+        let decoded_upper =
+            preflight_rules_json(&raw).expect("fixture JSON should pass structural preflight");
+        let exact_startup_peak = raw.len().saturating_add(decoded_upper);
+
+        let mut exact_limits = test_store_limits();
+        exact_limits.max_startup_transient_bytes = exact_startup_peak;
+        let exact = RulesStore::open_with_limits(Some(fixture_dir.path()), None, exact_limits)
+            .expect("startup transient bytes N should pass");
+        assert_eq!(
+            exact.accounting.snapshot().peak_startup_transient_bytes,
+            saturating_u64(exact_startup_peak)
+        );
+        assert_eq!(
+            exact
+                .read_state()
+                .expect("reopened state should be readable")
+                .groups
+                .len(),
+            1
+        );
+
+        let mut one_under_limits = exact_limits;
+        one_under_limits.max_startup_transient_bytes = exact_startup_peak - 1;
+        let error = RulesStore::open_with_limits(Some(fixture_dir.path()), None, one_under_limits)
+            .err()
+            .expect("startup transient bytes N-1 should fail");
+        assert_eq!(error, RulesLimitSurface::Startup.message());
+    }
+
+    #[test]
+    fn corrupt_oversized_and_deep_rules_startup_inputs_fail_closed_without_echo() {
+        let corrupt = tempdir().expect("corrupt directory should build");
+        let attacker = "startup-secret-marker";
+        std::fs::write(
+            corrupt.path().join(RULES_STORE_FILE_NAME),
+            format!("{{\"{attacker}\":"),
+        )
+        .expect("corrupt fixture should write");
+        let error = RulesStore::open_with_limits(Some(corrupt.path()), None, test_store_limits())
+            .err()
+            .expect("corrupt startup should fail");
+        assert!(!error.contains(attacker));
+        assert!(error.len() <= RULES_MAX_DIAGNOSTIC_BYTES);
+
+        let oversized = tempdir().expect("oversized directory should build");
+        std::fs::write(oversized.path().join(RULES_STORE_FILE_NAME), vec![b'x'; 65])
+            .expect("oversized fixture should write");
+        let mut limits = test_store_limits();
+        limits.max_durable_file_bytes = 64;
+        let error = RulesStore::open_with_limits(Some(oversized.path()), None, limits)
+            .err()
+            .expect("oversized startup should fail");
+        assert_eq!(error, RulesLimitSurface::DurableFile.message());
+
+        let deep = tempdir().expect("deep directory should build");
+        let mut deeply_nested = vec![b'['; RULES_STARTUP_MAX_JSON_DEPTH + 1];
+        deeply_nested.extend(std::iter::repeat_n(b']', RULES_STARTUP_MAX_JSON_DEPTH + 1));
+        std::fs::write(deep.path().join(RULES_STORE_FILE_NAME), deeply_nested)
+            .expect("deep fixture should write");
+        let error = RulesStore::open_with_limits(Some(deep.path()), None, test_store_limits())
+            .err()
+            .expect("deep startup should fail");
+        assert_eq!(error, "rules store JSON exceeds its nesting-depth limit");
+    }
+
+    #[test]
+    fn runtime_update_and_alert_growth_limits_are_exact_and_atomic() {
+        let group = sample_alert_group("alerts", "HighUsage");
+        let measured = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        measured
+            .apply_groups(vec![group.clone()])
+            .expect("alert group should apply");
+        let (rule_id, fingerprint) = configured_runtime_identity(&measured);
+        measured
+            .apply_runtime_updates(vec![(rule_id, alert_runtime_update(fingerprint, 1))])
+            .expect("measurement update should apply");
+        let exact_peak = usize::try_from(
+            measured
+                .accounting
+                .snapshot()
+                .peak_runtime_update_transient_bytes,
+        )
+        .expect("runtime peak should fit usize");
+        assert!(exact_peak > 1);
+
+        let mut exact_limits = test_store_limits();
+        exact_limits.max_runtime_update_transient_bytes = exact_peak;
+        let exact =
+            RulesStore::open_with_limits(None, None, exact_limits).expect("store should open");
+        exact
+            .apply_groups(vec![group.clone()])
+            .expect("alert group should apply");
+        let (rule_id, fingerprint) = configured_runtime_identity(&exact);
+        assert_eq!(
+            exact
+                .apply_runtime_updates(vec![(rule_id, alert_runtime_update(fingerprint, 1),)])
+                .expect("runtime update bytes N should pass"),
+            1
+        );
+
+        let mut one_under_limits = exact_limits;
+        one_under_limits.max_runtime_update_transient_bytes = exact_peak - 1;
+        let one_under =
+            RulesStore::open_with_limits(None, None, one_under_limits).expect("store should open");
+        one_under
+            .apply_groups(vec![group.clone()])
+            .expect("alert group should apply");
+        let (rule_id, fingerprint) = configured_runtime_identity(&one_under);
+        let error = one_under
+            .apply_runtime_updates(vec![(
+                rule_id.clone(),
+                alert_runtime_update(fingerprint, 1),
+            )])
+            .expect_err("runtime update bytes N-1 should fail");
+        assert_eq!(
+            error.to_string(),
+            RulesLimitSurface::RuntimeUpdate.message()
+        );
+        assert!(one_under
+            .read_state()
+            .expect("state should remain readable")
+            .runtime
+            .get(&rule_id)
+            .expect("runtime should remain configured")
+            .alert_instances
+            .is_empty());
+
+        let mut count_limits = test_store_limits();
+        count_limits.max_alert_instances_per_rule = 1;
+        let count_store =
+            RulesStore::open_with_limits(None, None, count_limits).expect("store should open");
+        count_store
+            .apply_groups(vec![group])
+            .expect("alert group should apply");
+        let (rule_id, fingerprint) = configured_runtime_identity(&count_store);
+        assert_eq!(
+            count_store
+                .apply_runtime_updates(vec![(
+                    rule_id.clone(),
+                    alert_runtime_update(fingerprint, 1),
+                )])
+                .expect("alert count N should pass"),
+            1
+        );
+        let error = count_store
+            .apply_runtime_updates(vec![(
+                rule_id.clone(),
+                alert_runtime_update(fingerprint, 2),
+            )])
+            .expect_err("alert count N+1 should fail");
+        assert_eq!(
+            error.to_string(),
+            RulesLimitSurface::RuntimeUpdate.message()
+        );
+        assert_eq!(
+            count_store
+                .read_state()
+                .expect("state should remain readable")
+                .runtime
+                .get(&rule_id)
+                .expect("runtime should remain configured")
+                .alert_instances
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_runtime_updates_cannot_spend_the_same_final_retained_bytes() {
+        let mut group = sample_alert_group("alerts", "HighUsage");
+        group.rules.push(RuleSpec::Alert(AlertRuleSpec {
+            alert: "HighLatency".to_string(),
+            expr: "source_metric > 0".to_string(),
+            interval_secs: None,
+            for_secs: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        }));
+        group.rules.shrink_to_fit();
+
+        let measured = RulesStore::open_with_limits(None, None, test_store_limits())
+            .expect("store should open");
+        measured
+            .apply_groups(vec![group.clone()])
+            .expect("measurement group should apply");
+        let state = measured.read_state().expect("state should be readable");
+        let identities = state
+            .runtime
+            .iter()
+            .map(|(rule_id, runtime)| (rule_id.clone(), runtime.fingerprint))
+            .collect::<Vec<_>>();
+        assert_eq!(identities.len(), 2);
+        drop(state);
+        measured
+            .apply_runtime_updates(vec![(
+                identities[0].0.clone(),
+                alert_runtime_update(identities[0].1, 1),
+            )])
+            .expect("first measurement update should apply");
+        let first_update_bytes = modeled_rules_state_bytes(
+            &measured
+                .read_state()
+                .expect("first measurement state should be readable"),
+        );
+        measured
+            .apply_runtime_updates(vec![(
+                identities[1].0.clone(),
+                alert_runtime_update(identities[1].1, 1),
+            )])
+            .expect("second measurement update should apply");
+        let both_update_bytes = modeled_rules_state_bytes(
+            &measured
+                .read_state()
+                .expect("combined measurement state should be readable"),
+        );
+        assert!(both_update_bytes > first_update_bytes);
+
+        let mut limits = test_store_limits();
+        limits.max_total_retained_state_bytes = first_update_bytes;
+        let store = Arc::new(
+            RulesStore::open_with_limits(None, None, limits).expect("bounded store should open"),
+        );
+        store
+            .apply_groups(vec![group])
+            .expect("baseline group should apply");
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = identities
+            .into_iter()
+            .map(|(rule_id, fingerprint)| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.apply_runtime_updates(vec![(
+                        rule_id,
+                        alert_runtime_update(fingerprint, 1),
+                    )])
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("runtime update thread should join"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "concurrent update results: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result.as_ref().is_err_and(|error| {
+                        error.to_string() == RulesLimitSurface::RuntimeUpdate.message()
+                    })
+                })
+                .count(),
+            1
+        );
+        let state = store.read_state().expect("state should remain readable");
+        assert_eq!(
+            state
+                .runtime
+                .values()
+                .map(|runtime| runtime.alert_instances.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(modeled_rules_state_bytes(&state) <= limits.max_total_retained_state_bytes);
+        let accounting = store.accounting.snapshot();
+        assert_eq!(accounting.runtime_update_rejections_total, 1);
+        assert_eq!(
+            accounting.retained_state_bytes,
+            saturating_u64(first_update_bytes)
+        );
+    }
+
+    #[test]
+    fn status_output_limit_is_exact_and_caller_owned() {
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let config = RulesRuntimeConfig {
+            store_limits: test_store_limits(),
+            max_alert_instances_per_rule: test_store_limits().max_alert_instances_per_rule,
+            ..RulesRuntimeConfig::default()
+        };
+        let measured = RulesRuntime::open_with_config(
+            None,
+            Arc::clone(&storage),
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            config,
+        )
+        .expect("runtime should open");
+        let mut measured_snapshot = measured
+            .apply_groups(vec![sample_recording_group("status", "status_recording")])
+            .expect("measurement group should apply");
+        let measured_body = measured
+            .encode_success_snapshot(&mut measured_snapshot)
+            .expect("measurement status should encode");
+        assert!(measured_body.len() <= crate::http::MAX_BODY_BYTES);
+        let measured_json: serde_json::Value = serde_json::from_slice(&measured_body)
+            .expect("measurement status should be valid JSON");
+        assert_eq!(measured_json["status"], "success");
+        let exact_output = usize::try_from(
+            measured
+                .store
+                .accounting
+                .snapshot()
+                .peak_snapshot_status_bytes,
+        )
+        .expect("status output should fit usize");
+
+        let exact_config = RulesRuntimeConfig {
+            store_limits: RulesStoreLimits {
+                max_snapshot_status_bytes: exact_output,
+                ..test_store_limits()
+            },
+            max_alert_instances_per_rule: test_store_limits().max_alert_instances_per_rule,
+            ..RulesRuntimeConfig::default()
+        };
+        let exact = RulesRuntime::open_with_config(
+            None,
+            Arc::clone(&storage),
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            exact_config,
+        )
+        .expect("runtime should open");
+        let mut snapshot = exact
+            .apply_groups(vec![sample_recording_group("status", "status_recording")])
+            .expect("status snapshot allocation should pass");
+        let body = exact
+            .encode_success_snapshot(&mut snapshot)
+            .expect("snapshot plus encoded response bytes N should pass");
+        assert!(body.len() <= crate::http::MAX_BODY_BYTES);
+        assert_eq!(
+            snapshot.metrics.peak_snapshot_status_bytes,
+            saturating_u64(exact_output)
+        );
+
+        let one_under_config = RulesRuntimeConfig {
+            store_limits: RulesStoreLimits {
+                max_snapshot_status_bytes: exact_output - 1,
+                ..test_store_limits()
+            },
+            max_alert_instances_per_rule: test_store_limits().max_alert_instances_per_rule,
+            ..RulesRuntimeConfig::default()
+        };
+        let one_under = RulesRuntime::open_with_config(
+            None,
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            one_under_config,
+        )
+        .expect("runtime should open");
+        one_under
+            .store
+            .apply_groups(vec![sample_recording_group("status", "status_recording")])
+            .expect("state publication should fit independently");
+        let mut snapshot = one_under
+            .snapshot()
+            .expect("snapshot allocation should fit below the combined response peak");
+        let error = one_under
+            .encode_success_snapshot(&mut snapshot)
+            .expect_err("snapshot plus encoded response bytes N-1 should fail");
+        assert_eq!(error, RulesLimitSurface::SnapshotStatus.message());
+        assert_eq!(
+            one_under
+                .store
+                .accounting
+                .snapshot()
+                .snapshot_rejections_total,
+            1
+        );
     }
 
     #[test]
@@ -2024,10 +4367,78 @@ mod tests {
             std::fs::read(&store_path).expect("persisted rules should remain readable"),
             initial_bytes
         );
+        let rules_accounting = runtime.store.accounting.snapshot();
+        assert_eq!(rules_accounting.persistence_failures_total, 1);
+        assert_eq!(
+            rules_accounting.durable_file_bytes,
+            u64::try_from(initial_bytes.len()).expect("initial file length should fit u64")
+        );
         let disk = budget.snapshot();
         assert_eq!(disk.active_reservations, 0);
         assert_eq!(disk.reserved_bytes, 0);
         assert_eq!(disk.rejections_total, 1);
+    }
+
+    #[test]
+    fn runtime_persistence_failure_stays_typed_and_does_not_publish() {
+        let temp_dir = tempdir().expect("temp dir should build");
+        let group = sample_alert_group("alerts", "HighUsage");
+        let bootstrap =
+            RulesStore::open(Some(temp_dir.path())).expect("bootstrap store should open");
+        bootstrap
+            .apply_groups(vec![group])
+            .expect("initial alert rule should persist");
+        drop(bootstrap);
+
+        let store_path = temp_dir.path().join(RULES_STORE_FILE_NAME);
+        let initial_bytes = std::fs::read(&store_path).expect("initial state should be readable");
+        let budget = LocalDiskBudget::open(
+            temp_dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(
+                    u64::try_from(initial_bytes.len())
+                        .expect("initial length should fit u64")
+                        .saturating_add(1),
+                ),
+                ..tsink::LocalDiskLimits::default()
+            },
+        )
+        .expect("disk budget should open");
+        let store = RulesStore::open_with_limits(
+            Some(temp_dir.path()),
+            Some(Arc::clone(&budget)),
+            test_store_limits(),
+        )
+        .expect("bounded store should reopen");
+        let before = store.accounting.snapshot();
+        let (rule_id, fingerprint) = configured_runtime_identity(&store);
+        let error = store
+            .apply_runtime_updates(vec![(
+                rule_id.clone(),
+                alert_runtime_update(fingerprint, 1),
+            )])
+            .expect_err("runtime persistence should exceed atomic-write quota");
+        assert!(matches!(
+            error,
+            RulesStoreError::Persistence(tsink::TsinkError::DiskQuotaExceeded { .. })
+        ));
+        let state = store.read_state().expect("state should remain readable");
+        assert!(state
+            .runtime
+            .get(&rule_id)
+            .expect("runtime should remain configured")
+            .alert_instances
+            .is_empty());
+        drop(state);
+        assert_eq!(
+            std::fs::read(&store_path).expect("durable state should remain readable"),
+            initial_bytes
+        );
+        let after = store.accounting.snapshot();
+        assert_eq!(after.retained_state_bytes, before.retained_state_bytes);
+        assert_eq!(after.durable_file_bytes, before.durable_file_bytes);
+        assert_eq!(after.persistence_failures_total, 1);
+        assert_eq!(budget.snapshot().active_reservations, 0);
     }
 
     #[test]
@@ -2075,7 +4486,17 @@ mod tests {
         runtime
             .snapshot_into(snapshot_dir.path())
             .expect("external snapshot should succeed");
-        assert!(snapshot_dir.path().join(RULES_STORE_FILE_NAME).exists());
+        let snapshot_file = snapshot_dir.path().join(RULES_STORE_FILE_NAME);
+        assert!(snapshot_file.exists());
+        assert_eq!(
+            std::fs::metadata(&snapshot_file)
+                .expect("snapshot file should be readable")
+                .len(),
+            store_bytes
+        );
+        let live_status = runtime.snapshot().expect("live status should be readable");
+        assert_eq!(live_status.metrics.durable_file_bytes, store_bytes);
+        assert!(live_status.metrics.peak_snapshot_file_bytes > store_bytes);
         assert_eq!(budget.snapshot().accounted_bytes, store_bytes);
 
         drop(runtime);
@@ -2100,6 +4521,9 @@ mod tests {
         let snapshot = reopened.snapshot().expect("reopened state should load");
         assert_eq!(snapshot.groups.len(), 1);
         assert_eq!(snapshot.groups[0].name, expected_group.name);
+        assert_eq!(snapshot.metrics.durable_file_bytes, store_bytes);
+        assert!(snapshot.metrics.retained_state_bytes > 0);
+        assert!(snapshot.metrics.peak_startup_transient_bytes >= store_bytes);
         assert_eq!(reopened_budget.snapshot().accounted_bytes, store_bytes);
     }
 

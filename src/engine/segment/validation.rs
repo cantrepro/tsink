@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use crate::engine::fs_utils::{path_exists_no_follow, rename_and_sync_parents, stage_dir_path};
+use crate::engine::fs_utils::{
+    path_exists_no_follow, rename_noreplace_and_sync_parents, stage_dir_path,
+};
 use crate::{Result, TsinkError};
 
 use super::LoadedSegment;
@@ -64,7 +66,7 @@ pub(crate) fn segment_validation_error(
     ))
 }
 
-fn validate_exact_segment_entries_no_follow(root: &Path) -> Result<()> {
+pub(super) fn validate_exact_segment_entries_no_follow(root: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(root).map_err(|source| TsinkError::IoWithPath {
         path: root.to_path_buf(),
         source,
@@ -182,7 +184,7 @@ pub(crate) fn quarantine_segment_root(
     purpose: &str,
 ) -> Result<QuarantinedSegmentRoot> {
     let quarantine_root = stage_dir_path(segment_root, purpose)?;
-    match rename_and_sync_parents(segment_root, &quarantine_root) {
+    match rename_noreplace_and_sync_parents(segment_root, &quarantine_root) {
         Ok(()) => Ok(QuarantinedSegmentRoot {
             path: quarantine_root,
             sync_failed: false,

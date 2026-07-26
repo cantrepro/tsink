@@ -315,10 +315,13 @@ impl ChunkStorage {
                 "postcommit rollup snapshot cleanup debt: {error}"
             )));
         }
+        // Snapshot before releasing the run lock so the background worker cannot begin a new
+        // traversal and reset the completion fields returned for this policy application.
+        let result = self.rollup_observability_snapshot_with_progress(progress);
         drop(_run_guard);
         drop(write_permits);
         self.enforce_post_commit_memory_budget_best_effort();
-        Ok(self.rollup_observability_snapshot_with_progress(progress))
+        Ok(result)
     }
 
     pub(in crate::engine) fn rollup_query_candidate(

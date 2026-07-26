@@ -2539,8 +2539,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.0",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "tsink-protocol"
+version = "0.10.2"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
 ]
 
 [[package]]
@@ -2551,8 +2561,6 @@ dependencies = [
  "chrono",
  "clap",
  "prost",
- "prost-build",
- "protoc-bin-vendored",
  "regex",
  "reqwest",
  "ring",
@@ -2566,8 +2574,20 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tsink",
+ "tsink-protocol",
  "x509-parser",
  "xxhash-rust",
+]
+
+[[package]]
+name = "tsink-test"
+version = "0.10.2"
+dependencies = [
+ "prost",
+ "snap",
+ "tempfile",
+ "tsink",
+ "tsink-protocol",
 ]
 
 [[package]]

@@ -80,6 +80,152 @@ pub struct SeriesPoints {
     pub points: Vec<DataPoint>,
 }
 
+/// Result of an execution-aware batch selection.
+///
+/// Built-in backends that report [`QueryExecutionAccounting::Complete`] return one
+/// `matched_selectors` bit for every input selector, in input order. The bit distinguishes an
+/// existing series with no points in the requested time range from a missing series. Compatibility
+/// backends may return `None`.
+#[derive(Debug)]
+pub struct SelectManyExecutionResult {
+    /// One result for every requested selector, in input order.
+    pub series: Vec<SeriesPoints>,
+    /// Exact series-existence bits aligned with `series`, when the backend exposes them.
+    pub matched_selectors: Option<Vec<bool>>,
+    memory_reservation: Option<crate::QueryMemoryReservation>,
+}
+
+impl SelectManyExecutionResult {
+    /// Creates a compatibility result without exact existence metadata or a retained-memory
+    /// reservation.
+    #[must_use]
+    pub fn unaccounted(series: Vec<SeriesPoints>) -> Self {
+        Self {
+            series,
+            matched_selectors: None,
+            memory_reservation: None,
+        }
+    }
+
+    /// Creates a completely accounted result whose memory remains reserved while it is owned.
+    #[must_use]
+    pub fn accounted(
+        series: Vec<SeriesPoints>,
+        matched_selectors: Vec<bool>,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            series,
+            matched_selectors: Some(matched_selectors),
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Creates a compatibility result whose returned allocation remains query-memory-accounted.
+    #[must_use]
+    pub fn reserved_unaccounted(
+        series: Vec<SeriesPoints>,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            series,
+            matched_selectors: None,
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Returns the bytes retained on behalf of this result.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation
+            .as_ref()
+            .map_or(0, crate::QueryMemoryReservation::bytes)
+    }
+
+    /// Removes and returns the reservation so a wrapper can replace it with its own accounting.
+    #[must_use]
+    pub fn take_memory_reservation(&mut self) -> Option<crate::QueryMemoryReservation> {
+        self.memory_reservation.take()
+    }
+
+    /// Consumes the detailed result and returns the compatibility series vector.
+    ///
+    /// This drops the retained reservation and is only appropriate for compatibility paths or
+    /// callers that already own accounting for the returned allocation. Bounded wrappers must
+    /// take and transfer/adopt the reservation before extracting the series.
+    #[must_use]
+    pub fn into_series(self) -> Vec<SeriesPoints> {
+        self.series
+    }
+}
+
+/// Execution-aware metadata selection whose returned allocation remains query-memory-accounted.
+#[derive(Debug)]
+pub struct SelectSeriesExecutionResult {
+    /// Matched series in the storage operation's deterministic order.
+    pub series: Vec<MetricSeries>,
+    memory_reservation: Option<crate::QueryMemoryReservation>,
+}
+
+impl SelectSeriesExecutionResult {
+    /// Creates a compatibility result without a retained-memory reservation.
+    #[must_use]
+    pub fn unaccounted(series: Vec<MetricSeries>) -> Self {
+        Self {
+            series,
+            memory_reservation: None,
+        }
+    }
+
+    /// Creates a completely accounted result whose memory remains reserved while it is owned.
+    #[must_use]
+    pub fn accounted(
+        series: Vec<MetricSeries>,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            series,
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Creates a compatibility metadata result whose allocation remains query-memory-accounted.
+    #[must_use]
+    pub fn reserved_unaccounted(
+        series: Vec<MetricSeries>,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            series,
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Returns the bytes retained on behalf of this result.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation
+            .as_ref()
+            .map_or(0, crate::QueryMemoryReservation::bytes)
+    }
+
+    /// Removes and returns the reservation so a wrapper can replace it with its own accounting.
+    #[must_use]
+    pub fn take_memory_reservation(&mut self) -> Option<crate::QueryMemoryReservation> {
+        self.memory_reservation.take()
+    }
+
+    /// Consumes the detailed result and returns the compatibility series vector.
+    ///
+    /// This drops the retained reservation and is only appropriate for compatibility paths or
+    /// callers that already own accounting for the returned allocation. Bounded wrappers must
+    /// take and transfer/adopt the reservation before extracting the series.
+    #[must_use]
+    pub fn into_series(self) -> Vec<MetricSeries> {
+        self.series
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SeriesMatcherOp {
     Equal,
@@ -134,6 +280,165 @@ pub struct SeriesSelection {
     pub end: Option<i64>,
 }
 
+/// Stable validation failure for a structured [`SeriesSelection`].
+///
+/// Protocol and distributed adapters can map this type to a client-input error without
+/// conflating it with storage configuration failures. Diagnostics contain only bounded indexes
+/// and byte counts; submitted regex text is never echoed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeriesSelectionValidationError {
+    MetricRequired,
+    MetricTooLong {
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidMetricName,
+    TooManyMatchers {
+        actual: usize,
+        maximum: usize,
+    },
+    EmptyMatcherName {
+        matcher_index: usize,
+    },
+    MatcherNameTooLong {
+        matcher_index: usize,
+        actual: usize,
+        maximum: usize,
+    },
+    MatcherValueTooLong {
+        matcher_index: usize,
+        actual: usize,
+        maximum: usize,
+    },
+    MatcherBytesTooLong {
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidMatcherRegex {
+        matcher_index: usize,
+    },
+    InvalidTimeRange {
+        start: i64,
+        end: i64,
+    },
+    IncompleteTimeRange,
+}
+
+impl std::fmt::Display for SeriesSelectionValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MetricRequired => formatter.write_str("series selection metric cannot be empty"),
+            Self::MetricTooLong { actual, maximum } => write!(
+                formatter,
+                "series selection metric is {actual} bytes, exceeding the hard limit {maximum}"
+            ),
+            Self::InvalidMetricName => {
+                formatter.write_str("series selection metric name is invalid")
+            }
+            Self::TooManyMatchers { actual, maximum } => write!(
+                formatter,
+                "series selection has {actual} matchers, exceeding the hard limit {maximum}"
+            ),
+            Self::EmptyMatcherName { matcher_index } => write!(
+                formatter,
+                "series matcher at index {matcher_index} has an empty label name"
+            ),
+            Self::MatcherNameTooLong {
+                matcher_index,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "series matcher at index {matcher_index} has a {actual}-byte label name, exceeding the hard limit {maximum}"
+            ),
+            Self::MatcherValueTooLong {
+                matcher_index,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "series matcher at index {matcher_index} has a {actual}-byte value, exceeding the hard limit {maximum}"
+            ),
+            Self::MatcherBytesTooLong { actual, maximum } => write!(
+                formatter,
+                "series selection matcher names and values total {actual} bytes, exceeding the hard limit {maximum}"
+            ),
+            Self::InvalidMatcherRegex { matcher_index } => write!(
+                formatter,
+                "series matcher at index {matcher_index} has an invalid or overly complex regex"
+            ),
+            Self::InvalidTimeRange { start, end } => write!(
+                formatter,
+                "invalid series selection time range: start ({start}) must be before end ({end})"
+            ),
+            Self::IncompleteTimeRange => formatter.write_str(
+                "series selection requires both start and end when time range filtering is enabled",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SeriesSelectionValidationError {}
+
+impl From<SeriesSelectionValidationError> for TsinkError {
+    fn from(error: SeriesSelectionValidationError) -> Self {
+        match error {
+            SeriesSelectionValidationError::MetricRequired => Self::MetricRequired,
+            SeriesSelectionValidationError::MetricTooLong { actual, maximum } => {
+                Self::InvalidMetricName(format!(
+                    "metric name too long: {actual} bytes (max {maximum})"
+                ))
+            }
+            SeriesSelectionValidationError::InvalidMetricName => {
+                Self::InvalidMetricName("metric name is invalid".to_string())
+            }
+            SeriesSelectionValidationError::InvalidTimeRange { start, end } => {
+                Self::InvalidTimeRange { start, end }
+            }
+            other => Self::InvalidConfiguration(other.to_string()),
+        }
+    }
+}
+
+/// Failure while preparing a [`SeriesSelection`] under a [`QueryExecution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeriesSelectionPreparationError {
+    Validation(SeriesSelectionValidationError),
+    Query(crate::QueryBudgetError),
+}
+
+impl std::fmt::Display for SeriesSelectionPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SeriesSelectionPreparationError {}
+
+impl From<SeriesSelectionPreparationError> for TsinkError {
+    fn from(error: SeriesSelectionPreparationError) -> Self {
+        match error {
+            SeriesSelectionPreparationError::Validation(error) => error.into(),
+            SeriesSelectionPreparationError::Query(error) => Self::QueryBudget(error),
+        }
+    }
+}
+
+/// Retained regex-program and query-memory guard for a validated series selection.
+///
+/// Keep this value alive through cache-key construction, request cloning, planning, and matcher
+/// use. Dropping it releases all memory charged by [`SeriesSelection::prepare_with_execution`].
+#[must_use = "dropping the preparation releases its query-memory reservation"]
+pub struct SeriesSelectionPreparation {
+    _regexes: Vec<crate::query_matcher::ExecutionBoundedRegex>,
+    _slots_reservation: crate::QueryMemoryReservation,
+}
+
 impl SeriesSelection {
     #[must_use]
     pub fn new() -> Self {
@@ -165,20 +470,380 @@ impl SeriesSelection {
         self
     }
 
-    pub(crate) fn normalized_time_range(&self) -> Result<Option<(i64, i64)>> {
+    /// Validates metric, matcher, regex, and time-range shape without accessing storage.
+    ///
+    /// This performs bounded regex compilation so adapters can reject malformed or overly
+    /// complex patterns before cache-key construction, fanout planning, or request cloning.
+    pub fn validate(&self) -> std::result::Result<(), SeriesSelectionValidationError> {
+        self.validate_shape_and_time()?;
+        for (matcher_index, matcher) in self.matchers.iter().enumerate() {
+            if matches!(
+                matcher.op,
+                SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch
+            ) && crate::query_matcher::build_bounded_regex(
+                &matcher.value,
+                crate::query_matcher::RegexAnchoring::Anchored,
+            )
+            .is_err()
+            {
+                return Err(SeriesSelectionValidationError::InvalidMatcherRegex { matcher_index });
+            }
+        }
+        Ok(())
+    }
+
+    /// Performs allocation-free metric, matcher-shape, and time-range validation.
+    ///
+    /// This does not compile regexes. Execution-aware callers should follow it with
+    /// [`Self::prepare_with_execution`] and retain the returned guard through downstream use.
+    pub fn validate_shape(&self) -> std::result::Result<(), SeriesSelectionValidationError> {
+        self.validate_shape_and_time().map(|_| ())
+    }
+
+    /// Validates and compiles regex matchers under `execution` memory and control limits.
+    ///
+    /// Compiler scratch is admitted before each compile and released afterward. Compiled
+    /// programs and their bounded lazy-DFA caches remain charged until the returned guard drops.
+    pub fn prepare_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> std::result::Result<SeriesSelectionPreparation, SeriesSelectionPreparationError> {
+        self.validate_shape_and_time()
+            .map_err(SeriesSelectionPreparationError::Validation)?;
+        execution
+            .checkpoint()
+            .map_err(SeriesSelectionPreparationError::Query)?;
+        let regex_count = self
+            .matchers
+            .iter()
+            .filter(|matcher| {
+                matches!(
+                    matcher.op,
+                    SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch
+                )
+            })
+            .count();
+        let slots_reservation = execution
+            .reserve_memory(crate::query_matcher::modeled_execution_regex_slots_bytes(
+                regex_count,
+            ))
+            .map_err(SeriesSelectionPreparationError::Query)?;
+        let mut regexes = Vec::with_capacity(regex_count);
+        for (matcher_index, matcher) in self.matchers.iter().enumerate() {
+            if !matches!(
+                matcher.op,
+                SeriesMatcherOp::RegexMatch | SeriesMatcherOp::RegexNoMatch
+            ) {
+                continue;
+            }
+            let regex = crate::query_matcher::prepare_bounded_regex_with_execution(
+                &matcher.value,
+                crate::query_matcher::RegexAnchoring::Anchored,
+                execution,
+            )
+            .map_err(|error| match error {
+                crate::query_matcher::BoundedRegexPreparationError::Regex(_) => {
+                    SeriesSelectionPreparationError::Validation(
+                        SeriesSelectionValidationError::InvalidMatcherRegex { matcher_index },
+                    )
+                }
+                crate::query_matcher::BoundedRegexPreparationError::Query(error) => {
+                    SeriesSelectionPreparationError::Query(error)
+                }
+            })?;
+            regexes.push(regex);
+        }
+        Ok(SeriesSelectionPreparation {
+            _regexes: regexes,
+            _slots_reservation: slots_reservation,
+        })
+    }
+
+    pub(crate) fn validate_shape_and_time(
+        &self,
+    ) -> std::result::Result<Option<(i64, i64)>, SeriesSelectionValidationError> {
+        if let Some(metric) = self.metric.as_deref() {
+            if metric.is_empty() {
+                return Err(SeriesSelectionValidationError::MetricRequired);
+            }
+            if metric.len() > crate::label::MAX_METRIC_NAME_LEN {
+                return Err(SeriesSelectionValidationError::MetricTooLong {
+                    actual: metric.len(),
+                    maximum: crate::label::MAX_METRIC_NAME_LEN,
+                });
+            }
+            if crate::validation::validate_metric(metric).is_err() {
+                return Err(SeriesSelectionValidationError::InvalidMetricName);
+            }
+        }
+        crate::query_matcher::validate_matcher_shapes(
+            self.matchers.len(),
+            self.matchers
+                .iter()
+                .map(|matcher| (matcher.name.as_str(), matcher.value.as_str())),
+        )
+        .map_err(|error| match error {
+            crate::query_matcher::MatcherShapeError::TooManyMatchers { actual } => {
+                SeriesSelectionValidationError::TooManyMatchers {
+                    actual,
+                    maximum: crate::MAX_SERIES_SELECTION_MATCHERS,
+                }
+            }
+            crate::query_matcher::MatcherShapeError::EmptyName { index } => {
+                SeriesSelectionValidationError::EmptyMatcherName {
+                    matcher_index: index,
+                }
+            }
+            crate::query_matcher::MatcherShapeError::NameTooLong { index, actual } => {
+                SeriesSelectionValidationError::MatcherNameTooLong {
+                    matcher_index: index,
+                    actual,
+                    maximum: crate::MAX_SERIES_MATCHER_NAME_BYTES,
+                }
+            }
+            crate::query_matcher::MatcherShapeError::ValueTooLong { index, actual } => {
+                SeriesSelectionValidationError::MatcherValueTooLong {
+                    matcher_index: index,
+                    actual,
+                    maximum: crate::MAX_SERIES_MATCHER_VALUE_BYTES,
+                }
+            }
+            crate::query_matcher::MatcherShapeError::TotalTooLong { actual } => {
+                SeriesSelectionValidationError::MatcherBytesTooLong {
+                    actual,
+                    maximum: crate::MAX_SERIES_SELECTION_MATCHER_BYTES,
+                }
+            }
+        })?;
+
         match (self.start, self.end) {
             (None, None) => Ok(None),
+            (Some(start), Some(end)) if start < end => Ok(Some((start, end))),
             (Some(start), Some(end)) => {
-                if start >= end {
-                    return Err(TsinkError::InvalidTimeRange { start, end });
-                }
-                Ok(Some((start, end)))
+                Err(SeriesSelectionValidationError::InvalidTimeRange { start, end })
             }
-            _ => Err(TsinkError::InvalidConfiguration(
-                "series selection requires both start and end when time range filtering is enabled"
-                    .to_string(),
-            )),
+            _ => Err(SeriesSelectionValidationError::IncompleteTimeRange),
         }
+    }
+
+    pub(crate) fn normalized_time_range(&self) -> Result<Option<(i64, i64)>> {
+        self.validate_shape_and_time().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod series_selection_validation_tests {
+    use super::*;
+    use crate::{
+        QueryBudgetError, QueryLimitReason, MAX_QUERY_REGEX_DIAGNOSTIC_BYTES,
+        MAX_SERIES_MATCHER_NAME_BYTES, MAX_SERIES_MATCHER_VALUE_BYTES,
+        MAX_SERIES_SELECTION_MATCHERS, MAX_SERIES_SELECTION_MATCHER_BYTES,
+    };
+    use std::time::Instant;
+
+    #[test]
+    fn public_validation_accepts_exact_matcher_shape_limits_and_returns_typed_one_over_errors() {
+        let exact_count = SeriesSelection::new().with_matchers(vec![
+            SeriesMatcher::equal("n", "");
+            MAX_SERIES_SELECTION_MATCHERS
+        ]);
+        assert!(exact_count.validate_shape().is_ok());
+        let one_over_count =
+            SeriesSelection::new().with_matchers(vec![
+                SeriesMatcher::equal("n", "");
+                MAX_SERIES_SELECTION_MATCHERS + 1
+            ]);
+        assert!(matches!(
+            one_over_count.validate_shape(),
+            Err(SeriesSelectionValidationError::TooManyMatchers {
+                actual,
+                maximum
+            }) if actual == MAX_SERIES_SELECTION_MATCHERS + 1
+                && maximum == MAX_SERIES_SELECTION_MATCHERS
+        ));
+
+        let exact_name = SeriesSelection::new().with_matcher(SeriesMatcher::equal(
+            "n".repeat(MAX_SERIES_MATCHER_NAME_BYTES),
+            "",
+        ));
+        assert!(exact_name.validate_shape().is_ok());
+        let one_over_name = SeriesSelection::new().with_matcher(SeriesMatcher::equal(
+            "n".repeat(MAX_SERIES_MATCHER_NAME_BYTES + 1),
+            "",
+        ));
+        assert!(matches!(
+            one_over_name.validate_shape(),
+            Err(SeriesSelectionValidationError::MatcherNameTooLong {
+                matcher_index: 0,
+                actual,
+                maximum
+            }) if actual == MAX_SERIES_MATCHER_NAME_BYTES + 1
+                && maximum == MAX_SERIES_MATCHER_NAME_BYTES
+        ));
+
+        let exact_value = SeriesSelection::new().with_matcher(SeriesMatcher::equal(
+            "n",
+            "v".repeat(MAX_SERIES_MATCHER_VALUE_BYTES),
+        ));
+        assert!(exact_value.validate_shape().is_ok());
+        let one_over_value = SeriesSelection::new().with_matcher(SeriesMatcher::equal(
+            "n",
+            "v".repeat(MAX_SERIES_MATCHER_VALUE_BYTES + 1),
+        ));
+        assert!(matches!(
+            one_over_value.validate_shape(),
+            Err(SeriesSelectionValidationError::MatcherValueTooLong {
+                matcher_index: 0,
+                actual,
+                maximum
+            }) if actual == MAX_SERIES_MATCHER_VALUE_BYTES + 1
+                && maximum == MAX_SERIES_MATCHER_VALUE_BYTES
+        ));
+
+        let exact_total_matcher_bytes = SeriesSelection::new().with_matchers(
+            (0..4)
+                .map(|_| {
+                    SeriesMatcher::equal(
+                        "n",
+                        "v".repeat(MAX_SERIES_SELECTION_MATCHER_BYTES / 4 - 1),
+                    )
+                })
+                .collect(),
+        );
+        assert!(exact_total_matcher_bytes.validate_shape().is_ok());
+        let mut one_over_total_matchers = exact_total_matcher_bytes.matchers;
+        one_over_total_matchers.push(SeriesMatcher::equal("n", ""));
+        assert!(matches!(
+            SeriesSelection::new()
+                .with_matchers(one_over_total_matchers)
+                .validate_shape(),
+            Err(SeriesSelectionValidationError::MatcherBytesTooLong {
+                actual,
+                maximum
+            }) if actual == MAX_SERIES_SELECTION_MATCHER_BYTES + 1
+                && maximum == MAX_SERIES_SELECTION_MATCHER_BYTES
+        ));
+    }
+
+    #[test]
+    fn public_regex_validation_has_a_bounded_pattern_free_diagnostic() {
+        let private_marker = "private-pattern-marker";
+        let pattern = format!(
+            "{}{private_marker}{}",
+            "(".repeat(crate::QUERY_REGEX_NEST_LIMIT as usize + 1),
+            ")".repeat(crate::QUERY_REGEX_NEST_LIMIT as usize + 1)
+        );
+        let selection =
+            SeriesSelection::new().with_matcher(SeriesMatcher::regex_match("host", pattern));
+        let error = selection
+            .validate()
+            .expect_err("over-nested regex must fail");
+        assert!(matches!(
+            error,
+            SeriesSelectionValidationError::InvalidMatcherRegex { matcher_index: 0 }
+        ));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.len() <= MAX_QUERY_REGEX_DIAGNOSTIC_BYTES);
+        assert!(!diagnostic.contains(private_marker));
+    }
+
+    #[test]
+    fn public_execution_preparation_has_an_exact_memory_boundary_and_zero_residue() {
+        let selection =
+            SeriesSelection::new().with_matcher(SeriesMatcher::regex_match("host", "web-[0-9]+"));
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default()).unwrap();
+        let calibration_execution = calibration_budget.begin_query().unwrap();
+        let preparation = selection
+            .prepare_with_execution(&calibration_execution)
+            .unwrap();
+        let exact_memory = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(exact_memory > 1);
+        drop(preparation);
+        assert_eq!(calibration_execution.snapshot().memory_reserved_bytes, 0);
+        drop(calibration_execution);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        for (limit, succeeds) in [(exact_memory, true), (exact_memory - 1, false)] {
+            let budget = QueryBudget::new(QueryBudgetLimits {
+                max_shared_memory_bytes: Some(limit),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            })
+            .unwrap();
+            let execution = budget.begin_query().unwrap();
+            let result = selection.prepare_with_execution(&execution);
+            match (result, succeeds) {
+                (Ok(preparation), true) => drop(preparation),
+                (
+                    Err(SeriesSelectionPreparationError::Query(QueryBudgetError::LimitExceeded(
+                        exceeded,
+                    ))),
+                    false,
+                ) => assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes),
+                (Ok(preparation), false) => {
+                    drop(preparation);
+                    panic!("one byte below the preparation peak must fail");
+                }
+                (Err(error), true) => panic!("exact preparation peak must succeed: {error}"),
+                (Err(error), false) => panic!("unexpected preparation error: {error}"),
+            }
+            assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+            drop(execution);
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+            assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn public_execution_preparation_obeys_control_before_compile_and_releases_memory() {
+        let selection =
+            SeriesSelection::new().with_matcher(SeriesMatcher::regex_match("host", "("));
+
+        let cancellation = QueryCancellationToken::new();
+        let cancellation_budget = QueryBudget::new(QueryBudgetLimits::default()).unwrap();
+        let cancellation_execution = cancellation_budget
+            .begin_query_with_token(cancellation.clone())
+            .unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            selection.prepare_with_execution(&cancellation_execution),
+            Err(SeriesSelectionPreparationError::Query(
+                QueryBudgetError::Cancelled
+            ))
+        ));
+        assert_eq!(cancellation_execution.snapshot().memory_reserved_bytes, 0);
+        drop(cancellation_execution);
+        assert_eq!(
+            cancellation_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let deadline_budget = QueryBudget::new(QueryBudgetLimits::default()).unwrap();
+        let deadline_execution = deadline_budget
+            .begin_query_with_token(QueryCancellationToken::new().with_deadline(deadline))
+            .unwrap();
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        assert!(matches!(
+            selection.prepare_with_execution(&deadline_execution),
+            Err(SeriesSelectionPreparationError::Query(
+                QueryBudgetError::DeadlineExceeded
+            ))
+        ));
+        assert_eq!(deadline_execution.snapshot().memory_reserved_bytes, 0);
+        drop(deadline_execution);
+        assert_eq!(deadline_budget.snapshot().shared_reserved_memory_bytes, 0);
     }
 }
 
@@ -260,6 +925,60 @@ pub struct ShardWindowRowsPage {
     pub rows: Vec<Row>,
 }
 
+/// Execution-aware shard-window page whose returned allocation remains query-memory-accounted.
+#[derive(Debug)]
+pub struct ShardWindowRowsExecutionResult {
+    /// Bounded shard-window page returned by the storage backend.
+    pub page: ShardWindowRowsPage,
+    memory_reservation: Option<crate::QueryMemoryReservation>,
+}
+
+impl ShardWindowRowsExecutionResult {
+    /// Creates a compatibility result without a retained-memory reservation.
+    #[must_use]
+    pub fn unaccounted(page: ShardWindowRowsPage) -> Self {
+        Self {
+            page,
+            memory_reservation: None,
+        }
+    }
+
+    /// Creates a completely accounted result whose memory remains reserved while it is owned.
+    #[must_use]
+    pub fn accounted(
+        page: ShardWindowRowsPage,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            page,
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Returns the bytes retained on behalf of this result.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation
+            .as_ref()
+            .map_or(0, crate::QueryMemoryReservation::bytes)
+    }
+
+    /// Removes and returns the reservation so a wrapper can replace or transfer its accounting.
+    #[must_use]
+    pub fn take_memory_reservation(&mut self) -> Option<crate::QueryMemoryReservation> {
+        self.memory_reservation.take()
+    }
+
+    /// Consumes the detailed result and returns the compatibility page.
+    ///
+    /// This drops the retained reservation and is only appropriate for compatibility paths.
+    /// Bounded wrappers must retain or transfer the reservation while the page remains owned.
+    #[must_use]
+    pub fn into_page(self) -> ShardWindowRowsPage {
+        self.page
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryRowsScanOptions {
@@ -275,6 +994,61 @@ pub struct QueryRowsPage {
     pub truncated: bool,
     pub next_row_offset: Option<u64>,
     pub rows: Vec<Row>,
+}
+
+/// Execution-aware row page whose returned allocation remains query-memory-accounted.
+#[derive(Debug)]
+pub struct QueryRowsExecutionResult {
+    /// Bounded row page returned by the storage backend.
+    pub page: QueryRowsPage,
+    memory_reservation: Option<crate::QueryMemoryReservation>,
+}
+
+impl QueryRowsExecutionResult {
+    /// Creates a compatibility result without a retained-memory reservation.
+    #[must_use]
+    pub fn unaccounted(page: QueryRowsPage) -> Self {
+        Self {
+            page,
+            memory_reservation: None,
+        }
+    }
+
+    /// Creates a completely accounted result whose memory remains reserved while it is owned.
+    #[must_use]
+    pub fn accounted(
+        page: QueryRowsPage,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            page,
+            memory_reservation: Some(memory_reservation),
+        }
+    }
+
+    /// Returns the bytes retained on behalf of this result.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation
+            .as_ref()
+            .map_or(0, crate::QueryMemoryReservation::bytes)
+    }
+
+    /// Removes and returns the reservation so a wrapper can resize or transfer its accounting.
+    #[must_use]
+    pub fn take_memory_reservation(&mut self) -> Option<crate::QueryMemoryReservation> {
+        self.memory_reservation.take()
+    }
+
+    /// Consumes the detailed result and returns the compatibility row page.
+    ///
+    /// This drops the retained reservation and is only appropriate for compatibility paths or
+    /// callers that already own accounting for the returned allocation. Bounded wrappers must
+    /// take and transfer/adopt the reservation before extracting the page.
+    #[must_use]
+    pub fn into_page(self) -> QueryRowsPage {
+        self.page
+    }
 }
 
 /// Durability guarantee established for a successful write when the call returns.
@@ -582,8 +1356,48 @@ impl WriteRejection {
             | TsinkError::Codec(_)
             | TsinkError::Other(_) => WriteRejectionCategory::Internal,
         };
-        Self::new(category, cause_index, error.to_string())
+        Self::new(
+            category,
+            cause_index,
+            bounded_display(error, MAX_WRITE_REJECTION_MESSAGE_BYTES),
+        )
     }
+}
+
+fn bounded_display(value: &impl std::fmt::Display, limit: usize) -> String {
+    struct BoundedWriter {
+        output: String,
+        limit: usize,
+        truncated: bool,
+    }
+
+    impl std::fmt::Write for BoundedWriter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            if self.truncated {
+                return Ok(());
+            }
+            let remaining = self.limit.saturating_sub(self.output.len());
+            if remaining == 0 {
+                self.truncated = !value.is_empty();
+                return Ok(());
+            }
+            let mut boundary = remaining.min(value.len());
+            while !value.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            self.output.push_str(&value[..boundary]);
+            self.truncated = boundary < value.len();
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter {
+        output: String::with_capacity(limit.min(256)),
+        limit,
+        truncated: false,
+    };
+    let _ = std::fmt::write(&mut writer, format_args!("{value}"));
+    writer.output
 }
 
 /// Acceptance state for one submitted row.
@@ -756,8 +1570,8 @@ pub struct EffectiveStorageLimits {
     pub max_write_batch_input_bytes: Option<u64>,
     /// Finite on-disk WAL byte limit. This is `None` when the WAL is inactive or unbounded.
     pub wal_bytes: Option<u64>,
-    /// Finite userspace WAL writer-buffer capacity. The buffer is inspected and reported but is
-    /// not charged to `accounted_memory_bytes`.
+    /// Finite userspace WAL writer-buffer capacity. The live buffer's actual retained capacity is
+    /// charged to `accounted_memory_bytes`.
     pub wal_write_buffer_bytes: Option<u64>,
     /// Finite byte limit enforced by the local data-directory coordinator.
     ///
@@ -828,9 +1642,10 @@ pub struct AsyncResourceLimits {
 
 /// Fixed worker topology, cadence, and per-pass maintenance bounds.
 ///
-/// The current engine owns at most one worker of each named kind. Custom profiles must retain
-/// that topology; the limits are nevertheless explicit so hosts can inspect the full thread
-/// contract rather than infer it from implementation details.
+/// The current engine owns at most one worker of each named kind. Custom profiles must retain that
+/// topology and its fixed cadences; unsupported values fail validation rather than being ignored.
+/// The limits are nevertheless explicit so hosts can inspect the full thread contract rather than
+/// infer it from implementation details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundResourceLimits {
@@ -1150,6 +1965,20 @@ impl ResourceLimits {
             Ok(())
         }
 
+        fn finite_usize(name: &str, value: u64) -> Result<()> {
+            let converted = usize::try_from(value).map_err(|_| {
+                TsinkError::InvalidConfiguration(format!(
+                    "resource limit '{name}' does not fit this platform's usize"
+                ))
+            })?;
+            if converted == usize::MAX {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "resource limit '{name}' resolves to the engine's unlimited sentinel; select ResourceProfile::ExpertUnlimited explicitly or use a smaller finite value"
+                )));
+            }
+            Ok(())
+        }
+
         for (name, value) in [
             ("accounted_memory_bytes", self.accounted_memory_bytes),
             ("local_disk_bytes", self.local_disk_bytes),
@@ -1178,6 +2007,22 @@ impl ResourceLimits {
             ),
         ] {
             positive(name, value)?;
+        }
+        for (name, value) in [
+            ("accounted_memory_bytes", self.accounted_memory_bytes),
+            ("wal_bytes", self.wal_bytes),
+            ("wal_write_buffer_bytes", self.wal_write_buffer_bytes),
+            ("cardinality", self.cardinality),
+            ("max_labels_per_series", self.max_labels_per_series),
+            ("max_series_identity_bytes", self.max_series_identity_bytes),
+            ("max_new_series_per_window", self.max_new_series_per_window),
+            ("max_concurrent_writers", self.max_concurrent_writers),
+            (
+                "max_active_partition_heads_per_series",
+                self.max_active_partition_heads_per_series,
+            ),
+        ] {
+            finite_usize(name, value)?;
         }
         for (name, value) in [
             (
@@ -1220,6 +2065,11 @@ impl ResourceLimits {
             ),
         ] {
             positive(name, u64::try_from(value).unwrap_or(u64::MAX))?;
+            if value == usize::MAX {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "resource limit '{name}' resolves to the engine's unlimited sentinel; select ResourceProfile::ExpertUnlimited explicitly or use a smaller finite value"
+                )));
+            }
         }
         for (name, duration) in [
             ("new_series_window", self.new_series_window),
@@ -1325,6 +2175,22 @@ impl ResourceLimits {
         {
             return Err(TsinkError::InvalidConfiguration(
                 "the current engine requires one flush, compaction, persisted-refresh, and rollup slot"
+                    .to_string(),
+            ));
+        }
+        let fixed_background = background_limits(
+            self.background.remote_fetch_concurrency,
+            self.background.maintenance_max_items_per_pass,
+            self.background.maintenance_max_bytes_per_pass,
+        );
+        if self.background.flush_interval != fixed_background.flush_interval
+            || self.background.compaction_interval != fixed_background.compaction_interval
+            || self.background.persisted_refresh_interval
+                != fixed_background.persisted_refresh_interval
+            || self.background.rollup_interval != fixed_background.rollup_interval
+        {
+            return Err(TsinkError::InvalidConfiguration(
+                "the current engine requires fixed background cadences: 250 ms flush, 5 s compaction, 250 ms persisted refresh, and 5 s rollup"
                     .to_string(),
             ));
         }
@@ -1564,7 +2430,7 @@ pub struct MemoryPressureSnapshot {
     pub active_backpressured_writers: u64,
     /// Writes that entered accounted-memory backpressure.
     pub backpressure_events_total: u64,
-    /// Writes rejected with `MemoryBudgetExceeded`.
+    /// Modeled storage-memory admissions rejected with `MemoryBudgetExceeded`.
     pub rejections_total: u64,
 }
 
@@ -1591,6 +2457,17 @@ pub struct MemoryObservabilitySnapshot {
     #[serde(default)]
     pub persisted_mmap_bytes: usize,
     pub tombstone_bytes: usize,
+    /// Modeled bytes retained by finite segment-catalog work: compute-only generation
+    /// reader/cursor/map staging and read-write v3/v2/pointer publication staging.
+    ///
+    /// This component is charged to the global storage-memory budget.
+    #[serde(default)]
+    pub remote_catalog_staging_bytes: usize,
+    /// Actual retained capacity of the live userspace WAL writer buffer.
+    ///
+    /// This component is charged to the global storage-memory budget.
+    #[serde(default)]
+    pub wal_writer_buffer_bytes: usize,
     /// Conservative modeled bytes retained by the WAL's committed series-definition cache.
     pub wal_series_definition_cache_bytes: usize,
     /// Current conservative reservation for tsink-owned foreground-write and startup-WAL scratch.
@@ -1617,7 +2494,7 @@ pub struct WalObservabilitySnapshot {
     pub sync_mode: String,
     /// Whether the configured policy synchronizes every acknowledged non-empty write immediately.
     pub acknowledged_writes_durable: bool,
-    /// Finite capacity of the userspace `BufWriter`; inspected but not storage-budget-accounted.
+    /// Finite capacity of the userspace `BufWriter`; its live capacity is storage-budget-accounted.
     pub write_buffer_capacity_bytes: u64,
     pub size_bytes: u64,
     pub segment_count: u64,
@@ -1879,6 +2756,22 @@ pub struct RollupObservabilitySnapshot {
     pub policies: Vec<RollupPolicyStatus>,
 }
 
+/// Declares whether one execution-aware storage operation accounts for its returned work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueryExecutionAccounting {
+    /// The execution-aware operation may return work that it did not charge to the supplied
+    /// execution. Callers that enforce a query budget must account for the returned result.
+    #[default]
+    Unaccounted,
+    /// The execution-aware operation charges all work represented by its returned result.
+    ///
+    /// The promise is operation-specific and covers the series, sample, and returned-byte work
+    /// counters. Detailed result APIs must also retain a query-memory reservation for their owned
+    /// returned allocation until the result is dropped or the reservation is explicitly taken.
+    /// A caller must still model its own fanout, merge, and output allocations.
+    Complete,
+}
+
 /// Synchronous interface implemented by tsink storage backends.
 ///
 /// Instances returned by [`StorageBuilder::build`] are shared trait objects and may be used from
@@ -2050,6 +2943,30 @@ pub trait Storage: Send + Sync {
         Ok(out)
     }
 
+    /// Selects a batch and, when supported, returns exact selector-existence metadata from the
+    /// same operation that performed the read.
+    ///
+    /// The conservative default preserves compatibility for third-party backends and cannot
+    /// distinguish an existing empty-range series from a missing series.
+    fn select_many_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> Result<SelectManyExecutionResult> {
+        self.select_many_with_execution(series, start, end, execution)
+            .map(SelectManyExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::select_many_with_execution_result`] fully accounts for its
+    /// returned result and supplies exact selector-existence metadata.
+    ///
+    /// The conservative default preserves compatibility for third-party backends.
+    fn select_many_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
+    }
+
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
 
     fn select_with_options_with_execution(
@@ -2127,6 +3044,26 @@ pub trait Storage: Send + Sync {
         self.select_series(selection)
     }
 
+    /// Selects metadata while retaining any query-memory reservation owned by the result.
+    ///
+    /// The conservative default preserves compatibility for third-party backends. A bounded
+    /// caller must require [`QueryExecutionAccounting::Complete`] before relying on this result.
+    fn select_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.select_series_with_execution(selection, execution)
+            .map(SelectSeriesExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::select_series_with_execution_result`] fully accounts for its
+    /// returned result. The conservative default preserves compatibility for third-party
+    /// backends.
+    fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
+    }
+
     #[cfg(test)]
     fn sync_persisted_segments_from_disk_if_dirty_for_tests(&self) -> Result<()> {
         Ok(())
@@ -2159,6 +3096,24 @@ pub trait Storage: Send + Sync {
         _execution: &QueryExecution,
     ) -> Result<Vec<MetricSeries>> {
         self.select_series_in_shards(selection, scope)
+    }
+
+    /// Selects shard-scoped metadata while retaining its query-memory reservation.
+    fn select_series_in_shards_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.select_series_in_shards_with_execution(selection, scope, execution)
+            .map(SelectSeriesExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::select_series_in_shards_with_execution_result`] fully accounts
+    /// for its returned result. The conservative default preserves compatibility for third-party
+    /// backends.
+    fn select_series_in_shards_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     fn compute_shard_window_digest(
@@ -2198,7 +3153,9 @@ pub trait Storage: Send + Sync {
                 &metric_series.labels,
             );
             point_hashes.clear();
-            point_hashes.extend(points.iter().map(shard_window_hash_data_point));
+            for point in &points {
+                point_hashes.push(shard_window_hash_data_point(point)?);
+            }
             point_hashes.sort_unstable();
 
             shard_window_fnv1a_update(&mut fingerprint, identity_key.as_bytes());
@@ -2237,6 +3194,15 @@ pub trait Storage: Send + Sync {
         _execution: &QueryExecution,
     ) -> Result<ShardWindowDigest> {
         self.compute_shard_window_digest(shard, shard_count, window_start, window_end)
+    }
+
+    /// Reports whether [`Storage::compute_shard_window_digest_with_execution`] fully charges its
+    /// scan work and fixed digest result to the supplied execution.
+    ///
+    /// The conservative default prevents bounded callers from trusting the compatibility
+    /// implementation above, which does not carry execution accounting into backend work.
+    fn compute_shard_window_digest_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     fn scan_shard_window_rows(
@@ -2339,6 +3305,39 @@ pub trait Storage: Send + Sync {
         self.scan_shard_window_rows(shard, shard_count, window_start, window_end, options)
     }
 
+    /// Scans a shard-window page while retaining the result's query-memory reservation.
+    ///
+    /// The conservative default preserves third-party compatibility but is not sufficient for a
+    /// bounded caller.
+    fn scan_shard_window_rows_with_execution_result(
+        &self,
+        shard: u32,
+        shard_count: u32,
+        window_start: i64,
+        window_end: i64,
+        options: ShardWindowScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<ShardWindowRowsExecutionResult> {
+        self.scan_shard_window_rows_with_execution(
+            shard,
+            shard_count,
+            window_start,
+            window_end,
+            options,
+            execution,
+        )
+        .map(ShardWindowRowsExecutionResult::unaccounted)
+    }
+
+    /// Reports whether the execution-aware shard-window scan accounts all returned work and
+    /// retains a memory reservation for the returned page.
+    ///
+    /// The conservative default prevents bounded repair callers from silently delegating to the
+    /// legacy scan above.
+    fn scan_shard_window_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
+    }
+
     fn scan_series_rows(
         &self,
         series: &[MetricSeries],
@@ -2409,6 +3408,30 @@ pub trait Storage: Send + Sync {
         _execution: &QueryExecution,
     ) -> Result<QueryRowsPage> {
         self.scan_series_rows(series, start, end, options)
+    }
+
+    /// Scans a row page while retaining any query-memory reservation owned by the result.
+    ///
+    /// The conservative default preserves compatibility for third-party backends. A bounded
+    /// caller must require [`QueryExecutionAccounting::Complete`] before relying on this result.
+    fn scan_series_rows_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        self.scan_series_rows_with_execution(series, start, end, options, execution)
+            .map(QueryRowsExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::scan_series_rows_with_execution_result`] fully accounts for its
+    /// returned work and retains a query-memory reservation for the returned row page.
+    ///
+    /// The conservative default preserves compatibility for third-party backends.
+    fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     fn scan_metric_rows(
@@ -2514,7 +3537,12 @@ pub trait Storage: Send + Sync {
     /// Writes an atomic on-disk snapshot to `destination`.
     ///
     /// The built-in persistent backend requires a destination that does not already exist and
-    /// publishes the completed snapshot as a directory. Snapshot support is backend-specific and
+    /// creates its sibling staging directory with create-exclusive semantics before publishing the
+    /// completed snapshot with an atomic no-replace directory rename. It bounds each copied source
+    /// tree and the aggregate staged namespace by [`MAX_SNAPSHOT_RESTORE_ENTRIES`], bounds depth by
+    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`], and synchronizes every copied regular file. Error cleanup
+    /// verifies the staging directory's captured filesystem identity before bounded deletion, so a
+    /// foreign replacement at the same path is preserved. Snapshot support is backend-specific and
     /// may not be available for all storage implementations. Restore built-in snapshots with
     /// [`StorageBuilder::restore_from_snapshot`].
     fn snapshot(&self, _destination: &Path) -> Result<()> {
@@ -2595,7 +3623,6 @@ pub struct StorageBuilder {
     background_fail_fast: bool,
     metadata_shard_count: Option<u32>,
     query_budget_limits: QueryBudgetLimits,
-    #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
     #[cfg(test)]
     current_time_override: Option<i64>,
@@ -2644,7 +3671,6 @@ impl Default for StorageBuilder {
             background_fail_fast: true,
             metadata_shard_count: None,
             query_budget_limits: QueryBudgetLimits::default(),
-            #[cfg(test)]
             background_threads_enabled_override: None,
             #[cfg(test)]
             current_time_override: None,
@@ -2935,6 +3961,19 @@ impl StorageBuilder {
         self.query_budget_limits
             .validate()
             .map_err(crate::QueryBudgetError::from)?;
+        let persistent_wal_enabled = self.runtime_mode == StorageRuntimeMode::ReadWrite
+            && self.data_path.is_some()
+            && self.wal_enabled;
+        if persistent_wal_enabled
+            && self.memory_limit_bytes != usize::MAX
+            && self.memory_limit_bytes < self.wal_buffer_size.max(1)
+        {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "accounted-memory limit {} is smaller than the configured WAL writer-buffer capacity {}; increase the memory limit or lower the WAL buffer size",
+                self.memory_limit_bytes,
+                self.wal_buffer_size.max(1)
+            )));
+        }
         if let Some(local_disk_bytes) = self.local_disk_limit_bytes {
             if local_disk_bytes == 0 {
                 return Err(TsinkError::InvalidConfiguration(
@@ -3397,11 +4436,34 @@ impl StorageBuilder {
         self
     }
 
+    /// Internal override used by snapshot restore's production-open validation copy.
+    ///
+    /// This is intentionally crate-private: embedders should not create a storage lifecycle
+    /// without its configured workers, while restore needs a deterministic strict open that owns
+    /// no concurrent mutator before exact validation-copy cleanup.
+    #[must_use]
+    pub(crate) fn with_background_threads_enabled_for_validation(mut self, enabled: bool) -> Self {
+        self.background_threads_enabled_override = Some(enabled);
+        self
+    }
+
     /// Opens the configured storage and starts any background workers it owns.
     ///
     /// The returned [`Arc`] may be shared between host threads. Call [`Storage::close`] once the
     /// host has stopped submitting work and before discarding its storage handles.
     pub fn build(self) -> Result<Arc<dyn Storage>> {
+        self.validate_before_build()?;
+        crate::engine::build_storage(self)
+    }
+
+    pub(crate) fn build_for_snapshot_validation(
+        self,
+    ) -> Result<crate::engine::engine::SnapshotValidationStorage> {
+        self.validate_before_build()?;
+        crate::engine::build_storage_for_snapshot_validation(self)
+    }
+
+    fn validate_before_build(&self) -> Result<()> {
         self.validate_resource_configuration()?;
         if self.max_labels_per_series > crate::label::MAX_SUPPORTED_LABELS_PER_SERIES {
             return Err(TsinkError::InvalidConfiguration(format!(
@@ -3415,16 +4477,30 @@ impl StorageBuilder {
                 "new-series creation-rate window must be greater than zero".to_string(),
             ));
         }
-        crate::engine::build_storage(self)
+        Ok(())
     }
 
     /// Restores a snapshot directory into `data_path`.
     ///
     /// Perform restoration before opening storage at the target path. If `data_path` already
     /// exists, a successful restore replaces it; activation uses staging and attempts rollback if
-    /// the replacement fails. The snapshot must be trusted and immutable for the duration of the
-    /// call. Static link checks reject unsafe entries, but portable filesystem APIs cannot make
-    /// traversal race-free against a process concurrently replacing snapshot paths.
+    /// the replacement fails. Both the snapshot and an existing replacement target must fit
+    /// [`MAX_SNAPSHOT_RESTORE_ENTRIES`] entries and [`MAX_SNAPSHOT_RESTORE_DEPTH`] depth. Staging
+    /// creation, backup publication, and target activation use create/no-replace semantics, so a
+    /// path installed during activation is preserved rather than overwritten. Owned staging and
+    /// backup cleanup is filesystem-identity checked, exact, bounded, and no-follow; an identity
+    /// capture failure retains the reported staging path instead of deleting by pathname alone.
+    ///
+    /// Before target capture or publication, restore copies the snapshot to a private validation
+    /// sibling and opens it through strict production discovery, registry recovery, segment and
+    /// catalog validation, tombstone hydration, WAL replay, and rollup loading. Validation uses the
+    /// finite [`ResourceProfile::Server`] memory/cardinality/WAL/disk limits, requires
+    /// non-degraded health, disables workers, and exits without normal close/flush persistence.
+    ///
+    /// The snapshot and its containing namespace must remain offline and immutable for the
+    /// duration of the call. Traversal is anchored to retained no-follow directory handles and
+    /// closed entry identities; the offline contract excludes a hostile same-identity actor
+    /// racing the platform's final namespace operations.
     pub fn restore_from_snapshot(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,
@@ -3435,24 +4511,32 @@ impl StorageBuilder {
     /// Restores an external snapshot under a caller-owned local disk budget.
     ///
     /// The destination must be a strict descendant of `disk_budget.root()`, while the snapshot
-    /// must not overlap that root. Restoration statically rejects link-like entries and measures
-    /// logical file bytes plus a finite entry count before mutation. It accepts at most
+    /// must not overlap that root. Restoration rejects link-like entries through handle-anchored
+    /// traversal and measures logical file bytes plus a finite entry count before mutation. It
+    /// accepts at most
     /// [`MAX_SNAPSHOT_RESTORE_ENTRIES`] entries and depth
-    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`]. Before creating destination state it reserves:
-    /// `logical_file_bytes + (snapshot_entry_count + missing_target_parent_directories) *
-    /// max(policy_floor, filesystem_allocation_unit)`, where the floor is
+    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`]. Its staging term reserves:
+    /// `2 * logical_file_bytes + (snapshot_entry_count + 2) *
+    /// max(policy_floor, filesystem_allocation_unit)`, where the two extra entries cover the
+    /// validation lock and one possible atomic recovery scratch path. The coordinator separately
+    /// adds `missing_target_parent_directories * entry_allowance`. The floor is
     /// [`SNAPSHOT_RESTORE_ENTRY_STAGING_ALLOWANCE_FLOOR_BYTES`]. This admission is deliberately
     /// conservative and is not presented as an exact physical filesystem footprint. Activation is
-    /// serialized with other managed budget mutations. A successful post-operation scan installs
-    /// exact logical accounting before release; if that scan fails, the API returns an explicit
-    /// committed-but-accounting error and conservatively charges the full reservation.
+    /// serialized with other managed budget mutations and uses create/no-replace staging, backup,
+    /// and target operations. An existing replacement target is also preflighted against the same
+    /// entry/depth envelope so backup cleanup remains finite. Owned staging and backup cleanup
+    /// verifies its captured filesystem identity and builds an exact no-follow plan before
+    /// deletion. A successful post-operation scan installs exact logical accounting before
+    /// release; if that scan fails, the API returns an explicit committed-but-accounting error and
+    /// conservatively charges the full reservation.
     ///
     /// Perform restoration before opening storage at the target path. The supplied budget is an
     /// offline restore envelope rooted above the target; it must not concurrently coordinate an
     /// open storage instance. After restore, open storage with its normal data-path budget rooted
-    /// at the restored target. The snapshot must be trusted and immutable throughout the call:
-    /// cross-platform path traversal cannot eliminate namespace-swap races between a static entry
-    /// check and opening that entry.
+    /// at the restored target. Before target capture or publication, a private copy must pass the
+    /// same strict production-open validation described by
+    /// [`StorageBuilder::restore_from_snapshot`]. The snapshot and its containing namespace must
+    /// remain offline and immutable throughout the call.
     pub fn restore_from_snapshot_with_disk_budget(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,
@@ -3622,8 +4706,7 @@ impl StorageBuilder {
         self.query_budget_limits
     }
 
-    #[cfg(test)]
-    pub(crate) fn background_threads_enabled_override_for_tests(&self) -> Option<bool> {
+    pub(crate) fn background_threads_enabled_override(&self) -> Option<bool> {
         self.background_threads_enabled_override
     }
 
@@ -3702,14 +4785,26 @@ pub(crate) fn shard_window_series_identity_key(metric: &str, labels: &[Label]) -
 pub(crate) const SHARD_WINDOW_FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const SHARD_WINDOW_FNV_PRIME: u64 = 0x100000001b3;
 
-pub(crate) fn shard_window_hash_data_point(point: &DataPoint) -> u64 {
+struct ShardWindowFnvWriter<'a> {
+    hash: &'a mut u64,
+}
+
+impl std::io::Write for ShardWindowFnvWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        shard_window_fnv1a_update(self.hash, buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn shard_window_hash_data_point(point: &DataPoint) -> Result<u64> {
     let mut hash = SHARD_WINDOW_FNV_OFFSET_BASIS;
     shard_window_fnv1a_update(&mut hash, &point.timestamp.to_le_bytes());
-    match serde_json::to_vec(&point.value) {
-        Ok(encoded) => shard_window_fnv1a_update(&mut hash, &encoded),
-        Err(_) => shard_window_fnv1a_update(&mut hash, format!("{:?}", point.value).as_bytes()),
-    }
-    hash
+    serde_json::to_writer(ShardWindowFnvWriter { hash: &mut hash }, &point.value)?;
+    Ok(hash)
 }
 
 pub(crate) fn shard_window_fnv1a_update(hash: &mut u64, bytes: &[u8]) {

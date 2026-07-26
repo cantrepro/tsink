@@ -106,6 +106,8 @@ metrics expose concurrency and cadence; they are not a CPU quota or a per-pass w
 | `tsink_memory_persisted_index_bytes` | gauge | Budget bytes used by persisted chunk refs and timestamp indexes |
 | `tsink_memory_persisted_mmap_bytes` | gauge | Budgeted virtual mapped file length; not resident bytes |
 | `tsink_memory_tombstone_bytes` | gauge | Budget bytes used by tombstone state |
+| `tsink_memory_remote_catalog_staging_bytes` | gauge | Modeled budget bytes retained by finite compute-only catalog reads and read-write catalog publication |
+| `tsink_memory_wal_writer_buffer_bytes` | gauge | Actual retained capacity of the live WAL writer buffer charged to the storage-memory budget |
 | `tsink_memory_wal_series_definition_cache_bytes` | gauge | Modeled budget bytes retained by the WAL series-definition cache |
 | `tsink_memory_write_transient_bytes` | gauge | Current modeled foreground-write and startup-replay scratch reservation |
 | `tsink_memory_write_transient_peak_bytes` | gauge | Peak concurrent modeled write/replay scratch reservation |
@@ -114,7 +116,7 @@ metrics expose concurrency and cadence; they are not a CPU quota or a per-pass w
 | `tsink_memory_pressure_level{level=...}` | gauge | One-hot modeled-memory pressure state: normal, approaching, backpressured, rejecting, or degraded |
 | `tsink_memory_backpressured_writers` | gauge | Writers currently waiting on modeled storage memory |
 | `tsink_memory_backpressure_events_total` | counter | Writes that entered modeled storage-memory backpressure |
-| `tsink_memory_rejections_total` | counter | Writes rejected by the modeled storage-memory budget |
+| `tsink_memory_rejections_total` | counter | Modeled storage-memory admissions rejected with `MemoryBudgetExceeded` |
 
 ### Write-Ahead Log (WAL)
 
@@ -314,6 +316,21 @@ consistency; this offline coordinator configures the maintenance reserve to zero
 | `tsink_rules_scheduler_active` | gauge | `1` when this node is the active rules scheduler |
 | `tsink_rules_configured{kind}` | gauge | Configured groups, rules, pending alerts, firing alerts |
 | `tsink_rules_runtime_limits{kind}` | gauge | Scheduler tick interval and per-evaluation limits |
+| `tsink_rules_store_limits{kind}` | gauge | Fixed-cardinality rules sidecar count, input-byte, retained, durable, startup, replacement, runtime-update, and status limits |
+| `tsink_rules_store_bytes{kind}` | gauge | Current modeled `retained_state` or `durable_file` bytes |
+| `tsink_rules_store_peak_bytes{kind}` | gauge | Peak modeled `retained_state`, `startup_transient`, `replacement_transient`, `runtime_update_transient`, `snapshot_status`, or `snapshot_file` bytes |
+| `tsink_rules_store_rejections_total{kind}` | counter | Fixed-cardinality limit rejections for `all`, `startup`, `replacement`, `runtime_update`, or `snapshot` |
+| `tsink_rules_store_persistence_failures_total` | counter | Durable rules-store and snapshot write failures |
+
+### Metric metadata sidecar
+
+| Metric | Type | Description |
+|---|---|---|
+| `tsink_metric_metadata_store_entries` | gauge | Metric-family metadata records currently retained |
+| `tsink_metric_metadata_store_memory_bytes{kind}` | gauge | Current or peak modeled bytes for retained state, transient work, and query results |
+| `tsink_metric_metadata_store_durable_file_bytes` | gauge | Bytes in the current durable metadata sidecar |
+| `tsink_metric_metadata_store_limit{kind}` | gauge | Fixed-cardinality entry, record, batch, retained, durable, startup, write, and query limits |
+| `tsink_metric_metadata_store_rejections_total{reason}` | counter | Rejections for `all`, `entry`, `record`, `update_batch`, `retained`, `durable_file`, `transient`, `query`, or `persistence` |
 
 ### Exemplars
 
@@ -326,7 +343,11 @@ consistency; this offline coordinator configures the maintenance reserve to zero
 | `tsink_exemplars_query_series_total` | counter | Exemplar series returned by queries |
 | `tsink_exemplars_query_results_total` | counter | Exemplars returned by queries |
 | `tsink_exemplars_stored{kind}` | gauge | Currently stored series and exemplars |
-| `tsink_exemplar_limits{kind}` | gauge | Configured exemlar quotas and guardrails |
+| `tsink_exemplar_store_memory_bytes{kind}` | gauge | Current/peak modeled retained and transient bytes owned by the exemplar sidecar |
+| `tsink_exemplar_store_durable_file_bytes{kind}` | gauge | Current/peak durable exemplar-file bytes |
+| `tsink_exemplar_store_resource_rejections_total{reason}` | counter | Bounded rejections for `all`, `shape`, `batch`, `retained`, `transient`, `durable`, `startup`, or `snapshot` |
+| `tsink_exemplar_store_last_rejection{code}` | gauge | Most recent stable `ExemplarStoreErrorCode`, or `none` before a rejection |
+| `tsink_exemplar_limits{kind}` | gauge | Configured exemplar request, query, shape, retained, transient, persistence, startup, and snapshot guardrails |
 
 ### Ingest protocols
 

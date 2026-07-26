@@ -17,18 +17,27 @@ struct DeleteBridgeContext<'a> {
 
 impl<'a> DeleteBridgeContext<'a> {
     fn update_staging_memory_upper_bound(
-        current: &TombstoneMap,
+        storage: &ChunkStorage,
         matched_series_ids: &[SeriesId],
     ) -> usize {
         let map_entries = matched_series_ids
             .len()
-            .saturating_mul(std::mem::size_of::<(SeriesId, Vec<TombstoneRange>)>())
-            .saturating_mul(4);
+            .saturating_mul(tombstone::TOMBSTONE_BTREE_ENTRY_ALLOCATION_BYTES)
+            .saturating_mul(2);
         let ranges = matched_series_ids.iter().fold(0usize, |total, series_id| {
+            let existing_ranges = storage
+                .tombstone_read_context()
+                .with_series_tombstone_range_sources(
+                    *series_id,
+                    |local, remote| {
+                        local
+                            .map_or(0, |ranges| ranges.len())
+                            .saturating_add(remote.map_or(0, |ranges| ranges.len()))
+                    },
+                );
             total.saturating_add(
-                current
-                    .get(series_id)
-                    .map_or(1usize, |existing| existing.len().saturating_add(1))
+                existing_ranges
+                    .saturating_add(1)
                     .saturating_mul(std::mem::size_of::<TombstoneRange>())
                     .saturating_mul(3),
             )
@@ -63,40 +72,49 @@ impl<'a> DeleteBridgeContext<'a> {
                     // before every lane was published. Roll it forward and reload the merged
                     // durable map before deriving this read-modify-write update from memory.
                     self.storage.recover_and_reload_tombstones_locked()?;
-                    self.storage.refresh_memory_usage();
                     let index = self.storage.tombstone_index_context();
                     let probe_bytes = index.transaction_probe_memory_upper_bound()?;
-                    let update_bytes = self
-                        .storage
-                        .tombstone_read_context()
-                        .with_tombstones(|current| {
-                            Self::update_staging_memory_upper_bound(
-                                current,
-                                matched_series_ids,
-                            )
-                        });
+                    let update_bytes =
+                        Self::update_staging_memory_upper_bound(self.storage, matched_series_ids);
                     let initial_reservation = probe_bytes.saturating_add(update_bytes);
                     let mut memory_reservation = self.storage.tombstone_memory_reservation();
                     memory_reservation.resize(initial_reservation)?;
                     // Tombstone updates are read-modify-write operations. Recompute them after
                     // acquiring the visibility fence so concurrent deletes cannot overwrite one
                     // another with snapshots prepared before either publication committed.
-                    let updated_tombstones =
-                        self.storage
-                            .tombstone_read_context()
-                            .with_tombstones(|current| {
-                                let mut updates =
-                                    TombstoneMap::with_capacity(matched_series_ids.len());
-                                for series_id in matched_series_ids {
-                                    let mut ranges =
-                                        current.get(series_id).cloned().unwrap_or_default();
-                                    tombstone::merge_tombstone_range(&mut ranges, tombstone);
-                                    if current.get(series_id) != Some(&ranges) {
-                                        updates.insert(*series_id, ranges);
+                    let mut updated_tombstones = TombstoneMap::new();
+                    for &series_id in matched_series_ids {
+                        let update = self.storage.tombstone_read_context()
+                            .with_series_tombstone_range_sources(
+                                series_id,
+                                |local, remote| {
+                                    let mut ranges = match (local, remote) {
+                                        (None, None) => Vec::new(),
+                                        (Some(ranges), None) | (None, Some(ranges)) => {
+                                            ranges.to_vec()
+                                        }
+                                        (Some(local), Some(remote)) => {
+                                            tombstone::union_normalized_tombstone_ranges(
+                                                local,
+                                                remote,
+                                            )
+                                        }
+                                    };
+                                    if tombstone::exclusive_interval_fully_tombstoned(
+                                        tombstone.start,
+                                        tombstone.end,
+                                        &ranges,
+                                    ) {
+                                        return None;
                                     }
-                                }
-                                updates
-                            });
+                                    tombstone::merge_tombstone_range(&mut ranges, tombstone);
+                                    Some(ranges)
+                                },
+                            );
+                        if let Some(ranges) = update {
+                            updated_tombstones.insert(series_id, ranges);
+                        }
+                    }
                     if updated_tombstones.is_empty() {
                         return Ok((Vec::new(), false));
                     }
@@ -246,21 +264,27 @@ impl ChunkStorage {
         })
     }
 
-    pub(super) fn apply_tombstone_filter(&self, series_id: SeriesId, points: &mut Vec<DataPoint>) {
+    pub(super) fn apply_tombstone_filter_for_query(
+        &self,
+        series_id: SeriesId,
+        points: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+    ) -> Result<()> {
         if points.is_empty() {
-            return;
+            return Ok(());
         }
 
         self.tombstone_read_context()
-            .with_series_tombstone_ranges(series_id, |ranges| {
+            .with_series_tombstone_ranges_for_query(series_id, execution, |ranges| {
                 let Some(ranges) = ranges else {
-                    return;
+                    return Ok(());
                 };
                 if ranges.is_empty() {
-                    return;
+                    return Ok(());
                 }
                 points.retain(|point| !tombstone::timestamp_is_tombstoned(point.timestamp, ranges));
-            });
+                Ok(())
+            })
     }
 
     #[cfg(test)]

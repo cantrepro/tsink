@@ -30,7 +30,7 @@ Start three nodes, each binding to its own data path and internal RPC endpoint:
 tsink-server \
   --listen 0.0.0.0:9201 \
   --data-path ./var/node1 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-1 \
   --cluster-bind 0.0.0.0:9211 \
   --cluster-seeds node-2:9212,node-3:9213 \
@@ -40,7 +40,7 @@ tsink-server \
 tsink-server \
   --listen 0.0.0.0:9202 \
   --data-path ./var/node2 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-2 \
   --cluster-bind 0.0.0.0:9212 \
   --cluster-seeds node-1:9211,node-3:9213 \
@@ -50,7 +50,7 @@ tsink-server \
 tsink-server \
   --listen 0.0.0.0:9203 \
   --data-path ./var/node3 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-3 \
   --cluster-bind 0.0.0.0:9213 \
   --cluster-seeds node-1:9211,node-2:9212 \
@@ -61,7 +61,7 @@ Each node bootstraps by contacting the seed list until the control plane accepts
 
 `--data-path` is mandatory in cluster mode, including for `query`-role nodes. Give every process a
 stable, node-specific directory on persistent local storage. Startup rejects
-`--cluster-enabled` without it; there is no temporary-root fallback for control, audit, dedupe, or
+`--cluster-enabled true` without it; there is no temporary-root fallback for control, audit, dedupe, or
 handoff files.
 
 ---
@@ -72,7 +72,7 @@ All cluster flags are only meaningful when `--cluster-enabled` is set.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable cluster mode. Requires `--data-path`. |
+| `--cluster-enabled <BOOL>` | `false` | Enable cluster mode. Requires `--data-path`. |
 | `--cluster-node-id <ID>` | — | **Required.** Stable, unique identifier for this node (e.g. `node-1`). Must not be `"unknown"`. |
 | `--cluster-bind <HOST:PORT>` | — | **Required.** Internal RPC listen/advertise address. Peers connect here. |
 | `--cluster-node-role <ROLE>` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. See [node roles](#node-roles). |
@@ -84,7 +84,7 @@ All cluster flags are only meaningful when `--cluster-enabled` is set.
 | `--cluster-read-partial-response <MODE>` | `allow` | Whether to allow partial results when some shards are unavailable: `allow` or `deny`. |
 | `--cluster-internal-auth-token <TOKEN>` | — | Shared-secret token sent on all internal RPC calls. Mutually exclusive with `--cluster-internal-auth-token-file`. |
 | `--cluster-internal-auth-token-file <PATH>` | — | Path to a file containing the shared-secret token. Mutually exclusive with `--cluster-internal-auth-token`. |
-| `--cluster-internal-mtls-enabled` | `false` | Enable mTLS for internal RPC. When set, token auth is disabled. Requires the three flags below. |
+| `--cluster-internal-mtls-enabled <BOOL>` | `false` | Enable mTLS for internal RPC. When true, token auth is disabled. Requires the three flags below. |
 | `--cluster-internal-mtls-ca-cert <PATH>` | — | PEM CA bundle used to verify peer certificates. |
 | `--cluster-internal-mtls-cert <PATH>` | — | PEM client certificate presented on outbound RPC. |
 | `--cluster-internal-mtls-key <PATH>` | — | PEM private key for `--cluster-internal-mtls-cert`. |
@@ -450,11 +450,11 @@ The token is sent on every internal RPC call via the `x-tsink-internal-auth` hea
 
 Enable mTLS to authenticate and encrypt all peer-to-peer traffic using certificates. When mTLS is enabled, shared-secret token auth is disabled.
 
-All three paths are required when `--cluster-internal-mtls-enabled` is set:
+All three paths are required when `--cluster-internal-mtls-enabled true` is set:
 
 ```bash
 tsink-server \
-  --cluster-internal-mtls-enabled \
+  --cluster-internal-mtls-enabled true \
   --cluster-internal-mtls-ca-cert /etc/tsink/ca.pem \
   --cluster-internal-mtls-cert    /etc/tsink/node.crt \
   --cluster-internal-mtls-key     /etc/tsink/node.key \
@@ -472,6 +472,43 @@ mTLS certificates can be rotated at runtime without restart. See the [secret rot
 ---
 
 ## RPC tuning
+
+### Bounded internal read envelopes
+
+Internal `select_batch`, `select_series`, `query_exemplars`, and `list_metrics` requests can carry
+`query_limits`. Supplying the field opts into the bounded RPC contract: the serving node admits
+exactly one query execution, propagates its cancellation/deadline through blocking storage work and
+handoff reads, retains memory accounting through JSON response construction, and returns complete
+execution accounting. A backend or peer that cannot prove complete accounting is rejected with
+`query_accounting_unavailable` or `query_accounting_invalid`; it is never treated as zero work.
+
+For `list_metrics`, the bounded form uses the same metadata selection path as `select_series` with
+an empty selector. Omitting `query_limits` preserves the older response shape and behavior, and the
+response omits `accounting`. The legacy single-series `/internal/v1/select` route likewise remains
+unaccounted for wire compatibility, but a bounded coordinator does not fall back to it.
+
+The anti-entropy `digest_window` route always requires `query_limits`, and every work-limit field
+must be finite. Missing limits fail with `query_limits_required`; incomplete limits fail with
+`invalid_query_limits`. The caller runs the local digest under an explicit execution and uses a
+second explicit execution for bounded request/header/raw-response/decode memory, while the serving
+node returns complete digest work accounting. The storage capability defaults to unaccounted, so
+third-party backends must explicitly implement and attest the execution-aware digest operation.
+An upgraded caller never falls back to an unaccounted digest RPC when a peer omits this contract.
+
+The `repair_backfill` route uses the same mandatory bounded contract. It requires every
+`query_limits` field to be finite in addition to the page-level `maxSeries`/`maxRows` controls.
+Missing or incomplete limits fail with `query_limits_required` or `invalid_query_limits`.
+The serving node admits exactly one execution, propagates its deadline/cancellation through the
+shard-window scan, retains the storage result and encoded response under query-memory
+reservations, and returns complete scan accounting. Retained-row validation includes vector and
+string capacities plus bytes, string, and native-histogram value heaps; canonical series ordering
+and value-key sorting also reserve their temporary identity/key envelopes before allocation. The
+caller separately accounts request, header, raw-response, decode, and decoded-response retention
+while validating the remote counters against the actual logical row payload before aggregating
+them. Storage backends must explicitly attest the execution-aware shard-window scan; upgraded
+callers never fall back to the legacy unaccounted scan or RPC.
+
+### Transport and fanout limits
 
 The following environment variables control internal RPC behavior and resource limits:
 

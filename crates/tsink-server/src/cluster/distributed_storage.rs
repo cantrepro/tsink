@@ -1,5 +1,7 @@
 use super::query::{
-    ReadFanoutError, ReadFanoutExecutor, ReadFanoutResponse, ReadFanoutResponseMetadata,
+    modeled_metric_series_vec_retained_bytes, modeled_points_vec_retained_bytes,
+    modeled_series_points_vec_retained_bytes, ReadFanoutError, ReadFanoutExecutor,
+    ReadFanoutResponse, ReadFanoutResponseMetadata, SeriesPoints,
 };
 use super::rpc::RpcClient;
 use std::collections::HashMap;
@@ -10,8 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tsink::{
     DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryBudget,
-    QueryExecution, QueryOptions, Result as TsinkResult, Row, SeriesMatcher, SeriesMatcherOp,
-    SeriesSelection, Storage, StorageObservabilitySnapshot, TsinkError,
+    QueryExecution, QueryExecutionAccounting, QueryMemoryReservation, QueryOptions,
+    Result as TsinkResult, Row, SelectManyExecutionResult, SelectSeriesExecutionResult,
+    SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage, StorageObservabilitySnapshot,
+    TsinkError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +46,120 @@ pub struct DistributedStorageCacheSnapshot {
 }
 
 type SelectAllCacheValue = Vec<(Vec<Label>, Vec<DataPoint>)>;
+
+const DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+
+struct DistributedReadMetadataState {
+    metadata: ReadFanoutResponseMetadata,
+    reservation: Option<QueryMemoryReservation>,
+}
+
+pub(crate) struct AccountedDistributedReadMetadata {
+    pub(crate) metadata: ReadFanoutResponseMetadata,
+    _reservation: Option<QueryMemoryReservation>,
+}
+
+impl AccountedDistributedReadMetadata {
+    #[cfg(test)]
+    fn reserved_memory_bytes(&self) -> u64 {
+        self._reservation
+            .as_ref()
+            .map_or(0, QueryMemoryReservation::bytes)
+    }
+}
+
+fn modeled_select_all_output_slots(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            u64::try_from(std::mem::size_of::<(Vec<Label>, Vec<DataPoint>)>()).unwrap_or(u64::MAX),
+        )
+        .saturating_add(64)
+}
+
+fn distributed_collection_growth_capacity_upper(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if len <= 4 {
+        4
+    } else {
+        len.checked_next_power_of_two().unwrap_or(usize::MAX)
+    }
+}
+
+fn modeled_distributed_metadata_string_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_distributed_metadata_retained_bytes(metadata: &ReadFanoutResponseMetadata) -> u64 {
+    let vector_bytes = if metadata.warnings.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(metadata.warnings.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(std::mem::size_of::<String>()).unwrap_or(u64::MAX))
+            .saturating_add(DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES)
+    };
+    vector_bytes.saturating_add(metadata.warnings.iter().fold(0u64, |bytes, warning| {
+        bytes.saturating_add(if warning.capacity() == 0 {
+            0
+        } else {
+            u64::try_from(warning.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_add(DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES)
+        })
+    }))
+}
+
+fn modeled_distributed_metadata_merge_upper_bytes(
+    current: &ReadFanoutResponseMetadata,
+    incoming: &ReadFanoutResponseMetadata,
+) -> u64 {
+    let missing_count = incoming
+        .warnings
+        .iter()
+        .filter(|warning| !current.warnings.iter().any(|item| item == *warning))
+        .count();
+    let future_len = current.warnings.len().saturating_add(missing_count);
+    let future_capacity = current
+        .warnings
+        .capacity()
+        .max(distributed_collection_growth_capacity_upper(future_len));
+    let vector_bytes = if future_capacity == 0 {
+        0
+    } else {
+        u64::try_from(future_capacity)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(std::mem::size_of::<String>()).unwrap_or(u64::MAX))
+            .saturating_add(DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES)
+    };
+    vector_bytes
+        .saturating_add(current.warnings.iter().fold(0u64, |bytes, warning| {
+            bytes.saturating_add(if warning.capacity() == 0 {
+                0
+            } else {
+                u64::try_from(warning.capacity())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(DISTRIBUTED_METADATA_ALLOCATION_ALLOWANCE_BYTES)
+            })
+        }))
+        .saturating_add(incoming.warnings.iter().fold(0u64, |bytes, warning| {
+            if current.warnings.iter().any(|item| item == warning) {
+                bytes
+            } else {
+                bytes.saturating_add(modeled_distributed_metadata_string_bytes(warning))
+            }
+        }))
+}
 
 #[derive(Debug, Default)]
 struct DistributedStorageCache {
@@ -80,7 +198,7 @@ pub struct DistributedStorageAdapter {
     read_bridge: DistributedPromqlReadBridge,
     cache_config: DistributedStorageCacheConfig,
     cache: Arc<Mutex<DistributedStorageCache>>,
-    read_metadata: Arc<Mutex<ReadFanoutResponseMetadata>>,
+    read_metadata: Arc<Mutex<DistributedReadMetadataState>>,
 }
 
 impl DistributedStorageAdapter {
@@ -99,11 +217,14 @@ impl DistributedStorageAdapter {
             read_bridge,
             cache_config: DistributedStorageCacheConfig::default(),
             cache: Arc::new(Mutex::new(DistributedStorageCache::default())),
-            read_metadata: Arc::new(Mutex::new(ReadFanoutResponseMetadata {
-                consistency: read_fanout.read_consistency_mode(),
-                partial_response_policy: read_fanout.read_partial_response_policy(),
-                partial_response: false,
-                warnings: Vec::new(),
+            read_metadata: Arc::new(Mutex::new(DistributedReadMetadataState {
+                metadata: ReadFanoutResponseMetadata {
+                    consistency: read_fanout.read_consistency_mode(),
+                    partial_response_policy: read_fanout.read_partial_response_policy(),
+                    partial_response: false,
+                    warnings: Vec::new(),
+                },
+                reservation: None,
             })),
         }
     }
@@ -114,9 +235,10 @@ impl DistributedStorageAdapter {
         self
     }
 
+    #[cfg(test)]
     pub fn read_metadata_snapshot(&self) -> ReadFanoutResponseMetadata {
         match self.read_metadata.lock() {
-            Ok(metadata) => metadata.clone(),
+            Ok(state) => state.metadata.clone(),
             Err(_) => ReadFanoutResponseMetadata {
                 consistency: self.read_fanout.read_consistency_mode(),
                 partial_response_policy: self.read_fanout.read_partial_response_policy(),
@@ -124,6 +246,31 @@ impl DistributedStorageAdapter {
                 warnings: Vec::new(),
             },
         }
+    }
+
+    pub(crate) fn take_accounted_read_metadata(
+        &self,
+    ) -> TsinkResult<AccountedDistributedReadMetadata> {
+        let mut state = self.lock_metadata()?;
+        let retained_bytes = modeled_distributed_metadata_retained_bytes(&state.metadata);
+        if retained_bytes > 0 && state.reservation.is_none() {
+            return Err(TsinkError::Other(
+                "distributed PromQL metadata omitted its retained-memory reservation".to_string(),
+            ));
+        }
+        let metadata = std::mem::replace(
+            &mut state.metadata,
+            ReadFanoutResponseMetadata {
+                consistency: self.read_fanout.read_consistency_mode(),
+                partial_response_policy: self.read_fanout.read_partial_response_policy(),
+                partial_response: false,
+                warnings: Vec::new(),
+            },
+        );
+        Ok(AccountedDistributedReadMetadata {
+            metadata,
+            _reservation: state.reservation.take(),
+        })
     }
 
     #[allow(dead_code)]
@@ -140,7 +287,7 @@ impl DistributedStorageAdapter {
         })
     }
 
-    fn lock_metadata(&self) -> TsinkResult<MutexGuard<'_, ReadFanoutResponseMetadata>> {
+    fn lock_metadata(&self) -> TsinkResult<MutexGuard<'_, DistributedReadMetadataState>> {
         self.read_metadata
             .lock()
             .map_err(|err| TsinkError::LockPoisoned {
@@ -148,21 +295,45 @@ impl DistributedStorageAdapter {
             })
     }
 
-    fn record_metadata(&self, metadata: &ReadFanoutResponseMetadata) -> TsinkResult<()> {
-        let mut current = self.lock_metadata()?;
-        current.partial_response |= metadata.partial_response;
-        for warning in &metadata.warnings {
-            if !current.warnings.iter().any(|item| item == warning) {
-                current.warnings.push(warning.clone());
+    fn record_metadata(
+        &self,
+        metadata: &ReadFanoutResponseMetadata,
+        execution: Option<&QueryExecution>,
+    ) -> TsinkResult<()> {
+        let mut state = self.lock_metadata()?;
+        if let Some(execution) = execution {
+            execution.checkpoint().map_err(TsinkError::from)?;
+            let upper = modeled_distributed_metadata_merge_upper_bytes(&state.metadata, metadata);
+            if upper > 0 {
+                if let Some(reservation) = &mut state.reservation {
+                    reservation.resize(upper).map_err(TsinkError::from)?;
+                } else {
+                    state.reservation =
+                        Some(execution.reserve_memory(upper).map_err(TsinkError::from)?);
+                }
             }
         }
-        current.warnings.sort();
+        state.metadata.partial_response |= metadata.partial_response;
+        for warning in &metadata.warnings {
+            if !state.metadata.warnings.iter().any(|item| item == warning) {
+                state.metadata.warnings.push(warning.clone());
+            }
+        }
+        // Warning strings are the complete comparison keys, so unstable sorting is deterministic
+        // here and avoids stable-sort scratch allocation.
+        state.metadata.warnings.sort_unstable();
+        let retained_bytes = modeled_distributed_metadata_retained_bytes(&state.metadata);
+        if let Some(reservation) = &mut state.reservation {
+            reservation
+                .resize(retained_bytes)
+                .map_err(TsinkError::from)?;
+        }
         Ok(())
     }
 
     fn finish_fanout<T>(&self, response: TsinkResult<ReadFanoutResponse<T>>) -> TsinkResult<T> {
         let response = response?;
-        self.record_metadata(&response.metadata)?;
+        self.record_metadata(&response.metadata, None)?;
         Ok(response.value)
     }
 
@@ -182,6 +353,47 @@ impl DistributedStorageAdapter {
         )
     }
 
+    fn select_series_distributed_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        self.select_series_distributed_result_with_execution(selection, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_distributed_result_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        let response = self
+            .read_bridge
+            .block_on(
+                self.read_fanout
+                    .select_series_with_ring_version_detailed_accounted_with_execution(
+                        &self.local_storage,
+                        &self.rpc_client,
+                        selection,
+                        self.ring_version,
+                        execution,
+                    ),
+            )
+            .map_err(map_read_fanout_error)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.record_metadata(&response.metadata, Some(execution))?;
+        let mut accounted = response.value;
+        let reservation = accounted.take_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "distributed select_series omitted its retained-result reservation".to_string(),
+            )
+        })?;
+        Ok(SelectSeriesExecutionResult::accounted(
+            std::mem::take(&mut accounted.series),
+            reservation,
+        ))
+    }
+
     fn list_metrics_distributed(&self) -> TsinkResult<Vec<MetricSeries>> {
         self.finish_fanout(
             self.read_bridge
@@ -192,6 +404,36 @@ impl DistributedStorageAdapter {
                 ))
                 .map_err(map_read_fanout_error),
         )
+    }
+
+    fn list_metrics_distributed_result_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        let response = self
+            .read_bridge
+            .block_on(
+                self.read_fanout
+                    .list_metrics_with_ring_version_detailed_accounted_with_execution(
+                        &self.local_storage,
+                        &self.rpc_client,
+                        self.ring_version,
+                        execution,
+                    ),
+            )
+            .map_err(map_read_fanout_error)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.record_metadata(&response.metadata, Some(execution))?;
+        let mut accounted = response.value;
+        let reservation = accounted.take_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "distributed list_metrics omitted its retained-result reservation".to_string(),
+            )
+        })?;
+        Ok(SelectSeriesExecutionResult::accounted(
+            std::mem::take(&mut accounted.series),
+            reservation,
+        ))
     }
 
     fn select_points_distributed(
@@ -215,6 +457,54 @@ impl DistributedStorageAdapter {
                 )
                 .map_err(map_read_fanout_error),
         )
+    }
+
+    fn select_points_distributed_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<SeriesPoints>> {
+        self.select_points_distributed_result_with_execution(series, start, end, execution)
+            .map(SelectManyExecutionResult::into_series)
+    }
+
+    fn select_points_distributed_result_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectManyExecutionResult> {
+        let response = self
+            .read_bridge
+            .block_on(
+                self.read_fanout
+                    .select_points_for_series_with_ring_version_detailed_accounted_with_execution(
+                        &self.local_storage,
+                        &self.rpc_client,
+                        series,
+                        start,
+                        end,
+                        self.ring_version,
+                        execution,
+                    ),
+            )
+            .map_err(map_read_fanout_error)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.record_metadata(&response.metadata, Some(execution))?;
+        let mut accounted = response.value;
+        let reservation = accounted.take_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "distributed select_batch omitted its retained-result reservation".to_string(),
+            )
+        })?;
+        Ok(SelectManyExecutionResult::accounted(
+            std::mem::take(&mut accounted.series),
+            std::mem::take(&mut accounted.matched),
+            reservation,
+        ))
     }
 
     fn cache_read<K, V>(
@@ -269,6 +559,14 @@ impl DistributedStorageAdapter {
 }
 
 impl Storage for DistributedStorageAdapter {
+    fn select_many_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Complete
+    }
+
+    fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Complete
+    }
+
     fn query_budget(&self) -> Option<QueryBudget> {
         self.local_storage.query_budget()
     }
@@ -328,7 +626,48 @@ impl Storage for DistributedStorageAdapter {
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<DataPoint>> {
         execution.checkpoint().map_err(TsinkError::from)?;
-        self.select(metric, labels, start, end)
+        let series = MetricSeries {
+            name: metric.to_string(),
+            labels: labels.to_vec(),
+        };
+        let mut selected = self.select_points_distributed_with_execution(
+            std::slice::from_ref(&series),
+            start,
+            end,
+            execution,
+        )?;
+        let mut reservation = execution
+            .reserve_memory(modeled_series_points_vec_retained_bytes(&selected))
+            .map_err(TsinkError::from)?;
+        let mut points = selected.pop().map(|item| item.points).unwrap_or_default();
+        points.sort_by_key(|point| point.timestamp);
+        drop(selected);
+        reservation
+            .resize(modeled_points_vec_retained_bytes(&points))
+            .map_err(TsinkError::from)?;
+        Ok(points)
+    }
+
+    fn select_many_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<SeriesPoints>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.select_points_distributed_with_execution(series, start, end, execution)
+    }
+
+    fn select_many_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectManyExecutionResult> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.select_points_distributed_result_with_execution(series, start, end, execution)
     }
 
     fn select_with_options(
@@ -336,6 +675,19 @@ impl Storage for DistributedStorageAdapter {
         _metric: &str,
         _opts: QueryOptions,
     ) -> TsinkResult<Vec<DataPoint>> {
+        Err(TsinkError::InvalidConfiguration(
+            "select_with_options is not supported by distributed PromQL storage adapter"
+                .to_string(),
+        ))
+    }
+
+    fn select_with_options_with_execution(
+        &self,
+        _metric: &str,
+        _opts: QueryOptions,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<DataPoint>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
         Err(TsinkError::InvalidConfiguration(
             "select_with_options is not supported by distributed PromQL storage adapter"
                 .to_string(),
@@ -406,11 +758,47 @@ impl Storage for DistributedStorageAdapter {
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
         execution.checkpoint().map_err(TsinkError::from)?;
-        self.select_all(metric, start, end)
+        let selection = SeriesSelection::new()
+            .with_metric(metric.to_string())
+            .with_time_range(start, end);
+        let series = self.select_series_distributed_with_execution(&selection, execution)?;
+        let _series_reservation = execution
+            .reserve_memory(modeled_metric_series_vec_retained_bytes(&series))
+            .map_err(TsinkError::from)?;
+        if series.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let selected =
+            self.select_points_distributed_with_execution(&series, start, end, execution)?;
+        let _points_reservation = execution
+            .reserve_memory(modeled_series_points_vec_retained_bytes(&selected))
+            .map_err(TsinkError::from)?;
+        let _out_slots_reservation = execution
+            .reserve_memory(modeled_select_all_output_slots(selected.len()))
+            .map_err(TsinkError::from)?;
+        let mut out = Vec::with_capacity(selected.len());
+        for item in selected {
+            if item.points.is_empty() {
+                continue;
+            }
+            out.push((item.series.labels, item.points));
+        }
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(out)
     }
 
     fn list_metrics(&self) -> TsinkResult<Vec<MetricSeries>> {
         self.list_metrics_distributed()
+    }
+
+    fn list_metrics_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.list_metrics_distributed_result_with_execution(execution)
+            .map(SelectSeriesExecutionResult::into_series)
     }
 
     fn list_metrics_with_wal(&self) -> TsinkResult<Vec<MetricSeries>> {
@@ -418,6 +806,7 @@ impl Storage for DistributedStorageAdapter {
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
+        selection.validate().map_err(TsinkError::from)?;
         let key = SeriesSelectionCacheKey::from_selection(selection);
         if let Some(series) = self.cache_read(
             self.cache_config.cache_select_series,
@@ -446,8 +835,18 @@ impl Storage for DistributedStorageAdapter {
         selection: &SeriesSelection,
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<MetricSeries>> {
+        self.select_series_with_execution_result(selection, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
         execution.checkpoint().map_err(TsinkError::from)?;
-        self.select_series(selection)
+        selection.validate_shape().map_err(TsinkError::from)?;
+        self.select_series_distributed_result_with_execution(selection, execution)
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> TsinkResult<DeleteSeriesResult> {
@@ -498,6 +897,7 @@ impl Storage for DistributedStorageAdapter {
 
 fn map_read_fanout_error(err: ReadFanoutError) -> TsinkError {
     match err {
+        ReadFanoutError::QueryBudget { error } => TsinkError::QueryBudget(error),
         ReadFanoutError::InvalidRequest { message }
         | ReadFanoutError::MergeLimitExceeded { message } => {
             TsinkError::InvalidConfiguration(message)
@@ -595,7 +995,67 @@ mod tests {
     use super::*;
     use crate::cluster::config::{ClusterConfig, DEFAULT_CLUSTER_SHARDS};
     use crate::cluster::{ClusterRequestContext, ClusterRuntime};
-    use tsink::{StorageBuilder, TimestampPrecision};
+    use tsink::{
+        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        QueryWorkLimits, StorageBuilder, TimestampPrecision,
+    };
+
+    struct CompatibilityStorage {
+        inner: Arc<dyn Storage>,
+        select_series_entered: Option<Arc<std::sync::Barrier>>,
+        select_series_release: Option<Arc<std::sync::Barrier>>,
+    }
+
+    impl Storage for CompatibilityStorage {
+        fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: QueryOptions,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn select_series_in_shards(
+            &self,
+            selection: &SeriesSelection,
+            scope: &tsink::MetadataShardScope,
+        ) -> TsinkResult<Vec<MetricSeries>> {
+            if let Some(entered) = &self.select_series_entered {
+                entered.wait();
+            }
+            if let Some(release) = &self.select_series_release {
+                release.wait();
+            }
+            self.inner.select_series_in_shards(selection, scope)
+        }
+
+        fn close(&self) -> TsinkResult<()> {
+            self.inner.close()
+        }
+    }
 
     fn make_cluster_context() -> ClusterRequestContext {
         let cfg = ClusterConfig {
@@ -610,6 +1070,58 @@ mod tests {
             .expect("cluster runtime should bootstrap")
             .expect("cluster runtime should exist");
         ClusterRequestContext::from_runtime(runtime).expect("cluster context should build")
+    }
+
+    fn make_bounded_adapter(rows: &[Row]) -> (Arc<dyn Storage>, Arc<DistributedStorageAdapter>) {
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(DEFAULT_CLUSTER_SHARDS)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(32 * 1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(32 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("storage should build");
+        assert_eq!(
+            storage.select_many_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        assert_eq!(
+            storage.select_series_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        assert_eq!(
+            storage.select_series_in_shards_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        storage.insert_rows(rows).expect("insert should succeed");
+
+        let context = make_cluster_context();
+        let adapter = Arc::new(DistributedStorageAdapter::new(
+            Arc::clone(&storage),
+            context.rpc_client,
+            context.read_fanout,
+            1,
+            DistributedPromqlReadBridge::from_current_runtime(),
+        ));
+        assert_eq!(
+            adapter.select_series_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        (storage, adapter)
+    }
+
+    fn assert_query_limit(error: TsinkError, expected: QueryLimitReason) {
+        match error {
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, expected);
+            }
+            other => panic!("expected {expected} query limit, got {other}"),
+        }
     }
 
     #[tokio::test]
@@ -732,5 +1244,551 @@ mod tests {
             metadata.partial_response_policy,
             context.read_fanout.read_partial_response_policy()
         );
+    }
+
+    #[tokio::test]
+    async fn execution_aware_select_accepts_exact_sample_limit_and_releases_on_one_over() {
+        let (storage, adapter) = make_bounded_adapter(&[
+            Row::with_labels(
+                "bounded_points",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1_700_000_000_000, 1.0),
+            ),
+            Row::with_labels(
+                "bounded_points",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1_700_000_001_000, 2.0),
+            ),
+        ]);
+
+        let exact = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_samples_returned: Some(2),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("exact query should admit")
+            .expect("adapter should expose its local query budget");
+        let exact_for_call = exact.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let points = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_with_execution(
+                "bounded_points",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_002_000,
+                &exact_for_call,
+            )
+        })
+        .await
+        .expect("exact select task should join")
+        .expect("exact sample limit should succeed");
+        assert_eq!(points.len(), 2);
+        assert_eq!(exact.snapshot().samples_returned, 2);
+        assert_eq!(exact.snapshot().samples_scanned, 2);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        let while_exact_is_live = storage.query_budget_snapshot();
+        assert_eq!(while_exact_is_live.queries_started_total, 1);
+        assert_eq!(while_exact_is_live.active_queries, 1);
+        assert_eq!(while_exact_is_live.peak_active_queries, 1);
+        assert_eq!(while_exact_is_live.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            adapter.cache_snapshot(),
+            DistributedStorageCacheSnapshot::default()
+        );
+        drop(exact);
+
+        let adapter_for_warmup = Arc::clone(&adapter);
+        tokio::task::spawn_blocking(move || {
+            adapter_for_warmup.select(
+                "bounded_points",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_002_000,
+            )
+        })
+        .await
+        .expect("cache warmup task should join")
+        .expect("compatibility cache warmup should succeed");
+        assert_eq!(adapter.cache_snapshot().select_points_misses, 1);
+
+        let one_over = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_samples_returned: Some(1),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-over query should admit")
+            .expect("adapter should expose its local query budget");
+        let one_over_for_call = one_over.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_with_execution(
+                "bounded_points",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_002_000,
+                &one_over_for_call,
+            )
+        })
+        .await
+        .expect("one-over select task should join")
+        .expect_err("one-over sample limit should fail");
+        assert_query_limit(error, QueryLimitReason::SamplesReturned);
+        assert_eq!(one_over.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(adapter.cache_snapshot().select_points_hits, 0);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_over);
+
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.queries_started_total, 3);
+        assert_eq!(released.queries_completed_total, 3);
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_aware_series_selection_enforces_exact_and_one_over_limits() {
+        let (storage, adapter) = make_bounded_adapter(&[
+            Row::with_labels(
+                "bounded_series",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1_700_000_000_000, 1.0),
+            ),
+            Row::with_labels(
+                "bounded_series",
+                vec![Label::new("host", "b")],
+                DataPoint::new(1_700_000_000_000, 2.0),
+            ),
+        ]);
+        let selection = SeriesSelection::new().with_metric("bounded_series");
+
+        let exact = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_series_matched: Some(2),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("exact query should admit")
+            .expect("adapter should expose its local query budget");
+        let exact_for_call = exact.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let selection_for_call = selection.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            adapter_for_call
+                .select_series_with_execution_result(&selection_for_call, &exact_for_call)
+        })
+        .await
+        .expect("exact series task should join")
+        .expect("exact series limit should succeed");
+        assert_eq!(selected.series.len(), 2);
+        assert!(selected.reserved_memory_bytes() > 0);
+        assert!(exact.snapshot().memory_reserved_bytes > 0);
+        assert_eq!(exact.snapshot().series_matched, 2);
+        drop(selected);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+
+        let one_over = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_series_matched: Some(1),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-over query should admit")
+            .expect("adapter should expose its local query budget");
+        let one_over_for_call = one_over.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_series_with_execution(&selection, &one_over_for_call)
+        })
+        .await
+        .expect("one-over series task should join")
+        .expect_err("one-over series limit should fail");
+        assert_query_limit(error, QueryLimitReason::SeriesMatched);
+        assert_eq!(one_over.snapshot().memory_reserved_bytes, 0);
+        drop(one_over);
+
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+        assert_eq!(
+            adapter.cache_snapshot(),
+            DistributedStorageCacheSnapshot::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_aware_select_enforces_exact_and_one_over_returned_bytes() {
+        let (storage, adapter) = make_bounded_adapter(&[Row::with_labels(
+            "bounded_bytes",
+            vec![Label::new("host", "a")],
+            DataPoint::new(1_700_000_000_000, "payload"),
+        )]);
+
+        let calibration = adapter
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("calibration query should admit")
+            .expect("adapter should expose its local query budget");
+        let calibration_for_call = calibration.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_with_execution(
+                "bounded_bytes",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_001_000,
+                &calibration_for_call,
+            )
+        })
+        .await
+        .expect("calibration task should join")
+        .expect("calibration query should succeed");
+        let exact_bytes = calibration.snapshot().returned_bytes;
+        assert!(exact_bytes > 1);
+        drop(calibration);
+
+        let exact = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_returned_bytes: Some(exact_bytes),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("exact query should admit")
+            .expect("adapter should expose its local query budget");
+        let exact_for_call = exact.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_with_execution(
+                "bounded_bytes",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_001_000,
+                &exact_for_call,
+            )
+        })
+        .await
+        .expect("exact returned-byte task should join")
+        .expect("exact returned-byte limit should succeed");
+        assert_eq!(exact.snapshot().returned_bytes, exact_bytes);
+        drop(exact);
+
+        let one_over = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_returned_bytes: Some(exact_bytes - 1),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-over query should admit")
+            .expect("adapter should expose its local query budget");
+        let one_over_for_call = one_over.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_with_execution(
+                "bounded_bytes",
+                &[Label::new("host", "a")],
+                1_700_000_000_000,
+                1_700_000_001_000,
+                &one_over_for_call,
+            )
+        })
+        .await
+        .expect("one-over returned-byte task should join")
+        .expect_err("one-over returned-byte limit should fail");
+        assert_query_limit(error, QueryLimitReason::ReturnedBytes);
+        assert_eq!(one_over.snapshot().memory_reserved_bytes, 0);
+        drop(one_over);
+
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_compatibility_remains_unbounded_but_bounded_fails_closed() {
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("storage should build");
+        inner
+            .insert_rows(&[
+                Row::with_labels(
+                    "compatibility_series",
+                    vec![Label::new("host", "a")],
+                    DataPoint::new(1_700_000_000_000, 1.0),
+                ),
+                Row::with_labels(
+                    "compatibility_series",
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(1_700_000_000_000, 2.0),
+                ),
+            ])
+            .expect("insert should succeed");
+        let compatibility: Arc<dyn Storage> = Arc::new(CompatibilityStorage {
+            inner,
+            select_series_entered: None,
+            select_series_release: None,
+        });
+        assert!(compatibility.query_budget().is_none());
+        assert_eq!(
+            compatibility.select_series_in_shards_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted
+        );
+
+        let context = make_cluster_context();
+        let adapter = Arc::new(DistributedStorageAdapter::new(
+            compatibility,
+            context.rpc_client,
+            context.read_fanout,
+            1,
+            DistributedPromqlReadBridge::from_current_runtime(),
+        ));
+        let budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(32 * 1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(32 * 1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("query budget should build");
+        let selection = SeriesSelection::new().with_metric("compatibility_series");
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let selection_for_call = selection.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_series(&selection_for_call)
+        })
+        .await
+        .expect("unbounded compatibility task should join")
+        .expect("legacy unbounded compatibility should succeed");
+        assert_eq!(selected.len(), 2);
+
+        let execution = budget
+            .begin_query_with(
+                QueryWorkLimits {
+                    max_series_matched: Some(2),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("bounded query should admit");
+        let execution_for_call = execution.clone();
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_series_with_execution(&selection, &execution_for_call)
+        })
+        .await
+        .expect("bounded compatibility task should join")
+        .expect_err("bounded compatibility must fail closed");
+        assert!(error
+            .to_string()
+            .contains("requires complete result accounting"));
+        assert_eq!(execution.snapshot().series_matched, 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_metadata_fails_closed_for_unaccounted_compatibility_storage() {
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("storage should build");
+        inner
+            .insert_rows(&[
+                Row::with_labels(
+                    "concurrent_compatibility_series",
+                    vec![Label::new("host", "a")],
+                    DataPoint::new(1_700_000_000_000, 1.0),
+                ),
+                Row::with_labels(
+                    "concurrent_compatibility_series",
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(1_700_000_000_000, 2.0),
+                ),
+            ])
+            .expect("insert should succeed");
+        let compatibility: Arc<dyn Storage> = Arc::new(CompatibilityStorage {
+            inner,
+            select_series_entered: None,
+            select_series_release: None,
+        });
+
+        let context = make_cluster_context();
+        let adapter = Arc::new(DistributedStorageAdapter::new(
+            compatibility,
+            context.rpc_client,
+            context.read_fanout,
+            1,
+            DistributedPromqlReadBridge::from_current_runtime(),
+        ));
+        let budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("query budget should build");
+        let execution = budget
+            .begin_query_with(
+                QueryWorkLimits {
+                    max_series_matched: Some(2),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("query should admit");
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let query_execution = execution.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            adapter_for_call.select_series_with_execution(
+                &SeriesSelection::new().with_metric("concurrent_compatibility_series"),
+                &query_execution,
+            )
+        })
+        .await
+        .expect("compatibility query task should join")
+        .expect_err("bounded metadata must reject an unaccounted local backend");
+        assert!(
+            error
+                .to_string()
+                .contains("requires complete result accounting"),
+            "unexpected compatibility error: {error}"
+        );
+        assert_eq!(execution.snapshot().series_matched, 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn distributed_metadata_warning_guard_has_exact_boundary_and_survives_snapshot_move() {
+        let (storage, adapter) = make_bounded_adapter(&[]);
+        let metadata = ReadFanoutResponseMetadata {
+            consistency: adapter.read_fanout.read_consistency_mode(),
+            partial_response_policy: adapter.read_fanout.read_partial_response_policy(),
+            partial_response: true,
+            warnings: vec!["bounded peer warning".repeat(8)],
+        };
+        let exact_bytes = modeled_distributed_metadata_merge_upper_bytes(
+            &adapter.read_metadata_snapshot(),
+            &metadata,
+        );
+        assert!(exact_bytes > 1);
+        let execution = adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_memory_bytes: Some(exact_bytes),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("metadata query should admit")
+            .expect("adapter should expose its local query budget");
+
+        adapter
+            .record_metadata(&metadata, Some(&execution))
+            .expect("exact metadata envelope should succeed");
+        let accounted = adapter
+            .take_accounted_read_metadata()
+            .expect("accounted metadata should move out of the adapter");
+        assert_eq!(accounted.metadata.warnings, metadata.warnings);
+        assert!(accounted.reserved_memory_bytes() > 0);
+        assert!(accounted.reserved_memory_bytes() <= exact_bytes);
+        assert!(execution.snapshot().memory_reserved_bytes > 0);
+
+        drop(adapter);
+        assert!(
+            execution.snapshot().memory_reserved_bytes > 0,
+            "the moved metadata guard must outlive the adapter"
+        );
+        drop(accounted);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+
+        let (one_under_storage, one_under_adapter) = make_bounded_adapter(&[]);
+        let one_under_metadata = ReadFanoutResponseMetadata {
+            consistency: one_under_adapter.read_fanout.read_consistency_mode(),
+            partial_response_policy: one_under_adapter.read_fanout.read_partial_response_policy(),
+            partial_response: true,
+            warnings: vec!["bounded peer warning".repeat(8)],
+        };
+        let required = modeled_distributed_metadata_merge_upper_bytes(
+            &one_under_adapter.read_metadata_snapshot(),
+            &one_under_metadata,
+        );
+        let one_under = one_under_adapter
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_memory_bytes: Some(required - 1),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-under metadata query should admit")
+            .expect("adapter should expose its local query budget");
+        let error = one_under_adapter
+            .record_metadata(&one_under_metadata, Some(&one_under))
+            .expect_err("one-under metadata envelope must fail before cloning");
+        assert_query_limit(error, QueryLimitReason::PerQueryMemoryBytes);
+        assert!(one_under_adapter
+            .read_metadata_snapshot()
+            .warnings
+            .is_empty());
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        drop(one_under);
+        let released = one_under_storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn public_metadata_snapshot_rejects_nonempty_unaccounted_warnings() {
+        let (_storage, adapter) = make_bounded_adapter(&[]);
+        let metadata = ReadFanoutResponseMetadata {
+            consistency: adapter.read_fanout.read_consistency_mode(),
+            partial_response_policy: adapter.read_fanout.read_partial_response_policy(),
+            partial_response: true,
+            warnings: vec!["legacy warning".to_string()],
+        };
+        adapter
+            .record_metadata(&metadata, None)
+            .expect("legacy metadata merge should remain compatible");
+
+        let error = match adapter.take_accounted_read_metadata() {
+            Ok(_) => panic!("public snapshot must fail closed without a warning reservation"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TsinkError::Other(_)));
+        assert_eq!(adapter.read_metadata_snapshot().warnings, metadata.warnings);
     }
 }

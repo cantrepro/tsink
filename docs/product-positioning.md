@@ -38,8 +38,9 @@ Docker should eventually be able to use an in-process or ephemeral-loopback
 fixture, send real Prometheus or OTLP traffic, control time and maintenance, run
 PromQL assertions, and tear down without fixed ports or arbitrary sleeps.
 
-This is the intended adoption beachhead. The dedicated `tsink-test` fixture is
-roadmap work and is not present in the current workspace.
+This is the intended adoption beachhead. The workspace now contains the initial
+`tsink-test` fixture for isolated direct-core tests. Real protocol traffic,
+controllable time, and deterministic maintenance remain roadmap work.
 
 ### Application and appliance developers
 
@@ -68,7 +69,8 @@ behavioral model.
    on local storage, and query through direct APIs or PromQL.
 2. **Metrics integration tests:** replace a Prometheus/TSDB container with a
    deterministic fixture that uses real Prometheus and OTLP adapters. This is the
-   first product-expansion priority, but its dedicated testkit is not shipped.
+   first product-expansion priority. The foundational direct-core testkit ships,
+   but the protocol and deterministic-control layers do not.
 3. **Built-in diagnostics:** give a self-hosted application, developer tool, or
    appliance local performance history without a required sidecar.
 4. **Disconnected collection:** retain data under finite limits and later send
@@ -139,8 +141,10 @@ compatibility gates.
   best-effort policy, and the principal ingest adapters preserve durability and
   partial/indeterminate effects. Cross-component and cross-node atomicity are
   deliberately not claimed.
-- The repository does not yet contain a `tsink-test` crate, public controllable
-  clock, or deterministic maintenance fixture.
+- The repository contains the foundational `tsink-test` crate for isolated in-process storage,
+  atomic writes, direct explicit-time PromQL, restart, and bounded diagnostics. It does not yet
+  contain protocol test listeners, a public controllable clock, or deterministic maintenance
+  controls.
 - PromQL, Prometheus protocol, and OTLP implementations exist, but generated
   compatibility matrices and a pinned differential test program do not.
 - Existing tiering, security, rules, synchronization, and server operations are

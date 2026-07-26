@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -9,6 +9,7 @@ use crate::engine::binio::{
     read_to_end_bounded, FILE_FLAG_ZSTD_BODY, MAX_DECODED_FRAMED_FILE_BYTES,
 };
 use crate::engine::chunk::Chunk;
+use crate::engine::encoder::{Encoder, MAX_DECODED_CHUNK_PEAK_BYTES};
 use crate::engine::index::ChunkIndex;
 use crate::engine::series::SeriesId;
 use crate::mmap::{create_mmap, PlatformMmap};
@@ -18,10 +19,10 @@ use super::format::{
     decode_persisted_series, parse_chunk_index_file, parse_chunk_index_file_with_decoded_limit,
     parse_chunks_file, parse_manifest, parse_postings_file, parse_postings_file_with_decoded_limit,
     parse_series_file, parse_series_file_with_decoded_limit, segment_manifest_from_parsed,
-    validate_chunk_index_against_chunks_file, verify_file_manifest_entry, ChunkRecordMeta,
-    CHUNK_INDEX_MAGIC, FILE_KIND_CHUNKS, FILE_KIND_CHUNK_INDEX, FILE_KIND_POSTINGS,
-    FILE_KIND_SERIES, FORMAT_VERSION, MAX_SEGMENT_CHUNKS_FILE_BYTES,
-    MAX_SEGMENT_MANIFEST_FILE_BYTES, POSTINGS_MAGIC, SERIES_MAGIC,
+    validate_chunk_index_against_chunks_file, validate_series_file_structure_with_decoded_limit,
+    verify_file_manifest_entry, ChunkRecordMeta, CHUNK_INDEX_MAGIC, FILE_KIND_CHUNKS,
+    FILE_KIND_CHUNK_INDEX, FILE_KIND_POSTINGS, FILE_KIND_SERIES, FORMAT_VERSION,
+    MAX_SEGMENT_CHUNKS_FILE_BYTES, MAX_SEGMENT_MANIFEST_FILE_BYTES, POSTINGS_MAGIC, SERIES_MAGIC,
 };
 use super::postings::SegmentPostingsIndex;
 use super::types::{
@@ -62,6 +63,8 @@ enum IndexedSegmentLoadOutcome {
     Skipped,
     Quarantined(StartupQuarantinedSegment),
 }
+
+const LEGACY_SEGMENT_SERIES_IDENTITY_FIXED_BYTES: usize = 64 * 1024;
 
 pub(crate) struct StartupRecoveredSegmentIndexes {
     pub(crate) loaded: LoadedSegmentIndexes,
@@ -139,6 +142,73 @@ pub fn load_segment(path: impl AsRef<Path>) -> Result<LoadedSegment> {
         series: segment.series,
         chunks_by_series: segment.chunks_by_series,
     })
+}
+
+/// Fully decodes every persisted chunk through the production codec path.
+///
+/// Normal startup maps encoded chunk payloads and decodes them lazily during queries. Snapshot
+/// restore uses this sequential validation pass before publication so checksum-consistent but
+/// codec-invalid payloads cannot become the new live data directory.
+pub(crate) fn validate_segment_payloads_for_restore(
+    path: &Path,
+    validation_memory_limit_bytes: usize,
+) -> Result<()> {
+    // Series/postings are validated by the strict production open below this pass. Loading only
+    // the production chunk index here keeps one root's codec-validation scratch bounded.
+    let segment = load_segment_index_with_series(path, false)?;
+    for entry in &segment.chunk_index.entries {
+        // The production codec's format peak includes storage-payload materialization and decoded
+        // point/value vectors. Admit that conservative peak before either decompression or point
+        // allocation, then drop both before advancing to the next entry.
+        if MAX_DECODED_CHUNK_PEAK_BYTES > validation_memory_limit_bytes {
+            return Err(TsinkError::MemoryBudgetExceeded {
+                budget: validation_memory_limit_bytes,
+                required: MAX_DECODED_CHUNK_PEAK_BYTES,
+            });
+        }
+        let payload = super::format::chunk_payload_from_record(
+            segment.chunks_mmap.as_slice(),
+            entry.chunk_offset,
+            entry.chunk_len,
+        )?;
+        let points = Encoder::decode_chunk_points_from_payload(
+            entry.lane,
+            entry.ts_codec,
+            entry.value_codec,
+            usize::from(entry.point_count),
+            payload.as_ref(),
+        )
+        .map_err(|err| {
+            TsinkError::DataCorruption(format!(
+                "persisted segment chunk payload cannot be decoded at {} offset {}: {err}",
+                path.display(),
+                entry.chunk_offset
+            ))
+        })?;
+        if points.len() != usize::from(entry.point_count) {
+            return Err(TsinkError::DataCorruption(format!(
+                "persisted segment chunk decoded {} points but its index declares {} at {}",
+                points.len(),
+                entry.point_count,
+                path.display()
+            )));
+        }
+        let decoded_min = points.iter().map(|point| point.ts).min();
+        let decoded_max = points.iter().map(|point| point.ts).max();
+        if decoded_min != Some(entry.min_ts) || decoded_max != Some(entry.max_ts) {
+            return Err(TsinkError::DataCorruption(format!(
+                "persisted segment chunk decoded timestamp bounds {:?}..={:?}, expected {}..={} at {}",
+                decoded_min,
+                decoded_max,
+                entry.min_ts,
+                entry.max_ts,
+                path.display()
+            )));
+        }
+        drop(points);
+        drop(payload);
+    }
+    Ok(())
 }
 
 pub fn load_segment_index(path: impl AsRef<Path>) -> Result<IndexedSegment> {
@@ -544,6 +614,503 @@ pub(crate) fn visit_segment_dirs_with_namespace_budget(
 
             visit(&path)?;
         }
+    }
+    Ok(())
+}
+
+/// Proves that a manifestless root contains at least one fully published v2 segment using only
+/// bounded, read-only inspection. The immutable segment manifest is checked against its canonical
+/// path and exact five-file namespace, every manifest-declared file is length- and hash-verified
+/// through no-follow handles, and `series.bin` is decoded to prove registry rebuildability.
+pub(crate) fn validate_legacy_segment_identity(
+    data_path: &Path,
+    startup_memory_budget: usize,
+) -> Result<bool> {
+    let mut namespace_budget = crate::engine::fs_utils::RecoveryNamespaceBudget::new(
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    );
+    let mut candidate: Option<(usize, u8, u64, PathBuf)> = None;
+
+    for (lane_order, lane_name) in ["lane_numeric", "lane_blob"].into_iter().enumerate() {
+        let lane_root = data_path.join(lane_name);
+        visit_segment_dirs_with_namespace_budget(
+            &lane_root,
+            0..=2u8,
+            &mut namespace_budget,
+            |path| {
+                let (level, segment_id) = parse_canonical_legacy_segment_path(path)?;
+                let key = (lane_order, level, segment_id);
+                if candidate
+                    .as_ref()
+                    .is_none_or(|(old_lane, old_level, old_id, _)| {
+                        key < (*old_lane, *old_level, *old_id)
+                    })
+                {
+                    candidate = Some((lane_order, level, segment_id, path.to_path_buf()));
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    let Some((_, expected_level, expected_segment_id, root)) = candidate else {
+        return Ok(false);
+    };
+    validate_legacy_segment_candidate(
+        &root,
+        expected_level,
+        expected_segment_id,
+        startup_memory_budget,
+    )?;
+    Ok(true)
+}
+
+fn parse_canonical_legacy_segment_path(path: &Path) -> Result<(u8, u64)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy persisted segment has a non-UTF-8 name: {}",
+                path.display()
+            ))
+        })?;
+    let hex = name.strip_prefix("seg-").ok_or_else(|| {
+        TsinkError::DataCorruption(format!(
+            "legacy persisted segment has a non-canonical name: {}",
+            path.display()
+        ))
+    })?;
+    if hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy persisted segment has a non-canonical id: {}",
+            path.display()
+        )));
+    }
+    let segment_id = u64::from_str_radix(hex, 16).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "legacy persisted segment id is invalid: {}",
+            path.display()
+        ))
+    })?;
+    if name != format!("seg-{segment_id:016x}") {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy persisted segment id is not canonical: {}",
+            path.display()
+        )));
+    }
+
+    let level_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy persisted segment has no canonical level: {}",
+                path.display()
+            ))
+        })?;
+    let level = match level_name {
+        "L0" => 0,
+        "L1" => 1,
+        "L2" => 2,
+        _ => {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy persisted segment has a non-canonical level: {}",
+                path.display()
+            )))
+        }
+    };
+    Ok((level, segment_id))
+}
+
+fn validate_legacy_segment_candidate(
+    root: &Path,
+    expected_level: u8,
+    expected_segment_id: u64,
+    startup_memory_budget: usize,
+) -> Result<()> {
+    super::validation::validate_exact_segment_entries_no_follow(root)?;
+    let layout = SegmentLayout::from_root(root.to_path_buf());
+
+    let manifest_metadata =
+        fs::symlink_metadata(&layout.manifest_path).map_err(|source| TsinkError::IoWithPath {
+            path: layout.manifest_path.clone(),
+            source,
+        })?;
+    let manifest_len = usize::try_from(manifest_metadata.len()).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "legacy segment manifest length exceeds this platform's range: {}",
+            layout.manifest_path.display()
+        ))
+    })?;
+    let manifest_memory = modeled_legacy_segment_manifest_memory(manifest_len)?;
+    crate::disk_budget::admit_startup_memory(startup_memory_budget, manifest_memory)?;
+    let manifest_bytes = read_legacy_segment_file_no_follow(
+        &layout.manifest_path,
+        manifest_metadata.len(),
+        MAX_SEGMENT_MANIFEST_FILE_BYTES,
+    )?;
+    let parsed_manifest = parse_manifest(&manifest_bytes)?;
+    if parsed_manifest.level != expected_level || parsed_manifest.segment_id != expected_segment_id
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment identity mismatch at {}: expected L{expected_level}/seg-{expected_segment_id:016x}, manifest=L{}/seg-{:016x}",
+            root.display(),
+            parsed_manifest.level,
+            parsed_manifest.segment_id
+        )));
+    }
+    drop(manifest_bytes);
+
+    let files = [
+        (
+            &layout.chunks_path,
+            &parsed_manifest.files[0],
+            FILE_KIND_CHUNKS,
+            MAX_SEGMENT_CHUNKS_FILE_BYTES,
+        ),
+        (
+            &layout.chunk_index_path,
+            &parsed_manifest.files[1],
+            FILE_KIND_CHUNK_INDEX,
+            MAX_DECODED_FRAMED_FILE_BYTES,
+        ),
+        (
+            &layout.series_path,
+            &parsed_manifest.files[2],
+            FILE_KIND_SERIES,
+            MAX_DECODED_FRAMED_FILE_BYTES,
+        ),
+        (
+            &layout.postings_path,
+            &parsed_manifest.files[3],
+            FILE_KIND_POSTINGS,
+            MAX_DECODED_FRAMED_FILE_BYTES,
+        ),
+    ];
+    for (path, entry, expected_kind, format_max_bytes) in files {
+        if entry.kind != expected_kind {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment manifest file kind mismatch at {}: expected {expected_kind}, got {}",
+                path.display(),
+                entry.kind
+            )));
+        }
+        if entry.file_len > format_max_bytes as u64 {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment file length {} exceeds its {format_max_bytes}-byte format limit: {}",
+                entry.file_len,
+                path.display()
+            )));
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.len() != entry.file_len {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment manifest length mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+
+    let series_memory = modeled_legacy_segment_series_identity_memory(
+        &layout.series_path,
+        parsed_manifest.files[2].file_len,
+    )?;
+    crate::disk_budget::admit_startup_memory(startup_memory_budget, series_memory)?;
+    let series_bytes = read_legacy_segment_file_no_follow(
+        &layout.series_path,
+        parsed_manifest.files[2].file_len,
+        MAX_DECODED_FRAMED_FILE_BYTES,
+    )?;
+    verify_file_manifest_entry(&parsed_manifest.files[2], FILE_KIND_SERIES, &series_bytes)?;
+    let series_count = validate_series_file_structure_with_decoded_limit(
+        &series_bytes,
+        MAX_DECODED_FRAMED_FILE_BYTES,
+    )?;
+    if series_count != parsed_manifest.series_count {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment series count mismatch at {}: manifest={}, series.bin={}",
+            root.display(),
+            parsed_manifest.series_count,
+            series_count
+        )));
+    }
+    drop(series_bytes);
+
+    for (path, entry, expected_kind, format_max_bytes) in files {
+        if expected_kind == FILE_KIND_SERIES {
+            continue;
+        }
+        let actual_hash =
+            hash_legacy_segment_file_no_follow(path, entry.file_len, format_max_bytes)?;
+        if actual_hash != entry.hash64 {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment manifest hash mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+    super::validation::validate_exact_segment_entries_no_follow(root)
+}
+
+fn modeled_legacy_segment_manifest_memory(manifest_len: usize) -> Result<usize> {
+    manifest_len
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(4 * 1024))
+        .ok_or_else(|| {
+            TsinkError::Other("legacy segment manifest memory model overflow".to_string())
+        })
+}
+
+fn modeled_legacy_segment_series_identity_memory(path: &Path, expected_len: u64) -> Result<usize> {
+    let raw_len = usize::try_from(expected_len).map_err(|_| {
+        TsinkError::DataCorruption(format!(
+            "legacy segment series file length exceeds this platform's range: {}",
+            path.display()
+        ))
+    })?;
+    if raw_len > MAX_DECODED_FRAMED_FILE_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment series file exceeds the {MAX_DECODED_FRAMED_FILE_BYTES}-byte format limit: {}",
+            path.display()
+        )));
+    }
+
+    let mut file = open_legacy_segment_file_no_follow(path, expected_len)?;
+    let mut prefix = [0u8; 12];
+    let prefix_len = raw_len.min(prefix.len());
+    file.read_exact(&mut prefix[..prefix_len]).map_err(|err| {
+        TsinkError::DataCorruption(format!(
+            "legacy segment series file has a truncated framing prefix at {}: {err}",
+            path.display()
+        ))
+    })?;
+    validate_opened_legacy_segment_file_identity(file, path, expected_len)?;
+    if prefix_len < 8 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment series file is too short: {}",
+            path.display()
+        )));
+    }
+    if prefix[..4] != SERIES_MAGIC {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment series file magic is invalid: {}",
+            path.display()
+        )));
+    }
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    if version != FORMAT_VERSION {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment series file version {version} is unsupported: {}",
+            path.display()
+        )));
+    }
+    let flags = u16::from_le_bytes([prefix[6], prefix[7]]);
+    let decoded_allocation = if flags & FILE_FLAG_ZSTD_BODY == 0 {
+        0
+    } else {
+        if prefix_len < 12 {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy compressed series file has a truncated framing prefix: {}",
+                path.display()
+            )));
+        }
+        let body_len = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
+        let decoded_len = body_len.checked_add(8).ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy segment series decoded length overflows: {}",
+                path.display()
+            ))
+        })?;
+        if decoded_len > MAX_DECODED_FRAMED_FILE_BYTES {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment series decoded length {decoded_len} exceeds the {MAX_DECODED_FRAMED_FILE_BYTES}-byte format limit: {}",
+                path.display()
+            )));
+        }
+        decoded_len
+    };
+
+    raw_len
+        .checked_add(decoded_allocation)
+        .and_then(|bytes| bytes.checked_add(LEGACY_SEGMENT_SERIES_IDENTITY_FIXED_BYTES))
+        .ok_or_else(|| {
+            TsinkError::Other("legacy segment series identity memory model overflow".to_string())
+        })
+}
+
+#[cfg(test)]
+pub(super) fn legacy_segment_identity_required_memory_for_test(root: &Path) -> Result<usize> {
+    let layout = SegmentLayout::from_root(root.to_path_buf());
+    let manifest_len = usize::try_from(
+        fs::symlink_metadata(&layout.manifest_path)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: layout.manifest_path.clone(),
+                source,
+            })?
+            .len(),
+    )
+    .unwrap_or(usize::MAX);
+    let manifest_memory = modeled_legacy_segment_manifest_memory(manifest_len)?;
+    let series_len = fs::symlink_metadata(&layout.series_path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: layout.series_path.clone(),
+            source,
+        })?
+        .len();
+    let series_memory =
+        modeled_legacy_segment_series_identity_memory(&layout.series_path, series_len)?;
+    Ok(manifest_memory.max(series_memory))
+}
+
+fn read_legacy_segment_file_no_follow(
+    path: &Path,
+    expected_len: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if expected_len > max_bytes as u64 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file exceeds its {max_bytes}-byte read bound: {}",
+            path.display()
+        )));
+    }
+    let mut file = open_legacy_segment_file_no_follow(path, expected_len)?;
+    let bytes = read_to_end_bounded(
+        &mut file,
+        max_bytes,
+        usize::try_from(expected_len).unwrap_or(max_bytes),
+        &format!("legacy segment identity file {}", path.display()),
+    )?;
+    validate_opened_legacy_segment_file_identity(file, path, expected_len)?;
+    Ok(bytes)
+}
+
+fn hash_legacy_segment_file_no_follow(
+    path: &Path,
+    expected_len: u64,
+    max_bytes: usize,
+) -> Result<u64> {
+    if expected_len > max_bytes as u64 {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file exceeds its {max_bytes}-byte hash bound: {}",
+            path.display()
+        )));
+    }
+    let mut file = open_legacy_segment_file_no_follow(path, expected_len)?;
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    let mut buffer = [0u8; 16 * 1024];
+    let mut observed = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        observed = observed.checked_add(read as u64).ok_or_else(|| {
+            TsinkError::DataCorruption(format!(
+                "legacy segment file length overflow while hashing: {}",
+                path.display()
+            ))
+        })?;
+        if observed > expected_len {
+            return Err(TsinkError::DataCorruption(format!(
+                "legacy segment file grew while hashing: {}",
+                path.display()
+            )));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if observed != expected_len {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file length changed while hashing: {}",
+            path.display()
+        )));
+    }
+    validate_opened_legacy_segment_file_identity(file, path, expected_len)?;
+    Ok(hasher.digest())
+}
+
+fn open_legacy_segment_file_no_follow(path: &Path, expected_len: u64) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_len
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file changed type or length while opening: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn validate_opened_legacy_segment_file_identity(
+    file: File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<()> {
+    let opened_identity =
+        same_file::Handle::from_file(file).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let current_metadata = fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&current_metadata)
+        || !current_metadata.file_type().is_file()
+        || current_metadata.len() != expected_len
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file changed type or length while validating: {}",
+            path.display()
+        )));
+    }
+    let current_identity =
+        same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if opened_identity != current_identity {
+        return Err(TsinkError::DataCorruption(format!(
+            "legacy segment file path changed while validating: {}",
+            path.display()
+        )));
     }
     Ok(())
 }

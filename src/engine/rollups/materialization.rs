@@ -1310,7 +1310,9 @@ impl ChunkStorage {
         result
     }
 
-    pub(in crate::engine) fn run_rollup_pipeline_once(&self) -> Result<RollupTraversalProgress> {
+    pub(in crate::engine) fn run_rollup_pipeline_once_with_snapshot(
+        &self,
+    ) -> Result<crate::storage::RollupObservabilitySnapshot> {
         self.ensure_open()?;
         let write_permits = self
             .runtime
@@ -1323,6 +1325,10 @@ impl ChunkStorage {
         let result = {
             let _run_guard = self.rollup_run_coordination_context().run_lock.lock();
             self.run_rollup_pipeline_once_locked(write_permit)
+                // Keep the status snapshot in the same serialization window as the explicit run.
+                // Otherwise the background worker can begin the next traversal, clear
+                // `source_traversal_complete`, and make this completed call return stale status.
+                .map(|progress| self.rollup_observability_snapshot_with_progress(progress))
         };
         drop(write_permits);
         self.enforce_post_commit_memory_budget_best_effort();

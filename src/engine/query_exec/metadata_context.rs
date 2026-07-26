@@ -73,6 +73,7 @@ trait MetadataPostingsReadOps {
         &self,
         series_ids: RoaringTreemap,
         prune_dead: bool,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap>;
 
     fn filter_series_postings_in_time_range(
@@ -158,7 +159,7 @@ impl MetadataSelectionContext<'_> {
         self.candidate_planning
             .record_metadata_candidate_plan_hooks(&plan, compiled_matchers);
         self.postings
-            .live_series_postings(plan.candidate_series_ids, true)
+            .live_series_postings(plan.candidate_series_ids, true, execution)
     }
 
     pub(super) fn shard_scoped_candidate_series_ids(
@@ -168,9 +169,11 @@ impl MetadataSelectionContext<'_> {
         scope_series_ids: &[SeriesId],
         execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
-        let live_scope_series_ids = self
-            .postings
-            .live_series_postings(scope_series_ids.iter().copied().collect(), true)?;
+        let live_scope_series_ids = self.postings.live_series_postings(
+            scope_series_ids.iter().copied().collect(),
+            true,
+            execution,
+        )?;
         let plan = self
             .candidate_planning
             .build_runtime_metadata_candidate_plan(
@@ -469,8 +472,9 @@ impl MetadataPostingsReadOps for ChunkStorage {
         &self,
         series_ids: RoaringTreemap,
         prune_dead: bool,
+        execution: &QueryExecution,
     ) -> Result<RoaringTreemap> {
-        ChunkStorage::live_series_postings(self, series_ids, prune_dead)
+        ChunkStorage::live_series_postings_for_query(self, series_ids, prune_dead, execution)
     }
 
     fn filter_series_postings_in_time_range(

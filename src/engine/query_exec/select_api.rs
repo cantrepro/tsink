@@ -4,28 +4,21 @@ use std::time::Instant;
 use super::{
     apply_offset_limit_in_place, dedupe_last_value_per_timestamp, elapsed_nanos_u64,
     modeled_point_output_upper_bound_bytes, modeled_point_result_upper_bound_bytes,
-    modeled_points_retained_bytes, modeled_vec_capacity_bytes, saturating_u64_from_usize,
-    value_heap_bytes, ChunkStorage, PersistedTierFetchStats, RawSeriesPagination,
+    modeled_points_retained_bytes, modeled_vec_capacity_bytes, modeled_vec_growth_capacity_upper,
+    saturating_u64_from_usize, value_heap_bytes, ChunkStorage, PersistedTierFetchStats,
+    RawSeriesPagination,
 };
 use crate::query_aggregation::{
     aggregate_series, downsample_points, downsample_points_with_custom,
     downsample_points_with_origin,
 };
 use crate::validation::{validate_labels, validate_metric};
+use crate::value::modeled_query_value_payload_bytes;
 use crate::QueryExecution;
 use crate::{
-    Aggregation, DataPoint, Label, MetricSeries, QueryOptions, Result, SeriesPoints, TsinkError,
+    Aggregation, DataPoint, Label, MetricSeries, QueryOptions, Result, SelectManyExecutionResult,
+    SeriesPoints, TsinkError,
 };
-
-fn modeled_vec_growth_capacity_upper(elements: usize) -> usize {
-    if elements == 0 {
-        return 0;
-    }
-    elements
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-        .max(4)
-}
 
 fn downsample_output_count_upper(
     points: &[DataPoint],
@@ -170,14 +163,19 @@ fn execute_custom_point_transform(
     let fixed_result_bytes = saturating_u64_from_usize(output_elements_upper)
         .saturating_mul(u64::try_from(std::mem::size_of::<DataPoint>()).unwrap_or(u64::MAX));
     let mut output_reservation = execution.reserve_memory(fixed_output_bytes)?;
-    let mut transferred_heap_bytes = 0u64;
+    let mut transferred_retained_heap_bytes = 0u64;
+    let mut transferred_returned_payload_bytes = 0u64;
     let mut admit = |point: &DataPoint| -> Result<()> {
         execution.checkpoint()?;
-        transferred_heap_bytes = transferred_heap_bytes
+        transferred_retained_heap_bytes = transferred_retained_heap_bytes
             .saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX));
-        execution
-            .ensure_returned_bytes(fixed_result_bytes.saturating_add(transferred_heap_bytes))?;
-        output_reservation.resize(fixed_output_bytes.saturating_add(transferred_heap_bytes))?;
+        transferred_returned_payload_bytes = transferred_returned_payload_bytes
+            .saturating_add(modeled_query_value_payload_bytes(&point.value));
+        execution.ensure_returned_bytes(
+            fixed_result_bytes.saturating_add(transferred_returned_payload_bytes),
+        )?;
+        output_reservation
+            .resize(fixed_output_bytes.saturating_add(transferred_retained_heap_bytes))?;
         Ok(())
     };
 
@@ -586,7 +584,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         execution: &QueryExecution,
-    ) -> Result<Vec<SeriesPoints>> {
+    ) -> Result<SelectManyExecutionResult> {
         let context = self.series_query_context();
         execution.checkpoint()?;
         self.ensure_open()?;
@@ -594,6 +592,7 @@ impl ChunkStorage {
             return Err(TsinkError::InvalidTimeRange { start, end });
         }
         self.request_background_persisted_refresh_if_needed();
+        execution.observe_intermediate_vector_size(saturating_u64_from_usize(series.len()))?;
 
         for item in series {
             validate_metric(&item.name)?;
@@ -603,21 +602,30 @@ impl ChunkStorage {
             bytes.saturating_add(modeled_series_points_identity_returned_bytes(item))
         });
         execution.ensure_returned_bytes(identity_returned_bytes)?;
-        let identity_retained_bytes = modeled_vec_capacity_bytes::<SeriesPoints>(series.len())
-            .saturating_add(series.iter().fold(0u64, |bytes, item| {
-                bytes.saturating_add(modeled_metric_series_retained_bytes(item))
-            }));
+        let identity_retained_bytes =
+            modeled_vec_capacity_bytes::<(MetricSeries, Option<super::SeriesId>)>(series.len())
+                .saturating_add(modeled_vec_capacity_bytes::<SeriesPoints>(series.len()))
+                .saturating_add(modeled_vec_capacity_bytes::<bool>(series.len()))
+                .saturating_add(series.iter().fold(0u64, |bytes, item| {
+                    bytes.saturating_add(modeled_metric_series_retained_bytes(item))
+                }));
         let mut output_reservation = execution.reserve_memory(identity_retained_bytes)?;
         // Charge identity bytes before `resolve_series_batch` clones metric and label strings.
         execution.charge_returned_bytes(identity_returned_bytes)?;
         let resolved = context.resolve_series_batch(series);
+        let matched_count = resolved.iter().fold(0u64, |count, (_, series_id)| {
+            count.saturating_add(u64::from(series_id.is_some()))
+        });
+        execution.charge_series_matched(matched_count)?;
         let plan = context.query_tier_plan(start, end);
 
         let mut out = Vec::with_capacity(resolved.len());
+        let mut matched_selectors = Vec::with_capacity(resolved.len());
         let mut retained_point_bytes = 0u64;
         let mut persisted_stats = PersistedTierFetchStats::default();
         for (series, series_id) in resolved {
             execution.checkpoint()?;
+            matched_selectors.push(series_id.is_some());
             let points = match series_id {
                 Some(series_id) => {
                     let (points, stats) = context.collect_points_for_series(
@@ -642,7 +650,11 @@ impl ChunkStorage {
         }
         self.record_query_tier_plan(plan);
         self.record_persisted_tier_fetch_stats(persisted_stats);
-        Ok(out)
+        Ok(SelectManyExecutionResult::accounted(
+            out,
+            matched_selectors,
+            output_reservation,
+        ))
     }
 
     pub(in crate::engine::storage_engine) fn select_all_api(

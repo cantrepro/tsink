@@ -385,12 +385,13 @@ impl ManagedStringSecret {
         }))
     }
 
-    pub fn current(&self) -> String {
-        self.state
+    /// Uses the current secret without allocating a cloned copy.
+    pub fn with_current<T>(&self, use_value: impl FnOnce(&str) -> T) -> T {
+        let state = self
+            .state
             .read()
-            .expect("secret read lock should not be poisoned")
-            .current
-            .clone()
+            .expect("secret read lock should not be poisoned");
+        use_value(&state.current)
     }
 
     pub fn matches(&self, provided: Option<&str>) -> bool {

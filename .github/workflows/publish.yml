@@ -1,110 +1,199 @@
 name: Publish
 
 on:
-  push:
-    branches: [master]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-  publish-tsink:
-    name: Publish tsink to crates.io
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '.packages[] | select(.name=="tsink") | .version')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Check if already published
-        id: check
-        run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
-            "https://crates.io/api/v1/crates/tsink/${{ steps.version.outputs.version }}")
-          if [ "$STATUS" = "200" ]; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish tsink
-        if: steps.check.outputs.published == 'false'
-        run: cargo publish -p tsink
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  publish-tsink-server:
-    name: Publish tsink-server to crates.io
-    needs: publish-tsink
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '.packages[] | select(.name=="tsink-server") | .version')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Check if already published
-        id: check
-        run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
-            "https://crates.io/api/v1/crates/tsink-server/${{ steps.version.outputs.version }}")
-          if [ "$STATUS" = "200" ]; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish tsink-server
-        if: steps.check.outputs.published == 'false'
-        run: cargo publish -p tsink-server
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  check-python-version:
-    name: Check Python package version
+  verify:
+    name: Verify release
     runs-on: ubuntu-latest
     outputs:
-      should_publish: ${{ steps.check.outputs.should_publish }}
+      commit: ${{ steps.revision.outputs.commit }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
 
-      - name: Get version
-        id: version
+      - name: Verify tag identity
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          TRIGGER_REF_TYPE: ${{ github.ref_type }}
+          TRIGGER_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
         run: |
-          VERSION=$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '.packages[] | select(.name=="tsink-uniffi") | .version')
+          if [ "$TRIGGER_REF_TYPE" != "tag" ]; then
+            echo "::error::Publishing requires a tag ref; received $TRIGGER_REF_TYPE '$TRIGGER_TAG'"
+            exit 1
+          fi
+
+          if ! TAG_COMMIT=$(git rev-parse --verify "refs/tags/$TRIGGER_TAG^{commit}"); then
+            echo "::error::Trigger ref '$TRIGGER_TAG' is not an available Git tag"
+            exit 1
+          fi
+          if ! EVENT_COMMIT=$(git rev-parse --verify "$EVENT_SHA^{commit}"); then
+            echo "::error::Trigger SHA '$EVENT_SHA' is not an available Git commit"
+            exit 1
+          fi
+          VERIFIED_COMMIT=$(git rev-parse HEAD)
+          if [ "$VERIFIED_COMMIT" != "$EVENT_COMMIT" ]; then
+            echo "::error::The checked-out commit does not match immutable trigger SHA $EVENT_SHA"
+            exit 1
+          fi
+          if [ "$TAG_COMMIT" != "$EVENT_COMMIT" ]; then
+            echo "::error::Tag $TRIGGER_TAG moved or does not resolve to trigger SHA $EVENT_SHA"
+            exit 1
+          fi
+
+      - name: Record verified revision
+        id: revision
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify versions, release tag, and changelog
+        id: version
+        env:
+          TRIGGER_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: |
+          VERSIONS=$(
+            cargo metadata --format-version 1 --no-deps --locked |
+              jq -r '
+                .packages[]
+                | select(
+                    .name == "tsink"
+                    or .name == "tsink-server"
+                    or .name == "tsink-uniffi"
+                  )
+                | .version
+              ' |
+              sort -u
+          )
+          VERSION_COUNT=$(printf '%s\n' "$VERSIONS" | awk 'NF { count += 1 } END { print count + 0 }')
+
+          if [ "$VERSION_COUNT" -ne 1 ]; then
+            echo "::error::Workspace package versions do not agree"
+            printf 'Found versions:\n%s\n' "$VERSIONS"
+            exit 1
+          fi
+
+          VERSION=$(printf '%s\n' "$VERSIONS" | awk 'NF { print; exit }')
+          if [ "$TRIGGER_TAG" != "v$VERSION" ] &&
+            [ "$TRIGGER_TAG" != "$VERSION" ]; then
+            echo "::error::Tag $TRIGGER_TAG does not match workspace version $VERSION"
+            exit 1
+          fi
+
+          FIRST_HEADING=$(awk '/^## / { print; exit }' CHANGELOG.md)
+          if [ "$FIRST_HEADING" != "## [Unreleased]" ]; then
+            echo "::error::The first CHANGELOG.md section must be exactly '## [Unreleased]'; found '$FIRST_HEADING'"
+            exit 1
+          fi
+
+          RELEASE_HEADING=$(awk '/^## / { seen += 1; if (seen == 2) { print; exit } }' CHANGELOG.md)
+          case "$RELEASE_HEADING" in
+            "## [$VERSION] - "* | "## $VERSION - "*) ;;
+            *)
+              echo "::error::The first release section after [Unreleased] must be version $VERSION; found '$RELEASE_HEADING'"
+              exit 1
+              ;;
+          esac
+
+          UNRELEASED_CONTENT=$(
+            awk '
+              /^## \[Unreleased\]$/ { inside = 1; next }
+              /^## / { if (inside) exit }
+              inside && NF { print; exit }
+            ' CHANGELOG.md
+          )
+          if [ -n "$UNRELEASED_CONTENT" ]; then
+            echo "::error::CHANGELOG.md still contains unpromoted [Unreleased] entries"
+            exit 1
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Check if already published on PyPI
-        id: check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features --locked
+
+      - name: Test workspace without default features
+        run: cargo test --workspace --no-default-features --locked
+
+      - name: Check MSRV
+        run: cargo +1.89.0 check --workspace --all-targets --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Smoke-test server version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tsink-ci' \
-            "https://pypi.org/pypi/tsink/${{ steps.version.outputs.version }}/json")
-          if [ "$STATUS" = "200" ]; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          ACTUAL=$(cargo run --quiet -p tsink-server --bin tsink-server --locked -- --version)
+          if [ "$ACTUAL" != "tsink-server $VERSION" ]; then
+            echo "::error::Server reported '$ACTUAL', expected 'tsink-server $VERSION'"
+            exit 1
           fi
+
+      - name: Dry-run core package
+        run: cargo package -p tsink --locked
+
+      - name: Dry-run downstream packages
+        run: |
+          cargo package -p tsink-server --locked --no-verify
+          cargo package -p tsink-uniffi --locked --no-verify
+
+  crate-publication-disabled:
+    name: crates.io publication disabled (missing release gates)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+
+      - name: Explain publication gate
+        run: |
+          echo "::notice::Crate packages passed the available dry-run checks."
+          echo "::notice::crates.io publication remains disabled until the storage-format compatibility, process-crash durability, compatibility-matrix, and final-artifact checksum/attestation gates required by GOAL.md exist."
 
   build-python-wheels:
     name: Build wheel (${{ matrix.target }})
-    needs: check-python-version
-    if: needs.check-python-version.outputs.should_publish == 'true'
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -124,6 +213,13 @@ jobs:
             args: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Set up QEMU
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -136,19 +232,67 @@ jobs:
           args: --release --out dist ${{ matrix.args }}
           working-directory: crates/tsink-uniffi
 
+      - name: Detect whether the target wheel is executable on this runner
+        id: runtime
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          HOST_ARCH=$(python -c 'import platform; print(platform.machine().lower())')
+          case "$HOST_ARCH" in
+            amd64 | x86_64) HOST_ARCH=x86_64 ;;
+            arm64 | aarch64) HOST_ARCH=aarch64 ;;
+          esac
+          TARGET_ARCH=${TARGET%%-*}
+
+          if [ "$HOST_ARCH" = "$TARGET_ARCH" ]; then
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping runtime smoke test for cross-compiled $TARGET wheel on $HOST_ARCH runner"
+          fi
+
+      - name: Install and execute native wheel
+        if: steps.runtime.outputs.runnable == 'true'
+        shell: bash
+        run: |
+          python -c '
+          import glob
+          import subprocess
+          import sys
+
+          wheels = glob.glob("crates/tsink-uniffi/dist/*.whl")
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one wheel, found {wheels!r}")
+          subprocess.check_call(
+              [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", wheels[0]]
+          )
+          '
+          python -I -c '
+          import tsink
+
+          builder = tsink.TsinkStorageBuilder()
+          builder.with_wal_enabled(False)
+          db = builder.build()
+          db.list_metrics()
+          db.close()
+          '
+
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.target }}
           path: crates/tsink-uniffi/dist/*.whl
+          if-no-files-found: error
 
   build-python-sdist:
     name: Build sdist
-    needs: check-python-version
-    if: needs.check-python-version.outputs.should_publish == 'true'
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -162,23 +306,18 @@ jobs:
         with:
           name: sdist
           path: crates/tsink-uniffi/dist/*.tar.gz
+          if-no-files-found: error
 
-  publish-python:
-    name: Publish to PyPI
-    needs: [check-python-version, build-python-wheels, build-python-sdist]
-    if: needs.check-python-version.outputs.should_publish == 'true'
+  python-publication-disabled:
+    name: PyPI publication disabled (incomplete smoke coverage)
+    needs: [verify, build-python-wheels, build-python-sdist]
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          path: dist
-          merge-multiple: true
+          ref: ${{ needs.verify.outputs.commit }}
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: dist/
+      - name: Explain publication gate
+        run: |
+          echo "::notice::Wheels and sdist were built, and native wheels were runtime-tested."
+          echo "::notice::PyPI publication remains disabled because cross-compiled wheels cannot all be executed in this matrix."

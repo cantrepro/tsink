@@ -3,23 +3,115 @@ use crate::validation::{validate_labels, validate_metric};
 use crate::{MetricSeries, Result, Row, TsinkError};
 
 use super::{
-    modeled_points_retained_bytes, modeled_vec_capacity_bytes, shard_window_fnv1a_update,
-    shard_window_hash_data_point, shard_window_series_identity_key,
-    sort_data_points_for_shard_window, validate_query_rows_scan_options,
+    modeled_metric_series_retained_bytes, modeled_metric_series_shape_retained_bytes,
+    modeled_points_retained_bytes, modeled_string_capacity_bytes, modeled_vec_capacity_bytes,
+    modeled_vec_growth_capacity_upper, shard_window_fnv1a_update, shard_window_hash_data_point,
+    sort_data_points_for_shard_window_with_execution, validate_query_rows_scan_options,
     validate_shard_window_request, validate_shard_window_scan_options, ChunkStorage,
-    MetadataShardScope, PersistedTierFetchStats, QueryExecution, QueryRowsPage,
-    QueryRowsScanOptions, RawSeriesScanPage, SeriesId, ShardWindowDigest, ShardWindowRowsPage,
-    ShardWindowScanOptions, SHARD_WINDOW_FNV_OFFSET_BASIS,
+    MetadataShardScope, PersistedTierFetchStats, QueryExecution, QueryRowsExecutionResult,
+    QueryRowsPage, QueryRowsScanOptions, RawSeriesScanPage, SeriesId, ShardWindowDigest,
+    ShardWindowRowsExecutionResult, ShardWindowRowsPage, ShardWindowScanOptions,
+    SHARD_WINDOW_FNV_OFFSET_BASIS,
 };
 
+fn modeled_resolved_series_retained_bytes(series: &[MetricSeries]) -> u64 {
+    modeled_vec_capacity_bytes::<(MetricSeries, Option<SeriesId>)>(series.len()).saturating_add(
+        series.iter().fold(0u64, |bytes, item| {
+            let label_text_bytes = item.labels.iter().fold(0usize, |total, label| {
+                total
+                    .saturating_add(label.name.len())
+                    .saturating_add(label.value.len())
+            });
+            bytes.saturating_add(modeled_metric_series_shape_retained_bytes(
+                item.name.len(),
+                item.labels.len(),
+                label_text_bytes,
+            ))
+        }),
+    )
+}
+
+fn shard_scan_identity_key_len(
+    metric_bytes: usize,
+    label_count: usize,
+    label_text_bytes: usize,
+) -> usize {
+    2usize
+        .saturating_add(metric_bytes.min(crate::label::MAX_METRIC_NAME_LEN))
+        .saturating_add(label_count.saturating_mul(4))
+        .saturating_add(label_text_bytes)
+        .saturating_mul(2)
+}
+
+fn shard_scan_identity_key(metric: &str, labels: &[crate::Label]) -> String {
+    fn push_hex_byte(output: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+
+    fn push_hex_bytes(output: &mut String, bytes: &[u8]) {
+        for byte in bytes {
+            push_hex_byte(output, *byte);
+        }
+    }
+
+    debug_assert!(labels.windows(2).all(|pair| pair[0] <= pair[1]));
+    let metric_bytes = metric.as_bytes();
+    let metric_len = metric_bytes.len().min(crate::label::MAX_METRIC_NAME_LEN);
+    let canonical_len = 2usize
+        .saturating_add(metric_len)
+        .saturating_add(labels.iter().fold(0usize, |bytes, label| {
+            if !label.is_valid() {
+                return bytes;
+            }
+            bytes
+                .saturating_add(4)
+                .saturating_add(label.name.len().min(u16::MAX as usize))
+                .saturating_add(label.value.len().min(u16::MAX as usize))
+        }));
+    let mut output = String::with_capacity(canonical_len.saturating_mul(2));
+    push_hex_bytes(&mut output, &(metric_len as u16).to_le_bytes());
+    push_hex_bytes(&mut output, &metric_bytes[..metric_len]);
+    for label in labels {
+        if !label.is_valid() {
+            continue;
+        }
+        let name_bytes = label.name.as_bytes();
+        let name_len = name_bytes.len().min(u16::MAX as usize);
+        push_hex_bytes(&mut output, &(name_len as u16).to_le_bytes());
+        push_hex_bytes(&mut output, &name_bytes[..name_len]);
+
+        let value_bytes = label.value.as_bytes();
+        let value_len = value_bytes.len().min(u16::MAX as usize);
+        push_hex_bytes(&mut output, &(value_len as u16).to_le_bytes());
+        push_hex_bytes(&mut output, &value_bytes[..value_len]);
+    }
+    output
+}
+
+fn modeled_shard_scan_entries_retained_bytes(entries: &Vec<ShardScanSeriesEntry>) -> u64 {
+    modeled_vec_capacity_bytes::<ShardScanSeriesEntry>(entries.capacity()).saturating_add(
+        entries.iter().fold(0u64, |bytes, entry| {
+            bytes
+                .saturating_add(modeled_metric_series_retained_bytes(&entry.series))
+                .saturating_add(modeled_string_capacity_bytes(entry.identity_key.capacity()))
+        }),
+    )
+}
+
 impl ChunkStorage {
-    fn shard_scan_series_entries(
+    pub(in crate::engine::storage_engine) fn shard_scan_series_entries(
         &self,
         shard: u32,
         shard_count: u32,
         operation: &'static str,
         execution: &QueryExecution,
-    ) -> Result<(Vec<ShardScanSeriesEntry>, crate::QueryMemoryReservation)> {
+    ) -> Result<(
+        Vec<ShardScanSeriesEntry>,
+        crate::QueryMemoryReservation,
+        crate::QueryMemoryReservation,
+    )> {
         let candidate_reservation = self.reserve_metadata_candidate_working_set(execution)?;
         let metadata = self.metadata_shard_scope_context();
         let series_query = self.series_query_context();
@@ -38,22 +130,52 @@ impl ChunkStorage {
             u64::try_from(candidate_series_ids.len()).unwrap_or(u64::MAX),
         )?;
 
+        let mut entries_bytes = modeled_vec_capacity_bytes::<ShardScanSeriesEntry>(
+            modeled_vec_growth_capacity_upper(candidate_series_ids.len()),
+        );
+        {
+            let registry = self.catalog.registry.read();
+            for series_id in &candidate_series_ids {
+                execution.checkpoint()?;
+                let Some((metric_bytes, label_count, label_text_bytes)) =
+                    registry.decoded_series_key_shape(*series_id)
+                else {
+                    continue;
+                };
+                entries_bytes = entries_bytes
+                    .saturating_add(modeled_metric_series_shape_retained_bytes(
+                        metric_bytes,
+                        label_count,
+                        label_text_bytes,
+                    ))
+                    .saturating_add(modeled_string_capacity_bytes(
+                        modeled_vec_growth_capacity_upper(shard_scan_identity_key_len(
+                            metric_bytes,
+                            label_count,
+                            label_text_bytes,
+                        )),
+                    ));
+            }
+        }
+        let mut entries_reservation = execution.reserve_memory(entries_bytes)?;
         let mut entries = Vec::with_capacity(candidate_series_ids.len());
         for series_id in candidate_series_ids {
             execution.checkpoint()?;
             let Some(series) = series_query.metric_series(series_id) else {
                 continue;
             };
-            let identity_key =
-                shard_window_series_identity_key(series.name.as_str(), &series.labels);
+            let identity_key = shard_scan_identity_key(series.name.as_str(), &series.labels);
             entries.push(ShardScanSeriesEntry {
                 series_id,
                 series,
                 identity_key,
             });
         }
-        entries.sort_by(|left, right| left.identity_key.cmp(&right.identity_key));
-        Ok((entries, candidate_reservation))
+        entries_reservation.resize(modeled_shard_scan_entries_retained_bytes(&entries))?;
+        execution.checkpoint()?;
+        entries.sort_unstable_by(|left, right| left.identity_key.cmp(&right.identity_key));
+        execution.checkpoint()?;
+        Ok((entries, candidate_reservation, entries_reservation))
     }
 
     fn scan_resolved_series_rows_with_plan(
@@ -64,7 +186,7 @@ impl ChunkStorage {
         plan: TieredQueryPlan,
         options: QueryRowsScanOptions,
         execution: &QueryExecution,
-    ) -> Result<QueryRowsPage> {
+    ) -> Result<QueryRowsExecutionResult> {
         let context = self.series_query_context();
         let max_rows = options.max_rows;
         let row_offset = options.row_offset.unwrap_or(0);
@@ -77,7 +199,7 @@ impl ChunkStorage {
         };
         let mut stream_row_offset = 0u64;
         let mut persisted_stats = PersistedTierFetchStats::default();
-        let mut row_reservations = Vec::new();
+        let mut row_reservation = execution.reserve_memory(0)?;
 
         for (index, (series, series_id)) in resolved.iter().enumerate() {
             execution.checkpoint()?;
@@ -98,12 +220,12 @@ impl ChunkStorage {
             stream_row_offset = stream_row_offset.saturating_add(page.final_rows_seen);
 
             if !page.points.is_empty() {
-                row_reservations.push(self.reserve_rows_materialization(
-                    execution,
+                row_reservation.resize(super::modeled_rows_append_upper_bytes(
+                    &response.rows,
                     &series.name,
                     &series.labels,
                     &page.points,
-                )?);
+                ))?;
                 response.rows_scanned = response
                     .rows_scanned
                     .saturating_add(u64::try_from(page.points.len()).unwrap_or(u64::MAX));
@@ -120,6 +242,7 @@ impl ChunkStorage {
                         point,
                     ));
                 }
+                row_reservation.resize(super::modeled_query_rows_retained_bytes(&response.rows))?;
             }
 
             if !page.reached_end {
@@ -139,7 +262,10 @@ impl ChunkStorage {
 
         self.record_query_tier_plan(plan);
         self.record_persisted_tier_fetch_stats(persisted_stats);
-        Ok(response)
+        Ok(QueryRowsExecutionResult::accounted(
+            response,
+            row_reservation,
+        ))
     }
 
     pub(in crate::engine::storage_engine) fn compute_shard_window_digest_api(
@@ -166,12 +292,13 @@ impl ChunkStorage {
         let plan = context.query_tier_plan(window_start, window_end);
         let mut persisted_stats = PersistedTierFetchStats::default();
 
-        let (entries, _candidate_reservation) = self.shard_scan_series_entries(
-            shard,
-            shard_count,
-            "compute_shard_window_digest",
-            execution,
-        )?;
+        let (entries, _candidate_reservation, _entries_reservation) = self
+            .shard_scan_series_entries(
+                shard,
+                shard_count,
+                "compute_shard_window_digest",
+                execution,
+            )?;
         for entry in entries {
             execution.checkpoint()?;
             let stats = context.collect_points_for_series_into(
@@ -200,7 +327,10 @@ impl ChunkStorage {
                 .max(4);
             point_hash_reservation
                 .resize(modeled_vec_capacity_bytes::<u64>(requested_hash_capacity))?;
-            point_hashes.extend(points.iter().map(shard_window_hash_data_point));
+            for point in &points {
+                execution.checkpoint()?;
+                point_hashes.push(shard_window_hash_data_point(point)?);
+            }
             point_hash_reservation
                 .resize(modeled_vec_capacity_bytes::<u64>(point_hashes.capacity()))?;
             point_hashes.sort_unstable();
@@ -221,6 +351,10 @@ impl ChunkStorage {
                 point_count.saturating_add(u64::try_from(point_hashes.len()).unwrap_or(u64::MAX));
         }
 
+        drop(point_hashes);
+        drop(point_hash_reservation);
+        drop(points);
+        drop(points_reservation);
         self.record_query_tier_plan(plan);
         self.record_persisted_tier_fetch_stats(persisted_stats);
         Ok(ShardWindowDigest {
@@ -242,7 +376,7 @@ impl ChunkStorage {
         window_end: i64,
         options: ShardWindowScanOptions,
         execution: &QueryExecution,
-    ) -> Result<ShardWindowRowsPage> {
+    ) -> Result<ShardWindowRowsExecutionResult> {
         let context = self.series_query_context();
         execution.checkpoint()?;
         self.ensure_open()?;
@@ -268,17 +402,14 @@ impl ChunkStorage {
         };
 
         let mut points = Vec::new();
+        let mut points_reservation = execution.reserve_memory(0)?;
         let mut stream_row_offset = 0u64;
         let mut remaining_series_budget = max_series;
         let plan = context.query_tier_plan(window_start, window_end);
         let mut persisted_stats = PersistedTierFetchStats::default();
-        let mut row_reservations = Vec::new();
-        let (entries, _candidate_reservation) = self.shard_scan_series_entries(
-            shard,
-            shard_count,
-            "scan_shard_window_rows",
-            execution,
-        )?;
+        let mut row_reservation = execution.reserve_memory(0)?;
+        let (entries, _candidate_reservation, _entries_reservation) = self
+            .shard_scan_series_entries(shard, shard_count, "scan_shard_window_rows", execution)?;
         'series_scan: for entry in entries {
             execution.checkpoint()?;
             let stats = context.collect_points_for_series_into(
@@ -291,17 +422,18 @@ impl ChunkStorage {
                 false,
             )?;
             persisted_stats.accumulate(stats);
+            points_reservation.resize(modeled_points_retained_bytes(&points))?;
             if points.is_empty() {
                 continue;
             }
 
-            sort_data_points_for_shard_window(&mut points);
-            row_reservations.push(self.reserve_rows_materialization(
-                execution,
+            sort_data_points_for_shard_window_with_execution(&mut points, execution)?;
+            row_reservation.resize(super::modeled_rows_append_upper_bytes(
+                &response.rows,
                 &entry.series.name,
                 &entry.series.labels,
                 &points,
-            )?);
+            ))?;
 
             let mut counted_series_for_budget = false;
             for point in points.iter() {
@@ -343,19 +475,25 @@ impl ChunkStorage {
             }
         }
 
+        drop(points);
+        drop(points_reservation);
+        row_reservation.resize(super::modeled_query_rows_retained_bytes(&response.rows))?;
         self.record_query_tier_plan(plan);
         self.record_persisted_tier_fetch_stats(persisted_stats);
-        Ok(response)
+        Ok(ShardWindowRowsExecutionResult::accounted(
+            response,
+            row_reservation,
+        ))
     }
 
-    pub(in crate::engine::storage_engine) fn scan_series_rows_api(
+    pub(in crate::engine::storage_engine) fn scan_series_rows_result_api(
         &self,
         series: &[MetricSeries],
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
         execution: &QueryExecution,
-    ) -> Result<QueryRowsPage> {
+    ) -> Result<QueryRowsExecutionResult> {
         let context = self.series_query_context();
         self.ensure_open()?;
         if start >= end {
@@ -368,6 +506,13 @@ impl ChunkStorage {
             validate_metric(&item.name)?;
             validate_labels(&item.labels)?;
         }
+        execution
+            .observe_intermediate_vector_size(u64::try_from(series.len()).unwrap_or(u64::MAX))?;
+        // Resolution clones every requested identity before scanning. Admit that complete
+        // retained shape before `resolve_series_batch` allocates; the reservation stays live
+        // until scanning no longer needs the cloned identities.
+        let _resolved_series_reservation =
+            execution.reserve_memory(modeled_resolved_series_retained_bytes(series))?;
         let resolved = context.resolve_series_batch(series);
         let plan = context.query_tier_plan(start, end);
         self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
@@ -407,10 +552,12 @@ impl ChunkStorage {
 
         let plan = context.query_tier_plan(start, end);
         self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
+            .map(QueryRowsExecutionResult::into_page)
     }
 }
 
-struct ShardScanSeriesEntry {
+#[derive(Debug)]
+pub(in crate::engine::storage_engine) struct ShardScanSeriesEntry {
     series_id: SeriesId,
     series: MetricSeries,
     identity_key: String,

@@ -34,6 +34,45 @@ pub struct Engine {
     timestamp_units_per_second: i64,
 }
 
+/// A PromQL value whose retained heap remains charged to its originating query execution.
+///
+/// Protocol adapters should keep this result (or the reservation returned by [`Self::into_parts`])
+/// alive through response encoding and transport handoff.
+#[derive(Debug)]
+#[must_use = "dropping the result releases its retained query-memory reservation"]
+pub struct PromqlExecutionResult {
+    value: PromqlValue,
+    result_memory_reservation: QueryMemoryReservation,
+}
+
+impl PromqlExecutionResult {
+    /// Borrows the evaluated PromQL value without releasing its result-memory charge.
+    #[must_use]
+    pub fn value(&self) -> &PromqlValue {
+        &self.value
+    }
+
+    /// Returns the bytes retained on behalf of the result.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.result_memory_reservation.bytes()
+    }
+
+    /// Consumes the wrapper and returns the value together with its retained-memory reservation.
+    pub fn into_parts(self) -> (PromqlValue, QueryMemoryReservation) {
+        (self.value, self.result_memory_reservation)
+    }
+
+    /// Consumes the wrapper and releases its retained-memory charge.
+    ///
+    /// This is intended for compatibility callers that do not need accounting through response
+    /// serialization.
+    #[must_use]
+    pub fn into_value(self) -> PromqlValue {
+        self.value
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct QueryParams<'a> {
     pub eval_time: i64,
@@ -64,9 +103,80 @@ impl PromqlMemoryTracker {
         self.reservations.lock().push(reservation);
         Ok(())
     }
+
+    pub(crate) fn adopt(&self, reservation: QueryMemoryReservation) {
+        self.reservations.lock().push(reservation);
+    }
+
+    fn into_result_reservation(
+        self,
+        execution: &QueryExecution,
+        retained_bytes: u64,
+    ) -> Result<QueryMemoryReservation> {
+        execution
+            .coalesce_memory_reservations(self.reservations.into_inner(), retained_bytes)
+            .map_err(|error| match error {
+                crate::query_budget::QueryMemoryCoalesceError::Budget(error) => {
+                    PromqlError::Storage(crate::TsinkError::from(error))
+                }
+                crate::query_budget::QueryMemoryCoalesceError::InvalidReservations => {
+                    PromqlError::Storage(crate::TsinkError::Other(
+                        "PromQL memory tracker contained a reservation from another execution"
+                            .to_string(),
+                    ))
+                }
+            })
+    }
 }
 
 const PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+
+fn modeled_promql_parse_preparation_bytes(input: &str) -> u64 {
+    let token_count_upper = input
+        .len()
+        .saturating_add(1)
+        .min(crate::promql::MAX_PARSE_TOKENS.saturating_add(1));
+    let token_count = u64::try_from(token_count_upper).unwrap_or(u64::MAX);
+    let token_and_ast_bytes = u64::try_from(
+        std::mem::size_of::<crate::promql::lexer::Token>()
+            .saturating_add(std::mem::size_of::<Expr>().saturating_mul(4))
+            .saturating_add(
+                PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES.saturating_mul(8) as usize,
+            ),
+    )
+    .unwrap_or(u64::MAX);
+    // Lexer literals and token kinds can duplicate input text, and parser moves/clones text into
+    // the AST while the token vector is still live. Eight input copies plus per-token node,
+    // vector-growth, Box, and allocator allowances conservatively cover that overlap.
+    token_count
+        .saturating_mul(token_and_ast_bytes)
+        .saturating_add(
+            u64::try_from(input.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8),
+        )
+        .saturating_add(PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn prepare_promql_parse_with_execution(
+    input: &str,
+    execution: &QueryExecution,
+) -> Result<(Expr, QueryMemoryReservation)> {
+    if input.len() > crate::promql::MAX_PARSE_INPUT_BYTES {
+        return Err(PromqlError::Parse(format!(
+            "PromQL query input exceeds the {}-byte limit (got {} bytes)",
+            crate::promql::MAX_PARSE_INPUT_BYTES,
+            input.len()
+        )));
+    }
+    execution.checkpoint().map_err(crate::TsinkError::from)?;
+    let reservation = execution
+        .reserve_memory(modeled_promql_parse_preparation_bytes(input))
+        .map_err(crate::TsinkError::from)?;
+    execution.checkpoint().map_err(crate::TsinkError::from)?;
+    let expr = crate::promql::parse(input)?;
+    Ok((expr, reservation))
+}
 
 fn modeled_vec_capacity_bytes<T>(capacity: usize) -> u64 {
     if capacity == 0 {
@@ -88,6 +198,28 @@ fn modeled_string_bytes(value: &str) -> u64 {
     }
 }
 
+fn modeled_promql_string_value_bytes(value: &str) -> u64 {
+    u64::try_from(std::mem::size_of::<PromqlValue>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_string_bytes(value))
+}
+
+fn modeled_owned_promql_string_value_bytes(value: &String) -> u64 {
+    u64::try_from(std::mem::size_of::<PromqlValue>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_owned_string_retained_bytes(value))
+}
+
+fn modeled_owned_string_retained_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(PROMQL_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
 fn modeled_labels_bytes(labels: &[Label]) -> u64 {
     modeled_vec_capacity_bytes::<Label>(labels.len()).saturating_add(labels.iter().fold(
         0u64,
@@ -95,6 +227,17 @@ fn modeled_labels_bytes(labels: &[Label]) -> u64 {
             bytes
                 .saturating_add(modeled_string_bytes(&label.name))
                 .saturating_add(modeled_string_bytes(&label.value))
+        },
+    ))
+}
+
+fn modeled_owned_labels_retained_bytes(labels: &Vec<Label>) -> u64 {
+    modeled_vec_capacity_bytes::<Label>(labels.capacity()).saturating_add(labels.iter().fold(
+        0u64,
+        |bytes, label| {
+            bytes
+                .saturating_add(modeled_owned_string_retained_bytes(&label.name))
+                .saturating_add(modeled_owned_string_retained_bytes(&label.value))
         },
     ))
 }
@@ -134,6 +277,15 @@ fn modeled_value_heap_bytes(value: &Value) -> u64 {
     }
 }
 
+fn modeled_value_retained_heap_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Bytes(bytes) => modeled_vec_capacity_bytes::<u8>(bytes.capacity()),
+        Value::String(value) => modeled_owned_string_retained_bytes(value),
+        Value::Histogram(histogram) => modeled_histogram_bytes(histogram),
+        Value::F64(_) | Value::I64(_) | Value::U64(_) | Value::Bool(_) => 0,
+    }
+}
+
 fn modeled_sample_bytes(
     metric: &str,
     labels: &[Label],
@@ -146,15 +298,29 @@ fn modeled_sample_bytes(
         .saturating_add(histogram.map(modeled_histogram_bytes).unwrap_or(0))
 }
 
+fn modeled_owned_sample_retained_bytes(sample: &crate::promql::types::Sample) -> u64 {
+    u64::try_from(std::mem::size_of::<crate::promql::types::Sample>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_owned_string_retained_bytes(&sample.metric))
+        .saturating_add(modeled_owned_labels_retained_bytes(&sample.labels))
+        .saturating_add(
+            sample
+                .histogram
+                .as_deref()
+                .map(modeled_histogram_bytes)
+                .unwrap_or(0),
+        )
+}
+
 fn modeled_prefetch_rows_bytes(rows: &MetricPrefetchRows) -> u64 {
     modeled_vec_capacity_bytes::<LabelPoints>(rows.capacity()).saturating_add(rows.iter().fold(
         0u64,
         |bytes, (labels, points)| {
             bytes
-                .saturating_add(modeled_labels_bytes(labels))
+                .saturating_add(modeled_owned_labels_retained_bytes(labels))
                 .saturating_add(modeled_vec_capacity_bytes::<DataPoint>(points.capacity()))
                 .saturating_add(points.iter().fold(0u64, |point_bytes, point| {
-                    point_bytes.saturating_add(modeled_value_heap_bytes(&point.value))
+                    point_bytes.saturating_add(modeled_value_retained_heap_bytes(&point.value))
                 }))
         },
     ))
@@ -166,21 +332,12 @@ fn promql_value_shape(value: &PromqlValue) -> (u64, u64) {
             1,
             u64::try_from(std::mem::size_of::<PromqlValue>()).unwrap_or(u64::MAX),
         ),
-        PromqlValue::String(value, _) => (
-            1,
-            u64::try_from(std::mem::size_of::<PromqlValue>())
-                .unwrap_or(u64::MAX)
-                .saturating_add(modeled_string_bytes(value)),
-        ),
+        PromqlValue::String(value, _) => (1, modeled_owned_promql_string_value_bytes(value)),
         PromqlValue::InstantVector(samples) => (
             u64::try_from(samples.len()).unwrap_or(u64::MAX),
             modeled_vec_capacity_bytes::<crate::promql::types::Sample>(samples.capacity())
                 .saturating_add(samples.iter().fold(0u64, |bytes, sample| {
-                    bytes.saturating_add(modeled_sample_bytes(
-                        &sample.metric,
-                        &sample.labels,
-                        sample.histogram.as_deref(),
-                    ))
+                    bytes.saturating_add(modeled_owned_sample_retained_bytes(sample))
                 })),
         ),
         PromqlValue::RangeVector(series) => {
@@ -192,8 +349,8 @@ fn promql_value_shape(value: &PromqlValue) -> (u64, u64) {
             let bytes = modeled_vec_capacity_bytes::<Series>(series.capacity()).saturating_add(
                 series.iter().fold(0u64, |bytes, series| {
                     bytes
-                        .saturating_add(modeled_string_bytes(&series.metric))
-                        .saturating_add(modeled_labels_bytes(&series.labels))
+                        .saturating_add(modeled_owned_string_retained_bytes(&series.metric))
+                        .saturating_add(modeled_owned_labels_retained_bytes(&series.labels))
                         .saturating_add(modeled_vec_capacity_bytes::<(i64, f64)>(
                             series.samples.capacity(),
                         ))
@@ -208,6 +365,83 @@ fn promql_value_shape(value: &PromqlValue) -> (u64, u64) {
                         ))
                 }),
             );
+            (samples, bytes)
+        }
+    }
+}
+
+fn modeled_query_slice_content_bytes<T>(len: usize) -> u64 {
+    u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+}
+
+fn modeled_query_labels_returned_bytes(labels: &[Label]) -> u64 {
+    modeled_query_slice_content_bytes::<Label>(labels.len()).saturating_add(labels.iter().fold(
+        0u64,
+        |bytes, label| {
+            bytes
+                .saturating_add(u64::try_from(label.name.len()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(label.value.len()).unwrap_or(u64::MAX))
+        },
+    ))
+}
+
+fn promql_value_returned_shape(value: &PromqlValue) -> (u64, u64) {
+    let fixed_value_bytes = u64::try_from(std::mem::size_of::<PromqlValue>()).unwrap_or(u64::MAX);
+    match value {
+        PromqlValue::Scalar(_, _) => (1, fixed_value_bytes),
+        PromqlValue::String(value, _) => (
+            1,
+            fixed_value_bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+        ),
+        PromqlValue::InstantVector(samples) => {
+            let bytes = fixed_value_bytes
+                .saturating_add(modeled_query_slice_content_bytes::<
+                    crate::promql::types::Sample,
+                >(samples.len()))
+                .saturating_add(samples.iter().fold(0u64, |bytes, sample| {
+                    bytes
+                        .saturating_add(u64::try_from(sample.metric.len()).unwrap_or(u64::MAX))
+                        .saturating_add(modeled_query_labels_returned_bytes(&sample.labels))
+                        .saturating_add(
+                            sample
+                                .histogram
+                                .as_deref()
+                                .map(crate::value::modeled_query_histogram_payload_bytes)
+                                .unwrap_or(0),
+                        )
+                }));
+            (u64::try_from(samples.len()).unwrap_or(u64::MAX), bytes)
+        }
+        PromqlValue::RangeVector(series) => {
+            let samples = series.iter().fold(0u64, |count, series| {
+                count
+                    .saturating_add(u64::try_from(series.samples.len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(series.histograms.len()).unwrap_or(u64::MAX))
+            });
+            let bytes = fixed_value_bytes
+                .saturating_add(modeled_query_slice_content_bytes::<Series>(series.len()))
+                .saturating_add(series.iter().fold(0u64, |bytes, series| {
+                    bytes
+                        .saturating_add(u64::try_from(series.metric.len()).unwrap_or(u64::MAX))
+                        .saturating_add(modeled_query_labels_returned_bytes(&series.labels))
+                        .saturating_add(modeled_query_slice_content_bytes::<(i64, f64)>(
+                            series.samples.len(),
+                        ))
+                        .saturating_add(modeled_query_slice_content_bytes::<(
+                            i64,
+                            Box<NativeHistogram>,
+                        )>(series.histograms.len()))
+                        .saturating_add(series.histograms.iter().fold(
+                            0u64,
+                            |histogram_bytes, (_, histogram)| {
+                                histogram_bytes.saturating_add(
+                                    crate::value::modeled_query_histogram_payload_bytes(histogram),
+                                )
+                            },
+                        ))
+                }));
             (samples, bytes)
         }
     }
@@ -423,23 +657,62 @@ impl Engine {
         time: i64,
         execution: &QueryExecution,
     ) -> Result<PromqlValue> {
-        let expr = crate::promql::parse(query_str)?;
+        self.instant_query_with_execution_internal(query_str, time, execution, false)
+            .map(|(value, _)| value)
+    }
+
+    /// Evaluates one instant query and retains its result-memory charge for the caller.
+    ///
+    /// Keep the returned guard alive through serialization. This method reuses the caller's
+    /// already-admitted execution and does not acquire another concurrency permit.
+    pub fn instant_query_with_execution_result(
+        &self,
+        query_str: &str,
+        time: i64,
+        execution: &QueryExecution,
+    ) -> Result<PromqlExecutionResult> {
+        let (value, result_memory_reservation) =
+            self.instant_query_with_execution_internal(query_str, time, execution, true)?;
+        Ok(PromqlExecutionResult {
+            value,
+            result_memory_reservation: result_memory_reservation
+                .expect("detailed instant-query execution always retains its result"),
+        })
+    }
+
+    fn instant_query_with_execution_internal(
+        &self,
+        query_str: &str,
+        time: i64,
+        execution: &QueryExecution,
+        retain_result: bool,
+    ) -> Result<(PromqlValue, Option<QueryMemoryReservation>)> {
+        let (expr, parse_reservation) = prepare_promql_parse_with_execution(query_str, execution)?;
         execution.checkpoint().map_err(crate::TsinkError::from)?;
         execution.ensure_steps(1).map_err(crate::TsinkError::from)?;
         execution.charge_steps(1).map_err(crate::TsinkError::from)?;
         let memory = PromqlMemoryTracker::default();
-        let params = QueryParams {
-            eval_time: time,
-            prefetch: None,
-            query_start: time,
-            query_end: time,
-            query_step: None,
-            execution,
-            memory: &memory,
+        let value = {
+            let params = QueryParams {
+                eval_time: time,
+                prefetch: None,
+                query_start: time,
+                query_end: time,
+                query_step: None,
+                execution,
+                memory: &memory,
+            };
+            self.eval(&expr, &params)?
         };
-        let value = self.eval(&expr, &params)?;
         charge_promql_result(execution, &value)?;
-        Ok(value)
+        drop(expr);
+        let result_memory_reservation = if retain_result {
+            Some(memory.into_result_reservation(execution, promql_value_shape(&value).1)?)
+        } else {
+            None
+        };
+        drop(parse_reservation);
+        Ok((value, result_memory_reservation))
     }
 
     pub fn range_query(
@@ -482,6 +755,40 @@ impl Engine {
         step: i64,
         execution: &QueryExecution,
     ) -> Result<PromqlValue> {
+        self.range_query_with_execution_internal(query_str, start, end, step, execution, false)
+            .map(|(value, _)| value)
+    }
+
+    /// Evaluates one range query and retains its result-memory charge for the caller.
+    ///
+    /// Keep the returned guard alive through serialization. Prefetch, all steps, and the retained
+    /// result share the caller-owned execution.
+    pub fn range_query_with_execution_result(
+        &self,
+        query_str: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+        execution: &QueryExecution,
+    ) -> Result<PromqlExecutionResult> {
+        let (value, result_memory_reservation) =
+            self.range_query_with_execution_internal(query_str, start, end, step, execution, true)?;
+        Ok(PromqlExecutionResult {
+            value,
+            result_memory_reservation: result_memory_reservation
+                .expect("detailed range-query execution always retains its result"),
+        })
+    }
+
+    fn range_query_with_execution_internal(
+        &self,
+        query_str: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+        execution: &QueryExecution,
+        retain_result: bool,
+    ) -> Result<(PromqlValue, Option<QueryMemoryReservation>)> {
         if step <= 0 {
             return Err(PromqlError::Eval("range step must be positive".to_string()));
         }
@@ -491,7 +798,7 @@ impl Engine {
             )));
         }
 
-        let expr = crate::promql::parse(query_str)?;
+        let (expr, parse_reservation) = prepare_promql_parse_with_execution(query_str, execution)?;
         let step_count = inclusive_step_count(start, end, step);
         execution
             .ensure_steps(step_count)
@@ -519,10 +826,19 @@ impl Engine {
             Self::append_step_value(&mut out, ts, val, &params)?;
         }
 
+        memory.reserve(execution, modeled_vec_capacity_bytes::<Series>(out.len()))?;
         let series = out.into_values().collect();
         let value = PromqlValue::RangeVector(series);
         charge_promql_result(execution, &value)?;
-        Ok(value)
+        drop(prefetch);
+        drop(expr);
+        let result_memory_reservation = if retain_result {
+            Some(memory.into_result_reservation(execution, promql_value_shape(&value).1)?)
+        } else {
+            None
+        };
+        drop(parse_reservation);
+        Ok((value, result_memory_reservation))
     }
 
     fn append_step_value(
@@ -594,9 +910,15 @@ impl Engine {
 
     pub(crate) fn eval(&self, expr: &Expr, params: &QueryParams<'_>) -> Result<PromqlValue> {
         params.checkpoint()?;
+        let string_literal_pre_reserved = matches!(expr, Expr::StringLiteral(_));
         let value = match expr {
             Expr::NumberLiteral(v) => Ok(PromqlValue::Scalar(*v, params.eval_time)),
-            Expr::StringLiteral(v) => Ok(PromqlValue::String(v.clone(), params.eval_time)),
+            Expr::StringLiteral(v) => {
+                params
+                    .memory
+                    .reserve(params.execution, modeled_promql_string_value_bytes(v))?;
+                Ok(PromqlValue::String(v.clone(), params.eval_time))
+            }
             Expr::Paren(expr) => self.eval(expr, params),
             Expr::VectorSelector(selector) => {
                 selector::eval_vector_selector(self, selector, params)
@@ -616,7 +938,9 @@ impl Engine {
             Expr::Aggregation(agg) => aggregation::eval_aggregation(self, agg, params),
             Expr::Call(call) => functions::eval_call(self, call, params),
         }?;
-        params.retain_value(&value)?;
+        if !string_literal_pre_reserved {
+            params.retain_value(&value)?;
+        }
         Ok(value)
     }
 
@@ -661,13 +985,17 @@ impl Engine {
         let mut cache = PrefetchCache::default();
         for metric in metrics {
             execution.checkpoint().map_err(crate::TsinkError::from)?;
-            let data = self.storage.select_all_with_execution(
+            let retained = selector::load_metric_rows_with_retained_execution(
+                self,
                 &metric,
                 fetch_start,
                 fetch_end,
                 execution,
             )?;
-            memory.reserve(execution, modeled_prefetch_rows_bytes(&data))?;
+            let (data, reservation) = retained.into_parts();
+            if let Some(reservation) = reservation {
+                memory.adopt(reservation);
+            }
             cache.insert(metric, data);
         }
 
@@ -818,7 +1146,7 @@ pub(crate) fn inclusive_step_count(start: i64, end: i64, step: i64) -> u64 {
 
 fn charge_promql_result(execution: &QueryExecution, value: &PromqlValue) -> Result<()> {
     execution.checkpoint().map_err(crate::TsinkError::from)?;
-    let (samples, bytes) = promql_value_shape(value);
+    let (samples, bytes) = promql_value_returned_shape(value);
     execution
         .observe_intermediate_vector_size(samples)
         .map_err(crate::TsinkError::from)?;
@@ -912,5 +1240,125 @@ fn latest_series_point(
         (Some((_, value)), None) => Some(LatestSeriesPoint::Float(value)),
         (None, Some((_, histogram))) => Some(LatestSeriesPoint::Histogram(histogram)),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        HistogramCount, HistogramResetHint, QueryBudgetError, QueryBudgetLimits, QueryLimitReason,
+        QueryWorkLimits,
+    };
+
+    fn histogram() -> NativeHistogram {
+        NativeHistogram {
+            count: Some(HistogramCount::Int(3)),
+            sum: 6.0,
+            schema: 1,
+            zero_threshold: 0.0,
+            zero_count: Some(HistogramCount::Int(0)),
+            negative_spans: Vec::new(),
+            negative_deltas: Vec::new(),
+            negative_counts: Vec::new(),
+            positive_spans: vec![crate::HistogramBucketSpan {
+                offset: 0,
+                length: 2,
+            }],
+            positive_deltas: vec![1, 2],
+            positive_counts: vec![1.0, 2.0],
+            reset_hint: HistogramResetHint::No,
+            custom_values: vec![0.5],
+        }
+    }
+
+    #[test]
+    fn promql_returned_shape_depends_on_content_not_capacity() {
+        let compact_histogram = histogram();
+        let mut roomy_histogram = compact_histogram.clone();
+        roomy_histogram.positive_spans.reserve(32);
+        roomy_histogram.positive_deltas.reserve(32);
+        roomy_histogram.positive_counts.reserve(32);
+        roomy_histogram.custom_values.reserve(32);
+
+        let compact_sample = crate::promql::types::Sample {
+            metric: "cpu".to_string(),
+            labels: vec![Label::new("host", "a")],
+            timestamp: 10,
+            value: 0.0,
+            histogram: Some(Box::new(compact_histogram)),
+        };
+        let mut roomy_labels = Vec::with_capacity(32);
+        roomy_labels.push(Label::new("host", "a"));
+        let roomy_sample = crate::promql::types::Sample {
+            metric: "cpu".to_string(),
+            labels: roomy_labels,
+            timestamp: 10,
+            value: 0.0,
+            histogram: Some(Box::new(roomy_histogram)),
+        };
+        let compact = PromqlValue::InstantVector(vec![compact_sample]);
+        let mut roomy_samples = Vec::with_capacity(32);
+        roomy_samples.push(roomy_sample);
+        let roomy = PromqlValue::InstantVector(roomy_samples);
+
+        assert_eq!(compact, roomy);
+        assert_eq!(
+            promql_value_returned_shape(&compact),
+            promql_value_returned_shape(&roomy)
+        );
+        assert!(promql_value_shape(&roomy).1 > promql_value_shape(&compact).1);
+
+        let compact_string = PromqlValue::String("x".to_string(), 0);
+        let mut roomy_string_value = String::with_capacity(256);
+        roomy_string_value.push('x');
+        let roomy_string = PromqlValue::String(roomy_string_value, 0);
+        assert_eq!(
+            promql_value_returned_shape(&compact_string),
+            promql_value_returned_shape(&roomy_string)
+        );
+        assert!(
+            promql_value_shape(&roomy_string).1 > promql_value_shape(&compact_string).1,
+            "retained-result accounting must use String capacity rather than logical length"
+        );
+    }
+
+    #[test]
+    fn parser_preparation_accepts_its_exact_memory_bound_and_rejects_one_less() {
+        let query = format!("metric_name{{label=\"{}\"}}", "value".repeat(128));
+        let exact_bytes = modeled_promql_parse_preparation_bytes(&query);
+        assert!(exact_bytes > 1);
+
+        for (limit, succeeds) in [(exact_bytes, true), (exact_bytes - 1, false)] {
+            let budget = QueryBudget::new(QueryBudgetLimits {
+                max_shared_memory_bytes: Some(limit),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            })
+            .unwrap();
+            let execution = budget.begin_query().unwrap();
+            let result = prepare_promql_parse_with_execution(&query, &execution);
+            if succeeds {
+                let (_expr, reservation) = result.unwrap();
+                assert_eq!(reservation.bytes(), exact_bytes);
+                assert_eq!(execution.snapshot().memory_reserved_bytes, exact_bytes);
+                drop(reservation);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PromqlError::Storage(crate::TsinkError::QueryBudget(
+                        QueryBudgetError::LimitExceeded(exceeded)
+                    ))) if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+                ));
+            }
+            assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+            drop(execution);
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+            assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        }
     }
 }

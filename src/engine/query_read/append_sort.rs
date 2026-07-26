@@ -36,7 +36,7 @@ impl ChunkStorage {
             out,
             execution,
         )?;
-        self.finalize_append_sort_points(series_id, analysis, out);
+        self.finalize_append_sort_points(series_id, analysis, out, execution)?;
         if let Some(reservation) = working_reservation.as_mut() {
             reservation.resize(modeled_points_bytes(out))?;
         }
@@ -78,7 +78,8 @@ impl ChunkStorage {
         series_id: SeriesId,
         analysis: super::analysis::SeriesReadAnalysis,
         out: &mut Vec<DataPoint>,
-    ) {
+        execution: Option<&QueryExecution>,
+    ) -> Result<()> {
         self.apply_retention_filter(out);
 
         if analysis.needs_append_sort_reorder() {
@@ -97,7 +98,7 @@ impl ChunkStorage {
             }
         }
 
-        self.apply_tombstone_filter(series_id, out);
+        self.apply_tombstone_filter_for_query(series_id, out, execution)
     }
 }
 

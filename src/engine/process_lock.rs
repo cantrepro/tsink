@@ -2,7 +2,7 @@ use super::*;
 use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
-const DATA_PATH_LOCK_FILE_NAME: &str = ".tsink.lock";
+pub(super) const DATA_PATH_LOCK_FILE_NAME: &str = ".tsink.lock";
 const SHARED_OBJECT_STORE_WRITER_LOCK_FILE_NAME: &str = ".tsink-writer.lock";
 const LOCK_ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCK_ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);

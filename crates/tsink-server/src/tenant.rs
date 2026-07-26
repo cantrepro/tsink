@@ -16,7 +16,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tsink::{
     BatchWriteResult, DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label,
     MetadataShardScope, MetricSeries, QueryBudget, QueryCancellationToken, QueryExecution,
-    QueryOptions, QueryWorkLimits, Result as TsinkResult, Row, RowWriteOutcome, RowWriteStatus,
+    QueryExecutionAccounting, QueryOptions, QueryWorkLimits, Result as TsinkResult, Row,
+    RowWriteOutcome, RowWriteStatus, SelectManyExecutionResult, SelectSeriesExecutionResult,
     SeriesMatcher, SeriesPoints, SeriesSelection, Storage, StorageObservabilitySnapshot,
     TsinkError, WriteMode, WriteRejection, WriteRejectionCategory,
 };
@@ -86,6 +87,21 @@ fn tenant_query_metric_series_identity_bytes(series: &[MetricSeries]) -> u64 {
 fn tenant_query_metric_series_retained_bytes(series: &[MetricSeries], capacity: usize) -> u64 {
     tenant_query_vec_capacity_bytes::<MetricSeries>(capacity)
         .saturating_add(tenant_query_metric_series_identity_bytes(series))
+}
+
+fn tenant_query_scoped_series_peak_bytes(series: &[MetricSeries], tenant_id: &str) -> u64 {
+    tenant_query_metric_series_retained_bytes(series, series.len()).saturating_add(
+        series.iter().fold(0u64, |bytes, item| {
+            let required_labels = item.labels.len().saturating_add(1);
+            let grown_capacity =
+                projected_tenant_query_vec_capacity(item.labels.len(), required_labels);
+            bytes
+                // `Vec::push` can briefly retain both the exact clone buffer and its grown buffer.
+                .saturating_add(tenant_query_vec_capacity_bytes::<Label>(grown_capacity))
+                .saturating_add(tenant_query_string_capacity_bytes(TENANT_LABEL.len()))
+                .saturating_add(tenant_query_string_capacity_bytes(tenant_id.len()))
+        }),
+    )
 }
 
 fn projected_tenant_query_vec_capacity(current: usize, required: usize) -> usize {
@@ -1727,14 +1743,76 @@ impl TenantScopedStorage {
         selection: &SeriesSelection,
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<MetricSeries>> {
+        self.read_series_with_execution_result(selection, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn read_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        self.read_series_with_optional_scope_with_execution_result(selection, None, execution)
+    }
+
+    fn read_series_in_shards(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        let mut merged = BTreeSet::new();
+        for scoped in self.read_selections(selection)? {
+            merged.extend(self.inner.select_series_in_shards(&scoped, scope)?);
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    fn read_series_in_shards_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        self.read_series_with_optional_scope_with_execution_result(
+            selection,
+            Some(scope),
+            execution,
+        )
+    }
+
+    fn read_series_with_optional_scope_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        scope: Option<&MetadataShardScope>,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
         let mut merged = Vec::new();
         let mut reservation = execution.reserve_memory(0).map_err(TsinkError::from)?;
+        let inner_accounting = match scope {
+            Some(_) => self.inner.select_series_in_shards_execution_accounting(),
+            None => self.inner.select_series_execution_accounting(),
+        };
         for scoped in self.read_selections(selection)? {
             execution.checkpoint().map_err(TsinkError::from)?;
-            let mut selected = self
-                .inner
-                .select_series_with_execution(&scoped, execution)?;
+            let mut selected_result = match scope {
+                Some(scope) => self
+                    .inner
+                    .select_series_in_shards_with_execution_result(&scoped, scope, execution)?,
+                None => self
+                    .inner
+                    .select_series_with_execution_result(&scoped, execution)?,
+            };
             execution.checkpoint().map_err(TsinkError::from)?;
+            if inner_accounting == QueryExecutionAccounting::Complete
+                && selected_result.reserved_memory_bytes() == 0
+                && !selected_result.series.is_empty()
+            {
+                return Err(TsinkError::Other(
+                    "completely accounted tenant metadata read omitted its result reservation"
+                        .to_string(),
+                ));
+            }
+            let mut selected = std::mem::take(&mut selected_result.series);
             if selected.is_empty() {
                 continue;
             }
@@ -1756,6 +1834,7 @@ impl TenantScopedStorage {
                     ))
                     .map_err(TsinkError::from)?;
                 merged = selected;
+                drop(selected_result);
                 continue;
             }
 
@@ -1770,10 +1849,13 @@ impl TenantScopedStorage {
             } else {
                 0
             };
-            let growth_peak = current_retained
-                .saturating_add(selected_retained)
-                .saturating_add(projected_growth_buffer);
-            reservation.resize(growth_peak).map_err(TsinkError::from)?;
+            reservation
+                .resize(
+                    current_retained
+                        .saturating_add(selected_retained)
+                        .saturating_add(projected_growth_buffer),
+                )
+                .map_err(TsinkError::from)?;
             merged.try_reserve(selected.len()).map_err(|err| {
                 TsinkError::Other(format!(
                     "failed to reserve tenant metadata merge output: {err}"
@@ -1781,6 +1863,7 @@ impl TenantScopedStorage {
             })?;
             merged.append(&mut selected);
             drop(selected);
+            drop(selected_result);
             reservation
                 .resize(tenant_query_metric_series_retained_bytes(
                     &merged,
@@ -1790,19 +1873,20 @@ impl TenantScopedStorage {
         }
         merged.sort_unstable();
         merged.dedup();
-        Ok(merged)
-    }
-
-    fn read_series_in_shards(
-        &self,
-        selection: &SeriesSelection,
-        scope: &MetadataShardScope,
-    ) -> TsinkResult<Vec<MetricSeries>> {
-        let mut merged = BTreeSet::new();
-        for scoped in self.read_selections(selection)? {
-            merged.extend(self.inner.select_series_in_shards(&scoped, scope)?);
-        }
-        Ok(merged.into_iter().collect())
+        reservation
+            .resize(tenant_query_metric_series_retained_bytes(
+                &merged,
+                merged.capacity(),
+            ))
+            .map_err(TsinkError::from)?;
+        Ok(match inner_accounting {
+            QueryExecutionAccounting::Complete => {
+                SelectSeriesExecutionResult::accounted(merged, reservation)
+            }
+            QueryExecutionAccounting::Unaccounted => {
+                SelectSeriesExecutionResult::reserved_unaccounted(merged, reservation)
+            }
+        })
     }
 
     fn visible_series(&self, mut series: Vec<MetricSeries>) -> Vec<MetricSeries> {
@@ -2081,6 +2165,261 @@ impl Storage for TenantScopedStorage {
         }
     }
 
+    fn select_many_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<SeriesPoints>> {
+        self.select_many_with_execution_result(series, start, end, execution)
+            .map(SelectManyExecutionResult::into_series)
+    }
+
+    fn select_many_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectManyExecutionResult> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        execution
+            .observe_intermediate_vector_size(u64::try_from(series.len()).unwrap_or(u64::MAX))
+            .map_err(TsinkError::from)?;
+        let inner_accounting = self.inner.select_many_execution_accounting();
+        let scoped_peak_bytes = tenant_query_scoped_series_peak_bytes(series, &self.tenant_id);
+        let mut wrapper_reservation = execution
+            .reserve_memory(scoped_peak_bytes)
+            .map_err(TsinkError::from)?;
+        let scoped = series
+            .iter()
+            .map(|item| {
+                Ok(MetricSeries {
+                    name: item.name.clone(),
+                    labels: self.scoped_labels(&item.labels)?,
+                })
+            })
+            .collect::<TsinkResult<Vec<_>>>()?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        let mut scoped_result = self
+            .inner
+            .select_many_with_execution_result(&scoped, start, end, execution)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        if inner_accounting == QueryExecutionAccounting::Complete
+            && scoped_result.reserved_memory_bytes() == 0
+            && !scoped_result.series.is_empty()
+        {
+            return Err(TsinkError::Other(
+                "completely accounted tenant batch read omitted its result reservation".to_string(),
+            ));
+        }
+        let scoped_matched_bytes = scoped_result
+            .matched_selectors
+            .as_ref()
+            .map_or(0, |matched| {
+                tenant_query_vec_capacity_bytes::<bool>(matched.capacity())
+            });
+        let selected_retained_bytes =
+            crate::cluster::query::modeled_series_points_vec_retained_bytes(&scoped_result.series);
+        wrapper_reservation
+            .resize(
+                scoped_peak_bytes
+                    .saturating_add(selected_retained_bytes)
+                    .saturating_add(scoped_matched_bytes),
+            )
+            .map_err(TsinkError::from)?;
+        if scoped_result.series.len() != series.len() {
+            return Err(TsinkError::Other(format!(
+                "tenant-scoped batch read received {} inner results for {} requested series",
+                scoped_result.series.len(),
+                series.len()
+            )));
+        }
+        if scoped_result
+            .series
+            .iter()
+            .zip(&scoped)
+            .any(|(item, selector)| item.series != *selector)
+        {
+            return Err(TsinkError::Other(
+                "tenant-scoped batch read returned identities outside requested order".to_string(),
+            ));
+        }
+        let mut matched_selectors = match inner_accounting {
+            QueryExecutionAccounting::Complete => {
+                let matched = scoped_result.matched_selectors.take().ok_or_else(|| {
+                    TsinkError::Other(
+                        "completely accounted tenant batch read omitted selector-existence bits"
+                            .to_string(),
+                    )
+                })?;
+                if matched.len() != series.len() {
+                    return Err(TsinkError::Other(format!(
+                        "tenant-scoped batch read received {} existence bits for {} requested series",
+                        matched.len(),
+                        series.len()
+                    )));
+                }
+                Some(matched)
+            }
+            QueryExecutionAccounting::Unaccounted => None,
+        };
+        let mut selected = std::mem::take(&mut scoped_result.series);
+        drop(scoped_result);
+
+        if self.is_default_tenant() {
+            let fallback_collection_bytes =
+                tenant_query_vec_capacity_bytes::<usize>(series.len()).saturating_add(
+                    tenant_query_metric_series_retained_bytes(series, series.len()),
+                );
+            let retained_before_fallback = scoped_peak_bytes
+                .saturating_add(selected_retained_bytes)
+                .saturating_add(fallback_collection_bytes);
+            wrapper_reservation
+                .resize(retained_before_fallback)
+                .map_err(TsinkError::from)?;
+            let fallback_indices = selected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let missing = matched_selectors
+                        .as_ref()
+                        .map_or_else(|| item.points.is_empty(), |matched| !matched[index]);
+                    missing.then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if !fallback_indices.is_empty() {
+                execution
+                    .observe_intermediate_vector_size(
+                        u64::try_from(fallback_indices.len()).unwrap_or(u64::MAX),
+                    )
+                    .map_err(TsinkError::from)?;
+                let fallback_series = fallback_indices
+                    .iter()
+                    .map(|index| series[*index].clone())
+                    .collect::<Vec<_>>();
+                let mut fallback_result = self.inner.select_many_with_execution_result(
+                    &fallback_series,
+                    start,
+                    end,
+                    execution,
+                )?;
+                execution.checkpoint().map_err(TsinkError::from)?;
+                let fallback_matched_bytes = fallback_result
+                    .matched_selectors
+                    .as_ref()
+                    .map_or(0, |matched| {
+                        tenant_query_vec_capacity_bytes::<bool>(matched.capacity())
+                    });
+                wrapper_reservation
+                    .resize(
+                        retained_before_fallback
+                            .saturating_add(
+                                crate::cluster::query::modeled_series_points_vec_retained_bytes(
+                                    &fallback_result.series,
+                                ),
+                            )
+                            .saturating_add(fallback_matched_bytes),
+                    )
+                    .map_err(TsinkError::from)?;
+                if fallback_result.series.len() != fallback_indices.len() {
+                    return Err(TsinkError::Other(format!(
+                        "default-tenant fallback read received {} inner results for {} requested series",
+                        fallback_result.series.len(),
+                        fallback_indices.len()
+                    )));
+                }
+                if fallback_result
+                    .series
+                    .iter()
+                    .zip(&fallback_series)
+                    .any(|(item, selector)| item.series != *selector)
+                {
+                    return Err(TsinkError::Other(
+                        "default-tenant fallback read returned identities outside requested order"
+                            .to_string(),
+                    ));
+                }
+                let fallback_matched = match inner_accounting {
+                    QueryExecutionAccounting::Complete => {
+                        let matched =
+                            fallback_result.matched_selectors.take().ok_or_else(|| {
+                                TsinkError::Other(
+                                    "completely accounted default-tenant fallback omitted selector-existence bits"
+                                        .to_string(),
+                                )
+                            })?;
+                        if matched.len() != fallback_indices.len() {
+                            return Err(TsinkError::Other(format!(
+                                "default-tenant fallback read received {} existence bits for {} requested series",
+                                matched.len(),
+                                fallback_indices.len()
+                            )));
+                        }
+                        Some(matched)
+                    }
+                    QueryExecutionAccounting::Unaccounted => None,
+                };
+                let fallback = std::mem::take(&mut fallback_result.series);
+                drop(fallback_result);
+                for (fallback_position, (index, fallback_item)) in
+                    fallback_indices.into_iter().zip(fallback).enumerate()
+                {
+                    let fallback_exists = fallback_matched.as_ref().map_or_else(
+                        || !fallback_item.points.is_empty(),
+                        |matched| matched[fallback_position],
+                    );
+                    if fallback_exists {
+                        selected[index].points = fallback_item.points;
+                    }
+                    if let Some(matched) = matched_selectors.as_mut() {
+                        matched[index] = fallback_exists;
+                    }
+                }
+            }
+        }
+
+        let final_output_identity_bytes =
+            tenant_query_vec_capacity_bytes::<SeriesPoints>(series.len())
+                .saturating_add(tenant_query_metric_series_identity_bytes(series));
+        wrapper_reservation
+            .resize(
+                wrapper_reservation
+                    .bytes()
+                    .saturating_add(final_output_identity_bytes),
+            )
+            .map_err(TsinkError::from)?;
+        let output = series
+            .iter()
+            .cloned()
+            .zip(selected)
+            .map(|(series, selected)| SeriesPoints {
+                series,
+                points: selected.points,
+            })
+            .collect::<Vec<_>>();
+        drop(scoped);
+        let output_retained_bytes =
+            crate::cluster::query::modeled_series_points_vec_retained_bytes(&output)
+                .saturating_add(matched_selectors.as_ref().map_or(0, |matched| {
+                    tenant_query_vec_capacity_bytes::<bool>(matched.capacity())
+                }));
+        wrapper_reservation
+            .resize(output_retained_bytes)
+            .map_err(TsinkError::from)?;
+        Ok(match matched_selectors {
+            Some(matched_selectors) => {
+                SelectManyExecutionResult::accounted(output, matched_selectors, wrapper_reservation)
+            }
+            None => SelectManyExecutionResult::reserved_unaccounted(output, wrapper_reservation),
+        })
+    }
+
+    fn select_many_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.inner.select_many_execution_accounting()
+    }
+
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> TsinkResult<Vec<DataPoint>> {
         let scoped = self.scoped_query_options(opts.clone())?;
         match self.inner.select_with_options(metric, scoped) {
@@ -2170,7 +2509,40 @@ impl Storage for TenantScopedStorage {
         selection: &SeriesSelection,
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self.visible_series(self.read_series_with_execution(selection, execution)?))
+        self.select_series_with_execution_result(selection, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        let mut selected = self.read_series_with_execution_result(selection, execution)?;
+        let mut reservation = selected.take_memory_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "tenant metadata result omitted its retained-memory reservation".to_string(),
+            )
+        })?;
+        let visible = self.visible_series(std::mem::take(&mut selected.series));
+        reservation
+            .resize(tenant_query_metric_series_retained_bytes(
+                &visible,
+                visible.capacity(),
+            ))
+            .map_err(TsinkError::from)?;
+        Ok(match self.inner.select_series_execution_accounting() {
+            QueryExecutionAccounting::Complete => {
+                SelectSeriesExecutionResult::accounted(visible, reservation)
+            }
+            QueryExecutionAccounting::Unaccounted => {
+                SelectSeriesExecutionResult::reserved_unaccounted(visible, reservation)
+            }
+        })
+    }
+
+    fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.inner.select_series_execution_accounting()
     }
 
     fn select_series_in_shards(
@@ -2179,6 +2551,52 @@ impl Storage for TenantScopedStorage {
         scope: &MetadataShardScope,
     ) -> TsinkResult<Vec<MetricSeries>> {
         Ok(self.visible_series(self.read_series_in_shards(selection, scope)?))
+    }
+
+    fn select_series_in_shards_with_execution(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        self.select_series_in_shards_with_execution_result(selection, scope, execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn select_series_in_shards_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        scope: &MetadataShardScope,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        let mut selected =
+            self.read_series_in_shards_with_execution_result(selection, scope, execution)?;
+        let mut reservation = selected.take_memory_reservation().ok_or_else(|| {
+            TsinkError::Other(
+                "tenant metadata result omitted its retained-memory reservation".to_string(),
+            )
+        })?;
+        let visible = self.visible_series(std::mem::take(&mut selected.series));
+        reservation
+            .resize(tenant_query_metric_series_retained_bytes(
+                &visible,
+                visible.capacity(),
+            ))
+            .map_err(TsinkError::from)?;
+        Ok(
+            match self.inner.select_series_in_shards_execution_accounting() {
+                QueryExecutionAccounting::Complete => {
+                    SelectSeriesExecutionResult::accounted(visible, reservation)
+                }
+                QueryExecutionAccounting::Unaccounted => {
+                    SelectSeriesExecutionResult::reserved_unaccounted(visible, reservation)
+                }
+            },
+        )
+    }
+
+    fn select_series_in_shards_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.inner.select_series_in_shards_execution_accounting()
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> TsinkResult<DeleteSeriesResult> {
@@ -2236,8 +2654,8 @@ mod tests {
     use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
     use std::collections::HashMap;
     use tsink::{
-        QueryBudgetError, QueryBudgetLimits, QueryLimitReason, QueryWorkLimits, StorageBuilder,
-        TimestampPrecision, WriteAcknowledgement,
+        QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        QueryWorkLimits, StorageBuilder, TimestampPrecision, WriteAcknowledgement,
     };
 
     fn make_storage() -> Arc<dyn Storage> {
@@ -2280,6 +2698,43 @@ mod tests {
             .expect("scoped series should insert");
         let scoped = scoped_storage(Arc::clone(&storage), DEFAULT_TENANT_ID);
         (storage, scoped)
+    }
+
+    fn default_tenant_batch_storage_with_limits(
+        limits: QueryBudgetLimits,
+    ) -> (Arc<dyn Storage>, Arc<dyn Storage>, Vec<MetricSeries>) {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(limits)
+            .build()
+            .expect("storage with query limits should build");
+        let series = vec![
+            MetricSeries {
+                name: "tenant_batch_budget".to_string(),
+                labels: vec![Label::new("host", "a")],
+            },
+            MetricSeries {
+                name: "tenant_batch_budget".to_string(),
+                labels: vec![Label::new("host", "b")],
+            },
+        ];
+        storage
+            .insert_rows(
+                &series
+                    .iter()
+                    .enumerate()
+                    .map(|(index, series)| {
+                        Row::with_labels(
+                            series.name.clone(),
+                            series.labels.clone(),
+                            DataPoint::new(10, (index + 1) as f64),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("legacy default-tenant series should insert");
+        let scoped = scoped_storage(Arc::clone(&storage), DEFAULT_TENANT_ID);
+        (storage, scoped, series)
     }
 
     struct FixedBatchResultStorage {
@@ -2650,6 +3105,38 @@ mod tests {
             .expect("insert should succeed");
 
         let tenant_a = scoped_storage(Arc::clone(&storage), "tenant-a");
+        assert_eq!(
+            tenant_a.select_many_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        assert_eq!(
+            tenant_a.select_series_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        assert_eq!(
+            tenant_a.select_series_in_shards_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        let execution = tenant_a
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query admission should succeed")
+            .expect("built-in storage should expose a query budget");
+        let selected = tenant_a
+            .select_series_with_execution_result(
+                &SeriesSelection::new().with_metric("cpu_usage"),
+                &execution,
+            )
+            .expect("detailed tenant metadata selection should succeed");
+        assert_eq!(selected.series.len(), 2);
+        assert!(selected.reserved_memory_bytes() > 0);
+        assert!(selected
+            .series
+            .iter()
+            .all(|series| series.labels.iter().all(|label| label.name != TENANT_LABEL)));
+        assert!(execution.snapshot().memory_reserved_bytes > 0);
+        drop(selected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
         let series = tenant_a
             .list_metrics()
             .expect("list_metrics should succeed");
@@ -3133,6 +3620,184 @@ mod tests {
                 if exceeded.reason == QueryLimitReason::IntermediateVectorSize
                     && exceeded.limit == 1
         ));
+    }
+
+    #[test]
+    fn default_tenant_batch_fallback_preflights_vector_and_memory_exactly() {
+        let limits = QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(64 * 1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(32 * 1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        };
+        let (storage, scoped, series) = default_tenant_batch_storage_with_limits(limits);
+
+        let calibration = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_intermediate_vector_size: Some(2),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("calibration query should start")
+            .expect("finite storage should expose one query execution");
+        let rows = scoped
+            .select_many_with_execution(&series, 9, 11, &calibration)
+            .expect("calibration query should succeed");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.points.len() == 1));
+        assert_eq!(calibration.snapshot().intermediate_vector_size, 2);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibrated_peak = storage
+            .query_budget_snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(calibrated_peak > 0);
+
+        let exact = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_intermediate_vector_size: Some(2),
+                    max_memory_bytes: Some(calibrated_peak),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("exact query should start")
+            .expect("finite storage should expose one query execution");
+        scoped
+            .select_many_with_execution(&series, 9, 11, &exact)
+            .expect("the calibrated exact memory and vector limits should pass");
+        assert_eq!(exact.snapshot().intermediate_vector_size, 2);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+
+        let one_under_memory = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_intermediate_vector_size: Some(2),
+                    max_memory_bytes: Some(calibrated_peak - 1),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-under-memory query should start")
+            .expect("finite storage should expose one query execution");
+        let error = scoped
+            .select_many_with_execution(&series, 9, 11, &one_under_memory)
+            .expect_err("one byte below the calibrated peak must fail");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+        ));
+        assert_eq!(one_under_memory.snapshot().memory_reserved_bytes, 0);
+        drop(one_under_memory);
+
+        let one_under_vector = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_intermediate_vector_size: Some(1),
+                    max_memory_bytes: Some(calibrated_peak),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("one-under-vector query should start")
+            .expect("finite storage should expose one query execution");
+        let error = scoped
+            .select_many_with_execution(&series, 9, 11, &one_under_vector)
+            .expect_err("a two-item batch must exceed a vector limit of one");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::IntermediateVectorSize
+        ));
+        assert_eq!(one_under_vector.snapshot().memory_reserved_bytes, 0);
+        drop(one_under_vector);
+
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn default_tenant_batch_does_not_fallback_when_scoped_series_exists_outside_range() {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(8 * 1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_series_matched: Some(1),
+                    max_memory_bytes: Some(4 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("storage with query limits should build");
+        let visible_series = MetricSeries {
+            name: "default_tenant_empty_range".to_string(),
+            labels: vec![Label::new("host", "same")],
+        };
+        storage
+            .insert_rows(&[Row::with_labels(
+                visible_series.name.clone(),
+                visible_series.labels.clone(),
+                DataPoint::new(10, 1.0),
+            )])
+            .expect("legacy series should insert");
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        visible_series.name.clone(),
+                        visible_series.labels.clone(),
+                        DataPoint::new(20, 2.0),
+                    )],
+                    DEFAULT_TENANT_ID,
+                )
+                .expect("scoped row should be valid"),
+            )
+            .expect("scoped series should insert");
+
+        let scoped = scoped_storage(Arc::clone(&storage), DEFAULT_TENANT_ID);
+        let execution = storage
+            .begin_query_execution(
+                QueryWorkLimits {
+                    max_series_matched: Some(1),
+                    max_memory_bytes: Some(4 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+                QueryCancellationToken::new(),
+            )
+            .expect("query should start")
+            .expect("finite storage should expose one query execution");
+        let result = scoped
+            .select_many_with_execution_result(&[visible_series], 9, 11, &execution)
+            .expect("scoped existence should suppress legacy fallback");
+
+        assert_eq!(result.series.len(), 1);
+        assert!(result.series[0].points.is_empty());
+        assert_eq!(result.matched_selectors.as_deref(), Some([true].as_slice()));
+        assert_eq!(execution.snapshot().series_matched, 1);
+        assert!(result.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result.reserved_memory_bytes()
+        );
+
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 
     #[test]

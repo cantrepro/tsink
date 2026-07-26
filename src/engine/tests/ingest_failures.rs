@@ -539,6 +539,174 @@ fn wal_sync_failure_does_not_ingest_points_or_survive_reopen() {
 }
 
 #[test]
+fn wal_publication_failure_keeps_a_replay_safe_prefix_for_later_publication() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+    let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let metric = "wal_publication_indeterminate";
+    let marker_temporary = wal_dir.join("wal.published.tmp");
+    std::fs::create_dir(&marker_temporary).unwrap();
+
+    let first = storage
+        .insert_rows_with_result(&[Row::new(metric, DataPoint::new(1, 1.0))])
+        .unwrap();
+    assert_eq!(
+        first.acknowledgement,
+        crate::WriteAcknowledgement::Volatile,
+        "a failed logical publish boundary must not claim WAL recovery"
+    );
+    assert_eq!(
+        storage.select(metric, &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0)],
+        "the post-apply publication failure must keep current-process visibility"
+    );
+    let appended_after_failure = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .current_appended_highwater();
+    assert!(appended_after_failure > WalHighWatermark::default());
+
+    std::fs::remove_dir(&marker_temporary).unwrap();
+    let second = storage
+        .insert_rows_with_result(&[Row::new(metric, DataPoint::new(2, 2.0))])
+        .unwrap();
+    assert_eq!(second.acknowledgement, crate::WriteAcknowledgement::Durable);
+    assert!(
+        storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .current_published_highwater()
+            > appended_after_failure,
+        "the later marker must publish the complete retained prefix"
+    );
+
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+    let reopened = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    reopened
+        .replay_from_wal(WalHighWatermark::default(), WalReplayMode::Strict)
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)],
+        "a later successful boundary may legitimately make the earlier Volatile write replayable"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn wal_post_rename_sync_failure_preserves_an_ambiguously_published_prefix() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join(WAL_DIR_NAME);
+    let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let metric = "wal_publication_post_rename_indeterminate";
+    storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .set_published_highwater_post_rename_hook(|| {
+            Err(TsinkError::Other(
+                "injected WAL publish-marker parent sync failure".to_string(),
+            ))
+        });
+
+    let result = storage
+        .insert_rows_with_result(&[Row::new(metric, DataPoint::new(1, 3.0))])
+        .unwrap();
+    assert_eq!(
+        result.acknowledgement,
+        crate::WriteAcknowledgement::Volatile
+    );
+    storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .clear_published_highwater_post_rename_hook();
+    assert_eq!(
+        storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .current_published_highwater(),
+        WalHighWatermark::default(),
+        "an ambiguous marker replacement must not be claimed as published in process"
+    );
+
+    storage.abandon_without_close_for_tests().unwrap();
+    drop(storage);
+
+    let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+    let reopened = ChunkStorage::new_with_data_path_and_options(
+        2,
+        Some(wal),
+        None,
+        None,
+        1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    reopened
+        .replay_from_wal(WalHighWatermark::default(), WalReplayMode::Strict)
+        .unwrap();
+    assert_eq!(
+        reopened.select(metric, &[], 0, 10).unwrap(),
+        vec![DataPoint::new(1, 3.0)]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn wal_observability_distinguishes_appended_and_durable_progress_for_periodic_mode() {
     let temp_dir = TempDir::new().unwrap();
     let wal = FramedWal::open(
@@ -598,17 +766,6 @@ fn committed_write_survives_post_commit_memory_pressure_failure() {
     );
     let labels = vec![Label::new("host", "a")];
 
-    let weak_storage = Arc::downgrade(&storage);
-    storage.set_ingest_post_samples_hook({
-        let numeric_root = numeric_root.clone();
-        move || {
-            replace_numeric_lane_with_file(&numeric_root);
-            if let Some(storage) = weak_storage.upgrade() {
-                storage.memory.budget_bytes.store(1, Ordering::SeqCst);
-            }
-        }
-    });
-
     storage
         .insert_rows(&[Row::with_labels(
             "post_commit_memory_pressure",
@@ -616,7 +773,14 @@ fn committed_write_survives_post_commit_memory_pressure_failure() {
             DataPoint::new(1, 1.0),
         )])
         .unwrap();
-    storage.clear_ingest_post_samples_hook();
+
+    // Lowering the budget from the old post-WAL/pre-apply hook would now (correctly) fail the
+    // atomic active-state staging admission before commit. Exercise the intended boundary
+    // directly: the write has committed, then best-effort pressure relief encounters an I/O
+    // failure and must report degraded maintenance without changing the write result.
+    replace_numeric_lane_with_file(&numeric_root);
+    storage.memory.budget_bytes.store(1, Ordering::SeqCst);
+    storage.enforce_post_commit_memory_budget_best_effort();
 
     assert_eq!(
         storage

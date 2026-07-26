@@ -9,6 +9,9 @@ repository = "https://github.com/cantrepro/tsink"
 homepage = "https://github.com/cantrepro/tsink"
 documentation = "https://github.com/cantrepro/tsink/blob/master/docs/python-bindings.md"
 license = "MIT"
+readme = "../../README.md"
+keywords = ["time-series", "database", "prometheus", "metrics", "python"]
+categories = ["database", "api-bindings"]
 
 [lib]
 crate-type = ["cdylib", "lib"]

@@ -52,5 +52,6 @@ pub const STORAGE_FORMAT_VERSION: u16 = 2;
 pub const DEFAULT_CHUNK_POINTS: usize = crate::storage::DEFAULT_CHUNK_POINTS;
 
 pub(crate) use storage_engine::{
-    build_storage, restore_storage_from_snapshot, restore_storage_from_snapshot_with_disk_budget,
+    build_storage, build_storage_for_snapshot_validation, restore_storage_from_snapshot,
+    restore_storage_from_snapshot_with_disk_budget,
 };

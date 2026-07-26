@@ -140,43 +140,47 @@ impl TimeRangeFilterContext<'_> {
     ) -> Result<bool> {
         execution.checkpoint()?;
         let _visibility_guard = self.visibility_read_fence();
-        let tombstones = self.tombstones.read();
-        let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
-        let active = self.chunks.active_shard(series_id).read();
-        let sealed = self.chunks.sealed_shard(series_id).read();
-        if let Some(chunks) = sealed.get(&series_id) {
-            let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
-            for (_, chunk) in chunks.range(..end_bound) {
-                execution.checkpoint()?;
-                if chunk.header.max_ts < start {
-                    continue;
+        self.tombstones
+            .with_series_tombstone_ranges_for_query(series_id, Some(execution), |tombstone_ranges| {
+                let active = self.chunks.active_shard(series_id).read();
+                let sealed = self.chunks.sealed_shard(series_id).read();
+                if let Some(chunks) = sealed.get(&series_id) {
+                    let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
+                    for (_, chunk) in chunks.range(..end_bound) {
+                        execution.checkpoint()?;
+                        if chunk.header.max_ts < start {
+                            continue;
+                        }
+                        if Self::chunk_has_visible_timestamp_in_time_range(
+                            chunk,
+                            start,
+                            end,
+                            tombstone_ranges,
+                            execution,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
                 }
-                if Self::chunk_has_visible_timestamp_in_time_range(
-                    chunk,
-                    start,
-                    end,
-                    tombstone_ranges,
-                    execution,
-                )? {
-                    return Ok(true);
-                }
-            }
-        }
 
-        let Some(state) = active.get(&series_id) else {
-            return Ok(false);
-        };
-        for point in state.points_in_partition_order() {
-            execution.checkpoint()?;
-            execution.charge_samples_scanned(1)?;
-            if point.ts >= start
-                && point.ts < end
-                && ChunkStorage::timestamp_survives_tombstones(point.ts, tombstone_ranges)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+                let Some(state) = active.get(&series_id) else {
+                    return Ok(false);
+                };
+                for point in state.points_in_partition_order() {
+                    execution.checkpoint()?;
+                    execution.charge_samples_scanned(1)?;
+                    if point.ts >= start
+                        && point.ts < end
+                        && ChunkStorage::timestamp_survives_tombstones(
+                            point.ts,
+                            tombstone_ranges,
+                        )
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
     }
 
     fn prune_series_postings_without_persisted_segment_overlap_in_time_range(
@@ -237,23 +241,24 @@ impl TimeRangeFilterContext<'_> {
                 .invoke_metadata_time_range_persisted_exact_scan_hook();
         }
 
-        let tombstones = self.tombstones.read();
-        let tombstone_ranges = tombstones.get(&series_id).map(Vec::as_slice);
-        for chunk_ref in chunk_refs {
-            execution.checkpoint()?;
-            if self.persisted_chunk_has_visible_timestamp_in_time_range(
-                &persisted_index,
-                chunk_ref,
-                start,
-                end,
-                tombstone_ranges,
-                execution,
-            )? {
-                return Ok(true);
-            }
-        }
+        self.tombstones
+            .with_series_tombstone_ranges_for_query(series_id, Some(execution), |tombstone_ranges| {
+                for chunk_ref in chunk_refs {
+                    execution.checkpoint()?;
+                    if self.persisted_chunk_has_visible_timestamp_in_time_range(
+                        &persisted_index,
+                        chunk_ref,
+                        start,
+                        end,
+                        tombstone_ranges,
+                        execution,
+                    )? {
+                        return Ok(true);
+                    }
+                }
 
-        Ok(false)
+                Ok(false)
+            })
     }
 
     pub(super) fn series_postings_with_data_in_time_range(
@@ -274,7 +279,7 @@ impl TimeRangeFilterContext<'_> {
             return Ok(RoaringTreemap::new());
         }
 
-        self.refresh_missing_visibility_summaries(&series_ids)?;
+        self.refresh_missing_visibility_summaries(&series_ids, execution)?;
 
         #[cfg(test)]
         if !series_ids.is_empty() {
@@ -285,7 +290,7 @@ impl TimeRangeFilterContext<'_> {
         let mut exact_scan_series_ids = RoaringTreemap::new();
         let mut control_error = None;
         self.visibility_cache.with_visibility_cache_state(
-            |summaries: &std::collections::HashMap<SeriesId, SeriesVisibilitySummary>, _, _| {
+            |summaries, _, _| {
                 for series_id in series_ids {
                     if let Err(error) = execution.checkpoint() {
                         control_error = Some(error);

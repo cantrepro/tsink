@@ -10,10 +10,10 @@ use tempfile::TempDir;
 use tsink::engine::wal::{FramedWal, SeriesDefinitionFrame};
 use tsink::{
     DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, LocalDiskBudget,
-    LocalDiskLimits, MetricSeries, NativeHistogram, QueryOptions, Row, RowWriteStatus,
-    SeriesMatcher, SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, Value,
-    WalSyncMode, WriteAcknowledgement, WriteMode, WriteRejection, WriteRejectionCategory,
-    MAX_WRITE_REJECTION_MESSAGE_BYTES,
+    LocalDiskLimits, MetricSeries, NativeHistogram, QueryOptions, ResourceProfile, Row,
+    RowWriteStatus, SeriesMatcher, SeriesSelection, Storage, StorageBuilder, TimestampPrecision,
+    TsinkError, Value, WalSyncMode, WriteAcknowledgement, WriteMode, WriteRejection,
+    WriteRejectionCategory, MAX_WRITE_REJECTION_MESSAGE_BYTES,
 };
 
 fn sample_histogram() -> NativeHistogram {
@@ -45,8 +45,9 @@ fn restore_entry_allowance_for(root: &std::path::Path) -> u64 {
 }
 
 #[test]
-fn effective_storage_limits_distinguish_unbounded_defaults() {
+fn effective_storage_limits_distinguish_explicit_expert_unlimited() {
     let storage = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::ExpertUnlimited)
         .with_wal_enabled(false)
         .build()
         .unwrap();
@@ -1866,7 +1867,7 @@ fn canonical_atomic_batch_reports_cardinality_limit_without_partial_commit() {
 }
 
 #[test]
-fn canonical_atomic_batch_reports_memory_pressure_without_visibility() {
+fn canonical_atomic_batch_returns_outer_memory_error_when_result_cannot_be_admitted() {
     let storage = StorageBuilder::new()
         .with_wal_enabled(false)
         .with_memory_limit(1)
@@ -1874,19 +1875,14 @@ fn canonical_atomic_batch_reports_memory_pressure_without_visibility() {
         .build()
         .unwrap();
 
-    let result = storage
+    let error = storage
         .write_batch(
             &[Row::new("memory_pressure", DataPoint::new(1, 1_i64))],
             WriteMode::Atomic,
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.accepted, 0);
-    assert_eq!(result.rejected, 1);
-    let RowWriteStatus::Rejected(rejection) = &result.outcomes[0].status else {
-        panic!("memory-limited write must be rejected");
-    };
-    assert_eq!(rejection.category, WriteRejectionCategory::MemoryPressure);
+    assert!(matches!(error, TsinkError::MemoryBudgetExceeded { .. }));
     assert!(storage
         .select("memory_pressure", &[], 0, 2)
         .unwrap()
@@ -1942,6 +1938,7 @@ fn canonical_atomic_batch_reports_disk_quota_after_over_limit_reopen() {
     }
 
     let reopened = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::ExpertUnlimited)
         .with_data_path(temp_dir.path())
         .with_chunk_points(1)
         .with_local_disk_limit(1)
@@ -2000,6 +1997,7 @@ fn persistent_reopen_reconciles_disk_categories_and_unknown_files() {
     fs::write(&host_file, vec![7u8; 13]).unwrap();
 
     let reopened = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::ExpertUnlimited)
         .with_data_path(temp_dir.path())
         .with_chunk_points(1)
         .with_local_disk_limit(64 * 1024 * 1024)

@@ -112,6 +112,58 @@ pub enum Value {
     Histogram(Box<NativeHistogram>),
 }
 
+fn modeled_query_slice_content_bytes<T>(len: usize) -> u64 {
+    u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+}
+
+/// Returns the canonical logical payload bytes charged for a native histogram query result.
+///
+/// The fixed structure and logical contents of every variable-length field are included. Allocator
+/// capacity and slack are deliberately excluded.
+#[must_use]
+pub fn modeled_query_histogram_payload_bytes(histogram: &NativeHistogram) -> u64 {
+    u64::try_from(std::mem::size_of::<NativeHistogram>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(modeled_query_slice_content_bytes::<HistogramBucketSpan>(
+            histogram.negative_spans.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<i64>(
+            histogram.negative_deltas.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<f64>(
+            histogram.negative_counts.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<HistogramBucketSpan>(
+            histogram.positive_spans.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<i64>(
+            histogram.positive_deltas.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<f64>(
+            histogram.positive_counts.len(),
+        ))
+        .saturating_add(modeled_query_slice_content_bytes::<f64>(
+            histogram.custom_values.len(),
+        ))
+}
+
+/// Returns the canonical logical payload bytes charged for a query result value.
+///
+/// This model uses content lengths rather than allocator capacities so the same logical value is
+/// charged identically after cloning, serialization, or deserialization. Fixed scalar values have
+/// no payload beyond their enclosing result slot.
+#[must_use]
+pub fn modeled_query_value_payload_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Bytes(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        Value::String(text) => u64::try_from(text.len()).unwrap_or(u64::MAX),
+        Value::Histogram(histogram) => modeled_query_histogram_payload_bytes(histogram),
+        Value::F64(_) | Value::I64(_) | Value::U64(_) | Value::Bool(_) => 0,
+    }
+}
+
 const F64_EXACT_INT_BITS: u32 = f64::MANTISSA_DIGITS;
 
 fn u64_is_exact_in_f64(value: u64) -> bool {
@@ -589,6 +641,72 @@ mod tests {
         let right = left.clone();
 
         assert_eq!(Value::from(left), Value::from(right));
+    }
+
+    #[test]
+    fn query_value_payload_bytes_depend_on_content_not_capacity() {
+        let compact_bytes = Value::Bytes(vec![1, 2, 3]);
+        let mut roomy_bytes = Vec::with_capacity(128);
+        roomy_bytes.extend([1, 2, 3]);
+        let roomy_bytes = Value::Bytes(roomy_bytes);
+        assert_eq!(compact_bytes, roomy_bytes);
+        assert_eq!(
+            modeled_query_value_payload_bytes(&compact_bytes),
+            modeled_query_value_payload_bytes(&roomy_bytes)
+        );
+        assert_eq!(modeled_query_value_payload_bytes(&roomy_bytes), 3);
+
+        let compact_string = Value::String("abc".to_string());
+        let mut roomy_string = String::with_capacity(128);
+        roomy_string.push_str("abc");
+        let roomy_string = Value::String(roomy_string);
+        assert_eq!(compact_string, roomy_string);
+        assert_eq!(
+            modeled_query_value_payload_bytes(&compact_string),
+            modeled_query_value_payload_bytes(&roomy_string)
+        );
+        assert_eq!(modeled_query_value_payload_bytes(&roomy_string), 3);
+
+        let compact_histogram = NativeHistogram {
+            count: Some(HistogramCount::Int(3)),
+            sum: 1.5,
+            schema: 1,
+            zero_threshold: 0.0,
+            zero_count: Some(HistogramCount::Int(0)),
+            negative_spans: vec![HistogramBucketSpan {
+                offset: -1,
+                length: 1,
+            }],
+            negative_deltas: vec![1],
+            negative_counts: vec![1.0],
+            positive_spans: vec![HistogramBucketSpan {
+                offset: 0,
+                length: 2,
+            }],
+            positive_deltas: vec![2, 3],
+            positive_counts: vec![2.0, 3.0],
+            reset_hint: HistogramResetHint::No,
+            custom_values: vec![0.5],
+        };
+        let mut roomy_histogram = compact_histogram.clone();
+        roomy_histogram.negative_spans.reserve(31);
+        roomy_histogram.negative_deltas.reserve(31);
+        roomy_histogram.negative_counts.reserve(31);
+        roomy_histogram.positive_spans.reserve(31);
+        roomy_histogram.positive_deltas.reserve(31);
+        roomy_histogram.positive_counts.reserve(31);
+        roomy_histogram.custom_values.reserve(31);
+        assert!(
+            roomy_histogram.positive_counts.capacity()
+                > compact_histogram.positive_counts.capacity()
+        );
+        let compact_histogram = Value::from(compact_histogram);
+        let roomy_histogram = Value::from(roomy_histogram);
+        assert_eq!(compact_histogram, roomy_histogram);
+        assert_eq!(
+            modeled_query_value_payload_bytes(&compact_histogram),
+            modeled_query_value_payload_bytes(&roomy_histogram)
+        );
     }
 
     #[test]

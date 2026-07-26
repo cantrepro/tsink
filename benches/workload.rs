@@ -4,11 +4,13 @@
 //! `scripts/measure_bpp.sh`
 //! `scripts/measure_bpp.sh mixed-order`
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -32,12 +34,270 @@ const SPARSE_WEIGHT: u16 = 100;
 const SHORT_LIVED_WEIGHT: u16 = 50;
 const WEIGHT_SCALE: u16 = 1000;
 
+// Benchmark-only whole-process instrumentation. These counters measure requested payload bytes
+// routed through Rust's global allocator, not engine-owned memory or allocator/RSS overhead.
+struct ProcessRequestedHeapAllocator;
+
+struct ProcessRequestedHeapCounters {
+    current_bytes: AtomicUsize,
+    peak_bytes: AtomicUsize,
+    exact: AtomicBool,
+}
+
+impl ProcessRequestedHeapCounters {
+    const fn new() -> Self {
+        Self {
+            current_bytes: AtomicUsize::new(0),
+            peak_bytes: AtomicUsize::new(0),
+            exact: AtomicBool::new(true),
+        }
+    }
+
+    fn record_allocation_result(&self, allocation: *mut u8, requested_bytes: usize) {
+        if !allocation.is_null() {
+            self.add(requested_bytes);
+        }
+    }
+
+    fn record_reallocation_result(
+        &self,
+        allocation: *mut u8,
+        previous_requested_bytes: usize,
+        new_requested_bytes: usize,
+    ) {
+        if allocation.is_null() {
+            // GlobalAlloc::realloc leaves the original allocation live on failure.
+            return;
+        }
+        if new_requested_bytes >= previous_requested_bytes {
+            self.add(new_requested_bytes - previous_requested_bytes);
+        } else {
+            self.subtract(previous_requested_bytes - new_requested_bytes);
+        }
+    }
+
+    fn record_deallocation(&self, requested_bytes: usize) {
+        self.subtract(requested_bytes);
+    }
+
+    fn current_bytes(&self) -> Option<u64> {
+        self.read_exact(&self.current_bytes)
+    }
+
+    fn peak_bytes(&self) -> Option<u64> {
+        self.read_exact(&self.peak_bytes)
+    }
+
+    fn add(&self, requested_bytes: usize) {
+        if requested_bytes == 0 {
+            return;
+        }
+
+        let mut current = self.current_bytes.load(Ordering::Relaxed);
+        loop {
+            if !self.exact.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(next) = current.checked_add(requested_bytes) else {
+                self.invalidate();
+                return;
+            };
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.raise_peak(next);
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn subtract(&self, requested_bytes: usize) {
+        if requested_bytes == 0 {
+            return;
+        }
+
+        let mut current = self.current_bytes.load(Ordering::Relaxed);
+        loop {
+            if !self.exact.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(next) = current.checked_sub(requested_bytes) else {
+                self.invalidate();
+                return;
+            };
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn raise_peak(&self, candidate: usize) {
+        let mut peak = self.peak_bytes.load(Ordering::Relaxed);
+        while candidate > peak {
+            if !self.exact.load(Ordering::Acquire) {
+                return;
+            }
+            match self.peak_bytes.compare_exchange_weak(
+                peak,
+                candidate,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+
+    fn invalidate(&self) {
+        // Once arithmetic is no longer exact, retain a conservative sentinel and stop updating.
+        // Readers return `None`, so no later phase can expose a wrapped or understated value.
+        self.current_bytes.store(usize::MAX, Ordering::Relaxed);
+        self.peak_bytes.store(usize::MAX, Ordering::Relaxed);
+        self.exact.store(false, Ordering::Release);
+    }
+
+    fn read_exact(&self, counter: &AtomicUsize) -> Option<u64> {
+        if !self.exact.load(Ordering::Acquire) {
+            return None;
+        }
+        let value = counter.load(Ordering::Relaxed);
+        if !self.exact.load(Ordering::Acquire) {
+            return None;
+        }
+        u64::try_from(value).ok()
+    }
+}
+
+static PROCESS_REQUESTED_HEAP_COUNTERS: ProcessRequestedHeapCounters =
+    ProcessRequestedHeapCounters::new();
+
+#[global_allocator]
+static BENCHMARK_ALLOCATOR: ProcessRequestedHeapAllocator = ProcessRequestedHeapAllocator;
+
+// SAFETY: every operation delegates to `System` with the original pointer/layout contract. The
+// side-channel accounting uses only atomics and never dereferences allocation pointers.
+unsafe impl GlobalAlloc for ProcessRequestedHeapAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s layout requirements.
+        let allocation = unsafe { System.alloc(layout) };
+        PROCESS_REQUESTED_HEAP_COUNTERS.record_allocation_result(allocation, layout.size());
+        allocation
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s layout requirements.
+        let allocation = unsafe { System.alloc_zeroed(layout) };
+        PROCESS_REQUESTED_HEAP_COUNTERS.record_allocation_result(allocation, layout.size());
+        allocation
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller guarantees that `ptr` and `layout` describe a live allocation from
+        // this allocator.
+        unsafe { System.dealloc(ptr, layout) };
+        PROCESS_REQUESTED_HEAP_COUNTERS.record_deallocation(layout.size());
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s pointer, layout, and size contract.
+        let allocation = unsafe { System.realloc(ptr, layout, new_size) };
+        PROCESS_REQUESTED_HEAP_COUNTERS.record_reallocation_result(
+            allocation,
+            layout.size(),
+            new_size,
+        );
+        allocation
+    }
+}
+
+#[cfg(test)]
+// Cargo sets `cfg(test)` for a harness-free bench even when it is compiled as a normal binary;
+// the explicit `cargo rustc --bench workload -- --test` check below supplies the test harness.
+#[allow(dead_code, unused_imports)]
+mod process_requested_heap_counter_tests {
+    use super::ProcessRequestedHeapCounters;
+    use std::ptr::{self, NonNull};
+
+    fn successful_allocation() -> *mut u8 {
+        NonNull::<u8>::dangling().as_ptr()
+    }
+
+    #[test]
+    fn tracks_alloc_realloc_dealloc_and_peak() {
+        let counters = ProcessRequestedHeapCounters::new();
+
+        counters.record_allocation_result(successful_allocation(), 64);
+        assert_eq!(counters.current_bytes(), Some(64));
+        assert_eq!(counters.peak_bytes(), Some(64));
+
+        counters.record_reallocation_result(successful_allocation(), 64, 96);
+        assert_eq!(counters.current_bytes(), Some(96));
+        assert_eq!(counters.peak_bytes(), Some(96));
+
+        counters.record_reallocation_result(successful_allocation(), 96, 16);
+        assert_eq!(counters.current_bytes(), Some(16));
+        assert_eq!(counters.peak_bytes(), Some(96));
+
+        counters.record_deallocation(16);
+        assert_eq!(counters.current_bytes(), Some(0));
+        assert_eq!(counters.peak_bytes(), Some(96));
+    }
+
+    #[test]
+    fn failed_alloc_and_realloc_leave_counters_unchanged() {
+        let counters = ProcessRequestedHeapCounters::new();
+
+        counters.record_allocation_result(ptr::null_mut(), usize::MAX);
+        counters.record_reallocation_result(ptr::null_mut(), 0, usize::MAX);
+
+        assert_eq!(counters.current_bytes(), Some(0));
+        assert_eq!(counters.peak_bytes(), Some(0));
+    }
+
+    #[test]
+    fn overflow_latches_measurement_as_unavailable() {
+        let counters = ProcessRequestedHeapCounters::new();
+
+        counters.record_allocation_result(successful_allocation(), usize::MAX);
+        counters.record_allocation_result(successful_allocation(), 1);
+        counters.record_deallocation(usize::MAX);
+
+        assert_eq!(counters.current_bytes(), None);
+        assert_eq!(counters.peak_bytes(), None);
+    }
+
+    #[test]
+    fn underflow_latches_measurement_as_unavailable() {
+        let counters = ProcessRequestedHeapCounters::new();
+
+        counters.record_deallocation(1);
+        counters.record_allocation_result(successful_allocation(), 64);
+
+        assert_eq!(counters.current_bytes(), None);
+        assert_eq!(counters.peak_bytes(), None);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkloadConfig {
     resource_profile: ResourceProfile,
     memory_limit_override_bytes: Option<usize>,
     maintenance_max_bytes_override: Option<u64>,
     runs: usize,
+    run_id_offset: usize,
     active_series: usize,
     shared_metric_names: bool,
     new_series_writer_threads: usize,
@@ -91,6 +351,7 @@ impl WorkloadConfig {
                 "TSINK_MAINTENANCE_MAX_BYTES_PER_PASS",
             ),
             runs: parse_env("TSINK_BPP_RUNS", 5usize),
+            run_id_offset: parse_env("TSINK_BPP_RUN_ID_OFFSET", 0usize),
             active_series: parse_env("TSINK_ACTIVE_SERIES", SUITE_ACTIVE_SERIES_TARGET),
             shared_metric_names: parse_env_bool("TSINK_SHARED_METRIC_NAMES", false),
             new_series_writer_threads: parse_env("TSINK_NEW_SERIES_WRITERS", 0usize),
@@ -250,14 +511,16 @@ struct RunResult {
     metadata_cache_bytes: usize,
     wal_series_definition_cache_bytes: usize,
     write_transient_bytes: usize,
+    peak_write_transient_bytes: usize,
     persisted_index_bytes: usize,
     persisted_mmap_bytes: usize,
     tombstone_bytes: usize,
     local_disk_accounted_bytes_before_close: u64,
     persisted_bytes: u64,
     effective_bpp: f64,
-    process_peak_rss_bytes_so_far: Option<u64>,
-    data_path: PathBuf,
+    process_rss: ProcessRssSnapshot,
+    process_requested_heap: ProcessRequestedHeapSnapshot,
+    storage_path_kind: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -269,7 +532,10 @@ struct NewSeriesRunResult {
     writer_p95_ms: f64,
     writer_p99_ms: f64,
     writer_max_ms: f64,
-    process_peak_rss_bytes_so_far: Option<u64>,
+    memory: BenchMemorySnapshot,
+    process_rss: ProcessRssSnapshot,
+    process_requested_heap: ProcessRequestedHeapSnapshot,
+    storage_path_kind: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -291,7 +557,60 @@ struct QuerySaturationRunResult {
     concurrency_rejections: u64,
     active_queries_after: u64,
     shared_reserved_memory_bytes_after: u64,
-    process_peak_rss_bytes_so_far: Option<u64>,
+    memory: BenchMemorySnapshot,
+    process_rss: ProcessRssSnapshot,
+    process_requested_heap: ProcessRequestedHeapSnapshot,
+    storage_path_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProcessRssSnapshot {
+    current_before_build_bytes: Option<u64>,
+    current_after_input_build_bytes: Option<u64>,
+    current_post_work_bytes: Option<u64>,
+    current_after_close_bytes: Option<u64>,
+    current_after_drop_bytes: Option<u64>,
+    peak_bytes_so_far: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProcessRequestedHeapSnapshot {
+    current_before_build_bytes: Option<u64>,
+    current_after_input_build_bytes: Option<u64>,
+    current_post_work_bytes: Option<u64>,
+    current_after_close_bytes: Option<u64>,
+    current_after_drop_bytes: Option<u64>,
+    peak_bytes_so_far: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct BenchMemorySnapshot {
+    accounted_bytes: usize,
+    active_and_sealed_bytes: usize,
+    registry_bytes: usize,
+    metadata_cache_bytes: usize,
+    wal_series_definition_cache_bytes: usize,
+    write_transient_bytes: usize,
+    peak_write_transient_bytes: usize,
+    persisted_index_bytes: usize,
+    persisted_mmap_bytes: usize,
+    tombstone_bytes: usize,
+}
+
+fn bench_memory_snapshot(storage: &dyn Storage) -> BenchMemorySnapshot {
+    let memory = storage.observability_snapshot().memory;
+    BenchMemorySnapshot {
+        accounted_bytes: memory.accounted_bytes,
+        active_and_sealed_bytes: memory.active_and_sealed_bytes,
+        registry_bytes: memory.registry_bytes,
+        metadata_cache_bytes: memory.metadata_cache_bytes,
+        wal_series_definition_cache_bytes: memory.wal_series_definition_cache_bytes,
+        write_transient_bytes: memory.write_transient_bytes,
+        peak_write_transient_bytes: memory.peak_write_transient_bytes,
+        persisted_index_bytes: memory.persisted_index_bytes,
+        persisted_mmap_bytes: memory.persisted_mmap_bytes,
+        tombstone_bytes: memory.tombstone_bytes,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -696,6 +1015,8 @@ fn insert_rows_with_late_write_retry(
 }
 
 fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
+    let current_before_build_bytes = process_current_rss_bytes();
+    let current_requested_heap_before_build_bytes = process_current_requested_heap_bytes();
     let keep_root = env::var("TSINK_BPP_KEEP_DIR").ok();
     let mut temp_dir: Option<TempDir> = None;
     let data_path = if let Some(root) = keep_root {
@@ -769,6 +1090,8 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
 
     std::thread::sleep(Duration::from_millis(cfg.settle_millis));
     let observability = storage.observability_snapshot();
+    let current_post_work_bytes = process_current_rss_bytes();
+    let current_requested_heap_post_work_bytes = process_current_requested_heap_bytes();
     max_post_write_accounted_memory_bytes =
         max_post_write_accounted_memory_bytes.max(observability.memory.accounted_bytes);
     let local_disk_accounted_bytes_before_close = observability
@@ -778,6 +1101,13 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
     storage
         .close()
         .map_err(|e| format!("storage close failed: {e}"))?;
+    let current_after_close_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_close_bytes = process_current_requested_heap_bytes();
+    drop(storage);
+    let current_after_drop_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_drop_bytes = process_current_requested_heap_bytes();
+    let peak_bytes_so_far = process_peak_rss_bytes_so_far();
+    let peak_requested_heap_bytes_so_far = process_peak_requested_heap_bytes_so_far();
 
     let persisted_bytes = persisted_bytes(&data_path).map_err(|e| {
         format!(
@@ -791,6 +1121,11 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
         persisted_bytes as f64 / retained_points as f64
     };
 
+    let storage_path_kind = if temp_dir.is_some() {
+        "temporary"
+    } else {
+        "configured"
+    };
     // Keep temp dir alive until after bytes are collected.
     let _temp_guard = temp_dir;
 
@@ -853,14 +1188,30 @@ fn run_once(cfg: &WorkloadConfig, run_id: usize) -> Result<RunResult, String> {
         metadata_cache_bytes: observability.memory.metadata_cache_bytes,
         wal_series_definition_cache_bytes: observability.memory.wal_series_definition_cache_bytes,
         write_transient_bytes: observability.memory.write_transient_bytes,
+        peak_write_transient_bytes: observability.memory.peak_write_transient_bytes,
         persisted_index_bytes: observability.memory.persisted_index_bytes,
         persisted_mmap_bytes: observability.memory.persisted_mmap_bytes,
         tombstone_bytes: observability.memory.tombstone_bytes,
         local_disk_accounted_bytes_before_close,
         persisted_bytes,
         effective_bpp,
-        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
-        data_path,
+        process_rss: ProcessRssSnapshot {
+            current_before_build_bytes,
+            current_after_input_build_bytes: None,
+            current_post_work_bytes,
+            current_after_close_bytes,
+            current_after_drop_bytes,
+            peak_bytes_so_far,
+        },
+        process_requested_heap: ProcessRequestedHeapSnapshot {
+            current_before_build_bytes: current_requested_heap_before_build_bytes,
+            current_after_input_build_bytes: None,
+            current_post_work_bytes: current_requested_heap_post_work_bytes,
+            current_after_close_bytes: current_requested_heap_after_close_bytes,
+            current_after_drop_bytes: current_requested_heap_after_drop_bytes,
+            peak_bytes_so_far: peak_requested_heap_bytes_so_far,
+        },
+        storage_path_kind,
     })
 }
 
@@ -906,6 +1257,8 @@ fn run_parallel_new_series_once(
     cfg: &WorkloadConfig,
     run_id: usize,
 ) -> Result<NewSeriesRunResult, String> {
+    let current_before_build_bytes = process_current_rss_bytes();
+    let current_requested_heap_before_build_bytes = process_current_requested_heap_bytes();
     let keep_root = env::var("TSINK_BPP_KEEP_DIR").ok();
     let mut temp_dir: Option<TempDir> = None;
     let data_path = if let Some(root) = keep_root {
@@ -935,11 +1288,13 @@ fn run_parallel_new_series_once(
     let writer_count = cfg.new_series_writer_threads.max(1);
     let series_per_writer = cfg.new_series_series_per_writer;
     let write_ts = current_unix_seconds();
+    let rows_ready_barrier = Arc::new(Barrier::new(writer_count + 1));
     let start_barrier = Arc::new(Barrier::new(writer_count + 1));
     let mut handles = Vec::with_capacity(writer_count);
 
     for writer_id in 0..writer_count {
         let writer_storage = Arc::clone(&storage);
+        let writer_ready = Arc::clone(&rows_ready_barrier);
         let writer_start = Arc::clone(&start_barrier);
         let shared_metric_names = cfg.new_series_shared_metric_names;
         handles.push(thread::spawn(move || -> Result<f64, String> {
@@ -961,6 +1316,7 @@ fn run_parallel_new_series_once(
                     )
                 })
                 .collect::<Vec<_>>();
+            writer_ready.wait();
             writer_start.wait();
             let started = Instant::now();
             writer_storage
@@ -970,8 +1326,11 @@ fn run_parallel_new_series_once(
         }));
     }
 
-    start_barrier.wait();
+    rows_ready_barrier.wait();
+    let current_after_input_build_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_input_build_bytes = process_current_requested_heap_bytes();
     let started = Instant::now();
+    start_barrier.wait();
     let mut writer_latencies_ms = Vec::with_capacity(writer_count);
     for handle in handles {
         writer_latencies_ms.push(
@@ -981,11 +1340,26 @@ fn run_parallel_new_series_once(
         );
     }
     let elapsed = started.elapsed();
+    let memory = bench_memory_snapshot(storage.as_ref());
+    let current_post_work_bytes = process_current_rss_bytes();
+    let current_requested_heap_post_work_bytes = process_current_requested_heap_bytes();
 
     storage
         .close()
         .map_err(|e| format!("storage close failed: {e}"))?;
+    let current_after_close_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_close_bytes = process_current_requested_heap_bytes();
+    drop(storage);
+    let current_after_drop_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_drop_bytes = process_current_requested_heap_bytes();
+    let peak_bytes_so_far = process_peak_rss_bytes_so_far();
+    let peak_requested_heap_bytes_so_far = process_peak_requested_heap_bytes_so_far();
 
+    let storage_path_kind = if temp_dir.is_some() {
+        "temporary"
+    } else {
+        "configured"
+    };
     let _temp_guard = temp_dir;
     let created_series = writer_count.saturating_mul(series_per_writer);
     let series_per_sec = if elapsed.is_zero() {
@@ -1005,7 +1379,24 @@ fn run_parallel_new_series_once(
             .iter()
             .copied()
             .fold(0.0f64, |current, value| current.max(value)),
-        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
+        memory,
+        process_rss: ProcessRssSnapshot {
+            current_before_build_bytes,
+            current_after_input_build_bytes,
+            current_post_work_bytes,
+            current_after_close_bytes,
+            current_after_drop_bytes,
+            peak_bytes_so_far,
+        },
+        process_requested_heap: ProcessRequestedHeapSnapshot {
+            current_before_build_bytes: current_requested_heap_before_build_bytes,
+            current_after_input_build_bytes: current_requested_heap_after_input_build_bytes,
+            current_post_work_bytes: current_requested_heap_post_work_bytes,
+            current_after_close_bytes: current_requested_heap_after_close_bytes,
+            current_after_drop_bytes: current_requested_heap_after_drop_bytes,
+            peak_bytes_so_far: peak_requested_heap_bytes_so_far,
+        },
+        storage_path_kind,
     })
 }
 
@@ -1051,6 +1442,8 @@ fn run_query_saturation_once(
         ));
     }
 
+    let current_before_build_bytes = process_current_rss_bytes();
+    let current_requested_heap_before_build_bytes = process_current_requested_heap_bytes();
     let keep_root = env::var("TSINK_BPP_KEEP_DIR").ok();
     let mut temp_dir: Option<TempDir> = None;
     let data_path = if let Some(root) = keep_root {
@@ -1318,9 +1711,24 @@ fn run_query_saturation_once(
             query_snapshot.active_queries, query_snapshot.shared_reserved_memory_bytes
         ));
     }
+    let memory = bench_memory_snapshot(storage.as_ref());
+    let current_post_work_bytes = process_current_rss_bytes();
+    let current_requested_heap_post_work_bytes = process_current_requested_heap_bytes();
     storage
         .close()
         .map_err(|e| format!("storage close failed: {e}"))?;
+    let current_after_close_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_close_bytes = process_current_requested_heap_bytes();
+    drop(storage);
+    let current_after_drop_bytes = process_current_rss_bytes();
+    let current_requested_heap_after_drop_bytes = process_current_requested_heap_bytes();
+    let peak_bytes_so_far = process_peak_rss_bytes_so_far();
+    let peak_requested_heap_bytes_so_far = process_peak_requested_heap_bytes_so_far();
+    let storage_path_kind = if temp_dir.is_some() {
+        "temporary"
+    } else {
+        "configured"
+    };
     let _temp_guard = temp_dir;
 
     Ok(QuerySaturationRunResult {
@@ -1344,7 +1752,24 @@ fn run_query_saturation_once(
         concurrency_rejections: query_snapshot.concurrency_rejections_total,
         active_queries_after: query_snapshot.active_queries,
         shared_reserved_memory_bytes_after: query_snapshot.shared_reserved_memory_bytes,
-        process_peak_rss_bytes_so_far: process_peak_rss_bytes_so_far(),
+        memory,
+        process_rss: ProcessRssSnapshot {
+            current_before_build_bytes,
+            current_after_input_build_bytes: None,
+            current_post_work_bytes,
+            current_after_close_bytes,
+            current_after_drop_bytes,
+            peak_bytes_so_far,
+        },
+        process_requested_heap: ProcessRequestedHeapSnapshot {
+            current_before_build_bytes: current_requested_heap_before_build_bytes,
+            current_after_input_build_bytes: None,
+            current_post_work_bytes: current_requested_heap_post_work_bytes,
+            current_after_close_bytes: current_requested_heap_after_close_bytes,
+            current_after_drop_bytes: current_requested_heap_after_drop_bytes,
+            peak_bytes_so_far: peak_requested_heap_bytes_so_far,
+        },
+        storage_path_kind,
     })
 }
 
@@ -1744,6 +2169,62 @@ fn persisted_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+fn process_current_requested_heap_bytes() -> Option<u64> {
+    PROCESS_REQUESTED_HEAP_COUNTERS.current_bytes()
+}
+
+fn process_peak_requested_heap_bytes_so_far() -> Option<u64> {
+    PROCESS_REQUESTED_HEAP_COUNTERS.peak_bytes()
+}
+
+#[cfg(target_vendor = "apple")]
+// libc exposes the stable Darwin task_info ABI through this deprecated helper; adding a second
+// benchmark-only Mach binding would not change the underlying call or its safety boundary.
+#[allow(deprecated)]
+fn process_current_rss_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::zeroed();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    // SAFETY: `info` is writable storage for the requested task-info flavor, `count` is the
+    // kernel-declared word count for that structure, and `mach_task_self` identifies this process.
+    let status = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: a successful `task_info` call initialized the structure. The Darwin representation
+    // is packed to four-byte alignment, so read the 64-bit field without assuming alignment.
+    let info = unsafe { info.assume_init() };
+    Some(unsafe { std::ptr::addr_of!(info.resident_size).read_unaligned() })
+}
+
+#[cfg(target_os = "linux")]
+fn process_current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    // SAFETY: `_SC_PAGESIZE` is a read-only process configuration query.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    resident_pages.checked_mul(u64::try_from(page_size).ok()?)
+}
+
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "linux")))]
+fn process_current_rss_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(not(unix))]
+fn process_current_rss_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(unix)]
 fn process_peak_rss_bytes_so_far() -> Option<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -1914,12 +2395,14 @@ impl XorShift64 {
 fn main() {
     let cfg = WorkloadConfig::from_env();
     println!(
-        "WORKLOAD_CONFIGURATION resource_profile={} memory_limit_override_bytes={} maintenance_max_bytes_override={} seed={}",
+        "WORKLOAD_CONFIGURATION resource_profile={} memory_limit_override_bytes={} maintenance_max_bytes_override={} runs={} run_id_offset={} seed={}",
         resource_profile_label(cfg.resource_profile),
         cfg.memory_limit_override_bytes
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
         cfg.maintenance_max_bytes_override
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        cfg.runs,
+        cfg.run_id_offset,
         cfg.seed,
     );
 
@@ -1938,12 +2421,13 @@ fn main() {
 
         let mut p95s = Vec::with_capacity(cfg.runs);
         let mut failures = 0usize;
-        for run_id in 0..cfg.runs {
+        for local_run_id in 0..cfg.runs {
+            let run_id = cfg.run_id_offset.saturating_add(local_run_id);
             match run_ingest_latency_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
                         "INGEST_LATENCY_RESULT run={} batches={} points={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} flush_pipeline_runs={} persist_runs={} pipeline_timeouts={} wal_resets={}",
-                        run_id + 1,
+                        run_id.saturating_add(1),
                         result.batches,
                         result.points,
                         result.p50_ms,
@@ -1959,7 +2443,11 @@ fn main() {
                 }
                 Err(err) => {
                     failures += 1;
-                    eprintln!("INGEST_LATENCY_RESULT run={} ERROR {}", run_id + 1, err);
+                    eprintln!(
+                        "INGEST_LATENCY_RESULT run={} ERROR {}",
+                        run_id.saturating_add(1),
+                        err
+                    );
                 }
             }
         }
@@ -1989,12 +2477,13 @@ fn main() {
 
         let mut frames_per_sec = Vec::with_capacity(cfg.runs);
         let mut failures = 0usize;
-        for run_id in 0..cfg.runs {
+        for local_run_id in 0..cfg.runs {
+            let run_id = cfg.run_id_offset.saturating_add(local_run_id);
             match run_wal_append_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
                         "WAL_APPEND_RESULT run={} frames={} points={} elapsed_ms={} frames_per_sec={:.1} points_per_sec={:.1} size_bytes={} segments={}",
-                        run_id + 1,
+                        run_id.saturating_add(1),
                         result.frames,
                         result.points,
                         result.elapsed.as_millis(),
@@ -2007,7 +2496,11 @@ fn main() {
                 }
                 Err(err) => {
                     failures += 1;
-                    eprintln!("WAL_APPEND_RESULT run={} ERROR {}", run_id + 1, err);
+                    eprintln!(
+                        "WAL_APPEND_RESULT run={} ERROR {}",
+                        run_id.saturating_add(1),
+                        err
+                    );
                 }
             }
         }
@@ -2034,12 +2527,13 @@ fn main() {
             cfg.runs, cfg.metadata_selector_series
         );
 
-        for run_id in 0..cfg.runs {
+        for local_run_id in 0..cfg.runs {
+            let run_id = cfg.run_id_offset.saturating_add(local_run_id);
             match run_metadata_selector_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
                         "METADATA_SELECTOR_RESULT run={} series={} exact_count={} exact_ms={} missing_count={} missing_ms={} broad_present_label_count={} broad_present_label_ms={} broad_regex_count={} broad_regex_ms={} broad_empty_regex_count={} broad_empty_regex_ms={} broad_negative_regex_count={} broad_negative_regex_ms={} shard_scoped_regex_count={} shard_scoped_regex_ms={} shard_scoped_negative_count={} shard_scoped_negative_ms={}",
-                        run_id + 1,
+                        run_id.saturating_add(1),
                         result.series,
                         result.exact_count,
                         result.exact_elapsed.as_millis(),
@@ -2060,7 +2554,11 @@ fn main() {
                     );
                 }
                 Err(err) => {
-                    eprintln!("METADATA_SELECTOR_RESULT run={} ERROR {}", run_id + 1, err);
+                    eprintln!(
+                        "METADATA_SELECTOR_RESULT run={} ERROR {}",
+                        run_id.saturating_add(1),
+                        err
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2084,14 +2582,18 @@ fn main() {
         let mut query_p95_ms = Vec::with_capacity(cfg.runs);
         let mut writer_ms = Vec::with_capacity(cfg.runs);
         let mut peak_query_memory_bytes = Vec::with_capacity(cfg.runs);
+        let mut post_work_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
+        let mut peak_write_transient_bytes = Vec::with_capacity(cfg.runs);
         let mut process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
         let mut failures = 0usize;
-        for run_id in 0..cfg.runs {
+        for local_run_id in 0..cfg.runs {
+            let run_id = cfg.run_id_offset.saturating_add(local_run_id);
             match run_query_saturation_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
-                        "QUERY_SATURATION_RESULT run={} workers={} seeded_series={} seeded_points={} series_per_query={} queries_succeeded={} query_points_returned={} writer_points={} elapsed_ms={} query_p50_ms={:.3} query_p95_ms={:.3} query_max_ms={:.3} writer_ms={:.3} peak_active_queries={} peak_shared_reserved_memory_bytes={} concurrency_rejections={} active_queries_after={} shared_reserved_memory_bytes_after={} process_peak_rss_bytes_so_far={}",
-                        run_id + 1,
+                        "QUERY_SATURATION_RESULT run={} resource_profile={} workers={} seeded_series={} seeded_points={} series_per_query={} queries_succeeded={} query_points_returned={} writer_points={} elapsed_ms={} query_p50_ms={:.3} query_p95_ms={:.3} query_max_ms={:.3} writer_ms={:.3} peak_active_queries={} peak_shared_reserved_memory_bytes={} concurrency_rejections={} active_queries_after={} shared_reserved_memory_bytes_after={} post_work_accounted_memory_bytes={} active_and_sealed_bytes={} registry_bytes={} metadata_cache_bytes={} wal_series_definition_cache_bytes={} write_transient_bytes={} peak_write_transient_bytes={} persisted_index_bytes={} persisted_mmap_bytes={} tombstone_bytes={} process_current_rss_before_build_bytes={} process_current_rss_after_input_build_bytes={} process_current_rss_post_work_bytes={} process_current_rss_after_close_bytes={} process_current_rss_after_drop_bytes={} process_peak_rss_bytes_so_far={} process_current_requested_heap_before_build_bytes={} process_current_requested_heap_after_input_build_bytes={} process_current_requested_heap_post_work_bytes={} process_current_requested_heap_after_close_bytes={} process_current_requested_heap_after_drop_bytes={} process_peak_requested_heap_bytes_so_far={} storage_path_kind={}",
+                        run_id.saturating_add(1),
+                        resource_profile_label(cfg.resource_profile),
                         result.workers,
                         result.seeded_series,
                         result.seeded_points,
@@ -2109,18 +2611,53 @@ fn main() {
                         result.concurrency_rejections,
                         result.active_queries_after,
                         result.shared_reserved_memory_bytes_after,
-                        optional_u64_text(result.process_peak_rss_bytes_so_far),
+                        result.memory.accounted_bytes,
+                        result.memory.active_and_sealed_bytes,
+                        result.memory.registry_bytes,
+                        result.memory.metadata_cache_bytes,
+                        result.memory.wal_series_definition_cache_bytes,
+                        result.memory.write_transient_bytes,
+                        result.memory.peak_write_transient_bytes,
+                        result.memory.persisted_index_bytes,
+                        result.memory.persisted_mmap_bytes,
+                        result.memory.tombstone_bytes,
+                        optional_u64_text(result.process_rss.current_before_build_bytes),
+                        optional_u64_text(result.process_rss.current_after_input_build_bytes),
+                        optional_u64_text(result.process_rss.current_post_work_bytes),
+                        optional_u64_text(result.process_rss.current_after_close_bytes),
+                        optional_u64_text(result.process_rss.current_after_drop_bytes),
+                        optional_u64_text(result.process_rss.peak_bytes_so_far),
+                        optional_u64_text(
+                            result.process_requested_heap.current_before_build_bytes
+                        ),
+                        optional_u64_text(
+                            result
+                                .process_requested_heap
+                                .current_after_input_build_bytes
+                        ),
+                        optional_u64_text(result.process_requested_heap.current_post_work_bytes),
+                        optional_u64_text(result.process_requested_heap.current_after_close_bytes),
+                        optional_u64_text(result.process_requested_heap.current_after_drop_bytes),
+                        optional_u64_text(result.process_requested_heap.peak_bytes_so_far),
+                        result.storage_path_kind,
                     );
                     query_p95_ms.push(result.query_p95_ms);
                     writer_ms.push(result.writer_ms);
                     peak_query_memory_bytes.push(result.peak_shared_reserved_memory_bytes);
-                    if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                    post_work_accounted_memory_bytes.push(result.memory.accounted_bytes as u64);
+                    peak_write_transient_bytes
+                        .push(result.memory.peak_write_transient_bytes as u64);
+                    if let Some(bytes) = result.process_rss.peak_bytes_so_far {
                         process_peak_rss_bytes.push(bytes);
                     }
                 }
                 Err(error) => {
                     failures = failures.saturating_add(1);
-                    eprintln!("QUERY_SATURATION_RESULT run={} ERROR {}", run_id + 1, error);
+                    eprintln!(
+                        "QUERY_SATURATION_RESULT run={} ERROR {}",
+                        run_id.saturating_add(1),
+                        error
+                    );
                 }
             }
         }
@@ -2129,7 +2666,7 @@ fn main() {
             std::process::exit(1);
         }
         println!(
-            "QUERY_SATURATION_SUITE_RESULT resource_profile={} runs={} failures={} p50_query_p95_ms={:.3} p95_query_p95_ms={:.3} p50_writer_ms={:.3} p95_writer_ms={:.3} p50_peak_shared_reserved_memory_bytes={} p95_peak_shared_reserved_memory_bytes={} max_process_peak_rss_bytes_so_far={}",
+            "QUERY_SATURATION_SUITE_RESULT resource_profile={} runs={} failures={} p50_query_p95_ms={:.3} p95_query_p95_ms={:.3} p50_writer_ms={:.3} p95_writer_ms={:.3} p50_peak_shared_reserved_memory_bytes={} p95_peak_shared_reserved_memory_bytes={} p50_post_work_accounted_memory_bytes={} p95_post_work_accounted_memory_bytes={} p50_peak_write_transient_bytes={} p95_peak_write_transient_bytes={} max_process_peak_rss_bytes_so_far={}",
             resource_profile_label(cfg.resource_profile),
             query_p95_ms.len(),
             failures,
@@ -2139,6 +2676,10 @@ fn main() {
             percentile(writer_ms, 0.95),
             percentile_u64(peak_query_memory_bytes.clone(), 0.50),
             percentile_u64(peak_query_memory_bytes, 0.95),
+            percentile_u64(post_work_accounted_memory_bytes.clone(), 0.50),
+            percentile_u64(post_work_accounted_memory_bytes, 0.95),
+            percentile_u64(peak_write_transient_bytes.clone(), 0.50),
+            percentile_u64(peak_write_transient_bytes, 0.95),
             optional_u64_text(process_peak_rss_bytes.iter().copied().max()),
         );
         return;
@@ -2157,14 +2698,18 @@ fn main() {
 
         let mut series_per_sec = Vec::with_capacity(cfg.runs);
         let mut writer_p95_ms = Vec::with_capacity(cfg.runs);
+        let mut post_work_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
+        let mut peak_write_transient_bytes = Vec::with_capacity(cfg.runs);
         let mut process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
         let mut failures = 0usize;
-        for run_id in 0..cfg.runs {
+        for local_run_id in 0..cfg.runs {
+            let run_id = cfg.run_id_offset.saturating_add(local_run_id);
             match run_parallel_new_series_once(&cfg, run_id) {
                 Ok(result) => {
                     println!(
-                        "NEW_SERIES_RESULT run={} created_series={} elapsed_ms={} series_per_sec={:.3} writer_p50_ms={:.3} writer_p95_ms={:.3} writer_p99_ms={:.3} writer_max_ms={:.3} process_peak_rss_bytes_so_far={}",
-                        run_id + 1,
+                        "NEW_SERIES_RESULT run={} resource_profile={} created_series={} elapsed_ms={} series_per_sec={:.3} writer_p50_ms={:.3} writer_p95_ms={:.3} writer_p99_ms={:.3} writer_max_ms={:.3} post_work_accounted_memory_bytes={} active_and_sealed_bytes={} registry_bytes={} metadata_cache_bytes={} wal_series_definition_cache_bytes={} write_transient_bytes={} peak_write_transient_bytes={} persisted_index_bytes={} persisted_mmap_bytes={} tombstone_bytes={} process_current_rss_before_build_bytes={} process_current_rss_after_input_build_bytes={} process_current_rss_post_work_bytes={} process_current_rss_after_close_bytes={} process_current_rss_after_drop_bytes={} process_peak_rss_bytes_so_far={} process_current_requested_heap_before_build_bytes={} process_current_requested_heap_after_input_build_bytes={} process_current_requested_heap_post_work_bytes={} process_current_requested_heap_after_close_bytes={} process_current_requested_heap_after_drop_bytes={} process_peak_requested_heap_bytes_so_far={} storage_path_kind={}",
+                        run_id.saturating_add(1),
+                        resource_profile_label(cfg.resource_profile),
                         result.created_series,
                         result.elapsed.as_millis(),
                         result.series_per_sec,
@@ -2172,17 +2717,52 @@ fn main() {
                         result.writer_p95_ms,
                         result.writer_p99_ms,
                         result.writer_max_ms,
-                        optional_u64_text(result.process_peak_rss_bytes_so_far),
+                        result.memory.accounted_bytes,
+                        result.memory.active_and_sealed_bytes,
+                        result.memory.registry_bytes,
+                        result.memory.metadata_cache_bytes,
+                        result.memory.wal_series_definition_cache_bytes,
+                        result.memory.write_transient_bytes,
+                        result.memory.peak_write_transient_bytes,
+                        result.memory.persisted_index_bytes,
+                        result.memory.persisted_mmap_bytes,
+                        result.memory.tombstone_bytes,
+                        optional_u64_text(result.process_rss.current_before_build_bytes),
+                        optional_u64_text(result.process_rss.current_after_input_build_bytes),
+                        optional_u64_text(result.process_rss.current_post_work_bytes),
+                        optional_u64_text(result.process_rss.current_after_close_bytes),
+                        optional_u64_text(result.process_rss.current_after_drop_bytes),
+                        optional_u64_text(result.process_rss.peak_bytes_so_far),
+                        optional_u64_text(
+                            result.process_requested_heap.current_before_build_bytes
+                        ),
+                        optional_u64_text(
+                            result
+                                .process_requested_heap
+                                .current_after_input_build_bytes
+                        ),
+                        optional_u64_text(result.process_requested_heap.current_post_work_bytes),
+                        optional_u64_text(result.process_requested_heap.current_after_close_bytes),
+                        optional_u64_text(result.process_requested_heap.current_after_drop_bytes),
+                        optional_u64_text(result.process_requested_heap.peak_bytes_so_far),
+                        result.storage_path_kind,
                     );
                     series_per_sec.push(result.series_per_sec);
                     writer_p95_ms.push(result.writer_p95_ms);
-                    if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                    post_work_accounted_memory_bytes.push(result.memory.accounted_bytes as u64);
+                    peak_write_transient_bytes
+                        .push(result.memory.peak_write_transient_bytes as u64);
+                    if let Some(bytes) = result.process_rss.peak_bytes_so_far {
                         process_peak_rss_bytes.push(bytes);
                     }
                 }
                 Err(err) => {
                     failures += 1;
-                    eprintln!("NEW_SERIES_RESULT run={} ERROR {}", run_id + 1, err);
+                    eprintln!(
+                        "NEW_SERIES_RESULT run={} ERROR {}",
+                        run_id.saturating_add(1),
+                        err
+                    );
                 }
             }
         }
@@ -2193,7 +2773,7 @@ fn main() {
         }
 
         println!(
-            "NEW_SERIES_SUITE_RESULT resource_profile={} runs={} failures={} p50_series_per_sec={:.3} p95_series_per_sec={:.3} p50_writer_p95_ms={:.3} p95_writer_p95_ms={:.3} max_process_peak_rss_bytes_so_far={}",
+            "NEW_SERIES_SUITE_RESULT resource_profile={} runs={} failures={} p50_series_per_sec={:.3} p95_series_per_sec={:.3} p50_writer_p95_ms={:.3} p95_writer_p95_ms={:.3} p50_post_work_accounted_memory_bytes={} p95_post_work_accounted_memory_bytes={} p50_peak_write_transient_bytes={} p95_peak_write_transient_bytes={} max_process_peak_rss_bytes_so_far={}",
             resource_profile_label(cfg.resource_profile),
             series_per_sec.len(),
             failures,
@@ -2201,6 +2781,10 @@ fn main() {
             percentile(series_per_sec, 0.95),
             percentile(writer_p95_ms.clone(), 0.50),
             percentile(writer_p95_ms, 0.95),
+            percentile_u64(post_work_accounted_memory_bytes.clone(), 0.50),
+            percentile_u64(post_work_accounted_memory_bytes, 0.95),
+            percentile_u64(peak_write_transient_bytes.clone(), 0.50),
+            percentile_u64(peak_write_transient_bytes, 0.95),
             optional_u64_text(process_peak_rss_bytes.iter().copied().max()),
         );
         return;
@@ -2235,17 +2819,19 @@ fn main() {
     let mut run_bpps = Vec::with_capacity(cfg.runs);
     let mut run_max_post_write_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
     let mut run_post_settle_accounted_memory_bytes = Vec::with_capacity(cfg.runs);
+    let mut run_peak_write_transient_bytes = Vec::with_capacity(cfg.runs);
     let mut run_local_disk_bytes = Vec::with_capacity(cfg.runs);
     let mut run_persisted_bytes = Vec::with_capacity(cfg.runs);
     let mut run_process_peak_rss_bytes = Vec::with_capacity(cfg.runs);
     let mut failures = 0usize;
 
-    for run_id in 0..cfg.runs {
+    for local_run_id in 0..cfg.runs {
+        let run_id = cfg.run_id_offset.saturating_add(local_run_id);
         match run_once(&cfg, run_id) {
             Ok(result) => {
                 println!(
-                    "RUN_RESULT run={} resource_profile={} accounted_memory_limit_bytes={} local_disk_limit_bytes={} wal_limit_bytes={} cardinality_limit={} max_concurrent_writers={} max_concurrent_queries={} maintenance_max_items_per_pass={} maintenance_max_bytes_per_pass={} retained_points={} late_rejected_points={} max_post_write_accounted_memory_bytes={} post_settle_accounted_memory_bytes={} active_and_sealed_bytes={} registry_bytes={} metadata_cache_bytes={} wal_series_definition_cache_bytes={} write_transient_bytes={} persisted_index_bytes={} persisted_mmap_bytes={} tombstone_bytes={} local_disk_accounted_bytes_before_close={} persisted_bytes={} effective_bpp={:.6} process_peak_rss_bytes_so_far={} path={}",
-                    run_id + 1,
+                    "RUN_RESULT run={} resource_profile={} accounted_memory_limit_bytes={} local_disk_limit_bytes={} wal_limit_bytes={} cardinality_limit={} max_concurrent_writers={} max_concurrent_queries={} maintenance_max_items_per_pass={} maintenance_max_bytes_per_pass={} retained_points={} late_rejected_points={} max_post_write_accounted_memory_bytes={} post_settle_accounted_memory_bytes={} active_and_sealed_bytes={} registry_bytes={} metadata_cache_bytes={} wal_series_definition_cache_bytes={} write_transient_bytes={} peak_write_transient_bytes={} persisted_index_bytes={} persisted_mmap_bytes={} tombstone_bytes={} local_disk_accounted_bytes_before_close={} persisted_bytes={} effective_bpp={:.6} process_current_rss_before_build_bytes={} process_current_rss_after_input_build_bytes={} process_current_rss_post_work_bytes={} process_current_rss_after_close_bytes={} process_current_rss_after_drop_bytes={} process_peak_rss_bytes_so_far={} process_current_requested_heap_before_build_bytes={} process_current_requested_heap_after_input_build_bytes={} process_current_requested_heap_post_work_bytes={} process_current_requested_heap_after_close_bytes={} process_current_requested_heap_after_drop_bytes={} process_peak_requested_heap_bytes_so_far={} storage_path_kind={}",
+                    run_id.saturating_add(1),
                     resource_profile_name_label(result.selected_profile),
                     result.accounted_memory_limit_bytes,
                     result.local_disk_limit_bytes,
@@ -2264,29 +2850,46 @@ fn main() {
                     result.metadata_cache_bytes,
                     result.wal_series_definition_cache_bytes,
                     result.write_transient_bytes,
+                    result.peak_write_transient_bytes,
                     result.persisted_index_bytes,
                     result.persisted_mmap_bytes,
                     result.tombstone_bytes,
                     result.local_disk_accounted_bytes_before_close,
                     result.persisted_bytes,
                     result.effective_bpp,
-                    optional_u64_text(result.process_peak_rss_bytes_so_far),
-                    result.data_path.display()
+                    optional_u64_text(result.process_rss.current_before_build_bytes),
+                    optional_u64_text(result.process_rss.current_after_input_build_bytes),
+                    optional_u64_text(result.process_rss.current_post_work_bytes),
+                    optional_u64_text(result.process_rss.current_after_close_bytes),
+                    optional_u64_text(result.process_rss.current_after_drop_bytes),
+                    optional_u64_text(result.process_rss.peak_bytes_so_far),
+                    optional_u64_text(result.process_requested_heap.current_before_build_bytes),
+                    optional_u64_text(
+                        result
+                            .process_requested_heap
+                            .current_after_input_build_bytes
+                    ),
+                    optional_u64_text(result.process_requested_heap.current_post_work_bytes),
+                    optional_u64_text(result.process_requested_heap.current_after_close_bytes),
+                    optional_u64_text(result.process_requested_heap.current_after_drop_bytes),
+                    optional_u64_text(result.process_requested_heap.peak_bytes_so_far),
+                    result.storage_path_kind,
                 );
                 run_bpps.push(result.effective_bpp);
                 run_max_post_write_accounted_memory_bytes
                     .push(result.max_post_write_accounted_memory_bytes as u64);
                 run_post_settle_accounted_memory_bytes
                     .push(result.post_settle_accounted_memory_bytes as u64);
+                run_peak_write_transient_bytes.push(result.peak_write_transient_bytes as u64);
                 run_local_disk_bytes.push(result.local_disk_accounted_bytes_before_close);
                 run_persisted_bytes.push(result.persisted_bytes);
-                if let Some(bytes) = result.process_peak_rss_bytes_so_far {
+                if let Some(bytes) = result.process_rss.peak_bytes_so_far {
                     run_process_peak_rss_bytes.push(bytes);
                 }
             }
             Err(err) => {
                 failures += 1;
-                eprintln!("RUN_RESULT run={} ERROR {}", run_id + 1, err);
+                eprintln!("RUN_RESULT run={} ERROR {}", run_id.saturating_add(1), err);
             }
         }
     }
@@ -2316,6 +2919,15 @@ fn main() {
         .copied()
         .max()
         .unwrap_or(0);
+    let p50_peak_write_transient_bytes =
+        percentile_u64(run_peak_write_transient_bytes.clone(), 0.50);
+    let p95_peak_write_transient_bytes =
+        percentile_u64(run_peak_write_transient_bytes.clone(), 0.95);
+    let max_peak_write_transient_bytes = run_peak_write_transient_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
     let p50_local_disk_bytes = percentile_u64(run_local_disk_bytes.clone(), 0.50);
     let p95_local_disk_bytes = percentile_u64(run_local_disk_bytes.clone(), 0.95);
     let max_local_disk_bytes = run_local_disk_bytes.iter().copied().max().unwrap_or(0);
@@ -2324,7 +2936,7 @@ fn main() {
     let max_persisted_bytes = run_persisted_bytes.iter().copied().max().unwrap_or(0);
 
     println!(
-        "SUITE_RESULT resource_profile={} runs={} failures={} p50_effective_bpp={:.6} p95_effective_bpp={:.6} p50_max_post_write_accounted_memory_bytes={} p95_max_post_write_accounted_memory_bytes={} max_post_write_accounted_memory_bytes={} p50_post_settle_accounted_memory_bytes={} p95_post_settle_accounted_memory_bytes={} max_post_settle_accounted_memory_bytes={} p50_local_disk_accounted_bytes_before_close={} p95_local_disk_accounted_bytes_before_close={} max_local_disk_accounted_bytes_before_close={} p50_persisted_bytes={} p95_persisted_bytes={} max_persisted_bytes={} max_process_peak_rss_bytes_so_far={}",
+        "SUITE_RESULT resource_profile={} runs={} failures={} p50_effective_bpp={:.6} p95_effective_bpp={:.6} p50_max_post_write_accounted_memory_bytes={} p95_max_post_write_accounted_memory_bytes={} max_post_write_accounted_memory_bytes={} p50_post_settle_accounted_memory_bytes={} p95_post_settle_accounted_memory_bytes={} max_post_settle_accounted_memory_bytes={} p50_peak_write_transient_bytes={} p95_peak_write_transient_bytes={} max_peak_write_transient_bytes={} p50_local_disk_accounted_bytes_before_close={} p95_local_disk_accounted_bytes_before_close={} max_local_disk_accounted_bytes_before_close={} p50_persisted_bytes={} p95_persisted_bytes={} max_persisted_bytes={} max_process_peak_rss_bytes_so_far={}",
         resource_profile_label(cfg.resource_profile),
         run_bpps.len(),
         failures,
@@ -2336,6 +2948,9 @@ fn main() {
         p50_post_settle_accounted_memory_bytes,
         p95_post_settle_accounted_memory_bytes,
         max_post_settle_accounted_memory_bytes,
+        p50_peak_write_transient_bytes,
+        p95_peak_write_transient_bytes,
+        max_peak_write_transient_bytes,
         p50_local_disk_bytes,
         p95_local_disk_bytes,
         max_local_disk_bytes,

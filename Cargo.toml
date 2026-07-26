@@ -12,11 +12,29 @@ license = "MIT"
 keywords = ["time-series", "database", "embedded", "tsdb", "metrics"]
 categories = ["database", "embedded", "data-structures"]
 readme = "README.md"
-exclude = [".github/**", "GOAL.md", "docs/goal-progress.md", "scripts/**"]
+exclude = [
+    ".github/**",
+    "benchmark-results/**",
+    "GOAL.md",
+    "docs/goal-progress.md",
+    "scripts/**",
+]
 
 [workspace]
-members = [".", "crates/tsink-server", "crates/tsink-uniffi"]
-default-members = [".", "crates/tsink-server", "crates/tsink-uniffi"]
+members = [
+    ".",
+    "crates/tsink-protocol",
+    "crates/tsink-server",
+    "crates/tsink-test",
+    "crates/tsink-uniffi",
+]
+default-members = [
+    ".",
+    "crates/tsink-protocol",
+    "crates/tsink-server",
+    "crates/tsink-test",
+    "crates/tsink-uniffi",
+]
 resolver = "2"
 
 [dependencies]
@@ -42,6 +60,12 @@ same-file = "1.0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 criterion = "0.8"
