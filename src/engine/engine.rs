@@ -64,6 +64,7 @@ mod observability;
 mod process_lock;
 #[path = "query_exec.rs"]
 mod query_exec;
+pub(crate) use query_exec::modeled_metric_series_vec_retained_bytes;
 #[doc(hidden)]
 pub use query_exec::modeled_query_rows_retained_bytes;
 #[path = "query_read.rs"]
@@ -595,6 +596,10 @@ impl Storage for ChunkStorage {
         crate::QueryExecutionAccounting::Complete
     }
 
+    fn list_metrics_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
     fn select_series_in_shards_execution_accounting(&self) -> crate::QueryExecutionAccounting {
         crate::QueryExecutionAccounting::Complete
     }
@@ -608,6 +613,10 @@ impl Storage for ChunkStorage {
     }
 
     fn scan_series_rows_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
+    fn scan_metric_rows_execution_accounting(&self) -> crate::QueryExecutionAccounting {
         crate::QueryExecutionAccounting::Complete
     }
 
@@ -879,22 +888,59 @@ impl Storage for ChunkStorage {
     }
 
     fn list_metrics_with_execution(&self, execution: &QueryExecution) -> Result<Vec<MetricSeries>> {
+        self.list_metrics_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
         execution.checkpoint()?;
-        self.list_metrics_api(execution)
+        self.list_metrics_result_api(execution)
     }
 
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
         let execution = self
             .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
             .expect("built-in storage always exposes a query budget");
-        self.list_metrics_with_wal_api(&execution)
+        self.list_metrics_with_wal_with_execution(&execution)
+    }
+
+    fn list_metrics_with_wal_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
+        self.list_metrics_with_wal_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_wal_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        execution.checkpoint()?;
+        self.list_metrics_with_wal_result_api(execution)
+    }
+
+    fn list_metrics_with_wal_execution_accounting(&self) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
     }
 
     fn list_metrics_in_shards(
         &self,
         scope: &crate::storage::MetadataShardScope,
     ) -> Result<Vec<MetricSeries>> {
-        self.list_metrics_in_shards_api(scope)
+        let scope = scope.normalized()?;
+        if scope.shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_bounded_metadata_shard_scope(&scope, "list_metrics_in_shards")?;
+        let execution = self
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
+            .expect("built-in storage always exposes a query budget");
+        self.list_metrics_in_shards_result_api(&scope, &execution)
+            .map(SelectSeriesExecutionResult::into_series)
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
@@ -932,10 +978,16 @@ impl Storage for ChunkStorage {
         selection: &SeriesSelection,
         scope: &crate::storage::MetadataShardScope,
     ) -> Result<Vec<MetricSeries>> {
+        crate::query_selection::validate_series_selection(selection)?;
+        let scope = scope.normalized()?;
+        if scope.shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_bounded_metadata_shard_scope(&scope, "select_series_in_shards")?;
         let execution = self
             .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
             .expect("built-in storage always exposes a query budget");
-        self.select_series_in_shards_with_execution(selection, scope, &execution)
+        self.select_series_in_shards_with_execution(selection, &scope, &execution)
     }
 
     fn select_series_in_shards_with_execution(
@@ -1094,8 +1146,6 @@ impl Storage for ChunkStorage {
         execution: &QueryExecution,
     ) -> Result<QueryRowsExecutionResult> {
         execution.checkpoint()?;
-        let matched = self.count_existing_series(series);
-        execution.charge_series_matched(matched)?;
         self.scan_series_rows_result_api(series, start, end, options, execution)
     }
 
@@ -1120,13 +1170,20 @@ impl Storage for ChunkStorage {
         options: crate::storage::QueryRowsScanOptions,
         execution: &QueryExecution,
     ) -> Result<crate::storage::QueryRowsPage> {
+        self.scan_metric_rows_with_execution_result(metric, start, end, options, execution)
+            .map(QueryRowsExecutionResult::into_page)
+    }
+
+    fn scan_metric_rows_with_execution_result(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: crate::storage::QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
         execution.checkpoint()?;
-        let matched = {
-            let registry = self.catalog.registry.read();
-            saturating_u64_from_usize(registry.series_ids_for_metric(metric).len())
-        };
-        execution.charge_series_matched(matched)?;
-        self.scan_metric_rows_api(metric, start, end, options, execution)
+        self.scan_metric_rows_result_api(metric, start, end, options, execution)
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> Result<DeleteSeriesResult> {

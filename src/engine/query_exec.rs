@@ -52,6 +52,7 @@ mod time_range_filter;
 mod time_range_planner;
 
 use metadata_context::{MetadataSelectionContext, RuntimeMetadataCandidatePlan};
+pub(crate) use metadata_series_selection::modeled_metric_series_vec_retained_bytes;
 use read_context::TimeRangeFilterContext;
 
 impl ChunkStorage {
@@ -118,16 +119,6 @@ impl ChunkStorage {
         execution.charge_samples_returned(1)?;
         execution.charge_returned_bytes(modeled_row_parts_returned_bytes(metric, labels, point))?;
         Ok(())
-    }
-
-    pub(in crate::engine::storage_engine) fn count_existing_series(
-        &self,
-        series: &[MetricSeries],
-    ) -> u64 {
-        saturating_u64_from_usize(
-            self.existing_series_ids_for_metric_series(series.iter().cloned())
-                .len(),
-        )
     }
 
     pub(in crate::engine::storage_engine) fn series_exists(
@@ -199,17 +190,6 @@ impl ChunkStorage {
     }
 }
 
-pub(super) fn modeled_points_bytes(points: &[DataPoint]) -> u64 {
-    points.iter().fold(0u64, |bytes, point| {
-        bytes.saturating_add(
-            u64::try_from(
-                std::mem::size_of::<DataPoint>().saturating_add(value_heap_bytes(&point.value)),
-            )
-            .unwrap_or(u64::MAX),
-        )
-    })
-}
-
 pub(super) fn modeled_points_returned_bytes(points: &[DataPoint]) -> u64 {
     points.iter().fold(0u64, |bytes, point| {
         bytes
@@ -260,24 +240,22 @@ pub(super) fn modeled_vec_growth_capacity_upper(elements: usize) -> usize {
 }
 
 pub(super) fn modeled_points_retained_bytes(points: &Vec<DataPoint>) -> u64 {
-    modeled_vec_capacity_bytes::<DataPoint>(points.capacity()).saturating_add(points.iter().fold(
-        0u64,
-        |bytes, point| {
-            bytes.saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX))
-        },
-    ))
+    modeled_vec_capacity_bytes::<DataPoint>(points.capacity()).saturating_add(
+        points.iter().fold(0u64, |bytes, point| {
+            bytes.saturating_add(modeled_value_retained_bytes(&point.value))
+        }),
+    )
 }
 
 pub(super) fn modeled_point_output_upper_bound_bytes(points: &[DataPoint], capacity: usize) -> u64 {
     // A built-in aggregation emits each input value at most once. First/last/min/max can clone a
     // variable-size value; numeric aggregations emit inline values. Summing every input payload is
     // therefore a conservative heap upper bound for both one-shot and bucketed built-ins.
-    modeled_vec_capacity_bytes::<DataPoint>(capacity).saturating_add(points.iter().fold(
-        0u64,
-        |bytes, point| {
-            bytes.saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX))
-        },
-    ))
+    modeled_vec_capacity_bytes::<DataPoint>(capacity).saturating_add(
+        points.iter().fold(0u64, |bytes, point| {
+            bytes.saturating_add(modeled_value_retained_bytes(&point.value))
+        }),
+    )
 }
 
 pub(super) fn modeled_point_result_upper_bound_bytes(points: &[DataPoint], elements: usize) -> u64 {
@@ -373,7 +351,7 @@ pub(super) fn modeled_string_capacity_bytes(capacity: usize) -> u64 {
     }
 }
 
-fn modeled_value_retained_bytes(value: &Value) -> u64 {
+pub(super) fn modeled_value_retained_bytes(value: &Value) -> u64 {
     let heap_bytes = u64::try_from(value_heap_bytes(value)).unwrap_or(u64::MAX);
     match value {
         Value::Bytes(bytes) => heap_bytes.saturating_add(if bytes.capacity() != 0 {
@@ -486,7 +464,8 @@ fn modeled_row_parts_returned_bytes(metric: &str, labels: &[Label], point: &Data
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(metric.len()).unwrap_or(u64::MAX))
         .saturating_add(modeled_labels_bytes(labels))
-        .saturating_add(modeled_points_returned_bytes(std::slice::from_ref(point)))
+        // `Row` owns its `DataPoint` inline, so only the value's logical payload is additional.
+        .saturating_add(modeled_query_value_payload_bytes(&point.value))
 }
 
 const SHARD_WINDOW_FNV_OFFSET_BASIS: u64 = crate::storage::SHARD_WINDOW_FNV_OFFSET_BASIS;

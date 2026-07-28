@@ -102,7 +102,7 @@ see the [embedded library guide](embedded-library.md) and
 | `with_wal_size_limit(n)` | `usize` | `512 MiB` (`Embedded`) | Maximum projected on-disk WAL size. A batch that would exceed the limit is rejected; WAL space is reclaimed after persisted state makes older records unnecessary. |
 | `with_wal_buffer_size(n)` | `usize` | `4096` | I/O buffer size for WAL writes. Larger buffers reduce syscall overhead on high-throughput workloads. |
 | `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` synchronizes each non-empty batch. `Periodic(duration)` checks the elapsed interval during a later append; it has no autonomous timer, so successful writes may be `Appended` until another write or lifecycle action synchronizes them. |
-| `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. |
+| `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | Logical replay policy after WAL open. Every persistent open first validates the complete published prefix strictly, so `Salvage` cannot bypass published corruption or perform in-place recovery; use `tsink-inspect salvage` with a separate destination. |
 
 ### Local disk
 

@@ -1119,7 +1119,26 @@ impl QueryExecution {
     /// duplicate full-size reservation.
     pub(crate) fn coalesce_memory_reservations(
         &self,
-        mut reservations: Vec<QueryMemoryReservation>,
+        reservations: &mut [QueryMemoryReservation],
+        retained_bytes: u64,
+    ) -> std::result::Result<QueryMemoryReservation, QueryMemoryCoalesceError> {
+        self.coalesce_memory_reservation_slice(reservations, retained_bytes)
+    }
+
+    /// Stack-backed variant for a fixed number of reservations.
+    ///
+    /// This avoids allocating an otherwise unaccounted temporary `Vec` solely to transfer guards.
+    pub(crate) fn coalesce_memory_reservation_array<const N: usize>(
+        &self,
+        reservations: &mut [QueryMemoryReservation; N],
+        retained_bytes: u64,
+    ) -> std::result::Result<QueryMemoryReservation, QueryMemoryCoalesceError> {
+        self.coalesce_memory_reservation_slice(reservations, retained_bytes)
+    }
+
+    fn coalesce_memory_reservation_slice(
+        &self,
+        reservations: &mut [QueryMemoryReservation],
         retained_bytes: u64,
     ) -> std::result::Result<QueryMemoryReservation, QueryMemoryCoalesceError> {
         self.checkpoint()?;
@@ -1139,7 +1158,7 @@ impl QueryExecution {
         } else {
             None
         };
-        for reservation in &mut reservations {
+        for reservation in reservations {
             reservation.released = true;
         }
         if let Some(additional) = additional.as_mut() {
@@ -1292,9 +1311,9 @@ mod tests {
         let second = query.reserve_memory(5).unwrap();
         assert_eq!(query.snapshot().memory_reserved_bytes, 9);
 
-        let retained = query
-            .coalesce_memory_reservations(vec![first, second], 6)
-            .unwrap();
+        let mut sources = vec![first, second];
+        let retained = query.coalesce_memory_reservations(&mut sources, 6).unwrap();
+        drop(sources);
         assert_eq!(retained.bytes(), 6);
         assert_eq!(query.snapshot().memory_reserved_bytes, 6);
         assert_eq!(budget.snapshot().shared_reserved_memory_bytes, 6);
@@ -1322,9 +1341,11 @@ mod tests {
             let query = budget.begin_query().unwrap();
             let first = query.reserve_memory(4).unwrap();
             let second = query.reserve_memory(5).unwrap();
-            let result = query.coalesce_memory_reservations(vec![first, second], 10);
+            let mut sources = vec![first, second];
+            let result = query.coalesce_memory_reservations(&mut sources, 10);
             if succeeds {
                 let retained = result.unwrap();
+                drop(sources);
                 assert_eq!(query.snapshot().memory_reserved_bytes, 10);
                 drop(retained);
             } else {
@@ -1334,6 +1355,8 @@ mod tests {
                         QueryBudgetError::LimitExceeded(exceeded)
                     )) if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
                 ));
+                assert_eq!(query.snapshot().memory_reserved_bytes, 9);
+                drop(sources);
             }
             assert_eq!(query.snapshot().memory_reserved_bytes, 0);
             drop(query);
@@ -1341,6 +1364,29 @@ mod tests {
             assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
             assert_eq!(snapshot.accounting_invariant_violations_total, 0);
         }
+    }
+
+    #[test]
+    fn coalescing_control_error_leaves_source_guards_live_for_caller_cleanup() {
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).unwrap();
+        let query = budget.begin_query().unwrap();
+        let mut sources = [
+            query.reserve_memory(4).unwrap(),
+            query.reserve_memory(5).unwrap(),
+        ];
+        query.cancellation_token().cancel();
+
+        assert!(matches!(
+            query.coalesce_memory_reservation_array(&mut sources, 9),
+            Err(QueryMemoryCoalesceError::Budget(
+                QueryBudgetError::Cancelled
+            ))
+        ));
+        assert_eq!(query.snapshot().memory_reserved_bytes, 9);
+        drop(sources);
+        assert_eq!(query.snapshot().memory_reserved_bytes, 0);
+        drop(query);
+        assert_eq!(budget.snapshot().active_queries, 0);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::pagination::{RawSeriesPagination, RawSeriesScanPage, SortedSeriesPageCollector};
-use super::snapshot::{PersistedSeriesSourceSnapshot, SeriesReadSnapshot};
+use super::snapshot::{
+    PersistedSeriesSourceSnapshot, PersistedSeriesSourceSnapshotParts, SeriesReadSnapshot,
+};
 use super::*;
 
 pub(super) trait QueryMergeCursor {
@@ -51,31 +53,45 @@ pub(super) struct PersistedSourceMergeCursor {
     execution: Option<QueryExecution>,
     #[cfg(test)]
     chunk_decode_hook: Option<Arc<IngestCommitHook>>,
+    _query_reservation: Option<crate::QueryMemoryReservation>,
 }
 
 impl PersistedSourceMergeCursor {
     pub(super) fn new(
-        chunk_refs: Vec<PersistedChunkRef>,
-        segment_maps: HashMap<usize, Arc<PlatformMmap>>,
-        segment_tiers: HashMap<usize, PersistedSegmentTier>,
+        persisted: PersistedSeriesSourceSnapshot,
         start: i64,
         end: i64,
         execution: Option<QueryExecution>,
         #[cfg(test)] chunk_decode_hook: Option<Arc<IngestCommitHook>>,
     ) -> Self {
+        let decode_capacity = modeled_vec_growth_capacity_upper(
+            persisted
+                .chunks
+                .iter()
+                .map(|chunk| usize::from(chunk.point_count))
+                .max()
+                .unwrap_or(0),
+        );
+        let PersistedSeriesSourceSnapshotParts {
+            chunks,
+            segment_maps,
+            segment_tiers,
+            query_reservation,
+        } = persisted.into_parts();
         Self {
-            chunk_refs,
+            chunk_refs: chunks,
             segment_maps,
             segment_tiers,
             start,
             end,
             next_chunk_idx: 0,
-            current_points: Vec::new(),
+            current_points: Vec::with_capacity(decode_capacity),
             next_point_idx: 0,
             stats: PersistedTierFetchStats::default(),
             execution,
             #[cfg(test)]
             chunk_decode_hook,
+            _query_reservation: query_reservation,
         }
     }
 
@@ -160,6 +176,7 @@ pub(super) struct SealedSourceMergeCursor {
 impl SealedSourceMergeCursor {
     pub(super) fn new(
         chunks: Vec<Arc<Chunk>>,
+        decode_capacity: usize,
         start: i64,
         end: i64,
         execution: Option<QueryExecution>,
@@ -169,7 +186,7 @@ impl SealedSourceMergeCursor {
             start,
             end,
             next_chunk_idx: 0,
-            current_points: Vec::new(),
+            current_points: Vec::with_capacity(decode_capacity),
             next_point_idx: 0,
             execution,
         }
@@ -283,18 +300,29 @@ impl SeriesSourceMergeCursors {
         execution: Option<&QueryExecution>,
         #[cfg(test)] chunk_decode_hook: Option<Arc<IngestCommitHook>>,
     ) -> Self {
+        let sealed_decode_capacity = modeled_vec_growth_capacity_upper(
+            sealed_chunks
+                .iter()
+                .map(|chunk| usize::from(chunk.header.point_count))
+                .max()
+                .unwrap_or(0),
+        );
         Self {
             persisted: PersistedSourceMergeCursor::new(
-                persisted.chunks,
-                persisted.segment_maps,
-                persisted.segment_tiers,
+                persisted,
                 start,
                 end,
                 execution.cloned(),
                 #[cfg(test)]
                 chunk_decode_hook,
             ),
-            sealed: SealedSourceMergeCursor::new(sealed_chunks, start, end, execution.cloned()),
+            sealed: SealedSourceMergeCursor::new(
+                sealed_chunks,
+                sealed_decode_capacity,
+                start,
+                end,
+                execution.cloned(),
+            ),
             active: ActiveSourceMergeCursor::new(active_points, start, end),
         }
     }
@@ -321,8 +349,7 @@ impl SeriesSourceMergeCursors {
                 return Ok(false);
             }
         }
-        collector.finish();
-        Ok(true)
+        Ok(!collector.finish())
     }
 
     fn into_stats(self) -> PersistedTierFetchStats {
@@ -344,6 +371,7 @@ impl ChunkStorage {
             execution,
             &snapshot,
             snapshot.analysis.estimated_points,
+            0,
         )?;
         let SeriesReadSnapshot {
             persisted,
@@ -353,8 +381,7 @@ impl ChunkStorage {
             query_reservation: _source_snapshot_reservation,
         } = snapshot;
 
-        out.clear();
-        out.reserve(analysis.estimated_points);
+        let mut decoded = Vec::with_capacity(analysis.estimated_points);
 
         let mut cursors = SeriesSourceMergeCursors::new(
             persisted,
@@ -370,22 +397,23 @@ impl ChunkStorage {
                 .clone(),
         );
 
-        cursors.merge_all_into(out)?;
+        cursors.merge_all_into(&mut decoded)?;
         let persisted_stats = cursors.into_stats();
-        self.apply_retention_filter(out);
+        self.apply_retention_filter(&mut decoded);
         match analysis.sorted_dedupe_mode() {
             super::pagination::SortedSeriesDedupeMode::Timestamp => {
-                dedupe_last_value_per_timestamp(out);
+                dedupe_last_value_per_timestamp(&mut decoded);
             }
             super::pagination::SortedSeriesDedupeMode::Exact => {
-                dedupe_exact_duplicate_points(out);
+                dedupe_exact_duplicate_points(&mut decoded);
             }
             super::pagination::SortedSeriesDedupeMode::None => {}
         }
-        self.apply_tombstone_filter_for_query(series_id, out, execution)?;
+        self.apply_tombstone_filter_for_query(series_id, &mut decoded, execution)?;
         if let Some(reservation) = working_reservation.as_mut() {
-            reservation.resize(modeled_points_bytes(out))?;
+            reservation.resize(modeled_points_retained_bytes(&decoded))?;
         }
+        publish_vec_reusing_capacity(out, decoded);
         Ok(persisted_stats)
     }
 
@@ -403,7 +431,7 @@ impl ChunkStorage {
             .unwrap_or(snapshot.analysis.estimated_points)
             .min(snapshot.analysis.estimated_points);
         let mut working_reservation =
-            reserve_query_read_working_set(execution, &snapshot, output_capacity)?;
+            reserve_query_read_working_set(execution, &snapshot, output_capacity, 0)?;
         let SeriesReadSnapshot {
             persisted,
             sealed_chunks,
@@ -426,7 +454,7 @@ impl ChunkStorage {
                 .clone(),
         );
 
-        let page = self
+        let mut page = self
             .tombstone_read_context()
             .with_series_tombstone_ranges_for_query(
                 series_id,
@@ -437,6 +465,7 @@ impl ChunkStorage {
                         tombstone_ranges,
                         analysis.sorted_dedupe_mode(),
                         pagination,
+                        output_capacity,
                     );
                     let reached_end = cursors.collect_page_with(&mut collector)?;
                     let final_rows_seen = collector.final_rows_seen();
@@ -447,12 +476,14 @@ impl ChunkStorage {
                         final_rows_seen,
                         reached_end,
                         stats: cursors.into_stats(),
+                        query_reservation: None,
                     })
                 },
             )?;
         if let Some(reservation) = working_reservation.as_mut() {
-            reservation.resize(modeled_points_bytes(&page.points))?;
+            reservation.resize(modeled_points_retained_bytes(&page.points))?;
         }
+        page.query_reservation = working_reservation;
         Ok(page)
     }
 }

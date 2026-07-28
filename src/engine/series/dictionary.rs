@@ -267,7 +267,13 @@ impl SeriesRegistry {
     }
 
     pub fn decode_series_key(&self, series_id: SeriesId) -> Option<SeriesKey> {
-        let definition = self.get_by_id(series_id)?;
+        // Borrow the encoded definition while decoding instead of cloning its heap-backed
+        // label-pair vector. Dictionary interning releases its dictionary guards before taking a
+        // series-shard write guard, so retaining this read guard while reading dictionaries does
+        // not invert the registry writer lock order.
+        let shard_idx = self.load_series_registry_shard_idx(series_id)?;
+        let shard = self.series_shards[shard_idx].read();
+        let definition = shard.by_id.get(&series_id)?;
         let metric = self
             .metric_dict
             .read()

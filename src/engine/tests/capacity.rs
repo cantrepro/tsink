@@ -136,10 +136,55 @@ fn memory_budget_spills_to_l0_and_preserves_query_results() {
         .memory
         .budget_bytes
         .store(tightened_budget as u64, std::sync::atomic::Ordering::SeqCst);
-    storage.enforce_memory_budget_if_needed().unwrap();
+    let mut admitted_budget = match storage.enforce_memory_budget_if_needed() {
+        Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+            assert_eq!(budget, tightened_budget);
+            assert!(required > budget);
+            required
+        }
+        result => panic!("expected finite spill-publication rejection, got {result:?}"),
+    };
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert_eq!(
+        storage.select("budget_metric", &labels, 0, 10).unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0),
+            DataPoint::new(4, 4.0),
+            DataPoint::new(5, 5.0),
+            DataPoint::new(6, 6.0),
+        ],
+        "a rejected spill must preserve every accepted point",
+    );
+
+    let mut persisted = false;
+    for _ in 0..8 {
+        storage
+            .memory
+            .budget_bytes
+            .store(admitted_budget as u64, std::sync::atomic::Ordering::SeqCst);
+        match storage.persist_segment_with_outcome() {
+            Ok(outcome) => {
+                assert!(outcome.persisted);
+                persisted = true;
+                break;
+            }
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, admitted_budget);
+                assert!(required > admitted_budget);
+                admitted_budget = required;
+            }
+            Err(error) => panic!("unexpected admitted spill retry failure: {error}"),
+        }
+    }
+    assert!(
+        persisted,
+        "spill retry did not converge after eight structured memory-boundary admissions",
+    );
     assert_engine_memory_usage_reconciled(&storage);
 
-    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let l0_segments = load_segments_for_level(&lane_path, 0).unwrap();
     assert!(
         !l0_segments.is_empty(),
@@ -158,7 +203,7 @@ fn memory_budget_spills_to_l0_and_preserves_query_results() {
             DataPoint::new(6, 6.0),
         ]
     );
-    assert_eq!(storage.memory_budget(), tightened_budget);
+    assert_eq!(storage.memory_budget(), admitted_budget);
     let post_snapshot = storage.observability_snapshot();
     assert!(
         post_snapshot.memory.active_and_sealed_bytes < snapshot.memory.active_and_sealed_bytes,
@@ -177,9 +222,9 @@ fn memory_budget_spills_to_l0_and_preserves_query_results() {
         .get(&series_id)
         .map(|chunks| chunks.len())
         .unwrap_or(0);
-    assert!(
-        sealed_count < 3,
-        "oldest sealed chunks should be evicted after spill"
+    assert_eq!(
+        sealed_count, 0,
+        "the persisted sealed chunk should be evicted after spill"
     );
 
     storage.close().unwrap();
@@ -222,7 +267,48 @@ fn reduced_hot_chunk_state_fits_previous_spill_budget() {
     );
     assert!(storage.memory_used() <= storage.memory_budget());
 
-    storage.close().unwrap();
+    let mut admitted_budget = 64 * 1024;
+    let mut rejections = 0usize;
+    let mut closed = false;
+    for _ in 0..8 {
+        match storage.close() {
+            Ok(()) => {
+                closed = true;
+                break;
+            }
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, admitted_budget);
+                assert!(required > budget);
+                rejections = rejections.saturating_add(1);
+                assert_eq!(
+                    storage.select("budget_metric", &labels, 0, 10).unwrap(),
+                    vec![
+                        DataPoint::new(1, 1.0),
+                        DataPoint::new(2, 2.0),
+                        DataPoint::new(3, 3.0),
+                        DataPoint::new(4, 4.0),
+                        DataPoint::new(5, 5.0),
+                        DataPoint::new(6, 6.0),
+                    ],
+                    "a rejected close must leave the accepted rows queryable for an admitted retry",
+                );
+                admitted_budget = required;
+                storage
+                    .memory
+                    .budget_bytes
+                    .store(admitted_budget as u64, Ordering::Release);
+            }
+            Err(error) => panic!("unexpected bounded close error: {error}"),
+        }
+    }
+    assert!(
+        closed,
+        "close retry did not converge after eight structured memory-boundary admissions",
+    );
+    assert!(
+        rejections > 0,
+        "the retained state fits, but the initial finite close-publication peak must reject",
+    );
 }
 
 #[test]
@@ -249,9 +335,13 @@ fn memory_budget_stats_reflect_builder_configuration() {
     assert_eq!(snapshot.memory.excluded_bytes, 0);
     assert!(!snapshot.memory.excluded_bytes_known);
     assert!(!snapshot.memory.excluded_categories.is_empty());
+    assert!(
+        snapshot.memory.accounted_bytes >= storage.memory_budget(),
+        "the configured budget is smaller than the instance's already-accounted retained state",
+    );
     assert_eq!(
         snapshot.memory.pressure.level,
-        Some(MemoryPressureLevel::Normal)
+        Some(MemoryPressureLevel::Rejecting)
     );
     assert_eq!(
         snapshot.memory.pressure.approaching_limit_basis_points,

@@ -170,12 +170,21 @@ impl FramedWal {
         self.with_cached_series_definition_index_memory_usage_bytes(|bytes| bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_series_definitions_snapshot(
         &self,
+    ) -> Result<Vec<SeriesDefinitionFrame>> {
+        self.committed_series_definitions_snapshot_with_preflight(|_| Ok(()))
+    }
+
+    pub(crate) fn committed_series_definitions_snapshot_with_preflight(
+        &self,
+        mut preflight: impl FnMut(&BTreeMap<SeriesId, SeriesDefinitionFrame>) -> Result<()>,
     ) -> Result<Vec<SeriesDefinitionFrame>> {
         loop {
             let mut index = self.cached_series_definition_index.lock();
             if index.initialized {
+                preflight(&index.committed)?;
                 return Ok(index.snapshot());
             }
             if index.building {
@@ -198,8 +207,9 @@ impl FramedWal {
                         rebuilt.building = false;
                         *index = rebuilt;
                     }
-                    let snapshot = index.snapshot();
                     self.cached_series_definition_index_ready.notify_all();
+                    preflight(&index.committed)?;
+                    let snapshot = index.snapshot();
                     return Ok(snapshot);
                 }
                 Err(err) => {

@@ -265,6 +265,43 @@ pub(crate) struct ChunkBuilderSnapshotCursor {
     next_point_idx_in_block: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChunkBuilderSnapshotMemoryUpperBound {
+    pub(crate) fixed_bytes: u64,
+    pub(crate) max_vector_len: usize,
+    pub(crate) nonempty: bool,
+}
+
+fn snapshot_vec_growth_capacity_upper(elements: usize) -> usize {
+    if elements == 0 {
+        return 0;
+    }
+    elements
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .max(4)
+}
+
+fn add_owned_snapshot_points_to_memory_upper_bound(
+    upper: &mut ChunkBuilderSnapshotMemoryUpperBound,
+    selected_points: usize,
+    collection_allocation_allowance_bytes: u64,
+) {
+    if selected_points == 0 {
+        return;
+    }
+    upper.nonempty = true;
+    upper.max_vector_len = upper.max_vector_len.max(selected_points);
+    let capacity = snapshot_vec_growth_capacity_upper(selected_points);
+    upper.fixed_bytes =
+        upper
+            .fixed_bytes
+            .saturating_add(u64::try_from(capacity).unwrap_or(u64::MAX).saturating_mul(
+                u64::try_from(std::mem::size_of::<ChunkPoint>()).unwrap_or(u64::MAX),
+            ))
+            .saturating_add(collection_allocation_allowance_bytes);
+}
+
 impl ChunkBuilderSnapshot {
     fn push_block(&mut self, block: ChunkBuilderSnapshotBlock) {
         let point_count = block.len();
@@ -483,6 +520,64 @@ impl ChunkBuilder {
             .collect();
         snapshot.push_block(ChunkBuilderSnapshotBlock::Owned(tail_points));
         snapshot
+    }
+
+    pub(crate) fn snapshot_in_range_memory_upper_bound(
+        &self,
+        start: i64,
+        end: i64,
+        collection_allocation_allowance_bytes: u64,
+    ) -> ChunkBuilderSnapshotMemoryUpperBound {
+        if end <= start {
+            return ChunkBuilderSnapshotMemoryUpperBound::default();
+        }
+
+        let source_block_count =
+            self.frozen_point_blocks.len() + usize::from(!self.tail_points.is_empty());
+        let block_capacity = snapshot_vec_growth_capacity_upper(source_block_count);
+        let mut fixed_bytes = u64::try_from(block_capacity)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(std::mem::size_of::<ChunkBuilderSnapshotBlock>()).unwrap_or(u64::MAX),
+            );
+        if block_capacity != 0 {
+            fixed_bytes = fixed_bytes.saturating_add(collection_allocation_allowance_bytes);
+        }
+
+        let mut upper = ChunkBuilderSnapshotMemoryUpperBound {
+            fixed_bytes,
+            max_vector_len: source_block_count,
+            nonempty: false,
+        };
+
+        for block in &self.frozen_point_blocks {
+            if !block.overlaps_range(start, end) {
+                continue;
+            }
+            if block.fully_within_range(start, end) {
+                upper.nonempty = true;
+                continue;
+            }
+            add_owned_snapshot_points_to_memory_upper_bound(
+                &mut upper,
+                block
+                    .points
+                    .iter()
+                    .filter(|point| point.ts >= start && point.ts < end)
+                    .count(),
+                collection_allocation_allowance_bytes,
+            );
+        }
+
+        add_owned_snapshot_points_to_memory_upper_bound(
+            &mut upper,
+            self.tail_points
+                .iter()
+                .filter(|point| point.ts >= start && point.ts < end)
+                .count(),
+            collection_allocation_allowance_bytes,
+        );
+        upper
     }
 
     pub fn finalize(self, ts_codec: TimestampCodecId, value_codec: ValueCodecId) -> Option<Chunk> {

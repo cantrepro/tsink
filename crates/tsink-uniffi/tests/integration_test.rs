@@ -502,6 +502,152 @@ fn test_embedded_surface_snapshot_shards_and_restore() {
 }
 
 #[test]
+fn test_shard_list_preserves_structured_query_budget_rejection() {
+    let builder = TsinkStorageBuilder::new();
+    builder.with_wal_enabled(false).unwrap();
+    builder.with_metadata_shard_count(1).unwrap();
+    builder
+        .with_query_budget_limits(UQueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(8 * 1024 * 1024),
+            per_query: UQueryWorkLimits {
+                max_series_matched: Some(1),
+                max_samples_scanned: None,
+                max_samples_returned: None,
+                max_returned_bytes: None,
+                max_pattern_expansion: None,
+                max_steps: None,
+                max_intermediate_vector_size: Some(2),
+                max_memory_bytes: Some(4 * 1024 * 1024),
+                max_wall_time_nanos: None,
+            },
+        })
+        .unwrap();
+
+    let db = builder.build().unwrap();
+    db.insert_rows(vec![
+        row(
+            "shard_budget_a",
+            vec![label("host", "a")],
+            1,
+            UValue::F64 { v: 1.0 },
+        ),
+        row(
+            "shard_budget_b",
+            vec![label("host", "b")],
+            1,
+            UValue::F64 { v: 2.0 },
+        ),
+    ])
+    .unwrap();
+
+    let error = db
+        .list_metrics_in_shards(UMetadataShardScope {
+            shard_count: 1,
+            shards: vec![0],
+        })
+        .expect_err("the UniFFI shard list must preserve the core series limit");
+    assert!(matches!(
+        error,
+        TsinkUniFFIError::ResourceExhausted { msg }
+            if msg.contains("series_matched")
+    ));
+
+    let snapshot = db.observability_snapshot().query_budget;
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.series_matched_rejections_total, 1);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_metric_list_preserves_exact_memory_admission_and_release() {
+    let build = |memory_limit: u64| {
+        let data_dir = tempdir().unwrap();
+        let builder = TsinkStorageBuilder::new();
+        builder
+            .with_data_path(data_dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        builder.with_wal_enabled(true).unwrap();
+        builder
+            .with_query_budget_limits(UQueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(memory_limit),
+                per_query: UQueryWorkLimits {
+                    max_series_matched: Some(2),
+                    max_samples_scanned: None,
+                    max_samples_returned: None,
+                    max_returned_bytes: Some(1024 * 1024),
+                    max_pattern_expansion: None,
+                    max_steps: None,
+                    max_intermediate_vector_size: Some(2),
+                    max_memory_bytes: Some(memory_limit),
+                    max_wall_time_nanos: None,
+                },
+            })
+            .unwrap();
+        (data_dir, builder.build().unwrap())
+    };
+    let seed = |db: &TsinkDB| {
+        db.insert_rows(vec![
+            row(
+                "wal_budget_a",
+                vec![label("host", "a")],
+                1,
+                UValue::F64 { v: 1.0 },
+            ),
+            row(
+                "wal_budget_b",
+                vec![label("host", "b")],
+                1,
+                UValue::F64 { v: 2.0 },
+            ),
+        ])
+        .unwrap();
+    };
+
+    let (_calibration_dir, calibration) = build(8 * 1024 * 1024);
+    seed(&calibration);
+    let before = calibration.observability_snapshot().query_budget;
+    assert_eq!(calibration.list_metrics_with_wal().unwrap().len(), 2);
+    let after = calibration.observability_snapshot().query_budget;
+    let exact_memory = after.peak_shared_reserved_memory_bytes;
+    assert!(exact_memory > 0);
+    assert_eq!(
+        after.queries_started_total - before.queries_started_total,
+        1
+    );
+    assert_eq!(
+        after.queries_completed_total - before.queries_completed_total,
+        1
+    );
+    assert_eq!(after.active_queries, 0);
+    assert_eq!(after.shared_reserved_memory_bytes, 0);
+    calibration.close().unwrap();
+
+    for (memory_limit, should_succeed) in [(exact_memory, true), (exact_memory - 1, false)] {
+        let (_data_dir, db) = build(memory_limit);
+        seed(&db);
+        let result = db.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 2);
+        } else {
+            assert!(matches!(
+                result.unwrap_err(),
+                TsinkUniFFIError::ResourceExhausted { msg }
+                    if msg.contains("per_query_memory_bytes")
+            ));
+        }
+        let snapshot = db.observability_snapshot().query_budget;
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        db.close().unwrap();
+    }
+}
+
+#[test]
 fn write_batch_best_effort_preserves_indexed_outcomes() {
     let builder = TsinkStorageBuilder::new();
     builder.with_wal_enabled(false).unwrap();

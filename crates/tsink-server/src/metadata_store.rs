@@ -274,8 +274,8 @@ impl AccountedMetricMetadataQueryResult {
 
 impl Drop for AccountedMetricMetadataQueryResult {
     fn drop(&mut self) {
-        // Release the execution-owned guard first. The store gauge can conservatively overlap
-        // that release, but it must never report the bytes free while the query guard is live.
+        // Destroy the protected allocation before either accounting owner reports it free.
+        drop(std::mem::take(&mut self.records));
         drop(self.reservation.take());
         self.accounting.release_query_bytes(self.accounted_bytes);
     }

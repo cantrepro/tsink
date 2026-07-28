@@ -633,7 +633,7 @@ fn batched_wal_replay_matches_direct_ingest_state_for_mixed_series_and_lanes() {
 }
 
 #[test]
-fn wal_replay_policy_strict_vs_salvage_applies_later_valid_frames_after_checksum_corruption() {
+fn wal_replay_salvages_an_open_handle_but_persistent_open_rejects_corrupt_published_frames() {
     let labels = vec![Label::new("host", "a")];
     let seed_corrupt_wal = |data_path: &Path| {
         let wal_dir = data_path.join(WAL_DIR_NAME);
@@ -694,16 +694,12 @@ fn wal_replay_policy_strict_vs_salvage_applies_later_valid_frames_after_checksum
         file.seek(SeekFrom::Start(checksum_offset)).unwrap();
         file.write_all(&checksum).unwrap();
         file.flush().unwrap();
-        wal_dir
+        wal
     };
 
-    let temp_dir = TempDir::new().unwrap();
-    let wal_dir = seed_corrupt_wal(temp_dir.path());
-
-    let strict_storage = ChunkStorage::new(
-        8,
-        Some(FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap()),
-    );
+    let strict_replay_dir = TempDir::new().unwrap();
+    let strict_wal = seed_corrupt_wal(strict_replay_dir.path());
+    let strict_storage = ChunkStorage::new(8, Some(strict_wal));
     let strict_err = strict_storage
         .replay_from_wal(WalHighWatermark::default(), WalReplayMode::Strict)
         .unwrap_err();
@@ -714,26 +710,9 @@ fn wal_replay_policy_strict_vs_salvage_applies_later_valid_frames_after_checksum
                 && message.contains("checksum mismatch")
     ));
 
-    let strict_startup_dir = TempDir::new().unwrap();
-    seed_corrupt_wal(strict_startup_dir.path());
-    let startup_err = match StorageBuilder::new()
-        .with_data_path(strict_startup_dir.path())
-        .with_timestamp_precision(TimestampPrecision::Seconds)
-        .with_chunk_points(8)
-        .build()
-    {
-        Ok(_) => panic!("expected default startup replay to fail on WAL corruption"),
-        Err(err) => err,
-    };
-    assert!(matches!(
-        startup_err,
-        TsinkError::DataCorruption(message)
-            if message.contains("segment 0, frame 3")
-                && message.contains("checksum mismatch")
-    ));
-
-    let replayed_timestamps = FramedWal::open(&wal_dir, WalSyncMode::PerAppend)
-        .unwrap()
+    let salvage_replay_dir = TempDir::new().unwrap();
+    let salvage_wal = seed_corrupt_wal(salvage_replay_dir.path());
+    let replayed_timestamps = salvage_wal
         .replay_committed_writes_after_with_mode(
             WalHighWatermark::default(),
             WalReplayMode::Salvage,
@@ -745,10 +724,7 @@ fn wal_replay_policy_strict_vs_salvage_applies_later_valid_frames_after_checksum
         .collect::<Vec<_>>();
     assert_eq!(replayed_timestamps, vec![1, 3]);
 
-    let reopened = ChunkStorage::new(
-        8,
-        Some(FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap()),
-    );
+    let reopened = ChunkStorage::new(8, Some(salvage_wal));
     reopened
         .replay_from_wal(WalHighWatermark::default(), WalReplayMode::Salvage)
         .unwrap();
@@ -768,50 +744,166 @@ fn wal_replay_policy_strict_vs_salvage_applies_later_valid_frames_after_checksum
         .collect::<Vec<_>>();
     assert_eq!(points, vec![DataPoint::new(1, 1.0), DataPoint::new(3, 3.0)]);
 
-    let salvage_startup_dir = TempDir::new().unwrap();
-    seed_corrupt_wal(salvage_startup_dir.path());
-    let salvaged = StorageBuilder::new()
-        .with_data_path(salvage_startup_dir.path())
-        .with_timestamp_precision(TimestampPrecision::Seconds)
-        .with_chunk_points(8)
-        .with_wal_replay_mode(WalReplayMode::Salvage)
-        .build()
-        .unwrap();
-    assert_eq!(
-        salvaged.select("replay_policy", &labels, 0, 10).unwrap(),
-        vec![DataPoint::new(1, 1.0), DataPoint::new(3, 3.0)]
-    );
-    salvaged
-        .insert_rows(&[Row::with_labels(
-            "replay_policy",
-            labels.clone(),
-            DataPoint::new(4, 4.0),
-        )])
-        .unwrap();
-    salvaged.close().unwrap();
+    let persistent_open_dir = TempDir::new().unwrap();
+    let persistent_wal = seed_corrupt_wal(persistent_open_dir.path());
+    let corrupt_segment_path = persistent_wal.path();
+    drop(persistent_wal);
+    let corrupt_segment_before = std::fs::read(&corrupt_segment_path).unwrap();
+    let published_marker_path = persistent_open_dir
+        .path()
+        .join(WAL_DIR_NAME)
+        .join("wal.published");
+    let published_marker_before = std::fs::read(&published_marker_path).unwrap();
 
-    let salvaged_reopened = StorageBuilder::new()
-        .with_data_path(salvage_startup_dir.path())
+    let open_err = match StorageBuilder::new()
+        .with_data_path(persistent_open_dir.path())
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(8)
         .with_wal_replay_mode(WalReplayMode::Salvage)
         .build()
-        .unwrap();
-    assert_eq!(
-        salvaged_reopened
-            .select("replay_policy", &labels, 0, 10)
-            .unwrap(),
-        vec![
-            DataPoint::new(1, 1.0),
-            DataPoint::new(3, 3.0),
-            DataPoint::new(4, 4.0),
-        ]
+    {
+        Ok(_) => panic!("persistent open must reject a corrupt published WAL prefix"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &open_err,
+            TsinkError::DataCorruption(message)
+                if message.contains("published WAL frame 3")
+                    && message.contains("checksum mismatch")
+        ),
+        "{open_err:?}",
     );
-    salvaged_reopened.close().unwrap();
+    assert_eq!(
+        std::fs::read(corrupt_segment_path).unwrap(),
+        corrupt_segment_before,
+        "failed persistent open must not rewrite the corrupt source WAL",
+    );
+    assert_eq!(
+        std::fs::read(published_marker_path).unwrap(),
+        published_marker_before,
+        "failed persistent open must not rewrite the source publication boundary",
+    );
+    let manifest_path = persistent_open_dir.path().join("tsink-manifest.json");
+    let installed_manifest = std::fs::read(&manifest_path).unwrap();
+    let manifest_json: serde_json::Value = serde_json::from_slice(&installed_manifest).unwrap();
+    assert_eq!(
+        manifest_json["payload"]["last_successfully_opened_tsink_version"],
+        serde_json::Value::Null,
+        "a legacy identity installed before recovery must not claim a successful open",
+    );
+    let retry_err = match StorageBuilder::new()
+        .with_data_path(persistent_open_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .build()
+    {
+        Ok(_) => panic!("strict retry must reject the same corrupt published WAL prefix"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &retry_err,
+            TsinkError::DataCorruption(message)
+                if message.contains("published WAL frame 3")
+                    && message.contains("checksum mismatch")
+        ),
+        "{retry_err:?}",
+    );
+    assert_eq!(
+        std::fs::read(manifest_path).unwrap(),
+        installed_manifest,
+        "failed retry must not rewrite the staged legacy identity",
+    );
+
+    let markerless_open_dir = TempDir::new().unwrap();
+    let markerless_wal = seed_corrupt_wal(markerless_open_dir.path());
+    let markerless_segment_path = markerless_wal.path();
+    drop(markerless_wal);
+    let markerless_segment_before = std::fs::read(&markerless_segment_path).unwrap();
+    let markerless_wal_dir = markerless_open_dir.path().join(WAL_DIR_NAME);
+    let markerless_published_path = markerless_wal_dir.join("wal.published");
+    std::fs::remove_file(&markerless_published_path).unwrap();
+    let mut markerless_names_before = std::fs::read_dir(&markerless_wal_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    markerless_names_before.sort();
+
+    let markerless_err = match StorageBuilder::new()
+        .with_data_path(markerless_open_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .with_wal_replay_mode(WalReplayMode::Salvage)
+        .build()
+    {
+        Ok(_) => panic!("salvage must not adopt a corrupt markerless WAL prefix"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &markerless_err,
+            TsinkError::DataCorruption(message)
+                if message.contains("published WAL frame 3")
+                    && message.contains("checksum mismatch")
+        ),
+        "{markerless_err:?}",
+    );
+    assert_eq!(
+        std::fs::read(&markerless_segment_path).unwrap(),
+        markerless_segment_before,
+        "markerless validation failure must not rewrite the corrupt source segment",
+    );
+    assert!(
+        !markerless_published_path.exists(),
+        "markerless validation failure must not publish a boundary",
+    );
+    let mut markerless_names_after = std::fs::read_dir(&markerless_wal_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    markerless_names_after.sort();
+    assert_eq!(
+        markerless_names_after, markerless_names_before,
+        "markerless validation failure must not quarantine or stage WAL files",
+    );
+    let markerless_manifest_path = markerless_open_dir.path().join("tsink-manifest.json");
+    let markerless_manifest = std::fs::read(&markerless_manifest_path).unwrap();
+    let markerless_manifest_json: serde_json::Value =
+        serde_json::from_slice(&markerless_manifest).unwrap();
+    assert_eq!(
+        markerless_manifest_json["payload"]["last_successfully_opened_tsink_version"],
+        serde_json::Value::Null,
+        "legacy identity installation may precede WAL validation but must not claim success",
+    );
+
+    let markerless_retry_err = match StorageBuilder::new()
+        .with_data_path(markerless_open_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .build()
+    {
+        Ok(_) => panic!("strict retry must reject the same markerless corrupt WAL prefix"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &markerless_retry_err,
+            TsinkError::DataCorruption(message)
+                if message.contains("published WAL frame 3")
+                    && message.contains("checksum mismatch")
+        ),
+        "{markerless_retry_err:?}",
+    );
+    assert_eq!(
+        std::fs::read(markerless_manifest_path).unwrap(),
+        markerless_manifest,
+        "failed markerless retry must not rewrite the staged legacy identity",
+    );
 }
 
 #[test]
-fn list_metrics_with_wal_rebuild_uses_configured_salvage_mode_on_corrupt_wal() {
+fn list_metrics_with_wal_live_rebuild_uses_configured_salvage_mode_on_corrupt_wal() {
     let labels = vec![Label::new("host", "a")];
     let metric = "replay_policy";
     let seed_corrupt_wal = |data_path: &Path| {
@@ -873,16 +965,11 @@ fn list_metrics_with_wal_rebuild_uses_configured_salvage_mode_on_corrupt_wal() {
         file.seek(SeekFrom::Start(checksum_offset)).unwrap();
         file.write_all(&checksum).unwrap();
         file.flush().unwrap();
-        wal_dir
+        wal
     };
 
-    let temp_dir = TempDir::new().unwrap();
-    let wal_dir = seed_corrupt_wal(temp_dir.path());
-
-    let strict_storage = ChunkStorage::new(
-        8,
-        Some(FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap()),
-    );
+    let strict_dir = TempDir::new().unwrap();
+    let strict_storage = ChunkStorage::new(8, Some(seed_corrupt_wal(strict_dir.path())));
     strict_storage
         .persisted
         .wal
@@ -897,10 +984,8 @@ fn list_metrics_with_wal_rebuild_uses_configured_salvage_mode_on_corrupt_wal() {
                 && message.contains("checksum mismatch")
     ));
 
-    let salvage_storage = ChunkStorage::new(
-        8,
-        Some(FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap()),
-    );
+    let salvage_dir = TempDir::new().unwrap();
+    let salvage_storage = ChunkStorage::new(8, Some(seed_corrupt_wal(salvage_dir.path())));
     assert!(salvage_storage.list_metrics().unwrap().is_empty());
     salvage_storage
         .persisted
@@ -1394,7 +1479,6 @@ fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
     let post_catalog_hook_calls = Arc::new(AtomicUsize::new(0));
     storage.set_catalog_transition_post_catalog_publication_hook({
         let post_catalog_hook_calls = Arc::clone(&post_catalog_hook_calls);
-        let storage = Arc::downgrade(&storage);
         let lane_path = lane_path.clone();
         let local_catalog_path = local_catalog_path.clone();
         let shared_catalog_path =
@@ -1405,9 +1489,6 @@ fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
             if call > 0 {
                 return Ok(());
             }
-            let storage = storage.upgrade().ok_or_else(|| {
-                TsinkError::Other("storage dropped before post-catalog hook".to_string())
-            })?;
             let local_inventory = super::super::tiering::load_segment_catalog(
                 &local_catalog_path,
                 Some(&lane_path),
@@ -1420,18 +1501,12 @@ fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
                 None,
                 Some(&tiered_storage),
             )?;
-            let visible_hot_segments = storage
-                .observability
-                .flush
-                .hot_segments_visible
-                .load(Ordering::Relaxed);
-            if local_inventory.entries().len() != 1
-                || shared_inventory.entries().len() != 1
-                || visible_hot_segments != 1
-            {
-                return Err(TsinkError::Other(
-                    "post-catalog hook did not observe the published flush inventory".to_string(),
-                ));
+            if local_inventory.entries().len() != 1 || shared_inventory.entries().len() != 1 {
+                return Err(TsinkError::Other(format!(
+                    "post-catalog hook did not observe the published flush inventory: local={}, shared={}",
+                    local_inventory.entries().len(),
+                    shared_inventory.entries().len(),
+                )));
             }
             Err(TsinkError::Other(
                 "injected post-catalog flush publication failure".to_string(),
@@ -1440,11 +1515,14 @@ fn flush_visibility_publication_failure_preserves_wal_and_retry_state() {
     });
 
     let error = storage.persist_segment_with_outcome().unwrap_err();
-    assert!(matches!(
-        error,
-        TsinkError::Other(message)
-            if message == "injected post-catalog flush publication failure"
-    ));
+    assert!(
+        matches!(
+            &error,
+            TsinkError::Other(message)
+                if message == "injected post-catalog flush publication failure"
+        ),
+        "unexpected post-catalog publication error: {error:?}",
+    );
     assert_eq!(
         post_catalog_hook_calls.load(Ordering::SeqCst),
         1,
@@ -2503,9 +2581,25 @@ fn explicit_runtime_refresh_loads_added_segment_without_decoding_chunk_payloads(
         .persisted
         .persisted_index_dirty
         .store(true, Ordering::SeqCst);
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
+    let mut refresh_passes = 0usize;
+    while storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst)
+    {
+        assert!(
+            refresh_passes < 16,
+            "bounded runtime refresh did not converge within 16 passes",
+        );
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        refresh_passes += 1;
+    }
+    assert!(
+        refresh_passes > 1,
+        "finite runtime refresh should publish through bounded continuation passes",
+    );
 
     assert!(!storage
         .persisted

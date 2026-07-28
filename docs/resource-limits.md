@@ -335,17 +335,32 @@ or larger query shapes.
 
 Execution-aware point and metadata selection also have detailed result contracts:
 `SelectManyExecutionResult` carries selector-aligned existence bits and a retained-memory guard,
-`SelectSeriesExecutionResult` carries the metadata vector and its guard, and
+`SelectSeriesExecutionResult` carries the metadata vector and its guard. Both
+`list_metrics_with_execution_result` and `select_series_with_execution_result` use that metadata
+contract, with separate conservative accounting-capability methods so one operation is never
+silently substituted for the other.
 `QueryRowsExecutionResult` does the same for a paged row scan. A built-in backend that advertises
 `QueryExecutionAccounting::Complete` charges the result work and keeps its modeled allocation
 reserved until that detailed result, or a replacement wrapper guard, is dropped. Row scans also
 pre-admit the complete cloned identity-resolution vector before resolving any requested series.
-`ChunkStorage`, tenant-scoping/default-tenant fallback, and distributed storage propagate or
-replace these guards around their final retained vectors. Compatibility backends default to
-`Unaccounted`; bounded PromQL and internal/distributed server paths that require complete
-accounting reject such a backend instead of trusting an unguarded result. Callers that need this
-retained-result guarantee must keep the detailed result contract: converting to a plain
-compatibility `Vec` transfers the vector to caller ownership after the guard is released.
+`ChunkStorage` advertises complete accounting for both series-list and metric-name row scans. Its
+raw point pages retain their decode/output guard through row identity cloning, then coalesce the
+raw-page and row reservations without an uncharged handoff. A non-default tenant
+`scan_series_rows` path scopes identities, delegates to the detailed inner scan, and replaces its
+guard around the tenant-visible page. The default-tenant fallback and distributed series-row path
+can fetch and charge more points than the returned compound page reports, so they truthfully
+advertise `Unaccounted`; tenant and distributed metric-name row adapters do the same. These remain
+fail-closed boundaries for finite callers.
+Compatibility backends default to `Unaccounted`; bounded PromQL and internal/distributed server
+paths that require complete accounting reject such a backend instead of trusting an unguarded
+result. Callers that need this retained-result guarantee must keep the detailed result contract:
+converting to a plain compatibility `Vec` or row page transfers the value to caller ownership after
+the guard is released. `AsyncStorage` transports the detailed `list_metrics`, `select_series`,
+`scan_series_rows`, and `scan_metric_rows` results through the worker reply, so the query permit and
+result-memory reservation stay live until the receiving future consumes the reply; dropping that
+future releases both through RAII. A finite/budgeted async read rejects an `Unaccounted` backend
+before invoking it and rejects a false-`Complete` result with a missing or undersized guard. An
+execution-less unlimited call retains the exact compatibility operation.
 PromQL multi-series fetches, including range prefetch and `info()` data reads, now consume both
 detailed metadata and detailed point batches. They validate point-result identities and existence
 evidence, pre-admit the label/point row transform, resize the transferred point guard to the actual
@@ -380,10 +395,15 @@ The portable query-memory model charges tsink-owned collection capacities and va
 named per-allocation allowance. It covers storage decode buffers, snapshots, candidate sets,
 built-in aggregation working sets, PromQL parse/regex preparation, stable-sort scratch,
 label-transform amplification, capture locations, and the guarded final point/metadata/PromQL
-results described above. Native-histogram bucket materialization uses exact final capacity,
-one bounded decode vector, and allocation-free sorting. This model is not RSS and does not include
-private global-allocator metadata or slack. It cannot charge memory allocated internally by
-caller-provided `Aggregator`,
+results described above. Read snapshots preflight candidate-vector growth before allocation and
+keep their guards behind the collections they own on success and error paths. Encoded chunk reads
+charge the timestamp, value, decoded-point, and destination vectors, nested value-capacity growth,
+and simultaneous persisted/sealed cursor retention. Persisted zstd chunks additionally preflight
+the declared logical payload, a full decoded-window allowance, and a conservative 1 MiB decoder and
+buffered-input workspace before decompression. Native-histogram bucket materialization uses exact
+final capacity, one bounded decode vector, and allocation-free sorting. This model is not RSS and
+does not include private global-allocator metadata or slack beyond the documented portable
+allowances. It cannot charge memory allocated internally by caller-provided `Aggregator`,
 `CodecAggregator`, or storage-backend implementations; their tsink-owned inputs and returned values
 are still subject to the applicable work counters.
 
@@ -1212,20 +1232,31 @@ change is not a linearizable snapshot proof.
 `ShardWindowScanOptions::{max_series,max_rows}` remain caller-requested pagination controls rather
 than resource limits. The shared `QueryExecution` separately enforces the profile's concurrency,
 work, deadline, and modeled-memory limits across direct, async, PromQL, and HTTP entry points.
-The built-in `list_metrics` entry point now admits that execution directly; async metadata reads
-forward the already-admitted execution instead of acquiring a second slot. Registry IDs are read
-in fixed 4,096-entry pages, and the page scratch, growing returned identities, and retained
-dead-series pruning IDs are reserved before allocation. A cold visibility-summary repair reserves
-its update, normalized-range, and cache-publication staging, checkpoints source traversal, and
-re-admits the actual active/sealed range count under the same read guards used for rebuilding; a
-post-estimate concurrent write therefore cannot grow the vector past its admitted envelope. Stable
-dead-series pruning observes the dead-ID length and reserves the one simultaneously live companion
-vector reused by removal, delta reconciliation, and shard unpublication. The default-tenant server
-wrapper admits one execution across both its scoped and legacy selections, observes their combined
-intermediate length, and pre-reserves an in-place merge/label-stripping path. Ordinary and
-shard-scoped metadata selection now pass that execution through live-retention filtering; cold
-visibility repair, its ID vectors, retention partitions, and time-range summary repair are no
-longer compatibility work outside the query envelope. Series count, returned-byte,
+The built-in `list_metrics`, `list_metrics_with_wal`, and shard-scoped metadata entry points now
+admit one execution directly; async metadata reads forward the already-admitted execution instead
+of acquiring a second slot. Their detailed replies retain the result guard across the worker
+channel; core, tenant, and distributed list adapters advertise `Complete`, while compatibility
+backends remain fail-closed under finite async limits. Registry IDs are read in fixed 4,096-entry
+pages, and the page scratch,
+WAL-definition snapshot, growing union/result identities, and retained dead-series pruning IDs are
+reserved before allocation. Before a cached WAL-definition snapshot is cloned, every committed
+definition is admitted as pattern-expansion work and a reserved borrowed-identity set preflights the
+exact WAL-only union against the remaining series and returned-byte limits. Live/WAL and intra-WAL
+duplicates therefore retain exact final-result semantics without permitting duplicate-heavy
+candidate traversal to escape its own work bound. Shard-scoped selection derives candidate work
+from the selected buckets rather than the complete registry, returns an empty scope without
+admission, and preserves validation and unsupported-geometry precedence before admission. A cold
+visibility-summary repair
+reserves its update, normalized-range, and cache-publication staging, checkpoints source traversal,
+and re-admits the actual active/sealed range count under the same read guards used for rebuilding;
+a post-estimate concurrent write therefore cannot grow the vector past its admitted envelope.
+Stable dead-series pruning observes the dead-ID length and reserves the one simultaneously live
+companion vector reused by removal, delta reconciliation, and shard unpublication. The
+default-tenant server wrapper admits one execution across both its scoped and legacy selections,
+observes their combined intermediate length, and pre-reserves an in-place merge/label-stripping
+path. Ordinary and shard-scoped metadata selection now pass that execution through live-retention
+filtering; cold visibility repair, its ID vectors, retention partitions, and time-range summary
+repair are no longer compatibility work outside the query envelope. Series count, returned-byte,
 intermediate-length, and per-query/shared-memory failures remain structured and release the slot on
 every exit. Prometheus remote read encodes and drops each completed query result
 before starting the next one, caps the aggregate uncompressed protobuf at 64 MiB, charges each local
@@ -1234,11 +1265,42 @@ The retained encoded and compressed buffers are a fixed server-adapter envelope 
 shared-query-memory reservation; public read-request admission bounds their concurrent
 multiplicity. Bounded distributed metadata and point fanout now reserve planning, RPC transport and
 decode envelopes, peer results, and merge state under the shared execution, and retain a detailed
-guard around the final vector. The compatibility distributed `list_metrics` path, WAL-definition
-merging, some async and metadata-HTTP result handoffs, other adapters that do not opt into detailed
-accounting, and caller-owned vectors after a detailed guard is consumed remain separate named
-boundaries. PromQL's exact single-series compatibility read and `info()` merge map are now charged
-inside the shared query execution rather than listed among those exclusions.
+guard around the final vector. Direct distributed `list_metrics` uses one top-level execution
+across its accounted fanout and merge, returns no partial result on rejection, and retains the
+final result reservation. Its self-admitted compatibility form consumes and drops any accounted
+fanout-warning side channel before returning, so that metadata cannot keep the locally owned query
+lease alive; execution-aware server calls leave that guard for the response adapter to consume.
+The public Prometheus metadata handlers (`/api/v1/series`, `/api/v1/labels`,
+`/api/v1/label/:name/values`, and `/api/v1/metadata`) and internal metadata calls carrying finite
+`query_limits` require complete detailed results, admit their projection and exact JSON body/header
+envelope, and retain guards until `HttpResponse` construction. The socket header buffer plus
+runtime, kernel, and TLS allocations after that explicit handoff remain outside the portable
+model.
+
+`/api/v1/status/tsdb` likewise requires query execution admission and a completely accounted
+detailed metric listing; it no longer converts a listing failure into a false empty success.
+Its full hotspot-tracker clone, maps, union/sort scratch, and retained top-eight result are reserved
+under the same execution, with the tracker lock held across sizing and cloning. The transform
+checkpoints tracker/map/union/sort traversal and reports intermediate collection high-water sizes.
+Status JSON has a separate 1 MiB encoded response ceiling; after the legacy JSON tree is assembled,
+its measured retained allocation, exact encoded body capacity, and response header capacities
+remain guarded through `HttpResponse` construction. Named profiles continue to apply their normal
+cumulative returned-byte limits. `ExpertUnlimited` keeps metric enumeration unbounded while still
+using this execution-aware path and the adapter's fixed encoded ceiling. Backends that expose
+neither query admission nor complete detailed listing accounting fail closed.
+
+Remaining named HTTP boundaries are the legacy internal metadata paths without `query_limits`;
+the best-effort `/metrics` collector; rebalance status and post-effect pause/resume/run reporting;
+the support bundle that composes and duplicates those responses; and the operational snapshot
+clones plus projection/JSON-tree construction peak assembled by `/api/v1/status/tsdb` before its
+measured retained-tree guard is established. Those status sources have independent producer caps
+where documented, but they do not yet share one reserve-before-clone query envelope.
+The default-tenant and distributed series-row adapters, tenant/distributed metric-name row-scan
+adapters, other backends that do not advertise complete accounting, and caller-owned results after
+a detailed guard is consumed also remain explicit boundaries. Core and async metric-name row scans
+and plain async metadata replies are no longer in that exclusion. PromQL's exact single-series
+compatibility read and `info()` merge map are now charged inside the shared query execution rather
+than listed among those exclusions.
 Rollup maintenance creates one internal execution per source read, preserving those instance limits
 and tightening memory, scanned/returned samples, returned bytes, and intermediate length to the
 finite maintenance ceiling. It never paginates or truncates a source into a false checkpoint: an

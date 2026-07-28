@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tsink::{
     DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label, MetricSeries, QueryBudget,
-    QueryExecution, QueryExecutionAccounting, QueryMemoryReservation, QueryOptions,
-    Result as TsinkResult, Row, SelectManyExecutionResult, SelectSeriesExecutionResult,
-    SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage, StorageObservabilitySnapshot,
-    TsinkError,
+    QueryCancellationToken, QueryExecution, QueryExecutionAccounting, QueryMemoryReservation,
+    QueryOptions, QueryWorkLimits, Result as TsinkResult, Row, SelectManyExecutionResult,
+    SelectSeriesExecutionResult, SeriesMatcher, SeriesMatcherOp, SeriesSelection, Storage,
+    StorageObservabilitySnapshot, TsinkError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,20 +789,73 @@ impl Storage for DistributedStorageAdapter {
     }
 
     fn list_metrics(&self) -> TsinkResult<Vec<MetricSeries>> {
-        self.list_metrics_distributed()
+        let Some(execution) =
+            self.begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
+        else {
+            // A third-party compatibility backend may not expose a query budget. Preserve that
+            // legacy behavior explicitly; finite built-in profiles always take the accounted path.
+            return self.list_metrics_distributed();
+        };
+        let result = self
+            .list_metrics_distributed_result_with_execution(&execution)
+            .map(SelectSeriesExecutionResult::into_series);
+        // This compatibility call owns the execution and cannot return fanout metadata. Move the
+        // metadata guard out on every result path so warning/partial-response memory cannot keep
+        // the self-admitted query lease alive. Execution-aware callers retain the separate take
+        // contract because their response adapters consume the warnings.
+        let accounted_metadata = self.take_accounted_read_metadata();
+        match (result, accounted_metadata) {
+            (Ok(series), Ok(metadata)) => {
+                drop(metadata);
+                Ok(series)
+            }
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     fn list_metrics_with_execution(
         &self,
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<MetricSeries>> {
+        self.list_metrics_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
         execution.checkpoint().map_err(TsinkError::from)?;
         self.list_metrics_distributed_result_with_execution(execution)
-            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Complete
     }
 
     fn list_metrics_with_wal(&self) -> TsinkResult<Vec<MetricSeries>> {
         self.list_metrics()
+    }
+
+    fn list_metrics_with_wal_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        self.list_metrics_with_wal_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_wal_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        execution.checkpoint().map_err(TsinkError::from)?;
+        self.list_metrics_distributed_result_with_execution(execution)
+    }
+
+    fn list_metrics_with_wal_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Complete
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
@@ -1072,18 +1125,14 @@ mod tests {
         ClusterRequestContext::from_runtime(runtime).expect("cluster context should build")
     }
 
-    fn make_bounded_adapter(rows: &[Row]) -> (Arc<dyn Storage>, Arc<DistributedStorageAdapter>) {
+    fn make_bounded_adapter_with_query_limits(
+        rows: &[Row],
+        query_limits: QueryBudgetLimits,
+    ) -> (Arc<dyn Storage>, Arc<DistributedStorageAdapter>) {
         let storage: Arc<dyn Storage> = StorageBuilder::new()
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .with_metadata_shard_count(DEFAULT_CLUSTER_SHARDS)
-            .with_query_budget_limits(QueryBudgetLimits {
-                max_concurrent_queries: Some(1),
-                max_shared_memory_bytes: Some(32 * 1024 * 1024),
-                per_query: QueryWorkLimits {
-                    max_memory_bytes: Some(32 * 1024 * 1024),
-                    ..QueryWorkLimits::default()
-                },
-            })
+            .with_query_budget_limits(query_limits)
             .build()
             .expect("storage should build");
         assert_eq!(
@@ -1115,6 +1164,20 @@ mod tests {
         (storage, adapter)
     }
 
+    fn make_bounded_adapter(rows: &[Row]) -> (Arc<dyn Storage>, Arc<DistributedStorageAdapter>) {
+        make_bounded_adapter_with_query_limits(
+            rows,
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(32 * 1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(32 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            },
+        )
+    }
+
     fn assert_query_limit(error: TsinkError, expected: QueryLimitReason) {
         match error {
             TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
@@ -1122,6 +1185,310 @@ mod tests {
             }
             other => panic!("expected {expected} query limit, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn distributed_metric_row_scan_accounting_remains_unaccounted() {
+        let (storage, adapter) = make_bounded_adapter(&[]);
+        assert_eq!(
+            storage.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Complete,
+            "the built-in local storage fixture should expose complete metric-row accounting",
+        );
+        assert_eq!(
+            adapter.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "distributed metric-row scans must fail closed until the adapter has a bounded complete implementation",
+        );
+    }
+
+    #[tokio::test]
+    async fn distributed_series_row_scan_accounting_remains_unaccounted() {
+        let (storage, adapter) = make_bounded_adapter(&[]);
+        assert_eq!(
+            storage.scan_series_rows_execution_accounting(),
+            QueryExecutionAccounting::Complete,
+            "the built-in local storage fixture should expose complete series-row accounting",
+        );
+        assert_eq!(
+            adapter.scan_series_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "distributed series-row scans must fail closed until fanout has a paginated row RPC",
+        );
+    }
+
+    fn distributed_list_metrics_rows() -> [Row; 2] {
+        [
+            Row::with_labels(
+                "bounded_distributed_list",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1_700_000_000_000, 1.0),
+            ),
+            Row::with_labels(
+                "bounded_distributed_list",
+                vec![Label::new("host", "b")],
+                DataPoint::new(1_700_000_000_000, 2.0),
+            ),
+        ]
+    }
+
+    fn distributed_list_metrics_limits(max_series_matched: u64) -> QueryBudgetLimits {
+        QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(32 * 1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(max_series_matched),
+                max_memory_bytes: Some(32 * 1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_list_metrics_detailed_result_retains_complete_guard() {
+        let (storage, adapter) = make_bounded_adapter(&distributed_list_metrics_rows());
+        assert_eq!(
+            adapter.list_metrics_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query admission should succeed")
+            .expect("built-in storage should expose a query budget");
+        let adapter_for_call = Arc::clone(&adapter);
+        let execution_for_call = execution.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            adapter_for_call.list_metrics_with_execution_result(&execution_for_call)
+        })
+        .await
+        .expect("distributed list task should join")
+        .expect("distributed metric listing should succeed");
+        assert_eq!(result.series.len(), 2);
+        assert!(result.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result.reserved_memory_bytes()
+        );
+        drop(result);
+        drop(
+            adapter
+                .take_accounted_read_metadata()
+                .expect("distributed read metadata should remain accounted"),
+        );
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_list_metrics_uses_one_execution_at_exact_series_limit() {
+        let (storage, adapter) = make_bounded_adapter_with_query_limits(
+            &distributed_list_metrics_rows(),
+            distributed_list_metrics_limits(2),
+        );
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let series = tokio::task::spawn_blocking(move || adapter_for_call.list_metrics())
+            .await
+            .expect("direct list_metrics task should join")
+            .expect("the exact series limit should admit");
+        assert_eq!(series.len(), 2);
+
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.peak_active_queries, 1);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_list_metrics_discards_warning_metadata_and_releases_its_query_lease() {
+        let (storage, adapter) = make_bounded_adapter(&distributed_list_metrics_rows());
+        let warning_metadata = ReadFanoutResponseMetadata {
+            consistency: adapter.read_fanout.read_consistency_mode(),
+            partial_response_policy: adapter.read_fanout.read_partial_response_policy(),
+            partial_response: true,
+            warnings: vec!["deterministic direct-list warning".to_string()],
+        };
+        adapter
+            .record_metadata(&warning_metadata, None)
+            .expect("warning fixture should be recorded");
+
+        let adapter_for_first = Arc::clone(&adapter);
+        let first = tokio::task::spawn_blocking(move || adapter_for_first.list_metrics())
+            .await
+            .expect("first direct list_metrics task should join")
+            .expect("first direct list_metrics call should succeed");
+        assert_eq!(first.len(), 2);
+        assert!(adapter.read_metadata_snapshot().warnings.is_empty());
+
+        let after_first = storage.query_budget_snapshot();
+        assert_eq!(after_first.queries_started_total, 1);
+        assert_eq!(after_first.queries_completed_total, 1);
+        assert_eq!(after_first.active_queries, 0);
+        assert_eq!(after_first.shared_reserved_memory_bytes, 0);
+        assert_eq!(after_first.accounting_invariant_violations_total, 0);
+
+        let adapter_for_second = Arc::clone(&adapter);
+        let second = tokio::task::spawn_blocking(move || adapter_for_second.list_metrics())
+            .await
+            .expect("second direct list_metrics task should join")
+            .expect("the released one-query envelope must admit the next call");
+        assert_eq!(second.len(), 2);
+
+        let after_second = storage.query_budget_snapshot();
+        assert_eq!(after_second.queries_started_total, 2);
+        assert_eq!(after_second.queries_completed_total, 2);
+        assert_eq!(after_second.active_queries, 0);
+        assert_eq!(after_second.peak_active_queries, 1);
+        assert_eq!(after_second.shared_reserved_memory_bytes, 0);
+        assert_eq!(after_second.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_aware_wal_list_reuses_the_distributed_query_envelope() {
+        let (storage, adapter) = make_bounded_adapter_with_query_limits(
+            &distributed_list_metrics_rows(),
+            distributed_list_metrics_limits(2),
+        );
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query should admit")
+            .expect("built-in storage should expose its query budget");
+        let adapter_for_call = Arc::clone(&adapter);
+        let execution_for_call = execution.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            adapter_for_call.list_metrics_with_wal_with_execution_result(&execution_for_call)
+        })
+        .await
+        .expect("execution-aware WAL list task should join")
+        .expect("the supplied envelope must be reused");
+        assert_eq!(result.series.len(), 2);
+        assert!(result.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result.reserved_memory_bytes(),
+        );
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_aware_list_leaves_warning_guard_for_the_accounted_consumer() {
+        let (storage, adapter) = make_bounded_adapter(&distributed_list_metrics_rows());
+        let warning_metadata = ReadFanoutResponseMetadata {
+            consistency: adapter.read_fanout.read_consistency_mode(),
+            partial_response_policy: adapter.read_fanout.read_partial_response_policy(),
+            partial_response: true,
+            warnings: vec!["accounted server-path warning".to_string()],
+        };
+        adapter
+            .record_metadata(&warning_metadata, None)
+            .expect("warning fixture should be recorded");
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query should admit")
+            .expect("built-in storage should expose its query budget");
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let execution_for_call = execution.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            adapter_for_call.list_metrics_with_wal_with_execution_result(&execution_for_call)
+        })
+        .await
+        .expect("execution-aware list task should join")
+        .expect("execution-aware list should preserve accounted metadata");
+        let metadata = adapter
+            .take_accounted_read_metadata()
+            .expect("the server consumer should receive the warning guard");
+        assert_eq!(metadata.metadata.warnings, warning_metadata.warnings);
+        assert!(result.reserved_memory_bytes() > 0);
+        assert!(metadata.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result
+                .reserved_memory_bytes()
+                .saturating_add(metadata.reserved_memory_bytes()),
+        );
+
+        let metadata_bytes = metadata.reserved_memory_bytes();
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, metadata_bytes);
+        drop(metadata);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_list_metrics_returns_structured_one_under_series_rejection() {
+        let (storage, adapter) = make_bounded_adapter_with_query_limits(
+            &distributed_list_metrics_rows(),
+            distributed_list_metrics_limits(1),
+        );
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || adapter_for_call.list_metrics())
+            .await
+            .expect("direct list_metrics task should join")
+            .expect_err("one under the required series limit should reject");
+        assert_query_limit(error, QueryLimitReason::SeriesMatched);
+
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.peak_active_queries, 1);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        assert!(adapter.read_metadata_snapshot().warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_list_metrics_rejects_while_the_only_query_permit_is_held() {
+        let (storage, adapter) = make_bounded_adapter(&distributed_list_metrics_rows());
+        let held = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("held query should admit")
+            .expect("built-in storage should expose its query budget");
+
+        let adapter_for_call = Arc::clone(&adapter);
+        let error = tokio::task::spawn_blocking(move || adapter_for_call.list_metrics())
+            .await
+            .expect("direct list_metrics task should join")
+            .expect_err("the occupied concurrency envelope should reject");
+        assert_query_limit(error, QueryLimitReason::ConcurrentQueries);
+
+        let while_held = storage.query_budget_snapshot();
+        assert_eq!(while_held.queries_started_total, 1);
+        assert_eq!(while_held.queries_completed_total, 0);
+        assert_eq!(while_held.active_queries, 1);
+        assert_eq!(while_held.peak_active_queries, 1);
+        assert_eq!(while_held.shared_reserved_memory_bytes, 0);
+        drop(held);
+
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.queries_started_total, 1);
+        assert_eq!(released.queries_completed_total, 1);
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 
     #[tokio::test]

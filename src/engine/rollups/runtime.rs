@@ -737,6 +737,10 @@ impl<'a> RollupStateStoreContext<'a> {
         self.state.policies.read().clone()
     }
 
+    pub(super) fn policies_are_empty(self) -> bool {
+        self.state.policies.read().is_empty()
+    }
+
     pub(super) fn checkpoints_snapshot(self) -> HashMap<String, BTreeMap<String, i64>> {
         self.state.checkpoints.read().clone()
     }

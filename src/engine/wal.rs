@@ -57,10 +57,132 @@ const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// compatibility, but a compressed constant-RLE frame must never expand without a finite bound.
 pub(in crate::engine) const MAX_WAL_REPLAY_DECODED_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const PUBLISHED_HIGHWATER_MAGIC: [u8; 4] = *b"TSHW";
+const PUBLISHED_HIGHWATER_V2_MAGIC: [u8; 4] = *b"TSH2";
 const PUBLISHED_HIGHWATER_RECORD_LEN: usize = 24;
+const PUBLISHED_HIGHWATER_V2_RECORD_LEN: usize = 40;
+const PUBLISHED_HIGHWATER_MAX_RECORD_LEN: usize = PUBLISHED_HIGHWATER_V2_RECORD_LEN;
 
 const FRAME_TYPE_SERIES_DEF: u8 = 1;
 const FRAME_TYPE_SAMPLES: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublishedHighwaterRecord {
+    pub(crate) highwater: WalHighWatermark,
+    pub(crate) reset_through: Option<WalHighWatermark>,
+}
+
+impl PublishedHighwaterRecord {
+    fn commit(highwater: WalHighWatermark) -> Self {
+        Self {
+            highwater,
+            reset_through: None,
+        }
+    }
+
+    fn with_reset_floor(
+        highwater: WalHighWatermark,
+        reset_through: WalHighWatermark,
+    ) -> Result<Self> {
+        if reset_through > highwater {
+            return Err(TsinkError::DataCorruption(format!(
+                "WAL reset floor {}:{} exceeds published boundary {}:{}",
+                reset_through.segment, reset_through.frame, highwater.segment, highwater.frame,
+            )));
+        }
+        Ok(Self {
+            highwater,
+            reset_through: Some(reset_through),
+        })
+    }
+}
+
+pub(crate) fn encode_published_highwater_record(record: PublishedHighwaterRecord) -> Vec<u8> {
+    match record.reset_through {
+        None => {
+            let mut bytes = Vec::with_capacity(PUBLISHED_HIGHWATER_RECORD_LEN);
+            bytes.extend_from_slice(&PUBLISHED_HIGHWATER_MAGIC);
+            append_u64(&mut bytes, record.highwater.segment);
+            append_u64(&mut bytes, record.highwater.frame);
+            let checksum = checksum32(&bytes);
+            append_u32(&mut bytes, checksum);
+            bytes
+        }
+        Some(reset_through) => {
+            let mut bytes = Vec::with_capacity(PUBLISHED_HIGHWATER_V2_RECORD_LEN);
+            bytes.extend_from_slice(&PUBLISHED_HIGHWATER_V2_MAGIC);
+            append_u64(&mut bytes, record.highwater.segment);
+            append_u64(&mut bytes, record.highwater.frame);
+            append_u64(&mut bytes, reset_through.segment);
+            append_u64(&mut bytes, reset_through.frame);
+            let checksum = checksum32(&bytes);
+            append_u32(&mut bytes, checksum);
+            bytes
+        }
+    }
+}
+
+pub(crate) fn decode_published_highwater_record(bytes: &[u8]) -> Result<PublishedHighwaterRecord> {
+    let (highwater, reset_through, checksum_offset) = if bytes.len()
+        == PUBLISHED_HIGHWATER_RECORD_LEN
+        && bytes[0..4] == PUBLISHED_HIGHWATER_MAGIC
+    {
+        (
+            WalHighWatermark {
+                segment: read_u64_at(bytes, 4)?,
+                frame: read_u64_at(bytes, 12)?,
+            },
+            None,
+            PUBLISHED_HIGHWATER_RECORD_LEN - 4,
+        )
+    } else if bytes.len() == PUBLISHED_HIGHWATER_V2_RECORD_LEN
+        && bytes[0..4] == PUBLISHED_HIGHWATER_V2_MAGIC
+    {
+        (
+            WalHighWatermark {
+                segment: read_u64_at(bytes, 4)?,
+                frame: read_u64_at(bytes, 12)?,
+            },
+            Some(WalHighWatermark {
+                segment: read_u64_at(bytes, 20)?,
+                frame: read_u64_at(bytes, 28)?,
+            }),
+            PUBLISHED_HIGHWATER_V2_RECORD_LEN - 4,
+        )
+    } else if matches!(
+        bytes.len(),
+        PUBLISHED_HIGHWATER_RECORD_LEN | PUBLISHED_HIGHWATER_V2_RECORD_LEN
+    ) {
+        return Err(TsinkError::DataCorruption(
+            "WAL publish boundary marker has an invalid magic header".to_string(),
+        ));
+    } else {
+        return Err(TsinkError::DataCorruption(format!(
+                "WAL publish boundary record must be {PUBLISHED_HIGHWATER_RECORD_LEN} or {PUBLISHED_HIGHWATER_V2_RECORD_LEN} bytes, found {}",
+                bytes.len()
+            )));
+    };
+
+    let expected_checksum = read_u32_at(bytes, checksum_offset)?;
+    let actual_checksum = checksum32(&bytes[..checksum_offset]);
+    if expected_checksum != actual_checksum {
+        return Err(TsinkError::DataCorruption(
+            "WAL publish boundary marker checksum mismatch".to_string(),
+        ));
+    }
+    if let Some(reset_through) = reset_through {
+        if reset_through > highwater {
+            return Err(TsinkError::DataCorruption(format!(
+                "WAL reset floor {}:{} exceeds published boundary {}:{}",
+                reset_through.segment, reset_through.frame, highwater.segment, highwater.frame,
+            )));
+        }
+    }
+
+    Ok(PublishedHighwaterRecord {
+        highwater,
+        reset_through,
+    })
+}
 
 #[cfg(test)]
 type WalAppendSyncHook = dyn Fn() -> Result<()> + Send + Sync + 'static;
@@ -78,6 +200,7 @@ pub(in crate::engine) enum WalDurabilityFailpoint {
     SeriesDefinitionAppend,
     SamplesAppend,
     Flush,
+    ResetAfterMarkerSync,
     ResetAfterTruncate,
 }
 
@@ -426,6 +549,7 @@ pub struct FramedWal {
     cached_series_definition_index_ready: Condvar,
     last_appended_highwater: Mutex<WalHighWatermark>,
     last_published_highwater: Mutex<WalHighWatermark>,
+    reset_highwater_floor: Mutex<Option<WalHighWatermark>>,
     last_durable_highwater: Mutex<WalHighWatermark>,
     configured_replay_mode: Mutex<WalReplayMode>,
     sync_mode: WalSyncMode,

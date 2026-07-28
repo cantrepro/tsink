@@ -43,7 +43,11 @@ impl WalSyncMode {
     }
 }
 
-/// Replay policy when WAL corruption is encountered mid-log.
+/// Replay policy when an already-open WAL encounters corruption during logical replay.
+///
+/// Persistent [`crate::StorageBuilder`] opens validate the complete published WAL prefix before
+/// replay begins. That validation is always strict, so this policy cannot turn a corrupt
+/// published data directory into an in-place salvage operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalReplayMode {
     /// Fail replay immediately with a corruption error.
@@ -54,5 +58,8 @@ pub enum WalReplayMode {
     Strict,
     /// Skip corrupted frames when boundaries remain trustworthy, otherwise skip the damaged
     /// segment and continue replaying later intact writes.
+    ///
+    /// This applies only after a WAL handle has passed its open-time published-prefix checks. Use
+    /// the destination-only inspection/salvage workflow for a corrupt persistent data directory.
     Salvage,
 }

@@ -31,12 +31,28 @@ pub(super) struct PersistedSeriesSourceSnapshot {
     _query_reservation: Option<crate::QueryMemoryReservation>,
 }
 
+pub(super) struct PersistedSeriesSourceSnapshotParts {
+    pub(super) chunks: Vec<PersistedChunkRef>,
+    pub(super) segment_maps: HashMap<usize, Arc<PlatformMmap>>,
+    pub(super) segment_tiers: HashMap<usize, PersistedSegmentTier>,
+    pub(super) query_reservation: Option<crate::QueryMemoryReservation>,
+}
+
 impl PersistedSeriesSourceSnapshot {
     pub(super) fn chunk_tier(&self, chunk_ref: &PersistedChunkRef) -> PersistedSegmentTier {
         self.segment_tiers
             .get(&chunk_ref.segment_slot)
             .copied()
             .unwrap_or(PersistedSegmentTier::Hot)
+    }
+
+    pub(super) fn into_parts(self) -> PersistedSeriesSourceSnapshotParts {
+        PersistedSeriesSourceSnapshotParts {
+            chunks: self.chunks,
+            segment_maps: self.segment_maps,
+            segment_tiers: self.segment_tiers,
+            query_reservation: self._query_reservation,
+        }
     }
 }
 
@@ -71,7 +87,6 @@ impl QuerySnapshotContext<'_> {
         plan: TieredQueryPlan,
         execution: Option<&QueryExecution>,
     ) -> Result<PersistedSeriesSourceSnapshot> {
-        let mut snapshot = PersistedSeriesSourceSnapshot::default();
         let persisted_index = self.persisted_index.read();
 
         let candidate_chunks = persisted_index
@@ -79,8 +94,10 @@ impl QuerySnapshotContext<'_> {
             .get(&series_id)
             .map(|chunks| chunks.partition_point(|chunk| chunk.min_ts < end))
             .unwrap_or(0);
-        let mut query_reservation = if let Some(execution) = execution {
+        let query_reservation = if let Some(execution) = execution {
             execution.checkpoint()?;
+            execution
+                .observe_intermediate_vector_size(saturating_u64_from_usize(candidate_chunks))?;
             Some(
                 execution.reserve_memory(modeled_persisted_snapshot_build_upper_bound(
                     candidate_chunks,
@@ -89,10 +106,14 @@ impl QuerySnapshotContext<'_> {
         } else {
             None
         };
-        let mut segment_slots = BTreeSet::<usize>::new();
+        let mut snapshot = PersistedSeriesSourceSnapshot {
+            chunks: Vec::with_capacity(candidate_chunks),
+            segment_maps: HashMap::with_capacity(candidate_chunks),
+            segment_tiers: HashMap::with_capacity(candidate_chunks),
+            _query_reservation: query_reservation,
+        };
 
         if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
-            snapshot.chunks.reserve(candidate_chunks);
             for chunk_ref in &chunks[..candidate_chunks] {
                 if let Some(execution) = execution {
                     execution.checkpoint()?;
@@ -105,38 +126,25 @@ impl QuerySnapshotContext<'_> {
                     continue;
                 }
 
-                segment_slots.insert(chunk_ref.segment_slot);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    snapshot.segment_maps.entry(chunk_ref.segment_slot)
+                {
+                    let Some(segment_map) =
+                        persisted_index.segment_maps.get(&chunk_ref.segment_slot)
+                    else {
+                        return Err(TsinkError::DataCorruption(format!(
+                            "missing mapped segment slot {}",
+                            chunk_ref.segment_slot
+                        )));
+                    };
+                    entry.insert(Arc::clone(segment_map));
+                    snapshot
+                        .segment_tiers
+                        .insert(chunk_ref.segment_slot, chunk_tier);
+                }
                 snapshot.chunks.push(*chunk_ref);
             }
         }
-
-        snapshot.segment_maps.reserve(segment_slots.len());
-        snapshot.segment_tiers.reserve(segment_slots.len());
-        for slot in &segment_slots {
-            if let Some(execution) = execution {
-                execution.checkpoint()?;
-            }
-            let Some(segment_map) = persisted_index.segment_maps.get(slot) else {
-                return Err(TsinkError::DataCorruption(format!(
-                    "missing mapped segment slot {}",
-                    slot
-                )));
-            };
-            snapshot.segment_maps.insert(*slot, Arc::clone(segment_map));
-            snapshot.segment_tiers.insert(
-                *slot,
-                persisted_index
-                    .segment_tiers
-                    .get(slot)
-                    .copied()
-                    .unwrap_or(PersistedSegmentTier::Hot),
-            );
-        }
-
-        if let Some(reservation) = query_reservation.as_mut() {
-            reservation.resize(modeled_persisted_snapshot_retained_bytes(&snapshot))?;
-        }
-        snapshot._query_reservation = query_reservation;
 
         Ok(snapshot)
     }
@@ -154,49 +162,60 @@ impl QuerySnapshotContext<'_> {
         let lock_wait_nanos = elapsed_nanos_u64(lock_wait_started);
         let lock_hold_started = Instant::now();
 
-        let mut active_points_visited = 0u64;
+        let mut active_points_visited = 0usize;
         let mut active_snapshot_bytes = 0u64;
+        let mut active_snapshot_max_vector = 0usize;
+        let mut nonempty_active_partitions = 0usize;
         if let Some(state) = active.get(&series_id) {
             let partition_window = self.partition_window.max(1);
             let start_partition = partition_id_for_timestamp(start, partition_window);
             let end_partition = partition_id_for_timestamp(end.saturating_sub(1), partition_window);
             if end > start {
                 for (_, head) in state.partition_heads.range(start_partition..=end_partition) {
+                    let model = head.builder.snapshot_in_range_memory_upper_bound(
+                        start,
+                        end,
+                        QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES,
+                    );
+                    active_snapshot_bytes = active_snapshot_bytes.saturating_add(model.fixed_bytes);
+                    active_snapshot_max_vector =
+                        active_snapshot_max_vector.max(model.max_vector_len);
+                    nonempty_active_partitions =
+                        nonempty_active_partitions.saturating_add(usize::from(model.nonempty));
                     for point in head.builder.iter_points() {
                         active_points_visited = active_points_visited.saturating_add(1);
-                        if point.ts >= start && point.ts < end {
-                            // A selected point may be cloned into an owned partial block. Reserve
-                            // its exact payload plus conservative Vec/block metadata before the
-                            // snapshot performs any allocation.
-                            active_snapshot_bytes = active_snapshot_bytes
-                                .saturating_add(
-                                    u64::try_from(std::mem::size_of::<ChunkPoint>())
-                                        .unwrap_or(u64::MAX),
-                                )
-                                .saturating_add(
-                                    u64::try_from(value_heap_bytes(&point.value))
-                                        .unwrap_or(u64::MAX),
-                                )
-                                .saturating_add(64);
-                        }
+                        // Only partial blocks clone values, but charging every visited payload is
+                        // a stable upper bound that also covers the transient zero-match build.
+                        active_snapshot_bytes = active_snapshot_bytes
+                            .saturating_add(modeled_value_retained_bytes(&point.value));
                     }
                 }
             }
         }
+        let active_partition_capacity =
+            modeled_vec_growth_capacity_upper(nonempty_active_partitions);
+        active_snapshot_bytes =
+            active_snapshot_bytes.saturating_add(modeled_vec_capacity_bytes::<
+                ActivePartitionSnapshot,
+            >(active_partition_capacity));
+        active_snapshot_max_vector = active_snapshot_max_vector.max(nonempty_active_partitions);
 
-        let sealed_snapshot_bytes = sealed
+        let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
+        let sealed_candidate_chunks = sealed
             .get(&series_id)
-            .map(|chunks| {
-                u64::try_from(chunks.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(
-                        u64::try_from(std::mem::size_of::<Arc<Chunk>>()).unwrap_or(u64::MAX),
-                    )
-            })
+            .map(|chunks| chunks.range(..end_bound).count())
             .unwrap_or(0);
+        let sealed_snapshot_capacity = modeled_vec_growth_capacity_upper(sealed_candidate_chunks);
+        let sealed_snapshot_bytes =
+            modeled_vec_capacity_bytes::<Arc<Chunk>>(sealed_snapshot_capacity);
         let query_reservation = if let Some(execution) = execution {
             execution.checkpoint()?;
-            execution.charge_samples_scanned(active_points_visited)?;
+            execution.observe_intermediate_vector_size(saturating_u64_from_usize(
+                active_points_visited
+                    .max(active_snapshot_max_vector)
+                    .max(sealed_candidate_chunks),
+            ))?;
+            execution.charge_samples_scanned(saturating_u64_from_usize(active_points_visited))?;
             Some(
                 execution
                     .reserve_memory(active_snapshot_bytes.saturating_add(sealed_snapshot_bytes))?,
@@ -206,11 +225,11 @@ impl QuerySnapshotContext<'_> {
         };
 
         let mut snapshot = InMemorySeriesSourceSnapshot {
+            sealed_chunks: Vec::with_capacity(sealed_snapshot_capacity),
+            active_points: ActiveSeriesSnapshot::default(),
             query_reservation,
-            ..InMemorySeriesSourceSnapshot::default()
         };
         if let Some(chunks) = sealed.get(&series_id) {
-            let end_bound = SealedChunkKey::upper_bound_for_min_ts(end);
             snapshot.sealed_chunks.extend(
                 chunks
                     .range(..end_bound)

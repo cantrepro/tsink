@@ -103,7 +103,50 @@ state.
 If writing fails before rename, the old directory remains manifestless and can be retried. If
 rename succeeds but synchronizing the parent directory reports an error, the open reports that
 error even though the new manifest may be visible; a later open revalidates the complete
-checksummed file. Recovery never treats a partial temporary manifest as a current format identity.
+checksummed file. If later WAL, segment, or registry recovery fails, the already installed format
+identity remains, but `last_successfully_opened_tsink_version` stays `null`; a retry validates the
+same manifest and repeats strict recovery. Recovery never treats a partial temporary manifest as a
+current format identity.
+
+A supported legacy WAL that lacks `wal.published` has no smaller durable boundary to trust. Normal
+recovery therefore treats every existing segment byte as published and streams the complete frame
+prefix through header, sequence, size, checksum, and codec validation before creating the marker.
+This check is independent of `WalReplayMode`; failure leaves the WAL namespace byte-for-byte
+unchanged, although the already installed root identity may remain with its successful-open field
+unset as described above.
+
+`wal.published` has two accepted checksummed encodings:
+
+| Encoding | Bytes | Fields |
+|---|---:|---|
+| Legacy `TSHW` | 24 | Magic, published high-water mark `H = (segment, frame)`, CRC-32. It carries no reset floor. |
+| V2 `TSH2` | 40 | Magic, published high-water mark `H`, reset-through mark `R`, CRC-32. The record is invalid unless `R <= H`. |
+
+All integer fields are little-endian. The CRC-32 covers every preceding byte in the record.
+Ordinary publication uses `TSHW` until a reset floor exists. A reset first durably publishes
+`TSH2` with
+`H = R = max(last appended high-water mark, (active segment, 0))`; only then may it truncate the
+active segment or remove older segments. Later commits keep the same `R`, advance `H`, and remain
+encoded as `TSH2`.
+
+Recovery derives an effective floor `F = max(clean persisted replay floor, R)`, with absent `R`
+contributing no reset authorization. When `H > F`, logical segment IDs from `F.segment` through
+`H.segment` must be contiguous and validation must reach the exact `H` frame in the boundary
+segment. An empty or short boundary segment, or one whose first frame is above `H`, fails before
+any suffix is truncated. The exact frame may be absent only when `F >= H`: either clean persisted
+state or a valid checksummed `TSH2` reset floor then proves that history is no longer required.
+Duplicate aliases and recognized link-like or non-regular segment paths also fail before recovery
+mutation. Gaps below `F` are already checkpointed or reset, while an empty segment strictly above
+`H` is outside the replay interval. After validation, recovery restores the runtime append and
+durable high-water floors through `H`, preventing frame numbering or durability state from moving
+backward.
+
+`wal.published` must be a regular non-link file of exactly 24 or 40 bytes. The reader opens it
+without following links where the platform supports that flag, verifies the opened file's identity
+before and after its fixed-size read, and rejects oversized markers before allocation. Publication
+removes only the stale `wal.published.tmp` directory entry without following a target, rejects a
+directory at that name, creates the replacement exclusively with no-follow protection, checks its
+identity before rename, and semantically rereads the installed marker after rename.
 
 Migration can block while it performs bounded validation. In particular, segment-only identity
 validation streams the declared immutable files to verify their hashes. There is currently no
@@ -193,17 +236,18 @@ It is accepted only when a complete inspection proves all of the following:
 - at least one exact corrupt WAL range was identified.
 
 WAL frame sequences must be globally consecutive across canonical segment files. A nonzero
-publication marker is reachable only when that exact frame was observed in its declared segment
-and it ends on a samples-frame logical commit boundary. A cleanly closed database may already have
-reset that WAL after persisting it: in that case the marker is covered only when a clean persisted
-segment manifest reports an equal or later WAL high-water mark. A segment contributes coverage
-only after its manifest checksum, identity, complete referenced-file set, lengths, and hashes all
-verify; corrupt, missing, or incomplete segments cannot mask absent WAL history. Inspection reports
-independently decoded nonempty WAL as replay-semantics-unverified until production replay is
-modeled.
+publication boundary `H` must be observed at a samples-frame logical commit boundary unless the
+effective floor covers it. A verified `TSH2` marker supplies its own authoritative reset
+evidence through `R`; a later commit with `H > R` still requires the exact `H` frame unless clean
+persisted state covers it. Legacy `TSHW` supplies no reset evidence, so an absent legacy boundary
+is covered only when a clean persisted segment manifest reports an equal or later WAL high-water
+mark. A segment contributes that floor only after its manifest checksum, identity, complete
+referenced-file set, lengths, and hashes all verify; corrupt, missing, or incomplete segments
+cannot mask absent WAL history. Inspection reports independently decoded nonempty WAL as
+replay-semantics-unverified until production replay is modeled.
 
 Salvage v1 intentionally retains **no WAL frames**. It rewrites the first canonical WAL file to
-zero bytes, publishes frame `0`, omits every later WAL file, and emits
+zero bytes, publishes `TSH2` with `H = R = (0, 0)`, omits every later WAL file, and emits
 `wal.salvage_v1_full_reset` ranges covering every source WAL byte. This is explicit data loss, not
 a best-effort attempt to preserve a structurally plausible prefix. The empty decoded registry and
 empty retained WAL make cross-artifact series identity consistency provable.
@@ -247,7 +291,8 @@ post-flush replacement state, rollup state, stale WAL marker temporaries, and se
 auxiliary stores. The tool never copies unvalidated recovery-critical bytes and calls the result
 clean.
 
-There is no in-place salvage mode. The damaged source is never opened for writing and remains the
-operator's backup/evidence. Verify the report and the recovered destination before redirecting an
-application to it; discarded ranges represent explicit data loss and cannot be reconstructed by
-this tool.
+There is no in-place salvage mode. `StorageBuilder::with_wal_replay_mode(WalReplayMode::Salvage)`
+does not bypass the strict published-prefix validation performed by persistent open. The damaged
+source is never opened for writing and remains the operator's backup/evidence. Verify the report
+and the recovered destination before redirecting an application to it; discarded ranges represent
+explicit data loss and cannot be reconstructed by this tool.

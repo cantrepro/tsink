@@ -398,7 +398,7 @@ impl LogicalWalWrite<'_> {
             .progress
             .appended_bytes
             .saturating_add(appended_bytes)
-            .saturating_add(PUBLISHED_HIGHWATER_RECORD_LEN as u64);
+            .saturating_add(self.wal.published_highwater_record_len());
         if required > reservation.reserved_bytes() {
             reservation.grow_by(required - reservation.reserved_bytes())?;
         }
@@ -530,7 +530,7 @@ impl FramedWal {
             .map(|budget| {
                 budget.reserve(
                     crate::DiskCategory::Wal,
-                    estimated_bytes.saturating_add(PUBLISHED_HIGHWATER_RECORD_LEN as u64),
+                    estimated_bytes.saturating_add(self.published_highwater_record_len()),
                     crate::DiskReservationKind::Growth,
                 )
             })
@@ -563,6 +563,18 @@ impl FramedWal {
 
     pub fn current_published_highwater(&self) -> WalHighWatermark {
         *self.last_published_highwater.lock()
+    }
+
+    pub(super) fn current_reset_highwater_floor(&self) -> Option<WalHighWatermark> {
+        *self.reset_highwater_floor.lock()
+    }
+
+    fn published_highwater_record_len(&self) -> u64 {
+        if self.current_reset_highwater_floor().is_some() {
+            PUBLISHED_HIGHWATER_V2_RECORD_LEN as u64
+        } else {
+            PUBLISHED_HIGHWATER_RECORD_LEN as u64
+        }
     }
 
     pub fn current_durable_highwater(&self) -> WalHighWatermark {
@@ -602,11 +614,36 @@ impl FramedWal {
         highwater: WalHighWatermark,
         sync: bool,
     ) -> Result<()> {
+        let record = match self.current_reset_highwater_floor() {
+            Some(reset_through) => {
+                PublishedHighwaterRecord::with_reset_floor(highwater, reset_through)?
+            }
+            None => PublishedHighwaterRecord::commit(highwater),
+        };
+        self.persist_published_highwater_record(record, sync)
+    }
+
+    pub(super) fn persist_reset_highwater(
+        &self,
+        highwater: WalHighWatermark,
+        sync: bool,
+    ) -> Result<()> {
+        let record = PublishedHighwaterRecord::with_reset_floor(highwater, highwater)?;
+        self.persist_published_highwater_record(record, sync)?;
+        *self.reset_highwater_floor.lock() = Some(highwater);
+        Ok(())
+    }
+
+    fn persist_published_highwater_record(
+        &self,
+        record: PublishedHighwaterRecord,
+        sync: bool,
+    ) -> Result<()> {
         write_published_highwater_marker(
             &self.dir,
             &self.published_highwater_path,
             &self.published_highwater_tmp_path,
-            highwater,
+            record,
             sync,
             || self.invoke_published_highwater_post_rename_hook(),
         )
@@ -626,7 +663,7 @@ impl FramedWal {
             crate::disk_budget::measured_path_bytes(&self.published_highwater_tmp_path)?;
         let reservation = budget.reserve(
             crate::DiskCategory::Wal,
-            PUBLISHED_HIGHWATER_RECORD_LEN as u64,
+            self.published_highwater_record_len(),
             crate::DiskReservationKind::Recovery,
         )?;
         let write_result = self.persist_published_highwater(highwater, sync);

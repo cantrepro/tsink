@@ -1,16 +1,21 @@
 use parking_lot::{Condvar, Mutex};
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::Notify;
 
 use tempfile::TempDir;
 use tsink::{
     Aggregation, AsyncRuntimeOptions, AsyncStorage, AsyncStorageBuilder, BatchWriteResult,
-    DataPoint, Label, QueryBudget, QueryBudgetLimits, QueryExecution, QueryOptions,
-    QueryWorkLimits, ResourceLimits, Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus,
-    Storage, StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode, WriteAcknowledgement,
-    WriteBatchLimits, WriteMode, WriteRejectionCategory,
+    DataPoint, Label, MetricSeries, QueryBudget, QueryBudgetError, QueryBudgetLimits,
+    QueryExecution, QueryExecutionAccounting, QueryLimitReason, QueryOptions,
+    QueryRowsExecutionResult, QueryRowsPage, QueryRowsScanOptions, QueryWorkLimits, ResourceLimits,
+    Result, RollupPolicy, Row, RowWriteOutcome, RowWriteStatus, SelectSeriesExecutionResult,
+    SeriesSelection, Storage, StorageBuilder, TimestampPrecision, TsinkError, WalSyncMode,
+    WriteAcknowledgement, WriteBatchLimits, WriteMode, WriteRejectionCategory,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -64,6 +69,1252 @@ async fn async_list_metrics_shares_one_query_slot_and_releases_all_resources() -
     assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
 
     storage.close().await?;
+    Ok(())
+}
+
+struct MetadataReplyTestStorage {
+    inner: Arc<dyn Storage>,
+    expose_query_budget: bool,
+    accounting: QueryExecutionAccounting,
+    block_detailed_metadata: bool,
+    omit_detailed_metadata_reservation: bool,
+    undersize_detailed_metadata_reservation: bool,
+    compatibility_list_calls: AtomicUsize,
+    compatibility_select_calls: AtomicUsize,
+    detailed_list_calls: AtomicUsize,
+    detailed_select_calls: AtomicUsize,
+    detailed_metadata_started: Notify,
+    release_detailed_metadata: Condvar,
+    release_flag: Mutex<bool>,
+}
+
+impl MetadataReplyTestStorage {
+    fn new(
+        inner: Arc<dyn Storage>,
+        expose_query_budget: bool,
+        accounting: QueryExecutionAccounting,
+        block_detailed_metadata: bool,
+    ) -> Self {
+        Self {
+            inner,
+            expose_query_budget,
+            accounting,
+            block_detailed_metadata,
+            omit_detailed_metadata_reservation: false,
+            undersize_detailed_metadata_reservation: false,
+            compatibility_list_calls: AtomicUsize::new(0),
+            compatibility_select_calls: AtomicUsize::new(0),
+            detailed_list_calls: AtomicUsize::new(0),
+            detailed_select_calls: AtomicUsize::new(0),
+            detailed_metadata_started: Notify::new(),
+            release_detailed_metadata: Condvar::new(),
+            release_flag: Mutex::new(false),
+        }
+    }
+
+    fn release_detailed_metadata(&self) {
+        *self.release_flag.lock() = true;
+        self.release_detailed_metadata.notify_all();
+    }
+
+    fn with_missing_detailed_metadata_reservation(mut self) -> Self {
+        self.omit_detailed_metadata_reservation = true;
+        self
+    }
+
+    fn with_undersized_detailed_metadata_reservation(mut self) -> Self {
+        self.undersize_detailed_metadata_reservation = true;
+        self
+    }
+
+    fn wait_for_detailed_metadata_release(&self) {
+        self.detailed_metadata_started.notify_one();
+        if self.block_detailed_metadata {
+            let mut released = self.release_flag.lock();
+            while !*released {
+                self.release_detailed_metadata.wait(&mut released);
+            }
+        }
+    }
+
+    fn maybe_omit_detailed_metadata_reservation(
+        &self,
+        detailed: SelectSeriesExecutionResult,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        if self.omit_detailed_metadata_reservation {
+            Ok(SelectSeriesExecutionResult::unaccounted(
+                detailed.into_series(),
+            ))
+        } else if self.undersize_detailed_metadata_reservation {
+            let series = detailed.into_series();
+            let reservation = execution.reserve_memory(1)?;
+            Ok(SelectSeriesExecutionResult::accounted(series, reservation))
+        } else {
+            Ok(detailed)
+        }
+    }
+
+    fn total_detailed_calls(&self) -> usize {
+        self.detailed_list_calls.load(Ordering::SeqCst)
+            + self.detailed_select_calls.load(Ordering::SeqCst)
+    }
+}
+
+struct DetailedMetadataReleaseGuard {
+    storage: Arc<MetadataReplyTestStorage>,
+    armed: bool,
+}
+
+impl DetailedMetadataReleaseGuard {
+    fn new(storage: Arc<MetadataReplyTestStorage>) -> Self {
+        Self {
+            storage,
+            armed: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.armed {
+            self.storage.release_detailed_metadata();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for DetailedMetadataReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl Storage for MetadataReplyTestStorage {
+    fn query_budget(&self) -> Option<QueryBudget> {
+        self.expose_query_budget
+            .then(|| self.inner.query_budget())
+            .flatten()
+    }
+
+    fn insert_rows(&self, rows: &[Row]) -> Result<()> {
+        self.inner.insert_rows(rows)
+    }
+
+    fn select(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<DataPoint>> {
+        self.inner.select(metric, labels, start, end)
+    }
+
+    fn select_with_options(&self, metric: &str, options: QueryOptions) -> Result<Vec<DataPoint>> {
+        self.inner.select_with_options(metric, options)
+    }
+
+    fn select_all(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        self.inner.select_all(metric, start, end)
+    }
+
+    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
+        self.compatibility_list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_metrics()
+    }
+
+    fn list_metrics_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.detailed_list_calls.fetch_add(1, Ordering::SeqCst);
+        self.wait_for_detailed_metadata_release();
+        self.inner
+            .list_metrics_with_execution_result(execution)
+            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed, execution))
+    }
+
+    fn list_metrics_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.accounting
+    }
+
+    fn select_series(&self, selection: &SeriesSelection) -> Result<Vec<MetricSeries>> {
+        self.compatibility_select_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.select_series(selection)
+    }
+
+    fn select_series_with_execution_result(
+        &self,
+        selection: &SeriesSelection,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.detailed_select_calls.fetch_add(1, Ordering::SeqCst);
+        self.wait_for_detailed_metadata_release();
+        self.inner
+            .select_series_with_execution_result(selection, execution)
+            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed, execution))
+    }
+
+    fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.accounting
+    }
+
+    fn close(&self) -> Result<()> {
+        self.inner.close()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AsyncMetadataOperation {
+    ListMetrics,
+    SelectSeries,
+}
+
+impl AsyncMetadataOperation {
+    async fn run(self, storage: &AsyncStorage) -> Result<Vec<MetricSeries>> {
+        match self {
+            Self::ListMetrics => storage.list_metrics().await,
+            Self::SelectSeries => {
+                storage
+                    .select_series(SeriesSelection::new().with_metric("async_metadata"))
+                    .await
+            }
+        }
+    }
+
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::ListMetrics => "async_list_metrics",
+            Self::SelectSeries => "async_select_series",
+        }
+    }
+
+    fn compatibility_calls(self, storage: &MetadataReplyTestStorage) -> usize {
+        match self {
+            Self::ListMetrics => storage.compatibility_list_calls.load(Ordering::SeqCst),
+            Self::SelectSeries => storage.compatibility_select_calls.load(Ordering::SeqCst),
+        }
+    }
+
+    fn detailed_calls(self, storage: &MetadataReplyTestStorage) -> usize {
+        match self {
+            Self::ListMetrics => storage.detailed_list_calls.load(Ordering::SeqCst),
+            Self::SelectSeries => storage.detailed_select_calls.load(Ordering::SeqCst),
+        }
+    }
+}
+
+struct RowScanTestStorage {
+    inner: Arc<dyn Storage>,
+    expose_query_budget: bool,
+    accounting: QueryExecutionAccounting,
+    block_detailed_scan: bool,
+    omit_detailed_scan_reservation: bool,
+    compatibility_scan_calls: AtomicUsize,
+    detailed_scan_calls: AtomicUsize,
+    detailed_scan_started: Notify,
+    release_detailed_scan: Condvar,
+    release_flag: Mutex<bool>,
+}
+
+impl RowScanTestStorage {
+    fn new(
+        inner: Arc<dyn Storage>,
+        expose_query_budget: bool,
+        accounting: QueryExecutionAccounting,
+        block_detailed_scan: bool,
+    ) -> Self {
+        Self {
+            inner,
+            expose_query_budget,
+            accounting,
+            block_detailed_scan,
+            omit_detailed_scan_reservation: false,
+            compatibility_scan_calls: AtomicUsize::new(0),
+            detailed_scan_calls: AtomicUsize::new(0),
+            detailed_scan_started: Notify::new(),
+            release_detailed_scan: Condvar::new(),
+            release_flag: Mutex::new(false),
+        }
+    }
+
+    fn release_detailed_scan(&self) {
+        *self.release_flag.lock() = true;
+        self.release_detailed_scan.notify_all();
+    }
+
+    fn with_missing_detailed_scan_reservation(mut self) -> Self {
+        self.omit_detailed_scan_reservation = true;
+        self
+    }
+}
+
+struct DetailedScanReleaseGuard {
+    storage: Arc<RowScanTestStorage>,
+    armed: bool,
+}
+
+impl DetailedScanReleaseGuard {
+    fn new(storage: Arc<RowScanTestStorage>) -> Self {
+        Self {
+            storage,
+            armed: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.armed {
+            self.storage.release_detailed_scan();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for DetailedScanReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl Storage for RowScanTestStorage {
+    fn query_budget(&self) -> Option<QueryBudget> {
+        self.expose_query_budget
+            .then(|| self.inner.query_budget())
+            .flatten()
+    }
+
+    fn insert_rows(&self, rows: &[Row]) -> Result<()> {
+        self.inner.insert_rows(rows)
+    }
+
+    fn select(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<DataPoint>> {
+        self.inner.select(metric, labels, start, end)
+    }
+
+    fn select_with_options(&self, metric: &str, options: QueryOptions) -> Result<Vec<DataPoint>> {
+        self.inner.select_with_options(metric, options)
+    }
+
+    fn select_all(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+        self.inner.select_all(metric, start, end)
+    }
+
+    fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
+        self.inner.list_metrics()
+    }
+
+    fn scan_series_rows(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+    ) -> Result<QueryRowsPage> {
+        self.compatibility_scan_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_series_rows(series, start, end, options)
+    }
+
+    fn scan_series_rows_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        self.detailed_scan_calls.fetch_add(1, Ordering::SeqCst);
+        self.detailed_scan_started.notify_one();
+
+        if self.block_detailed_scan {
+            let mut released = self.release_flag.lock();
+            while !*released {
+                self.release_detailed_scan.wait(&mut released);
+            }
+        }
+
+        if self.accounting == QueryExecutionAccounting::Complete {
+            let detailed = self
+                .inner
+                .scan_series_rows_with_execution_result(series, start, end, options, execution)?;
+            if self.omit_detailed_scan_reservation {
+                Ok(QueryRowsExecutionResult::unaccounted(detailed.into_page()))
+            } else {
+                Ok(detailed)
+            }
+        } else {
+            self.scan_series_rows(series, start, end, options)
+                .map(QueryRowsExecutionResult::unaccounted)
+        }
+    }
+
+    fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.accounting
+    }
+
+    fn scan_metric_rows(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+    ) -> Result<QueryRowsPage> {
+        self.compatibility_scan_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_metric_rows(metric, start, end, options)
+    }
+
+    fn scan_metric_rows_with_execution_result(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        self.detailed_scan_calls.fetch_add(1, Ordering::SeqCst);
+        self.detailed_scan_started.notify_one();
+
+        if self.block_detailed_scan {
+            let mut released = self.release_flag.lock();
+            while !*released {
+                self.release_detailed_scan.wait(&mut released);
+            }
+        }
+
+        if self.accounting == QueryExecutionAccounting::Complete {
+            let detailed = self
+                .inner
+                .scan_metric_rows_with_execution_result(metric, start, end, options, execution)?;
+            if self.omit_detailed_scan_reservation {
+                Ok(QueryRowsExecutionResult::unaccounted(detailed.into_page()))
+            } else {
+                Ok(detailed)
+            }
+        } else {
+            self.scan_metric_rows(metric, start, end, options)
+                .map(QueryRowsExecutionResult::unaccounted)
+        }
+    }
+
+    fn scan_metric_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.accounting
+    }
+
+    fn close(&self) -> Result<()> {
+        self.inner.close()
+    }
+}
+
+fn guarded_row_scan_limits() -> QueryBudgetLimits {
+    QueryBudgetLimits {
+        max_concurrent_queries: Some(1),
+        max_shared_memory_bytes: Some(1024 * 1024),
+        per_query: QueryWorkLimits {
+            max_memory_bytes: Some(1024 * 1024),
+            ..QueryWorkLimits::default()
+        },
+    }
+}
+
+fn build_row_scan_storage(limits: QueryBudgetLimits) -> Result<Arc<dyn Storage>> {
+    let storage = StorageBuilder::new()
+        .with_query_budget_limits(limits)
+        .build()?;
+    storage.insert_rows(&[Row::with_labels(
+        "async_rows",
+        vec![Label::new("host", "a")],
+        DataPoint::new(1, 1.0),
+    )])?;
+    Ok(storage)
+}
+
+fn row_scan_series() -> Vec<MetricSeries> {
+    vec![MetricSeries {
+        name: "async_rows".to_string(),
+        labels: vec![Label::new("host", "a")],
+    }]
+}
+
+fn row_scan_options() -> QueryRowsScanOptions {
+    QueryRowsScanOptions {
+        max_rows: Some(1),
+        row_offset: None,
+    }
+}
+
+async fn poll_once_pending<F>(mut future: Pin<&mut F>)
+where
+    F: Future + ?Sized,
+{
+    poll_fn(|context| match future.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("row scan unexpectedly completed during its enqueue poll"),
+    })
+    .await;
+}
+
+fn assert_concurrent_query_rejection(error: TsinkError) {
+    match error {
+        TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+            assert_eq!(exceeded.reason, QueryLimitReason::ConcurrentQueries);
+        }
+        other => panic!("expected concurrent-query rejection, got {other:?}"),
+    }
+}
+
+async fn wait_for_query_resources_to_release(storage: &Arc<dyn Storage>) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = storage.query_budget_snapshot();
+            if snapshot.active_queries == 0 && snapshot.shared_reserved_memory_bytes == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("query slot and retained result memory must be released");
+}
+
+fn build_metadata_reply_storage(limits: QueryBudgetLimits) -> Result<Arc<dyn Storage>> {
+    let storage = StorageBuilder::new()
+        .with_query_budget_limits(limits)
+        .build()?;
+    storage.insert_rows(&[Row::with_labels(
+        "async_metadata",
+        vec![Label::new("host", "a")],
+        DataPoint::new(1, 1.0),
+    )])?;
+    Ok(storage)
+}
+
+async fn assert_async_metadata_reply_holds_resources(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(MetadataReplyTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedMetadataReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply = Box::pin(operation.run(&async_storage));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_metadata_started.notified(),
+    )
+    .await
+    .expect("the guarded metadata read must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), operation.run(&async_storage))
+        .await
+        .expect("the worker must process a metadata read behind the completed held reply")
+        .expect_err("the held metadata reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+    assert_eq!(held_snapshot.queries_started_total, 1);
+    assert_eq!(held_snapshot.queries_completed_total, 0);
+    assert_eq!(held_snapshot.concurrency_rejections_total, 1);
+    assert_eq!(operation.detailed_calls(&storage), 1);
+    assert_eq!(storage.total_detailed_calls(), 1);
+    assert_eq!(storage.compatibility_list_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.compatibility_select_calls.load(Ordering::SeqCst), 0);
+
+    let series = held_reply.await?;
+    assert_eq!(series.len(), 1);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+async fn assert_dropping_async_metadata_reply_releases_resources(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(MetadataReplyTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedMetadataReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply = Box::pin(operation.run(&async_storage));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_metadata_started.notified(),
+    )
+    .await
+    .expect("the guarded metadata read must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), operation.run(&async_storage))
+        .await
+        .expect("the worker must buffer the first reply and process the second metadata read")
+        .expect_err("the buffered metadata reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+
+    drop(held_reply);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+async fn assert_budgeted_async_metadata_rejects_unaccounted_backend(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(MetadataReplyTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = operation
+        .run(&async_storage)
+        .await
+        .expect_err("a budgeted unaccounted metadata backend must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: actual_operation,
+            reason,
+        } if actual_operation == operation.operation_name()
+            && reason == "bounded async metadata reads require complete execution accounting"
+    ));
+    assert_eq!(operation.detailed_calls(&storage), 0);
+    assert_eq!(storage.total_detailed_calls(), 0);
+    assert_eq!(operation.compatibility_calls(&storage), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+async fn assert_budgeted_async_metadata_rejects_missing_result_guard(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(
+        MetadataReplyTestStorage::new(
+            Arc::clone(&inner),
+            true,
+            QueryExecutionAccounting::Complete,
+            false,
+        )
+        .with_missing_detailed_metadata_reservation(),
+    );
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = operation
+        .run(&async_storage)
+        .await
+        .expect_err("a false-complete metadata result without a guard must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: actual_operation,
+            reason,
+        } if actual_operation == operation.operation_name()
+            && reason == "bounded async metadata reads require complete execution accounting"
+    ));
+    assert_eq!(operation.detailed_calls(&storage), 1);
+    assert_eq!(storage.total_detailed_calls(), 1);
+    assert_eq!(operation.compatibility_calls(&storage), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+async fn assert_budgeted_async_metadata_rejects_undersized_result_guard(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(
+        MetadataReplyTestStorage::new(
+            Arc::clone(&inner),
+            true,
+            QueryExecutionAccounting::Complete,
+            false,
+        )
+        .with_undersized_detailed_metadata_reservation(),
+    );
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = operation
+        .run(&async_storage)
+        .await
+        .expect_err("a false-complete metadata result with an undersized guard must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: actual_operation,
+            reason,
+        } if actual_operation == operation.operation_name()
+            && reason == "bounded async metadata reads require complete execution accounting"
+    ));
+    assert_eq!(operation.detailed_calls(&storage), 1);
+    assert_eq!(storage.total_detailed_calls(), 1);
+    assert_eq!(operation.compatibility_calls(&storage), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+async fn assert_unlimited_async_metadata_preserves_compatibility(
+    operation: AsyncMetadataOperation,
+) -> Result<()> {
+    let inner = build_metadata_reply_storage(QueryBudgetLimits::default())?;
+    let storage = Arc::new(MetadataReplyTestStorage::new(
+        Arc::clone(&inner),
+        false,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let series = operation.run(&async_storage).await?;
+    assert_eq!(series.len(), 1);
+    assert_eq!(operation.detailed_calls(&storage), 0);
+    assert_eq!(storage.total_detailed_calls(), 0);
+    assert_eq!(operation.compatibility_calls(&storage), 1);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_list_metrics_holds_query_resources_until_reply_receipt() -> Result<()> {
+    assert_async_metadata_reply_holds_resources(AsyncMetadataOperation::ListMetrics).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_select_series_holds_query_resources_until_reply_receipt() -> Result<()> {
+    assert_async_metadata_reply_holds_resources(AsyncMetadataOperation::SelectSeries).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_dropping_completed_list_metrics_future_releases_resources() -> Result<()> {
+    assert_dropping_async_metadata_reply_releases_resources(AsyncMetadataOperation::ListMetrics)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_dropping_completed_select_series_future_releases_resources() -> Result<()> {
+    assert_dropping_async_metadata_reply_releases_resources(AsyncMetadataOperation::SelectSeries)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_list_metrics_rejects_unaccounted_backend() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_unaccounted_backend(AsyncMetadataOperation::ListMetrics)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_select_series_rejects_unaccounted_backend() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_unaccounted_backend(AsyncMetadataOperation::SelectSeries)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_list_metrics_rejects_missing_result_guard() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_missing_result_guard(AsyncMetadataOperation::ListMetrics)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_select_series_rejects_missing_result_guard() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_missing_result_guard(
+        AsyncMetadataOperation::SelectSeries,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_list_metrics_rejects_undersized_result_guard() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_undersized_result_guard(
+        AsyncMetadataOperation::ListMetrics,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_budgeted_select_series_rejects_undersized_result_guard() -> Result<()> {
+    assert_budgeted_async_metadata_rejects_undersized_result_guard(
+        AsyncMetadataOperation::SelectSeries,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_unlimited_list_metrics_preserves_compatibility() -> Result<()> {
+    assert_unlimited_async_metadata_preserves_compatibility(AsyncMetadataOperation::ListMetrics)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_metadata_unlimited_select_series_preserves_compatibility() -> Result<()> {
+    assert_unlimited_async_metadata_preserves_compatibility(AsyncMetadataOperation::SelectSeries)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_scan_series_rows_holds_query_resources_until_reply_receipt() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedScanReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply =
+        Box::pin(async_storage.scan_series_rows(row_scan_series(), 0, 2, row_scan_options()));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_scan_started.notified(),
+    )
+    .await
+    .expect("the guarded scan must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        async_storage.scan_series_rows(row_scan_series(), 0, 2, row_scan_options()),
+    )
+    .await
+    .expect("the worker must process a scan behind the completed held reply")
+    .expect_err("the held reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+    assert_eq!(held_snapshot.queries_started_total, 1);
+    assert_eq!(held_snapshot.queries_completed_total, 0);
+    assert_eq!(held_snapshot.concurrency_rejections_total, 1);
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    let page = held_reply.await?;
+    assert_eq!(page.rows.len(), 1);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_completed_async_scan_series_rows_future_releases_query_resources() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedScanReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply =
+        Box::pin(async_storage.scan_series_rows(row_scan_series(), 0, 2, row_scan_options()));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_scan_started.notified(),
+    )
+    .await
+    .expect("the guarded scan must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        async_storage.scan_series_rows(row_scan_series(), 0, 2, row_scan_options()),
+    )
+    .await
+    .expect("the worker must buffer the first reply and process the second scan")
+    .expect_err("the buffered reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+
+    drop(held_reply);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_async_scan_series_rows_rejects_unaccounted_backends() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = async_storage
+        .scan_series_rows(row_scan_series(), 0, 2, row_scan_options())
+        .await
+        .expect_err("a budgeted unaccounted backend must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: "async_scan_series_rows",
+            reason,
+        } if reason == "bounded async row scans require complete execution accounting"
+    ));
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlimited_async_scan_series_rows_preserves_unaccounted_backend_compatibility() -> Result<()>
+{
+    let inner = build_row_scan_storage(QueryBudgetLimits::default())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        false,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let page = async_storage
+        .scan_series_rows(row_scan_series(), 0, 2, row_scan_options())
+        .await?;
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 1);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_scan_metric_rows_holds_query_resources_until_reply_receipt() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedScanReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply =
+        Box::pin(async_storage.scan_metric_rows("async_rows", 0, 2, row_scan_options()));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_scan_started.notified(),
+    )
+    .await
+    .expect("the guarded metric scan must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        async_storage.scan_metric_rows("async_rows", 0, 2, row_scan_options()),
+    )
+    .await
+    .expect("the worker must process a metric scan behind the completed held reply")
+    .expect_err("the held metric reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+    assert_eq!(held_snapshot.queries_started_total, 1);
+    assert_eq!(held_snapshot.queries_completed_total, 0);
+    assert_eq!(held_snapshot.concurrency_rejections_total, 1);
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    let page = held_reply.await?;
+    assert_eq!(page.rows.len(), 1);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_completed_async_scan_metric_rows_future_releases_query_resources() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Complete,
+        true,
+    ));
+    let async_storage = AsyncStorage::from_storage_with_options(
+        storage.clone() as Arc<dyn Storage>,
+        AsyncRuntimeOptions {
+            read_workers: 1,
+            ..AsyncRuntimeOptions::default()
+        },
+    )?;
+    let mut release_guard = DetailedScanReleaseGuard::new(Arc::clone(&storage));
+
+    let mut held_reply =
+        Box::pin(async_storage.scan_metric_rows("async_rows", 0, 2, row_scan_options()));
+    poll_once_pending(held_reply.as_mut()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        storage.detailed_scan_started.notified(),
+    )
+    .await
+    .expect("the guarded metric scan must reach the backend");
+    release_guard.release();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        async_storage.scan_metric_rows("async_rows", 0, 2, row_scan_options()),
+    )
+    .await
+    .expect("the worker must buffer the first metric reply and process the second scan")
+    .expect_err("the buffered metric reply must continue owning the only query slot");
+    assert_concurrent_query_rejection(error);
+    let held_snapshot = inner.query_budget_snapshot();
+    assert_eq!(held_snapshot.active_queries, 1);
+    assert!(held_snapshot.shared_reserved_memory_bytes > 0);
+
+    drop(held_reply);
+    wait_for_query_resources_to_release(&inner).await;
+    let released_snapshot = inner.query_budget_snapshot();
+    assert_eq!(released_snapshot.queries_started_total, 1);
+    assert_eq!(released_snapshot.queries_completed_total, 1);
+    assert_eq!(released_snapshot.active_queries, 0);
+    assert_eq!(released_snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_async_scan_metric_rows_rejects_unaccounted_backends() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        true,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = async_storage
+        .scan_metric_rows("async_rows", 0, 2, row_scan_options())
+        .await
+        .expect_err("a budgeted unaccounted metric backend must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: "async_scan_metric_rows",
+            reason,
+        } if reason == "bounded async row scans require complete execution accounting"
+    ));
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_async_scan_metric_rows_rejects_a_missing_result_reservation() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(
+        RowScanTestStorage::new(
+            Arc::clone(&inner),
+            true,
+            QueryExecutionAccounting::Complete,
+            false,
+        )
+        .with_missing_detailed_scan_reservation(),
+    );
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = async_storage
+        .scan_metric_rows("async_rows", 0, 2, row_scan_options())
+        .await
+        .expect_err("a falsely complete metric backend must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: "async_scan_metric_rows",
+            reason,
+        } if reason == "bounded async row scans require complete execution accounting"
+    ));
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlimited_async_scan_metric_rows_preserves_unaccounted_backend_compatibility() -> Result<()>
+{
+    let inner = build_row_scan_storage(QueryBudgetLimits::default())?;
+    let storage = Arc::new(RowScanTestStorage::new(
+        Arc::clone(&inner),
+        false,
+        QueryExecutionAccounting::Unaccounted,
+        false,
+    ));
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let page = async_storage
+        .scan_metric_rows("async_rows", 0, 2, row_scan_options())
+        .await?;
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 1);
+
+    async_storage.close().await?;
     Ok(())
 }
 

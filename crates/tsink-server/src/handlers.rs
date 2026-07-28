@@ -126,6 +126,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use snap::raw::{decompress_len, Decoder as SnappyDecoder, Encoder as SnappyEncoder};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2316,6 +2317,424 @@ fn metric_metadata_store_status_json(metadata_store: &MetricMetadataStore) -> Js
     })
 }
 
+const TSDB_STATUS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const TSDB_STATUS_JSON_OBJECT_ENTRY_ALLOWANCE_BYTES: u64 = 128;
+
+struct TsdbStatusCancellationGuard {
+    token: tsink::QueryCancellationToken,
+}
+
+impl Drop for TsdbStatusCancellationGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+fn tsdb_status_error_response(
+    status: u16,
+    error_type: &str,
+    error_code: &str,
+    message: &str,
+    retry_after: Option<&str>,
+) -> HttpResponse {
+    let mut response = json_response(
+        status,
+        &json!({
+            "status": "error",
+            "errorType": error_type,
+            "error": message,
+        }),
+    )
+    .with_header(READ_ERROR_CODE_HEADER, error_code);
+    if let Some(retry_after) = retry_after {
+        response = response.with_header("Retry-After", retry_after);
+    }
+    response
+}
+
+fn tsdb_status_query_budget_error_response(error: &tsink::QueryBudgetError) -> HttpResponse {
+    match error {
+        tsink::QueryBudgetError::InvalidLimits(_) => tsdb_status_error_response(
+            400,
+            "invalid_query_limits",
+            "invalid_query_limits",
+            "invalid TSDB status query limits",
+            None,
+        ),
+        tsink::QueryBudgetError::LimitExceeded(exceeded) => {
+            let error_code = format!("query_limit_{}", exceeded.reason.as_str());
+            let retryable = matches!(
+                exceeded.reason,
+                tsink::QueryLimitReason::ConcurrentQueries
+                    | tsink::QueryLimitReason::SharedMemoryBytes
+            );
+            tsdb_status_error_response(
+                if retryable { 429 } else { 413 },
+                &error_code,
+                &error_code,
+                &format!(
+                    "TSDB status query exceeded the {} limit",
+                    exceeded.reason.as_str()
+                ),
+                retryable.then_some("1"),
+            )
+        }
+        tsink::QueryBudgetError::Cancelled => tsdb_status_error_response(
+            503,
+            "canceled",
+            "query_cancelled",
+            "TSDB status query was canceled",
+            None,
+        ),
+        tsink::QueryBudgetError::DeadlineExceeded => tsdb_status_error_response(
+            503,
+            "timeout",
+            "query_deadline_exceeded",
+            "TSDB status query deadline exceeded",
+            None,
+        ),
+        _ => tsdb_status_error_response(
+            500,
+            "execution",
+            "status_query_budget_failed",
+            "TSDB status query budget failed",
+            None,
+        ),
+    }
+}
+
+fn tsdb_status_storage_error_response(error: tsink::TsinkError) -> HttpResponse {
+    match error {
+        tsink::TsinkError::QueryBudget(error) => tsdb_status_query_budget_error_response(&error),
+        _ => tsdb_status_error_response(
+            500,
+            "execution",
+            "status_storage_list_failed",
+            "TSDB status metric enumeration failed",
+            None,
+        ),
+    }
+}
+
+fn tsdb_status_saturating_u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn modeled_tsdb_status_vec_capacity_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    tsdb_status_saturating_u64_from_usize(capacity)
+        .saturating_mul(tsdb_status_saturating_u64_from_usize(
+            std::mem::size_of::<T>(),
+        ))
+        .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_tsdb_status_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    tsdb_status_saturating_u64_from_usize(value.capacity())
+        .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_tsdb_status_json_retained_bytes(value: &JsonValue) -> u64 {
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => 0,
+        JsonValue::String(value) => modeled_tsdb_status_string_capacity_bytes(value),
+        JsonValue::Array(values) => modeled_tsdb_status_vec_capacity_bytes::<JsonValue>(
+            values.capacity(),
+        )
+        .saturating_add(values.iter().fold(0u64, |bytes, value| {
+            bytes.saturating_add(modeled_tsdb_status_json_retained_bytes(value))
+        })),
+        JsonValue::Object(values) => {
+            let entry_bytes = tsdb_status_saturating_u64_from_usize(values.len()).saturating_mul(
+                tsdb_status_saturating_u64_from_usize(std::mem::size_of::<(String, JsonValue)>())
+                    .saturating_add(TSDB_STATUS_JSON_OBJECT_ENTRY_ALLOWANCE_BYTES),
+            );
+            entry_bytes
+                .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+                .saturating_add(values.iter().fold(0u64, |bytes, (key, value)| {
+                    bytes
+                        .saturating_add(modeled_tsdb_status_string_capacity_bytes(key))
+                        .saturating_add(modeled_tsdb_status_json_retained_bytes(value))
+                }))
+        }
+    }
+}
+
+fn modeled_tsdb_status_response_retained_bytes(response: &HttpResponse) -> u64 {
+    modeled_tsdb_status_vec_capacity_bytes::<u8>(response.body.capacity())
+        .saturating_add(modeled_tsdb_status_vec_capacity_bytes::<(String, String)>(
+            response.headers.capacity(),
+        ))
+        .saturating_add(response.headers.iter().fold(0u64, |bytes, (name, value)| {
+            bytes
+                .saturating_add(modeled_tsdb_status_string_capacity_bytes(name))
+                .saturating_add(modeled_tsdb_status_string_capacity_bytes(value))
+        }))
+}
+
+fn modeled_tsdb_status_header_preflight_bytes() -> u64 {
+    modeled_tsdb_status_vec_capacity_bytes::<(String, String)>(4)
+        .saturating_add(
+            tsdb_status_saturating_u64_from_usize("Content-Type".len())
+                .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+        )
+        .saturating_add(
+            tsdb_status_saturating_u64_from_usize("application/json".len())
+                .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+        )
+}
+
+struct TsdbStatusJsonLengthCounter<'a> {
+    bytes: usize,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+    fixed_limit_exceeded: bool,
+}
+
+impl IoWrite for TsdbStatusJsonLengthCounter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return Err(io::Error::other(
+                "TSDB status JSON measurement was canceled",
+            ));
+        }
+        let next_bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("TSDB status JSON length overflowed usize"))?;
+        if next_bytes > TSDB_STATUS_MAX_RESPONSE_BYTES {
+            self.fixed_limit_exceeded = true;
+            return Err(io::Error::other(
+                "TSDB status JSON exceeded its fixed encoded-byte limit",
+            ));
+        }
+        self.bytes = next_bytes;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TsdbStatusControlledJsonWriter<'a, W> {
+    inner: W,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+}
+
+impl<W: IoWrite> IoWrite for TsdbStatusControlledJsonWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return Err(io::Error::other(
+                "TSDB status JSON serialization was canceled",
+            ));
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[derive(Debug)]
+struct AccountedTsdbStatusPayload {
+    // Field order is intentional: the owned tree is destroyed before its reservation.
+    payload: JsonValue,
+    reservation: tsink::QueryMemoryReservation,
+}
+
+#[derive(Debug)]
+struct PreparedTsdbStatusResponse {
+    payload: JsonValue,
+    response: HttpResponse,
+    reservation: tsink::QueryMemoryReservation,
+}
+
+fn serialize_tsdb_status_response(
+    payload: JsonValue,
+    execution: &tsink::QueryExecution,
+) -> Result<PreparedTsdbStatusResponse, HttpResponse> {
+    let payload_retained_bytes = modeled_tsdb_status_json_retained_bytes(&payload);
+    // The status tree is assembled by legacy snapshot/projection helpers before this point. Its
+    // retained size is observable here, so keep it charged while the separately pre-admitted body
+    // is materialized. The source clones and tree-construction peak remain an explicit boundary in
+    // the resource-limit documentation.
+    let reservation = execution
+        .reserve_memory(payload_retained_bytes)
+        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    let mut accounted_payload = AccountedTsdbStatusPayload {
+        payload,
+        reservation,
+    };
+
+    let mut counter = TsdbStatusJsonLengthCounter {
+        bytes: 0,
+        execution,
+        control_error: None,
+        fixed_limit_exceeded: false,
+    };
+    if serde_json::to_writer(&mut counter, &accounted_payload.payload).is_err() {
+        return Err(match counter.control_error {
+            Some(error) => tsdb_status_query_budget_error_response(&error),
+            None if counter.fixed_limit_exceeded => tsdb_status_error_response(
+                413,
+                "query_limit_returned_bytes",
+                "query_limit_returned_bytes",
+                "TSDB status response exceeds the fixed encoded-byte limit",
+                None,
+            ),
+            None => tsdb_status_error_response(
+                500,
+                "execution",
+                "status_json_measurement_failed",
+                "TSDB status JSON measurement failed",
+                None,
+            ),
+        });
+    }
+    let body_len = counter.bytes;
+    if body_len > TSDB_STATUS_MAX_RESPONSE_BYTES {
+        return Err(tsdb_status_error_response(
+            413,
+            "query_limit_returned_bytes",
+            "query_limit_returned_bytes",
+            "TSDB status response exceeds the fixed encoded-byte limit",
+            None,
+        ));
+    }
+    execution
+        .charge_returned_bytes(tsdb_status_saturating_u64_from_usize(body_len))
+        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+
+    accounted_payload
+        .reservation
+        .resize(
+            payload_retained_bytes
+                .saturating_add(modeled_tsdb_status_vec_capacity_bytes::<u8>(body_len))
+                .saturating_add(modeled_tsdb_status_header_preflight_bytes()),
+        )
+        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len).map_err(|_| {
+        tsdb_status_error_response(
+            500,
+            "execution",
+            "status_json_allocation_failed",
+            "TSDB status JSON allocation failed",
+            None,
+        )
+    })?;
+    accounted_payload
+        .reservation
+        .resize(
+            payload_retained_bytes
+                .saturating_add(modeled_tsdb_status_vec_capacity_bytes::<u8>(
+                    body.capacity(),
+                ))
+                .saturating_add(modeled_tsdb_status_header_preflight_bytes()),
+        )
+        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    body.resize(body_len, 0);
+    let written = {
+        let cursor = io::Cursor::new(body.as_mut_slice());
+        let mut writer = TsdbStatusControlledJsonWriter {
+            inner: cursor,
+            execution,
+            control_error: None,
+        };
+        if serde_json::to_writer(&mut writer, &accounted_payload.payload).is_err() {
+            return Err(match writer.control_error {
+                Some(error) => tsdb_status_query_budget_error_response(&error),
+                None => tsdb_status_error_response(
+                    500,
+                    "execution",
+                    "status_json_serialization_failed",
+                    "TSDB status JSON serialization failed",
+                    None,
+                ),
+            });
+        }
+        usize::try_from(writer.inner.position()).unwrap_or(usize::MAX)
+    };
+    if written != body_len {
+        return Err(tsdb_status_error_response(
+            500,
+            "execution",
+            "status_json_length_changed",
+            "TSDB status JSON length changed after admission",
+            None,
+        ));
+    }
+
+    let response = HttpResponse::new(200, body).with_header("Content-Type", "application/json");
+    accounted_payload
+        .reservation
+        .resize(
+            payload_retained_bytes
+                .saturating_add(modeled_tsdb_status_response_retained_bytes(&response)),
+        )
+        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    let AccountedTsdbStatusPayload {
+        payload,
+        reservation,
+    } = accounted_payload;
+    Ok(PreparedTsdbStatusResponse {
+        payload,
+        response,
+        reservation,
+    })
+}
+
+#[derive(Debug)]
+struct GuardedTsdbStatusMetrics {
+    series: Vec<MetricSeries>,
+    reservation: tsink::QueryMemoryReservation,
+}
+
+fn validate_tsdb_status_metric_result(
+    mut result: tsink::SelectSeriesExecutionResult,
+) -> Result<GuardedTsdbStatusMetrics, HttpResponse> {
+    let reservation = result.take_memory_reservation().ok_or_else(|| {
+        tsdb_status_error_response(
+            500,
+            "execution",
+            "status_query_accounting_invalid",
+            "TSDB status metric enumeration omitted its result reservation",
+            None,
+        )
+    })?;
+    let required_metric_bytes =
+        crate::cluster::query::modeled_metric_series_vec_retained_bytes(&result.series);
+    if reservation.bytes() < required_metric_bytes {
+        let response = tsdb_status_error_response(
+            500,
+            "execution",
+            "status_query_accounting_invalid",
+            "TSDB status metric enumeration returned an undersized result reservation",
+            None,
+        );
+        // The backend's series allocation must disappear before its undersized accounting guard.
+        // This avoids briefly making live result memory appear released on the rejection path.
+        drop(result);
+        drop(reservation);
+        return Err(response);
+    }
+    Ok(GuardedTsdbStatusMetrics {
+        series: std::mem::take(&mut result.series),
+        reservation,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tsdb_status(
     storage: &Arc<dyn Storage>,
@@ -2358,171 +2777,237 @@ async fn handle_tsdb_status(
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
     let effective_storage_limits = storage.effective_storage_limits();
-    let metadata_store_status = metric_metadata_store_status_json(metadata_store);
     let local_disk = local_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let server_disk_limits = local_disk_budget.map(tsink::LocalDiskBudget::limits);
-    let storage = Arc::clone(&storage);
+    if storage.list_metrics_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+        return tsdb_status_error_response(
+            500,
+            "execution",
+            "status_query_accounting_unavailable",
+            "TSDB status requires complete metric-enumeration accounting",
+            None,
+        );
+    }
+    let cancellation = tsink::QueryCancellationToken::new();
+    let cancellation_guard = TsdbStatusCancellationGuard {
+        token: cancellation.clone(),
+    };
+    let execution =
+        match storage.begin_query_execution(tsink::QueryWorkLimits::default(), cancellation) {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
+                return tsdb_status_error_response(
+                    500,
+                    "execution",
+                    "status_query_accounting_unavailable",
+                    "TSDB status requires query execution admission",
+                    None,
+                )
+            }
+            Err(tsink::TsinkError::QueryBudget(error)) => {
+                return tsdb_status_query_budget_error_response(&error)
+            }
+            Err(_) => {
+                return tsdb_status_error_response(
+                    500,
+                    "execution",
+                    "status_query_admission_failed",
+                    "TSDB status query admission failed",
+                    None,
+                )
+            }
+        };
+    let worker_storage = Arc::clone(&storage);
+    let worker_execution = execution.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let metrics = storage.list_metrics().unwrap_or_default();
-        let series_count = metrics.len();
-        let observability = storage.observability_snapshot();
-        (metrics, series_count, observability)
+        let metrics = worker_storage.list_metrics_with_execution_result(&worker_execution)?;
+        let observability = worker_storage.observability_snapshot();
+        Ok::<_, tsink::TsinkError>((metrics, observability))
     })
     .await;
 
-    let (metrics_list, series_count, observability): (
-        Vec<MetricSeries>,
-        usize,
-        tsink::StorageObservabilitySnapshot,
-    ) = match result {
-        Ok(values) => values,
-        Err(err) => return text_response(500, &format!("status task failed: {err}")),
+    let (metrics_result, observability) = match result {
+        Ok(Ok(values)) => values,
+        Ok(Err(error)) => return tsdb_status_storage_error_response(error),
+        Err(_) => {
+            return tsdb_status_error_response(
+                500,
+                "execution",
+                "status_task_failed",
+                "TSDB status worker task failed",
+                None,
+            )
+        }
     };
-    let local_disk = local_disk.or_else(|| observability.local_disk.clone());
-    let cluster_write_metrics = write_routing_metrics_snapshot();
-    let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
-    let cluster_fanout_metrics = read_fanout_metrics_snapshot();
-    let cluster_fanout_labeled_metrics = read_fanout_labeled_metrics_snapshot();
-    let cluster_read_planner_metrics = read_planner_metrics_snapshot();
-    let cluster_read_planner_labeled_metrics = read_planner_labeled_metrics_snapshot();
-    let mut cluster_read_planner_last_plans = read_planner_last_plans_snapshot();
-    let cluster_dedupe_metrics = dedupe_metrics_snapshot();
-    let cluster_outbox_metrics = outbox_metrics_snapshot();
-    let read_admission_metrics = admission::read_admission_metrics_snapshot();
-    let write_admission_metrics = admission::write_admission_metrics_snapshot();
-    let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
-    let cluster_outbox_peers = cluster_context
-        .and_then(|context| context.outbox.as_ref())
-        .map(|outbox| outbox.peer_backlog_snapshot())
-        .unwrap_or_default();
-    let cluster_outbox_stalled_peers = cluster_context
-        .and_then(|context| context.outbox.as_ref())
-        .map(|outbox| outbox.stalled_peer_snapshot())
-        .unwrap_or_default();
-    let cluster_outbox_config = cluster_context
-        .and_then(|context| context.outbox.as_ref())
-        .map(|outbox| outbox.config())
-        .unwrap_or_default();
-    let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
-    let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
-    let cluster_handoff = cluster_handoff_snapshot(cluster_context);
-    let cluster_digest = cluster_digest_snapshot(cluster_context);
-    let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
-    let cluster_hotspot =
-        cluster_hotspot_snapshot_for_request(&metrics_list, cluster_context, Some(&tenant_id));
-    let tenant_runtime_status_json = tenant_registry
-        .and_then(|registry| registry.status_snapshot_for(&tenant_id).ok())
-        .map(|snapshot| tenant_runtime_status_json(&snapshot))
-        .unwrap_or(JsonValue::Null);
-    let cluster_read_guardrails =
-        cluster_context.map(|context| context.read_fanout.resource_guardrails());
-    let read_guardrail_max_queries = cluster_read_guardrails
-        .map(|limits| limits.max_inflight_queries)
-        .unwrap_or(0);
-    let read_guardrail_max_merged_points = cluster_read_guardrails
-        .map(|limits| limits.max_inflight_merged_points)
-        .unwrap_or(0);
-    let read_guardrail_acquire_timeout_ms = cluster_read_guardrails
-        .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let read_per_query_fanout_concurrency = cluster_context
-        .map(|context| context.runtime.fanout_concurrency)
-        .unwrap_or(0);
-    let public_read_guardrails = admission::global_public_read_admission()
-        .ok()
-        .map(|controller| controller.guardrails());
-    let public_read_guardrail_max_requests = public_read_guardrails
-        .map(|limits| limits.max_inflight_requests)
-        .unwrap_or(0);
-    let public_read_guardrail_max_queries = public_read_guardrails
-        .map(|limits| limits.max_inflight_queries)
-        .unwrap_or(0);
-    let public_read_guardrail_acquire_timeout_ms = public_read_guardrails
-        .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let write_guardrails = admission::global_public_write_admission()
-        .ok()
-        .map(|controller| controller.guardrails());
-    let write_guardrail_max_requests = write_guardrails
-        .map(|limits| limits.max_inflight_requests)
-        .unwrap_or(0);
-    let write_guardrail_max_rows = write_guardrails
-        .map(|limits| limits.max_inflight_rows)
-        .unwrap_or(0);
-    let write_guardrail_acquire_timeout_ms = write_guardrails
-        .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let payload_status = payload_status_snapshot(cluster_context);
-    let otlp_status = otlp_metrics_status_snapshot();
-    let legacy_ingest_status = legacy_ingest::status_snapshot();
-    let edge_sync_source_status = edge_sync_context
-        .map(|context| context.source_status_snapshot())
-        .unwrap_or_default();
-    let edge_sync_accept_status = edge_sync_context
-        .map(|context| context.accept_status_snapshot())
-        .unwrap_or_default();
-    let cluster_audit_health = cluster_context
-        .and_then(|context| context.audit_log.as_ref())
-        .map(|audit_log| audit_log.health_snapshot())
-        .unwrap_or_default();
-    let usage_journal = usage_accounting
-        .map(UsageAccounting::ledger_status)
-        .unwrap_or_default();
-    let usage_current_tenant = usage_accounting
-        .map(|accounting| accounting.tenant_summary(&tenant_id))
-        .map(|summary| {
-            json!({
-                "tenantId": summary.tenant_id,
-                "ingest": summary.ingest,
-                "query": summary.query,
-                "retention": summary.retention,
-                "background": summary.background,
-                "latestStorageSnapshot": summary.latest_storage_snapshot,
+    let guarded_metrics = match validate_tsdb_status_metric_result(metrics_result) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
+    let GuardedTsdbStatusMetrics {
+        series: metrics_list,
+        reservation: metrics_reservation,
+    } = guarded_metrics;
+    let series_count = metrics_list.len();
+    if let Err(error) = execution.checkpoint() {
+        return tsdb_status_query_budget_error_response(&error);
+    };
+    let payload = {
+        let metadata_store_status = metric_metadata_store_status_json(metadata_store);
+        let local_disk = local_disk.or_else(|| observability.local_disk.clone());
+        let cluster_write_metrics = write_routing_metrics_snapshot();
+        let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
+        let cluster_fanout_metrics = read_fanout_metrics_snapshot();
+        let cluster_fanout_labeled_metrics = read_fanout_labeled_metrics_snapshot();
+        let cluster_read_planner_metrics = read_planner_metrics_snapshot();
+        let cluster_read_planner_labeled_metrics = read_planner_labeled_metrics_snapshot();
+        let mut cluster_read_planner_last_plans = read_planner_last_plans_snapshot();
+        let cluster_dedupe_metrics = dedupe_metrics_snapshot();
+        let cluster_outbox_metrics = outbox_metrics_snapshot();
+        let read_admission_metrics = admission::read_admission_metrics_snapshot();
+        let write_admission_metrics = admission::write_admission_metrics_snapshot();
+        let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
+        let cluster_outbox_peers = cluster_context
+            .and_then(|context| context.outbox.as_ref())
+            .map(|outbox| outbox.peer_backlog_snapshot())
+            .unwrap_or_default();
+        let cluster_outbox_stalled_peers = cluster_context
+            .and_then(|context| context.outbox.as_ref())
+            .map(|outbox| outbox.stalled_peer_snapshot())
+            .unwrap_or_default();
+        let cluster_outbox_config = cluster_context
+            .and_then(|context| context.outbox.as_ref())
+            .map(|outbox| outbox.config())
+            .unwrap_or_default();
+        let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
+        let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
+        let cluster_handoff = cluster_handoff_snapshot(cluster_context);
+        let cluster_digest = cluster_digest_snapshot(cluster_context);
+        let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
+        let hotspot_control_state = cluster_context
+            .and_then(|context| context.control_consensus.as_ref())
+            .map(|consensus| consensus.current_state());
+        let cluster_hotspot = match hotspot::build_cluster_hotspot_snapshot_with_execution(
+            &metrics_list,
+            cluster_context.map(|context| &context.runtime.ring),
+            hotspot_control_state.as_ref(),
+            Some(&tenant_id),
+            &execution,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let tenant_runtime_status_json = tenant_registry
+            .and_then(|registry| registry.status_snapshot_for(&tenant_id).ok())
+            .map(|snapshot| tenant_runtime_status_json(&snapshot))
+            .unwrap_or(JsonValue::Null);
+        let cluster_read_guardrails =
+            cluster_context.map(|context| context.read_fanout.resource_guardrails());
+        let read_guardrail_max_queries = cluster_read_guardrails
+            .map(|limits| limits.max_inflight_queries)
+            .unwrap_or(0);
+        let read_guardrail_max_merged_points = cluster_read_guardrails
+            .map(|limits| limits.max_inflight_merged_points)
+            .unwrap_or(0);
+        let read_guardrail_acquire_timeout_ms = cluster_read_guardrails
+            .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let read_per_query_fanout_concurrency = cluster_context
+            .map(|context| context.runtime.fanout_concurrency)
+            .unwrap_or(0);
+        let public_read_guardrails = admission::global_public_read_admission()
+            .ok()
+            .map(|controller| controller.guardrails());
+        let public_read_guardrail_max_requests = public_read_guardrails
+            .map(|limits| limits.max_inflight_requests)
+            .unwrap_or(0);
+        let public_read_guardrail_max_queries = public_read_guardrails
+            .map(|limits| limits.max_inflight_queries)
+            .unwrap_or(0);
+        let public_read_guardrail_acquire_timeout_ms = public_read_guardrails
+            .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let write_guardrails = admission::global_public_write_admission()
+            .ok()
+            .map(|controller| controller.guardrails());
+        let write_guardrail_max_requests = write_guardrails
+            .map(|limits| limits.max_inflight_requests)
+            .unwrap_or(0);
+        let write_guardrail_max_rows = write_guardrails
+            .map(|limits| limits.max_inflight_rows)
+            .unwrap_or(0);
+        let write_guardrail_acquire_timeout_ms = write_guardrails
+            .map(|limits| u64::try_from(limits.acquire_timeout.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let payload_status = payload_status_snapshot(cluster_context);
+        let otlp_status = otlp_metrics_status_snapshot();
+        let legacy_ingest_status = legacy_ingest::status_snapshot();
+        let edge_sync_source_status = edge_sync_context
+            .map(|context| context.source_status_snapshot())
+            .unwrap_or_default();
+        let edge_sync_accept_status = edge_sync_context
+            .map(|context| context.accept_status_snapshot())
+            .unwrap_or_default();
+        let cluster_audit_health = cluster_context
+            .and_then(|context| context.audit_log.as_ref())
+            .map(|audit_log| audit_log.health_snapshot())
+            .unwrap_or_default();
+        let usage_journal = usage_accounting
+            .map(UsageAccounting::ledger_status)
+            .unwrap_or_default();
+        let usage_current_tenant = usage_accounting
+            .map(|accounting| accounting.tenant_summary(&tenant_id))
+            .map(|summary| {
+                json!({
+                    "tenantId": summary.tenant_id,
+                    "ingest": summary.ingest,
+                    "query": summary.query,
+                    "retention": summary.retention,
+                    "background": summary.background,
+                    "latestStorageSnapshot": summary.latest_storage_snapshot,
+                })
             })
-        })
-        .unwrap_or(JsonValue::Null);
-    let usage_reconciliation = usage_accounting
-        .map(|accounting| {
-            let report = accounting.report(Some(&tenant_id), None, None, UsageBucketWidth::None);
-            usage_reconciliation_json(&report, &observability)
-        })
-        .unwrap_or(JsonValue::Null);
-    let managed_control_plane_status = managed_control_plane
-        .map(ManagedControlPlane::status_snapshot)
-        .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(JsonValue::Null))
-        .unwrap_or(JsonValue::Null);
-    let managed_control_plane_deployments = managed_control_plane
-        .map(ManagedControlPlane::deployment_summaries)
-        .map(|summaries| serde_json::to_value(summaries).unwrap_or(JsonValue::Null))
-        .unwrap_or(JsonValue::Null);
-    let managed_control_plane_current_tenant = managed_control_plane
-        .and_then(|control_plane| control_plane.tenant_snapshot(&tenant_id))
-        .map(|tenant| serde_json::to_value(tenant).unwrap_or(JsonValue::Null))
-        .unwrap_or(JsonValue::Null);
+            .unwrap_or(JsonValue::Null);
+        let usage_reconciliation = usage_accounting
+            .map(|accounting| {
+                let report =
+                    accounting.report(Some(&tenant_id), None, None, UsageBucketWidth::None);
+                usage_reconciliation_json(&report, &observability)
+            })
+            .unwrap_or(JsonValue::Null);
+        let managed_control_plane_status = managed_control_plane
+            .map(ManagedControlPlane::status_snapshot)
+            .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(JsonValue::Null))
+            .unwrap_or(JsonValue::Null);
+        let managed_control_plane_deployments = managed_control_plane
+            .map(ManagedControlPlane::deployment_summaries)
+            .map(|summaries| serde_json::to_value(summaries).unwrap_or(JsonValue::Null))
+            .unwrap_or(JsonValue::Null);
+        let managed_control_plane_current_tenant = managed_control_plane
+            .and_then(|control_plane| control_plane.tenant_snapshot(&tenant_id))
+            .map(|tenant| serde_json::to_value(tenant).unwrap_or(JsonValue::Null))
+            .unwrap_or(JsonValue::Null);
 
-    let mut hot_shards = cluster_write_labeled_metrics.shards.clone();
-    hot_shards.sort_by(|left, right| {
-        right
-            .rows_total
-            .cmp(&left.rows_total)
-            .then_with(|| left.shard.cmp(&right.shard))
-    });
-    hot_shards.truncate(8);
+        let mut hot_shards = cluster_write_labeled_metrics.shards.clone();
+        hot_shards.sort_by(|left, right| {
+            right
+                .rows_total
+                .cmp(&left.rows_total)
+                .then_with(|| left.shard.cmp(&right.shard))
+        });
+        hot_shards.truncate(8);
 
-    let mut write_peers = cluster_write_labeled_metrics.peers.clone();
-    write_peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    let mut fanout_peers = cluster_fanout_labeled_metrics.peers.clone();
-    fanout_peers.sort_by(|left, right| {
-        left.node_id
-            .cmp(&right.node_id)
-            .then(left.operation.cmp(&right.operation))
-    });
-    cluster_read_planner_last_plans.sort_by(|left, right| left.operation.cmp(&right.operation));
+        let mut write_peers = cluster_write_labeled_metrics.peers.clone();
+        write_peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let mut fanout_peers = cluster_fanout_labeled_metrics.peers.clone();
+        fanout_peers.sort_by(|left, right| {
+            left.node_id
+                .cmp(&right.node_id)
+                .then(left.operation.cmp(&right.operation))
+        });
+        cluster_read_planner_last_plans.sort_by(|left, right| left.operation.cmp(&right.operation));
 
-    json_response(
-        200,
-        &json!({
+        json!({
             "status": "success",
             "data": {
                 "seriesCount": series_count,
@@ -3303,8 +3788,32 @@ async fn handle_tsdb_status(
                     "security": security_status_json(security_manager, rbac_registry)
                 }
             }
-        }),
-    )
+        })
+    };
+    // The inner block released its named snapshots and hotspot guard after materializing their
+    // payload projections. Release the outer observability and metric-list sources in allocation-
+    // before-guard order before charging the retained JSON tree.
+    drop(observability);
+    drop(metrics_list);
+    drop(metrics_reservation);
+    let prepared = match serialize_tsdb_status_response(payload, &execution) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let PreparedTsdbStatusResponse {
+        payload,
+        response,
+        reservation,
+    } = prepared;
+    drop(payload);
+    let mut status_json_reservation = reservation;
+    status_json_reservation
+        .resize(modeled_tsdb_status_response_retained_bytes(&response))
+        .expect("shrinking a TSDB status response reservation cannot fail");
+    drop(status_json_reservation);
+    drop(execution);
+    drop(cancellation_guard);
+    response
 }
 
 fn support_bundle_tenant_id(request: &HttpRequest) -> Result<String, HttpResponse> {
@@ -8018,7 +8527,7 @@ mod tests {
     use std::cmp::Ordering as CmpOrdering;
     use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -8084,6 +8593,190 @@ mod tests {
 
         fn memory_budget(&self) -> usize {
             self.inner.memory_budget()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct StatusSelectSeriesFailingStorage {
+        inner: Arc<dyn Storage>,
+    }
+
+    impl Storage for StatusSelectSeriesFailingStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            _selection: &SeriesSelection,
+            _execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            Err(TsinkError::Other(
+                "injected status metric enumeration failure".to_string(),
+            ))
+        }
+
+        fn select_series_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn memory_used(&self) -> usize {
+            self.inner.memory_used()
+        }
+
+        fn memory_budget(&self) -> usize {
+            self.inner.memory_budget()
+        }
+
+        fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+            self.inner.effective_storage_limits()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    struct LargeStatusIdentityStorage {
+        inner: Arc<dyn Storage>,
+        series: Vec<MetricSeries>,
+        observed_returned_bytes: AtomicU64,
+        saw_unbounded_returned_byte_limit: AtomicBool,
+    }
+
+    impl Storage for LargeStatusIdentityStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            _selection: &SeriesSelection,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.saw_unbounded_returned_byte_limit.store(
+                execution.limits().max_returned_bytes.is_none(),
+                AtomicOrdering::Relaxed,
+            );
+            let returned_bytes =
+                crate::cluster::query::modeled_metric_series_slice_returned_bytes(&self.series);
+            self.observed_returned_bytes
+                .store(returned_bytes, AtomicOrdering::Relaxed);
+            let series_count = u64::try_from(self.series.len()).unwrap_or(u64::MAX);
+            execution
+                .ensure_series_matched(series_count)
+                .map_err(TsinkError::from)?;
+            execution
+                .ensure_returned_bytes(returned_bytes)
+                .map_err(TsinkError::from)?;
+            let mut reservation = execution
+                .reserve_memory(
+                    crate::cluster::query::modeled_metric_series_vec_retained_bytes(&self.series),
+                )
+                .map_err(TsinkError::from)?;
+            let series = self.series.clone();
+            reservation
+                .resize(crate::cluster::query::modeled_metric_series_vec_retained_bytes(&series))
+                .map_err(TsinkError::from)?;
+            execution
+                .charge_series_matched(series_count)
+                .map_err(TsinkError::from)?;
+            execution
+                .charge_returned_bytes(returned_bytes)
+                .map_err(TsinkError::from)?;
+            Ok(tsink::SelectSeriesExecutionResult::accounted(
+                series,
+                reservation,
+            ))
+        }
+
+        fn select_series_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            tsink::QueryExecutionAccounting::Complete
+        }
+
+        fn memory_used(&self) -> usize {
+            self.inner.memory_used()
+        }
+
+        fn memory_budget(&self) -> usize {
+            self.inner.memory_budget()
+        }
+
+        fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+            self.inner.effective_storage_limits()
         }
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
@@ -13167,8 +13860,14 @@ mod tests {
         let legacy_budget = storage.query_budget_snapshot();
         assert_eq!(
             legacy_budget.queries_started_total,
-            budget_before.queries_started_total
+            budget_before.queries_started_total + 1
         );
+        assert_eq!(
+            legacy_budget.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(legacy_budget.active_queries, 0);
+        assert_eq!(legacy_budget.shared_reserved_memory_bytes, 0);
 
         let calibration = dispatch(Some(QueryWorkLimits::default())).await;
         assert_eq!(
@@ -13193,11 +13892,11 @@ mod tests {
         let calibration_budget = storage.query_budget_snapshot();
         assert_eq!(
             calibration_budget.queries_started_total,
-            budget_before.queries_started_total + 1
+            legacy_budget.queries_started_total + 1
         );
         assert_eq!(
             calibration_budget.queries_completed_total,
-            budget_before.queries_completed_total + 1
+            legacy_budget.queries_completed_total + 1
         );
         assert_eq!(calibration_budget.active_queries, 0);
         assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
@@ -18645,9 +19344,11 @@ mod tests {
         let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
         assert_eq!(body["status"], "error");
         assert_eq!(body["errorType"], "bad_data");
-        assert!(body["error"]
-            .as_str()
-            .is_some_and(|message| message.contains(READ_PARTIAL_RESPONSE_OVERRIDE_HEADER)));
+        assert_eq!(body["error"], "invalid cluster read policy override");
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("metadata_invalid_cluster_read_policy")
+        );
     }
 
     #[tokio::test]
@@ -22578,6 +23279,373 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_tsdb_retains_and_releases_one_complete_query_execution() {
+        let storage = make_storage();
+        storage
+            .insert_rows(&[Row::with_labels(
+                "status_guard_metric",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1, 1.0),
+            )])
+            .expect("status fixture should insert");
+        let engine = make_engine(&storage);
+        let before = storage.query_budget_snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        let after = storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert!(after.peak_shared_reserved_memory_bytes > 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_expert_unlimited_still_uses_detailed_execution() {
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_resource_profile(tsink::ResourceProfile::ExpertUnlimited)
+            .build()
+            .expect("expert-unlimited status storage should build");
+        let engine = make_engine(&storage);
+        let before = storage.query_budget_snapshot();
+        assert_eq!(before.limits, QueryBudgetLimits::default());
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let after = storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert!(after.peak_shared_reserved_memory_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_expert_unlimited_does_not_cap_large_metric_identity_enumeration() {
+        let inner: Arc<dyn Storage> = StorageBuilder::new()
+            .with_resource_profile(tsink::ResourceProfile::ExpertUnlimited)
+            .build()
+            .expect("expert-unlimited status storage should build");
+        let large_name_prefix = "large_status_identity_".repeat(40);
+        let series = (0..2_048)
+            .map(|index| MetricSeries {
+                name: format!("{large_name_prefix}{index:04}"),
+                labels: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            crate::cluster::query::modeled_metric_series_slice_returned_bytes(&series)
+                > u64::try_from(TSDB_STATUS_MAX_RESPONSE_BYTES).unwrap_or(u64::MAX)
+        );
+        let large_storage = Arc::new(LargeStatusIdentityStorage {
+            inner,
+            series,
+            observed_returned_bytes: AtomicU64::new(0),
+            saw_unbounded_returned_byte_limit: AtomicBool::new(false),
+        });
+        let storage: Arc<dyn Storage> = large_storage.clone();
+        let engine = make_engine(&storage);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.len() <= TSDB_STATUS_MAX_RESPONSE_BYTES);
+        assert!(
+            large_storage
+                .observed_returned_bytes
+                .load(AtomicOrdering::Relaxed)
+                > u64::try_from(TSDB_STATUS_MAX_RESPONSE_BYTES).unwrap_or(u64::MAX)
+        );
+        assert!(large_storage
+            .saw_unbounded_returned_byte_limit
+            .load(AtomicOrdering::Relaxed));
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid status JSON");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["seriesCount"], 2_048);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_rejects_unaccounted_metric_enumeration() {
+        let inner = make_storage();
+        let storage: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage { inner });
+        let engine = make_engine(&storage);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("status_query_accounting_unavailable")
+        );
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("error JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(
+            body["error"],
+            "TSDB status requires complete metric-enumeration accounting"
+        );
+    }
+
+    #[test]
+    fn status_tsdb_rejects_false_complete_missing_result_reservation() {
+        let error = validate_tsdb_status_metric_result(
+            tsink::SelectSeriesExecutionResult::unaccounted(vec![MetricSeries {
+                name: "missing_status_guard".to_string(),
+                labels: vec![Label::new("host", "a")],
+            }]),
+        )
+        .expect_err("a false-Complete result without a guard must fail");
+
+        assert_eq!(error.status, 500);
+        assert_eq!(
+            response_header(&error, READ_ERROR_CODE_HEADER),
+            Some("status_query_accounting_invalid")
+        );
+        let body: JsonValue = serde_json::from_slice(&error.body).expect("error JSON");
+        assert_eq!(
+            body["error"],
+            "TSDB status metric enumeration omitted its result reservation"
+        );
+    }
+
+    #[test]
+    fn status_tsdb_rejects_false_complete_undersized_result_reservation() {
+        let budget = tsink::QueryBudget::new(QueryBudgetLimits::default())
+            .expect("unlimited status test budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("status test execution should admit");
+        let reservation = execution
+            .reserve_memory(1)
+            .expect("one-byte lying reservation should admit");
+        let error =
+            validate_tsdb_status_metric_result(tsink::SelectSeriesExecutionResult::accounted(
+                vec![MetricSeries {
+                    name: "undersized_status_guard".repeat(8),
+                    labels: vec![Label::new("host", "a".repeat(256))],
+                }],
+                reservation,
+            ))
+            .expect_err("a false-Complete undersized guard must fail");
+
+        assert_eq!(error.status, 500);
+        assert_eq!(
+            response_header(&error, READ_ERROR_CODE_HEADER),
+            Some("status_query_accounting_invalid")
+        );
+        let body: JsonValue = serde_json::from_slice(&error.body).expect("error JSON");
+        assert_eq!(
+            body["error"],
+            "TSDB status metric enumeration returned an undersized result reservation"
+        );
+        drop(execution);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_propagates_metric_enumeration_failure() {
+        let inner = make_storage();
+        let storage: Arc<dyn Storage> = Arc::new(StatusSelectSeriesFailingStorage {
+            inner: Arc::clone(&inner),
+        });
+        let engine = make_engine(&storage);
+        let before = inner.query_budget_snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("status_storage_list_failed")
+        );
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("error JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["error"], "TSDB status metric enumeration failed");
+        assert!(!String::from_utf8_lossy(&response.body).contains("injected"));
+        let after = inner.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn status_tsdb_json_response_enforces_exact_memory_and_returned_byte_boundaries() {
+        fn execution_with_limits(
+            memory: Option<u64>,
+            returned: Option<u64>,
+        ) -> tsink::QueryExecution {
+            tsink::QueryBudget::new(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: memory,
+                per_query: QueryWorkLimits {
+                    max_returned_bytes: returned,
+                    max_memory_bytes: memory,
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .expect("status test budget should build")
+            .begin_query()
+            .expect("status test execution should admit")
+        }
+
+        let payload = json!({
+            "status": "success",
+            "data": {
+                "seriesCount": 2,
+                "hotspot": {
+                    "hotShards": [{"shard": 7, "storageSeries": 2}],
+                    "tenantPressure": [{"tenantId": "team-a", "storageSeries": 2}]
+                }
+            }
+        });
+        let calibration = execution_with_limits(None, None);
+        let prepared = serialize_tsdb_status_response(payload.clone(), &calibration)
+            .expect("calibration response should serialize");
+        let exact_returned_bytes =
+            u64::try_from(prepared.response.body.len()).expect("body length should fit u64");
+        let exact_memory_bytes = prepared.reservation.bytes();
+        assert_eq!(
+            exact_memory_bytes,
+            modeled_tsdb_status_json_retained_bytes(&payload).saturating_add(
+                modeled_tsdb_status_response_retained_bytes(&prepared.response)
+            )
+        );
+        drop(prepared);
+        drop(calibration);
+
+        let below_returned =
+            execution_with_limits(Some(exact_memory_bytes), Some(exact_returned_bytes - 1));
+        let error = serialize_tsdb_status_response(payload.clone(), &below_returned)
+            .expect_err("one byte below the encoded response must fail");
+        assert_eq!(error.status, 413);
+        assert_eq!(
+            response_header(&error, READ_ERROR_CODE_HEADER),
+            Some("query_limit_returned_bytes")
+        );
+        drop(below_returned);
+
+        let below_memory =
+            execution_with_limits(Some(exact_memory_bytes - 1), Some(exact_returned_bytes));
+        let error = serialize_tsdb_status_response(payload.clone(), &below_memory)
+            .expect_err("one byte below the retained response peak must fail");
+        assert_eq!(error.status, 413);
+        assert_eq!(
+            response_header(&error, READ_ERROR_CODE_HEADER),
+            Some("query_limit_per_query_memory_bytes")
+        );
+        drop(below_memory);
+
+        let exact = execution_with_limits(Some(exact_memory_bytes), Some(exact_returned_bytes));
+        let prepared = serialize_tsdb_status_response(payload.clone(), &exact)
+            .expect("the exact retained and returned-byte boundary must pass");
+        assert_eq!(prepared.reservation.bytes(), exact_memory_bytes);
+        assert_eq!(
+            u64::try_from(prepared.response.body.len()).unwrap(),
+            exact_returned_bytes
+        );
+        drop(prepared);
+        drop(exact);
+
+        let oversized = execution_with_limits(None, None);
+        let error = serialize_tsdb_status_response(
+            json!({"oversized": "x".repeat(TSDB_STATUS_MAX_RESPONSE_BYTES)}),
+            &oversized,
+        )
+        .expect_err("the fixed encoded ceiling must stop measurement early");
+        assert_eq!(error.status, 413);
+        assert_eq!(
+            response_header(&error, READ_ERROR_CODE_HEADER),
+            Some("query_limit_returned_bytes")
+        );
+        drop(oversized);
+    }
+
+    #[tokio::test]
     async fn status_tsdb_reports_configured_effective_storage_limits() {
         let storage = StorageBuilder::new()
             .with_wal_enabled(false)
@@ -23709,9 +24777,23 @@ mod tests {
     #[tokio::test]
     async fn admin_restore_maps_offline_quota_and_target_validation_to_typed_errors() {
         let temp_dir = TempDir::new().expect("tempdir should build");
+        let source_path = temp_dir.path().join("source");
         let snapshot_path = temp_dir.path().join("snapshot");
-        std::fs::create_dir_all(&snapshot_path).unwrap();
-        std::fs::write(snapshot_path.join("payload.bin"), b"snapshot-payload").unwrap();
+        let source_storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_data_path(&source_path)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .build()
+            .expect("source storage should build");
+        source_storage
+            .insert_rows(&[Row::new(
+                "admin_restore_quota_metric",
+                DataPoint::new(1, 1.0),
+            )])
+            .expect("source insert should succeed");
+        source_storage
+            .snapshot(&snapshot_path)
+            .expect("source snapshot should succeed");
+        source_storage.close().expect("source storage should close");
         let offline_restore_root = temp_dir.path().join("offline-restores");
         let quota_budget = tsink::LocalDiskBudget::open(
             &offline_restore_root,

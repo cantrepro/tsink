@@ -4,14 +4,7 @@ use super::*;
 
 impl SeriesRegistry {
     pub(crate) fn has_series_for_metric(&self, metric: &str) -> bool {
-        let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
-            return false;
-        };
-        self.metric_postings_shards[Self::metric_postings_shard_idx(metric_id)]
-            .read()
-            .metric_postings
-            .get(&metric_id)
-            .is_some_and(|ids| !ids.is_empty())
+        self.series_count_for_metric(metric) > 0
     }
 
     pub fn series_ids_for_metric(&self, metric: &str) -> Vec<SeriesId> {
@@ -24,6 +17,45 @@ impl SeriesRegistry {
             .get(&metric_id)
             .map(|ids| ids.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Returns the number of series posted for one metric without materializing their ids.
+    pub(crate) fn series_count_for_metric(&self, metric: &str) -> usize {
+        let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
+            return 0;
+        };
+        self.metric_postings_shards[Self::metric_postings_shard_idx(metric_id)]
+            .read()
+            .metric_postings
+            .get(&metric_id)
+            .map_or(0, |ids| usize::try_from(ids.len()).unwrap_or(usize::MAX))
+    }
+
+    /// Materializes one metric's postings only after the exact count passes caller admission.
+    ///
+    /// The postings read guard stays held across `preflight` and vector construction, preventing a
+    /// concurrent series registration from invalidating the admitted count. It is released before
+    /// callers decode identities, preserving the registry's series-shard-before-postings writer
+    /// lock order.
+    pub(crate) fn series_ids_for_metric_with_preflight<E>(
+        &self,
+        metric: &str,
+        preflight: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Vec<SeriesId>, E> {
+        let Some(metric_id) = self.metric_dict.read().get_id(metric) else {
+            preflight(0)?;
+            return Ok(Vec::new());
+        };
+        let shard = self.metric_postings_shards[Self::metric_postings_shard_idx(metric_id)].read();
+        let Some(ids) = shard.metric_postings.get(&metric_id) else {
+            preflight(0)?;
+            return Ok(Vec::new());
+        };
+        let count = usize::try_from(ids.len()).unwrap_or(usize::MAX);
+        preflight(count)?;
+        let mut series_ids = Vec::with_capacity(count);
+        series_ids.extend(ids.iter());
+        Ok(series_ids)
     }
 
     /// Returns the next bounded, ascending page of series ids for one metric.

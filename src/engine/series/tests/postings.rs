@@ -140,6 +140,56 @@ fn missing_label_queries_do_not_block_unrelated_new_series_registration() {
 }
 
 #[test]
+fn metric_postings_preflight_stabilizes_ids_during_concurrent_registration() {
+    let registry = Arc::new(SeriesRegistry::new());
+    let first = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    let (preflight_entered_tx, preflight_entered_rx) = mpsc::channel();
+    let (release_preflight_tx, release_preflight_rx) = mpsc::channel();
+    let query_registry = Arc::clone(&registry);
+    let query = thread::spawn(move || {
+        query_registry.series_ids_for_metric_with_preflight("cpu", |count| {
+            preflight_entered_tx.send(count).unwrap();
+            release_preflight_rx.recv().unwrap();
+            Ok::<(), ()>(())
+        })
+    });
+    assert_eq!(preflight_entered_rx.recv().unwrap(), 1);
+
+    let (writer_started_tx, writer_started_rx) = mpsc::channel();
+    let (writer_finished_tx, writer_finished_rx) = mpsc::channel();
+    let writer_registry = Arc::clone(&registry);
+    let writer = thread::spawn(move || {
+        writer_started_tx.send(()).unwrap();
+        let result = writer_registry.resolve_or_insert("cpu", &[Label::new("host", "b")]);
+        writer_finished_tx.send(result).unwrap();
+    });
+    writer_started_rx.recv().unwrap();
+    assert!(
+        writer_finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "registration for the same metric must wait for snapshot materialization",
+    );
+
+    release_preflight_tx.send(()).unwrap();
+    let admitted_ids = query.join().unwrap().unwrap();
+    assert_eq!(admitted_ids, vec![first]);
+    assert!(
+        writer_finished_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap()
+            .unwrap()
+            .created
+    );
+    writer.join().unwrap();
+    assert_eq!(registry.series_count_for_metric("cpu"), 2);
+}
+
+#[test]
 fn metric_postings_pages_seek_after_the_exclusive_cursor() {
     let registry = SeriesRegistry::new();
     let mut expected = Vec::new();

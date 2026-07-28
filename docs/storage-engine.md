@@ -163,16 +163,34 @@ lifecycle/persistence work is needed to advance durability.
 
 ### WAL high-watermark
 
-A separate file `wal.published` records the highest `(segment, frame)` pair that has been durably flushed to a segment on disk. On crash recovery this watermark determines which WAL frames have already been persisted and can be skipped during replay.
+A separate file `wal.published` records the logical published boundary `H = (segment, frame)`.
+Legacy 24-byte `TSHW` records contain only `H` and do not authorize a reset. V2 40-byte `TSH2`
+records additionally contain a reset-through floor `R`, require `R <= H`, and protect both marks
+with a CRC-32.
+
+Recovery and replay use the effective floor
+`F = max(clean persisted replay floor, R)`. If `H > F`, recovery must find the exact `H` frame in
+the boundary segment before any suffix truncation. The frame may be absent only when `F >= H`.
+After validation, recovery restores the runtime append and durable high-water floors through `H`.
+The marker is read only as an exact 24- or 40-byte regular non-link file, with no-follow and
+file-identity checks where supported.
+
+A reset durably publishes `TSH2` with
+`H = R = max(last appended high-water mark, (active segment, 0))` before truncating the active
+segment or removing older segments. Later commits preserve `R` and advance `H`, so only the
+reset-covered prefix may be absent.
 
 ### Replay modes
 
 | Mode | Behavior |
 |---|---|
 | `Strict` (default) | Any checksum mismatch or truncation fails the open call immediately. |
-| `Salvage` | Skips corrupted frames whose boundaries are intact; quarantines the corrupt segment and continues from the next. |
+| `Salvage` | Applies logical replay salvage only after the complete published prefix passes strict physical validation. |
 
-On open, if the last active segment is found corrupt, it is quarantined (left in place) and a fresh segment is started.
+Every persistent open validates the complete published WAL prefix before either logical replay
+policy is applied. `Salvage` cannot skip, quarantine, rewrite, or recover corrupt published data in
+place. Use the explicit `tsink-inspect salvage` destination workflow when a bounded recovery copy
+is required; the original data directory remains unchanged.
 
 Lifecycle replay does not collect the WAL into one pending write. It reserves each bounded frame
 before payload allocation, applies definitions singly, and decodes one sample batch at a time under
@@ -307,7 +325,7 @@ of low-rate recent points without fragmenting the persisted index every 250 ms.
 3. **Persist recovery metadata** — persist the selected registry delta required to decode the new roots. A bounded pass does not rebuild the complete registry catalog; the serialized persisted-refresh owner later applies the exact root delta to its per-segment sidecar.
 4. **Publish persisted visibility** — under the catalog visibility fence, install the verified indexes and make the roots query-visible as one transition.
 5. **Release sealed memory** — only after successful visibility publication, advance persisted chunk watermarks, remove pending locators, and evict covered sealed chunks.
-6. **Advance durability and trim safely** — mark the selected replay-closed WAL high-water mark durable, then reset/trim only when no newer committed write makes that reset unsafe.
+6. **Advance durability and trim safely** — mark the selected replay-closed WAL high-water mark durable, then reset/trim only when no newer committed write makes that reset unsafe. Reset publishes and synchronizes `TSH2` with `H = R` before removing any covered WAL frame.
 
 Any failure before step 4 rolls back the staged roots and leaves WAL durability and the pending
 sealed prefix unchanged for retry. Lowering a segment checkpoint below selected data would duplicate
@@ -654,7 +672,7 @@ A fully configured storage instance on disk:
   wal/
     wal-0.log            ← WAL segments (oldest to active)
     wal-1.log
-    wal.published        ← flush high-watermark checkpoint
+    wal.published        ← published WAL boundary and optional checksummed reset floor
   lane_numeric/
     segments/
       L0/

@@ -36,6 +36,95 @@ fn storage_with_query_limits_and_metadata_shards(limits: QueryBudgetLimits) -> C
     .unwrap()
 }
 
+fn storage_with_wal_and_query_limits(limits: QueryBudgetLimits) -> (TempDir, ChunkStorage) {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let options = ChunkStorageOptions {
+        retention_enforced: false,
+        background_threads_enabled: false,
+        background_fail_fast: false,
+        ..ChunkStorageOptions::default()
+    };
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+        64,
+        Some(wal),
+        None,
+        None,
+        1,
+        options,
+        None,
+        limits,
+    )
+    .unwrap();
+    (temp_dir, storage)
+}
+
+fn prime_wal_only_metric(storage: &ChunkStorage) {
+    storage
+        .persisted
+        .wal
+        .as_ref()
+        .expect("test storage has a WAL")
+        .prime_committed_series_definitions_snapshot([SeriesDefinitionFrame {
+            series_id: u64::MAX - 1,
+            metric: "wal_only_metadata".to_string(),
+            labels: vec![Label::new("origin", "wal")],
+        }]);
+}
+
+fn insert_live_and_prime_duplicate_wal_union(storage: &ChunkStorage) {
+    storage
+        .insert_rows(&[Row::with_labels(
+            "shared_wal_union",
+            vec![Label::new("host", "live")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage
+        .persisted
+        .wal
+        .as_ref()
+        .expect("test storage has a WAL")
+        .prime_committed_series_definitions_snapshot([
+            SeriesDefinitionFrame {
+                series_id: u64::MAX - 4,
+                metric: "shared_wal_union".to_string(),
+                labels: vec![Label::new("host", "live")],
+            },
+            SeriesDefinitionFrame {
+                series_id: u64::MAX - 3,
+                metric: "shared_wal_union".to_string(),
+                labels: vec![Label::new("host", "live")],
+            },
+            SeriesDefinitionFrame {
+                series_id: u64::MAX - 2,
+                metric: "wal_union_only".to_string(),
+                labels: vec![Label::new("origin", "wal")],
+            },
+            SeriesDefinitionFrame {
+                series_id: u64::MAX - 1,
+                metric: "wal_union_only".to_string(),
+                labels: vec![Label::new("origin", "wal")],
+            },
+        ]);
+}
+
+fn prime_large_wal_metadata_snapshot(storage: &ChunkStorage) {
+    let metric_suffix = "x".repeat(4_096);
+    storage
+        .persisted
+        .wal
+        .as_ref()
+        .expect("test storage has a WAL")
+        .prime_committed_series_definitions_snapshot((0..64u64).map(|series_id| {
+            SeriesDefinitionFrame {
+                series_id,
+                metric: format!("wal_preflight_{series_id:03}_{metric_suffix}"),
+                labels: Vec::new(),
+            }
+        }));
+}
+
 fn insert_two_points(storage: &ChunkStorage) {
     storage
         .insert_rows(&[
@@ -1314,6 +1403,729 @@ fn guarded_row_scan_preflights_resolved_identity_clones_at_exact_boundaries() {
     }
 }
 
+#[test]
+fn guarded_row_scan_preflights_unique_matched_id_buffer_at_exact_boundaries() {
+    const MATCHED_SERIES: usize = 128;
+    let requested = (0..MATCHED_SERIES)
+        .map(|index| MetricSeries {
+            name: "guarded_row_scan_matched".to_string(),
+            labels: vec![Label::new(
+                "host",
+                format!("matched-host-{index:04}-{}", "x".repeat(128)),
+            )],
+        })
+        .collect::<Vec<_>>();
+    let build_storage = |limits| {
+        let storage = storage_with_query_limits(limits);
+        let rows = requested
+            .iter()
+            .enumerate()
+            .map(|(index, series)| {
+                Row::with_labels(
+                    series.name.clone(),
+                    series.labels.clone(),
+                    DataPoint::new(1, index as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage
+    };
+
+    let calibration = build_storage(QueryBudgetLimits::default());
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let result = calibration
+        .scan_series_rows_with_execution_result(
+            &requested,
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        )
+        .unwrap();
+    assert!(result.page.rows.is_empty());
+    assert_eq!(result.reserved_memory_bytes(), 0);
+    assert_eq!(execution.snapshot().series_matched, MATCHED_SERIES as u64);
+    drop(result);
+    drop(execution);
+    let exact_memory = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(
+        exact_memory
+            >= super::super::query_exec::modeled_vec_capacity_bytes::<SeriesId>(MATCHED_SERIES)
+    );
+
+    for (memory_limit, should_succeed) in [(exact_memory, true), (exact_memory - 1, false)] {
+        let storage = build_storage(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(memory_limit),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(memory_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_series_rows_with_execution_result(
+            &requested,
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact matched-ID memory boundary must succeed");
+            assert!(result.page.rows.is_empty());
+            assert_eq!(execution.snapshot().series_matched, MATCHED_SERIES as u64);
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one byte below the matched-ID resolution peak must fail"),
+                QueryLimitReason::PerQueryMemoryBytes,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn guarded_row_scan_counts_unique_existing_series_and_ignores_missing_series() {
+    let existing_a = MetricSeries {
+        name: "guarded_row_scan_duplicates".to_string(),
+        labels: vec![Label::new("host", "a")],
+    };
+    let existing_b = MetricSeries {
+        name: "guarded_row_scan_duplicates".to_string(),
+        labels: vec![Label::new("host", "b")],
+    };
+    let missing = MetricSeries {
+        name: "guarded_row_scan_duplicates".to_string(),
+        labels: vec![Label::new("host", "missing")],
+    };
+    let requested = vec![
+        missing,
+        existing_a.clone(),
+        existing_a.clone(),
+        existing_b.clone(),
+    ];
+
+    for (series_limit, should_succeed) in [(2, true), (1, false)] {
+        let storage = storage_with_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    existing_a.name.clone(),
+                    existing_a.labels.clone(),
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    existing_b.name.clone(),
+                    existing_b.labels.clone(),
+                    DataPoint::new(1, 2.0),
+                ),
+            ])
+            .unwrap();
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_series_rows_with_execution_result(
+            &requested,
+            0,
+            2,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("two unique existing series must fit the exact limit");
+            assert_eq!(result.page.rows.len(), 3);
+            assert!(!result.page.truncated);
+            assert_eq!(result.page.next_row_offset, None);
+            assert_eq!(execution.snapshot().series_matched, 2);
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one-under unique matched-series limit must fail"),
+                QueryLimitReason::SeriesMatched,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+fn metric_row_scan_storage(
+    limits: QueryBudgetLimits,
+    target_series: usize,
+    unrelated_series: usize,
+    long_labels: bool,
+) -> ChunkStorage {
+    let storage = storage_with_query_limits(limits);
+    let rows = (0..target_series)
+        .map(|index| {
+            let labels = if long_labels {
+                (0..6)
+                    .map(|label_index| {
+                        Label::new(
+                            format!("dimension_{label_index:02}"),
+                            format!("target-{index:04}-{label_index:02}-{}", "x".repeat(512)),
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![Label::new("host", format!("target-{index:04}"))]
+            };
+            Row::with_labels("metric_row_target", labels, DataPoint::new(1, index as f64))
+        })
+        .chain((0..unrelated_series).map(|index| {
+            Row::with_labels(
+                format!("metric_row_unrelated_{index:04}"),
+                vec![Label::new("host", format!("unrelated-{index:04}"))],
+                DataPoint::new(1, index as f64),
+            )
+        }))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+    storage
+}
+
+#[test]
+fn metric_row_scan_charges_only_target_metric_at_exact_series_and_vector_boundaries() {
+    const TARGET_SERIES: usize = 8;
+    const UNRELATED_SERIES: usize = 64;
+
+    for (series_limit, should_succeed) in [
+        (TARGET_SERIES as u64, true),
+        (TARGET_SERIES as u64 - 1, false),
+    ] {
+        let storage = metric_row_scan_storage(
+            QueryBudgetLimits {
+                per_query: QueryWorkLimits {
+                    max_series_matched: Some(series_limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            TARGET_SERIES,
+            UNRELATED_SERIES,
+            false,
+        );
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_execution_result(
+            "metric_row_target",
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact matched-series limit must succeed");
+            assert!(result.page.rows.is_empty());
+            assert_eq!(execution.snapshot().series_matched, TARGET_SERIES as u64);
+            assert_eq!(
+                execution.snapshot().intermediate_vector_size,
+                TARGET_SERIES as u64
+            );
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one under the target metric count must fail"),
+                QueryLimitReason::SeriesMatched,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    for (vector_limit, should_succeed) in [
+        (TARGET_SERIES as u64, true),
+        (TARGET_SERIES as u64 - 1, false),
+    ] {
+        let storage = metric_row_scan_storage(
+            QueryBudgetLimits {
+                per_query: QueryWorkLimits {
+                    max_intermediate_vector_size: Some(vector_limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            TARGET_SERIES,
+            UNRELATED_SERIES,
+            false,
+        );
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_execution_result(
+            "metric_row_target",
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            assert!(result.unwrap().page.rows.is_empty());
+        } else {
+            assert_query_limit(
+                result.expect_err("one under the target postings length must fail"),
+                QueryLimitReason::IntermediateVectorSize,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn metric_row_scan_identity_preflight_has_an_exact_memory_boundary() {
+    const TARGET_SERIES: usize = 32;
+    let calibration =
+        metric_row_scan_storage(QueryBudgetLimits::default(), TARGET_SERIES, 16, true);
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let result = calibration
+        .scan_metric_rows_with_execution_result(
+            "metric_row_target",
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        )
+        .unwrap();
+    assert!(result.page.rows.is_empty());
+    drop(result);
+    drop(execution);
+    let exact_memory = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_memory > 0);
+
+    for (memory_limit, should_succeed) in [(exact_memory, true), (exact_memory - 1, false)] {
+        let storage = metric_row_scan_storage(
+            QueryBudgetLimits {
+                max_shared_memory_bytes: Some(memory_limit),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(memory_limit),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            TARGET_SERIES,
+            16,
+            true,
+        );
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_execution_result(
+            "metric_row_target",
+            2,
+            3,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            assert!(result.unwrap().page.rows.is_empty());
+        } else {
+            assert_query_limit(
+                result.expect_err("one byte below the identity peak must fail"),
+                QueryLimitReason::PerQueryMemoryBytes,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn metric_row_scan_result_guard_owns_returned_rows_until_drop() {
+    let storage = metric_row_scan_storage(QueryBudgetLimits::default(), 1, 0, false);
+    assert_eq!(
+        storage.scan_metric_rows_execution_accounting(),
+        QueryExecutionAccounting::Complete
+    );
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let result = storage
+        .scan_metric_rows_with_execution_result(
+            "metric_row_target",
+            0,
+            2,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        )
+        .unwrap();
+    assert_eq!(result.page.rows.len(), 1);
+    let retained = super::super::query_exec::modeled_query_rows_retained_bytes(&result.page.rows);
+    assert!(retained > 0);
+    assert_eq!(result.reserved_memory_bytes(), retained);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        retained
+    );
+
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        retained
+    );
+    drop(result);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        0
+    );
+}
+
+#[test]
+fn metric_row_scan_caps_allocation_for_an_unbounded_logical_page_limit() {
+    let storage = metric_row_scan_storage(QueryBudgetLimits::default(), 1, 0, false);
+    let before = storage
+        .observability_snapshot()
+        .query
+        .merge_path_queries_total;
+    let page = storage
+        .scan_metric_rows(
+            "metric_row_target",
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(usize::MAX),
+                ..crate::QueryRowsScanOptions::default()
+            },
+        )
+        .expect("a huge logical page limit must not become a huge Vec allocation");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .query
+            .merge_path_queries_total,
+        before + 1,
+        "the regression must exercise the bounded merge-page collector",
+    );
+    let snapshot = storage.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+}
+
+#[test]
+fn empty_metric_row_scan_returns_a_zero_byte_guard_that_keeps_the_query_lease() {
+    let storage = storage_with_query_limits(QueryBudgetLimits::default());
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let mut result = storage
+        .scan_metric_rows_with_execution_result(
+            "missing_metric",
+            0,
+            1,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        )
+        .unwrap();
+    assert!(result.page.rows.is_empty());
+    let reservation = result
+        .take_memory_reservation()
+        .expect("complete accounting must return a guard even for an empty page");
+    assert_eq!(reservation.bytes(), 0);
+    drop(result);
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+    drop(reservation);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+}
+
+#[test]
+fn row_scan_exact_page_only_truncates_for_a_real_later_row() {
+    let storage = storage_with_query_limits(QueryBudgetLimits::default());
+    let first = MetricSeries {
+        name: "row_page_first".to_string(),
+        labels: vec![Label::new("host", "a")],
+    };
+    let second = MetricSeries {
+        name: "row_page_second".to_string(),
+        labels: vec![Label::new("host", "b")],
+    };
+    let missing = MetricSeries {
+        name: "row_page_missing".to_string(),
+        labels: vec![Label::new("host", "missing")],
+    };
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                first.name.clone(),
+                first.labels.clone(),
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                second.name.clone(),
+                second.labels.clone(),
+                DataPoint::new(1, 2.0),
+            ),
+        ])
+        .unwrap();
+
+    let terminal = storage
+        .scan_series_rows(
+            &[first.clone(), missing],
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(1),
+                ..crate::QueryRowsScanOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(terminal.rows.len(), 1);
+    assert_eq!(terminal.rows[0].metric, first.name);
+    assert!(!terminal.truncated);
+    assert_eq!(terminal.next_row_offset, None);
+
+    let first_page = storage
+        .scan_series_rows(
+            &[first.clone(), second.clone()],
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(1),
+                ..crate::QueryRowsScanOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(first_page.rows.len(), 1);
+    assert_eq!(first_page.rows[0].metric, first.name);
+    assert!(first_page.truncated);
+    assert_eq!(first_page.next_row_offset, Some(1));
+
+    let second_page = storage
+        .scan_series_rows(
+            &[first, second.clone()],
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                row_offset: first_page.next_row_offset,
+                max_rows: Some(1),
+            },
+        )
+        .unwrap();
+    assert_eq!(second_page.rows.len(), 1);
+    assert_eq!(second_page.rows[0].metric, second.name);
+    assert!(!second_page.truncated);
+    assert_eq!(second_page.next_row_offset, None);
+}
+
+#[test]
+fn metric_row_returned_bytes_count_the_inline_point_once_at_exact_boundary() {
+    let metric = "metric_row_returned_exact";
+    let labels = vec![Label::new("host", "alpha")];
+    let expected = u64::try_from(
+        std::mem::size_of::<Row>()
+            .saturating_add(metric.len())
+            .saturating_add(std::mem::size_of::<Label>())
+            .saturating_add(labels[0].name.len())
+            .saturating_add(labels[0].value.len()),
+    )
+    .unwrap();
+
+    for (returned_limit, should_succeed) in [(expected, true), (expected - 1, false)] {
+        let storage = storage_with_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(returned_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                labels.clone(),
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_execution_result(
+            metric,
+            0,
+            2,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact logical row-byte boundary must succeed");
+            assert_eq!(result.page.rows.len(), 1);
+            assert_eq!(execution.snapshot().returned_bytes, expected);
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one byte below the logical row size must fail"),
+                QueryLimitReason::ReturnedBytes,
+            );
+        }
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+}
+
+#[test]
+fn one_row_page_preflights_the_full_sealed_chunk_vector() {
+    const POINTS: usize = 32;
+    for (vector_limit, should_succeed) in [(POINTS as u64, true), (POINTS as u64 - 1, false)] {
+        let storage = storage_with_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_intermediate_vector_size: Some(vector_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        storage
+            .insert_rows(
+                &(0..POINTS)
+                    .map(|index| {
+                        Row::new(
+                            "sealed_page_vector",
+                            DataPoint::new(i64::try_from(index).unwrap(), index as f64),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage.flush_all_active().unwrap();
+
+        let result = storage.scan_metric_rows(
+            "sealed_page_vector",
+            0,
+            i64::try_from(POINTS).unwrap(),
+            crate::QueryRowsScanOptions {
+                max_rows: Some(1),
+                ..crate::QueryRowsScanOptions::default()
+            },
+        );
+        if should_succeed {
+            let page = result.expect("the exact decoded-vector boundary must succeed");
+            assert_eq!(page.rows.len(), 1);
+            assert!(page.truncated);
+        } else {
+            assert_query_limit(
+                result.expect_err("one below the decoded chunk length must fail"),
+                QueryLimitReason::IntermediateVectorSize,
+            );
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+}
+
+#[test]
+fn zero_match_sealed_snapshot_preflights_candidate_vector_before_allocation() {
+    const CHUNKS: usize = 16;
+    for (vector_limit, should_succeed) in [(CHUNKS as u64, true), (CHUNKS as u64 - 1, false)] {
+        let options = ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            background_fail_fast: false,
+            ..ChunkStorageOptions::default()
+        };
+        let storage =
+            ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+                1,
+                None,
+                None,
+                None,
+                1,
+                options,
+                None,
+                QueryBudgetLimits {
+                    per_query: QueryWorkLimits {
+                        max_intermediate_vector_size: Some(vector_limit),
+                        ..QueryWorkLimits::default()
+                    },
+                    ..QueryBudgetLimits::default()
+                },
+            )
+            .unwrap();
+        storage
+            .insert_rows(
+                &(0..CHUNKS)
+                    .map(|index| {
+                        Row::new(
+                            "sealed_zero_match",
+                            DataPoint::new(i64::try_from(index).unwrap(), index as f64),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage.flush_all_active().unwrap();
+
+        let result = storage.scan_metric_rows(
+            "sealed_zero_match",
+            100,
+            101,
+            crate::QueryRowsScanOptions::default(),
+        );
+        if should_succeed {
+            assert!(result
+                .expect("the exact sealed-candidate boundary must succeed")
+                .rows
+                .is_empty());
+        } else {
+            assert_query_limit(
+                result.expect_err("one below the sealed candidate count must fail"),
+                QueryLimitReason::IntermediateVectorSize,
+            );
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+}
+
 const DEAD_METADATA_SERIES_COUNT: usize = 16_384;
 
 fn dead_metadata_storage(limits: QueryBudgetLimits) -> ChunkStorage {
@@ -1427,6 +2239,573 @@ fn list_metrics_uses_one_execution_and_preflights_exact_result_and_memory_limits
         }
         assert_eq!(storage.query_budget_snapshot().active_queries, 0);
     }
+}
+
+#[test]
+fn list_metrics_with_wal_accounts_snapshot_union_and_wal_only_results_exactly() {
+    let (_calibration_dir, calibration) =
+        storage_with_wal_and_query_limits(QueryBudgetLimits::default());
+    insert_metadata_limit_series(&calibration);
+    prime_wal_only_metric(&calibration);
+    let before = calibration.query_budget_snapshot();
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let detailed = calibration
+        .list_metrics_with_wal_with_execution_result(&execution)
+        .unwrap();
+    assert_eq!(detailed.series.len(), 4);
+    assert!(detailed
+        .series
+        .iter()
+        .any(|series| series.name == "wal_only_metadata"));
+    assert_eq!(execution.snapshot().series_matched, 4);
+    let exact_returned_bytes = execution.snapshot().returned_bytes;
+    let exact_intermediate = execution.snapshot().intermediate_vector_size;
+    let exact_memory_bytes = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_returned_bytes > 0);
+    assert!(exact_intermediate >= 4);
+    assert!(exact_memory_bytes > 0);
+    drop(detailed);
+    drop(execution);
+    let after = calibration.query_budget_snapshot();
+    assert_eq!(
+        after.queries_started_total - before.queries_started_total,
+        1
+    );
+    assert_eq!(
+        after.queries_completed_total - before.queries_completed_total,
+        1
+    );
+    assert_eq!(after.active_queries, 0);
+    assert_eq!(after.shared_reserved_memory_bytes, 0);
+    assert_eq!(after.accounting_invariant_violations_total, 0);
+
+    for (series_limit, should_succeed) in [(4, true), (3, false)] {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        prime_wal_only_metric(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 4);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::SeriesMatched);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (returned_limit, should_succeed) in [
+        (exact_returned_bytes, true),
+        (exact_returned_bytes - 1, false),
+    ] {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(returned_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        prime_wal_only_metric(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 4);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::ReturnedBytes);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (intermediate_limit, should_succeed) in
+        [(exact_intermediate, true), (exact_intermediate - 1, false)]
+    {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_intermediate_vector_size: Some(intermediate_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        prime_wal_only_metric(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 4);
+        } else {
+            assert_query_limit(
+                result.unwrap_err(),
+                QueryLimitReason::IntermediateVectorSize,
+            );
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (memory_limit, should_succeed) in
+        [(exact_memory_bytes, true), (exact_memory_bytes - 1, false)]
+    {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(memory_limit),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(memory_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        prime_wal_only_metric(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 4);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::PerQueryMemoryBytes);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn list_metrics_with_wal_preflights_exact_union_limits_across_duplicates() {
+    let (_calibration_dir, calibration) =
+        storage_with_wal_and_query_limits(QueryBudgetLimits::default());
+    insert_live_and_prime_duplicate_wal_union(&calibration);
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let detailed = calibration
+        .list_metrics_with_wal_with_execution_result(&execution)
+        .unwrap();
+    assert_eq!(
+        detailed.series,
+        vec![
+            MetricSeries {
+                name: "shared_wal_union".to_string(),
+                labels: vec![Label::new("host", "live")],
+            },
+            MetricSeries {
+                name: "wal_union_only".to_string(),
+                labels: vec![Label::new("origin", "wal")],
+            },
+        ]
+    );
+    assert_eq!(execution.snapshot().series_matched, 2);
+    let exact_returned_bytes = execution.snapshot().returned_bytes;
+    assert!(exact_returned_bytes > 0);
+    drop(detailed);
+    drop(execution);
+
+    for (series_limit, should_succeed) in [(2, true), (1, false)] {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_live_and_prime_duplicate_wal_union(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 2);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::SeriesMatched);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (returned_limit, should_succeed) in [
+        (exact_returned_bytes, true),
+        (exact_returned_bytes - 1, false),
+    ] {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(returned_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_live_and_prime_duplicate_wal_union(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 2);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::ReturnedBytes);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+}
+
+#[test]
+fn list_metrics_with_wal_preflights_candidate_expansion_before_snapshot_clone() {
+    const WAL_CANDIDATES: u64 = 64;
+
+    for (candidate_limit, should_succeed) in [(WAL_CANDIDATES, true), (WAL_CANDIDATES - 1, false)] {
+        let (_dir, storage) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_pattern_expansion: Some(candidate_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        prime_large_wal_metadata_snapshot(&storage);
+        let result = storage.list_metrics_with_wal();
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), WAL_CANDIDATES as usize);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::PatternExpansion);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(
+            snapshot.pattern_expansion_rejections_total,
+            if should_succeed { 0 } else { 1 }
+        );
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn list_metrics_with_wal_rejects_tiny_output_limits_before_full_snapshot_admission() {
+    const MEMORY_LIMIT: u64 = 128 * 1024;
+
+    let (_memory_dir, memory_limited) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+        max_shared_memory_bytes: Some(MEMORY_LIMIT),
+        per_query: QueryWorkLimits {
+            max_memory_bytes: Some(MEMORY_LIMIT),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    });
+    prime_large_wal_metadata_snapshot(&memory_limited);
+    assert_query_limit(
+        memory_limited.list_metrics_with_wal().unwrap_err(),
+        QueryLimitReason::PerQueryMemoryBytes,
+    );
+
+    let (_series_dir, series_limited) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+        max_shared_memory_bytes: Some(MEMORY_LIMIT),
+        per_query: QueryWorkLimits {
+            max_series_matched: Some(1),
+            max_memory_bytes: Some(MEMORY_LIMIT),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    });
+    prime_large_wal_metadata_snapshot(&series_limited);
+    assert_query_limit(
+        series_limited.list_metrics_with_wal().unwrap_err(),
+        QueryLimitReason::SeriesMatched,
+    );
+    let snapshot = series_limited.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+
+    let (_returned_dir, returned_limited) = storage_with_wal_and_query_limits(QueryBudgetLimits {
+        max_shared_memory_bytes: Some(MEMORY_LIMIT),
+        per_query: QueryWorkLimits {
+            max_returned_bytes: Some(1),
+            max_memory_bytes: Some(MEMORY_LIMIT),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    });
+    prime_large_wal_metadata_snapshot(&returned_limited);
+    assert_query_limit(
+        returned_limited.list_metrics_with_wal().unwrap_err(),
+        QueryLimitReason::ReturnedBytes,
+    );
+    let snapshot = returned_limited.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+}
+
+#[test]
+fn list_metrics_in_shards_uses_one_execution_and_preflights_exact_limits() {
+    let calibration = storage_with_query_limits_and_metadata_shards(QueryBudgetLimits::default());
+    insert_metadata_limit_series(&calibration);
+    let scope = crate::storage::MetadataShardScope::new(1, vec![0]);
+
+    let budget_before = calibration.query_budget_snapshot();
+    let select_series_calls_before = calibration
+        .observability_snapshot()
+        .query
+        .select_series_calls_total;
+    assert_eq!(calibration.list_metrics_in_shards(&scope).unwrap().len(), 3);
+    let budget_after = calibration.query_budget_snapshot();
+    assert_eq!(
+        budget_after.queries_started_total - budget_before.queries_started_total,
+        1
+    );
+    assert_eq!(
+        budget_after.queries_completed_total - budget_before.queries_completed_total,
+        1
+    );
+    assert_eq!(budget_after.active_queries, 0);
+    assert_eq!(budget_after.shared_reserved_memory_bytes, 0);
+    assert_eq!(
+        calibration
+            .observability_snapshot()
+            .query
+            .select_series_calls_total,
+        select_series_calls_before,
+        "a shard-scoped list must not be reported as a select_series call",
+    );
+
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let detailed = calibration
+        .select_series_in_shards_with_execution_result(&SeriesSelection::new(), &scope, &execution)
+        .unwrap();
+    assert_eq!(detailed.series.len(), 3);
+    let exact_returned_bytes = execution.snapshot().returned_bytes;
+    let exact_memory_bytes = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_returned_bytes > 0);
+    assert!(exact_memory_bytes > 0);
+    drop(detailed);
+    drop(execution);
+    assert_eq!(
+        calibration
+            .query_budget_snapshot()
+            .shared_reserved_memory_bytes,
+        0
+    );
+
+    for (series_limit, should_succeed) in [(3, true), (2, false)] {
+        let storage = storage_with_query_limits_and_metadata_shards(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        let result = storage.list_metrics_in_shards(&scope);
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 3);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::SeriesMatched);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (returned_limit, should_succeed) in [
+        (exact_returned_bytes, true),
+        (exact_returned_bytes - 1, false),
+    ] {
+        let storage = storage_with_query_limits_and_metadata_shards(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(returned_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        let result = storage.list_metrics_in_shards(&scope);
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 3);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::ReturnedBytes);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    }
+
+    for (memory_limit, should_succeed) in
+        [(exact_memory_bytes, true), (exact_memory_bytes - 1, false)]
+    {
+        let storage = storage_with_query_limits_and_metadata_shards(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(memory_limit),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(memory_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        insert_metadata_limit_series(&storage);
+        let result = storage.list_metrics_in_shards(&scope);
+        if should_succeed {
+            assert_eq!(result.unwrap().len(), 3);
+        } else {
+            assert_query_limit(result.unwrap_err(), QueryLimitReason::PerQueryMemoryBytes);
+        }
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    let concurrent = storage_with_query_limits_and_metadata_shards(QueryBudgetLimits {
+        max_concurrent_queries: Some(1),
+        ..QueryBudgetLimits::default()
+    });
+    insert_metadata_limit_series(&concurrent);
+    let held = concurrent
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    assert_query_limit(
+        concurrent.list_metrics_in_shards(&scope).unwrap_err(),
+        QueryLimitReason::ConcurrentQueries,
+    );
+    drop(held);
+    let snapshot = concurrent.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+}
+
+#[test]
+fn shard_metadata_admission_uses_scoped_candidates_and_preserves_precedence() {
+    let shard_count = 64u32;
+    let limits = QueryBudgetLimits {
+        max_concurrent_queries: Some(1),
+        max_shared_memory_bytes: Some(2_048),
+        per_query: QueryWorkLimits {
+            max_series_matched: Some(1),
+            max_pattern_expansion: Some(1),
+            max_intermediate_vector_size: Some(1),
+            max_memory_bytes: Some(2_048),
+            ..QueryWorkLimits::default()
+        },
+    };
+    let options = ChunkStorageOptions {
+        retention_enforced: false,
+        background_threads_enabled: false,
+        background_fail_fast: false,
+        metadata_shard_count: Some(shard_count),
+        ..ChunkStorageOptions::default()
+    };
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+        64, None, None, None, 1, options, None, limits,
+    )
+    .unwrap();
+    let metric = "scoped_candidate_budget";
+    let target_shard = 0u32;
+    let mut occupied = vec![false; shard_count as usize];
+    let mut rows = Vec::new();
+    let mut target_added = false;
+    for index in 0..10_000 {
+        let labels = vec![Label::new("host", format!("candidate-{index}"))];
+        let shard = (crate::label::stable_series_identity_hash(metric, &labels)
+            % u64::from(shard_count)) as u32;
+        if shard == target_shard {
+            if target_added {
+                continue;
+            }
+            target_added = true;
+        } else if rows.len() >= 24 {
+            continue;
+        }
+        occupied[shard as usize] = true;
+        rows.push(Row::with_labels(
+            metric,
+            labels,
+            DataPoint::new(1, index as f64),
+        ));
+        if target_added && rows.len() >= 24 {
+            break;
+        }
+    }
+    assert!(target_added);
+    assert!(rows.len() > 10);
+    storage.insert_rows(&rows).unwrap();
+
+    let held = storage
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let before_shortcuts = storage.query_budget_snapshot();
+    assert!(storage
+        .list_metrics_in_shards(&crate::storage::MetadataShardScope::new(
+            shard_count,
+            Vec::new(),
+        ))
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .select_series_in_shards(
+            &SeriesSelection::new(),
+            &crate::storage::MetadataShardScope::new(shard_count, Vec::new()),
+        )
+        .unwrap()
+        .is_empty());
+    let mismatch = crate::storage::MetadataShardScope::new(shard_count / 2, vec![0]);
+    assert!(matches!(
+        storage.list_metrics_in_shards(&mismatch),
+        Err(TsinkError::UnsupportedOperation {
+            operation: "list_metrics_in_shards",
+            ..
+        })
+    ));
+    assert!(matches!(
+        storage.select_series_in_shards(&SeriesSelection::new(), &mismatch),
+        Err(TsinkError::UnsupportedOperation {
+            operation: "select_series_in_shards",
+            ..
+        })
+    ));
+    let after_shortcuts = storage.query_budget_snapshot();
+    assert_eq!(
+        after_shortcuts.queries_started_total,
+        before_shortcuts.queries_started_total
+    );
+    assert_eq!(
+        after_shortcuts.concurrency_rejections_total,
+        before_shortcuts.concurrency_rejections_total
+    );
+    drop(held);
+
+    let target_scope = crate::storage::MetadataShardScope::new(shard_count, vec![target_shard]);
+    assert_eq!(
+        storage.list_metrics_in_shards(&target_scope).unwrap().len(),
+        1
+    );
+    let empty_shard = occupied
+        .iter()
+        .position(|is_occupied| !*is_occupied)
+        .expect("the sparse fixture must leave an empty metadata shard");
+    assert!(storage
+        .list_metrics_in_shards(&crate::storage::MetadataShardScope::new(
+            shard_count,
+            vec![u32::try_from(empty_shard).unwrap()],
+        ))
+        .unwrap()
+        .is_empty());
+    let snapshot = storage.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
 }
 
 #[test]

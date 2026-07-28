@@ -12,10 +12,30 @@ impl ChunkStorage {
         out: &mut Vec<DataPoint>,
         execution: Option<&QueryExecution>,
     ) -> Result<PersistedTierFetchStats> {
+        let (stats, _query_reservation) = self
+            .execute_series_read_append_sort_path_with_reservation(
+                series_id, start, end, snapshot, out, execution,
+            )?;
+        Ok(stats)
+    }
+
+    fn execute_series_read_append_sort_path_with_reservation(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        snapshot: SeriesReadSnapshot,
+        out: &mut Vec<DataPoint>,
+        execution: Option<&QueryExecution>,
+    ) -> Result<(
+        PersistedTierFetchStats,
+        Option<crate::QueryMemoryReservation>,
+    )> {
         let mut working_reservation = reserve_query_read_working_set(
             execution,
             &snapshot,
             snapshot.analysis.estimated_points,
+            0,
         )?;
         let SeriesReadSnapshot {
             persisted,
@@ -25,22 +45,22 @@ impl ChunkStorage {
             query_reservation: _source_snapshot_reservation,
         } = snapshot;
 
-        out.clear();
-        out.reserve(analysis.estimated_points);
+        let mut decoded = Vec::with_capacity(analysis.estimated_points);
         let persisted_stats = decode_append_sort_sources_into(
             &persisted,
             &sealed_chunks,
             &active_points,
             start,
             end,
-            out,
+            &mut decoded,
             execution,
         )?;
-        self.finalize_append_sort_points(series_id, analysis, out, execution)?;
+        self.finalize_append_sort_points(series_id, analysis, &mut decoded, execution)?;
         if let Some(reservation) = working_reservation.as_mut() {
-            reservation.resize(modeled_points_bytes(out))?;
+            reservation.resize(modeled_points_retained_bytes(&decoded))?;
         }
-        Ok(persisted_stats)
+        publish_vec_reusing_capacity(out, decoded);
+        Ok((persisted_stats, working_reservation))
     }
 
     pub(super) fn collect_raw_series_page_with_append_sort(
@@ -53,23 +73,34 @@ impl ChunkStorage {
         execution: Option<&QueryExecution>,
     ) -> Result<RawSeriesScanPage> {
         let mut points = Vec::new();
-        let stats = self.execute_series_read_append_sort_path(
-            series_id,
-            start,
-            end,
-            snapshot,
-            &mut points,
-            execution,
-        )?;
+        let (stats, mut query_reservation) = self
+            .execute_series_read_append_sort_path_with_reservation(
+                series_id,
+                start,
+                end,
+                snapshot,
+                &mut points,
+                execution,
+            )?;
         let total_rows = points.len();
         let rows_consumed = pagination.rows_consumed(total_rows);
         apply_offset_limit_in_place(&mut points, pagination.offset, pagination.limit);
+        if let Some(reservation) = query_reservation.as_mut() {
+            if let Err(error) = reservation.resize(modeled_points_retained_bytes(&points)) {
+                // `query_reservation` was bound after `points`; destroy the protected allocation
+                // explicitly before returning the resize failure.
+                drop(points);
+                drop(query_reservation);
+                return Err(error.into());
+            }
+        }
 
         Ok(RawSeriesScanPage {
             points,
             final_rows_seen: saturating_u64_from_usize(rows_consumed),
             reached_end: rows_consumed >= total_rows,
             stats,
+            query_reservation,
         })
     }
 

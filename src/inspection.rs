@@ -24,6 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh64::Xxh64;
 
+use crate::engine::segment::WalHighWatermark;
+use crate::engine::wal::{
+    decode_published_highwater_record, encode_published_highwater_record, PublishedHighwaterRecord,
+};
 use crate::{Result, TsinkError};
 
 /// Schema version of [`DataDirectoryInspectionReport`].
@@ -43,8 +47,9 @@ const CURRENT_FORMAT_FEATURES: [&str; 4] = [
 const WAL_FRAME_MAGIC: [u8; 4] = *b"TSFR";
 const WAL_FRAME_HEADER_BYTES: u64 = 24;
 const WAL_MAX_FRAME_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-const WAL_PUBLISHED_MAGIC: [u8; 4] = *b"TSHW";
-const WAL_PUBLISHED_BYTES: u64 = 24;
+const WAL_PUBLISHED_LEGACY_BYTES: u64 = 24;
+const WAL_PUBLISHED_V2_BYTES: u64 = 40;
+const WAL_PUBLISHED_MAX_BYTES: u64 = WAL_PUBLISHED_V2_BYTES;
 const SEGMENT_MANIFEST_MAGIC: [u8; 4] = *b"TSM2";
 const SEGMENT_FORMAT_VERSION: u16 = 2;
 const SEGMENT_MANIFEST_BYTES: usize = 180;
@@ -348,6 +353,12 @@ pub struct InspectedWalPublishedMarker {
     pub segment: Option<u64>,
     /// Published frame sequence.
     pub frame: Option<u64>,
+    /// Segment id through which a checksummed v2 marker authorizes reset WAL absence.
+    #[serde(default)]
+    pub reset_through_segment: Option<u64>,
+    /// Frame sequence through which a checksummed v2 marker authorizes reset WAL absence.
+    #[serde(default)]
+    pub reset_through_frame: Option<u64>,
     /// Type byte of the exact published frame, when nonzero and verified.
     pub frame_type: Option<u8>,
 }
@@ -892,6 +903,8 @@ pub fn inspect_data_directory(
                         checksum_valid: None,
                         segment: None,
                         frame: None,
+                        reset_through_segment: None,
+                        reset_through_frame: None,
                         frame_type: None,
                     },
                     Vec::new(),
@@ -1871,7 +1884,7 @@ fn build_salvage_copy_plan(
     });
 
     let mut copy_entries = 1u64; // the exclusively created staging root
-    let mut copy_bytes = WAL_PUBLISHED_BYTES;
+    let mut copy_bytes = WAL_PUBLISHED_V2_BYTES;
     for entry in entries {
         if should_omit_salvage_entry(&entry.relative, cut_segment) {
             continue;
@@ -3184,14 +3197,15 @@ fn rename_handle_relative_noreplace(
     })
 }
 
-fn encode_salvaged_wal_marker(highwater: SalvagedWalHighwater) -> [u8; 24] {
-    let mut bytes = [0u8; 24];
-    bytes[0..4].copy_from_slice(&WAL_PUBLISHED_MAGIC);
-    bytes[4..12].copy_from_slice(&highwater.segment.to_le_bytes());
-    bytes[12..20].copy_from_slice(&highwater.frame.to_le_bytes());
-    let checksum = crc32fast::hash(&bytes[..20]);
-    bytes[20..24].copy_from_slice(&checksum.to_le_bytes());
-    bytes
+fn encode_salvaged_wal_marker(highwater: SalvagedWalHighwater) -> Vec<u8> {
+    let highwater = WalHighWatermark {
+        segment: highwater.segment,
+        frame: highwater.frame,
+    };
+    encode_published_highwater_record(PublishedHighwaterRecord {
+        highwater,
+        reset_through: Some(highwater),
+    })
 }
 
 fn wal_segment_id_from_relative(relative: &Path) -> Option<u64> {
@@ -3997,7 +4011,9 @@ fn inspect_persisted_salvage_report(
                 && wal_segments[0].valid_frames == 0
                 && published.checksum_valid == Some(true)
                 && published.segment == Some(report.retained_wal_highwater.segment)
-                && published.frame == Some(0);
+                && published.frame == Some(0)
+                && published.reset_through_segment == Some(report.retained_wal_highwater.segment)
+                && published.reset_through_frame == Some(0);
             let invariant_valid = report.report_schema_version
                 == DATA_DIRECTORY_INSPECTION_REPORT_SCHEMA_VERSION
                 && !report.source_path.is_empty()
@@ -4158,15 +4174,25 @@ fn inspect_wal_published(
             checksum_valid: None,
             segment: None,
             frame: None,
+            reset_through_segment: None,
+            reset_through_frame: None,
             frame_type: None,
         });
     };
-    if entry.kind != EntryKind::File || entry.len != WAL_PUBLISHED_BYTES {
+    if entry.kind != EntryKind::File
+        || !matches!(
+            entry.len,
+            WAL_PUBLISHED_LEGACY_BYTES | WAL_PUBLISHED_V2_BYTES
+        )
+    {
         ctx.finding(
             "wal.published_invalid_size_or_type",
             InspectionSeverity::Error,
             Some(&entry.relative),
-            format!("published marker must be a {WAL_PUBLISHED_BYTES}-byte regular non-link file"),
+            format!(
+                "published marker must be a {WAL_PUBLISHED_LEGACY_BYTES}- or \
+                 {WAL_PUBLISHED_V2_BYTES}-byte regular non-link file"
+            ),
             None,
         );
         return Ok(InspectedWalPublishedMarker {
@@ -4174,46 +4200,63 @@ fn inspect_wal_published(
             checksum_valid: Some(false),
             segment: None,
             frame: None,
+            reset_through_segment: None,
+            reset_through_frame: None,
             frame_type: None,
         });
     }
-    let Some(bytes) = read_regular_file(ctx, source, entry, WAL_PUBLISHED_BYTES)? else {
+    let Some(bytes) = read_regular_file(ctx, source, entry, WAL_PUBLISHED_MAX_BYTES)? else {
         return Ok(InspectedWalPublishedMarker {
             present: true,
             checksum_valid: None,
             segment: None,
             frame: None,
+            reset_through_segment: None,
+            reset_through_frame: None,
             frame_type: None,
         });
     };
-    let expected = read_u32_at(&bytes, 20);
-    if !ctx.admit_hash(20) {
+    let hashed_bytes = entry.len.saturating_sub(4);
+    if !ctx.admit_hash(hashed_bytes) {
         return Ok(InspectedWalPublishedMarker {
             present: true,
             checksum_valid: None,
             segment: None,
             frame: None,
+            reset_through_segment: None,
+            reset_through_frame: None,
             frame_type: None,
         });
     }
-    let checksum_valid = bytes.get(0..4) == Some(WAL_PUBLISHED_MAGIC.as_slice())
-        && crc32fast::hash(&bytes[..20]) == expected;
-    if !checksum_valid {
-        ctx.finding(
-            "wal.published_corrupt",
-            InspectionSeverity::Error,
-            Some(&entry.relative),
-            "published marker magic or checksum is invalid",
-            None,
-        );
+    match decode_published_highwater_record(&bytes) {
+        Ok(record) => Ok(InspectedWalPublishedMarker {
+            present: true,
+            checksum_valid: Some(true),
+            segment: Some(record.highwater.segment),
+            frame: Some(record.highwater.frame),
+            reset_through_segment: record.reset_through.map(|highwater| highwater.segment),
+            reset_through_frame: record.reset_through.map(|highwater| highwater.frame),
+            frame_type: None,
+        }),
+        Err(_) => {
+            ctx.finding(
+                "wal.published_corrupt",
+                InspectionSeverity::Error,
+                Some(&entry.relative),
+                "published marker magic or checksum is invalid",
+                None,
+            );
+            Ok(InspectedWalPublishedMarker {
+                present: true,
+                checksum_valid: Some(false),
+                segment: None,
+                frame: None,
+                reset_through_segment: None,
+                reset_through_frame: None,
+                frame_type: None,
+            })
+        }
     }
-    Ok(InspectedWalPublishedMarker {
-        present: true,
-        checksum_valid: Some(checksum_valid),
-        segment: checksum_valid.then(|| read_u64_at(&bytes, 4)),
-        frame: checksum_valid.then(|| read_u64_at(&bytes, 12)),
-        frame_type: None,
-    })
 }
 
 fn inspect_wal_segments(
@@ -4399,22 +4442,71 @@ fn validate_wal_published_boundary(
         segment: marker_segment,
         frame: marker_frame,
     };
-    let marker_reachable = wal_segments.iter().any(|segment| {
-        segment.segment_id == marker_segment
-            && (marker_frame == 0
-                || matches!(
-                    (segment.first_valid_frame, segment.last_valid_frame),
-                    (Some(first), Some(last)) if first <= marker_frame && marker_frame <= last
-                ))
+    let boundary_segment = wal_segments
+        .iter()
+        .find(|segment| segment.segment_id == marker_segment);
+    let reset_floor = match (
+        published.reset_through_segment,
+        published.reset_through_frame,
+    ) {
+        (Some(segment), Some(frame)) => Some(WalInspectionBoundary { segment, frame }),
+        _ => None,
+    };
+    let effective_floor = persisted_wal_highwater
+        .unwrap_or(WalInspectionBoundary {
+            segment: 0,
+            frame: 0,
+        })
+        .max(reset_floor.unwrap_or(WalInspectionBoundary {
+            segment: 0,
+            frame: 0,
+        }));
+    let marker_reachable = boundary_segment.is_some_and(|segment| {
+        (marker_frame == 0 && reset_floor != Some(marker))
+            || matches!(
+                (segment.first_valid_frame, segment.last_valid_frame),
+                (Some(first), Some(last)) if first <= marker_frame && marker_frame <= last
+            )
     });
-    let marker_persisted = persisted_wal_highwater.is_some_and(|highwater| highwater >= marker);
-    if !marker_reachable && !marker_persisted {
+    let required_segment_ids_covered = marker <= effective_floor || {
+        let mut required_ids = wal_segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|segment_id| {
+                *segment_id >= effective_floor.segment && *segment_id <= marker_segment
+            });
+        required_ids.next().is_some_and(|first| {
+            if first != effective_floor.segment {
+                return false;
+            }
+            let mut previous = first;
+            for segment_id in required_ids {
+                if previous.checked_add(1) != Some(segment_id) {
+                    return false;
+                }
+                previous = segment_id;
+            }
+            previous == marker_segment
+        })
+    };
+    let absence_covered = effective_floor >= marker
+        && boundary_segment.is_some_and(|segment| {
+            segment.status == WalSegmentStatus::Clean
+                && (segment.file_len == 0
+                    || segment
+                        .first_valid_frame
+                        .is_some_and(|first| first > marker_frame))
+        });
+    if !required_segment_ids_covered || (!marker_reachable && !absence_covered) {
         ctx.finding(
             "wal.published_boundary_missing",
             InspectionSeverity::Error,
             Some(Path::new("wal/wal.published")),
             format!(
-                "published boundary {marker_segment}:{marker_frame} is neither present in verified WAL frames nor covered by a clean persisted segment"
+                "published boundary {marker_segment}:{marker_frame} is not backed by the complete \
+                 canonical WAL interval from effective floor {}:{}, nor safely absent from a \
+                 clean declared segment behind that floor",
+                effective_floor.segment, effective_floor.frame
             ),
             None,
         );
@@ -6253,9 +6345,13 @@ mod tests {
     }
 
     fn wal_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+        wal_frame_with_type(seq, 1, payload)
+    }
+
+    fn wal_frame_with_type(seq: u64, frame_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; 24];
         out[0..4].copy_from_slice(&WAL_FRAME_MAGIC);
-        out[4] = 1;
+        out[4] = frame_type;
         out[8..16].copy_from_slice(&seq.to_le_bytes());
         out[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         out[20..24].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
@@ -6272,13 +6368,41 @@ mod tests {
         payload
     }
 
+    fn valid_samples_payload() -> Vec<u8> {
+        let batch = crate::engine::wal::SamplesBatchFrame::from_points(
+            1,
+            crate::engine::chunk::ValueLane::Numeric,
+            &[crate::engine::chunk::ChunkPoint {
+                ts: 1,
+                value: crate::Value::I64(1),
+            }],
+        )
+        .unwrap();
+        crate::engine::wal::FramedWal::encode_samples_frame_payload(&[batch]).unwrap()
+    }
+
     fn write_published(root: &Path, segment: u64, frame: u64) {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&WAL_PUBLISHED_MAGIC);
-        bytes.extend_from_slice(&segment.to_le_bytes());
-        bytes.extend_from_slice(&frame.to_le_bytes());
-        let crc = crc32fast::hash(&bytes);
-        bytes.extend_from_slice(&crc.to_le_bytes());
+        let bytes = encode_published_highwater_record(PublishedHighwaterRecord {
+            highwater: WalHighWatermark { segment, frame },
+            reset_through: None,
+        });
+        std::fs::write(root.join("wal/wal.published"), bytes).unwrap();
+    }
+
+    fn write_published_v2(
+        root: &Path,
+        segment: u64,
+        frame: u64,
+        reset_through_segment: u64,
+        reset_through_frame: u64,
+    ) {
+        let bytes = encode_published_highwater_record(PublishedHighwaterRecord {
+            highwater: WalHighWatermark { segment, frame },
+            reset_through: Some(WalHighWatermark {
+                segment: reset_through_segment,
+                frame: reset_through_frame,
+            }),
+        });
         std::fs::write(root.join("wal/wal.published"), bytes).unwrap();
     }
 
@@ -7377,6 +7501,37 @@ mod tests {
             .is_empty());
         assert_eq!(report.recovered_inspection.health, InspectionHealth::Clean);
         assert!(report.recovered_inspection.discarded_ranges.is_empty());
+        assert_eq!(
+            report
+                .recovered_inspection
+                .wal_published
+                .reset_through_segment,
+            Some(0)
+        );
+        assert_eq!(
+            report
+                .recovered_inspection
+                .wal_published
+                .reset_through_frame,
+            Some(0)
+        );
+        let marker_bytes = std::fs::read(destination.join("wal/wal.published")).unwrap();
+        assert_eq!(marker_bytes.len(), WAL_PUBLISHED_V2_BYTES as usize);
+        let marker = decode_published_highwater_record(&marker_bytes).unwrap();
+        assert_eq!(
+            marker.highwater,
+            WalHighWatermark {
+                segment: 0,
+                frame: 0,
+            }
+        );
+        assert_eq!(marker.reset_through, Some(marker.highwater));
+        let destination_file_bytes = tree_snapshot(&destination)
+            .into_values()
+            .flatten()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>();
+        assert_eq!(report.copied_bytes, destination_file_bytes);
         assert!(report.discarded_ranges.iter().any(|range| {
             range.reason_code == "wal.salvage_v1_full_reset"
                 && range.path == wal_relative.to_string_lossy()
@@ -7445,6 +7600,291 @@ mod tests {
                 finding.code == "wal.mid_log_sequence_invalid"
                     && finding.path.as_deref() == Some("wal/wal-0000000000000001.log")
             }));
+        }
+    }
+
+    #[test]
+    fn wal_published_inspection_decodes_legacy_and_v2_reset_floor() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(temp.path().join("wal/wal.log"), []).unwrap();
+
+        write_published(temp.path(), 0, 0);
+        let legacy =
+            inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default()).unwrap();
+        assert_eq!(legacy.wal_published.checksum_valid, Some(true));
+        assert_eq!(legacy.wal_published.segment, Some(0));
+        assert_eq!(legacy.wal_published.frame, Some(0));
+        assert_eq!(legacy.wal_published.reset_through_segment, None);
+        assert_eq!(legacy.wal_published.reset_through_frame, None);
+        assert_eq!(legacy.work.bytes_hashed, 20);
+
+        write_published_v2(temp.path(), 0, 0, 0, 0);
+        let v2 =
+            inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default()).unwrap();
+        assert_eq!(v2.wal_published.checksum_valid, Some(true));
+        assert_eq!(v2.wal_published.segment, Some(0));
+        assert_eq!(v2.wal_published.frame, Some(0));
+        assert_eq!(v2.wal_published.reset_through_segment, Some(0));
+        assert_eq!(v2.wal_published.reset_through_frame, Some(0));
+        assert_eq!(v2.work.bytes_hashed, 36);
+
+        let legacy_json: InspectedWalPublishedMarker = serde_json::from_value(serde_json::json!({
+            "present": true,
+            "checksum_valid": true,
+            "segment": 0,
+            "frame": 0,
+            "frame_type": null
+        }))
+        .unwrap();
+        assert_eq!(legacy_json.reset_through_segment, None);
+        assert_eq!(legacy_json.reset_through_frame, None);
+    }
+
+    #[test]
+    fn wal_published_v2_hash_bound_is_exact() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(temp.path().join("wal/wal.log"), []).unwrap();
+        write_published_v2(temp.path(), 0, 0, 0, 0);
+
+        let exact = DataDirectoryInspectionLimits {
+            max_bytes_hashed: 36,
+            ..DataDirectoryInspectionLimits::default()
+        };
+        let report = inspect_data_directory(temp.path(), exact).unwrap();
+        assert_eq!(report.wal_published.checksum_valid, Some(true));
+        assert_eq!(report.work.bytes_hashed, 36);
+
+        let report = inspect_data_directory(
+            temp.path(),
+            DataDirectoryInspectionLimits {
+                max_bytes_hashed: 35,
+                ..exact
+            },
+        )
+        .unwrap();
+        assert_eq!(report.wal_published.checksum_valid, None);
+        assert!(report
+            .completeness
+            .bounds_hit
+            .contains(&"max_bytes_hashed".to_string()));
+    }
+
+    #[test]
+    fn wal_published_inspection_rejects_noncanonical_record_sizes_without_reading() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(temp.path().join("wal/wal.log"), []).unwrap();
+        for len in [23usize, 25, 39, 41] {
+            std::fs::write(temp.path().join("wal/wal.published"), vec![0; len]).unwrap();
+            let report =
+                inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default())
+                    .unwrap();
+            assert_eq!(report.wal_published.checksum_valid, Some(false), "{len}");
+            assert_eq!(report.work.bytes_read, 0, "{len}");
+            assert!(report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "wal.published_invalid_size_or_type"));
+        }
+    }
+
+    #[test]
+    fn wal_published_inspection_rejects_corrupt_or_invalid_v2_records() {
+        for case in ["checksum", "reset_above_published"] {
+            let temp = TempDir::new().unwrap();
+            std::fs::create_dir(temp.path().join("wal")).unwrap();
+            std::fs::write(temp.path().join("wal/wal.log"), []).unwrap();
+            let mut bytes = encode_published_highwater_record(PublishedHighwaterRecord {
+                highwater: WalHighWatermark {
+                    segment: 0,
+                    frame: 1,
+                },
+                reset_through: Some(WalHighWatermark {
+                    segment: 0,
+                    frame: if case == "checksum" { 1 } else { 2 },
+                }),
+            });
+            if case == "checksum" {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            std::fs::write(temp.path().join("wal/wal.published"), bytes).unwrap();
+
+            let report =
+                inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default())
+                    .unwrap();
+            assert_eq!(report.wal_published.checksum_valid, Some(false), "{case}");
+            assert_eq!(report.wal_published.segment, None, "{case}");
+            assert_eq!(report.wal_published.frame, None, "{case}");
+            assert_eq!(report.wal_published.reset_through_segment, None, "{case}");
+            assert_eq!(report.wal_published.reset_through_frame, None, "{case}");
+            assert!(report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "wal.published_corrupt"));
+        }
+    }
+
+    #[test]
+    fn reset_floor_accepts_an_empty_boundary_or_a_clean_file_beginning_after_it() {
+        for case in ["empty", "begins_after"] {
+            let temp = TempDir::new().unwrap();
+            std::fs::create_dir(temp.path().join("wal")).unwrap();
+            let bytes = match case {
+                "empty" => Vec::new(),
+                "begins_after" => wal_frame(3, &valid_series_definition_payload("after_reset")),
+                _ => unreachable!(),
+            };
+            std::fs::write(temp.path().join("wal/wal.log"), bytes).unwrap();
+            write_published_v2(temp.path(), 0, 2, 0, 2);
+
+            let report =
+                inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default())
+                    .unwrap();
+            assert_eq!(report.wal_published.reset_through_segment, Some(0));
+            assert_eq!(report.wal_published.reset_through_frame, Some(2));
+            assert_eq!(report.wal_segments[0].status, WalSegmentStatus::Clean);
+            assert!(
+                !report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == "wal.published_boundary_missing"),
+                "{case}: {report:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_reset_commit_still_requires_its_exact_samples_boundary() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(
+            temp.path().join("wal/wal.log"),
+            wal_frame_with_type(3, 2, &valid_samples_payload()),
+        )
+        .unwrap();
+        write_published_v2(temp.path(), 0, 3, 0, 2);
+
+        let report =
+            inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default()).unwrap();
+        assert_eq!(report.wal_published.frame_type, Some(2));
+        assert_eq!(report.wal_published.reset_through_segment, Some(0));
+        assert_eq!(report.wal_published.reset_through_frame, Some(2));
+        assert!(
+            !report.findings.iter().any(|finding| matches!(
+                finding.code.as_str(),
+                "wal.published_boundary_missing" | "wal.published_not_logical_boundary"
+            )),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn legacy_marker_requires_contiguous_replay_interval_segment_ids() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(
+            temp.path().join("wal/wal.log"),
+            wal_frame(1, &valid_series_definition_payload("floor")),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("wal/wal-0000000000000002.log"),
+            wal_frame_with_type(2, 2, &valid_samples_payload()),
+        )
+        .unwrap();
+        write_published(temp.path(), 2, 2);
+
+        let report =
+            inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default()).unwrap();
+        assert_eq!(report.wal_published.frame_type, Some(2));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "wal.published_boundary_missing"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn v2_reset_floor_requires_contiguous_replay_interval_segment_ids() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("wal")).unwrap();
+        std::fs::write(
+            temp.path().join("wal/wal-0000000000000001.log"),
+            wal_frame(2, &valid_series_definition_payload("after_reset")),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("wal/wal-0000000000000003.log"),
+            wal_frame_with_type(3, 2, &valid_samples_payload()),
+        )
+        .unwrap();
+        write_published_v2(temp.path(), 3, 3, 1, 1);
+
+        let report =
+            inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default()).unwrap();
+        assert_eq!(report.wal_published.frame_type, Some(2));
+        assert_eq!(report.wal_published.reset_through_segment, Some(1));
+        assert_eq!(report.wal_published.reset_through_frame, Some(1));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "wal.published_boundary_missing"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn reset_floor_rejects_missing_short_corrupt_or_uncovered_boundaries() {
+        for case in ["missing", "short", "corrupt", "zero_corrupt", "uncovered"] {
+            let temp = TempDir::new().unwrap();
+            std::fs::create_dir(temp.path().join("wal")).unwrap();
+            match case {
+                "missing" => {
+                    std::fs::write(temp.path().join("wal/wal.log"), []).unwrap();
+                    write_published_v2(temp.path(), 1, 2, 1, 2);
+                }
+                "short" => {
+                    std::fs::write(
+                        temp.path().join("wal/wal.log"),
+                        wal_frame(1, &valid_series_definition_payload("short")),
+                    )
+                    .unwrap();
+                    write_published_v2(temp.path(), 0, 2, 0, 2);
+                }
+                "corrupt" => {
+                    std::fs::write(temp.path().join("wal/wal.log"), b"bad").unwrap();
+                    write_published_v2(temp.path(), 0, 2, 0, 2);
+                }
+                "zero_corrupt" => {
+                    std::fs::write(temp.path().join("wal/wal.log"), b"bad").unwrap();
+                    write_published_v2(temp.path(), 0, 0, 0, 0);
+                }
+                "uncovered" => {
+                    std::fs::write(
+                        temp.path().join("wal/wal.log"),
+                        wal_frame(3, &valid_series_definition_payload("after_floor")),
+                    )
+                    .unwrap();
+                    write_published_v2(temp.path(), 0, 2, 0, 1);
+                }
+                _ => unreachable!(),
+            }
+
+            let report =
+                inspect_data_directory(temp.path(), DataDirectoryInspectionLimits::default())
+                    .unwrap();
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == "wal.published_boundary_missing"),
+                "{case}: {report:#?}"
+            );
         }
     }
 

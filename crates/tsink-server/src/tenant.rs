@@ -16,10 +16,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tsink::{
     BatchWriteResult, DataPoint, DeleteSeriesResult, EffectiveStorageLimits, Label,
     MetadataShardScope, MetricSeries, QueryBudget, QueryCancellationToken, QueryExecution,
-    QueryExecutionAccounting, QueryOptions, QueryWorkLimits, Result as TsinkResult, Row,
-    RowWriteOutcome, RowWriteStatus, SelectManyExecutionResult, SelectSeriesExecutionResult,
-    SeriesMatcher, SeriesPoints, SeriesSelection, Storage, StorageObservabilitySnapshot,
-    TsinkError, WriteMode, WriteRejection, WriteRejectionCategory,
+    QueryExecutionAccounting, QueryOptions, QueryRowsExecutionResult, QueryRowsPage,
+    QueryRowsScanOptions, QueryWorkLimits, Result as TsinkResult, Row, RowWriteOutcome,
+    RowWriteStatus, SelectManyExecutionResult, SelectSeriesExecutionResult, SeriesMatcher,
+    SeriesPoints, SeriesSelection, Storage, StorageObservabilitySnapshot, TsinkError, WriteMode,
+    WriteRejection, WriteRejectionCategory,
 };
 
 pub const TENANT_HEADER: &str = "x-tsink-tenant";
@@ -2420,6 +2421,107 @@ impl Storage for TenantScopedStorage {
         self.inner.select_many_execution_accounting()
     }
 
+    fn scan_series_rows_with_execution(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> TsinkResult<QueryRowsPage> {
+        self.scan_series_rows_with_execution_result(series, start, end, options, execution)
+            .map(QueryRowsExecutionResult::into_page)
+    }
+
+    fn scan_series_rows_with_execution_result(
+        &self,
+        series: &[MetricSeries],
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> TsinkResult<QueryRowsExecutionResult> {
+        if self.scan_series_rows_execution_accounting() != QueryExecutionAccounting::Complete {
+            return self
+                .scan_series_rows(series, start, end, options)
+                .map(QueryRowsExecutionResult::unaccounted);
+        }
+        execution.checkpoint().map_err(TsinkError::from)?;
+        execution
+            .observe_intermediate_vector_size(u64::try_from(series.len()).unwrap_or(u64::MAX))
+            .map_err(TsinkError::from)?;
+        let scoped_peak_bytes = tenant_query_scoped_series_peak_bytes(series, &self.tenant_id);
+        let scoped_reservation = execution
+            .reserve_memory(scoped_peak_bytes)
+            .map_err(TsinkError::from)?;
+        let scoped = series
+            .iter()
+            .map(|item| {
+                Ok(MetricSeries {
+                    name: item.name.clone(),
+                    labels: self.scoped_labels(&item.labels)?,
+                })
+            })
+            .collect::<TsinkResult<Vec<_>>>()?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        let inner_result = self
+            .inner
+            .scan_series_rows_with_execution_result(&scoped, start, end, options, execution)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+
+        let source_bytes = tsink::modeled_query_rows_retained_bytes(&inner_result.page.rows);
+        if inner_result.reserved_memory_bytes() < source_bytes {
+            return Err(TsinkError::Other(format!(
+                "completely accounted tenant row scan retained {} bytes for a {}-byte result",
+                inner_result.reserved_memory_bytes(),
+                source_bytes
+            )));
+        }
+        let mut visible_reservation = execution
+            .reserve_memory(source_bytes)
+            .map_err(TsinkError::from)?;
+        let mut visible_rows = Vec::with_capacity(inner_result.page.rows.capacity());
+        for row in &inner_result.page.rows {
+            execution.checkpoint().map_err(TsinkError::from)?;
+            let mut visible_labels = Vec::with_capacity(row.labels_capacity());
+            visible_labels.extend(
+                row.labels()
+                    .iter()
+                    .filter(|label| label.name != TENANT_LABEL)
+                    .cloned(),
+            );
+            visible_rows.push(Row::with_labels(
+                row.metric().to_string(),
+                visible_labels,
+                row.data_point().clone(),
+            ));
+        }
+        let page = QueryRowsPage {
+            rows_scanned: inner_result.page.rows_scanned,
+            truncated: inner_result.page.truncated,
+            next_row_offset: inner_result.page.next_row_offset,
+            rows: visible_rows,
+        };
+        drop(inner_result);
+        drop(scoped);
+        drop(scoped_reservation);
+        visible_reservation
+            .resize(tsink::modeled_query_rows_retained_bytes(&page.rows))
+            .map_err(TsinkError::from)?;
+        Ok(QueryRowsExecutionResult::accounted(
+            page,
+            visible_reservation,
+        ))
+    }
+
+    fn scan_series_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        if self.is_default_tenant() {
+            QueryExecutionAccounting::Unaccounted
+        } else {
+            self.inner.scan_series_rows_execution_accounting()
+        }
+    }
+
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> TsinkResult<Vec<DataPoint>> {
         let scoped = self.scoped_query_options(opts.clone())?;
         match self.inner.select_with_options(metric, scoped) {
@@ -2482,16 +2584,90 @@ impl Storage for TenantScopedStorage {
         &self,
         execution: &QueryExecution,
     ) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self
-            .visible_series(self.read_series_with_execution(&SeriesSelection::new(), execution)?))
+        self.list_metrics_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        self.select_series_with_execution_result(&SeriesSelection::new(), execution)
+    }
+
+    fn list_metrics_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.select_series_execution_accounting()
     }
 
     fn list_metrics_with_wal(&self) -> TsinkResult<Vec<MetricSeries>> {
+        if let Some(execution) = self
+            .inner
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
+        {
+            return self.list_metrics_with_wal_with_execution(&execution);
+        }
         Ok(self.visible_series(self.inner.list_metrics_with_wal()?))
     }
 
+    fn list_metrics_with_wal_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<Vec<MetricSeries>> {
+        self.list_metrics_with_wal_with_execution_result(execution)
+            .map(SelectSeriesExecutionResult::into_series)
+    }
+
+    fn list_metrics_with_wal_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<SelectSeriesExecutionResult> {
+        let accounting = self.inner.list_metrics_with_wal_execution_accounting();
+        let mut listed = self
+            .inner
+            .list_metrics_with_wal_with_execution_result(execution)?;
+        let visible = self.visible_series(std::mem::take(&mut listed.series));
+        match accounting {
+            QueryExecutionAccounting::Complete => {
+                let mut reservation = listed.take_memory_reservation().ok_or_else(|| {
+                    TsinkError::Other(
+                        "completely accounted tenant WAL metadata listing omitted its result reservation"
+                            .to_string(),
+                    )
+                })?;
+                reservation
+                    .resize(tenant_query_metric_series_retained_bytes(
+                        &visible,
+                        visible.capacity(),
+                    ))
+                    .map_err(TsinkError::from)?;
+                Ok(SelectSeriesExecutionResult::accounted(visible, reservation))
+            }
+            QueryExecutionAccounting::Unaccounted => {
+                Ok(SelectSeriesExecutionResult::unaccounted(visible))
+            }
+        }
+    }
+
+    fn list_metrics_with_wal_execution_accounting(&self) -> QueryExecutionAccounting {
+        self.inner.list_metrics_with_wal_execution_accounting()
+    }
+
     fn list_metrics_in_shards(&self, scope: &MetadataShardScope) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self.visible_series(self.read_series_in_shards(&SeriesSelection::new(), scope)?))
+        let scope = scope.normalized()?;
+        if scope.shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(execution) = self
+            .inner
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
+        {
+            return self.select_series_in_shards_with_execution(
+                &SeriesSelection::new(),
+                &scope,
+                &execution,
+            );
+        }
+        Ok(self.visible_series(self.read_series_in_shards(&SeriesSelection::new(), &scope)?))
     }
 
     fn select_series(&self, selection: &SeriesSelection) -> TsinkResult<Vec<MetricSeries>> {
@@ -2550,7 +2726,18 @@ impl Storage for TenantScopedStorage {
         selection: &SeriesSelection,
         scope: &MetadataShardScope,
     ) -> TsinkResult<Vec<MetricSeries>> {
-        Ok(self.visible_series(self.read_series_in_shards(selection, scope)?))
+        selection.validate().map_err(TsinkError::from)?;
+        let scope = scope.normalized()?;
+        if scope.shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(execution) = self
+            .inner
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())?
+        {
+            return self.select_series_in_shards_with_execution(selection, &scope, &execution);
+        }
+        Ok(self.visible_series(self.read_series_in_shards(selection, &scope)?))
     }
 
     fn select_series_in_shards_with_execution(
@@ -2670,6 +2857,7 @@ mod tests {
     ) -> (Arc<dyn Storage>, Arc<dyn Storage>) {
         let storage = StorageBuilder::new()
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(1)
             .with_query_budget_limits(limits)
             .build()
             .expect("storage with query limits should build");
@@ -3034,6 +3222,157 @@ mod tests {
             format!(
                 "{TENANT_HEADER} and {SCOPE_ORG_ID_HEADER} must match when both headers are set"
             )
+        );
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_accounting_remains_unaccounted() {
+        let storage = make_storage();
+        assert_eq!(
+            storage.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Complete,
+            "the built-in inner storage fixture should expose complete metric-row accounting",
+        );
+        let tenant = scoped_storage(storage, "tenant-a");
+        assert_eq!(
+            tenant.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "tenant metric-row scans must fail closed until the wrapper has a bounded complete implementation",
+        );
+    }
+
+    #[test]
+    fn tenant_series_row_scan_retains_complete_guard_and_pagination() {
+        let storage = make_storage();
+        let visible_series = MetricSeries {
+            name: "tenant_guarded_rows".to_string(),
+            labels: vec![Label::new("host", "a")],
+        };
+        let scoped_rows = scope_rows_for_tenant(
+            vec![
+                Row::with_labels(
+                    visible_series.name.clone(),
+                    visible_series.labels.clone(),
+                    DataPoint::new(10, 1.0),
+                ),
+                Row::with_labels(
+                    visible_series.name.clone(),
+                    visible_series.labels.clone(),
+                    DataPoint::new(20, 2.0),
+                ),
+            ],
+            "tenant-a",
+        )
+        .expect("tenant rows should scope");
+        storage
+            .insert_rows(&scoped_rows)
+            .expect("tenant rows should insert");
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        assert_eq!(
+            tenant.scan_series_rows_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+
+        let execution = tenant
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query admission should succeed")
+            .expect("built-in storage should expose a query budget");
+        let result = tenant
+            .scan_series_rows_with_execution_result(
+                std::slice::from_ref(&visible_series),
+                0,
+                30,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect("tenant row page should succeed");
+        assert_eq!(result.page.rows.len(), 1);
+        assert!(result.page.truncated);
+        assert_eq!(result.page.next_row_offset, Some(1));
+        assert_eq!(result.page.rows[0].metric(), visible_series.name);
+        assert_eq!(result.page.rows[0].labels(), visible_series.labels);
+        assert!(result.page.rows[0]
+            .labels()
+            .iter()
+            .all(|label| label.name != TENANT_LABEL));
+        assert_eq!(
+            result.reserved_memory_bytes(),
+            tsink::modeled_query_rows_retained_bytes(&result.page.rows)
+        );
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result.reserved_memory_bytes()
+        );
+        assert_eq!(execution.snapshot().series_matched, 1);
+        assert_eq!(execution.snapshot().samples_returned, 1);
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn default_tenant_series_row_scan_accounting_remains_unaccounted() {
+        let storage = make_storage();
+        let tenant = scoped_storage(storage, DEFAULT_TENANT_ID);
+        assert_eq!(
+            tenant.scan_series_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "default-tenant legacy fallback cannot preserve exact page counters through one inner row scan",
+        );
+    }
+
+    #[test]
+    fn tenant_list_metrics_detailed_result_retains_complete_guard() {
+        let storage = make_storage();
+        let scoped_rows = scope_rows_for_tenant(
+            vec![Row::with_labels(
+                "tenant_guarded_list",
+                vec![Label::new("host", "a")],
+                DataPoint::new(10, 1.0),
+            )],
+            "tenant-a",
+        )
+        .expect("tenant row should scope");
+        storage
+            .insert_rows(&scoped_rows)
+            .expect("tenant row should insert");
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        assert_eq!(
+            tenant.list_metrics_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+
+        let execution = tenant
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query admission should succeed")
+            .expect("built-in storage should expose a query budget");
+        let result = tenant
+            .list_metrics_with_execution_result(&execution)
+            .expect("tenant metric listing should succeed");
+        assert_eq!(result.series.len(), 1);
+        assert_eq!(result.series[0].name, "tenant_guarded_list");
+        assert!(result.series[0]
+            .labels
+            .iter()
+            .all(|label| label.name != TENANT_LABEL));
+        assert!(result.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            result.reserved_memory_bytes()
+        );
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
         );
     }
 
@@ -3614,6 +3953,172 @@ mod tests {
         let err = scoped
             .list_metrics()
             .expect_err("the tenant merge must observe its cumulative intermediate length");
+        assert!(matches!(
+            err,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::IntermediateVectorSize
+                    && exceeded.limit == 1
+        ));
+    }
+
+    #[test]
+    fn default_tenant_wal_metadata_list_retains_one_accounted_envelope() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let storage = StorageBuilder::new()
+            .with_data_path(data_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(8 * 1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_series_matched: Some(8),
+                    max_returned_bytes: Some(1024 * 1024),
+                    max_intermediate_vector_size: Some(8),
+                    max_memory_bytes: Some(4 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("persistent storage with query limits should build");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after epoch")
+            .as_millis() as i64;
+        storage
+            .insert_rows(&[Row::with_labels(
+                "tenant_wal_budget",
+                vec![Label::new("host", "legacy")],
+                DataPoint::new(now, 1.0),
+            )])
+            .unwrap();
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        "tenant_wal_budget",
+                        vec![Label::new("host", "current")],
+                        DataPoint::new(now, 2.0),
+                    )],
+                    DEFAULT_TENANT_ID,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let scoped = scoped_storage(Arc::clone(&storage), DEFAULT_TENANT_ID);
+
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let detailed = scoped
+            .list_metrics_with_wal_with_execution_result(&execution)
+            .expect("tenant WAL metadata must use the supplied execution");
+        assert_eq!(detailed.series.len(), 2);
+        assert!(detailed
+            .series
+            .iter()
+            .all(|series| series.labels.iter().all(|label| label.name != TENANT_LABEL)));
+        assert!(detailed.reserved_memory_bytes() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            detailed.reserved_memory_bytes()
+        );
+        drop(detailed);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let before = storage.query_budget_snapshot();
+        assert_eq!(scoped.list_metrics_with_wal().unwrap().len(), 2);
+        let after = storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total - before.queries_started_total,
+            1
+        );
+        assert_eq!(
+            after.queries_completed_total - before.queries_completed_total,
+            1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn default_tenant_shard_metadata_reads_share_one_query_envelope() {
+        let limits = |series_limit, intermediate_limit| QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(8 * 1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                max_intermediate_vector_size: Some(intermediate_limit),
+                max_memory_bytes: Some(4 * 1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        };
+        let scope = MetadataShardScope::new(1, vec![0]);
+
+        let (storage, scoped) = default_tenant_metadata_storage_with_limits(limits(2, 2));
+        let before = storage.query_budget_snapshot();
+        let listed = scoped
+            .list_metrics_in_shards(&scope)
+            .expect("the exact request-wide tenant shard list should pass");
+        assert_eq!(listed.len(), 2);
+        let after_list = storage.query_budget_snapshot();
+        assert_eq!(
+            after_list.queries_started_total - before.queries_started_total,
+            1
+        );
+        assert_eq!(
+            after_list.queries_completed_total - before.queries_completed_total,
+            1
+        );
+        assert_eq!(after_list.active_queries, 0);
+        assert_eq!(after_list.shared_reserved_memory_bytes, 0);
+
+        let selected = scoped
+            .select_series_in_shards(&SeriesSelection::new(), &scope)
+            .expect("the exact request-wide tenant shard selection should pass");
+        assert_eq!(selected.len(), 2);
+        let after_select = storage.query_budget_snapshot();
+        assert_eq!(
+            after_select.queries_started_total - after_list.queries_started_total,
+            1
+        );
+        assert_eq!(
+            after_select.queries_completed_total - after_list.queries_completed_total,
+            1
+        );
+        assert_eq!(after_select.active_queries, 0);
+        assert_eq!(after_select.shared_reserved_memory_bytes, 0);
+        assert_eq!(after_select.accounting_invariant_violations_total, 0);
+
+        let (_storage, scoped) = default_tenant_metadata_storage_with_limits(limits(1, 2));
+        let err = scoped
+            .list_metrics_in_shards(&scope)
+            .expect_err("scoped and legacy shard branches must share the series limit");
+        assert!(matches!(
+            err,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::SeriesMatched
+                    && exceeded.limit == 1
+        ));
+
+        let (_storage, scoped) = default_tenant_metadata_storage_with_limits(limits(1, 2));
+        let err = scoped
+            .select_series_in_shards(&SeriesSelection::new(), &scope)
+            .expect_err("direct shard selection must share one tenant query execution");
+        assert!(matches!(
+            err,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::SeriesMatched
+                    && exceeded.limit == 1
+        ));
+
+        let (_storage, scoped) = default_tenant_metadata_storage_with_limits(limits(2, 1));
+        let err = scoped
+            .list_metrics_in_shards(&scope)
+            .expect_err("the shard-list merge must observe its cumulative intermediate length");
         assert!(matches!(
             err,
             TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))

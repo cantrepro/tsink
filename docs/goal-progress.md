@@ -1008,15 +1008,14 @@ Phase 2 targeted verification completed since that full matrix:
   clippy. Serial focused results were 90/90 persistence-background, 38/38 post-flush, 19/19
   bounded-tombstone, 30/30 secure-snapshot, 10/10 finite-remote-catalog, and 5/5
   background-retention tests. A final baseline-excluded core sweep passed 1,175/1,175.
-- Clean-revision acceptance debt — `OPEN`, outside this stopping stage: the unfiltered serial core
-  run exposed 11 failures that each reproduce in a clean `ab10341` archive (four memory-pressure
-  expectations, three deletion/tombstone-transition expectations, and four runtime-refresh/flush/
-  WAL-salvage expectations). The current stage introduced three additional stale one-wake
-  tombstone-test assumptions; those were corrected without changing production accounting and the
-  complete bounded-tombstone module now passes. One later retention-cleanup failure from the first
-  panicking run passed independently on both clean and current trees. Per the maintainer's stop
-  instruction, the 11 clean-revision failures remain recorded rather than being expanded into new
-  implementation work.
+- Clean-revision acceptance debt — `RESOLVED` on 2026-07-28: all 11 failures reproduced from
+  `ab10341` were reconciled while preserving finite rejection and data-safety behavior. The four
+  memory-pressure cases now assert structured rejection, rollback, queryability, and an exact
+  admitted retry; the three deletion/tombstone-transition cases use an explicit unbounded
+  maintenance profile where they intentionally exercise complete-snapshot semantics; and the four
+  runtime-refresh/flush/WAL cases use bounded convergence and distinguish logical open-handle
+  salvage from persistent strict reopen validation. Focused serial results were 12/12 admission
+  control, 36/36 capacity, 35/35 deletion, and 33/33 persistence-recovery tests.
 - Workflow and package hygiene validation — `PASS`: both GitHub workflow files parse as YAML,
   their embedded release shell fragments pass syntax checks, manual branch dispatch is rejected,
   artifact checkouts resolve to the verified commit, and both crates.io and PyPI publication remain
@@ -1110,7 +1109,11 @@ assigned to later roadmap phases.
 
 ## Storage-format and compatibility impact
 
-- No core segment, WAL wire format, or data-directory format version changed.
+- The core segment and data-directory format versions did not change. WAL publication markers now
+  have an additive 40-byte `TSH2` form that records a checksummed reset-through floor `R` alongside
+  the published high-water boundary `H`; current code still reads legacy 24-byte `TSHW` markers.
+  Reset writes `TSH2`, so rollback to a binary that only accepts `TSHW` requires a compatible
+  pre-upgrade data copy.
 - The experimental cluster dedupe log gained optional canonical completion data. Current code reads
   legacy markers, but a duplicate whose legacy marker lacks the original result returns
   `409 idempotency_result_unavailable` rather than fabricating success. This disk-budget slice did
@@ -1212,18 +1215,85 @@ assigned to later roadmap phases.
   security-disclosure contact/channel remain unresolved. A security address is not fabricated in
   repository metadata.
 
-## Deliberate stop point and unstarted next work
+## Current continuation and next work
 
-Work is intentionally paused after the finite catalog/retention/post-flush/snapshot acceptance
-stage at the maintainer's request. Phase 2 remains `IN PROGRESS`; no subsequent roadmap phase or
-feature work was started.
+Phase 2 remains `IN PROGRESS`. The 2026-07-28 continuation closed the inherited 11-test acceptance
+debt and additional WAL and query-accounting boundaries:
 
-1. Resolve or deliberately revise the 11 clean-`ab10341` core acceptance expectations recorded
-   above, keeping data-safety behavior and finite transition staging authoritative.
-2. Calibrate the implemented query envelope under constrained direct, async, PromQL, HTTP, and
-   distributed workloads, and decide explicit contracts for remaining compatibility adapters and
-   caller-owned result vectors. Keep cancellation/error release and logical-versus-physical byte
-   evidence separate from process-memory measurements.
-3. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
+- Strict WAL opening now validates a complete markerless stream before publishing a boundary,
+  rejects duplicate logical segment aliases and recognized symlink/non-regular entries without
+  mutation, and proves contiguous coverage only across the authoritative persisted replay floor
+  through the published boundary. Legal checkpointed gaps below that floor and unpublished gaps
+  above the boundary remain supported. A reset now publishes `TSH2` with
+  `H = R = max(last appended high-water mark, (active segment, 0))` before removing WAL bytes;
+  future commits preserve `R` while advancing `H`, and replay starts at the greater of the clean
+  persisted floor and `R`.
+- Core, tenant, UniFFI, and distributed metadata-list paths now share one admitted execution
+  through shard selection, WAL-definition merging, fanout, deduplication, tenant-label stripping,
+  and retained result ownership. Exact-boundary, one-under, empty-scope/error-precedence,
+  held-concurrency, no-partial-result, and release assertions pass in 35/35 core query-budget,
+  24/24 tenant, 13/13 distributed-storage, and 15/15 UniFFI integration tests.
+- Built-in core metric-name row scans now use the same detailed `QueryRowsExecutionResult` contract
+  as explicit-series scans. Metric-postings count and identity materialization are admitted while
+  the postings read guard prevents concurrent growth. Both async row-scan commands carry the
+  detailed guard through the worker reply and reject an unaccounted finite backend before
+  invocation. Tenant and distributed metric-name adapters remain explicitly `Unaccounted`.
+- Async `list_metrics` and `select_series` now carry their operation-specific detailed metadata
+  guards through the worker reply instead of consuming them in the worker. Finite calls require
+  `Complete` accounting and reject missing or undersized false-`Complete` guards; unlimited calls
+  preserve the exact compatibility operation. Core, tenant, and distributed list adapters expose
+  guarded detailed results. A non-default tenant series-row scan replaces the scoped inner guard
+  around its visible page, while default-tenant and distributed series-row scans remain explicitly
+  `Unaccounted` because their compound paths can fetch and charge more points than the page reports.
+- Raw point pages retain their working reservation through row materialization and coalesce it with
+  the final row guard without a cancellation or error-path accounting gap. Snapshot vectors are
+  preflighted before allocation; persisted and sealed cursor scratch is charged simultaneously;
+  compressed chunks include declared output, a decoded-window allowance, and a 1 MiB zstd
+  workspace; decoder timestamp/value/point vectors and nested value-capacity growth are included.
+  Pagination now reports continuation only after observing a real later row. Focused verification
+  currently passes 49/49 core query-budget tests, 9/9 query-read tests, 42/42 async tests, the
+  metric-postings concurrency regression, 3/3 server series-row accounting tests, and 2/2
+  tenant/distributed detailed-list guard tests.
+- Public Prometheus metadata and finite-limit internal metadata already retain their source,
+  projection, body, and header guards through `HttpResponse` construction. The audited remaining
+  HTTP boundaries are legacy internal metadata without `query_limits`, best-effort `/metrics`,
+  rebalance reporting, and the support bundle; these are now explicitly documented rather than
+  being grouped into an ambiguous “metadata HTTP” gap.
+- `/api/v1/status/tsdb` now requires one admitted execution and complete detailed metric-list
+  accounting, propagates enumeration failures through stable error envelopes, reserves the full
+  hotspot tracker clone/map/union/top-N transformation under that execution, checkpoints and
+  observes intermediate hotspot work, and guards the measured retained JSON tree plus exact
+  encoded body/header allocations through `HttpResponse` construction. The independent 1 MiB
+  encoded ceiling no longer tightens `ExpertUnlimited` enumeration. This is partial hardening:
+  named operational snapshot clones and the JSON projection/tree-construction peak remain outside
+  reserve-before-allocation query accounting and are documented as an explicit adapter boundary.
+  Focused exact-minus-one/exact returned-byte and memory tests accompany execution/guard-release,
+  large-identity unlimited enumeration, hotspot cancellation/intermediate accounting,
+  unaccounted-backend, false-`Complete` missing/undersized guard, and storage-error regressions.
+- Empty-policy shared background rollup passes now complete without draining writer permits, so
+  sustained ordinary writes cannot turn idle rollup maintenance into a write-timeout fail-fast.
+  The fast path remains serialized with policy publication, preserves worker/cursor observability,
+  honors the indeterminate-publication fence, and keeps a pending cursor retry unchanged on error.
+- The current tree passes `RUSTFLAGS="-D warnings" cargo test --workspace --all-features --locked`:
+  1,235/1,235 core library tests, 42/42 async integration tests, the 4/4 concurrent-write
+  integration binary (including the previously load-sensitive different-metrics case), 887/887
+  server tests with one intentional fixture-regeneration ignore, and every remaining workspace
+  integration and doc test passed. Warning-denied default and no-default all-target checks and the
+  Rust 1.89 MSRV all-target check also pass. Focused idle-rollup tests pass 3/3, and the complete
+  server binary had already passed independently. The full no-default test run, final package
+  verification, CI benchmark smokes, and complete constrained profile matrix remain before any
+  constant is qualified.
+
+The next required Phase 2 work is:
+
+1. Finish the remaining locked verification variants for this continuation: the full no-default
+   test run, final warning-denied rustdoc/package checks, and CI benchmark smokes.
+2. Address the remaining best-effort metrics/rebalance/support-bundle operational HTTP boundaries
+   or retain their explicit semantics, and close the default-tenant/distributed series-row and
+   tenant/distributed metric-row adapter gaps where exact page-work reconciliation is possible.
+3. Calibrate the shared query envelope under constrained direct, async, PromQL, HTTP, and
+   distributed workloads, keeping logical-versus-physical byte evidence separate from
+   process-memory measurements.
+4. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
    revise the shipped provisional constants and record the final evidence. Preserve the explicit
    expert-only unlimited migration path and deterministic base-plus-override contract.

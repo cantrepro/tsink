@@ -487,7 +487,8 @@ fn modeled_repair_row_returned_bytes(
                 .saturating_add(u64::try_from(label.name.len()).unwrap_or(u64::MAX))
                 .saturating_add(u64::try_from(label.value.len()).unwrap_or(u64::MAX))
         }))
-        .saturating_add(u64::try_from(std::mem::size_of::<DataPoint>()).unwrap_or(u64::MAX))
+        // `Row` (and the wire-equivalent `InternalRow`) owns its `DataPoint` inline. Only the
+        // value's logical payload is additional to the row envelope.
         .saturating_add(tsink::value::modeled_query_value_payload_bytes(
             &data_point.value,
         ))

@@ -1360,12 +1360,37 @@ impl ChunkStorage {
                 &mut reservation,
                 u64::MAX,
             )?;
+        let retained_bytes = ChunkStorage::tombstone_map_memory_usage_bytes(&prepared.tombstones);
+        let lane_bytes = index.tombstone_lane_construction_upper_bound(
+            index.runtime_mode != StorageRuntimeMode::ComputeOnly,
+        );
+        let recovery_peak = retained_bytes
+            .saturating_add(lane_bytes)
+            .saturating_add(prepared.recovery_memory_upper_bound);
+        let namespace_peak = retained_bytes
+            .saturating_add(lane_bytes)
+            .saturating_add(tombstone::MAX_TOMBSTONE_TRANSACTION_PATH_BYTES)
+            .saturating_add(4096);
+        ensure_bounded_tombstone_maintenance_memory(
+            &mut reservation,
+            u64::MAX,
+            recovery_peak.max(namespace_peak),
+        )?;
+        let lanes = index.tombstone_index_persist_lanes();
+        let (_, recovery_work_bytes) = tombstone::preflight_tombstone_recovery_namespace_work(
+            index.transaction_data_path()?,
+            &lanes,
+            usize::MAX,
+            u64::MAX,
+            prepared.work_items,
+            prepared.work_bytes,
+        )?;
         Ok((self
             .memory
             .tombstone_staged_bytes
             .load(Ordering::Acquire)
             .min(usize::MAX as u64) as usize)
-            .max(usize::try_from(prepared.work_bytes).unwrap_or(usize::MAX)))
+            .max(usize::try_from(recovery_work_bytes).unwrap_or(usize::MAX)))
     }
 
     #[cfg(test)]

@@ -4,9 +4,10 @@ use crate::cgroup;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     AsyncResourceLimits, BatchWriteResult, DataPoint, EffectiveStorageLimits, Label, MetricSeries,
-    QueryBudgetLimits, QueryCancellationToken, QueryExecution, QueryOptions, QueryRowsPage,
-    QueryRowsScanOptions, QueryWorkLimits, ResourceConfigurationSnapshot, ResourceLimitOverride,
-    ResourceProfile, Result, RollupObservabilitySnapshot, RollupPolicy, Row, RowWriteOutcome,
+    QueryBudgetLimits, QueryCancellationToken, QueryExecution, QueryExecutionAccounting,
+    QueryOptions, QueryRowsExecutionResult, QueryRowsPage, QueryRowsScanOptions, QueryWorkLimits,
+    ResourceConfigurationSnapshot, ResourceLimitOverride, ResourceProfile, Result,
+    RollupObservabilitySnapshot, RollupPolicy, Row, RowWriteOutcome, SelectSeriesExecutionResult,
     SeriesSelection, Storage, StorageBuilder, StorageObservabilitySnapshot, TimestampPrecision,
     TsinkError, WriteBatchLimits, WriteMode, WriteRejection, WriteRejectionCategory, WriteResult,
 };
@@ -249,25 +250,25 @@ enum ReadCommand {
         reply: Reply<Vec<(Vec<Label>, Vec<DataPoint>)>>,
     },
     ListMetrics {
-        reply: Reply<Vec<MetricSeries>>,
+        reply: Reply<SelectSeriesExecutionResult>,
     },
     SelectSeries {
         selection: SeriesSelection,
-        reply: Reply<Vec<MetricSeries>>,
+        reply: Reply<SelectSeriesExecutionResult>,
     },
     ScanSeriesRows {
         series: Vec<MetricSeries>,
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
-        reply: Reply<QueryRowsPage>,
+        reply: Reply<QueryRowsExecutionResult>,
     },
     ScanMetricRows {
         metric: String,
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
-        reply: Reply<QueryRowsPage>,
+        reply: Reply<QueryRowsExecutionResult>,
     },
 }
 
@@ -569,6 +570,7 @@ impl AsyncStorage {
             reply,
         })
         .await
+        .map(QueryRowsExecutionResult::into_page)
     }
 
     /// Runs [`Storage::scan_metric_rows`] on the reader worker pool.
@@ -590,6 +592,7 @@ impl AsyncStorage {
             reply,
         })
         .await
+        .map(QueryRowsExecutionResult::into_page)
     }
 
     /// Runs [`Storage::list_metrics`] on the reader worker pool.
@@ -597,6 +600,7 @@ impl AsyncStorage {
         self.ensure_open()?;
         self.send_read(0, |reply| ReadCommand::ListMetrics { reply })
             .await
+            .map(SelectSeriesExecutionResult::into_series)
     }
 
     /// Runs [`Storage::select_series`] on the reader worker pool.
@@ -608,6 +612,7 @@ impl AsyncStorage {
             reply,
         })
         .await
+        .map(SelectSeriesExecutionResult::into_series)
     }
 
     /// Returns [`Storage::memory_used`] directly without entering a worker queue.
@@ -1156,9 +1161,11 @@ impl AsyncStorageBuilder {
         self
     }
 
-    /// Sets WAL replay policy when corruption is encountered mid-log.
+    /// Sets the logical WAL replay policy after open-time validation.
     ///
-    /// The underlying storage builder defaults to [`WalReplayMode::Strict`].
+    /// The underlying storage builder defaults to [`WalReplayMode::Strict`] and always validates
+    /// the complete published WAL prefix strictly before replay. `Salvage` therefore does not
+    /// provide in-place recovery of a corrupt persistent data directory.
     #[must_use]
     pub fn with_wal_replay_mode(mut self, mode: WalReplayMode) -> Self {
         self.inner = self.inner.with_wal_replay_mode(mode);
@@ -1343,8 +1350,20 @@ fn read_worker_loop(
                 let result = run_read_with_execution(
                     execution.as_ref(),
                     &cancellation,
-                    |execution| storage.list_metrics_with_execution(execution),
-                    || storage.list_metrics(),
+                    |execution| {
+                        if storage.list_metrics_execution_accounting()
+                            != QueryExecutionAccounting::Complete
+                        {
+                            return Err(incomplete_async_metadata_accounting("async_list_metrics"));
+                        }
+                        let detailed = storage.list_metrics_with_execution_result(execution)?;
+                        validate_async_metadata_result(detailed, "async_list_metrics")
+                    },
+                    || {
+                        storage
+                            .list_metrics()
+                            .map(SelectSeriesExecutionResult::unaccounted)
+                    },
                 );
                 let _ = reply.send_blocking(result);
             }
@@ -1352,8 +1371,23 @@ fn read_worker_loop(
                 let result = run_read_with_execution(
                     execution.as_ref(),
                     &cancellation,
-                    |execution| storage.select_series_with_execution(&selection, execution),
-                    || storage.select_series(&selection),
+                    |execution| {
+                        if storage.select_series_execution_accounting()
+                            != QueryExecutionAccounting::Complete
+                        {
+                            return Err(incomplete_async_metadata_accounting(
+                                "async_select_series",
+                            ));
+                        }
+                        let detailed =
+                            storage.select_series_with_execution_result(&selection, execution)?;
+                        validate_async_metadata_result(detailed, "async_select_series")
+                    },
+                    || {
+                        storage
+                            .select_series(&selection)
+                            .map(SelectSeriesExecutionResult::unaccounted)
+                    },
                 );
                 let _ = reply.send_blocking(result);
             }
@@ -1368,11 +1402,23 @@ fn read_worker_loop(
                     execution.as_ref(),
                     &cancellation,
                     |execution| {
-                        storage.scan_series_rows_with_execution(
+                        if storage.scan_series_rows_execution_accounting()
+                            != QueryExecutionAccounting::Complete
+                        {
+                            return Err(incomplete_async_row_scan_accounting(
+                                "async_scan_series_rows",
+                            ));
+                        }
+                        let detailed = storage.scan_series_rows_with_execution_result(
                             &series, start, end, options, execution,
-                        )
+                        )?;
+                        validate_async_row_scan_result(detailed, "async_scan_series_rows")
                     },
-                    || storage.scan_series_rows(&series, start, end, options),
+                    || {
+                        storage
+                            .scan_series_rows(&series, start, end, options)
+                            .map(QueryRowsExecutionResult::unaccounted)
+                    },
                 );
                 let _ = reply.send_blocking(result);
             }
@@ -1387,16 +1433,77 @@ fn read_worker_loop(
                     execution.as_ref(),
                     &cancellation,
                     |execution| {
-                        storage.scan_metric_rows_with_execution(
+                        if storage.scan_metric_rows_execution_accounting()
+                            != QueryExecutionAccounting::Complete
+                        {
+                            return Err(incomplete_async_row_scan_accounting(
+                                "async_scan_metric_rows",
+                            ));
+                        }
+                        let detailed = storage.scan_metric_rows_with_execution_result(
                             &metric, start, end, options, execution,
-                        )
+                        )?;
+                        validate_async_row_scan_result(detailed, "async_scan_metric_rows")
                     },
-                    || storage.scan_metric_rows(&metric, start, end, options),
+                    || {
+                        storage
+                            .scan_metric_rows(&metric, start, end, options)
+                            .map(QueryRowsExecutionResult::unaccounted)
+                    },
                 );
                 let _ = reply.send_blocking(result);
             }
         }
     }
+}
+
+fn incomplete_async_row_scan_accounting(operation: &'static str) -> TsinkError {
+    TsinkError::UnsupportedOperation {
+        operation,
+        reason: "bounded async row scans require complete execution accounting".to_string(),
+    }
+}
+
+fn incomplete_async_metadata_accounting(operation: &'static str) -> TsinkError {
+    TsinkError::UnsupportedOperation {
+        operation,
+        reason: "bounded async metadata reads require complete execution accounting".to_string(),
+    }
+}
+
+fn validate_async_metadata_result(
+    mut detailed: SelectSeriesExecutionResult,
+    operation: &'static str,
+) -> Result<SelectSeriesExecutionResult> {
+    let required =
+        crate::engine::engine::modeled_metric_series_vec_retained_bytes(&detailed.series);
+    let Some(reservation) = detailed.take_memory_reservation() else {
+        return Err(incomplete_async_metadata_accounting(operation));
+    };
+    if reservation.bytes() < required {
+        return Err(incomplete_async_metadata_accounting(operation));
+    }
+    Ok(SelectSeriesExecutionResult::accounted(
+        std::mem::take(&mut detailed.series),
+        reservation,
+    ))
+}
+
+fn validate_async_row_scan_result(
+    mut detailed: QueryRowsExecutionResult,
+    operation: &'static str,
+) -> Result<QueryRowsExecutionResult> {
+    let required = crate::modeled_query_rows_retained_bytes(&detailed.page.rows);
+    let Some(reservation) = detailed.take_memory_reservation() else {
+        return Err(incomplete_async_row_scan_accounting(operation));
+    };
+    if reservation.bytes() < required {
+        return Err(incomplete_async_row_scan_accounting(operation));
+    }
+    Ok(QueryRowsExecutionResult::accounted(
+        detailed.into_page(),
+        reservation,
+    ))
 }
 
 impl ReadCommand {

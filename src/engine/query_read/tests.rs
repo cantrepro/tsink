@@ -11,6 +11,9 @@ use super::pagination::{RawSeriesPagination, SortedSeriesDedupeMode, SortedSerie
 use super::*;
 use crate::engine::chunk::ChunkHeader;
 use crate::engine::tombstone::TombstoneMap;
+use crate::{
+    QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason, QueryWorkLimits,
+};
 
 fn default_future_skew_window(precision: TimestampPrecision) -> i64 {
     super::super::duration_to_timestamp_units(
@@ -69,15 +72,58 @@ fn live_storage(chunk_point_cap: usize) -> ChunkStorage {
 }
 
 fn persistent_numeric_storage(path: &std::path::Path, chunk_point_cap: usize) -> ChunkStorage {
-    ChunkStorage::new_with_data_path_and_options(
+    persistent_numeric_storage_with_query_budget(
+        path,
+        chunk_point_cap,
+        QueryBudgetLimits::default(),
+    )
+}
+
+fn persistent_numeric_storage_with_query_budget(
+    path: &std::path::Path,
+    chunk_point_cap: usize,
+    limits: QueryBudgetLimits,
+) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
         chunk_point_cap,
         None,
         Some(path.join(NUMERIC_LANE_ROOT)),
         None,
         1,
         test_options(None),
+        None,
+        limits,
     )
     .unwrap()
+}
+
+fn persistent_blob_storage_with_query_budget(
+    path: &std::path::Path,
+    chunk_point_cap: usize,
+    limits: QueryBudgetLimits,
+) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+        chunk_point_cap,
+        None,
+        None,
+        Some(path.join(BLOB_LANE_ROOT)),
+        1,
+        test_options(None),
+        None,
+        limits,
+    )
+    .unwrap()
+}
+
+fn query_memory_limits(memory_limit: u64) -> QueryBudgetLimits {
+    QueryBudgetLimits {
+        max_shared_memory_bytes: Some(memory_limit),
+        per_query: QueryWorkLimits {
+            max_memory_bytes: Some(memory_limit),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    }
 }
 
 fn unsorted_chunk(series_id: SeriesId, points: &[(i64, f64)]) -> Arc<Chunk> {
@@ -199,6 +245,7 @@ fn sorted_series_page_collector_applies_pagination_after_filters_and_dedupe() {
         Some(&tombstones),
         SortedSeriesDedupeMode::Timestamp,
         RawSeriesPagination::new(1, Some(1)),
+        1,
     );
 
     assert!(!collector.push(DataPoint::new(10, 10.0)));
@@ -421,6 +468,15 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
             Some(&execution),
         )
         .unwrap();
+    let merge_page_reserved = merge_page.reserved_memory_bytes();
+    assert_eq!(
+        merge_page_reserved,
+        modeled_points_retained_bytes(&merge_page.points)
+    );
+    assert_eq!(
+        execution.snapshot().memory_reserved_bytes,
+        merge_page_reserved
+    );
     let (append_page_snapshot, _) = storage
         .snapshot_series_read_sources(series_id, 0, 10, plan)
         .unwrap();
@@ -437,8 +493,20 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
             Some(&execution),
         )
         .unwrap();
+    let append_page_reserved = append_page.reserved_memory_bytes();
+    assert_eq!(
+        append_page_reserved,
+        modeled_points_retained_bytes(&append_page.points)
+    );
+    assert_eq!(
+        execution.snapshot().memory_reserved_bytes,
+        merge_page_reserved.saturating_add(append_page_reserved)
+    );
     assert_eq!(merge_page.points, vec![DataPoint::new(3, 3.0)]);
     assert_eq!(append_page.points, merge_page.points);
+    drop(append_page);
+    drop(merge_page);
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
 
     drop(execution);
     storage.visibility.tombstones.write().remove(&series_id);
@@ -453,4 +521,440 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
             .unwrap();
     }
     drop(storage);
+}
+
+#[test]
+fn raw_page_to_rows_coalescing_peak_is_exact() {
+    const POINTS: usize = 32;
+    let series = MetricSeries {
+        name: "raw_page_row_coalesce".to_string(),
+        labels: vec![Label::new("identity", "x".repeat(128))],
+    };
+    let build_storage = |limits| {
+        let storage =
+            ChunkStorage::new_with_data_path_and_options_and_disk_budget_and_query_budget(
+                512,
+                None,
+                None,
+                None,
+                1,
+                test_options(None),
+                None,
+                limits,
+            )
+            .unwrap();
+        let rows = (0..POINTS)
+            .map(|index| {
+                Row::with_labels(
+                    series.name.clone(),
+                    series.labels.clone(),
+                    DataPoint::new(
+                        i64::try_from(index).unwrap(),
+                        Value::String(format!("value-{index:04}-{}", "v".repeat(128))),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage
+    };
+
+    let calibration = build_storage(QueryBudgetLimits::default());
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let result = calibration
+        .scan_series_rows_with_execution_result(
+            std::slice::from_ref(&series),
+            0,
+            i64::try_from(POINTS).unwrap(),
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        )
+        .unwrap();
+    assert_eq!(result.page.rows.len(), POINTS);
+    assert_eq!(
+        result.reserved_memory_bytes(),
+        modeled_query_rows_retained_bytes(&result.page.rows)
+    );
+    assert_eq!(
+        execution.snapshot().memory_reserved_bytes,
+        result.reserved_memory_bytes()
+    );
+    let exact_peak = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_peak > result.reserved_memory_bytes());
+    drop(result);
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    drop(execution);
+
+    for (memory_limit, should_succeed) in [(exact_peak, true), (exact_peak - 1, false)] {
+        let storage = build_storage(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(memory_limit),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(memory_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_series_rows_with_execution_result(
+            std::slice::from_ref(&series),
+            0,
+            i64::try_from(POINTS).unwrap(),
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact raw-page/row coalescing peak must succeed");
+            assert_eq!(result.page.rows.len(), POINTS);
+            assert_eq!(
+                result.reserved_memory_bytes(),
+                modeled_query_rows_retained_bytes(&result.page.rows)
+            );
+            drop(result);
+        } else {
+            assert!(matches!(
+                result.expect_err("one byte below the coalescing peak must fail"),
+                TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                    if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+            ));
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn point_retained_memory_model_counts_nested_value_allocations() {
+    let text = Value::String("retained-string".repeat(8));
+    assert_eq!(
+        modeled_value_retained_bytes(&text),
+        u64::try_from(value_heap_bytes(&text))
+            .unwrap()
+            .saturating_add(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+    );
+
+    let histogram = Value::Histogram(Box::new(crate::NativeHistogram {
+        count: Some(crate::HistogramCount::Int(7)),
+        sum: 11.0,
+        schema: 1,
+        zero_threshold: 0.001,
+        zero_count: Some(crate::HistogramCount::Float(0.5)),
+        negative_spans: vec![crate::HistogramBucketSpan {
+            offset: -2,
+            length: 1,
+        }],
+        negative_deltas: vec![-1],
+        negative_counts: vec![1.0],
+        positive_spans: vec![crate::HistogramBucketSpan {
+            offset: 1,
+            length: 2,
+        }],
+        positive_deltas: vec![1, 2],
+        positive_counts: vec![2.0, 4.0],
+        reset_hint: crate::HistogramResetHint::Gauge,
+        custom_values: vec![0.25, 0.75],
+    }));
+    assert_eq!(
+        modeled_value_retained_bytes(&histogram),
+        u64::try_from(value_heap_bytes(&histogram))
+            .unwrap()
+            .saturating_add(8 * QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+        "the histogram box and all seven non-empty vectors need separate allowances",
+    );
+}
+
+#[test]
+fn persisted_and_sealed_merge_query_memory_peak_is_exact() {
+    const POINTS_PER_SOURCE: usize = 8;
+    const TOTAL_POINTS: usize = POINTS_PER_SOURCE * 2;
+    const METRIC: &str = "mixed_persisted_sealed_peak";
+
+    let build_storage = |limits| {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = persistent_numeric_storage_with_query_budget(
+            temp_dir.path(),
+            POINTS_PER_SOURCE,
+            limits,
+        );
+        storage
+            .insert_rows(
+                &(0..POINTS_PER_SOURCE)
+                    .map(|index| {
+                        Row::new(
+                            METRIC,
+                            DataPoint::new(i64::try_from(index).unwrap(), index as f64),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage.flush_all_active().unwrap();
+        assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+        storage
+            .insert_rows(
+                &(POINTS_PER_SOURCE..TOTAL_POINTS)
+                    .map(|index| {
+                        Row::new(
+                            METRIC,
+                            DataPoint::new(i64::try_from(index).unwrap(), index as f64),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage.flush_all_active().unwrap();
+        let series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing(METRIC, &[])
+            .unwrap()
+            .series_id;
+        (temp_dir, storage, series_id)
+    };
+
+    let assert_merge_layout = |storage: &ChunkStorage, series_id| {
+        let (snapshot, _) = storage
+            .snapshot_series_read_sources(
+                series_id,
+                0,
+                i64::try_from(TOTAL_POINTS).unwrap(),
+                TieredQueryPlan::from_cutoffs(0, i64::try_from(TOTAL_POINTS).unwrap(), None, None),
+            )
+            .unwrap();
+        assert_eq!(snapshot.persisted.chunks.len(), 1);
+        assert_eq!(snapshot.sealed_chunks.len(), 1);
+        assert_eq!(snapshot.active_points.point_count(), 0);
+        assert!(snapshot.analysis.can_use_merge_path());
+    };
+
+    let expected = (0..TOTAL_POINTS)
+        .map(|index| DataPoint::new(i64::try_from(index).unwrap(), index as f64))
+        .collect::<Vec<_>>();
+    let (_calibration_dir, calibration, calibration_series_id) =
+        build_storage(QueryBudgetLimits::default());
+    assert_merge_layout(&calibration, calibration_series_id);
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let page = calibration
+        .collect_raw_series_page_with_plan(
+            calibration_series_id,
+            0,
+            i64::try_from(TOTAL_POINTS).unwrap(),
+            TieredQueryPlan::from_cutoffs(0, i64::try_from(TOTAL_POINTS).unwrap(), None, None),
+            0,
+            None,
+            Some(&execution),
+            true,
+        )
+        .unwrap();
+    assert_eq!(page.points, expected);
+    assert!(page.reached_end);
+    assert_eq!(page.stats.hot_persisted_chunks_read, 1);
+    let retained_bytes = page.reserved_memory_bytes();
+    let exact_peak = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_peak > retained_bytes);
+    drop(page);
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    drop(execution);
+    let calibration_budget = calibration.query_budget_snapshot();
+    assert_eq!(calibration_budget.active_queries, 0);
+    assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
+    assert_eq!(calibration_budget.accounting_invariant_violations_total, 0);
+
+    for (memory_limit, should_succeed) in [(exact_peak, true), (exact_peak - 1, false)] {
+        let (_temp_dir, storage, series_id) = build_storage(query_memory_limits(memory_limit));
+        assert_merge_layout(&storage, series_id);
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.collect_raw_series_page_with_plan(
+            series_id,
+            0,
+            i64::try_from(TOTAL_POINTS).unwrap(),
+            TieredQueryPlan::from_cutoffs(0, i64::try_from(TOTAL_POINTS).unwrap(), None, None),
+            0,
+            None,
+            Some(&execution),
+            true,
+        );
+        if should_succeed {
+            let page = result.expect("the exact persisted-plus-sealed peak must succeed");
+            assert_eq!(page.points, expected);
+            assert!(page.reached_end);
+            assert_eq!(page.stats.hot_persisted_chunks_read, 1);
+            assert_eq!(page.reserved_memory_bytes(), retained_bytes);
+            drop(page);
+        } else {
+            assert!(matches!(
+                result.expect_err("one byte below the mixed-source peak must fail"),
+                TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                    if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+            ));
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let budget = storage.query_budget_snapshot();
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn zstd_compressed_constant_blob_query_memory_peak_is_exact() {
+    const POINTS: usize = 16;
+    const METRIC: &str = "compressed_constant_blob_peak";
+
+    let constant_value = Value::String("highly-compressible-query-payload-".repeat(512));
+    let build_storage = |limits| {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = persistent_blob_storage_with_query_budget(temp_dir.path(), POINTS, limits);
+        storage
+            .insert_rows(
+                &(0..POINTS)
+                    .map(|index| {
+                        Row::new(
+                            METRIC,
+                            DataPoint::new(i64::try_from(index).unwrap(), constant_value.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage.flush_all_active().unwrap();
+        assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+        let series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing(METRIC, &[])
+            .unwrap()
+            .series_id;
+        (temp_dir, storage, series_id)
+    };
+
+    let assert_zstd_constant_chunk = |storage: &ChunkStorage, series_id| {
+        let persisted = storage.persisted.persisted_index.read();
+        let chunks = persisted.chunk_refs.get(&series_id).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks[0];
+        assert_eq!(chunk.lane, ValueLane::Blob);
+        assert_eq!(chunk.value_codec, chunk::ValueCodecId::ConstantRle);
+        let segment = persisted.segment_maps.get(&chunk.segment_slot).unwrap();
+        let (decoded_len, compressed) =
+            crate::engine::segment::chunk_payload_decoded_len_from_record(
+                segment.as_slice(),
+                chunk.chunk_offset,
+                chunk.chunk_len,
+            )
+            .unwrap();
+        assert!(compressed, "the persisted chunk must use zstd");
+        assert!(decoded_len > usize::try_from(chunk.chunk_len).unwrap());
+    };
+
+    let expected = (0..POINTS)
+        .map(|index| DataPoint::new(i64::try_from(index).unwrap(), constant_value.clone()))
+        .collect::<Vec<_>>();
+    let (_calibration_dir, calibration, calibration_series_id) =
+        build_storage(QueryBudgetLimits::default());
+    assert_zstd_constant_chunk(&calibration, calibration_series_id);
+    let (snapshot, _) = calibration
+        .snapshot_series_read_sources(
+            calibration_series_id,
+            0,
+            i64::try_from(POINTS).unwrap(),
+            TieredQueryPlan::from_cutoffs(0, i64::try_from(POINTS).unwrap(), None, None),
+        )
+        .unwrap();
+    assert_eq!(snapshot.persisted.chunks.len(), 1);
+    assert!(snapshot.sealed_chunks.is_empty());
+    assert_eq!(snapshot.active_points.point_count(), 0);
+    assert!(snapshot.analysis.can_use_merge_path());
+    drop(snapshot);
+
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let page = calibration
+        .collect_raw_series_page_with_plan(
+            calibration_series_id,
+            0,
+            i64::try_from(POINTS).unwrap(),
+            TieredQueryPlan::from_cutoffs(0, i64::try_from(POINTS).unwrap(), None, None),
+            0,
+            None,
+            Some(&execution),
+            true,
+        )
+        .unwrap();
+    assert_eq!(page.points, expected);
+    assert!(page.reached_end);
+    let retained_bytes = page.reserved_memory_bytes();
+    let exact_peak = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_peak > retained_bytes);
+    drop(page);
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    drop(execution);
+    let calibration_budget = calibration.query_budget_snapshot();
+    assert_eq!(calibration_budget.active_queries, 0);
+    assert_eq!(calibration_budget.shared_reserved_memory_bytes, 0);
+    assert_eq!(calibration_budget.accounting_invariant_violations_total, 0);
+
+    for (memory_limit, should_succeed) in [(exact_peak, true), (exact_peak - 1, false)] {
+        let (_temp_dir, storage, series_id) = build_storage(query_memory_limits(memory_limit));
+        assert_zstd_constant_chunk(&storage, series_id);
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.collect_raw_series_page_with_plan(
+            series_id,
+            0,
+            i64::try_from(POINTS).unwrap(),
+            TieredQueryPlan::from_cutoffs(0, i64::try_from(POINTS).unwrap(), None, None),
+            0,
+            None,
+            Some(&execution),
+            true,
+        );
+        if should_succeed {
+            let page = result.expect("the exact zstd-decode peak must succeed");
+            assert_eq!(page.points, expected);
+            assert!(page.reached_end);
+            assert_eq!(page.reserved_memory_bytes(), retained_bytes);
+            drop(page);
+        } else {
+            assert!(matches!(
+                result.expect_err("one byte below the zstd-decode peak must fail"),
+                TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                    if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+            ));
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let budget = storage.query_budget_snapshot();
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
+    }
 }

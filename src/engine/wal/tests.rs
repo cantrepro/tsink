@@ -9,11 +9,14 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use super::{
-    checksum32, collect_wal_segment_files, encode_series_definition, replay_from_path,
+    checksum32, collect_wal_segment_files, decode_published_highwater_record,
+    encode_published_highwater_record, encode_series_definition, replay_from_path,
     replay_from_path_with_mode, scan_last_seq, segment_path, CachedSeriesDefinitionFrame,
-    CachedSeriesDefinitionIndex, FramedWal, ReplayFrame, SamplesBatchFrame, SeriesDefinitionFrame,
-    DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_SERIES_DEF,
-    PUBLISHED_HIGHWATER_RECORD_LEN, WAL_FILE_NAME, WAL_PUBLISHED_HIGHWATER_FILE_NAME,
+    CachedSeriesDefinitionIndex, FramedWal, PublishedHighwaterRecord, ReplayFrame,
+    SamplesBatchFrame, SeriesDefinitionFrame, DEFAULT_WAL_SEGMENT_MAX_BYTES, FRAME_HEADER_LEN,
+    FRAME_MAGIC, FRAME_TYPE_SERIES_DEF, PUBLISHED_HIGHWATER_MAX_RECORD_LEN,
+    PUBLISHED_HIGHWATER_RECORD_LEN, PUBLISHED_HIGHWATER_V2_RECORD_LEN, WAL_FILE_NAME,
+    WAL_PUBLISHED_HIGHWATER_FILE_NAME, WAL_PUBLISHED_HIGHWATER_TMP_FILE_NAME,
 };
 use crate::engine::binio::{write_u32_at, write_u64_at};
 use crate::engine::chunk::{ChunkPoint, ValueLane};
@@ -51,6 +54,107 @@ fn wal_directory_image(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             )
         })
         .collect()
+}
+
+fn rewrite_published_highwater(path: &Path, highwater: WalHighWatermark) {
+    let marker = path.join(WAL_PUBLISHED_HIGHWATER_FILE_NAME);
+    let mut bytes = fs::read(&marker).unwrap();
+    assert_eq!(bytes.len(), PUBLISHED_HIGHWATER_RECORD_LEN);
+    write_u64_at(&mut bytes, 4, highwater.segment).unwrap();
+    write_u64_at(&mut bytes, 12, highwater.frame).unwrap();
+    let checksum = checksum32(&bytes[..20]);
+    write_u32_at(&mut bytes, 20, checksum).unwrap();
+    fs::write(marker, bytes).unwrap();
+}
+
+fn seed_two_published_frames(path: &Path) -> (PathBuf, u64, Vec<u8>) {
+    let wal = FramedWal::open(path, WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "first".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let segment = wal.path();
+    let first_frame_len = fs::metadata(&segment).unwrap().len();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 2,
+        metric: "second".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    drop(wal);
+
+    let complete_segment = fs::read(&segment).unwrap();
+    assert!(complete_segment.len() > first_frame_len as usize);
+    (segment, first_frame_len, complete_segment)
+}
+
+fn seed_three_segment_published_wal(path: &Path) -> Vec<PathBuf> {
+    let definitions = (1..=3)
+        .map(|series_id| SeriesDefinitionFrame {
+            series_id,
+            metric: format!("segment_{series_id}"),
+            labels: vec![],
+        })
+        .collect::<Vec<_>>();
+    let segment_max_bytes =
+        FramedWal::estimate_series_definition_frame_bytes(&definitions[0]).unwrap();
+    let wal =
+        FramedWal::open_with_options(path, WalSyncMode::PerAppend, 128, segment_max_bytes).unwrap();
+    for definition in &definitions {
+        wal.append_series_definition(definition).unwrap();
+    }
+    drop(wal);
+
+    let segments = collect_wal_segment_files(path)
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.path)
+        .collect::<Vec<_>>();
+    assert!(
+        segments.len() >= 3,
+        "the namespace-integrity tests require at least three published WAL segments",
+    );
+    segments
+}
+
+#[test]
+fn published_highwater_codec_preserves_legacy_and_v2_reset_records() {
+    let published = WalHighWatermark {
+        segment: 7,
+        frame: 19,
+    };
+    let reset_through = WalHighWatermark {
+        segment: 6,
+        frame: 11,
+    };
+
+    let legacy = PublishedHighwaterRecord::commit(published);
+    let legacy_bytes = encode_published_highwater_record(legacy);
+    assert_eq!(legacy_bytes.len(), PUBLISHED_HIGHWATER_RECORD_LEN);
+    assert_eq!(&legacy_bytes[..4], b"TSHW");
+    assert_eq!(
+        decode_published_highwater_record(&legacy_bytes).unwrap(),
+        legacy
+    );
+
+    let v2 = PublishedHighwaterRecord::with_reset_floor(published, reset_through).unwrap();
+    let v2_bytes = encode_published_highwater_record(v2);
+    assert_eq!(v2_bytes.len(), PUBLISHED_HIGHWATER_V2_RECORD_LEN);
+    assert_eq!(&v2_bytes[..4], b"TSH2");
+    assert_eq!(decode_published_highwater_record(&v2_bytes).unwrap(), v2);
+
+    let mut corrupt = v2_bytes;
+    *corrupt.last_mut().unwrap() ^= 0xff;
+    assert!(matches!(
+        decode_published_highwater_record(&corrupt),
+        Err(TsinkError::DataCorruption(message)) if message.contains("checksum mismatch")
+    ));
+    assert!(matches!(
+        PublishedHighwaterRecord::with_reset_floor(reset_through, published),
+        Err(TsinkError::DataCorruption(message)) if message.contains("reset floor")
+    ));
 }
 
 fn sample_histogram() -> NativeHistogram {
@@ -347,6 +451,188 @@ fn strict_wal_open_rejects_corrupt_published_frame_without_mutating_namespace() 
 }
 
 #[test]
+fn wal_open_rejects_empty_boundary_above_replay_floor_without_mutation() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "published".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+        let segment = wal.path();
+        drop(wal);
+        fs::write(&segment, []).unwrap();
+        let before = wal_directory_image(temp_dir.path());
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+            WalHighWatermark::default(),
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must require the published boundary frame"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("WAL publish boundary frame 1 is missing")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(
+            wal_directory_image(temp_dir.path()),
+            before,
+            "{replay_mode:?} rejection must not mutate an empty boundary segment",
+        );
+    }
+}
+
+#[test]
+fn wal_open_rejects_first_frame_after_boundary_above_replay_floor_without_mutation() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let (segment, first_frame_len, complete_segment) =
+            seed_two_published_frames(temp_dir.path());
+        rewrite_published_highwater(
+            temp_dir.path(),
+            WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            },
+        );
+        fs::write(&segment, &complete_segment[first_frame_len as usize..]).unwrap();
+        let before = wal_directory_image(temp_dir.path());
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+            WalHighWatermark::default(),
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must require the published boundary frame"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains(
+                        "WAL publish boundary frame 1 is missing before frame 2"
+                    )
+            ),
+            "{error:?}",
+        );
+        assert_eq!(
+            wal_directory_image(temp_dir.path()),
+            before,
+            "{replay_mode:?} rejection must not truncate the higher first frame",
+        );
+    }
+}
+
+#[test]
+fn wal_open_rejects_short_published_prefix_above_replay_floor_without_mutation() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let (segment, first_frame_len, complete_segment) =
+            seed_two_published_frames(temp_dir.path());
+        fs::write(&segment, &complete_segment[..first_frame_len as usize]).unwrap();
+        let before = wal_directory_image(temp_dir.path());
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+            WalHighWatermark::default(),
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must require the published boundary frame"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("WAL publish boundary frame 2 is missing")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(
+            wal_directory_image(temp_dir.path()),
+            before,
+            "{replay_mode:?} rejection must not mutate the short published prefix",
+        );
+    }
+}
+
+#[test]
+fn wal_open_allows_absent_boundary_only_when_checkpoint_floor_covers_marker() {
+    for retain_higher_frame in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let (segment, first_frame_len, complete_segment) =
+            seed_two_published_frames(temp_dir.path());
+        rewrite_published_highwater(
+            temp_dir.path(),
+            WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            },
+        );
+        let boundary_bytes = if retain_higher_frame {
+            &complete_segment[first_frame_len as usize..]
+        } else {
+            &[]
+        };
+        fs::write(&segment, boundary_bytes).unwrap();
+        let marker_before =
+            fs::read(temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)).unwrap();
+
+        let reopened = FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            WalReplayMode::Strict,
+            WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            reopened.current_published_highwater(),
+            WalHighWatermark {
+                segment: 0,
+                frame: 1,
+            },
+        );
+        assert_eq!(
+            fs::metadata(&segment).unwrap().len(),
+            0,
+            "checkpoint-covered empty and higher-first-frame boundaries are both legal",
+        );
+        assert_eq!(
+            fs::read(temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)).unwrap(),
+            marker_before,
+            "checkpoint authorization must not rewrite the publication marker",
+        );
+    }
+}
+
+#[test]
 fn strict_wal_open_truncates_corrupt_unpublished_suffix_after_full_preflight() {
     let temp_dir = TempDir::new().unwrap();
     let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
@@ -498,6 +784,283 @@ fn wal_reopen_discards_unpublished_frames_from_a_later_segment() {
         .collect::<Vec<_>>();
     assert_eq!(committed_series_ids, vec![1]);
     assert_eq!(std::fs::metadata(reopened.path()).unwrap().len(), 0);
+}
+
+#[test]
+fn wal_open_rejects_a_gap_in_the_published_segment_namespace_without_mutation() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let segments = seed_three_segment_published_wal(temp_dir.path());
+        fs::remove_file(&segments[1]).unwrap();
+        let before = wal_directory_image(temp_dir.path());
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+            WalHighWatermark::default(),
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must reject a published WAL segment gap"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("non-contiguous WAL segment namespace")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(
+            wal_directory_image(temp_dir.path()),
+            before,
+            "{replay_mode:?} rejection must not change WAL files or the publication marker",
+        );
+    }
+}
+
+#[test]
+fn wal_open_rejects_duplicate_zero_segment_aliases_without_mutation() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let segments = seed_three_segment_published_wal(temp_dir.path());
+        let legacy_alias = temp_dir.path().join(WAL_FILE_NAME);
+        fs::copy(&segments[0], &legacy_alias).unwrap();
+        let before = wal_directory_image(temp_dir.path());
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must reject duplicate segment-zero aliases"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("duplicate WAL segment id 0")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(
+            wal_directory_image(temp_dir.path()),
+            before,
+            "{replay_mode:?} rejection must not change WAL files or the publication marker",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_open_rejects_a_segment_symlink_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let wal_dir = TempDir::new().unwrap();
+        let external_dir = TempDir::new().unwrap();
+        let external = external_dir.path().join("sentinel");
+        fs::write(&external, b"external-sentinel").unwrap();
+        let segment = segment_path(wal_dir.path(), 0);
+        symlink(&external, &segment).unwrap();
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+            wal_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must reject a recognized segment symlink"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("recognized WAL segment must be a regular non-link file")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(fs::read(&external).unwrap(), b"external-sentinel");
+        assert!(fs::symlink_metadata(&segment)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            !wal_dir
+                .path()
+                .join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)
+                .exists(),
+            "rejected symlink namespace must not publish a WAL boundary",
+        );
+        assert_eq!(fs::read_dir(wal_dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_open_rejects_a_published_marker_symlink_without_mutating_the_wal_or_target() {
+    use std::os::unix::fs::symlink;
+
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let root = TempDir::new().unwrap();
+        let wal_dir = root.path().join("wal");
+        let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "published".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+        let segment = wal.path();
+        let segment_before = fs::read(&segment).unwrap();
+        let marker = wal_dir.join(WAL_PUBLISHED_HIGHWATER_FILE_NAME);
+        let valid_marker = fs::read(&marker).unwrap();
+        drop(wal);
+
+        let external = root.path().join("external-marker");
+        fs::write(&external, &valid_marker).unwrap();
+        fs::remove_file(&marker).unwrap();
+        symlink(&external, &marker).unwrap();
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+            &wal_dir,
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must reject a linked publish marker"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains(
+                        "WAL publish boundary marker must be a regular non-link file"
+                    )
+            ),
+            "{error:?}",
+        );
+        assert_eq!(fs::read(&segment).unwrap(), segment_before);
+        assert_eq!(fs::read(&external).unwrap(), valid_marker);
+        assert!(fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            !wal_dir.join(WAL_PUBLISHED_HIGHWATER_TMP_FILE_NAME).exists(),
+            "rejected marker reads must not stage a replacement",
+        );
+    }
+}
+
+#[test]
+fn wal_open_rejects_an_oversized_published_marker_without_mutating_the_wal() {
+    for replay_mode in [WalReplayMode::Strict, WalReplayMode::Salvage] {
+        let temp_dir = TempDir::new().unwrap();
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "published".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+        let segment = wal.path();
+        let segment_before = fs::read(&segment).unwrap();
+        drop(wal);
+
+        let marker = temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME);
+        let oversized = vec![0xa5; PUBLISHED_HIGHWATER_MAX_RECORD_LEN + 1];
+        fs::write(&marker, &oversized).unwrap();
+
+        let error = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+            temp_dir.path(),
+            WalSyncMode::PerAppend,
+            128,
+            None,
+            replay_mode,
+        ) {
+            Ok(_) => panic!("{replay_mode:?} open must reject an oversized publish marker"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                TsinkError::DataCorruption(message)
+                    if message.contains("WAL publish boundary record must be")
+            ),
+            "{error:?}",
+        );
+        assert_eq!(fs::read(&segment).unwrap(), segment_before);
+        assert_eq!(fs::read(&marker).unwrap(), oversized);
+        assert!(
+            !temp_dir
+                .path()
+                .join(WAL_PUBLISHED_HIGHWATER_TMP_FILE_NAME)
+                .exists(),
+            "rejected marker reads must not stage a replacement",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_publication_unlinks_stale_tmp_links_without_mutating_their_targets() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let root = TempDir::new().unwrap();
+        let wal_dir = root.path().join("wal");
+        let wal = FramedWal::open(&wal_dir, WalSyncMode::PerAppend).unwrap();
+        let external = root.path().join(if hard_link {
+            "hard-link-target"
+        } else {
+            "symlink-target"
+        });
+        fs::write(&external, b"external-sentinel").unwrap();
+        let temporary = wal_dir.join(WAL_PUBLISHED_HIGHWATER_TMP_FILE_NAME);
+        if hard_link {
+            fs::hard_link(&external, &temporary).unwrap();
+        } else {
+            symlink(&external, &temporary).unwrap();
+        }
+
+        wal.append_series_definition(&SeriesDefinitionFrame {
+            series_id: 1,
+            metric: "published".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&external).unwrap(),
+            b"external-sentinel",
+            "{} target must not be opened through the owned temporary name",
+            if hard_link { "hard-link" } else { "symlink" },
+        );
+        assert!(
+            matches!(
+                fs::symlink_metadata(&temporary),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "successful marker replacement must consume its temporary entry",
+        );
+        let marker_metadata =
+            fs::symlink_metadata(wal_dir.join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)).unwrap();
+        assert!(marker_metadata.file_type().is_file());
+        assert!(!crate::engine::fs_utils::is_link_or_reparse_point(
+            &marker_metadata
+        ));
+        assert_eq!(wal.replay_frames().unwrap().len(), 1);
+    }
 }
 
 #[test]
@@ -1309,7 +1872,7 @@ fn wal_reset_preserves_frames_when_recovery_headroom_is_unavailable() {
         TsinkError::InsufficientDiskSpace {
             required,
             available: 0
-        } if required == PUBLISHED_HIGHWATER_RECORD_LEN as u64
+        } if required == PUBLISHED_HIGHWATER_MAX_RECORD_LEN as u64
     ));
     assert_eq!(wal.replay_frames().unwrap().len(), frames_before.len());
     assert_runtime_accounting_matches_disk(&wal, &wal_dir);
@@ -1346,6 +1909,163 @@ fn wal_reset_preserves_monotonic_sequence() {
 
     assert_eq!(wal.current_highwater().frame, 2);
     assert_eq!(wal.current_durable_highwater().frame, 2);
+}
+
+#[test]
+fn reset_marker_sync_failpoint_recovery_finishes_the_authorized_reset() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 7,
+        metric: "before_reset".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let reset_floor = wal.current_highwater();
+    let segment = wal.path();
+    let segment_before = fs::read(&segment).unwrap();
+    wal.set_durability_failpoint_hook(|point| {
+        if point == super::WalDurabilityFailpoint::ResetAfterMarkerSync {
+            return Err(TsinkError::Other(
+                "injected reset failure after marker sync".to_string(),
+            ));
+        }
+        Ok(())
+    });
+
+    let error = wal.reset().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected reset failure after marker sync"));
+    assert_eq!(
+        fs::read(&segment).unwrap(),
+        segment_before,
+        "the failpoint fires before any WAL frame is removed",
+    );
+    wal.clear_durability_failpoint_hook();
+    drop(wal);
+
+    let reopened = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    assert_eq!(reopened.current_highwater(), reset_floor);
+    assert!(reopened.replay_frames().unwrap().is_empty());
+    assert_eq!(fs::metadata(reopened.path()).unwrap().len(), 0);
+    reopened
+        .append_series_definition(&SeriesDefinitionFrame {
+            series_id: 8,
+            metric: "after_reset".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+    assert!(reopened.current_published_highwater() > reset_floor);
+}
+
+#[test]
+fn reset_floor_survives_rotation_reopen_and_a_later_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let first = SeriesDefinitionFrame {
+        series_id: 7,
+        metric: "before_reset".to_string(),
+        labels: vec![],
+    };
+    let segment_max_bytes = FramedWal::estimate_series_definition_frame_bytes(&first).unwrap();
+    let wal = FramedWal::open_with_options(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        128,
+        segment_max_bytes,
+    )
+    .unwrap();
+    wal.append_series_definition(&first).unwrap();
+    assert_eq!(
+        wal.active_segment(),
+        1,
+        "the append must leave a newer empty segment"
+    );
+
+    wal.reset().unwrap();
+    let reset_floor = WalHighWatermark {
+        segment: 1,
+        frame: 0,
+    };
+    let marker_path = temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME);
+    let reset_record = decode_published_highwater_record(&fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(reset_record.highwater, reset_floor);
+    assert_eq!(reset_record.reset_through, Some(reset_floor));
+    assert_eq!(
+        fs::metadata(&marker_path).unwrap().len(),
+        PUBLISHED_HIGHWATER_V2_RECORD_LEN as u64,
+    );
+    drop(wal);
+
+    let reopened = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    assert_eq!(reopened.current_highwater(), reset_floor);
+    assert_eq!(reopened.current_durable_highwater(), reset_floor);
+    assert!(reopened.replay_frames().unwrap().is_empty());
+
+    reopened
+        .append_series_definition(&SeriesDefinitionFrame {
+            series_id: 8,
+            metric: "after_reset".to_string(),
+            labels: vec![],
+        })
+        .unwrap();
+    let committed = reopened.current_published_highwater();
+    assert!(committed > reset_floor);
+    let committed_record =
+        decode_published_highwater_record(&fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(committed_record.highwater, committed);
+    assert_eq!(committed_record.reset_through, Some(reset_floor));
+    drop(reopened);
+
+    let reopened_again = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    assert_eq!(reopened_again.current_published_highwater(), committed);
+    assert_eq!(reopened_again.replay_frames().unwrap().len(), 1);
+}
+
+#[test]
+fn post_reset_commit_still_requires_its_exact_published_frame() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 1,
+        metric: "before_reset".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    wal.reset().unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 2,
+        metric: "after_reset".to_string(),
+        labels: vec![],
+    })
+    .unwrap();
+    let segment = wal.path();
+    let published = wal.current_published_highwater();
+    let marker_before = fs::read(temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)).unwrap();
+    drop(wal);
+    fs::write(&segment, []).unwrap();
+    let before = wal_directory_image(temp_dir.path());
+
+    let error = match FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend) {
+        Ok(_) => panic!("a post-reset commit must retain an exact published frame"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            TsinkError::DataCorruption(message)
+                if message.contains(&format!(
+                    "WAL publish boundary frame {} is missing",
+                    published.frame
+                ))
+        ),
+        "{error:?}",
+    );
+    assert_eq!(wal_directory_image(temp_dir.path()), before);
+    assert_eq!(
+        fs::read(temp_dir.path().join(WAL_PUBLISHED_HIGHWATER_FILE_NAME)).unwrap(),
+        marker_before,
+    );
 }
 
 #[test]
@@ -1682,6 +2402,29 @@ fn ensure_min_highwater_moves_active_segment_floor() {
             frame: 9
         }
     );
+    drop(wal);
+
+    let reopened = FramedWal::open_with_buffer_size_and_disk_budget_and_replay_floor(
+        temp_dir.path(),
+        WalSyncMode::PerAppend,
+        128,
+        None,
+        WalReplayMode::Strict,
+        WalHighWatermark {
+            segment: 3,
+            frame: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.active_segment(), 3);
+    assert_eq!(
+        reopened.current_highwater(),
+        WalHighWatermark {
+            segment: 3,
+            frame: 9,
+        },
+    );
+    assert_runtime_accounting_matches_disk(&reopened, temp_dir.path());
 }
 
 #[test]
@@ -1792,7 +2535,7 @@ fn replay_salvage_mode_skips_checksum_mismatch_and_continues_with_later_frames()
 }
 
 #[test]
-fn salvage_wal_open_quarantines_corrupt_active_segment_before_new_appends() {
+fn salvage_wal_open_rejects_corrupt_markerless_segment_without_mutating_namespace() {
     let temp_dir = TempDir::new().unwrap();
     let wal_path = temp_dir.path().join(WAL_FILE_NAME);
     let mut file = OpenOptions::new()
@@ -1836,45 +2579,31 @@ fn salvage_wal_open_quarantines_corrupt_active_segment_before_new_appends() {
     );
     write_frame(&mut file, 3, &payload_c, checksum32(&payload_c));
     file.flush().unwrap();
+    drop(file);
+    let before = fs::read(&wal_path).unwrap();
 
-    let reopened = FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
+    let err = match FramedWal::open_with_buffer_size_and_disk_budget_and_replay_mode(
         temp_dir.path(),
         WalSyncMode::PerAppend,
         1,
         None,
         WalReplayMode::Salvage,
-    )
-    .unwrap();
-    let recovery_segment = segment_path(temp_dir.path(), 1);
-    assert_eq!(
-        reopened.current_highwater(),
-        WalHighWatermark {
-            segment: 0,
-            frame: 3,
-        }
+    ) {
+        Ok(_) => panic!("salvage WAL open must reject a corrupt markerless published prefix"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(
+            err,
+            TsinkError::DataCorruption(ref message)
+                if message.contains("published WAL frame 2")
+                    && message.contains("checksum mismatch")
+        ),
+        "{err}"
     );
-    assert_eq!(reopened.active_segment(), 1);
-    assert_eq!(reopened.path(), recovery_segment);
-    assert_eq!(reopened.next_seq.load(Ordering::SeqCst), 1);
-
-    reopened
-        .append_series_definition(&SeriesDefinitionFrame {
-            series_id: 4,
-            metric: "cpu_d".to_string(),
-            labels: vec![Label::new("host", "d")],
-        })
-        .unwrap();
-
-    let replayed_series_ids = reopened
-        .replay_frames_with_mode(WalReplayMode::Salvage)
-        .unwrap()
-        .into_iter()
-        .map(|frame| match frame {
-            ReplayFrame::SeriesDefinition(frame) => frame.series_id,
-            ReplayFrame::Samples(_) => panic!("expected series definition frame"),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(replayed_series_ids, vec![1, 3, 4]);
+    assert_eq!(fs::read(&wal_path).unwrap(), before);
+    assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -1905,12 +2634,16 @@ fn strict_wal_open_rejects_corrupt_active_segment_without_mutating_namespace() {
         None,
         WalReplayMode::Strict,
     ) {
-        Ok(_) => panic!("strict WAL open must reject a corrupt active segment"),
+        Ok(_) => panic!("strict WAL open must reject a corrupt markerless published prefix"),
         Err(err) => err,
     };
 
     assert!(
-        matches!(err, TsinkError::DataCorruption(ref message) if message.contains("strict WAL open detected corruption")),
+        matches!(
+            err,
+            TsinkError::DataCorruption(ref message)
+                if message.contains("published WAL prefix has a truncated frame header")
+        ),
         "{err}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), before);
@@ -2201,6 +2934,7 @@ fn failed_append_does_not_advance_next_seq() {
             segment: 0,
             frame: 6,
         }),
+        reset_highwater_floor: parking_lot::Mutex::new(None),
         last_durable_highwater: parking_lot::Mutex::new(WalHighWatermark {
             segment: 0,
             frame: 6,

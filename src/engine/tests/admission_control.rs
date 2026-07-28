@@ -388,7 +388,7 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
 }
 
 #[test]
-fn memory_pressure_relief_completes_with_busy_writer_permit() {
+fn memory_pressure_relief_rejects_safely_with_busy_writer_permit() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
@@ -423,7 +423,7 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             maintenance_max_items_per_pass: 1_024,
             maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
-            background_threads_enabled: true,
+            background_threads_enabled: false,
             background_fail_fast: false,
             metadata_shard_count: None,
             remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
@@ -435,24 +435,50 @@ fn memory_pressure_relief_completes_with_busy_writer_permit() {
     )
     .unwrap();
 
+    let expected = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
     storage
         .insert_rows(&[
-            Row::new("memory_pressure_drain_metric", DataPoint::new(1, 1.0)),
-            Row::new("memory_pressure_drain_metric", DataPoint::new(2, 2.0)),
+            Row::new("memory_pressure_drain_metric", expected[0].clone()),
+            Row::new("memory_pressure_drain_metric", expected[1].clone()),
         ])
         .unwrap();
-
     storage
         .memory
         .budget_bytes
         .store(1, std::sync::atomic::Ordering::Release);
     storage.refresh_memory_usage();
 
-    let _held_permit = storage.runtime.write_limiter.acquire();
-    storage.enforce_memory_budget_if_needed().unwrap();
+    let held_permit = storage.runtime.write_limiter.acquire();
+    let error = storage
+        .enforce_memory_budget_if_needed()
+        .expect_err("a one-byte budget cannot admit the finite persistence peak");
+    assert!(matches!(
+        error,
+        TsinkError::MemoryBudgetExceeded {
+            budget: 1,
+            required,
+        } if required > 1
+    ));
+    assert!(
+        load_segments_for_level(&lane_path, 0).unwrap().is_empty(),
+        "rejected memory-pressure relief must roll back its staged segment",
+    );
+    assert_eq!(
+        storage
+            .select("memory_pressure_drain_metric", &[], 0, 3)
+            .unwrap(),
+        expected,
+        "rejected memory-pressure relief must preserve accepted data",
+    );
+    drop(held_permit);
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, std::sync::atomic::Ordering::Release);
+    storage.close().unwrap();
     assert!(
         !load_segments_for_level(&lane_path, 0).unwrap().is_empty(),
-        "memory-pressure relief should still persist data while another writer permit is held",
+        "an admitted close retry must persist the accepted data",
     );
 }
 

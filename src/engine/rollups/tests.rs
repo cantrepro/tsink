@@ -258,11 +258,103 @@ fn open_budgeted_rollup_storage(
     storage
 }
 
+fn open_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
+    let mut options = ChunkStorageOptions::default();
+    options.background_threads_enabled = false;
+    options.max_writers = 1;
+    options.write_timeout = std::time::Duration::ZERO;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(data_path.join("numeric")),
+        Some(data_path.join("blob")),
+        1,
+        options,
+    )
+    .unwrap();
+    storage.load_rollup_runtime_state().unwrap();
+    storage
+}
+
 fn assert_no_rollup_reservation(budget: &crate::LocalDiskBudget, expected_bytes: u64) {
     let snapshot = budget.snapshot();
     assert_eq!(snapshot.accounted_bytes, expected_bytes);
     assert_eq!(snapshot.active_reservations, 0);
     assert_eq!(snapshot.reserved_bytes, 0);
+}
+
+#[test]
+fn fenced_idle_shared_background_rollup_preserves_pending_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = open_empty_rollup_storage(temp_dir.path());
+    {
+        let mut cursor = storage.rollups.traversal_cursor.lock();
+        cursor.policy_id = Some("removed-policy".to_string());
+        cursor.policy_generation = 7;
+        cursor.after_series_id = Some(11);
+        cursor.checkpoint_persistence_pending = true;
+        cursor.cycle_complete = false;
+    }
+    storage
+        .rollups
+        .runtime
+        .snapshot_publication_fenced
+        .store(true, Ordering::Release);
+    let held_permit = storage.runtime.write_limiter.acquire();
+
+    let error = storage
+        .run_shared_background_rollup_pipeline_once()
+        .expect_err("an empty-policy pass must still honor the publication fence");
+
+    assert!(error.to_string().contains("fenced"));
+    assert!(error.to_string().contains("reopen"));
+    let cursor = storage.rollups.traversal_cursor.lock();
+    assert_eq!(cursor.policy_id.as_deref(), Some("removed-policy"));
+    assert_eq!(cursor.policy_generation, 7);
+    assert_eq!(cursor.after_series_id, Some(11));
+    assert!(cursor.checkpoint_persistence_pending);
+    assert!(!cursor.cycle_complete);
+    drop(cursor);
+    assert_eq!(storage.runtime.write_limiter.available_permits(), 0);
+
+    storage
+        .rollups
+        .runtime
+        .snapshot_publication_fenced
+        .store(false, Ordering::Release);
+    drop(held_permit);
+    storage.close().unwrap();
+}
+
+#[test]
+fn successful_idle_shared_background_rollup_clears_pending_cursor() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = open_empty_rollup_storage(temp_dir.path());
+    {
+        let mut cursor = storage.rollups.traversal_cursor.lock();
+        cursor.policy_id = Some("removed-policy".to_string());
+        cursor.policy_generation = 7;
+        cursor.after_series_id = Some(11);
+        cursor.checkpoint_persistence_pending = true;
+        cursor.cycle_complete = false;
+    }
+    let held_permit = storage.runtime.write_limiter.acquire();
+
+    storage
+        .run_shared_background_rollup_pipeline_once()
+        .unwrap();
+
+    let cursor = storage.rollups.traversal_cursor.lock();
+    assert_eq!(cursor.policy_id, None);
+    assert_eq!(cursor.policy_generation, 0);
+    assert_eq!(cursor.after_series_id, None);
+    assert!(!cursor.checkpoint_persistence_pending);
+    assert!(cursor.cycle_complete);
+    drop(cursor);
+    assert_eq!(storage.runtime.write_limiter.available_permits(), 0);
+
+    drop(held_permit);
+    storage.close().unwrap();
 }
 
 #[test]

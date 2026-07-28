@@ -2140,11 +2140,11 @@ fn decode_chunk_payload_from_storage(payload: &[u8], chunk_flags: u8) -> Result<
     Ok(payload.to_vec())
 }
 
-pub(crate) fn chunk_payload_from_record<'a>(
-    bytes: &'a [u8],
+fn chunk_payload_record_parts(
+    bytes: &[u8],
     chunk_offset: u64,
     chunk_len: u32,
-) -> Result<Cow<'a, [u8]>> {
+) -> Result<(&[u8], u8)> {
     ensure_chunks_file_size(bytes)?;
     let offset = usize::try_from(chunk_offset).map_err(|_| {
         TsinkError::DataCorruption(format!("chunk offset {chunk_offset} exceeds usize"))
@@ -2200,8 +2200,45 @@ pub(crate) fn chunk_payload_from_record<'a>(
             chunk_offset
         )));
     }
+    validate_chunk_payload_flags(chunk_flags)?;
+    Ok((&record[payload_start..payload_end], chunk_flags))
+}
 
-    let payload = &record[payload_start..payload_end];
+pub(crate) fn chunk_payload_decoded_len_from_record(
+    bytes: &[u8],
+    chunk_offset: u64,
+    chunk_len: u32,
+) -> Result<(usize, bool)> {
+    let (payload, chunk_flags) = chunk_payload_record_parts(bytes, chunk_offset, chunk_len)?;
+    let compressed = chunk_payload_uses_zstd(chunk_flags)?;
+    let decoded_len = if compressed {
+        if payload.len() < CHUNK_PAYLOAD_ZSTD_ORIGINAL_LEN_PREFIX_BYTES {
+            return Err(TsinkError::DataCorruption(
+                "compressed chunk payload missing original length prefix".to_string(),
+            ));
+        }
+        usize::try_from(read_u32_at(payload, 0)?).map_err(|_| {
+            TsinkError::DataCorruption(
+                "compressed chunk decoded length does not fit this platform".to_string(),
+            )
+        })?
+    } else {
+        payload.len()
+    };
+    if decoded_len > MAX_DECODED_CHUNK_PAYLOAD_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "chunk payload decoded size {decoded_len} exceeds the format safety limit {MAX_DECODED_CHUNK_PAYLOAD_BYTES}"
+        )));
+    }
+    Ok((decoded_len, compressed))
+}
+
+pub(crate) fn chunk_payload_from_record<'a>(
+    bytes: &'a [u8],
+    chunk_offset: u64,
+    chunk_len: u32,
+) -> Result<Cow<'a, [u8]>> {
+    let (payload, chunk_flags) = chunk_payload_record_parts(bytes, chunk_offset, chunk_len)?;
     if chunk_payload_uses_zstd(chunk_flags)? {
         return Ok(Cow::Owned(decompress_chunk_payload_zstd(payload)?));
     }

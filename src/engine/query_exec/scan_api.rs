@@ -191,6 +191,7 @@ impl ChunkStorage {
         let max_rows = options.max_rows;
         let row_offset = options.row_offset.unwrap_or(0);
 
+        let mut row_reservation = execution.reserve_memory(0)?;
         let mut response = QueryRowsPage {
             rows_scanned: 0,
             truncated: false,
@@ -199,11 +200,10 @@ impl ChunkStorage {
         };
         let mut stream_row_offset = 0u64;
         let mut persisted_stats = PersistedTierFetchStats::default();
-        let mut row_reservation = execution.reserve_memory(0)?;
 
         for (index, (series, series_id)) in resolved.iter().enumerate() {
             execution.checkpoint()?;
-            let page = match series_id {
+            let mut page = match series_id {
                 Some(series_id) => context.collect_raw_series_page(
                     *series_id,
                     start,
@@ -216,20 +216,34 @@ impl ChunkStorage {
                 )?,
                 None => RawSeriesScanPage::default(),
             };
-            persisted_stats.accumulate(page.stats);
-            stream_row_offset = stream_row_offset.saturating_add(page.final_rows_seen);
+            let raw_points_reservation = page.take_query_reservation();
+            let RawSeriesScanPage {
+                points,
+                final_rows_seen,
+                reached_end,
+                stats,
+                query_reservation: _,
+            } = page;
+            persisted_stats.accumulate(stats);
+            stream_row_offset = stream_row_offset.saturating_add(final_rows_seen);
 
-            if !page.points.is_empty() {
+            if !points.is_empty() {
+                let raw_points_reservation = raw_points_reservation.ok_or_else(|| {
+                    TsinkError::Other(
+                        "row scan received raw points without a query-memory reservation"
+                            .to_string(),
+                    )
+                })?;
                 row_reservation.resize(super::modeled_rows_append_upper_bytes(
                     &response.rows,
                     &series.name,
                     &series.labels,
-                    &page.points,
+                    &points,
                 ))?;
                 response.rows_scanned = response
                     .rows_scanned
-                    .saturating_add(u64::try_from(page.points.len()).unwrap_or(u64::MAX));
-                for point in page.points {
+                    .saturating_add(u64::try_from(points.len()).unwrap_or(u64::MAX));
+                for point in points {
                     self.charge_row_before_materialization(
                         execution,
                         &series.name,
@@ -242,20 +256,46 @@ impl ChunkStorage {
                         point,
                     ));
                 }
-                row_reservation.resize(super::modeled_query_rows_retained_bytes(&response.rows))?;
+                let mut source_reservations = [row_reservation, raw_points_reservation];
+                row_reservation = match execution.coalesce_memory_reservation_array(
+                    &mut source_reservations,
+                    super::modeled_query_rows_retained_bytes(&response.rows),
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        // Keep both source guards live until the materialized rows are gone.
+                        drop(response);
+                        let error = match error {
+                            crate::query_budget::QueryMemoryCoalesceError::Budget(error) => {
+                                error.into()
+                            }
+                            crate::query_budget::QueryMemoryCoalesceError::InvalidReservations => {
+                                TsinkError::Other(
+                                    "row scan received an incompatible raw-page query-memory reservation"
+                                        .to_string(),
+                                )
+                            }
+                        };
+                        drop(source_reservations);
+                        return Err(error);
+                    }
+                };
+            } else {
+                drop(points);
+                drop(raw_points_reservation);
             }
 
-            if !page.reached_end {
+            if !reached_end {
                 response.truncated = true;
                 response.next_row_offset = Some(stream_row_offset);
                 break;
             }
 
-            if max_rows.is_some_and(|max| response.rows.len() >= max) {
-                if index + 1 < resolved.len() {
-                    response.truncated = true;
-                    response.next_row_offset = Some(stream_row_offset);
-                }
+            // A full exact page ends only when no later identities remain. Otherwise continue
+            // with a zero-row logical limit to look for one real row; empty trailing identities
+            // must not turn an exact final page into a conservative extra continuation page.
+            if max_rows.is_some_and(|max| response.rows.len() >= max) && index + 1 >= resolved.len()
+            {
                 break;
             }
         }
@@ -514,18 +554,36 @@ impl ChunkStorage {
         let _resolved_series_reservation =
             execution.reserve_memory(modeled_resolved_series_retained_bytes(series))?;
         let resolved = context.resolve_series_batch(series);
+        let existing_occurrences = resolved
+            .iter()
+            .filter(|(_, series_id)| series_id.is_some())
+            .count();
+        let matched_series_ids_reservation = execution
+            .reserve_memory(modeled_vec_capacity_bytes::<SeriesId>(existing_occurrences))?;
+        let mut matched_series_ids = Vec::with_capacity(existing_occurrences);
+        matched_series_ids.extend(
+            resolved
+                .iter()
+                .filter_map(|(_, series_id)| series_id.as_ref().copied()),
+        );
+        matched_series_ids.sort_unstable();
+        matched_series_ids.dedup();
+        execution
+            .charge_series_matched(u64::try_from(matched_series_ids.len()).unwrap_or(u64::MAX))?;
+        drop(matched_series_ids);
+        drop(matched_series_ids_reservation);
         let plan = context.query_tier_plan(start, end);
         self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
     }
 
-    pub(in crate::engine::storage_engine) fn scan_metric_rows_api(
+    pub(in crate::engine::storage_engine) fn scan_metric_rows_result_api(
         &self,
         metric: &str,
         start: i64,
         end: i64,
         options: QueryRowsScanOptions,
         execution: &QueryExecution,
-    ) -> Result<QueryRowsPage> {
+    ) -> Result<QueryRowsExecutionResult> {
         let context = self.series_query_context();
         self.ensure_open()?;
         validate_metric(metric)?;
@@ -535,24 +593,23 @@ impl ChunkStorage {
         validate_query_rows_scan_options(options)?;
         self.request_background_persisted_refresh_if_needed();
 
-        let mut resolved = context
-            .resolved_series_for_metric(metric)
-            .into_iter()
-            .map(|(series_id, series)| (series, Some(series_id)))
-            .collect::<Vec<_>>();
-        if resolved.is_empty() {
-            return Ok(QueryRowsPage {
-                rows_scanned: 0,
-                truncated: false,
-                next_row_offset: None,
-                rows: Vec::new(),
-            });
-        }
-        resolved.sort_by(|a, b| a.0.labels.cmp(&b.0.labels));
+        let mut resolved_with_reservation =
+            context.resolved_series_for_metric(metric, execution)?;
+        resolved_with_reservation
+            .series
+            .sort_unstable_by(|a, b| a.0.labels.cmp(&b.0.labels));
 
         let plan = context.query_tier_plan(start, end);
-        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
-            .map(QueryRowsExecutionResult::into_page)
+        let result = self.scan_resolved_series_rows_with_plan(
+            &resolved_with_reservation.series,
+            start,
+            end,
+            plan,
+            options,
+            execution,
+        );
+        drop(resolved_with_reservation);
+        result
     }
 }
 

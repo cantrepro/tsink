@@ -243,6 +243,17 @@ impl Encoder {
             .ok_or(TsinkError::WriteBatchSizeOverflow)
     }
 
+    pub(in crate::engine) fn modeled_decoded_chunk_peak_bytes_from_payload(
+        lane: ValueLane,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        payload: &[u8],
+    ) -> Result<usize> {
+        Self::ensure_format_point_count(point_count)?;
+        let (_timestamp_payload, value_payload) = split_chunk_payload(payload)?;
+        Self::modeled_decoded_chunk_peak_bytes(lane, value_codec, point_count, value_payload)
+    }
+
     pub fn choose_lane(points: &[DataPoint]) -> ValueLane {
         if points.iter().any(|point| {
             matches!(

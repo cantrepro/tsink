@@ -104,6 +104,15 @@ fn test_large_offset_bounds_check() {
 fn test_empty_partition_handling() {
     let temp_dir = TempDir::new().unwrap();
 
+    // Establish current-format ownership before injecting a legacy partition-shaped unknown
+    // entry. A manifestless unknown directory must remain a fail-closed startup error.
+    StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap()
+        .close()
+        .unwrap();
     let data_dir = temp_dir.path().join("p-0-1000");
     fs::create_dir_all(&data_dir).unwrap();
     fs::write(data_dir.join("data"), []).unwrap();
@@ -133,6 +142,16 @@ fn test_empty_partition_handling() {
 #[test]
 fn test_malformed_metadata_handling() {
     let temp_dir = TempDir::new().unwrap();
+
+    // Establish current-format ownership before injecting a legacy partition-shaped unknown
+    // entry. A manifestless unknown directory must remain a fail-closed startup error.
+    StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap()
+        .close()
+        .unwrap();
     let data_dir = temp_dir.path().join("p-0-1000");
     fs::create_dir_all(&data_dir).unwrap();
 

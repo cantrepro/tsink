@@ -5,7 +5,7 @@ use super::{
     RoaringTreemap, RollupQueryCandidate, RwLock, RwLockReadGuard, SeriesId, SeriesRegistry,
     TieredQueryPlan, VisibilityCacheReadContext,
 };
-use crate::QueryExecution;
+use crate::{QueryExecution, QueryMemoryReservation};
 
 #[allow(clippy::too_many_arguments)]
 trait SeriesQueryReadOps {
@@ -87,6 +87,12 @@ pub(super) struct SeriesQueryContext<'a> {
     ops: &'a dyn SeriesQueryReadOps,
 }
 
+pub(super) struct ResolvedMetricSeriesBatch {
+    pub(super) series: Vec<(MetricSeries, Option<SeriesId>)>,
+    // Keep the reservation after the protected vector so the vector is destroyed first.
+    _query_reservation: QueryMemoryReservation,
+}
+
 impl<'a> SeriesQueryContext<'a> {
     pub(super) fn query_tier_plan(self, start: i64, end: i64) -> TieredQueryPlan {
         self.planning.query_tier_plan(start, end)
@@ -121,25 +127,88 @@ impl<'a> SeriesQueryContext<'a> {
             })
     }
 
-    pub(super) fn resolved_series_for_metric(self, metric: &str) -> Vec<(SeriesId, MetricSeries)> {
+    pub(super) fn resolved_series_for_metric(
+        self,
+        metric: &str,
+        execution: &QueryExecution,
+    ) -> Result<ResolvedMetricSeriesBatch> {
         let registry = self.registry.read();
-        registry
-            .series_ids_for_metric(metric)
-            .into_iter()
-            .map(|series_id| {
-                let labels = registry
-                    .decode_series_key(series_id)
-                    .map(|key| key.labels)
-                    .unwrap_or_default();
-                (
-                    series_id,
-                    MetricSeries {
-                        name: metric.to_string(),
-                        labels,
-                    },
-                )
-            })
-            .collect()
+        let mut resolution_reservation = None;
+        let mut resolved_slots = 0u64;
+        let series_ids = registry.series_ids_for_metric_with_preflight(
+            metric,
+            |series_count| -> Result<()> {
+                let series_count_u64 = u64::try_from(series_count).unwrap_or(u64::MAX);
+                execution.charge_series_matched(series_count_u64)?;
+                execution.observe_intermediate_vector_size(series_count_u64)?;
+
+                let vector_capacity = super::modeled_vec_growth_capacity_upper(series_count);
+                let id_slots = super::modeled_vec_capacity_bytes::<SeriesId>(vector_capacity);
+                resolved_slots = super::modeled_vec_capacity_bytes::<(
+                    MetricSeries,
+                    Option<SeriesId>,
+                )>(vector_capacity);
+                resolution_reservation =
+                    Some(execution.reserve_memory(id_slots.saturating_add(resolved_slots))?);
+                Ok(())
+            },
+        )?;
+        let mut identity_bytes = 0u64;
+        for series_id in &series_ids {
+            execution.checkpoint()?;
+            let Some((metric_bytes, label_count, label_text_bytes)) =
+                registry.decoded_series_key_shape(*series_id)
+            else {
+                continue;
+            };
+            identity_bytes =
+                identity_bytes.saturating_add(super::modeled_metric_series_shape_retained_bytes(
+                    metric_bytes,
+                    label_count,
+                    label_text_bytes,
+                ));
+        }
+        resolution_reservation
+            .as_mut()
+            .expect("metric postings preflight always initializes a reservation")
+            .resize(
+                super::modeled_vec_capacity_bytes::<SeriesId>(series_ids.capacity())
+                    .saturating_add(resolved_slots)
+                    .saturating_add(identity_bytes),
+            )?;
+
+        let mut resolved = Vec::with_capacity(series_ids.len());
+        for series_id in &series_ids {
+            execution.checkpoint()?;
+            let Some(series_key) = registry.decode_series_key(*series_id) else {
+                continue;
+            };
+            resolved.push((
+                MetricSeries {
+                    name: series_key.metric,
+                    labels: series_key.labels,
+                },
+                Some(*series_id),
+            ));
+        }
+
+        drop(series_ids);
+        let retained_bytes = super::modeled_vec_capacity_bytes::<(MetricSeries, Option<SeriesId>)>(
+            resolved.capacity(),
+        )
+        .saturating_add(resolved.iter().fold(0u64, |bytes, (series, _)| {
+            bytes.saturating_add(super::modeled_metric_series_retained_bytes(series))
+        }));
+        resolution_reservation
+            .as_mut()
+            .expect("metric postings preflight always initializes a reservation")
+            .resize(retained_bytes)?;
+        Ok(ResolvedMetricSeriesBatch {
+            series: resolved,
+            _query_reservation: resolution_reservation
+                .take()
+                .expect("metric postings preflight always initializes a reservation"),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -183,7 +183,7 @@ RSS. See [Resource limits and profiles](resource-limits.md) for the exact accoun
 | `with_wal_size_limit(bytes)` | 512 MiB (`Embedded`) | Maximum WAL size on disk. |
 | `with_wal_buffer_size(size)` | 4 KiB | Finite WAL `BufWriter` capacity; the live retained capacity is charged to the storage-memory budget and reported by the observability APIs. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | `WalSyncMode.PER_APPEND` synchronizes each non-empty write; `WalSyncMode.PERIODIC(interval)` uses an append-driven sync interval. |
-| `with_wal_replay_mode(mode)` | `Strict` | `WalReplayMode.STRICT` or `WalReplayMode.SALVAGE`. |
+| `with_wal_replay_mode(mode)` | `Strict` | Logical replay policy after strict published-prefix validation. `SALVAGE` cannot open a corrupt published data directory; use destination-only `tsink-inspect salvage`. |
 
 #### Local disk
 

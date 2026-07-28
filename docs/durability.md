@@ -48,13 +48,24 @@ For a WAL-backed write, tsink performs these operations in order:
 2. In `PerAppend`, or when a `Periodic` append observes that its interval has elapsed, call
    `sync_data` on the active WAL segment. An append that does not take this step cannot be
    acknowledged as `Durable`.
-3. Write the logical commit boundary to `wal/wal.published.tmp`. On the durable path, call
-   `sync_data` on that temporary file. Rename it over `wal/wal.published`, then synchronize the
-   `wal/` directory on platforms where directory-handle synchronization is supported.
+3. Remove only a stale `wal/wal.published.tmp` directory entry without following its target,
+   rejecting a real directory at that name. Create the temporary marker exclusively with no-follow
+   protection, write the logical commit boundary `H`, and, on the durable path, call `sync_data`
+   on that file. Legacy 24-byte `TSHW` records carry only `H`; once a reset has installed a
+   40-byte `TSH2` record, every later commit preserves its reset-through floor `R` while advancing
+   `H`. Verify the temporary file's identity before renaming it over `wal/wal.published`,
+   semantically reread the installed exact-size regular marker, then synchronize the `wal/`
+   directory on platforms where directory-handle synchronization is supported.
 4. Only after the boundary publication is attempted does the write expose the corresponding WAL
    high-water mark and return its acknowledgement. Recovery discards a syntactically valid WAL
    suffix beyond the last published boundary rather than treating an uncommitted frame as a later
    write.
+
+During recovery, `TSH2` is valid only when `R <= H`; legacy `TSHW` has no reset floor. Recovery and
+replay use `F = max(clean persisted replay floor, R)`. If `H > F`, validation must reach the exact
+`H` frame in the boundary segment. Empty or short boundary segments and a first frame above `H`
+fail before truncation. The frame may be absent only when `F >= H`, after which recovery restores
+the runtime append and durable floors through `H`.
 
 Creating or rotating a WAL segment synchronizes the `wal/` directory, and rotation synchronizes the
 previous active segment before switching files. `Periodic(interval)` is append-driven: no timer
@@ -71,10 +82,14 @@ uses synchronized temporary-file replacement followed by parent-directory synchr
 The manifest is published last within each segment so recovery never treats a partially encoded
 staging directory as a complete segment.
 
-WAL reset first flushes and synchronizes the active WAL file, installs and synchronizes its empty
-replacement, removes older WAL segment files, synchronizes `wal/`, and atomically replaces the
-published-boundary marker with its file and directory synchronization enabled. It occurs only after
-the corresponding segment and recovery-metadata publication has committed.
+WAL reset occurs only after the corresponding segment and recovery-metadata publication has
+committed. It first flushes and synchronizes the active WAL file, then durably publishes a
+40-byte `TSH2` marker with
+`H = R = max(last appended high-water mark, (active segment, 0))`, including marker-file and
+`wal/`-directory synchronization. Only after that reset authorization is durable does it truncate
+and synchronize the active segment, remove older WAL segment files, and synchronize `wal/` again.
+A crash after marker publication can therefore complete the authorized reset during recovery; a
+crash before it still requires the exact ordinary published prefix.
 
 On Linux, macOS, and other non-Windows targets, directory synchronization opens the directory and
 calls `sync_all`. The current Windows implementation synchronizes regular files but treats

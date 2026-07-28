@@ -108,13 +108,13 @@ impl PromqlMemoryTracker {
         self.reservations.lock().push(reservation);
     }
 
-    fn into_result_reservation(
-        self,
+    fn coalesce_result_reservation(
+        &mut self,
         execution: &QueryExecution,
         retained_bytes: u64,
     ) -> Result<QueryMemoryReservation> {
         execution
-            .coalesce_memory_reservations(self.reservations.into_inner(), retained_bytes)
+            .coalesce_memory_reservations(self.reservations.get_mut(), retained_bytes)
             .map_err(|error| match error {
                 crate::query_budget::QueryMemoryCoalesceError::Budget(error) => {
                     PromqlError::Storage(crate::TsinkError::from(error))
@@ -691,7 +691,7 @@ impl Engine {
         execution.checkpoint().map_err(crate::TsinkError::from)?;
         execution.ensure_steps(1).map_err(crate::TsinkError::from)?;
         execution.charge_steps(1).map_err(crate::TsinkError::from)?;
-        let memory = PromqlMemoryTracker::default();
+        let mut memory = PromqlMemoryTracker::default();
         let value = {
             let params = QueryParams {
                 eval_time: time,
@@ -707,7 +707,7 @@ impl Engine {
         charge_promql_result(execution, &value)?;
         drop(expr);
         let result_memory_reservation = if retain_result {
-            Some(memory.into_result_reservation(execution, promql_value_shape(&value).1)?)
+            Some(memory.coalesce_result_reservation(execution, promql_value_shape(&value).1)?)
         } else {
             None
         };
@@ -803,7 +803,7 @@ impl Engine {
         execution
             .ensure_steps(step_count)
             .map_err(crate::TsinkError::from)?;
-        let memory = PromqlMemoryTracker::default();
+        let mut memory = PromqlMemoryTracker::default();
         let prefetch = if self.supports_prefetch(&expr) {
             Some(self.build_prefetch_cache(&expr, start, end, execution, &memory)?)
         } else {
@@ -833,7 +833,7 @@ impl Engine {
         drop(prefetch);
         drop(expr);
         let result_memory_reservation = if retain_result {
-            Some(memory.into_result_reservation(execution, promql_value_shape(&value).1)?)
+            Some(memory.coalesce_result_reservation(execution, promql_value_shape(&value).1)?)
         } else {
             None
         };

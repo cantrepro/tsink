@@ -41,8 +41,9 @@ compatibility and is not yet covered by a stable support promise.
   namespace memory and reversible opaque-path rendering, byte-compares and re-syncs the final
   staging generation, publishes with an atomic handle-relative no-replace rename, and reattests the
   requested identities, complete namespace generation, and exact bytes after publication. The
-  inspector recognizes a reset WAL publication marker only when fully verified clean segment
-  manifests cover its persisted high-water mark.
+  inspector recognizes verified `TSH2` reset coverage directly and accepts legacy `TSHW`
+  absent-boundary coverage only when fully verified clean segment manifests reach its high-water
+  mark.
 - Structured write-rejection, acknowledgement, partial-effect, and indeterminate-outcome metrics
   and HTTP response headers across the principal ingest adapters.
 - Shared local-disk quota admission and exact restart/category accounting for the experimental
@@ -82,6 +83,33 @@ compatibility and is not yet covered by a stable support promise.
 
 ### Changed
 
+- `GET /api/v1/status/tsdb` now fails closed unless metric enumeration exposes complete detailed
+  query accounting, propagates storage errors instead of reporting a false zero-series success,
+  reserves its hotspot transformation under one execution, and enforces a fixed 1 MiB encoded
+  response ceiling while retaining the measured JSON tree and exact body/header guards through
+  response construction. The fixed response ceiling no longer tightens `ExpertUnlimited` metric
+  enumeration; legacy operational snapshot clones and JSON-tree construction remain an explicit
+  status-adapter accounting boundary.
+- Empty-policy background rollup passes no longer drain every writer permit. They retain the
+  existing worker-success/cursor-cleanup behavior under the rollup transaction lock, still reject
+  a fenced snapshot publication, and leave a pending checkpoint retry intact on that error.
+- Persistent opens now state and test their fail-closed WAL boundary explicitly: the complete
+  published WAL prefix is validated strictly before logical replay, including every byte in a
+  markerless legacy WAL before a current publication marker is adopted, even when
+  `WalReplayMode::Salvage` is selected. Duplicate segment aliases and missing IDs inside the
+  persisted-floor-to-published replay interval are rejected before recovery mutation, as are
+  recognized link-like segment paths. That mode does not provide in-place recovery of published
+  corruption; `tsink-inspect salvage` remains the explicit destination-only recovery path.
+  `wal.published` is now accepted only as an exact-size regular non-link file, opened with
+  no-follow and identity checks where supported. Legacy 24-byte `TSHW` records publish a boundary
+  `H` without authorizing reset; 40-byte `TSH2` records add a checksummed reset-through floor `R`
+  and require `R <= H`. Reset durably publishes
+  `H = R = max(last appended high-water mark, (active segment, 0))` before truncating or removing
+  WAL files, and later commits preserve `R` while advancing `H`. Recovery and replay use
+  `max(clean persisted replay floor, R)`, require the exact `H` frame whenever it remains above
+  that floor, and restore runtime append/durable floors through `H`. Temporary publication removes
+  only the stale directory entry, creates the replacement exclusively, identity-checks it before
+  rename, and semantically validates the installed marker afterward.
 - Finite `Custom(ResourceLimits)` profiles now reject values that do not fit the target platform,
   would collapse to an internal `usize::MAX` unlimited sentinel, or request background cadences
   the fixed runtime topology cannot honor; unbounded behavior continues to require explicit
@@ -116,9 +144,25 @@ compatibility and is not yet covered by a stable support promise.
   selector-existence bits. Built-in local storage, tenant/default-tenant wrappers, and distributed
   storage propagate or replace these guards. Bounded PromQL and internal/distributed server paths
   fail closed when a compatibility backend reports `QueryExecutionAccounting::Unaccounted`.
+  `list_metrics` now has its own additive detailed-result/accounting contract instead of being
+  conflated with an empty structured selection. `AsyncStorage` transports both list and selection
+  metadata guards through its reply channel; finite calls reject unaccounted, missing, or
+  undersized guards, while execution-less unlimited calls preserve exact compatibility dispatch.
   PromQL multi-series, range-prefetch, and `info()` reads now adopt detailed point reservations
   through their label/point transforms and cache lifetime, validate batch identities/existence
   evidence, and reject an unaccounted bounded point backend before reading it.
+- Core `scan_series_rows` and `scan_metric_rows` now retain allocation-backed raw point pages
+  through row materialization and return a detailed final-result guard. Snapshot candidates,
+  decoded vectors, nested values, compressed payloads, and zstd decode workspace are preflighted
+  before allocation; raw and row guards are coalesced without an accounting gap. Exact final pages
+  no longer advertise a continuation unless a real later row survives filtering and deduplication.
+  `AsyncStorage` transports either row-result guard through the worker reply, retaining the query
+  permit and result-memory reservation until receipt or cancellation. A finite execution rejects
+  an `Unaccounted` backend before invoking it; execution-less unlimited calls retain their explicit
+  compatibility behavior. Non-default tenant series-row scans replace the scoped result guard
+  around the tenant-visible page. Default-tenant and distributed series-row scans, plus tenant and
+  distributed metric-name scans, remain truthfully `Unaccounted` until their compound pagination
+  work can be reconciled exactly.
 - Modeled returned-byte accounting is now canonical logical work based on fixed result slots and
   content lengths, including byte strings, UTF-8 strings, labels, and native-histogram arrays. It is
   independent of allocator capacity and spare space; retained query memory continues to use
@@ -170,12 +214,18 @@ compatibility and is not yet covered by a stable support promise.
   high-water for mixed, writer-saturation, and query-pressure rows. The value is cumulative within
   a benchmark process and includes allocator, runtime, and harness memory; it is evidence for the
   remaining clean RSS matrix, not an engine-only accounting or cap.
-- Built-in `list_metrics` now admits the shared query budget for direct calls and reuses the async
-  worker's execution. Fixed registry-page scratch, accumulated returned identities, cold
+- Built-in `list_metrics` and `list_metrics_with_wal` now admit the shared query budget for direct
+  calls and reuse the async worker's execution. Fixed registry-page scratch, accumulated returned
+  identities, WAL-definition merging, shard-scoped candidate materialization, cold
   visibility-summary repair, retained dead-series IDs, and the pruning companion vector are
   preflighted against series, returned-byte, intermediate-vector, and per-query/shared-memory
   limits before growth. Cold repair re-admits actual active/sealed counts under their read guards,
-  so concurrent ingest cannot invalidate the estimate. The default-tenant server wrapper also
+  so concurrent ingest cannot invalidate the estimate. WAL definitions are charged as candidate
+  expansion and their exact deduplicated live/WAL union is preflighted through borrowed identities
+  before the cached snapshot is cloned. Tenant and UniFFI paths propagate the accounted result,
+  while direct distributed fanout and deduplication retain one top-level execution and final-result
+  guard. A self-admitted distributed compatibility call consumes its warning side channel before
+  return so it cannot retain the locally owned query permit. The default-tenant server wrapper also
   shares one execution across scoped and legacy selections and reserves its in-place merge before
   growth.
 - Timed non-tiered flushes now defer a WAL-backed current head until it fills at least half of its
@@ -385,7 +435,10 @@ compatibility and is not yet covered by a stable support promise.
   the checkpoint pending if repair fails; v1 migration still requires a valid mirror. Recovery
   snapshots carry `steppedDownTerm`, default older bundles to zero, merge the live/restored floor on
   normal restore, and clear it only for an explicit `forceLocalLeader` restore.
-- No core segment or WAL wire-format version changed in this work.
+- The core segment format version is unchanged. The WAL publication marker has an additive
+  40-byte `TSH2` form carrying a checksummed reset-through floor as well as the published boundary;
+  current code continues to read legacy 24-byte `TSHW` markers. A rollback to a binary that accepts
+  only `TSHW` requires preserving a compatible pre-upgrade data copy.
 - The budgeted restore method and its public entry/depth/admission constants are additive. Existing
   callers of `restore_from_snapshot` retain an unbudgeted API, with stricter invalid-snapshot and
   overlapping-path rejection before destination mutation.

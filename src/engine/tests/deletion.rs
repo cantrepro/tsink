@@ -11,6 +11,34 @@ use crate::label::stable_series_identity_hash;
 use crate::storage::MetadataShardScope;
 use crate::{Aggregation, QueryOptions};
 
+fn reopen_persistent_numeric_storage_with_unbounded_maintenance(
+    root: &Path,
+    timestamp_precision: TimestampPrecision,
+    chunk_point_cap: usize,
+) -> ChunkStorage {
+    let mut options = base_storage_test_options(timestamp_precision, None);
+    options.maintenance_max_items_per_pass = usize::MAX;
+    options.maintenance_max_bytes_per_pass = u64::MAX;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        chunk_point_cap,
+        None,
+        Some(root.join(NUMERIC_LANE_ROOT)),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+    storage.load_tombstones_index().unwrap();
+    storage
+        .apply_loaded_segment_indexes(
+            load_segment_indexes(root.join(NUMERIC_LANE_ROOT)).unwrap(),
+            false,
+        )
+        .unwrap();
+    storage.reconcile_live_metadata_indexes().unwrap();
+    storage
+}
+
 fn labels_for_shard(metric: &str, shard_count: u32, target_shard: u32, prefix: &str) -> Vec<Label> {
     (0..4096u32)
         .map(|idx| vec![Label::new("host", format!("{prefix}-{idx}"))])
@@ -1219,7 +1247,14 @@ fn catalog_tombstone_swap_clears_stale_cache_when_refresh_fails() {
         storage.close().unwrap();
     }
 
-    let storage = reopen_persistent_numeric_storage(&data_path, TimestampPrecision::Seconds, 1);
+    // This test exercises the complete-snapshot tombstone swap and its post-swap cache fallback.
+    // Finite maintenance intentionally advances local catalog reconciliation in pages and does not
+    // treat an out-of-band manifest rewrite as an ordinary single-wake transition.
+    let storage = reopen_persistent_numeric_storage_with_unbounded_maintenance(
+        &data_path,
+        TimestampPrecision::Seconds,
+        1,
+    );
     assert_eq!(
         storage
             .select("catalog_cache_repair_metric", &labels, 0, 20)
@@ -1326,6 +1361,11 @@ fn catalog_failure_after_tombstone_swap_stays_conservative_through_retry() {
         ChunkStorageOptions {
             background_threads_enabled: false,
             background_fail_fast: false,
+            // The transition below deliberately exercises the complete-snapshot path. Finite
+            // read-write publication relies on durable-before-live deletes and does not rescan an
+            // externally rewritten tombstone manifest as part of this single transition.
+            maintenance_max_items_per_pass: usize::MAX,
+            maintenance_max_bytes_per_pass: u64::MAX,
             ..ChunkStorageOptions::default()
         },
     )

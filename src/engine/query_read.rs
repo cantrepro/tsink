@@ -6,9 +6,10 @@ use crate::engine::tombstone;
 use parking_lot::RwLockReadGuard;
 
 use super::query_exec::{
-    modeled_points_bytes, modeled_vec_capacity_bytes, QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES,
+    modeled_points_retained_bytes, modeled_value_retained_bytes, modeled_vec_capacity_bytes,
+    modeled_vec_growth_capacity_upper, QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES,
 };
-use super::state::{ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor};
+use super::state::{ActivePartitionSnapshot, ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor};
 use super::tiering::PersistedSegmentTier;
 use super::*;
 
@@ -29,136 +30,269 @@ mod tests;
 
 pub(super) use pagination::{RawSeriesPagination, RawSeriesScanPage};
 
-/// Upper bound used by the query allocation model for variable-width decoded payload per encoded
-/// byte. Fixed `DataPoint`/`Value` storage is charged separately from this payload expansion.
-const QUERY_DECODE_VARIABLE_PAYLOAD_BYTES_PER_ENCODED_BYTE: u64 = 8;
-
 /// One modeled control byte per occupied hash-table bucket, plus the exact key/value payload.
 const QUERY_HASH_TABLE_CONTROL_BYTES_PER_BUCKET: u64 = 1;
 
-/// A B-tree entry retains the key plus parent/child/index bookkeeping. Four machine words per
-/// entry is the portable query model; the collection allocation allowance is charged separately.
-const QUERY_BTREE_BOOKKEEPING_WORDS_PER_ENTRY: u64 = 4;
+/// Conservative fixed context/input-buffer allowance for one zstd decoder. The decoded output
+/// buffer and a full logical-window allowance are charged separately.
+const QUERY_ZSTD_DECODE_FIXED_WORKSPACE_BYTES: u64 = 1024 * 1024;
 
-fn encoded_decode_heap_upper_bound(encoded_bytes: u64) -> u64 {
-    // Every decoded variable-size primitive consumes at most eight payload bytes while its
-    // encoded form consumes at least one. Fixed DataPoint/Value storage is accounted separately.
-    encoded_bytes.saturating_mul(QUERY_DECODE_VARIABLE_PAYLOAD_BYTES_PER_ENCODED_BYTE)
+fn decoded_value_allocation_allowance(lane: ValueLane, point_count: usize) -> u64 {
+    match lane {
+        ValueLane::Numeric => 0,
+        // A native histogram owns its box plus seven vectors. String/Bytes values allocate fewer
+        // collections, so eight allocations per point covers every blob-lane value shape.
+        ValueLane::Blob => saturating_u64_from_usize(point_count)
+            .saturating_mul(8)
+            .saturating_mul(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES),
+    }
 }
 
-fn modeled_hash_map_capacity_bytes<K, V>(capacity: usize) -> u64 {
-    if capacity == 0 {
+fn modeled_vec_reserve_capacity_upper(current_capacity: usize, required_len: usize) -> usize {
+    if current_capacity >= required_len {
+        return current_capacity;
+    }
+    current_capacity
+        .saturating_mul(2)
+        .max(modeled_vec_growth_capacity_upper(required_len))
+}
+
+fn publish_vec_reusing_capacity<T>(out: &mut Vec<T>, mut replacement: Vec<T>) {
+    if out.capacity() >= replacement.len() {
+        out.clear();
+        out.append(&mut replacement);
+    } else {
+        *out = replacement;
+    }
+}
+
+fn modeled_hash_map_bucket_capacity_upper(entries: usize) -> usize {
+    if entries == 0 {
         return 0;
     }
-    let bucket_payload = u64::try_from(
-        std::mem::size_of::<K>()
-            .saturating_add(std::mem::size_of::<V>())
-            .saturating_add(
-                usize::try_from(QUERY_HASH_TABLE_CONTROL_BYTES_PER_BUCKET).unwrap_or(1),
-            ),
-    )
-    .unwrap_or(u64::MAX);
-    saturating_u64_from_usize(capacity)
+    modeled_vec_growth_capacity_upper(entries).saturating_mul(2)
+}
+
+fn modeled_hash_map_bucket_bytes<K, V>(bucket_capacity: usize) -> u64 {
+    if bucket_capacity == 0 {
+        return 0;
+    }
+    let bucket_payload = u64::try_from(std::mem::size_of::<(K, V)>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(QUERY_HASH_TABLE_CONTROL_BYTES_PER_BUCKET);
+    saturating_u64_from_usize(bucket_capacity)
         .saturating_mul(bucket_payload)
         .saturating_add(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
 }
 
-fn modeled_btree_set_entries_bytes<T>(entries: usize) -> u64 {
-    if entries == 0 {
-        return 0;
-    }
-    let entry = u64::try_from(std::mem::size_of::<T>())
-        .unwrap_or(u64::MAX)
+fn modeled_persisted_snapshot_build_upper_bound(candidate_chunks: usize) -> u64 {
+    let vec_capacity = modeled_vec_growth_capacity_upper(candidate_chunks);
+    let map_bucket_capacity = modeled_hash_map_bucket_capacity_upper(candidate_chunks);
+    modeled_vec_capacity_bytes::<PersistedChunkRef>(vec_capacity)
+        .saturating_add(modeled_hash_map_bucket_bytes::<usize, Arc<PlatformMmap>>(
+            map_bucket_capacity,
+        ))
         .saturating_add(
-            u64::try_from(std::mem::size_of::<usize>())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(QUERY_BTREE_BOOKKEEPING_WORDS_PER_ENTRY),
-        );
-    saturating_u64_from_usize(entries)
-        .saturating_mul(entry)
+            modeled_hash_map_bucket_bytes::<usize, PersistedSegmentTier>(map_bucket_capacity),
+        )
+}
+
+fn modeled_encoded_decode_bytes(
+    lane: ValueLane,
+    value_codec: chunk::ValueCodecId,
+    point_count: usize,
+    payload: &[u8],
+) -> Result<(u64, u64)> {
+    let exact_fixed_bytes = point_count
+        .checked_mul(
+            std::mem::size_of::<i64>()
+                .saturating_add(std::mem::size_of::<Value>())
+                .saturating_add(std::mem::size_of::<ChunkPoint>()),
+        )
+        .ok_or(TsinkError::WriteBatchSizeOverflow)?;
+    let modeled_peak = Encoder::modeled_decoded_chunk_peak_bytes_from_payload(
+        lane,
+        value_codec,
+        point_count,
+        payload,
+    )?;
+    let heap_bytes = modeled_peak.checked_sub(exact_fixed_bytes).ok_or_else(|| {
+        TsinkError::DataCorruption(
+            "decoded chunk memory model is smaller than its fixed vectors".to_string(),
+        )
+    })?;
+    // Histogram decoding can leave Vec capacity below twice its logical payload. Doubling the
+    // codec's exact logical heap model covers that slack; the named per-allocation allowance
+    // covers boxes and allocator metadata.
+    let heap_upper = saturating_u64_from_usize(heap_bytes)
+        .saturating_mul(2)
+        .saturating_add(decoded_value_allocation_allowance(lane, point_count));
+    let capacity = modeled_vec_growth_capacity_upper(point_count);
+    let scratch = modeled_vec_capacity_bytes::<i64>(capacity)
+        .saturating_add(modeled_vec_capacity_bytes::<Value>(capacity))
+        .saturating_add(modeled_vec_capacity_bytes::<ChunkPoint>(capacity))
+        .saturating_add(modeled_vec_capacity_bytes::<DataPoint>(capacity))
+        .saturating_add(heap_upper);
+    Ok((heap_upper, scratch))
+}
+
+fn modeled_numeric_encoded_decode_bytes(point_count: usize) -> (u64, u64) {
+    let capacity = modeled_vec_growth_capacity_upper(point_count);
+    (
+        0,
+        modeled_vec_capacity_bytes::<i64>(capacity)
+            .saturating_add(modeled_vec_capacity_bytes::<Value>(capacity))
+            .saturating_add(modeled_vec_capacity_bytes::<ChunkPoint>(capacity))
+            .saturating_add(modeled_vec_capacity_bytes::<DataPoint>(capacity)),
+    )
+}
+
+fn modeled_zstd_decode_scratch(decoded_len: usize) -> u64 {
+    modeled_vec_capacity_bytes::<u8>(modeled_vec_growth_capacity_upper(decoded_len))
+        .saturating_add(saturating_u64_from_usize(decoded_len))
+        .saturating_add(QUERY_ZSTD_DECODE_FIXED_WORKSPACE_BYTES)
         .saturating_add(QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
 }
 
-fn modeled_persisted_snapshot_build_upper_bound(candidate_chunks: usize) -> u64 {
-    modeled_vec_capacity_bytes::<PersistedChunkRef>(candidate_chunks)
-        .saturating_add(modeled_btree_set_entries_bytes::<usize>(candidate_chunks))
-        .saturating_add(modeled_hash_map_capacity_bytes::<usize, Arc<PlatformMmap>>(
-            candidate_chunks,
-        ))
-        .saturating_add(
-            modeled_hash_map_capacity_bytes::<usize, PersistedSegmentTier>(candidate_chunks),
-        )
-}
-
-fn modeled_persisted_snapshot_retained_bytes(
-    snapshot: &snapshot::PersistedSeriesSourceSnapshot,
-) -> u64 {
-    modeled_vec_capacity_bytes::<PersistedChunkRef>(snapshot.chunks.capacity())
-        .saturating_add(modeled_hash_map_capacity_bytes::<usize, Arc<PlatformMmap>>(
-            snapshot.segment_maps.capacity(),
-        ))
-        .saturating_add(
-            modeled_hash_map_capacity_bytes::<usize, PersistedSegmentTier>(
-                snapshot.segment_tiers.capacity(),
-            ),
-        )
-}
-
-fn sealed_chunk_heap_upper_bound(chunk: &Chunk) -> u64 {
+fn modeled_sealed_chunk_decode_bytes(chunk: &Chunk) -> Result<(u64, u64)> {
+    let point_count = usize::from(chunk.header.point_count);
     if !chunk.points.is_empty() {
-        return chunk.points.iter().fold(0u64, |bytes, point| {
-            bytes.saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX))
+        let heap_upper = chunk.points.iter().fold(0u64, |bytes, point| {
+            bytes.saturating_add(modeled_value_retained_bytes(&point.value))
         });
+        return Ok((
+            heap_upper,
+            modeled_vec_capacity_bytes::<DataPoint>(modeled_vec_growth_capacity_upper(point_count))
+                .saturating_add(heap_upper),
+        ));
     }
-    encoded_decode_heap_upper_bound(u64::try_from(chunk.encoded_payload.len()).unwrap_or(u64::MAX))
+    modeled_encoded_decode_bytes(
+        chunk.header.lane,
+        chunk.header.value_codec,
+        point_count,
+        &chunk.encoded_payload,
+    )
 }
 
 fn reserve_query_read_working_set(
     execution: Option<&QueryExecution>,
     snapshot: &snapshot::SeriesReadSnapshot,
     output_points: usize,
+    output_current_capacity: usize,
 ) -> Result<Option<crate::QueryMemoryReservation>> {
     let Some(execution) = execution else {
         return Ok(None);
     };
     execution.checkpoint()?;
-    let output_points = saturating_u64_from_usize(output_points);
-    execution.observe_intermediate_vector_size(output_points)?;
+    let output_capacity =
+        modeled_vec_reserve_capacity_upper(output_current_capacity, output_points);
+    let persisted_decode_capacity = snapshot
+        .persisted
+        .chunks
+        .iter()
+        .map(|chunk| usize::from(chunk.point_count))
+        .max()
+        .unwrap_or(0);
+    let sealed_decode_capacity = snapshot
+        .sealed_chunks
+        .iter()
+        .map(|chunk| usize::from(chunk.header.point_count))
+        .max()
+        .unwrap_or(0);
+    execution.observe_intermediate_vector_size(saturating_u64_from_usize(
+        output_points
+            .max(persisted_decode_capacity)
+            .max(sealed_decode_capacity),
+    ))?;
 
-    let fixed_point_bytes = u64::try_from(std::mem::size_of::<DataPoint>()).unwrap_or(u64::MAX);
-    let fixed_output_bytes = output_points.saturating_mul(fixed_point_bytes);
-    let mut output_heap_upper = 0u64;
-    let mut max_chunk_scratch = 0u64;
+    let mut max_decompression_scratch = 0u64;
     for chunk_ref in &snapshot.persisted.chunks {
-        let heap_upper = encoded_decode_heap_upper_bound(u64::from(chunk_ref.chunk_len));
-        output_heap_upper = output_heap_upper.saturating_add(heap_upper);
-        max_chunk_scratch = max_chunk_scratch.max(
-            u64::from(chunk_ref.point_count)
-                .saturating_mul(fixed_point_bytes)
-                .saturating_add(heap_upper),
-        );
+        let segment_map = snapshot
+            .persisted
+            .segment_maps
+            .get(&chunk_ref.segment_slot)
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(format!(
+                    "missing mapped segment slot {}",
+                    chunk_ref.segment_slot
+                ))
+            })?;
+        let (decoded_len, compressed) =
+            crate::engine::segment::chunk_payload_decoded_len_from_record(
+                segment_map.as_slice(),
+                chunk_ref.chunk_offset,
+                chunk_ref.chunk_len,
+            )?;
+        if compressed {
+            max_decompression_scratch =
+                max_decompression_scratch.max(modeled_zstd_decode_scratch(decoded_len));
+        }
     }
-    for chunk in &snapshot.sealed_chunks {
-        let heap_upper = sealed_chunk_heap_upper_bound(chunk);
+    // Blob payloads may need one preflight decompression so the codec-aware heap model can inspect
+    // the logical value payload. This reservation exists before that allocation.
+    let mut reservation = execution.reserve_memory(max_decompression_scratch)?;
+
+    let fixed_output_bytes = modeled_vec_capacity_bytes::<DataPoint>(output_capacity);
+    let mut output_heap_upper = 0u64;
+    let mut max_persisted_chunk_scratch = 0u64;
+    for chunk_ref in &snapshot.persisted.chunks {
+        execution.checkpoint()?;
+        let segment_map = snapshot
+            .persisted
+            .segment_maps
+            .get(&chunk_ref.segment_slot)
+            .ok_or_else(|| {
+                TsinkError::DataCorruption(format!(
+                    "missing mapped segment slot {}",
+                    chunk_ref.segment_slot
+                ))
+            })?;
+        let (decoded_len, compressed) =
+            crate::engine::segment::chunk_payload_decoded_len_from_record(
+                segment_map.as_slice(),
+                chunk_ref.chunk_offset,
+                chunk_ref.chunk_len,
+            )?;
+        let decompression_scratch = if compressed {
+            modeled_zstd_decode_scratch(decoded_len)
+        } else {
+            0
+        };
+        let point_count = usize::from(chunk_ref.point_count);
+        let (heap_upper, decode_scratch) = if compressed && chunk_ref.lane == ValueLane::Numeric {
+            modeled_numeric_encoded_decode_bytes(point_count)
+        } else {
+            let payload = persisted_chunk_payload(&snapshot.persisted.segment_maps, chunk_ref)?;
+            modeled_encoded_decode_bytes(
+                chunk_ref.lane,
+                chunk_ref.value_codec,
+                point_count,
+                payload.as_ref(),
+            )?
+        };
         output_heap_upper = output_heap_upper.saturating_add(heap_upper);
-        max_chunk_scratch = max_chunk_scratch.max(
-            u64::from(chunk.header.point_count)
-                .saturating_mul(fixed_point_bytes)
-                .saturating_add(heap_upper),
-        );
+        max_persisted_chunk_scratch =
+            max_persisted_chunk_scratch.max(decode_scratch.saturating_add(decompression_scratch));
+    }
+    let mut max_sealed_chunk_scratch = 0u64;
+    for chunk in &snapshot.sealed_chunks {
+        let (heap_upper, decode_scratch) = modeled_sealed_chunk_decode_bytes(chunk)?;
+        output_heap_upper = output_heap_upper.saturating_add(heap_upper);
+        max_sealed_chunk_scratch = max_sealed_chunk_scratch.max(decode_scratch);
     }
     for point in snapshot.active_points.iter_points_in_partition_order() {
-        output_heap_upper = output_heap_upper
-            .saturating_add(u64::try_from(value_heap_bytes(&point.value)).unwrap_or(u64::MAX));
+        output_heap_upper =
+            output_heap_upper.saturating_add(modeled_value_retained_bytes(&point.value));
     }
 
     let bytes = fixed_output_bytes
         .saturating_add(output_heap_upper)
-        .saturating_add(max_chunk_scratch);
-    execution
-        .reserve_memory(bytes)
-        .map(Some)
-        .map_err(Into::into)
+        // The merge cursor peeks every source before choosing a point, so one persisted decoded
+        // chunk and one sealed decoded chunk can remain live simultaneously.
+        .saturating_add(max_persisted_chunk_scratch)
+        .saturating_add(max_sealed_chunk_scratch);
+    reservation.resize(bytes)?;
+    Ok(Some(reservation))
 }
 
 #[derive(Clone, Copy)]

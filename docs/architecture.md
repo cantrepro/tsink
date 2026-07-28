@@ -122,6 +122,11 @@ All interaction with the engine goes through the `Storage` trait. Key methods:
 - Every read command carries a query cancellation token. Dropping the awaiting future cancels
   running built-in query work at cooperative checkpoints; accepted writes retain side-effecting
   completion semantics.
+- `list_metrics`, `select_series`, `scan_series_rows`, and `scan_metric_rows` carry their detailed
+  result guards through the worker reply, retaining the query permit and result-memory reservation
+  until receipt or cancellation. Finite executions reject a backend that advertises `Unaccounted`
+  accounting for the requested operation, or returns a missing or undersized guard, before
+  accepting its result.
 - Uses `parking_lot::Mutex` and `std::thread` — suitable for embedding in any async runtime.
 
 ---
@@ -344,14 +349,41 @@ lifecycle/persistence work can advance durability. See
 
 | Mode                     | Behavior                                             |
 | ------------------------ | ---------------------------------------------------- |
-| `WalReplayMode::Strict`  | Abort if any WAL segment is corrupted or unreadable. |
-| `WalReplayMode::Salvage` | Skip damaged segments and continue replay.           |
+| `WalReplayMode::Strict`  | Abort logical replay if a frame is corrupted or unreadable. |
+| `WalReplayMode::Salvage` | Continue logical replay past recoverable corruption only after the WAL passed open-time validation. |
+
+Persistent open always validates the complete published WAL prefix strictly before applying either
+logical replay policy. `Salvage` therefore cannot bypass published corruption, rewrite or
+quarantine corrupt WAL data, or recover it in place; the supported recovery path writes a separate
+destination through `tsink-inspect salvage`. When a supported legacy WAL has no `wal.published`
+marker, every existing segment byte is treated as published and must pass the same streaming
+validation before tsink derives or installs a marker. The legacy root format identity may already
+have been installed with a null successful-open version before this normal recovery check fails.
 
 ### High-water mark
 
 `WalHighWatermark { segment: u64, frame: u64 }` tracks how far replay has been committed. Each persisted segment stores the WAL high-water mark at the time it was written, so recovery knows which WAL frames to replay and which to skip.
 
-The published high-water file (`wal.published`) uses magic `b"TSHW"`.
+The published high-water file (`wal.published`) accepts a legacy 24-byte `TSHW` record containing
+the published boundary `H`, or a 40-byte `TSH2` record containing `H` and a checksummed
+reset-through floor `R`. Both records end in a CRC-32; `TSH2` is rejected unless `R <= H`.
+Legacy `TSHW` carries no reset authorization.
+
+Recovery uses the effective floor `F = max(clean persisted replay floor, R)`. When `H > F`, each
+logical segment ID from `F.segment` through `H.segment` must have one contiguous physical
+representation and validation must reach the exact `H` frame. An empty or short boundary segment,
+or one whose first frame is above `H`, is corruption. The frame may be absent only when `F >= H`;
+gaps below `F` are already checkpointed or reset. Reads accept only an exact 24- or 40-byte regular
+non-link marker, use no-follow open where supported, and verify file identity around the bounded
+read.
+
+A reset durably publishes `TSH2` with
+`H = R = max(last appended high-water mark, (active segment, 0))` before truncating or removing
+WAL files. Future commits preserve `R` while advancing `H`. After recovery validates the marker and
+required prefix, it restores the runtime append and durable floors through `H`. Publication
+removes only a stale `wal.published.tmp` directory entry without following its target, rejects a
+directory, creates the temporary file exclusively with no-follow protection, identity-checks it
+before rename, and semantically revalidates the installed marker after rename.
 
 ---
 

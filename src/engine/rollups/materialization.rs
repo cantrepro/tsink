@@ -888,17 +888,11 @@ fn rollup_policy_page_coverage(
     report
 }
 
-// Caller must hold `rollup_run_lock`. One bounded pass visits one policy and at most
-// `source_limit` postings. The cursor is advanced only after any changed checkpoint state is
-// durable, so a persistence failure retries the same page.
-fn run_rollup_pipeline_page_once_locked_impl(
+fn begin_rollup_pipeline_page_once_locked(
     store: RollupStateStoreContext<'_>,
-    source_reads: RollupSourceReadContext<'_>,
-    materialized_writes: RollupMaterializedWriteContext<'_, '_, '_>,
     observability: &RollupObservabilityCounters,
     cursor: &mut BackgroundRollupCursor,
-    limits: BackgroundRollupPassLimits,
-) -> Result<()> {
+) -> Result<Instant> {
     store.ensure_snapshot_mutations_unfenced()?;
 
     let started = Instant::now();
@@ -919,17 +913,41 @@ fn run_rollup_pipeline_page_once_locked_impl(
         cursor.checkpoint_persistence_pending = false;
     }
 
+    Ok(started)
+}
+
+fn complete_idle_rollup_pipeline_page(
+    observability: &RollupObservabilityCounters,
+    cursor: &mut BackgroundRollupCursor,
+    started: Instant,
+) {
+    cursor.policy_id = None;
+    cursor.policy_generation = 0;
+    cursor.after_series_id = None;
+    cursor.cycle_complete = true;
+    observability
+        .worker_success_total
+        .fetch_add(1, Ordering::Relaxed);
+    observability
+        .last_run_duration_nanos
+        .store(elapsed_nanos_u64(started), Ordering::Relaxed);
+}
+
+// Caller must hold `rollup_run_lock`. One bounded pass visits one policy and at most
+// `source_limit` postings. The cursor is advanced only after any changed checkpoint state is
+// durable, so a persistence failure retries the same page.
+fn run_rollup_pipeline_page_once_locked_impl(
+    store: RollupStateStoreContext<'_>,
+    source_reads: RollupSourceReadContext<'_>,
+    materialized_writes: RollupMaterializedWriteContext<'_, '_, '_>,
+    observability: &RollupObservabilityCounters,
+    cursor: &mut BackgroundRollupCursor,
+    limits: BackgroundRollupPassLimits,
+) -> Result<()> {
+    let started = begin_rollup_pipeline_page_once_locked(store, observability, cursor)?;
+
     let Some(policy) = store.policy_for_background_cursor(cursor) else {
-        cursor.policy_id = None;
-        cursor.policy_generation = 0;
-        cursor.after_series_id = None;
-        cursor.cycle_complete = true;
-        observability
-            .worker_success_total
-            .fetch_add(1, Ordering::Relaxed);
-        observability
-            .last_run_duration_nanos
-            .store(elapsed_nanos_u64(started), Ordering::Relaxed);
+        complete_idle_rollup_pipeline_page(observability, cursor, started);
         return Ok(());
     };
 
@@ -1268,6 +1286,43 @@ impl ChunkStorage {
 
     pub(in crate::engine) fn run_shared_background_rollup_pipeline_once(&self) -> Result<()> {
         self.ensure_open()?;
+        let store = self.rollup_state_store_context();
+        let idle_result = if store.policies_are_empty() {
+            // An idle pass needs no materialized write capability. Taking only the rollup lock
+            // cannot form the permit -> rollup-lock cycle guarded against by the write paths:
+            // this branch never waits for a permit. After the optimistic read above, the lock
+            // makes the decisive empty-policy check atomic with policy publication/removal and
+            // lets us preserve the normal empty-pass cursor cleanup and observability updates.
+            let coordination = self.rollup_run_coordination_context();
+            let _run_guard = coordination.run_lock.lock();
+            self.ensure_open()?;
+            if store.policies_are_empty() {
+                let mut cursor = coordination.traversal_cursor.lock();
+                Some(
+                    begin_rollup_pipeline_page_once_locked(
+                        store,
+                        &self.observability.rollup,
+                        &mut cursor,
+                    )
+                    .map(|started| {
+                        complete_idle_rollup_pipeline_page(
+                            &self.observability.rollup,
+                            &mut cursor,
+                            started,
+                        );
+                    }),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(result) = idle_result {
+            self.enforce_post_commit_memory_budget_best_effort();
+            return result;
+        }
+
         let write_permits = self
             .runtime
             .write_limiter

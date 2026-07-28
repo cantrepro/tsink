@@ -95,6 +95,25 @@ pub(crate) fn execute_prepared_series_selection<B: SeriesSelectionBackend>(
     selection: &SeriesSelection,
     prepared: PreparedSeriesSelection,
 ) -> Result<Vec<MetricSeries>> {
+    execute_prepared_series_selection_with_ordering(backend, selection, prepared, true)
+}
+
+pub(crate) fn execute_prepared_series_selection_preserving_backend_order<
+    B: SeriesSelectionBackend,
+>(
+    backend: &B,
+    selection: &SeriesSelection,
+    prepared: PreparedSeriesSelection,
+) -> Result<Vec<MetricSeries>> {
+    execute_prepared_series_selection_with_ordering(backend, selection, prepared, false)
+}
+
+fn execute_prepared_series_selection_with_ordering<B: SeriesSelectionBackend>(
+    backend: &B,
+    selection: &SeriesSelection,
+    prepared: PreparedSeriesSelection,
+    sort_series: bool,
+) -> Result<Vec<MetricSeries>> {
     let mut candidates = backend.candidate_items(selection, &prepared)?;
 
     if let Some((start, end)) = prepared.time_range {
@@ -103,7 +122,9 @@ pub(crate) fn execute_prepared_series_selection<B: SeriesSelectionBackend>(
 
     let mut series = backend.materialize_items(candidates)?;
     retain_series_matching_selection(&mut series, selection, &prepared);
-    series.sort();
+    if sort_series {
+        series.sort();
+    }
     Ok(series)
 }
 

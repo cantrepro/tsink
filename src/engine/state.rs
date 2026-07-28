@@ -20,7 +20,9 @@ pub(in crate::engine) use snapshot::{
     active_series_snapshot_flatten_count, active_series_snapshot_point_count,
     reset_active_series_snapshot_flatten_count, reset_active_series_snapshot_point_count,
 };
-pub(super) use snapshot::{ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor};
+pub(super) use snapshot::{
+    ActivePartitionSnapshot, ActiveSeriesSnapshot, ActiveSeriesSnapshotCursor,
+};
 
 pub(super) const SERIES_VISIBILITY_SUMMARY_MAX_RANGES: usize = 32;
 

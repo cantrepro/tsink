@@ -3013,8 +3013,49 @@ pub trait Storage: Send + Sync {
         self.list_metrics()
     }
 
+    /// Lists known series while retaining any query-memory reservation owned by the result.
+    ///
+    /// The conservative default preserves compatibility for third-party backends. A bounded
+    /// caller must require [`QueryExecutionAccounting::Complete`] before relying on this result.
+    fn list_metrics_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.list_metrics_with_execution(execution)
+            .map(SelectSeriesExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::list_metrics_with_execution_result`] fully accounts for its
+    /// returned result. The conservative default preserves compatibility for third-party
+    /// backends.
+    fn list_metrics_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
+    }
+
     fn list_metrics_with_wal(&self) -> Result<Vec<MetricSeries>> {
         self.list_metrics()
+    }
+
+    /// Lists series known to live state or the WAL while sharing an admitted execution.
+    fn list_metrics_with_wal_with_execution(
+        &self,
+        _execution: &QueryExecution,
+    ) -> Result<Vec<MetricSeries>> {
+        self.list_metrics_with_wal()
+    }
+
+    /// Lists live/WAL metadata while retaining any query-memory reservation owned by the result.
+    fn list_metrics_with_wal_with_execution_result(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.list_metrics_with_wal_with_execution(execution)
+            .map(SelectSeriesExecutionResult::unaccounted)
+    }
+
+    /// Reports whether the detailed live/WAL listing fully accounts for its returned result.
+    fn list_metrics_with_wal_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     /// Lists known metric series within a shard scope.
@@ -3464,6 +3505,30 @@ pub trait Storage: Send + Sync {
         _execution: &QueryExecution,
     ) -> Result<QueryRowsPage> {
         self.scan_metric_rows(metric, start, end, options)
+    }
+
+    /// Scans one metric while retaining any query-memory reservation owned by the result.
+    ///
+    /// The conservative default preserves compatibility for third-party backends. A bounded
+    /// caller must require [`QueryExecutionAccounting::Complete`] before relying on this result.
+    fn scan_metric_rows_with_execution_result(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        self.scan_metric_rows_with_execution(metric, start, end, options, execution)
+            .map(QueryRowsExecutionResult::unaccounted)
+    }
+
+    /// Reports whether [`Storage::scan_metric_rows_with_execution_result`] fully accounts for its
+    /// returned work and retains a query-memory reservation for the returned row page.
+    ///
+    /// The conservative default preserves compatibility for third-party backends.
+    fn scan_metric_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     /// Adds deletion tombstones for series selected by matchers and optional time range.
@@ -4383,10 +4448,13 @@ impl StorageBuilder {
         self
     }
 
-    /// Sets WAL replay policy when corruption is encountered mid-log.
+    /// Sets the logical WAL replay policy after open-time validation.
     ///
-    /// Builders default to [`WalReplayMode::Strict`] so durable startup never silently drops
-    /// corrupted WAL history unless salvage is opted into explicitly.
+    /// Builders default to [`WalReplayMode::Strict`]. Every persistent open validates the complete
+    /// published WAL prefix strictly before logical replay, including when `mode` is
+    /// [`WalReplayMode::Salvage`]. Consequently this setting does not provide in-place recovery of
+    /// a corrupt published data directory; use the destination-only inspection/salvage workflow
+    /// for that case.
     #[must_use]
     pub fn with_wal_replay_mode(mut self, mode: WalReplayMode) -> Self {
         self.wal_replay_mode = mode;

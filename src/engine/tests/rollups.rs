@@ -22,11 +22,18 @@ fn cpu_rollup_policy(id: &str, interval: i64) -> crate::storage::RollupPolicy {
 }
 
 fn single_writer_persistent_rollup_storage(root: &std::path::Path) -> Arc<ChunkStorage> {
+    single_writer_persistent_rollup_storage_with_timeout(root, Duration::from_secs(5))
+}
+
+fn single_writer_persistent_rollup_storage_with_timeout(
+    root: &std::path::Path,
+    write_timeout: Duration,
+) -> Arc<ChunkStorage> {
     let wal = FramedWal::open(root.join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
     let mut options = base_storage_test_options(TimestampPrecision::Milliseconds, None);
     options.retention_enforced = false;
     options.max_writers = 1;
-    options.write_timeout = Duration::from_secs(5);
+    options.write_timeout = write_timeout;
 
     Arc::new(
         ChunkStorage::new_with_data_path_and_options(
@@ -1712,6 +1719,29 @@ fn close_waits_for_single_writer_historical_invalidation_without_lock_inversion(
         ]
     );
     reopened.close().unwrap();
+}
+
+#[test]
+fn idle_shared_background_rollup_does_not_wait_for_writer_permits() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage =
+        single_writer_persistent_rollup_storage_with_timeout(temp_dir.path(), Duration::ZERO);
+    let held_permit = storage.runtime.write_limiter.acquire();
+    let before = storage.observability_snapshot().rollups;
+
+    storage
+        .run_shared_background_rollup_pipeline_once()
+        .unwrap();
+
+    let after = storage.observability_snapshot().rollups;
+    assert_eq!(after.worker_runs_total, before.worker_runs_total + 1);
+    assert_eq!(after.worker_success_total, before.worker_success_total + 1);
+    assert_eq!(after.worker_errors_total, before.worker_errors_total);
+    assert!(after.source_traversal_complete);
+    assert_eq!(storage.runtime.write_limiter.available_permits(), 0);
+
+    drop(held_permit);
+    storage.close().unwrap();
 }
 
 #[test]

@@ -23,7 +23,7 @@ fn modeled_string_capacity_bytes(value: &String) -> u64 {
     }
 }
 
-fn modeled_metric_series_vec_retained_bytes(series: &Vec<MetricSeries>) -> u64 {
+pub(crate) fn modeled_metric_series_vec_retained_bytes(series: &Vec<MetricSeries>) -> u64 {
     super::modeled_vec_capacity_bytes::<MetricSeries>(series.capacity()).saturating_add(
         series.iter().fold(0u64, |bytes, item| {
             bytes
@@ -327,16 +327,26 @@ impl ChunkStorage {
         selection: &SeriesSelection,
         scope: &crate::storage::MetadataShardScope,
         execution: &QueryExecution,
+        operation: &'static str,
+        preserve_backend_order: bool,
     ) -> Result<(Vec<MetricSeries>, crate::QueryMemoryReservation)> {
         crate::query_selection::validate_series_selection(selection)?;
         let context = self.metadata_selection_context();
-        let candidate_reservation = self.reserve_metadata_candidate_working_set(execution)?;
+        let (candidate_series_ids, candidate_reservation) = self
+            .bounded_metadata_series_ids_for_scope_with_preflight(
+                scope,
+                operation,
+                |series_count| -> Result<crate::QueryMemoryReservation> {
+                    let series_count = u64::try_from(series_count).unwrap_or(u64::MAX);
+                    execution.ensure_pattern_expansion(series_count)?;
+                    execution
+                        .reserve_memory(super::modeled_metadata_candidate_working_set_bytes(
+                            series_count,
+                        ))
+                        .map_err(Into::into)
+                },
+            )?;
         let prepared = self.prepare_series_selection_for_execution(selection, execution)?;
-        execution.ensure_pattern_expansion(
-            u64::try_from(self.catalog.registry.read().series_count()).unwrap_or(u64::MAX),
-        )?;
-        let candidate_series_ids =
-            self.bounded_metadata_series_ids_for_scope(scope, "select_series_in_shards")?;
         let backend = ShardScopedPostingsSeriesSelectionBackend {
             context,
             candidate_series_ids,
@@ -347,9 +357,13 @@ impl ChunkStorage {
             _candidate_reservation: candidate_reservation,
             result_reservation: RefCell::new(None),
         };
-        let series = crate::query_selection::execute_prepared_series_selection(
-            &backend, selection, prepared,
-        )?;
+        let series = if preserve_backend_order {
+            crate::query_selection::execute_prepared_series_selection_preserving_backend_order(
+                &backend, selection, prepared,
+            )
+        } else {
+            crate::query_selection::execute_prepared_series_selection(&backend, selection, prepared)
+        }?;
         let reservation = match backend.result_reservation.into_inner() {
             Some(reservation) => reservation,
             None => execution.reserve_memory(0)?,

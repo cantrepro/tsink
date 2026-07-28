@@ -1099,6 +1099,13 @@ mod tests {
         assert_eq!(directory_bytes(&data_path), before);
         assert!(!data_path.join(".tsink.lock").exists());
         assert!(!manifest_path(&data_path).exists());
+
+        let err = build_error(builder(&data_path).with_wal_enabled(false));
+        assert!(matches!(err, TsinkError::DataCorruption(message)
+            if message.contains("read-only framed-WAL identity validation")));
+        assert_eq!(directory_bytes(&data_path), before);
+        assert!(!data_path.join(".tsink.lock").exists());
+        assert!(!manifest_path(&data_path).exists());
     }
 
     #[test]

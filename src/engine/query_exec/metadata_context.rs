@@ -2,7 +2,41 @@ use super::{
     rollups, ChunkStorage, CompiledSeriesMatcher, MetadataShardScope, MetricSeries, Result,
     RetentionTierPolicy, RoaringTreemap, SeriesId, SeriesSelection, TieredQueryPlan,
 };
-use crate::{QueryExecution, QueryMemoryReservation};
+use crate::{QueryExecution, QueryMemoryReservation, SelectSeriesExecutionResult};
+use std::collections::BTreeSet;
+
+const WAL_METADATA_BTREE_BOOKKEEPING_WORDS_PER_ENTRY: u64 = 4;
+
+fn modeled_wal_metadata_identity_set_bytes(entries: usize) -> u64 {
+    if entries == 0 {
+        return 0;
+    }
+    let key_bytes =
+        u64::try_from(std::mem::size_of::<(&str, &[crate::Label])>()).unwrap_or(u64::MAX);
+    let bookkeeping_bytes = u64::try_from(std::mem::size_of::<usize>())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(WAL_METADATA_BTREE_BOOKKEEPING_WORDS_PER_ENTRY);
+    u64::try_from(entries)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(key_bytes.saturating_add(bookkeeping_bytes))
+        .saturating_add(super::QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn contains_metric_series_identity(
+    sorted_series: &[MetricSeries],
+    metric: &str,
+    labels: &[crate::Label],
+) -> bool {
+    sorted_series
+        .binary_search_by(|series| {
+            series
+                .name
+                .as_str()
+                .cmp(metric)
+                .then_with(|| series.labels.as_slice().cmp(labels))
+        })
+        .is_ok()
+}
 
 fn projected_growing_vec_capacity(current: usize, required: usize) -> usize {
     if required <= current {
@@ -116,7 +150,11 @@ trait MetadataListingReadOps {
         generation_before: Option<u64>,
     );
 
-    fn wal_metric_series(&self) -> Result<Vec<MetricSeries>>;
+    fn wal_metric_series_result(
+        &self,
+        sorted_live_series: &[MetricSeries],
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult>;
 }
 
 trait MetadataShardScopeReadOps {
@@ -125,12 +163,6 @@ trait MetadataShardScopeReadOps {
         scope: &MetadataShardScope,
         operation: &'static str,
     ) -> Result<Vec<SeriesId>>;
-
-    fn live_metric_series_for_scope(
-        &self,
-        scope: &MetadataShardScope,
-        operation: &'static str,
-    ) -> Result<Vec<MetricSeries>>;
 }
 
 #[derive(Clone, Copy)]
@@ -273,8 +305,13 @@ impl MetadataListingContext<'_> {
         Ok(())
     }
 
-    pub(super) fn wal_metric_series(self) -> Result<Vec<MetricSeries>> {
-        self.ops.wal_metric_series()
+    pub(super) fn wal_metric_series_result(
+        self,
+        sorted_live_series: &[MetricSeries],
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.ops
+            .wal_metric_series_result(sorted_live_series, execution)
     }
 }
 
@@ -290,14 +327,6 @@ impl MetadataShardScopeContext<'_> {
         operation: &'static str,
     ) -> Result<Vec<SeriesId>> {
         self.ops.live_series_ids_for_scope(scope, operation)
-    }
-
-    pub(super) fn live_metric_series_for_scope(
-        self,
-        scope: &MetadataShardScope,
-        operation: &'static str,
-    ) -> Result<Vec<MetricSeries>> {
-        self.ops.live_metric_series_for_scope(scope, operation)
     }
 }
 
@@ -420,14 +449,121 @@ impl ChunkStorage {
         Ok(())
     }
 
-    fn wal_metric_series_impl(&self) -> Result<Vec<MetricSeries>> {
+    fn wal_metric_series_impl(
+        &self,
+        sorted_live_series: &[MetricSeries],
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
         let Some(wal) = &self.persisted.wal else {
-            return Ok(Vec::new());
+            return execution
+                .reserve_memory(0)
+                .map(|reservation| SelectSeriesExecutionResult::accounted(Vec::new(), reservation))
+                .map_err(Into::into);
         };
 
-        let definitions = wal.committed_series_definitions_snapshot()?;
+        let mut reservation = execution.reserve_memory(0)?;
+        let mut snapshot_retained_bytes = 0u64;
+        let definitions =
+            wal.committed_series_definitions_snapshot_with_preflight(|committed_definitions| {
+                execution.checkpoint()?;
+                execution.observe_intermediate_vector_size(
+                    u64::try_from(committed_definitions.len()).unwrap_or(u64::MAX),
+                )?;
+                let candidate_count =
+                    u64::try_from(committed_definitions.len()).unwrap_or(u64::MAX);
+                execution.ensure_pattern_expansion(candidate_count)?;
+                // Exact live/WAL union admission must happen before cloning the cached snapshot.
+                // The borrowed identity set owns no metric or label text and grows only after the
+                // candidate fits both exact output limits. Duplicates within the WAL and against
+                // the already-sorted live result therefore retain their historical union
+                // semantics without forcing an unbounded definition clone on a rejected query.
+                let mut unique_wal_identities = BTreeSet::new();
+                let mut unique_wal_returned_bytes = 0u64;
+                for definition in committed_definitions.values() {
+                    execution.checkpoint()?;
+                    execution.charge_pattern_expansion(1)?;
+                    if rollups::is_internal_rollup_metric(&definition.metric)
+                        || contains_metric_series_identity(
+                            sorted_live_series,
+                            &definition.metric,
+                            &definition.labels,
+                        )
+                    {
+                        continue;
+                    }
+
+                    let identity = (definition.metric.as_str(), definition.labels.as_slice());
+                    if unique_wal_identities.contains(&identity) {
+                        continue;
+                    }
+
+                    let next_unique_count = unique_wal_identities.len().saturating_add(1);
+                    let label_text_bytes =
+                        definition.labels.iter().fold(0usize, |label_bytes, label| {
+                            label_bytes
+                                .saturating_add(label.name.len())
+                                .saturating_add(label.value.len())
+                        });
+                    let next_returned_bytes = unique_wal_returned_bytes.saturating_add(
+                        super::modeled_metric_series_shape_bytes(
+                            definition.metric.len(),
+                            definition.labels.len(),
+                            label_text_bytes,
+                        ),
+                    );
+                    execution.ensure_series_matched(
+                        u64::try_from(next_unique_count).unwrap_or(u64::MAX),
+                    )?;
+                    execution.ensure_returned_bytes(next_returned_bytes)?;
+                    reservation
+                        .resize(modeled_wal_metadata_identity_set_bytes(next_unique_count))?;
+                    unique_wal_identities.insert(identity);
+                    unique_wal_returned_bytes = next_returned_bytes;
+                }
+
+                let candidate_identity_bytes =
+                    modeled_wal_metadata_identity_set_bytes(unique_wal_identities.len());
+                let identity_bytes =
+                    committed_definitions
+                        .values()
+                        .fold(0u64, |bytes, definition| {
+                            let label_text_bytes =
+                                definition.labels.iter().fold(0usize, |label_bytes, label| {
+                                    label_bytes
+                                        .saturating_add(label.name.len())
+                                        .saturating_add(label.value.len())
+                                });
+                            bytes.saturating_add(super::modeled_metric_series_shape_retained_bytes(
+                                definition.metric.len(),
+                                definition.labels.len(),
+                                label_text_bytes,
+                            ))
+                        });
+                snapshot_retained_bytes =
+                    super::modeled_vec_capacity_bytes::<crate::engine::wal::SeriesDefinitionFrame>(
+                        super::modeled_vec_growth_capacity_upper(committed_definitions.len()),
+                    )
+                    .saturating_add(identity_bytes);
+                // The borrowed candidate set is dropped before the snapshot clone. Holding the
+                // larger of these two phase peaks covers the transition without summing
+                // allocations that are never simultaneously live.
+                reservation.resize(candidate_identity_bytes.max(snapshot_retained_bytes))?;
+                Ok(())
+            })?;
+        reservation.resize(snapshot_retained_bytes)?;
+
+        let output_capacity = super::modeled_vec_growth_capacity_upper(definitions.len());
+        reservation.resize(snapshot_retained_bytes.saturating_add(
+            super::modeled_vec_capacity_bytes::<MetricSeries>(output_capacity),
+        ))?;
         let mut series = Vec::new();
+        series.try_reserve(definitions.len()).map_err(|err| {
+            crate::TsinkError::Other(format!(
+                "failed to reserve WAL metric-series materialization: {err}"
+            ))
+        })?;
         for definition in definitions {
+            execution.checkpoint()?;
             if rollups::is_internal_rollup_metric(&definition.metric) {
                 continue;
             }
@@ -436,7 +572,10 @@ impl ChunkStorage {
                 labels: definition.labels,
             });
         }
-        Ok(series)
+        reservation.resize(
+            super::metadata_series_selection::modeled_metric_series_vec_retained_bytes(&series),
+        )?;
+        Ok(SelectSeriesExecutionResult::accounted(series, reservation))
     }
 }
 
@@ -560,8 +699,12 @@ impl MetadataListingReadOps for ChunkStorage {
         );
     }
 
-    fn wal_metric_series(&self) -> Result<Vec<MetricSeries>> {
-        self.wal_metric_series_impl()
+    fn wal_metric_series_result(
+        &self,
+        sorted_live_series: &[MetricSeries],
+        execution: &QueryExecution,
+    ) -> Result<SelectSeriesExecutionResult> {
+        self.wal_metric_series_impl(sorted_live_series, execution)
     }
 }
 
@@ -573,15 +716,5 @@ impl MetadataShardScopeReadOps for ChunkStorage {
     ) -> Result<Vec<SeriesId>> {
         self.bounded_metadata_series_ids_for_scope(scope, operation)
             .and_then(|series_ids| self.live_series_ids(series_ids, true))
-    }
-
-    fn live_metric_series_for_scope(
-        &self,
-        scope: &MetadataShardScope,
-        operation: &'static str,
-    ) -> Result<Vec<MetricSeries>> {
-        self.bounded_metadata_series_ids_for_scope(scope, operation)
-            .and_then(|series_ids| self.live_series_ids(series_ids, true))
-            .map(|series_ids| self.metric_series_for_ids(series_ids))
     }
 }

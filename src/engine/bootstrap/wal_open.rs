@@ -24,6 +24,7 @@ impl StartupWalOpenPhase {
                     plan.local_disk_budget().cloned(),
                     builder.wal_replay_mode(),
                     !snapshot_validation,
+                    Some(replay_highwater),
                 )?;
             if snapshot_validation {
                 wal.ensure_min_highwater_without_segment_creation(replay_highwater)?;

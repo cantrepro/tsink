@@ -1,5 +1,7 @@
 use super::codec::{decode_samples_payload, decode_series_definition};
-use super::segments::{collect_wal_segment_files, WalSegmentFile};
+use super::segments::{
+    collect_wal_segment_files, open_existing_wal_segment_for_read, WalSegmentFile,
+};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -329,21 +331,16 @@ impl WalReplayStream {
     }
 
     fn open_next_segment(&mut self) -> Result<bool> {
-        while let Some(segment) = self.segments.get(self.next_segment_idx) {
-            self.next_segment_idx += 1;
+        let Some(segment) = self.segments.get(self.next_segment_idx) else {
+            return Ok(false);
+        };
+        self.next_segment_idx += 1;
 
-            let file = match OpenOptions::new().read(true).open(&segment.path) {
-                Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
+        let file = open_existing_wal_segment_for_read(&segment.path)?;
 
-            self.current_segment_id = segment.id;
-            self.current_reader = Some(BufReader::new(file));
-            return Ok(true);
-        }
-
-        Ok(false)
+        self.current_segment_id = segment.id;
+        self.current_reader = Some(BufReader::new(file));
+        Ok(true)
     }
 }
 
@@ -619,6 +616,8 @@ impl FramedWal {
         context: WalReplayContext,
     ) -> Result<WalReplayStream> {
         let segments = collect_wal_segment_files(&self.dir)?;
+        let replay_highwater =
+            replay_highwater.max(self.current_reset_highwater_floor().unwrap_or_default());
         Ok(WalReplayStream::new_with_context(
             segments,
             replay_highwater,

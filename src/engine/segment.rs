@@ -25,10 +25,10 @@ pub use self::types::{
 pub(in crate::engine) use self::writer::fail_segment_publish_rollback_once;
 pub use self::writer::SegmentWriter;
 
-pub(crate) use self::format::chunk_payload_from_record;
 pub(crate) use self::format::decoded_chunks_file_payload_bytes;
 #[cfg(test)]
 pub(crate) use self::format::CHUNK_FLAG_PAYLOAD_ZSTD;
+pub(crate) use self::format::{chunk_payload_decoded_len_from_record, chunk_payload_from_record};
 pub(crate) use self::format::{MAX_SEGMENT_CHUNKS_FILE_BYTES, MAX_SEGMENT_MANIFEST_FILE_BYTES};
 
 pub(crate) use self::loader::{

@@ -44,6 +44,64 @@ fn restore_entry_allowance_for(root: &std::path::Path) -> u64 {
         .unwrap()
 }
 
+fn create_valid_restore_snapshot(path: &std::path::Path) {
+    let source = path.parent().unwrap().join(".restore-fixture-source");
+    let storage = StorageBuilder::new()
+        .with_resource_profile(ResourceProfile::ExpertUnlimited)
+        .with_data_path(&source)
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("restore_fixture_metric", DataPoint::new(1, 1.0))])
+        .unwrap();
+    storage.snapshot(path).unwrap();
+    storage.close().unwrap();
+    fs::remove_dir_all(source).unwrap();
+}
+
+fn restore_tree_measurement(root: &std::path::Path) -> (u64, u64) {
+    fn visit(directory: &std::path::Path, logical_bytes: &mut u64, entries: &mut u64) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            *entries = entries.checked_add(1).unwrap();
+            if metadata.file_type().is_dir() {
+                visit(&path, logical_bytes, entries);
+            } else {
+                assert!(metadata.file_type().is_file());
+                *logical_bytes = logical_bytes.checked_add(metadata.len()).unwrap();
+            }
+        }
+    }
+
+    let mut logical_bytes = 0u64;
+    let mut entries = 1u64; // The snapshot root is part of the staging entry envelope.
+    visit(root, &mut logical_bytes, &mut entries);
+    (logical_bytes, entries)
+}
+
+fn restore_required_admission(
+    snapshot: &std::path::Path,
+    budget_root: &std::path::Path,
+    missing_target_parent_directories: u64,
+) -> (u64, u64) {
+    let (logical_bytes, entries) = restore_tree_measurement(snapshot);
+    let entry_allowance = restore_entry_allowance_for(budget_root);
+    let required = logical_bytes
+        .checked_mul(2)
+        .and_then(|bytes| {
+            entries
+                .checked_add(2)
+                .and_then(|entries| entries.checked_add(missing_target_parent_directories))
+                .and_then(|entries| entries.checked_mul(entry_allowance))
+                .and_then(|allowance| bytes.checked_add(allowance))
+        })
+        .unwrap();
+    (logical_bytes, required)
+}
+
 #[test]
 fn effective_storage_limits_distinguish_explicit_expert_unlimited() {
     let storage = StorageBuilder::new()
@@ -698,13 +756,13 @@ fn budgeted_restore_rejects_quota_before_destination_mutation() {
     let snapshot_path = temp_dir.path().join("external-snapshot");
     let budget_root = temp_dir.path().join("restore-envelope");
     let target_path = budget_root.join("missing-parent/target");
-    fs::create_dir_all(&snapshot_path).unwrap();
+    create_valid_restore_snapshot(&snapshot_path);
     fs::write(snapshot_path.join("payload"), b"12345").unwrap();
-    let entry_allowance = restore_entry_allowance_for(&budget_root);
+    let (_, required) = restore_required_admission(&snapshot_path, &budget_root, 1);
     let budget = LocalDiskBudget::open(
         &budget_root,
         LocalDiskLimits {
-            max_bytes: Some(4),
+            max_bytes: Some(required - 1),
             ..LocalDiskLimits::default()
         },
     )
@@ -719,9 +777,12 @@ fn budgeted_restore_rejects_quota_before_destination_mutation() {
 
     assert!(matches!(
         err,
-        TsinkError::DiskQuotaExceeded { requested, .. }
-            if requested
-                == 5 + 3 * entry_allowance
+        TsinkError::DiskQuotaExceeded {
+            requested,
+            limit,
+            used: 0,
+            reserved: 0,
+        } if requested == required && limit == required - 1
     ));
     assert!(!budget_root.join("missing-parent").exists());
     assert_eq!(fs::read(snapshot_path.join("payload")).unwrap(), b"12345");
@@ -738,9 +799,12 @@ fn budgeted_restore_reserves_entry_allowance_for_empty_files() {
     let snapshot_path = temp_dir.path().join("external-snapshot");
     let budget_root = temp_dir.path().join("restore-envelope");
     let target_path = budget_root.join("target");
-    fs::create_dir_all(&snapshot_path).unwrap();
+    create_valid_restore_snapshot(&snapshot_path);
+    let (_, entries_before) = restore_tree_measurement(&snapshot_path);
     fs::write(snapshot_path.join("empty"), b"").unwrap();
-    let required = 2 * restore_entry_allowance_for(&budget_root);
+    let (logical_bytes, entries_after) = restore_tree_measurement(&snapshot_path);
+    assert_eq!(entries_after, entries_before + 1);
+    let (_, required) = restore_required_admission(&snapshot_path, &budget_root, 0);
     let budget = LocalDiskBudget::open(
         &budget_root,
         LocalDiskLimits {
@@ -767,6 +831,10 @@ fn budgeted_restore_reserves_entry_allowance_for_empty_files() {
             ..
         } if requested == required && limit == required - 1
     ));
+    assert!(
+        logical_bytes > 0,
+        "the valid snapshot must retain nonempty files"
+    );
     assert!(!target_path.exists());
     assert_eq!(budget.snapshot().accounted_bytes, 0);
     assert_eq!(budget.snapshot().active_reservations, 0);
@@ -778,9 +846,8 @@ fn budgeted_restore_reserves_allowance_for_every_missing_target_parent() {
     let snapshot_path = temp_dir.path().join("external-snapshot");
     let budget_root = temp_dir.path().join("restore-envelope");
     let target_path = budget_root.join("one/two/three/target");
-    fs::create_dir_all(&snapshot_path).unwrap();
-    let entry_allowance = restore_entry_allowance_for(&budget_root);
-    let required = 4 * entry_allowance; // snapshot root plus three missing target parents
+    create_valid_restore_snapshot(&snapshot_path);
+    let (_, required) = restore_required_admission(&snapshot_path, &budget_root, 3);
     let budget = LocalDiskBudget::open(
         &budget_root,
         LocalDiskLimits {
@@ -816,6 +883,7 @@ fn budgeted_restore_replaces_target_preserves_siblings_and_reopens_exactly() {
     let snapshot_path = temp_dir.path().join("external-snapshot");
     let budget_root = temp_dir.path().join("restore-envelope");
     let target_path = budget_root.join("target");
+    create_valid_restore_snapshot(&snapshot_path);
     fs::create_dir_all(snapshot_path.join("nested")).unwrap();
     fs::write(snapshot_path.join("payload"), b"fresh").unwrap();
     fs::write(snapshot_path.join("nested/more"), b"xy").unwrap();
@@ -823,8 +891,9 @@ fn budgeted_restore_replaces_target_preserves_siblings_and_reopens_exactly() {
     fs::write(target_path.join("old"), b"oldold").unwrap();
     fs::write(budget_root.join("host-owned.bin"), b"host").unwrap();
 
-    // Existing bytes (10) plus 7 logical staging bytes and four entry allowances fit exactly.
-    let staging_admission = 7 + 4 * restore_entry_allowance_for(&budget_root);
+    let (snapshot_logical_bytes, staging_admission) =
+        restore_required_admission(&snapshot_path, &budget_root, 0);
+    // Existing target/sibling bytes plus the validation-copy and activation peak fit exactly.
     let limits = LocalDiskLimits {
         max_bytes: Some(10 + staging_admission),
         ..LocalDiskLimits::default()
@@ -851,16 +920,21 @@ fn budgeted_restore_replaces_target_preserves_siblings_and_reopens_exactly() {
         .starts_with(".tmp-tsink-restore-")));
 
     let accounting = budget.snapshot();
-    assert_eq!(accounting.accounted_bytes, 11);
-    assert_eq!(accounting.unknown_bytes, 11);
+    let final_bytes = snapshot_logical_bytes + 4;
+    assert_eq!(accounting.accounted_bytes, final_bytes);
+    let final_unknown_bytes = accounting.unknown_bytes;
+    assert!(
+        final_unknown_bytes >= 11,
+        "host-owned and added snapshot payload bytes remain unknown"
+    );
     assert_eq!(accounting.active_reservations, 0);
     assert_eq!(accounting.reserved_bytes, 0);
     drop(budget);
 
     let reopened = LocalDiskBudget::open(&budget_root, limits).unwrap();
     let reopened_accounting = reopened.snapshot();
-    assert_eq!(reopened_accounting.accounted_bytes, 11);
-    assert_eq!(reopened_accounting.unknown_bytes, 11);
+    assert_eq!(reopened_accounting.accounted_bytes, final_bytes);
+    assert_eq!(reopened_accounting.unknown_bytes, final_unknown_bytes);
     assert_eq!(reopened_accounting.active_reservations, 0);
 }
 
@@ -949,18 +1023,14 @@ fn budgeted_restore_rejects_snapshot_and_target_symlinks_before_mutation() {
 #[test]
 fn concurrent_budgeted_restores_admit_only_the_final_available_bytes() {
     let temp_dir = TempDir::new().unwrap();
-    let snapshot_a = temp_dir.path().join("snapshot-a");
-    let snapshot_b = temp_dir.path().join("snapshot-b");
+    let snapshot = temp_dir.path().join("snapshot");
     let budget_root = temp_dir.path().join("restore-envelope");
-    fs::create_dir_all(&snapshot_a).unwrap();
-    fs::create_dir_all(&snapshot_b).unwrap();
-    fs::write(snapshot_a.join("payload"), b"aaaa").unwrap();
-    fs::write(snapshot_b.join("payload"), b"bbbb").unwrap();
-    let entry_allowance = restore_entry_allowance_for(&budget_root);
+    create_valid_restore_snapshot(&snapshot);
+    let (snapshot_logical_bytes, required) = restore_required_admission(&snapshot, &budget_root, 0);
     let budget = LocalDiskBudget::open(
         &budget_root,
         LocalDiskLimits {
-            max_bytes: Some(4 + 2 * entry_allowance),
+            max_bytes: Some(required),
             ..LocalDiskLimits::default()
         },
     )
@@ -968,8 +1038,8 @@ fn concurrent_budgeted_restores_admit_only_the_final_available_bytes() {
     let barrier = Arc::new(std::sync::Barrier::new(3));
 
     let handles = [
-        (snapshot_a, budget_root.join("target-a")),
-        (snapshot_b, budget_root.join("target-b")),
+        (snapshot.clone(), budget_root.join("target-a")),
+        (snapshot, budget_root.join("target-b")),
     ]
     .into_iter()
     .map(|(snapshot, target)| {
@@ -1003,7 +1073,7 @@ fn concurrent_budgeted_restores_admit_only_the_final_available_bytes() {
         1
     );
     let accounting = budget.snapshot();
-    assert_eq!(accounting.accounted_bytes, 4);
+    assert_eq!(accounting.accounted_bytes, snapshot_logical_bytes);
     assert_eq!(accounting.active_reservations, 0);
     assert_eq!(accounting.reserved_bytes, 0);
     assert_eq!(accounting.rejections_total, 1);
@@ -1104,7 +1174,7 @@ fn test_far_future_write_does_not_reject_current_data_or_hide_history() {
 }
 
 #[test]
-fn test_full_delete_recomputes_retention_reference_across_series() {
+fn test_full_delete_preserves_monotonic_retention_reference_across_series() {
     let storage = StorageBuilder::new()
         .with_retention(Duration::from_secs(60))
         .with_timestamp_precision(TimestampPrecision::Seconds)
@@ -1152,30 +1222,35 @@ fn test_full_delete_recomputes_retention_reference_across_series() {
         Some(anchor)
     );
 
-    storage
+    let deleted = storage
         .delete_series(
             &SeriesSelection::new()
                 .with_metric("delete_retention_metric")
                 .with_matcher(SeriesMatcher::equal("host", "anchor")),
         )
         .unwrap();
+    assert_eq!(deleted.matched_series, 1);
+    assert_eq!(deleted.tombstones_applied, 1);
 
-    assert!(storage
-        .observability_snapshot()
-        .retention
-        .recency_reference_timestamp
-        .is_some_and(|ts| ts < anchor));
+    // The bounded recency reference is deliberately monotonic: deleting the anchor updates only
+    // the affected series visibility state and never performs an unbounded whole-cache scan.
+    // Keeping the conservative upper bound also prevents already-expired data from reappearing.
     assert_eq!(
         storage
-            .select(
-                "delete_retention_metric",
-                &hidden_labels,
-                hidden - 1,
-                anchor + 1
-            )
-            .unwrap(),
-        vec![DataPoint::new(hidden, 1.0)]
+            .observability_snapshot()
+            .retention
+            .recency_reference_timestamp,
+        Some(anchor)
     );
+    assert!(storage
+        .select(
+            "delete_retention_metric",
+            &hidden_labels,
+            hidden - 1,
+            anchor + 1
+        )
+        .unwrap()
+        .is_empty());
     assert!(storage
         .select(
             "delete_retention_metric",
@@ -1526,6 +1601,16 @@ fn test_build_with_new_data_path_and_wal_disabled() {
 fn test_wal_disabled_does_not_replay_stale_segments() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
+
+    // Establish current-format ownership before injecting a stale owned WAL. A corrupt WAL name
+    // alone must not grant cleanup authority over a manifestless lookalike directory.
+    StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap()
+        .close()
+        .unwrap();
     fs::create_dir_all(&wal_dir).unwrap();
     fs::write(wal_dir.join("wal.log"), [0xFF, 0x00, 0x13, 0x37]).unwrap();
 
@@ -1540,6 +1625,7 @@ fn test_wal_disabled_does_not_replay_stale_segments() {
         .is_empty());
     assert!(storage.list_metrics().unwrap().is_empty());
     storage.close().unwrap();
+    assert!(!wal_dir.exists());
 
     let storage = StorageBuilder::new()
         .with_data_path(temp_dir.path())
@@ -1558,6 +1644,15 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
     let temp_dir = TempDir::new().unwrap();
     let wal_dir = temp_dir.path().join("wal");
 
+    // Establish current-format ownership before injecting a stale owned WAL. A corrupt WAL name
+    // alone must not grant cleanup authority over a manifestless lookalike directory.
+    StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_wal_enabled(false)
+        .build()
+        .unwrap()
+        .close()
+        .unwrap();
     fs::create_dir_all(&wal_dir).unwrap();
     fs::write(wal_dir.join("wal.log"), [0xAA, 0xBB, 0xCC]).unwrap();
 
@@ -1570,6 +1665,7 @@ fn test_wal_disabled_cleans_stale_segments_before_reenable() {
         .insert_rows(&[Row::new("fresh_metric", DataPoint::new(6, 6.0))])
         .unwrap();
     storage.close().unwrap();
+    assert!(!wal_dir.exists());
 
     let reopened = StorageBuilder::new()
         .with_data_path(temp_dir.path())

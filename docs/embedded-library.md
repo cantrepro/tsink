@@ -126,7 +126,7 @@ let storage = StorageBuilder::new()
 | `with_wal_size_limit(bytes)` | 512 MiB (`Embedded`) | Cap total WAL size on disk. Exceeding this returns `WalSizeLimitExceeded`. |
 | `with_wal_buffer_size(size)` | 4 KiB | Finite userspace `BufWriter` capacity. The live retained capacity is charged to the storage-memory budget and reported by effective limits, WAL observability, and memory observability. |
 | `with_wal_sync_mode(mode)` | `PerAppend` | Durability policy — see [WAL sync modes](#wal-sync-modes). |
-| `with_wal_replay_mode(mode)` | `Strict` | Corruption handling during WAL replay — see [WAL replay modes](#wal-replay-modes). |
+| `with_wal_replay_mode(mode)` | `Strict` | Logical replay policy after strict open-time validation — see [WAL replay modes](#wal-replay-modes). |
 
 ### Local disk
 
@@ -651,7 +651,11 @@ StorageBuilder::new()
 | Mode | Behaviour |
 |---|---|
 | `WalReplayMode::Strict` (default) | Abort replay on any corruption. Use for production where data integrity is paramount. |
-| `WalReplayMode::Salvage` | Skip corrupted frames/segments and continue. Useful for disaster recovery when some data loss is acceptable. |
+| `WalReplayMode::Salvage` | Skip corrupt logical frames only after a WAL handle has passed open-time validation. Persistent open always validates the complete published WAL prefix strictly, so this mode does not rewrite/quarantine corrupt WAL data or recover it in place. A legacy root format identity may already have been installed with its successful-open version unset before normal recovery fails. |
+
+For persistent disaster recovery, use the bounded `tsink-inspect` workflow described in
+[storage format and recovery](storage-format.md#offline-inspection-and-explicit-salvage). Salvage
+writes a separate destination and never mutates the damaged source.
 
 ---
 
