@@ -170,6 +170,17 @@ the cache, so its metadata path does not trigger the standalone WAL helper's laz
 standalone `FramedWal` has no storage-memory budget of its own. Caller-owned inputs and collections
 returned by public WAL inspection helpers remain named exclusions.
 
+Successful ordinary finite segment persistence and finite close settle these retained components
+through scoped deltas rather than a whole-engine memory recount. WAL cache growth is measured and
+published while holding the cache mutex. A successful physical WAL reset clears the cache and
+publishes its exact post-clear retained capacity under that same mutex, including retained
+buffer capacity, so an older growth observation cannot race in after the decrement. A conditional
+reset skipped because
+newer WAL data exists and a reset that fails before the physical replacement publish no cache
+decrement; if a later settlement step fails after the physical reset, the already-real cache
+release remains reflected in accounting. Full reconciliation remains an explicit diagnostic and
+the exceptional complete-tombstone path, not the ordinary finite flush or close path.
+
 Atomic write application also grows the same transient lease before cloning any affected active
 series. Its conservative staging peak includes six additional modeled copies of every pre-existing
 active state plus six copies of the already-admitted retained-growth allowance, with a fixed staged
@@ -534,14 +545,20 @@ A retention/tiering wake whose persisted catalog is already clean now evaluates 
 root page. A clean page advances the cursor without catalog publication; only the empty terminal page
 claims a clean full cycle. Unknown dirty state is left pending for the catalog-refresh phase instead
 of being mistaken for a no-op, and completed replacement recovery remains authoritative before page
-selection.
+selection. An inspected active head, sealed chunk, or retention root consumes its item slot even
+when a byte-limit lookahead leaves that candidate for the next wake; later phases receive only the
+true item/byte remainder and cannot reuse the rejected lookahead.
 
 Ordinary persisted-index add/remove accounting measures only the roots, per-series reference
 vectors, and posting keys named by the transition; it no longer walks every live segment before
 and after a bounded flush. A non-tiered transition likewise updates visible-segment counters from
-that exact root delta without constructing a complete inventory. The ordinary registry-catalog
-sidecar is also incremental: `series_index.catalog.d/` has one entry per live segment and one
-manifest containing at most one pending page intent. An intent is capped at 16 MiB, the directory
+that exact root delta without constructing a complete inventory. If a bounded flush fails after
+index mutation, it reverses the exact visible-tier delta and records one exact root-removal retry
+intent; it does not turn the failure into an all-root catalog or registry repair. A finite tiered
+writer also keeps registry-reconciliation debt sticky until a terminal paged publication clears
+it. The ordinary registry-catalog sidecar is also incremental: `series_index.catalog.d/` has one
+entry per live segment and one manifest containing at most one pending page intent. An intent is
+capped at 16 MiB, the directory
 at 16,382 live entries plus its manifest and atomic-write allowance, and retry replays the same
 remove/upsert set before publishing its exact final count. Native manifest and entry reads reject
 more than 17 MiB and 16 KiB before allocation; legacy JSON rejects more than 64 MiB. The aggregate
@@ -577,6 +594,13 @@ replace rather than accumulate the process-local reservation, so continuous writ
 delay convergence; there is no stale-reader lease in this format. Lifecycle startup and
 `ExpertUnlimited` retain the v2/physical-scan compatibility path.
 
+Unknown-dirty finite tiered state never falls through to a complete physical inventory. A
+read-write runtime reconciles its authoritative visible map through the bounded writer cursor; an
+open compute-only runtime leaves the debt with the interval/backoff-governed remote worker. During
+close, when producers have stopped, compute-only mode drains the pinned remote generation through
+the same bounded pages and fails if the shared pointer changes rather than silently switching
+generations.
+
 Finite read-write tiered catalog publication uses a process-local, file-handle-free continuation.
 It scans the visible persisted-root map one charged item at a time into a 16,384-entry
 identity-ordered snapshot, then streams the local v2 compatibility image, immutable v3 generation,
@@ -598,6 +622,16 @@ cursor without replaying the installed visibility transition, and checkpoint the
 registry-catalog image when a cursor may contain work from multiple callers. `ExpertUnlimited`
 retains the legacy complete one-shot publication path.
 
+Finite background post-flush recovery retains an admitted `ReadDir` cursor instead of collecting
+and sorting the complete marker namespace. One raw entry or marker outcome consumes a wake, every
+raw entry counts toward the 16,384-entry namespace ceiling, and a Prepared rollback does not fall
+through to another marker. A Committing marker charges every source and output root plus aggregate
+marker, file, decode/index, path, registry-delta, and transition-staging work before mutation. The
+catalog transition and committed-tombstone recovery receive only the remaining item/byte envelope.
+Retained cursor and decode memory is reported in `remote_catalog_staging_bytes` and releases on
+success, error, reset, and close. Startup and foreground lifecycle drains keep the strict complete
+recovery path.
+
 The finite writer cursor builds its ordered snapshot directly from persisted state, so it no
 longer requires a caller-owned complete `SegmentInventory` merely to encode the catalog. Explicit
 complete-inventory compatibility transitions and `ExpertUnlimited` still materialize their input
@@ -606,15 +640,15 @@ proportional to the live catalog but is hard-capped by the namespace ceiling and
 global storage-memory budget; each scan/encode fragment is independently rejectable when it cannot
 fit one maintenance pass.
 
-Finite read-write tombstone recovery snapshots no longer clone and republish the complete live map.
-The live tombstone index is ordered by series ID with a conservative fixed per-node memory charge,
-and a process-local cursor copies at most the configured item/byte page under the tombstone
-visibility fence. Each page uses the existing crash-atomic multi-lane update coordinator, and a
-dedicated tombstone generation restarts paging only when the tombstone map changes; unrelated
-segment/catalog visibility publication cannot starve it. Startup marks the reconciliation pending,
-the persisted-refresh worker advances one page per otherwise-exclusive maintenance wake, and close
-drains the same cursor while writers are stopped. `ExpertUnlimited` retains the legacy one-shot
-snapshot.
+Finite read-write catalog publication preflights its complete visibility transition and any
+committed tombstone coordinator under one remaining item/byte envelope before either can mutate
+disk. Recovery validates the coordinator, every recorded lane/manifest dependency, and each
+candidate shard at its exact declared length, admits the combined decode/reload peak, and only
+then rolls the durable candidate forward and reloads query-visible state. A dependency window
+that cannot fit returns a structured maintenance limit before the visibility transition or
+recovery mutation; the successful path retains the ordinary crash-atomic multi-lane coordinator.
+Startup, close, and `ExpertUnlimited` retain their complete recovery paths, while ordinary finite
+publication uses the bounded preflight and remaining-pass budget.
 
 Startup hydration defines the live map as the union of every durable lane, while supported runtime
 removals persist an empty-range update before removing a live entry. Therefore ordinary finite
@@ -639,16 +673,23 @@ names are pinned, decoded shard fragments remain private and charged to
 changed manifest or visibility generation discards the staged continuation and retries. No
 tombstone-store root is enumerated.
 
-After complete validation, the cursor unions the staged deletes with the current live map so a
-retry cannot resurrect an older delete, then admits one visibility-fenced publication item. A
-decode, validation, admission, or terminal-revalidation failure leaves the previous map visible.
-The current live `BTreeMap` replacement and affected-series visibility-cache rebuild are still one
-monolithic terminal item: their conservative and exact staging requirements must fit
-`maintenance_max_bytes_per_pass`, otherwise the refresh returns
-`MaintenanceWorkItemTooLarge` without swapping visibility. Restarting with a raised maintenance
-ceiling can unstrand an already bounded deployment; supporting arbitrarily larger tombstone sets
-under the same ceiling requires a future immutable sharded live tombstone snapshot and
-epoch-tagged cache publication rather than pagination of the mutable map swap.
+After complete validation, the cursor builds a query-visible immutable remote overlay with a fixed
+256-shard fanout. It reuses the predecessor's `Arc` for every unchanged shard and copy-on-writes
+only affected shards, so a retry cannot resurrect an older delete and a changed publication has a
+bounded, admitted candidate peak. Queries union the local tombstone base with only the requested
+remote shard. A decode, validation, admission, or terminal-revalidation failure leaves the prior
+overlay visible; terminal publication exchanges the overlay pointer under the visibility fence.
+
+Each changed remote-overlay publication advances a checked logical epoch. Cached visibility
+payloads are tagged per series and are logically absent whenever their tag does not equal that
+epoch, so publication never enumerates or clears a whole cache; a later read lazily rebuilds and
+retags only the series it needs. A semantically identical refresh preserves the snapshot pointer,
+epoch, visibility/tombstone generations, and cache tags. The epoch never wraps: exhaustion is a
+structured rejection before registry, pointer, accounting, cache, or generation state changes.
+The snapshot's fixed table, changed-shard candidates, retained cursor state, terminal manifest
+revalidation, and old/new publication overlap are all admitted to the modeled storage-memory and
+maintenance envelopes. Thus a pass that cannot fit returns the relevant structured limit without
+swapping visibility, while a larger configured ceiling can admit a larger bounded deployment.
 
 Finite read-write tiered publication now resumes the ordered scan and streamed v2/v3 encoders
 across maintenance wakes, with source retirement fenced behind its pointer-last terminal pass.
@@ -819,6 +860,13 @@ rejected; an external export destination is outside that quota and reports its o
 Object-store roots are also outside the live quota, and any configuration that overlaps one with
 the managed root is rejected.
 
+Snapshot-export cleanup is also inside the 128 MiB secure-copy operation cap. After exact
+whole-tree verification, it admits a conservative maximum for the simultaneously live
+handle-relative display paths, Unix component encoding, and Windows ancestor lock chains before
+any deletion attempt. Windows can then delete through the identity-attested `DELETE` handles.
+Portable Unix reports unsupported identity-conditioned unlink and retains the verified staging
+tree, so bounded admission is not misrepresented as race-free pathname deletion.
+
 Offline restore has a separate, explicit core envelope.
 `StorageBuilder::restore_from_snapshot_with_disk_budget` accepts a caller-owned
 `LocalDiskBudget` rooted above the target; the target must be a strict descendant and the snapshot
@@ -827,9 +875,16 @@ counting toward a 100,000-entry limit and descendant-directory depth capped at 1
 symlinks, Windows reparse points, special entries, and resolved source/target overlap in either
 direction are rejected. Source and staging traversal is anchored to no-follow directory handles
 and a finite closed-identity manifest. Each secure session is capped at 64 MiB modeled retained
-memory, and simultaneously live secure traversal, staging-manifest, verification, and generated
-copy-buffer state shares a 128 MiB operation cap. This cap does not include the storage instance
-used for semantic validation.
+memory, and simultaneously live secure traversal, staging-manifest, verification, requested-path
+anchor re-attestation, and generated copy-buffer state shares a 128 MiB operation cap. This cap
+does not include the storage instance used for semantic validation.
+
+Restore validation-copy and published-backup cleanup admit their conservative maximum
+handle-relative path, component-encoding, and Windows lock-chain scratch against that same
+operation cap after dropping the temporary verification manifest. Windows dispositions the
+identity-attested handles. Portable Unix deletion remains subject to restore's caller-enforced
+offline target-containing-namespace precondition—including the backup and
+`.tmp-tsink-restore-*` siblings—because no identity-conditioned unlink is available.
 
 Before target capture or publication, a private copy is opened with strict production
 discovery/recovery/hydration. It uses the finite `Server` envelope: 2 GiB accounted memory, 10
@@ -837,9 +892,9 @@ million series, 8 GiB WAL, and 256 GiB local disk. Filesystem free-headroom and 
 reserve are set to zero for validation. Non-degraded health is required, workers are disabled, and
 the validation-only shutdown does not run the normal flush/checkpoint pipeline. Consequently a
 structurally valid snapshot created under larger custom or `ExpertUnlimited` limits can be rejected
-by restore's deliberate validation ceiling. The containing namespace remains an exclusive private
-contract; retained anchors do not claim protection from a hostile same-UID actor during the
-platform's final narrow rename window.
+by restore's deliberate validation ceiling. The snapshot source and target-containing namespace
+remain exclusive private contracts; retained anchors do not claim protection from a hostile
+same-UID actor during the platform's final narrow rename or Unix cleanup windows.
 
 The budgeted restore staging term is
 `2 * logical_file_bytes + (snapshot_entries + 2) * entry_allowance`, where the two extra entries
@@ -1212,10 +1267,11 @@ specifies different values is rejected during build instead of being silently ig
 maintenance item/byte pair currently bounds compaction, sealed-chunk
 persistence, active-flush discovery, retention/tiering root/action pagination, finite non-tiered
 unknown-dirty catalog reconciliation, finite compute-only v3 catalog reading/application, and
-finite read-write catalog publication and tombstone recovery-snapshot paging, and rollup postings
-traversal; each rollup source read and its downstream transform/row assembly share one finite
-query/maintenance envelope. Tiered writer publication retains one complete, hard-bounded snapshot,
-but its simultaneous memory peak is admitted before publication.
+finite read-write catalog publication with committed-tombstone recovery preflight, finite
+background post-flush marker recovery, and rollup postings traversal; each rollup source read and
+its downstream transform/row assembly share one finite query/maintenance envelope. Tiered writer
+publication retains one complete, hard-bounded snapshot, but its simultaneous memory peak is
+admitted before publication.
 Finite explicit/manual rollup calls share the background cursor and advance at most one
 item/byte-bounded policy/source page; bounded status counters plus the continuation policy and
 exclusive series ID distinguish partial progress until a terminal page proves the cycle complete.

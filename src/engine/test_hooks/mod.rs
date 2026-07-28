@@ -47,6 +47,7 @@ pub(super) struct PersistTestHooks {
     pub(super) query_persisted_chunk_decode_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) exact_sealed_eviction_inspect_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) persisted_index_accounting_inspect_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) full_memory_reconciliation_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) persisted_catalog_inventory_entry_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) flush_pre_visibility_publish_hook: RwLock<Option<Arc<FallibleCommitHook>>>,
     pub(super) catalog_transition_post_index_mutation_hook: RwLock<Option<Arc<FallibleCommitHook>>>,

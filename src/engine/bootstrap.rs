@@ -189,14 +189,23 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
             validation_staging_path.display()
         )));
     }
-    snapshot_source.verify_requested_namespace_unchanged()?;
+    let validation_live_retained_bytes = admit_secure_snapshot_operation_retained_bytes(
+        &[
+            snapshot_source.retained_memory_bytes(),
+            validation_staging.retained_memory_bytes(),
+        ],
+        "secure snapshot restore validation namespace re-attestation",
+        snapshot_path,
+    )?;
+    snapshot_source.verify_requested_namespace_unchanged(validation_live_retained_bytes)?;
     validate_and_remove_secure_restore_copy(
         validation_staging,
         validation_configuration,
         validation_wal_enabled,
     )?;
     snapshot_source.verify_unchanged(snapshot_source.retained_memory_bytes())?;
-    snapshot_source.verify_requested_namespace_unchanged()?;
+    snapshot_source
+        .verify_requested_namespace_unchanged(snapshot_source.retained_memory_bytes())?;
 
     let original_target = if path_exists_no_follow(data_path)? {
         Some(
@@ -239,7 +248,15 @@ pub(super) fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Pa
             staging_path.display()
         )));
     }
-    snapshot_source.verify_requested_namespace_unchanged()?;
+    let restore_live_retained_bytes = admit_secure_snapshot_operation_retained_bytes(
+        &[
+            restore_source_retained_bytes,
+            staging.retained_memory_bytes(),
+        ],
+        "secure snapshot restore publication namespace re-attestation",
+        snapshot_path,
+    )?;
+    snapshot_source.verify_requested_namespace_unchanged(restore_live_retained_bytes)?;
 
     let backup = original_target
         .is_some()
@@ -365,14 +382,25 @@ pub(super) fn restore_storage_from_snapshot_with_disk_budget(
                     staging.display()
                 )));
             }
-            snapshot_source.verify_requested_namespace_unchanged()?;
+            let validation_live_retained_bytes =
+                admit_secure_snapshot_operation_retained_bytes(
+                    &[
+                        snapshot_source.retained_memory_bytes(),
+                        validation_staging.retained_memory_bytes(),
+                    ],
+                    "budgeted secure snapshot restore validation namespace re-attestation",
+                    snapshot_path,
+                )?;
+            snapshot_source
+                .verify_requested_namespace_unchanged(validation_live_retained_bytes)?;
             validate_and_remove_secure_restore_copy(
                 validation_staging,
                 validation_configuration,
                 validation_wal_enabled,
             )?;
             snapshot_source.verify_unchanged(snapshot_source.retained_memory_bytes())?;
-            snapshot_source.verify_requested_namespace_unchanged()?;
+            snapshot_source
+                .verify_requested_namespace_unchanged(snapshot_source.retained_memory_bytes())?;
 
             disk_budget.validate_managed_directory_path(target)?;
             if path_exists_no_follow(staging)? || path_exists_no_follow(backup)? {
@@ -426,7 +454,17 @@ pub(super) fn restore_storage_from_snapshot_with_disk_budget(
                     staging.display()
                 )));
             }
-            snapshot_source.verify_requested_namespace_unchanged()?;
+            let restore_live_retained_bytes =
+                admit_secure_snapshot_operation_retained_bytes(
+                    &[
+                        restore_source_retained_bytes,
+                        secure_staging.retained_memory_bytes(),
+                    ],
+                    "budgeted secure snapshot restore publication namespace re-attestation",
+                    snapshot_path,
+                )?;
+            snapshot_source
+                .verify_requested_namespace_unchanged(restore_live_retained_bytes)?;
 
             if let Err(validate_err) = disk_budget.validate_managed_directory_path(target) {
                 return Err(TsinkError::Other(format!(
@@ -480,7 +518,8 @@ fn validate_secure_restore_source(
     drop(bytes);
     validate_retained_legacy_registry_catalog(snapshot_source, snapshot_path)?;
     snapshot_source.verify_unchanged(snapshot_source.retained_memory_bytes())?;
-    snapshot_source.verify_requested_namespace_unchanged()?;
+    snapshot_source
+        .verify_requested_namespace_unchanged(snapshot_source.retained_memory_bytes())?;
     Ok(validation_configuration)
 }
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, ReadDir};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,7 @@ use super::super::super::tiering::{
     PersistedSegmentTier, SegmentInventoryEntry, SegmentLaneFamily, SegmentPathResolver,
 };
 use super::super::super::*;
-use super::super::{RetiredPostFlushRoot, StagedSegmentPromotion};
+use super::super::{RemoteCatalogMemoryReservation, RetiredPostFlushRoot, StagedSegmentPromotion};
 
 pub(in crate::engine::storage_engine) const POST_FLUSH_REPLACEMENT_DIR_NAME: &str =
     ".post-flush-replacements";
@@ -23,6 +23,12 @@ const POST_FLUSH_REPLACEMENT_MARKER_PREFIX: &str = "transaction-";
 const POST_FLUSH_REPLACEMENT_MARKER_SUFFIX: &str = ".json";
 const MAX_POST_FLUSH_REPLACEMENT_MARKER_BYTES: u64 = 4 * 1024 * 1024;
 pub(super) const MAX_POST_FLUSH_REPLACEMENT_RECORDS: usize = 16 * 1024;
+const BOUNDED_POST_FLUSH_MARKER_CURSOR_BASE_BYTES: usize = 4 * 1024;
+const BOUNDED_POST_FLUSH_MARKER_PARSE_BASE_BYTES: usize = 16 * 1024;
+const BOUNDED_POST_FLUSH_MARKER_PARSE_PAYLOAD_COPIES: usize = 6;
+const BOUNDED_POST_FLUSH_TRANSITION_RECORD_BYTES: usize = 1024;
+const BOUNDED_POST_FLUSH_TRANSITION_PATH_COPIES: usize = 16;
+const BOUNDED_POST_FLUSH_RECOVERY_OPERATION: &str = "bounded post-flush replacement recovery";
 
 static POST_FLUSH_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -79,6 +85,42 @@ pub(super) struct PostFlushReplacement {
     marker: PostFlushReplacementMarker,
     sources: Vec<ValidatedSourceRecord>,
     outputs: Vec<ValidatedSegmentRecord>,
+}
+
+struct BackgroundPostFlushMarkerScan {
+    marker_dir: PathBuf,
+    entries: ReadDir,
+    observed_entries: usize,
+    _memory_reservation: RemoteCatalogMemoryReservation,
+}
+
+/// Process-local continuation for the finite runtime marker namespace scan.
+///
+/// The retained `ReadDir` ensures that one background wake never has to collect or sort the
+/// complete marker namespace. Startup and foreground lifecycle drains deliberately keep their
+/// complete, strict scan because they are not finite maintenance pages.
+#[derive(Default)]
+pub(in crate::engine::storage_engine) struct BackgroundPostFlushRecoveryCursor {
+    scan: Option<BackgroundPostFlushMarkerScan>,
+}
+
+pub(super) struct BoundedRuntimeReplacement {
+    replacement: PostFlushReplacement,
+    source_states: Vec<OwnedSegmentState>,
+    output_entries: Vec<SegmentInventoryEntry>,
+    source_roots: Vec<PathBuf>,
+    selected_items: usize,
+    selected_bytes: u64,
+    retained_memory_bytes: usize,
+    _marker_memory_reservation: RemoteCatalogMemoryReservation,
+    _segment_memory_reservation: RemoteCatalogMemoryReservation,
+}
+
+pub(super) enum BoundedRuntimeReplacementStep {
+    NoPending,
+    NamespaceEntryConsumed,
+    PreparedRolledBack,
+    Committing(Box<BoundedRuntimeReplacement>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -740,6 +782,158 @@ fn regular_file_read_options() -> fs::OpenOptions {
     options
 }
 
+fn bounded_marker_cursor_reservation_bytes(data_path: &Path) -> usize {
+    BOUNDED_POST_FLUSH_MARKER_CURSOR_BASE_BYTES.saturating_add(
+        replacement_marker_dir(data_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len(),
+    )
+}
+
+fn bounded_marker_parse_reservation_bytes(marker_path: &Path, marker_bytes: u64) -> usize {
+    usize::try_from(marker_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BOUNDED_POST_FLUSH_MARKER_PARSE_PAYLOAD_COPIES)
+        .saturating_add(BOUNDED_POST_FLUSH_MARKER_PARSE_BASE_BYTES)
+        .saturating_add(
+            marker_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+}
+
+impl BackgroundPostFlushRecoveryCursor {
+    pub(super) fn reset(&mut self) {
+        self.scan = None;
+    }
+
+    fn begin_scan(
+        &mut self,
+        data_path: &Path,
+        memory_reservation: RemoteCatalogMemoryReservation,
+    ) -> Result<bool> {
+        debug_assert!(self.scan.is_none());
+        let marker_dir = replacement_marker_dir(data_path);
+        let metadata = match fs::symlink_metadata(&marker_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: marker_dir,
+                    source,
+                })
+            }
+        };
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_dir()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "post-flush replacement marker root is link-like or not a directory: {}",
+                marker_dir.display()
+            )));
+        }
+        // Establish the exact namespace state as durable before a finite cursor starts
+        // interpreting marker phases. A later marker entry is synchronized again before parse.
+        crate::engine::fs_utils::sync_dir(&marker_dir)?;
+        let entries = fs::read_dir(&marker_dir).map_err(|source| TsinkError::IoWithPath {
+            path: marker_dir.clone(),
+            source,
+        })?;
+        self.scan = Some(BackgroundPostFlushMarkerScan {
+            marker_dir,
+            entries,
+            observed_entries: 0,
+            _memory_reservation: memory_reservation,
+        });
+        Ok(true)
+    }
+
+    fn next_marker_path(&mut self) -> Result<BoundedMarkerPathStep> {
+        let scan = self
+            .scan
+            .as_mut()
+            .expect("bounded post-flush marker scan must be initialized");
+        let Some(entry) = scan.entries.next() else {
+            self.scan = None;
+            return Ok(BoundedMarkerPathStep::NoPending);
+        };
+        if scan.observed_entries == crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: BOUNDED_POST_FLUSH_RECOVERY_OPERATION,
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: scan.observed_entries.saturating_add(1),
+            });
+        }
+        scan.observed_entries = scan.observed_entries.checked_add(1).ok_or_else(|| {
+            TsinkError::Other(format!(
+                "post-flush replacement marker namespace entry counter overflow at {}",
+                scan.marker_dir.display()
+            ))
+        })?;
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: scan.marker_dir.clone(),
+            source,
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(BoundedMarkerPathStep::EntryConsumed);
+        };
+        if !is_post_flush_replacement_marker_name(&name) {
+            return Ok(BoundedMarkerPathStep::EntryConsumed);
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?;
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "post-flush replacement marker entry is link-like or not regular: {}",
+                path.display()
+            )));
+        }
+        Ok(BoundedMarkerPathStep::Marker {
+            path,
+            marker_bytes: metadata.len(),
+        })
+    }
+}
+
+enum BoundedMarkerPathStep {
+    NoPending,
+    EntryConsumed,
+    Marker { path: PathBuf, marker_bytes: u64 },
+}
+
+fn validate_finite_recovery_envelope(
+    selected_items: usize,
+    selected_bytes: u64,
+    item_limit: usize,
+    byte_limit: u64,
+) -> Result<()> {
+    if selected_items > item_limit {
+        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: BOUNDED_POST_FLUSH_RECOVERY_OPERATION,
+            item_limit,
+            byte_limit,
+            selected_items,
+            selected_bytes,
+        });
+    }
+    if selected_bytes > byte_limit {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: BOUNDED_POST_FLUSH_RECOVERY_OPERATION,
+            limit: byte_limit,
+            required: selected_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn next_marker_path(data_path: &Path) -> Result<Option<PathBuf>> {
     let marker_dir = replacement_marker_dir(data_path);
     let metadata = match fs::symlink_metadata(&marker_dir) {
@@ -908,6 +1102,160 @@ pub(super) fn publish_prepared_replacement(
 }
 
 impl PostFlushReplacement {
+    fn finite_recovery_item_count(&self) -> Result<usize> {
+        self.sources
+            .len()
+            .checked_add(self.outputs.len())
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "post-flush replacement finite recovery item count overflowed".to_string(),
+                )
+            })
+    }
+
+    fn preflight_bounded_recovery(&self) -> Result<(Vec<OwnedSegmentState>, u64, usize)> {
+        let mut roots = Vec::with_capacity(self.sources.len().saturating_add(self.outputs.len()));
+        let states = match self.marker.phase {
+            PostFlushReplacementPhase::Prepared => {
+                for (index, source) in self.sources.iter().enumerate() {
+                    require_absent(
+                        &source_retirement_path(self, index)?,
+                        "retirement target while marker is Prepared",
+                    )?;
+                    roots.push(source.segment.root.clone());
+                }
+                let states = (0..self.outputs.len())
+                    .map(|index| self.output_state_without_validation(index))
+                    .collect::<Result<Vec<_>>>()?;
+                for (index, state) in states.iter().copied().enumerate() {
+                    match state {
+                        OwnedSegmentState::Live => roots.push(self.outputs[index].root.clone()),
+                        OwnedSegmentState::Retired => {
+                            roots.push(output_rollback_path(self, index)?);
+                        }
+                        OwnedSegmentState::Gone => {}
+                    }
+                }
+                states
+            }
+            PostFlushReplacementPhase::Committing => {
+                for (index, output) in self.outputs.iter().enumerate() {
+                    require_absent(
+                        &output_rollback_path(self, index)?,
+                        "rollback target while marker is Committing",
+                    )?;
+                    roots.push(output.root.clone());
+                }
+                let states = (0..self.sources.len())
+                    .map(|index| self.source_state_without_validation(index))
+                    .collect::<Result<Vec<_>>>()?;
+                if states.contains(&OwnedSegmentState::Live)
+                    && states.contains(&OwnedSegmentState::Gone)
+                {
+                    return Err(TsinkError::DataCorruption(
+                        "post-flush replacement has an unowned missing source while another source remains visible"
+                            .to_string(),
+                    ));
+                }
+                for (index, state) in states.iter().copied().enumerate() {
+                    match state {
+                        OwnedSegmentState::Live => {
+                            roots.push(self.sources[index].segment.root.clone());
+                        }
+                        OwnedSegmentState::Retired => {
+                            roots.push(source_retirement_path(self, index)?);
+                        }
+                        OwnedSegmentState::Gone => {}
+                    }
+                }
+                states
+            }
+        };
+
+        let mut source_bytes = 0u64;
+        // This reservation remains live through catalog-transition construction. In addition to
+        // each segment decoder's conservative runtime preflight, include the marker-root clones,
+        // output/source descriptor vectors, and registry-delta/path handoffs that are built before
+        // the exact transition object exists and can be modeled a second time.
+        let mut reservation_bytes = roots
+            .len()
+            .saturating_mul(BOUNDED_POST_FLUSH_TRANSITION_RECORD_BYTES);
+        for root in roots {
+            let metadata =
+                fs::symlink_metadata(&root).map_err(|source| TsinkError::IoWithPath {
+                    path: root.clone(),
+                    source,
+                })?;
+            if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+                || !metadata.file_type().is_dir()
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "post-flush replacement recovery root is link-like or not a directory: {}",
+                    root.display()
+                )));
+            }
+            let preflight =
+                super::super::super::tiering::preflight_segment_runtime_refresh_memory(&root)?;
+            source_bytes = source_bytes
+                .checked_add(preflight.source_bytes)
+                .ok_or_else(|| {
+                    TsinkError::Other(
+                        "post-flush replacement source byte preflight overflowed".to_string(),
+                    )
+                })?;
+            reservation_bytes = reservation_bytes
+                .saturating_add(preflight.reservation_bytes)
+                .saturating_add(
+                    root.as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        .saturating_mul(BOUNDED_POST_FLUSH_TRANSITION_PATH_COPIES),
+                );
+        }
+        Ok((states, source_bytes, reservation_bytes))
+    }
+
+    fn prepare_bounded_prepared_recovery(
+        &self,
+        expected_states: &[OwnedSegmentState],
+    ) -> Result<Vec<OwnedSegmentState>> {
+        self.validate_prepared_sources()?;
+        let states = (0..self.outputs.len())
+            .map(|index| self.output_state(index))
+            .collect::<Result<Vec<_>>>()?;
+        if states != expected_states {
+            return Err(TsinkError::DataCorruption(
+                "Prepared post-flush replacement paths changed after recovery preflight"
+                    .to_string(),
+            ));
+        }
+        Ok(states)
+    }
+
+    fn prepare_bounded_committing_recovery(
+        &self,
+        expected_states: &[OwnedSegmentState],
+    ) -> Result<(Vec<OwnedSegmentState>, Vec<SegmentInventoryEntry>)> {
+        let states = self.validate_committing_state()?;
+        if states != expected_states {
+            return Err(TsinkError::DataCorruption(
+                "Committing post-flush replacement paths changed after recovery preflight"
+                    .to_string(),
+            ));
+        }
+        let mut output_entries = Vec::with_capacity(self.outputs.len());
+        for output in &self.outputs {
+            let segment = validate_complete_segment(output, &output.root)?;
+            output_entries.push(SegmentInventoryEntry {
+                lane: output.record.lane,
+                tier: output.record.tier,
+                root: output.root.clone(),
+                manifest: segment.manifest,
+            });
+        }
+        Ok((states, output_entries))
+    }
+
     pub(super) fn mark_committing(
         &mut self,
         data_path: &Path,
@@ -952,15 +1300,25 @@ impl PostFlushReplacement {
     fn output_state(&self, index: usize) -> Result<OwnedSegmentState> {
         let output = &self.outputs[index];
         let rollback = output_rollback_path(self, index)?;
-        match (entry_metadata(&output.root)?, entry_metadata(&rollback)?) {
-            (Some(_), None) => {
+        let state = self.output_state_without_validation(index)?;
+        match state {
+            OwnedSegmentState::Live => {
                 validate_complete_segment(output, &output.root)?;
-                Ok(OwnedSegmentState::Live)
             }
-            (None, Some(_)) => {
+            OwnedSegmentState::Retired => {
                 validate_complete_segment(output, &rollback)?;
-                Ok(OwnedSegmentState::Retired)
             }
+            OwnedSegmentState::Gone => {}
+        }
+        Ok(state)
+    }
+
+    fn output_state_without_validation(&self, index: usize) -> Result<OwnedSegmentState> {
+        let output = &self.outputs[index];
+        let rollback = output_rollback_path(self, index)?;
+        match (entry_metadata(&output.root)?, entry_metadata(&rollback)?) {
+            (Some(_), None) => Ok(OwnedSegmentState::Live),
+            (None, Some(_)) => Ok(OwnedSegmentState::Retired),
             (None, None) => Ok(OwnedSegmentState::Gone),
             (Some(_), Some(_)) => Err(TsinkError::DataCorruption(format!(
                 "post-flush Prepared output and rollback target both exist: output={}, rollback={}",
@@ -1041,15 +1399,25 @@ impl PostFlushReplacement {
     fn source_state(&self, index: usize) -> Result<OwnedSegmentState> {
         let source = &self.sources[index].segment;
         let retired = source_retirement_path(self, index)?;
-        match (entry_metadata(&source.root)?, entry_metadata(&retired)?) {
-            (Some(_), None) => {
+        let state = self.source_state_without_validation(index)?;
+        match state {
+            OwnedSegmentState::Live => {
                 validate_complete_segment(source, &source.root)?;
-                Ok(OwnedSegmentState::Live)
             }
-            (None, Some(_)) => {
+            OwnedSegmentState::Retired => {
                 validate_complete_segment(source, &retired)?;
-                Ok(OwnedSegmentState::Retired)
             }
+            OwnedSegmentState::Gone => {}
+        }
+        Ok(state)
+    }
+
+    fn source_state_without_validation(&self, index: usize) -> Result<OwnedSegmentState> {
+        let source = &self.sources[index].segment;
+        let retired = source_retirement_path(self, index)?;
+        match (entry_metadata(&source.root)?, entry_metadata(&retired)?) {
+            (Some(_), None) => Ok(OwnedSegmentState::Live),
+            (None, Some(_)) => Ok(OwnedSegmentState::Retired),
             (None, None) => Ok(OwnedSegmentState::Gone),
             (Some(_), Some(_)) => Err(TsinkError::DataCorruption(format!(
                 "post-flush source and retirement target both exist: source={}, retired={}",
@@ -1308,6 +1676,146 @@ pub(super) fn next_runtime_replacement(
             }
         }
     }
+}
+
+impl BoundedRuntimeReplacement {
+    pub(super) fn replacement(&self) -> &PostFlushReplacement {
+        &self.replacement
+    }
+
+    pub(super) fn output_entries(&self) -> &[SegmentInventoryEntry] {
+        &self.output_entries
+    }
+
+    pub(super) fn source_roots(&self) -> &[PathBuf] {
+        &self.source_roots
+    }
+
+    pub(super) fn selected_items(&self) -> usize {
+        self.selected_items
+    }
+
+    pub(super) fn selected_bytes(&self) -> u64 {
+        self.selected_bytes
+    }
+
+    pub(super) fn retained_memory_bytes(&self) -> usize {
+        self.retained_memory_bytes
+    }
+
+    pub(super) fn finish_committing(
+        &self,
+        local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    ) -> Result<usize> {
+        self.replacement
+            .finish_committing_from_states(local_disk_budget, &self.source_states)
+    }
+}
+
+pub(super) fn next_runtime_replacement_bounded<F>(
+    cursor: &mut BackgroundPostFlushRecoveryCursor,
+    data_path: &Path,
+    resolver: SegmentPathResolver<'_>,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    item_limit: usize,
+    byte_limit: u64,
+    mut reserve_memory: F,
+) -> Result<BoundedRuntimeReplacementStep>
+where
+    F: FnMut(usize) -> Result<RemoteCatalogMemoryReservation>,
+{
+    let outcome = (|| {
+        if cursor.scan.is_none() {
+            let reservation = reserve_memory(bounded_marker_cursor_reservation_bytes(data_path))?;
+            if !cursor.begin_scan(data_path, reservation)? {
+                return Ok(BoundedRuntimeReplacementStep::NoPending);
+            }
+        }
+        let marker = match cursor.next_marker_path()? {
+            BoundedMarkerPathStep::NoPending => {
+                return Ok(BoundedRuntimeReplacementStep::NoPending)
+            }
+            BoundedMarkerPathStep::EntryConsumed => {
+                return Ok(BoundedRuntimeReplacementStep::NamespaceEntryConsumed)
+            }
+            BoundedMarkerPathStep::Marker { path, marker_bytes } => (path, marker_bytes),
+        };
+        let (marker_path, marker_bytes) = marker;
+        if marker_bytes > MAX_POST_FLUSH_REPLACEMENT_MARKER_BYTES {
+            return Err(TsinkError::DataCorruption(format!(
+                "post-flush replacement marker exceeds the {} byte limit: {}",
+                MAX_POST_FLUSH_REPLACEMENT_MARKER_BYTES,
+                marker_path.display()
+            )));
+        }
+        let marker_memory_bytes =
+            bounded_marker_parse_reservation_bytes(&marker_path, marker_bytes);
+        let marker_memory_reservation = reserve_memory(marker_memory_bytes)?;
+        // A prior marker write may have returned after its rename but before parent
+        // synchronization. Establish this exact visible marker as durable before interpreting
+        // its phase.
+        crate::engine::fs_utils::sync_parent_dir(&marker_path)?;
+        let replacement = parse_marker(data_path, resolver, &marker_path)?;
+        let selected_items = replacement.finite_recovery_item_count()?;
+        if selected_items > item_limit {
+            validate_finite_recovery_envelope(
+                selected_items,
+                marker_bytes.max(u64::try_from(marker_memory_bytes).unwrap_or(u64::MAX)),
+                item_limit,
+                byte_limit,
+            )?;
+            unreachable!("finite recovery item validation must reject an oversized marker");
+        }
+        // The marker contains only paths. Inspect fixed file lengths/headers for every source and
+        // output first, then admit their aggregate decode/index capacity before the first full
+        // segment validation or runtime load.
+        let (preflight_states, source_bytes, segment_memory_bytes) =
+            replacement.preflight_bounded_recovery()?;
+        let segment_memory_reservation = reserve_memory(segment_memory_bytes)?;
+        let logical_bytes = marker_bytes.checked_add(source_bytes).ok_or_else(|| {
+            TsinkError::Other(
+                "post-flush replacement finite recovery byte count overflowed".to_string(),
+            )
+        })?;
+        let retained_memory_bytes = bounded_marker_cursor_reservation_bytes(data_path)
+            .saturating_add(marker_memory_bytes)
+            .saturating_add(segment_memory_bytes);
+        let selected_bytes =
+            logical_bytes.max(u64::try_from(retained_memory_bytes).unwrap_or(u64::MAX));
+        validate_finite_recovery_envelope(selected_items, selected_bytes, item_limit, byte_limit)?;
+
+        match replacement.marker.phase {
+            PostFlushReplacementPhase::Prepared => {
+                let states = replacement.prepare_bounded_prepared_recovery(&preflight_states)?;
+                replacement.rollback_prepared_from_states(local_disk_budget, &states)?;
+                drop(segment_memory_reservation);
+                drop(marker_memory_reservation);
+                Ok(BoundedRuntimeReplacementStep::PreparedRolledBack)
+            }
+            PostFlushReplacementPhase::Committing => {
+                let (source_states, output_entries) =
+                    replacement.prepare_bounded_committing_recovery(&preflight_states)?;
+                let source_roots = replacement.source_roots();
+                Ok(BoundedRuntimeReplacementStep::Committing(Box::new(
+                    BoundedRuntimeReplacement {
+                        replacement,
+                        source_states,
+                        output_entries,
+                        source_roots,
+                        selected_items,
+                        selected_bytes,
+                        retained_memory_bytes,
+                        _marker_memory_reservation: marker_memory_reservation,
+                        _segment_memory_reservation: segment_memory_reservation,
+                    },
+                )))
+            }
+        }
+    })();
+    if outcome.is_err() {
+        cursor.reset();
+    }
+    outcome
 }
 
 #[derive(Debug)]
@@ -1703,7 +2211,9 @@ pub(in crate::engine::storage_engine) fn finalize_pending_post_flush_replacement
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
 
+    use parking_lot::Mutex;
     use tempfile::TempDir;
 
     use super::*;
@@ -1781,6 +2291,290 @@ mod tests {
             None,
             usize::MAX,
         )
+    }
+
+    struct TestRecoveryMemory {
+        accounting: Arc<super::super::super::RemoteCatalogMemoryAccounting>,
+        write_transient: super::super::super::WriteTransientMemoryAccounting,
+        admission_lock: Mutex<()>,
+        used_bytes: AtomicU64,
+        tombstone_staged_bytes: AtomicU64,
+        budget_bytes: AtomicU64,
+        rejections_total: AtomicU64,
+    }
+
+    impl TestRecoveryMemory {
+        fn unlimited() -> Self {
+            Self::with_budget(u64::MAX)
+        }
+
+        fn with_budget(budget_bytes: u64) -> Self {
+            Self {
+                accounting: Arc::new(super::super::super::RemoteCatalogMemoryAccounting::default()),
+                write_transient: super::super::super::WriteTransientMemoryAccounting::default(),
+                admission_lock: Mutex::new(()),
+                used_bytes: AtomicU64::new(0),
+                tombstone_staged_bytes: AtomicU64::new(0),
+                budget_bytes: AtomicU64::new(budget_bytes),
+                rejections_total: AtomicU64::new(0),
+            }
+        }
+
+        fn reserve(&self, bytes: usize) -> Result<RemoteCatalogMemoryReservation> {
+            self.accounting.new_reservation(
+                bytes,
+                super::super::super::MemoryReservationAdmissionContext {
+                    reservation_admission_lock: &self.admission_lock,
+                    used_bytes: &self.used_bytes,
+                    tombstone_staged_bytes: &self.tombstone_staged_bytes,
+                    remote_catalog_staging: &self.accounting,
+                    write_transient: &self.write_transient,
+                    budget_bytes: &self.budget_bytes,
+                    memory_rejections_total: &self.rejections_total,
+                },
+            )
+        }
+
+        fn current_bytes(&self) -> usize {
+            self.accounting.current_bytes()
+        }
+    }
+
+    #[test]
+    fn bounded_prepared_marker_recovery_pages_one_marker_per_wake_and_releases_memory() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let numeric_lane = data_path.join("lane_numeric");
+        let first_source = write_test_segment(&numeric_lane, 1);
+        let second_source = write_test_segment(&numeric_lane, 2);
+        let first = publish_prepared_replacement(
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            &[source(&first_source, false)],
+            &[],
+            0,
+            None,
+        )
+        .unwrap();
+        let second = publish_prepared_replacement(
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            &[source(&second_source, false)],
+            &[],
+            0,
+            None,
+        )
+        .unwrap();
+        let memory = TestRecoveryMemory::unlimited();
+        let mut cursor = BackgroundPostFlushRecoveryCursor::default();
+
+        let first_step = next_runtime_replacement_bounded(
+            &mut cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            usize::MAX,
+            u64::MAX,
+            |bytes| memory.reserve(bytes),
+        )
+        .unwrap();
+        assert!(matches!(
+            first_step,
+            BoundedRuntimeReplacementStep::PreparedRolledBack
+        ));
+        assert_eq!(
+            usize::from(first.marker_path.exists()) + usize::from(second.marker_path.exists()),
+            1,
+            "one finite wake must roll back exactly one Prepared marker"
+        );
+        assert_eq!(
+            memory.current_bytes(),
+            bounded_marker_cursor_reservation_bytes(&data_path),
+            "marker payload and aggregate segment decode reservations must release after rollback"
+        );
+
+        let second_step = next_runtime_replacement_bounded(
+            &mut cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            usize::MAX,
+            u64::MAX,
+            |bytes| memory.reserve(bytes),
+        )
+        .unwrap();
+        assert!(matches!(
+            second_step,
+            BoundedRuntimeReplacementStep::PreparedRolledBack
+        ));
+        assert!(!first.marker_path.exists());
+        assert!(!second.marker_path.exists());
+
+        let terminal = next_runtime_replacement_bounded(
+            &mut cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            usize::MAX,
+            u64::MAX,
+            |bytes| memory.reserve(bytes),
+        )
+        .unwrap();
+        assert!(matches!(terminal, BoundedRuntimeReplacementStep::NoPending));
+        assert_eq!(memory.current_bytes(), 0);
+    }
+
+    #[test]
+    fn bounded_committing_marker_requires_exact_multi_root_item_and_byte_envelope() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let numeric_lane = data_path.join("lane_numeric");
+        let first_source = write_test_segment(&numeric_lane, 1);
+        let second_source = write_test_segment(&numeric_lane, 2);
+        let staged_root = write_test_segment(&temp.path().join("staging"), 3);
+        let final_root = numeric_lane
+            .join("segments")
+            .join("L0")
+            .join("seg-0000000000000003");
+        let mut replacement = publish_prepared_replacement(
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            &[source(&first_source, true), source(&second_source, false)],
+            &[promotion(&staged_root, &final_root)],
+            0,
+            None,
+        )
+        .unwrap();
+        crate::engine::fs_utils::rename_and_sync_parents(&staged_root, &final_root).unwrap();
+        replacement
+            .mark_committing(&data_path, numeric_resolver(&numeric_lane), None)
+            .unwrap();
+
+        let marker_bytes = fs::symlink_metadata(&replacement.marker_path)
+            .unwrap()
+            .len();
+        let marker_memory =
+            bounded_marker_parse_reservation_bytes(&replacement.marker_path, marker_bytes);
+        let (_, source_bytes, segment_memory) = replacement.preflight_bounded_recovery().unwrap();
+        let required_items = replacement.finite_recovery_item_count().unwrap();
+        let required_bytes = marker_bytes.checked_add(source_bytes).unwrap().max(
+            u64::try_from(
+                bounded_marker_cursor_reservation_bytes(&data_path)
+                    .saturating_add(marker_memory)
+                    .saturating_add(segment_memory),
+            )
+            .unwrap(),
+        );
+        assert_eq!(required_items, 3);
+
+        let memory = TestRecoveryMemory::unlimited();
+        let mut cursor = BackgroundPostFlushRecoveryCursor::default();
+        let item_error = match next_runtime_replacement_bounded(
+            &mut cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            required_items - 1,
+            required_bytes,
+            |bytes| memory.reserve(bytes),
+        ) {
+            Err(err) => err,
+            Ok(_) => {
+                panic!("N-1 roots must reject before source retirement or visibility mutation")
+            }
+        };
+        assert!(matches!(
+            item_error,
+            TsinkError::MaintenanceDependencyWindowExceeded {
+                item_limit,
+                selected_items,
+                ..
+            } if item_limit == required_items - 1 && selected_items == required_items
+        ));
+        assert!(first_source.exists());
+        assert!(second_source.exists());
+        assert!(replacement.marker_path.exists());
+        assert_eq!(memory.current_bytes(), 0);
+
+        let byte_error = match next_runtime_replacement_bounded(
+            &mut cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            required_items,
+            required_bytes - 1,
+            |bytes| memory.reserve(bytes),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("one byte below the aggregate marker/root peak must reject"),
+        };
+        assert!(matches!(
+            byte_error,
+            TsinkError::MaintenanceWorkItemTooLarge {
+                limit,
+                required,
+                ..
+            } if limit == required_bytes - 1 && required == required_bytes
+        ));
+        assert!(first_source.exists());
+        assert!(second_source.exists());
+        assert!(replacement.marker_path.exists());
+        assert_eq!(memory.current_bytes(), 0);
+
+        let aggregate_memory_bytes = bounded_marker_cursor_reservation_bytes(&data_path)
+            .saturating_add(marker_memory)
+            .saturating_add(segment_memory);
+        let below_global_memory =
+            TestRecoveryMemory::with_budget(u64::try_from(aggregate_memory_bytes - 1).unwrap());
+        let mut below_memory_cursor = BackgroundPostFlushRecoveryCursor::default();
+        let memory_error = match next_runtime_replacement_bounded(
+            &mut below_memory_cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            required_items,
+            required_bytes,
+            |bytes| below_global_memory.reserve(bytes),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("N-1 aggregate decode/transition memory must reject"),
+        };
+        assert!(matches!(
+            memory_error,
+            TsinkError::MemoryBudgetExceeded { budget, required }
+                if budget == aggregate_memory_bytes - 1 && required == aggregate_memory_bytes
+        ));
+        assert_eq!(below_global_memory.current_bytes(), 0);
+        assert!(first_source.exists());
+        assert!(second_source.exists());
+        assert!(replacement.marker_path.exists());
+
+        let exact_global_memory =
+            TestRecoveryMemory::with_budget(u64::try_from(aggregate_memory_bytes).unwrap());
+        let mut exact_cursor = BackgroundPostFlushRecoveryCursor::default();
+        let exact = next_runtime_replacement_bounded(
+            &mut exact_cursor,
+            &data_path,
+            numeric_resolver(&numeric_lane),
+            None,
+            required_items,
+            required_bytes,
+            |bytes| exact_global_memory.reserve(bytes),
+        )
+        .expect("the exact aggregate marker/root envelope must admit");
+        let BoundedRuntimeReplacementStep::Committing(exact) = exact else {
+            panic!("expected a committing replacement");
+        };
+        assert_eq!(exact.selected_items(), required_items);
+        assert_eq!(exact.selected_bytes(), required_bytes);
+        assert_eq!(exact_global_memory.current_bytes(), aggregate_memory_bytes);
+        drop(exact);
+        exact_cursor.reset();
+        assert_eq!(
+            exact_global_memory.current_bytes(),
+            0,
+            "all retained cursor, marker, and segment decode memory must release"
+        );
     }
 
     #[test]

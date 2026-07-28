@@ -826,6 +826,163 @@ fn series_definition_cache_memory_model_tracks_pending_commit_and_reset() {
 }
 
 #[test]
+fn conditional_reset_does_not_publish_a_cache_delta_when_newer_wal_data_exists() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 43,
+        metric: "cache_reset_skipped".to_string(),
+        labels: vec![Label::new("host", "newer")],
+    })
+    .unwrap();
+    let cache_bytes_before = wal.cached_series_definition_index_memory_usage_bytes();
+    assert!(cache_bytes_before > 0);
+
+    let callbacks = AtomicU64::new(0);
+    assert!(!wal
+        .reset_if_current_highwater_at_most(WalHighWatermark::default(), |_| {
+            callbacks.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap());
+    assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        wal.cached_series_definition_index_memory_usage_bytes(),
+        cache_bytes_before
+    );
+}
+
+#[test]
+fn cache_observation_and_reset_delta_are_serialized_by_the_cache_mutex() {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 44,
+        metric: "cache_reset_serialized".to_string(),
+        labels: vec![Label::new("host", "serialized")],
+    })
+    .unwrap();
+    let observed_before = wal.cached_series_definition_index_memory_usage_bytes();
+    assert!(observed_before > 0);
+
+    let accounted = Arc::new(AtomicU64::new(0));
+    let (observation_entered_tx, observation_entered_rx) = mpsc::channel();
+    let (release_observation_tx, release_observation_rx) = mpsc::channel();
+    let observer_wal = Arc::clone(&wal);
+    let observer_accounted = Arc::clone(&accounted);
+    let observer = thread::spawn(move || {
+        observer_wal.with_cached_series_definition_index_memory_usage_bytes(|bytes| {
+            observation_entered_tx.send(()).unwrap();
+            release_observation_rx.recv().unwrap();
+            observer_accounted.store(bytes as u64, Ordering::Release);
+        });
+    });
+    observation_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let reset_wal = Arc::clone(&wal);
+    let reset_accounted = Arc::clone(&accounted);
+    let (reset_started_tx, reset_started_rx) = mpsc::channel();
+    let (reset_finished_tx, reset_finished_rx) = mpsc::channel();
+    let reset = thread::spawn(move || {
+        reset_started_tx.send(()).unwrap();
+        let result = reset_wal.reset_if_current_highwater_at_most(
+            WalHighWatermark {
+                segment: u64::MAX,
+                frame: u64::MAX,
+            },
+            |bytes| reset_accounted.store(bytes as u64, Ordering::Release),
+        );
+        reset_finished_tx.send(result).unwrap();
+    });
+    reset_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        reset_finished_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "reset must wait until the older cache observation publishes its charge"
+    );
+
+    release_observation_tx.send(()).unwrap();
+    observer.join().unwrap();
+    assert!(reset_finished_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap());
+    reset.join().unwrap();
+
+    assert_eq!(
+        accounted.load(Ordering::Acquire) as usize,
+        wal.cached_series_definition_index_memory_usage_bytes(),
+        "the reset delta must win after the serialized older growth observation"
+    );
+}
+
+#[test]
+fn reset_reports_exact_retained_buffer_capacity_during_cache_rebuild() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    let rebuild_entered = Arc::new(Barrier::new(2));
+    let rebuild_release = Arc::new(Barrier::new(2));
+    wal.set_cached_series_definition_rebuild_hook({
+        let rebuild_entered = Arc::clone(&rebuild_entered);
+        let rebuild_release = Arc::clone(&rebuild_release);
+        move || {
+            rebuild_entered.wait();
+            rebuild_release.wait();
+        }
+    });
+
+    let rebuild_wal = Arc::clone(&wal);
+    let rebuild = thread::spawn(move || rebuild_wal.committed_series_definitions_snapshot());
+    rebuild_entered.wait();
+
+    wal.append_series_definition(&SeriesDefinitionFrame {
+        series_id: 45,
+        metric: "buffered_during_rebuild".to_string(),
+        labels: vec![Label::new("host", "buffered")],
+    })
+    .unwrap();
+    assert!(
+        wal.cached_series_definition_index_memory_usage_bytes() > 0,
+        "the in-flight rebuild should retain the appended frame in its buffer"
+    );
+
+    let accounted_after_reset = AtomicU64::new(u64::MAX);
+    assert!(wal
+        .reset_if_current_highwater_at_most(
+            WalHighWatermark {
+                segment: u64::MAX,
+                frame: u64::MAX,
+            },
+            |bytes| accounted_after_reset.store(bytes as u64, Ordering::Release),
+        )
+        .unwrap());
+    let exact_after_reset = wal.cached_series_definition_index_memory_usage_bytes();
+    assert!(
+        exact_after_reset > 0,
+        "clear retains the buffered-frame Vec capacity and must keep charging it"
+    );
+    assert_eq!(
+        accounted_after_reset.load(Ordering::Acquire) as usize,
+        exact_after_reset
+    );
+
+    rebuild_release.wait();
+    assert!(rebuild.join().unwrap().unwrap().is_empty());
+    wal.clear_cached_series_definition_rebuild_hook();
+}
+
+#[test]
 fn cached_series_definition_rebuild_overlays_pending_definitions_before_buffered_samples() {
     let definition = SeriesDefinitionFrame {
         series_id: 17,

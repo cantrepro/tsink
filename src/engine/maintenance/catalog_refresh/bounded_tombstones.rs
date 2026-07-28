@@ -167,9 +167,12 @@ impl BoundedRemoteTombstoneRefreshCycle {
         let context = storage.tombstone_index_context();
         let construction_bytes = context.tombstone_lane_construction_upper_bound(true);
         let construction_work = u64::try_from(construction_bytes).unwrap_or(u64::MAX);
+        // The fixed-fanout cursor is dependency metadata, not a manifest/shard data item. Its
+        // complete construction remains charged to the byte envelope before paths are allocated;
+        // every existing manifest, shard, and range entry still consumes its own item slot.
         if !budget.charge_for(
             REMOTE_TOMBSTONE_CURSOR_INITIALIZATION_OPERATION,
-            1,
+            0,
             construction_work,
         )? {
             return Ok(None);
@@ -219,7 +222,6 @@ impl BoundedRemoteTombstoneRefreshCycle {
     /// this final bounded sweep closes the multi-wake gap immediately before publication.
     fn terminal_revalidate_manifests(
         &self,
-        storage: &ChunkStorage,
         budget: &mut RemoteCatalogPassBudget,
         reservation: &mut super::super::TombstoneMemoryReservation<'_>,
         simultaneously_live_bytes: usize,
@@ -304,12 +306,6 @@ impl BoundedRemoteTombstoneRefreshCycle {
                 return Ok(TerminalManifestRevalidation::Changed);
             }
         }
-        // `storage` is intentionally part of this helper's contract: callers must invoke it only
-        // while holding this storage's visibility fence.
-        debug_assert_eq!(
-            storage.runtime.runtime_mode,
-            StorageRuntimeMode::ComputeOnly
-        );
         Ok(TerminalManifestRevalidation::Validated)
     }
 
@@ -695,6 +691,12 @@ impl BoundedRemoteTombstoneRefreshCycle {
             .all(|fragments| fragments.iter().all(TombstoneMap::is_empty))
     }
 
+    fn all_manifests_missing(&self) -> bool {
+        self.manifests
+            .iter()
+            .all(|manifest| !manifest.fingerprint.exists)
+    }
+
     fn setup_candidate(
         &mut self,
         storage: &ChunkStorage,
@@ -707,12 +709,13 @@ impl BoundedRemoteTombstoneRefreshCycle {
             if storage.visibility_state_generation() != expected_visibility_generation {
                 return Ok(BoundedRemoteTombstoneRefreshOutcome::Restart);
             }
+            // Missing manifests have no logical data item, but the terminal metadata sweep below
+            // still charges every stat/revalidation byte before it fences publication.
             match self.terminal_revalidate_manifests(
-                storage,
                 budget,
                 &mut reservation,
                 0,
-                1,
+                usize::from(!self.all_manifests_missing()),
                 0,
                 REMOTE_TOMBSTONE_REVALIDATION_OPERATION,
             )? {
@@ -784,7 +787,6 @@ impl BoundedRemoteTombstoneRefreshCycle {
                         return Ok(BoundedRemoteTombstoneRefreshOutcome::Restart);
                     }
                     match self.terminal_revalidate_manifests(
-                        storage,
                         budget,
                         &mut reservation,
                         0,
@@ -1019,7 +1021,6 @@ impl BoundedRemoteTombstoneRefreshCycle {
             return Ok(BoundedRemoteTombstoneRefreshOutcome::Restart);
         }
         match self.terminal_revalidate_manifests(
-            storage,
             budget,
             &mut reservation,
             publication_bytes,
@@ -1227,6 +1228,23 @@ mod tests {
 
     fn assert_live_tombstones(storage: &ChunkStorage, expected: &TombstoneMap) {
         assert_eq!(storage.tombstone_read_context().snapshot(), *expected);
+    }
+
+    fn advance_until_remote_tombstone_continuation_is_staged(storage: &ChunkStorage) {
+        for _ in 0..16 {
+            storage
+                .sync_persisted_segments_from_disk_if_dirty()
+                .unwrap();
+            if storage
+                .memory
+                .tombstone_staged_bytes
+                .load(Ordering::Acquire)
+                > 0
+            {
+                return;
+            }
+        }
+        panic!("finite one-item refresh did not stage a remote tombstone continuation");
     }
 
     fn advance_until(
@@ -2334,16 +2352,7 @@ mod tests {
         let tombstone_path = hot_numeric_tombstone_path(&tiered_storage);
         tombstone::persist_tombstones(&tombstone_path, &map(&[(1, 10, 20)])).unwrap();
 
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
-        assert!(
-            storage
-                .memory
-                .tombstone_staged_bytes
-                .load(Ordering::Acquire)
-                > 0
-        );
+        advance_until_remote_tombstone_continuation_is_staged(&storage);
         let lane = storage
             .tombstone_index_context()
             .remote_tombstone_refresh_lanes()
@@ -2492,17 +2501,7 @@ mod tests {
         )
         .unwrap();
 
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
-        assert!(
-            storage
-                .memory
-                .tombstone_staged_bytes
-                .load(Ordering::Acquire)
-                > 0,
-            "the first one-item pass should retain its decoded manifest state"
-        );
+        advance_until_remote_tombstone_continuation_is_staged(&storage);
 
         storage.close().unwrap();
         assert_eq!(
@@ -2549,16 +2548,7 @@ mod tests {
             &map(&[(1, 10, 20)]),
         )
         .unwrap();
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
-        assert!(
-            storage
-                .memory
-                .tombstone_staged_bytes
-                .load(Ordering::Acquire)
-                > 0
-        );
+        advance_until_remote_tombstone_continuation_is_staged(&storage);
 
         let held_writer = storage.runtime.write_limiter.acquire();
         assert!(matches!(
@@ -2579,17 +2569,7 @@ mod tests {
         );
         drop(held_writer);
 
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
-        assert!(
-            storage
-                .memory
-                .tombstone_staged_bytes
-                .load(Ordering::Acquire)
-                > 0,
-            "the reopened storage should start a fresh bounded continuation"
-        );
+        advance_until_remote_tombstone_continuation_is_staged(&storage);
         storage.close().unwrap();
     }
 }

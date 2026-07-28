@@ -223,17 +223,18 @@ pub(in crate::engine::storage_engine) struct WriteCommitWalCompletionContext<'a>
 
 impl WriteCommitWalCompletionContext<'_> {
     pub(in crate::engine::storage_engine) fn sync_wal_series_definition_cache_memory_usage(self) {
-        let bytes = self
-            .wal
-            .map(FramedWal::cached_series_definition_index_memory_usage_bytes)
-            .unwrap_or(0);
-        grow_included_memory_component_to_bytes(
-            self.accounting_enabled,
-            self.wal_series_definition_cache_used_bytes,
-            self.shared_used_bytes,
-            self.used_bytes,
-            bytes,
-        );
+        let Some(wal) = self.wal else {
+            return;
+        };
+        wal.with_cached_series_definition_index_memory_usage_bytes(|bytes| {
+            grow_included_memory_component_to_bytes(
+                self.accounting_enabled,
+                self.wal_series_definition_cache_used_bytes,
+                self.shared_used_bytes,
+                self.used_bytes,
+                bytes,
+            );
+        });
     }
 }
 
@@ -271,10 +272,25 @@ impl LifecyclePublicationContext<'_> {
         self,
         wal: Option<&FramedWal>,
     ) {
-        let bytes = wal
-            .map(FramedWal::cached_series_definition_index_memory_usage_bytes)
-            .unwrap_or(0);
-        grow_included_memory_component_to_bytes(
+        let Some(wal) = wal else {
+            return;
+        };
+        wal.with_cached_series_definition_index_memory_usage_bytes(|bytes| {
+            grow_included_memory_component_to_bytes(
+                self.accounting_enabled,
+                self.wal_series_definition_cache_used_bytes,
+                self.shared_used_bytes,
+                self.used_bytes,
+                bytes,
+            );
+        });
+    }
+
+    pub(in crate::engine::storage_engine) fn reset_wal_series_definition_cache_memory_usage(
+        self,
+        bytes: usize,
+    ) {
+        reset_included_memory_component_bytes(
             self.accounting_enabled,
             self.wal_series_definition_cache_used_bytes,
             self.shared_used_bytes,

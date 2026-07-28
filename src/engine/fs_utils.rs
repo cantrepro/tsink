@@ -9,8 +9,9 @@ use crate::{Result, TsinkError};
 #[path = "fs_utils/secure_snapshot.rs"]
 mod secure_snapshot;
 pub(crate) use secure_snapshot::{
-    admit_secure_snapshot_operation_retained_bytes, SecureSnapshotNamespaceFence,
-    SecureSnapshotSourceFile, SecureSnapshotSourceTree, SecureSnapshotStagingDirectory,
+    admit_secure_snapshot_operation_retained_bytes, attest_secure_snapshot_requested_path_absent,
+    SecureSnapshotNamespaceFence, SecureSnapshotSourceFile, SecureSnapshotSourceTree,
+    SecureSnapshotStagingDirectory,
 };
 
 static STAGE_PATH_COUNTER: AtomicU64 = AtomicU64::new(1);

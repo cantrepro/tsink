@@ -31,7 +31,9 @@ struct FlushPersistSnapshot {
     wal_highwater: WalHighWatermark,
     series: usize,
     chunks: usize,
+    inspected_chunks: usize,
     points: usize,
+    selected_input_bytes: u64,
 }
 
 impl FlushPersistSnapshot {
@@ -46,6 +48,8 @@ struct StagedFlushPublish {
     selected_sealed_locations: Vec<PendingSealedChunkLocation>,
     wal_highwater: WalHighWatermark,
     outcome: PersistSegmentOutcome,
+    inspected_chunks: usize,
+    selected_input_bytes: u64,
 }
 
 struct VerifiedFlushPublish {
@@ -55,6 +59,8 @@ struct VerifiedFlushPublish {
     selected_sealed_locations: Vec<PendingSealedChunkLocation>,
     wal_highwater: WalHighWatermark,
     outcome: PersistSegmentOutcome,
+    inspected_chunks: usize,
+    selected_input_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -259,12 +265,14 @@ impl ChunkStorage {
                     operation: "sealed chunk persistence",
                     item_limit: max_items,
                     byte_limit: max_bytes,
-                    selected_items: snapshot.chunks,
+                    selected_items: inspected_chunks,
                     selected_bytes: selected_input_bytes,
                 });
             }
         }
         snapshot.wal_highwater = max_chunk_wal_highwater;
+        snapshot.inspected_chunks = inspected_chunks;
+        snapshot.selected_input_bytes = selected_input_bytes;
 
         Ok(snapshot)
     }
@@ -366,7 +374,9 @@ impl ChunkStorage {
             wal_highwater,
             series,
             chunks,
+            inspected_chunks,
             points,
+            selected_input_bytes,
         } = flush_snapshot;
 
         if !numeric_chunks.is_empty() && snapshot_ctx.numeric_lane_path.is_none() {
@@ -444,6 +454,8 @@ impl ChunkStorage {
             flushed_watermarks,
             selected_sealed_locations,
             wal_highwater,
+            inspected_chunks,
+            selected_input_bytes,
         }))
     }
 
@@ -475,6 +487,8 @@ impl ChunkStorage {
             selected_sealed_locations: staged.selected_sealed_locations,
             wal_highwater: staged.wal_highwater,
             outcome: staged.outcome,
+            inspected_chunks: staged.inspected_chunks,
+            selected_input_bytes: staged.selected_input_bytes,
         })
     }
 
@@ -499,12 +513,16 @@ impl ChunkStorage {
         {
             super::super::maintenance::ensure_no_pending_post_flush_replacement(data_path)?;
         }
-        if publish_ctx.0.load(Ordering::SeqCst) {
-            if let Err(err) = self.apply_known_dirty_persisted_refresh_if_pending() {
-                tracing::warn!(
-                    error = %err,
-                    "Failed to apply known dirty persisted refresh before flush registry persistence; deferring reconcile"
-                );
+        if publish_ctx.0.load(Ordering::SeqCst) && policy == PersistSnapshotPolicy::All {
+            if let Err(err) = self.drain_known_dirty_persisted_refresh_if_pending() {
+                if let Err(rollback_err) =
+                    self.rollback_published_segment_roots(published_segment_roots)
+                {
+                    return Err(TsinkError::Other(format!(
+                        "known-dirty catalog drain failed before flush publication and rollback failed: drain={err}, rollback={rollback_err}"
+                    )));
+                }
+                return Err(err);
             }
         }
 
@@ -538,7 +556,11 @@ impl ChunkStorage {
     fn plan_flush_dirty_refresh_stage(
         &self,
         publish_ctx: FlushPublishContext<'_>,
+        policy: PersistSnapshotPolicy,
     ) -> Option<PlannedPersistedCatalogRefresh> {
+        if policy != PersistSnapshotPolicy::All {
+            return None;
+        }
         if !publish_ctx.0.load(Ordering::SeqCst) {
             return None;
         }
@@ -560,6 +582,7 @@ impl ChunkStorage {
         publish_ctx: FlushPublishContext<'_>,
         verified: VerifiedFlushPublish,
         planned_dirty_refresh: Option<PlannedPersistedCatalogRefresh>,
+        policy: PersistSnapshotPolicy,
     ) -> Result<(WalHighWatermark, PersistSegmentOutcome)> {
         let VerifiedFlushPublish {
             published_segment_roots,
@@ -568,6 +591,8 @@ impl ChunkStorage {
             selected_sealed_locations,
             wal_highwater,
             outcome,
+            inspected_chunks,
+            selected_input_bytes,
         } = verified;
 
         // Publish the new persisted view as one visibility transition: install segment
@@ -583,12 +608,43 @@ impl ChunkStorage {
             },
             registry_catalog_update: None,
         };
-        #[cfg(test)]
-        let publish_result = self
-            .invoke_flush_pre_visibility_publish_hook()
-            .and_then(|()| publication.publish_transition(flush_transition));
-        #[cfg(not(test))]
-        let publish_result = publication.publish_transition(flush_transition);
+        let publish_result = (|| -> Result<_> {
+            #[cfg(test)]
+            self.invoke_flush_pre_visibility_publish_hook()?;
+            match policy {
+                PersistSnapshotPolicy::All => publication.publish_transition(flush_transition),
+                PersistSnapshotPolicy::BackgroundBounded {
+                    max_items,
+                    max_bytes,
+                } => {
+                    // Chunk selection already spent this wake's source-work allowance. The
+                    // visibility transition is part of that same atomic work item, so reserve
+                    // its exact staging peak and give committed-tombstone recovery only the true
+                    // remainder rather than a fresh (or unlimited) maintenance envelope.
+                    let staging_bytes =
+                        self.modeled_finite_transition_staging_bytes(&flush_transition);
+                    let staging_work = u64::try_from(staging_bytes).unwrap_or(u64::MAX);
+                    let selected_work = selected_input_bytes.max(staging_work);
+                    if selected_work > max_bytes {
+                        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                            operation: "bounded flush catalog publication",
+                            limit: max_bytes,
+                            required: selected_work,
+                        });
+                    }
+                    let transition_reservation =
+                        self.remote_catalog_memory_reservation(staging_bytes)?;
+                    let result = publication.publish_transition_with_finite_recovery_budget(
+                        flush_transition,
+                        max_items.saturating_sub(inspected_chunks),
+                        max_bytes.saturating_sub(selected_work),
+                        true,
+                    );
+                    drop(transition_reservation);
+                    result
+                }
+            }
+        })();
         let catalog_publication_deferred = publish_result
             .as_ref()
             .is_ok_and(|result| result.is_deferred());
@@ -603,15 +659,40 @@ impl ChunkStorage {
                     .any(|root| persisted_index.segments_by_root.contains_key(root))
             };
             let visibility_rollback = if has_visible_published_root {
-                self.remove_persisted_segment_roots(&published_segment_roots)
+                self.remove_persisted_segment_roots_with_observability_delta(
+                    &published_segment_roots,
+                )
             } else {
                 Ok(false)
             };
             drop(publication);
             let disk_rollback = self.rollback_published_segment_roots(&published_segment_roots);
-            let catalog_rollback =
-                self.refresh_segment_catalog_and_observability_from_persisted_state(&[]);
-            let registry_rollback = self.persist_series_registry_index();
+            let (catalog_rollback, registry_rollback) = match policy {
+                PersistSnapshotPolicy::All => (
+                    self.refresh_segment_catalog_and_observability_from_persisted_state(&[]),
+                    self.persist_series_registry_index(),
+                ),
+                PersistSnapshotPolicy::BackgroundBounded { .. } => {
+                    // Do not turn a failed finite flush into an all-roots repair. The exact
+                    // rollback roots are sufficient to replay the catalog and registry removal
+                    // through the ordinary one-root dirty-refresh path. A tiered writer may have
+                    // reached any point in its catalog/registry publication, so retain the
+                    // complete-registry sticky debt across cursor invalidation as well.
+                    self.persisted
+                        .pending_persisted_segment_diff
+                        .lock()
+                        .record_changes(Vec::<PathBuf>::new(), published_segment_roots.clone());
+                    if self.finite_tiered_catalog_publication_enabled() {
+                        self.coordination
+                            .bounded_registry_reconciliation_required
+                            .store(true, Ordering::Release);
+                    }
+                    self.persisted
+                        .persisted_index_dirty
+                        .store(true, Ordering::SeqCst);
+                    (Ok(()), Ok(()))
+                }
+            };
             let mut rollback_errors = Vec::new();
             if let Err(rollback_err) = visibility_rollback {
                 rollback_errors.push(format!("persisted visibility: {rollback_err}"));
@@ -703,7 +784,10 @@ impl ChunkStorage {
         // Only reset the WAL while holding the WAL writer lock and only if no newer
         // committed write has appeared since the flush snapshot was taken. This keeps
         // background and memory-pressure persists off the global writer permit hot path.
-        let reset = match wal.reset_if_current_highwater_at_most(wal_highwater) {
+        let publication = self.lifecycle_publication_context();
+        let reset = match wal.reset_if_current_highwater_at_most(wal_highwater, |bytes| {
+            publication.reset_wal_series_definition_cache_memory_usage(bytes);
+        }) {
             Ok(reset) => reset,
             Err(err) => {
                 self.observability
@@ -734,6 +818,13 @@ impl ChunkStorage {
         // directory-scanning compaction cannot consume and remove a staged root before verify
         // and catalog publication finish.
         let _compaction_guard = self.compaction_gate();
+        if policy != PersistSnapshotPolicy::All && publish_ctx.0.load(Ordering::SeqCst) {
+            // Persisted-catalog reconciliation owns a separate bounded wake. Starting a flush
+            // while that work is pending would either spend two complete envelopes or strand a
+            // preplanned delta behind the flush transition. Leave sealed/WAL state untouched and
+            // let the persisted-refresh worker establish the current catalog first.
+            return Ok(None);
+        }
         let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx, policy)? else {
             return Ok(None);
         };
@@ -750,11 +841,12 @@ impl ChunkStorage {
             policy,
         )?;
 
-        let planned_dirty_refresh = self.plan_flush_dirty_refresh_stage(publish_ctx);
+        let planned_dirty_refresh = self.plan_flush_dirty_refresh_stage(publish_ctx, policy);
         let published = self.publish_verified_flush_visibility_stage(
             publish_ctx,
             verified_flush,
             planned_dirty_refresh,
+            policy,
         )?;
         // Durability is monotonic and cannot be rolled back. Advance it only after the segment
         // roots and catalog visibility have committed successfully; a failed publication rolls
@@ -881,9 +973,6 @@ impl ChunkStorage {
                         .flush
                         .persist_noop_total
                         .fetch_add(1, Ordering::Relaxed);
-                }
-                if self.memory.accounting_enabled && outcome.persisted {
-                    self.refresh_memory_usage();
                 }
                 Ok(outcome)
             }

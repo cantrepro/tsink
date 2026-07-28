@@ -215,8 +215,13 @@ impl StorageStateAssembly {
         CoordinationState {
             post_flush_maintenance_pending: AtomicBool::new(false),
             startup_metadata_reconcile_pending: AtomicBool::new(false),
+            prefer_metadata_reconcile_on_maintenance_tie: AtomicBool::new(false),
+            bounded_registry_reconciliation_required: AtomicBool::new(false),
             background_retention_maintenance_cursor: Mutex::new(
                 BackgroundRetentionMaintenanceCursor::default(),
+            ),
+            background_post_flush_recovery_cursor: Mutex::new(
+                BackgroundPostFlushRecoveryCursor::default(),
             ),
             background_metadata_reconciliation_cursor: Mutex::new(
                 BackgroundMetadataReconciliationCursor::default(),

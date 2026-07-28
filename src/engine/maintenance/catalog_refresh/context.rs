@@ -25,6 +25,7 @@ pub(super) struct CatalogRefreshContext<'a> {
     persisted_index: &'a RwLock<PersistedIndexState>,
     persisted_index_dirty: &'a AtomicBool,
     pending_persisted_segment_diff: &'a Mutex<PendingPersistedSegmentDiff>,
+    bounded_registry_reconciliation_required: &'a AtomicBool,
     numeric_lane_path: Option<&'a Path>,
     blob_lane_path: Option<&'a Path>,
     tiered_storage: Option<&'a super::super::config::TieredStorageConfig>,
@@ -87,8 +88,13 @@ impl<'a> CatalogRefreshContext<'a> {
 
     pub(super) fn synchronize_persisted_index_dirty_with_pending(self) {
         let pending = self.pending_persisted_segment_diff.lock();
-        self.persisted_index_dirty
-            .store(!pending.is_empty(), Ordering::SeqCst);
+        let registry_reconciliation_required = self
+            .bounded_registry_reconciliation_required
+            .load(Ordering::Acquire);
+        self.persisted_index_dirty.store(
+            !pending.is_empty() || registry_reconciliation_required,
+            Ordering::SeqCst,
+        );
     }
 
     pub(super) fn runtime_refresh_segment_inventory(self) -> Result<SegmentInventory> {
@@ -319,6 +325,9 @@ impl ChunkStorage {
             persisted_index: &self.persisted.persisted_index,
             persisted_index_dirty: self.persisted.persisted_index_dirty.as_ref(),
             pending_persisted_segment_diff: &self.persisted.pending_persisted_segment_diff,
+            bounded_registry_reconciliation_required: &self
+                .coordination
+                .bounded_registry_reconciliation_required,
             numeric_lane_path: self.persisted.numeric_lane_path.as_deref(),
             blob_lane_path: self.persisted.blob_lane_path.as_deref(),
             tiered_storage: self.persisted.tiered_storage.as_ref(),

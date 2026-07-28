@@ -330,7 +330,11 @@ impl FramedWal {
         Ok(self.segment_count.load(Ordering::Acquire))
     }
 
-    fn reset_locked(&self, mut writer: MutexGuard<'_, BufWriter<File>>) -> Result<()> {
+    fn reset_locked(
+        &self,
+        mut writer: MutexGuard<'_, BufWriter<File>>,
+        observe_reset_cache: impl FnOnce(usize),
+    ) -> Result<()> {
         let mut disk_reservation = self
             .local_disk_budget
             .as_ref()
@@ -380,7 +384,11 @@ impl FramedWal {
         })();
 
         if reset_result.is_ok() {
-            self.clear_cached_series_definition_index_if_initialized();
+            // Publish the exact post-clear cache charge while the cache mutex is still held.
+            // Growth observations use the same mutex, so an older observation cannot re-add a
+            // stale charge after this reset releases it. Do this before settlement/reconciliation:
+            // those later stages can fail after the cache was already cleared.
+            self.clear_cached_series_definition_index_if_initialized(observe_reset_cache);
             self.mark_published_through(reset_highwater);
             self.mark_durable_through(reset_highwater);
             *self.last_sync.lock() = Instant::now();
@@ -439,19 +447,20 @@ impl FramedWal {
     }
 
     pub fn reset(&self) -> Result<()> {
-        self.reset_locked(self.writer.lock())
+        self.reset_locked(self.writer.lock(), |_| {})
     }
 
     pub(crate) fn reset_if_current_highwater_at_most(
         &self,
         max_highwater: WalHighWatermark,
+        observe_reset_cache: impl FnOnce(usize),
     ) -> Result<bool> {
         let writer = self.writer.lock();
         if *self.last_appended_highwater.lock() > max_highwater {
             return Ok(false);
         }
 
-        self.reset_locked(writer)?;
+        self.reset_locked(writer, observe_reset_cache)?;
         Ok(true)
     }
 

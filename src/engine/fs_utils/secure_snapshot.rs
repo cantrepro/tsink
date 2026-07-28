@@ -21,7 +21,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
 pub(crate) const MAX_SECURE_SNAPSHOT_SESSION_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_SECURE_SNAPSHOT_OPERATION_RETAINED_BYTES: usize =
@@ -86,7 +86,9 @@ pub(crate) struct SecureSnapshotStagingDirectory {
 /// The pre-move closed-identity manifest for an original restore target now visible as a backup.
 ///
 /// Cleanup consumes this token and removes only entries that still match the manifest captured
-/// before the target-to-backup move.
+/// before the target-to-backup move. Windows dispositions the verified DELETE handles. Portable
+/// Unix cleanup is not an identity-atomic unlink and therefore also requires restore's documented
+/// caller-enforced exclusion of every other actor from the containing namespace.
 #[derive(Debug)]
 pub(crate) struct SecureSnapshotPublishedBackup {
     parent: SecureDirectoryAnchor,
@@ -106,6 +108,9 @@ pub(crate) struct SecureSnapshotPublicationError {
     pub(crate) error: TsinkError,
     /// True once the staging directory has become visible at the requested target.
     pub(crate) published: bool,
+    /// An unpublished staging tree that passed exact verification and is eligible for
+    /// platform-safe cleanup. Platforms without identity-conditioned deletion retain it.
+    verified_staging_cleanup: Option<Box<SecureSnapshotStagingDirectory>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +273,62 @@ struct SecureOpenedFile {
     component_locks: Vec<File>,
 }
 
+#[cfg(test)]
+type AbsentSourceBetweenParentProbesHook = dyn Fn(&Path) + Send + Sync + 'static;
+
+#[cfg(test)]
+fn absent_source_between_parent_probes_hook_slot(
+) -> &'static std::sync::Mutex<Option<std::sync::Arc<AbsentSourceBetweenParentProbesHook>>> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<AbsentSourceBetweenParentProbesHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn absent_source_between_parent_probes_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+struct AbsentSourceBetweenParentProbesHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for AbsentSourceBetweenParentProbesHookGuard {
+    fn drop(&mut self) {
+        *absent_source_between_parent_probes_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_absent_source_between_parent_probes_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> AbsentSourceBetweenParentProbesHookGuard {
+    let lock = absent_source_between_parent_probes_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *absent_source_between_parent_probes_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(std::sync::Arc::new(hook));
+    AbsentSourceBetweenParentProbesHookGuard { _lock: lock }
+}
+
+#[cfg(test)]
+fn invoke_absent_source_between_parent_probes_hook(path: &Path) {
+    let hook = absent_source_between_parent_probes_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
 #[cfg(all(test, unix))]
 type AnchorResolutionHook = dyn Fn(&Path) + Send + Sync + 'static;
 
@@ -361,6 +422,112 @@ fn install_publication_after_rename_hook(
 #[cfg(all(test, unix))]
 fn invoke_publication_after_rename_hook(path: &Path) {
     let hook = publication_after_rename_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(test, windows))]
+type WindowsPublicationBeforeRenameHook = dyn Fn(&Path, &Path) + Send + Sync + 'static;
+
+#[cfg(all(test, windows))]
+fn windows_publication_before_rename_hook_slot(
+) -> &'static std::sync::Mutex<Option<std::sync::Arc<WindowsPublicationBeforeRenameHook>>> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<WindowsPublicationBeforeRenameHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(all(test, windows))]
+fn windows_snapshot_hook_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(all(test, windows))]
+struct WindowsPublicationBeforeRenameHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for WindowsPublicationBeforeRenameHookGuard {
+    fn drop(&mut self) {
+        *windows_publication_before_rename_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(all(test, windows))]
+fn install_windows_publication_before_rename_hook(
+    hook: impl Fn(&Path, &Path) + Send + Sync + 'static,
+) -> WindowsPublicationBeforeRenameHookGuard {
+    let lock = windows_snapshot_hook_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *windows_publication_before_rename_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(std::sync::Arc::new(hook));
+    WindowsPublicationBeforeRenameHookGuard { _lock: lock }
+}
+
+#[cfg(all(test, windows))]
+fn invoke_windows_publication_before_rename_hook(source: &Path, target: &Path) {
+    let hook = windows_publication_before_rename_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(source, target);
+    }
+}
+
+#[cfg(all(test, windows))]
+type WindowsCleanupBeforeDispositionHook = dyn Fn(&Path) + Send + Sync + 'static;
+
+#[cfg(all(test, windows))]
+fn windows_cleanup_before_disposition_hook_slot(
+) -> &'static std::sync::Mutex<Option<std::sync::Arc<WindowsCleanupBeforeDispositionHook>>> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<WindowsCleanupBeforeDispositionHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(all(test, windows))]
+struct WindowsCleanupBeforeDispositionHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for WindowsCleanupBeforeDispositionHookGuard {
+    fn drop(&mut self) {
+        *windows_cleanup_before_disposition_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(all(test, windows))]
+fn install_windows_cleanup_before_disposition_hook(
+    hook: impl Fn(&Path) + Send + Sync + 'static,
+) -> WindowsCleanupBeforeDispositionHookGuard {
+    let lock = windows_snapshot_hook_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *windows_cleanup_before_disposition_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(std::sync::Arc::new(hook));
+    WindowsCleanupBeforeDispositionHookGuard { _lock: lock }
+}
+
+#[cfg(all(test, windows))]
+fn invoke_windows_cleanup_before_disposition_hook(path: &Path) {
+    let hook = windows_cleanup_before_disposition_hook_slot()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
@@ -668,10 +835,14 @@ impl SecureSnapshotSourceTree {
         Ok(())
     }
 
-    pub(crate) fn verify_requested_namespace_unchanged(&self) -> Result<()> {
-        let requested = open_existing_directory_chain_nofollow(
+    pub(crate) fn verify_requested_namespace_unchanged(
+        &self,
+        operation_live_retained_bytes: usize,
+    ) -> Result<()> {
+        let requested = open_existing_directory_chain_nofollow_with_operation_baseline(
             &self.root.display_path,
             "snapshot source requested-path re-attestation",
+            operation_live_retained_bytes,
         )?;
         let requested_identity = identity_from_file(&requested.root, &self.root.display_path)?;
         let retained_identity = identity_from_file(&self.root.root, &self.root.display_path)?;
@@ -805,6 +976,51 @@ impl SecureSnapshotSourceFile {
     }
 
     pub(crate) fn verify_unchanged(&self) -> Result<()> {
+        self.attest_current_identity()
+    }
+
+    pub(crate) fn verify_requested_namespace_unchanged(
+        &self,
+        operation_live_retained_bytes: usize,
+    ) -> Result<()> {
+        let parent_path = self.display_path.parent().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(format!(
+                "snapshot source file has no parent directory: {}",
+                self.display_path.display()
+            ))
+        })?;
+        let requested_parent = open_existing_directory_chain_nofollow_with_operation_baseline(
+            parent_path,
+            "snapshot standalone-file requested-parent re-attestation",
+            operation_live_retained_bytes,
+        )?;
+        let requested_parent_identity = identity_from_file(&requested_parent.root, parent_path)?;
+        let retained_parent_identity =
+            identity_from_file(&self.parent.root, &self.parent.display_path)?;
+        if !requested_parent_identity.stable_eq(self.parent_identity)
+            || !retained_parent_identity.stable_eq(self.parent_identity)
+        {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot source file requested parent changed after secure open: {}",
+                parent_path.display()
+            )));
+        }
+
+        let relative = Path::new(&self.file_name);
+        let requested_probe =
+            open_relative_entry_probe(&requested_parent, relative, &requested_parent_identity)?;
+        let metadata = probe_metadata(&requested_probe, &self.display_path)?;
+        let requested_identity = identity_from_file(&requested_probe.file, &self.display_path)?;
+        if is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+            || metadata.len() != self.len
+            || requested_identity != self.identity
+        {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot source file requested path changed after secure open: {}",
+                self.display_path.display()
+            )));
+        }
         self.attest_current_identity()
     }
 
@@ -946,10 +1162,11 @@ impl SecureSnapshotNamespaceFence {
         self.retained_memory_bytes
     }
 
-    pub(crate) fn attest(&self) -> Result<()> {
-        let requested = open_existing_directory_chain_nofollow(
+    pub(crate) fn attest(&self, operation_live_retained_bytes: usize) -> Result<()> {
+        let requested = open_existing_directory_chain_nofollow_with_operation_baseline(
             &self.anchor.display_path,
             "snapshot aggregate namespace re-attestation",
+            operation_live_retained_bytes,
         )?;
         let requested_identity = identity_from_file(&requested.root, &self.anchor.display_path)?;
         let anchored_identity = identity_from_file(&self.anchor.root, &self.anchor.display_path)?;
@@ -960,6 +1177,121 @@ impl SecureSnapshotNamespaceFence {
             )));
         }
         Ok(())
+    }
+
+    /// Accepts a caller-owned mutation of the aggregate directory while retaining its original
+    /// directory object. Callers must validate every requested source immediately before and
+    /// after this operation; this method deliberately authorizes only the aggregate directory's
+    /// mutable metadata, never a replacement at its requested path.
+    pub(crate) fn rebaseline_same_stable_identity(
+        &mut self,
+        operation_live_retained_bytes: usize,
+    ) -> Result<()> {
+        let requested = open_existing_directory_chain_nofollow_with_operation_baseline(
+            &self.anchor.display_path,
+            "snapshot aggregate namespace rebaseline",
+            operation_live_retained_bytes,
+        )?;
+        let requested_identity = identity_from_file(&requested.root, &self.anchor.display_path)?;
+        let anchored_identity = identity_from_file(&self.anchor.root, &self.anchor.display_path)?;
+        if !requested_identity.stable_eq(self.identity)
+            || !anchored_identity.stable_eq(self.identity)
+            || requested_identity != anchored_identity
+        {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "snapshot aggregate source namespace changed while rebaselining: {}",
+                self.anchor.display_path.display()
+            )));
+        }
+        self.identity = anchored_identity;
+        self.attest(operation_live_retained_bytes)
+    }
+}
+
+/// Re-probes an optional source that was absent during initial measurement.
+///
+/// Both parent opens are no-follow and must resolve to the same stable directory object. The
+/// second absence probe closes a parent-path replacement race around the first probe.
+pub(crate) fn attest_secure_snapshot_requested_path_absent(
+    path: &Path,
+    operation_live_retained_bytes: usize,
+) -> Result<()> {
+    let parent_path = path.parent().ok_or_else(|| {
+        TsinkError::InvalidConfiguration(format!(
+            "snapshot optional source has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        TsinkError::InvalidConfiguration(format!(
+            "snapshot optional source has no final component: {}",
+            path.display()
+        ))
+    })?;
+    validate_single_component(file_name, path)?;
+
+    let open_parent = || match open_existing_directory_chain_nofollow_with_operation_baseline(
+        parent_path,
+        "snapshot absent-source requested-parent re-attestation",
+        operation_live_retained_bytes,
+    ) {
+        Ok(parent) => Ok(Some(parent)),
+        Err(TsinkError::IoWithPath { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    };
+    let attest_child_absent =
+        |parent: &SecureDirectoryAnchor, parent_identity: &ClosedSnapshotIdentity| {
+            match probe_relative_entry_kind_nofollow(parent, Path::new(file_name), parent_identity)
+            {
+                Err(TsinkError::IoWithPath { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
+                Err(err) => Err(err),
+                Ok(_) => Err(TsinkError::InvalidConfiguration(format!(
+                    "snapshot optional source appeared after initial absence: {}",
+                    path.display()
+                ))),
+            }
+        };
+
+    let first_parent_identity = match open_parent()? {
+        Some(first_parent) => {
+            let identity = identity_from_file(&first_parent.root, parent_path)?;
+            attest_child_absent(&first_parent, &identity)?;
+            Some(identity)
+        }
+        None => None,
+    };
+    #[cfg(test)]
+    invoke_absent_source_between_parent_probes_hook(path);
+
+    let second_parent = open_parent()?;
+    match (first_parent_identity, second_parent) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot optional source requested parent appeared during absence re-attestation: {}",
+            parent_path.display()
+        ))),
+        (Some(_), None) => Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot optional source requested parent disappeared during absence re-attestation: {}",
+            parent_path.display()
+        ))),
+        (Some(first_identity), Some(second_parent)) => {
+            let second_identity = identity_from_file(&second_parent.root, parent_path)?;
+            if !first_identity.stable_eq(second_identity) {
+                return Err(TsinkError::InvalidConfiguration(format!(
+                    "snapshot optional source requested parent changed during absence re-attestation: {}",
+                    parent_path.display()
+                )));
+            }
+            attest_child_absent(&second_parent, &second_identity)
+        }
     }
 }
 
@@ -998,6 +1330,18 @@ impl SecureSnapshotPublishedBackup {
                 self.backup_path.display()
             )));
         }
+        drop(entries);
+        let cleanup_scratch_bytes = modeled_exact_cleanup_scratch_bytes(
+            &self.backup_path,
+            &self.backup_name,
+            self.entries.iter().map(|entry| entry.relative.as_path()),
+        )?;
+        admit_operation_retained_bytes(
+            verification_baseline,
+            cleanup_scratch_bytes,
+            "secure restore exact cleanup scratch",
+            &self.backup_path,
+        )?;
         remove_published_backup_exact(self)
     }
 
@@ -1278,6 +1622,31 @@ impl SecureSnapshotStagingDirectory {
         sync_file_as_directory(&self.root.root, &self.display_path)
     }
 
+    /// Attempts to remove only the create-exclusive entries retained in this staging session.
+    ///
+    /// Exact verification and cleanup scratch admission happen before mutation. Windows then
+    /// removes each identity through the same DELETE-capable handle used for its final
+    /// attestation. Portable Unix has no identity-conditioned unlink primitive, so it retains the
+    /// verified tree instead of claiming pathname re-attestation closes the unlink race.
+    pub(crate) fn remove_exact_created_tree(self) -> Result<()> {
+        self.verify_exact_created_tree()?;
+        let cleanup_scratch_bytes = modeled_exact_cleanup_scratch_bytes(
+            &self.display_path,
+            &self.root_name,
+            self.created
+                .iter()
+                .skip(1)
+                .map(|entry| entry.relative.as_path()),
+        )?;
+        admit_operation_retained_bytes(
+            self.operation_live_retained_bytes()?,
+            cleanup_scratch_bytes,
+            "secure snapshot exact cleanup scratch",
+            &self.display_path,
+        )?;
+        remove_created_staging_exact(self)
+    }
+
     /// Removes a validation copy after a real storage open has been allowed to rewrite known
     /// files.
     ///
@@ -1357,46 +1726,53 @@ impl SecureSnapshotStagingDirectory {
         self,
         target: &Path,
     ) -> std::result::Result<(), SecureSnapshotPublicationError> {
-        self.verify_exact_created_tree()
-            .map_err(SecureSnapshotPublicationError::before_publication)?;
-        let target_parent = target.parent().ok_or_else(|| {
-            SecureSnapshotPublicationError::before_publication(TsinkError::InvalidConfiguration(
-                format!(
+        if let Err(error) = self.verify_exact_created_tree() {
+            // Verification failure deliberately leaves the create-exclusive tree untouched.
+            return Err(SecureSnapshotPublicationError::before_publication(error));
+        }
+        let preflight = (|| -> Result<OsString> {
+            let target_parent = target.parent().ok_or_else(|| {
+                TsinkError::InvalidConfiguration(format!(
                     "snapshot publication target has no parent: {}",
                     target.display()
-                ),
-            ))
-        })?;
-        let target_parent_anchor =
-            open_existing_directory_chain_nofollow(target_parent, "snapshot publication parent")
-                .map_err(SecureSnapshotPublicationError::before_publication)?;
-        let retained_parent_identity =
-            identity_from_file(&self.parent.root, &self.parent.display_path)
-                .map_err(SecureSnapshotPublicationError::before_publication)?;
-        let requested_parent_identity =
-            identity_from_file(&target_parent_anchor.root, target_parent)
-                .map_err(SecureSnapshotPublicationError::before_publication)?;
-        if !retained_parent_identity.stable_eq(requested_parent_identity) {
-            return Err(SecureSnapshotPublicationError::before_publication(
-                TsinkError::InvalidConfiguration(format!(
+                ))
+            })?;
+            let target_parent_anchor = open_existing_directory_chain_nofollow(
+                target_parent,
+                "snapshot publication parent",
+            )?;
+            let retained_parent_identity =
+                identity_from_file(&self.parent.root, &self.parent.display_path)?;
+            let requested_parent_identity =
+                identity_from_file(&target_parent_anchor.root, target_parent)?;
+            if !retained_parent_identity.stable_eq(requested_parent_identity) {
+                return Err(TsinkError::InvalidConfiguration(format!(
                     "secure snapshot publication target parent {} is not the retained parent {}",
                     target_parent.display(),
                     self.parent.display_path.display()
-                )),
-            ));
-        }
-        let target_name = target.file_name().ok_or_else(|| {
-            SecureSnapshotPublicationError::before_publication(TsinkError::InvalidConfiguration(
-                format!(
+                )));
+            }
+            let target_name = target.file_name().ok_or_else(|| {
+                TsinkError::InvalidConfiguration(format!(
                     "snapshot publication target has no final component: {}",
                     target.display()
-                ),
-            ))
-        })?;
-        validate_single_component(target_name, target)
-            .map_err(SecureSnapshotPublicationError::before_publication)?;
-        let anchored_target = self.parent.display_path.join(target_name);
-        publish_staging_noreplace(self, target, &anchored_target, target_name)
+                ))
+            })?;
+            validate_single_component(target_name, target)?;
+            Ok(target_name.to_os_string())
+        })();
+        let target_name = match preflight {
+            Ok(target_name) => target_name,
+            Err(error) => {
+                return Err(
+                    SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                        error, self,
+                    ),
+                );
+            }
+        };
+        let anchored_target = self.parent.display_path.join(&target_name);
+        publish_staging_noreplace(self, target, &anchored_target, &target_name)
     }
 
     /// Replaces one existing sibling by first moving it to an absent backup sibling.
@@ -1593,7 +1969,9 @@ impl SecureSnapshotStagingDirectory {
         identity: ClosedSnapshotIdentity,
     ) -> Result<()> {
         // The directory/file creation primitive is create-exclusive, so a duplicate relative path
-        // fails before this point without an O(n) manifest scan.
+        // fails before this point without an O(n) manifest scan. Every creation first resolves its
+        // parent through `created_parent_identity`, so append order is a parent-before-descendant
+        // topological order on every platform; exact cleanup may safely traverse it in reverse.
         validate_retained_relative_path(relative)?;
         let retained_path = relative.to_path_buf();
         let path_capacity = retained_path.capacity();
@@ -1747,6 +2125,18 @@ impl SecureSnapshotPublicationError {
         Self {
             error,
             published: false,
+            verified_staging_cleanup: None,
+        }
+    }
+
+    fn before_publication_with_verified_staging(
+        error: TsinkError,
+        staging: SecureSnapshotStagingDirectory,
+    ) -> Self {
+        Self {
+            error,
+            published: false,
+            verified_staging_cleanup: Some(Box::new(staging)),
         }
     }
 
@@ -1754,7 +2144,16 @@ impl SecureSnapshotPublicationError {
         Self {
             error,
             published: true,
+            verified_staging_cleanup: None,
         }
+    }
+
+    pub(crate) fn into_error_and_verified_cleanup(mut self) -> (TsinkError, Option<Result<()>>) {
+        let cleanup = self
+            .verified_staging_cleanup
+            .take()
+            .map(|staging| (*staging).remove_exact_created_tree());
+        (self.error, cleanup)
     }
 }
 
@@ -1866,6 +2265,30 @@ fn anchor_dynamic_retained_bytes(anchor: &SecureDirectoryAnchor) -> Result<usize
     Ok(bytes)
 }
 
+fn temporary_anchor_retained_bytes(anchor: &SecureDirectoryAnchor) -> Result<usize> {
+    checked_add_memory(
+        std::mem::size_of::<SecureDirectoryAnchor>(),
+        anchor_dynamic_retained_bytes(anchor)?,
+        "secure snapshot temporary namespace anchor",
+    )
+}
+
+fn open_existing_directory_chain_nofollow_with_operation_baseline(
+    path: &Path,
+    operation: &str,
+    operation_live_retained_bytes: usize,
+) -> Result<SecureDirectoryAnchor> {
+    let anchor = open_existing_directory_chain_nofollow(path, operation)?;
+    let transient_bytes = temporary_anchor_retained_bytes(&anchor)?;
+    admit_operation_retained_bytes(
+        operation_live_retained_bytes,
+        transient_bytes,
+        operation,
+        path,
+    )?;
+    Ok(anchor)
+}
+
 fn source_tree_retained_bytes(
     root: &SecureDirectoryAnchor,
     manifest_bytes: usize,
@@ -1928,6 +2351,76 @@ fn staging_retained_bytes(
         "secure snapshot staging session",
     )?;
     checked_add_memory(bytes, manifest_bytes, "secure snapshot staging session")
+}
+
+fn modeled_exact_cleanup_scratch_bytes<'a>(
+    root_display: &Path,
+    root_name: &OsStr,
+    relatives: impl Iterator<Item = &'a Path>,
+) -> Result<usize> {
+    let operation = "secure snapshot exact cleanup scratch";
+    let root_bytes = root_display.as_os_str().as_encoded_bytes().len();
+    let root_component_bytes = root_name
+        .as_encoded_bytes()
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| TsinkError::Other(format!("{operation} accounting overflow")))?;
+    // Root attestation and error construction can retain the anchored display, its diagnostic
+    // clone, and parent-resolution buffers even when the staging tree has no descendants.
+    let mut maximum = root_bytes
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(root_component_bytes))
+        .ok_or_else(|| TsinkError::Other(format!("{operation} root accounting overflow")))?;
+
+    for relative in relatives {
+        let relative_bytes = relative.as_os_str().as_encoded_bytes().len();
+        let separator_bytes = usize::from(root_bytes != 0 && relative_bytes != 0);
+        let display_bytes = root_bytes
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(relative_bytes))
+            .ok_or_else(|| TsinkError::Other(format!("{operation} accounting overflow")))?;
+
+        // Parent traversal and error-safe display reporting can retain several path buffers at
+        // once. Four complete encoded paths deliberately over-model those sequential buffers
+        // without allocating another per-entry plan.
+        let mut scratch = display_bytes
+            .checked_mul(4)
+            .ok_or_else(|| TsinkError::Other(format!("{operation} path accounting overflow")))?;
+
+        #[cfg(unix)]
+        {
+            let component_bytes = relative
+                .file_name()
+                .map_or(0, |name| name.as_bytes().len())
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TsinkError::Other(format!("{operation} component accounting overflow"))
+                })?;
+            scratch = checked_add_memory(scratch, component_bytes, operation)?;
+        }
+
+        #[cfg(windows)]
+        {
+            let parent_depth = relative.components().count().saturating_sub(1);
+            let lock_capacity = if parent_depth == 0 {
+                0
+            } else {
+                parent_depth.checked_next_power_of_two().ok_or_else(|| {
+                    TsinkError::Other(format!("{operation} lock accounting overflow"))
+                })?
+            };
+            let lock_bytes = lock_capacity
+                .checked_mul(std::mem::size_of::<File>())
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(|| {
+                    TsinkError::Other(format!("{operation} lock accounting overflow"))
+                })?;
+            scratch = checked_add_memory(scratch, lock_bytes, operation)?;
+        }
+
+        maximum = maximum.max(scratch);
+    }
+    Ok(maximum)
 }
 
 fn relative_path_hash(path: &Path) -> u64 {
@@ -2991,10 +3484,26 @@ fn publish_staging_noreplace(
     target: &Path,
     target_name: &OsStr,
 ) -> std::result::Result<(), SecureSnapshotPublicationError> {
-    let source = c_component(&staging.root_name, &staging.display_path)
-        .map_err(SecureSnapshotPublicationError::before_publication)?;
-    let destination = c_component(target_name, target)
-        .map_err(SecureSnapshotPublicationError::before_publication)?;
+    let source = match c_component(&staging.root_name, &staging.display_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Err(
+                SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                    error, staging,
+                ),
+            );
+        }
+    };
+    let destination = match c_component(target_name, target) {
+        Ok(destination) => destination,
+        Err(error) => {
+            return Err(
+                SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                    error, staging,
+                ),
+            );
+        }
+    };
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let renamed = unsafe {
         libc::syscall(
@@ -3022,20 +3531,26 @@ fn publish_staging_noreplace(
         not(target_vendor = "apple")
     ))]
     let renamed = {
-        return Err(SecureSnapshotPublicationError::before_publication(
-            TsinkError::InvalidConfiguration(
+        return Err(
+            SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                TsinkError::InvalidConfiguration(
                 "secure handle-relative no-replace snapshot publication is unsupported on this Unix platform"
                     .to_string(),
+                ),
+                staging,
             ),
-        ));
+        );
     };
     if renamed != 0 {
-        return Err(SecureSnapshotPublicationError::before_publication(
-            TsinkError::IoWithPath {
-                path: target.to_path_buf(),
-                source: std::io::Error::last_os_error(),
-            },
-        ));
+        return Err(
+            SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                TsinkError::IoWithPath {
+                    path: target.to_path_buf(),
+                    source: std::io::Error::last_os_error(),
+                },
+                staging,
+            ),
+        );
     }
     #[cfg(test)]
     invoke_publication_after_rename_hook(target);
@@ -3347,6 +3862,11 @@ fn publish_staging_replacing(
 
 #[cfg(unix)]
 fn remove_published_backup_exact(backup: SecureSnapshotPublishedBackup) -> Result<()> {
+    // Restore is specified as offline for the complete containing namespace. Unlike the online
+    // snapshot staging cleanup above, this path relies on the caller honoring that exclusion:
+    // portable Unix has no identity-conditioned unlink, so the final verified-handle-to-unlinkat
+    // window is not safe against an uncooperative same-identity process. Keep that platform
+    // limitation explicit rather than describing this as an atomic exact-identity delete.
     for entry in backup.entries.iter().rev() {
         let expected_parent = *backup.parent_identity(&entry.relative)?;
         let (parent, name, display) =
@@ -3428,6 +3948,17 @@ fn remove_published_backup_exact(backup: SecureSnapshotPublishedBackup) -> Resul
         &backup.requested_backup_path,
         "restore post-cleanup backup-parent attestation",
     )
+}
+
+#[cfg(unix)]
+fn remove_created_staging_exact(staging: SecureSnapshotStagingDirectory) -> Result<()> {
+    Err(TsinkError::UnsupportedOperation {
+        operation: "secure snapshot staging cleanup",
+        reason: format!(
+            "portable Unix has no identity-conditioned unlink primitive; retaining the verified staging tree at {} rather than risk deleting a pathname replacement",
+            staging.display_path.display()
+        ),
+    })
 }
 
 #[cfg(unix)]
@@ -3664,11 +4195,15 @@ const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
 #[cfg(windows)]
+const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0004;
+#[cfg(windows)]
 const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 #[cfg(windows)]
 const WINDOWS_FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
 const WINDOWS_FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+#[cfg(windows)]
+const WINDOWS_DELETE_ACCESS: u32 = 0x0001_0000;
 
 #[cfg(windows)]
 fn open_windows_directory(path: &Path) -> Result<File> {
@@ -3692,6 +4227,64 @@ fn open_windows_directory(path: &Path) -> Result<File> {
         )));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_entry_for_exact_delete(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .access_mode(WINDOWS_FILE_READ_ATTRIBUTES | WINDOWS_DELETE_ACCESS)
+        // Denying delete sharing pins this exact identity from open through disposition.
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE)
+        .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT | WINDOWS_FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(windows)]
+fn open_windows_directory_for_exact_delete(path: &Path) -> Result<File> {
+    let file = open_windows_entry_for_exact_delete(path)?;
+    let metadata = file.metadata().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "snapshot exact-cleanup directory is link-like or not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn remove_windows_entry_by_verified_handle(file: File, display: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    #[cfg(test)]
+    invoke_windows_cleanup_before_disposition_hook(display);
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .expect("Windows disposition structure size fits u32"),
+        )
+    };
+    if removed == 0 {
+        return Err(TsinkError::IoWithPath {
+            path: display.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    drop(file);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -4008,7 +4601,9 @@ fn create_staging_at_parent(
         path: anchored_display.clone(),
         source,
     })?;
-    let root = open_windows_directory(&anchored_display)?;
+    // Staging roots retain DELETE access from creation onward. The handle denies delete sharing,
+    // so exact cleanup can disposition this same identity without a pathname race.
+    let root = open_windows_directory_for_exact_delete(&anchored_display)?;
     Ok(SecureDirectoryAnchor {
         display_path: anchored_display,
         root,
@@ -4029,62 +4624,174 @@ fn publish_staging_noreplace(
     target: &Path,
     _target_name: &OsStr,
 ) -> std::result::Result<(), SecureSnapshotPublicationError> {
-    let operation_live_retained = staging
-        .operation_live_retained_bytes()
-        .map_err(SecureSnapshotPublicationError::before_publication)?;
+    let operation_live_retained = match staging.operation_live_retained_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(
+                SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                    error, staging,
+                ),
+            );
+        }
+    };
     let expected_root = staging.created[0].identity;
-    let expected_created = staging.created;
-    let source_path = staging.display_path;
-    let parent = staging.parent;
+    let SecureSnapshotStagingDirectory {
+        parent,
+        root,
+        display_path: source_path,
+        root_name,
+        created: expected_created,
+        created_directory_index,
+        created_directory_index_bytes,
+        created_manifest_bytes,
+        retained_memory_bytes,
+        operation_baseline_retained_bytes,
+    } = staging;
     // Windows directory handles opened without FILE_SHARE_DELETE prevent replacement during
     // copy. MoveFileExW cannot rename while that staging-root handle is live, so release only the
     // root handle; the parent and every external ancestor remain locked against rename/delete.
-    drop(staging.root);
-    super::rename_path_noreplace(&source_path, target)
-        .map_err(SecureSnapshotPublicationError::before_publication)?;
-
-    let target_file = open_windows_directory(target)
-        .map_err(SecureSnapshotPublicationError::after_publication)?;
-    let actual_root = identity_from_file(&target_file, target)
-        .map_err(SecureSnapshotPublicationError::after_publication)?;
-    if !actual_root.stable_eq(expected_root) {
-        return Err(SecureSnapshotPublicationError::after_publication(
-            TsinkError::DataCorruption(format!(
-                "Windows snapshot publication moved an unexpected staging identity to {}",
-                target.display()
-            )),
-        ));
+    drop(root);
+    #[cfg(test)]
+    invoke_windows_publication_before_rename_hook(&source_path, target);
+    if let Err(error) = super::rename_path_noreplace(&source_path, target) {
+        let reopened =
+            open_windows_directory_for_exact_delete(&source_path).and_then(|root_file| {
+                let actual = identity_from_file(&root_file, &source_path)?;
+                if !actual.stable_eq(expected_root) {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "snapshot staging identity changed after failed Windows publication: {}",
+                        source_path.display()
+                    )));
+                }
+                attest_root_entry(&parent, &root_name, &source_path, &expected_root)?;
+                Ok(root_file)
+            });
+        return match reopened {
+            Ok(root_file) => {
+                let root = SecureDirectoryAnchor {
+                    display_path: source_path.clone(),
+                    root: root_file,
+                    ancestor_locks: Vec::new(),
+                };
+                let staging = SecureSnapshotStagingDirectory {
+                    parent,
+                    root,
+                    display_path: source_path,
+                    root_name,
+                    created: expected_created,
+                    created_directory_index,
+                    created_directory_index_bytes,
+                    created_manifest_bytes,
+                    retained_memory_bytes,
+                    operation_baseline_retained_bytes,
+                };
+                Err(
+                    SecureSnapshotPublicationError::before_publication_with_verified_staging(
+                        error, staging,
+                    ),
+                )
+            }
+            Err(source_attestation_error) => {
+                match open_expected_windows_directory(target, &expected_root) {
+                    Ok(target_file) => {
+                        let post_publication = verify_windows_noreplace_published_target(
+                            &parent,
+                            requested_target,
+                            target,
+                            target_file,
+                            &expected_created,
+                            operation_live_retained,
+                        );
+                        let published_error = match post_publication {
+                            Ok(()) => TsinkError::Other(format!(
+                                "Windows no-replace rename reported failure ({error}), but the expected staging identity is visible at {}; treating publication as committed and retaining it",
+                                target.display()
+                            )),
+                            Err(post_error) => TsinkError::Other(format!(
+                                "Windows no-replace rename reported failure ({error}), and the expected staging identity is visible at {}, but post-publication verification failed: {post_error}; retaining the visible destination",
+                                target.display()
+                            )),
+                        };
+                        Err(SecureSnapshotPublicationError::after_publication(
+                            published_error,
+                        ))
+                    }
+                    Err(target_attestation_error) => {
+                        Err(SecureSnapshotPublicationError::before_publication(
+                            TsinkError::Other(format!(
+                                "{error}; refusing cleanup because the unpublished staging identity could not be re-attested at {}: {source_attestation_error}; the expected identity was not verified at target {}: {target_attestation_error}",
+                                source_path.display(),
+                                target.display()
+                            )),
+                        ))
+                    }
+                }
+            }
+        };
     }
+
+    let target_file = open_expected_windows_directory(target, &expected_root)
+        .map_err(SecureSnapshotPublicationError::after_publication)?;
+    verify_windows_noreplace_published_target(
+        &parent,
+        requested_target,
+        target,
+        target_file,
+        &expected_created,
+        operation_live_retained,
+    )
+    .map_err(SecureSnapshotPublicationError::after_publication)
+}
+
+#[cfg(windows)]
+fn open_expected_windows_directory(
+    target: &Path,
+    expected_root: &ClosedSnapshotIdentity,
+) -> Result<File> {
+    let target_file = open_windows_directory(target)?;
+    let actual_root = identity_from_file(&target_file, target)?;
+    if !actual_root.stable_eq(*expected_root) {
+        return Err(TsinkError::DataCorruption(format!(
+            "Windows snapshot publication found an unexpected identity at {}",
+            target.display()
+        )));
+    }
+    Ok(target_file)
+}
+
+#[cfg(windows)]
+fn verify_windows_noreplace_published_target(
+    parent: &SecureDirectoryAnchor,
+    requested_target: &Path,
+    target: &Path,
+    target_file: File,
+    expected_created: &[SecureCreatedEntry],
+    operation_live_retained: usize,
+) -> Result<()> {
     let published = SecureDirectoryAnchor {
         display_path: target.to_path_buf(),
         root: target_file,
         ancestor_locks: Vec::new(),
     };
-    let (observed, observed_bytes) = measure_created_tree(&published, operation_live_retained)
-        .map_err(SecureSnapshotPublicationError::after_publication)?;
+    let (observed, observed_bytes) = measure_created_tree(&published, operation_live_retained)?;
     admit_operation_retained_bytes(
         operation_live_retained,
         observed_bytes,
         "Windows secure snapshot post-publication verification",
         target,
-    )
-    .map_err(SecureSnapshotPublicationError::after_publication)?;
-    if !created_manifests_match(&expected_created, &observed) {
-        return Err(SecureSnapshotPublicationError::after_publication(
-            TsinkError::DataCorruption(format!(
-                "Windows snapshot publication tree identity changed at {}",
-                target.display()
-            )),
-        ));
+    )?;
+    if !created_manifests_match(expected_created, &observed) {
+        return Err(TsinkError::DataCorruption(format!(
+            "Windows snapshot publication tree identity changed at {}",
+            target.display()
+        )));
     }
-    sync_file_as_directory(&parent.root, &parent.display_path)
-        .map_err(SecureSnapshotPublicationError::after_publication)?;
+    sync_file_as_directory(&parent.root, &parent.display_path)?;
     attest_requested_publication_parent(
-        &parent,
+        parent,
         requested_target,
         "snapshot post-publication parent attestation",
     )
-    .map_err(SecureSnapshotPublicationError::after_publication)
 }
 
 #[cfg(windows)]
@@ -4104,6 +4811,20 @@ fn opened_windows_sibling_directory(
         )));
     }
     Ok((probe.file, identity))
+}
+
+#[cfg(windows)]
+fn opened_windows_sibling_directory_for_exact_delete(
+    parent: &SecureDirectoryAnchor,
+    name: &OsStr,
+    display: &Path,
+) -> Result<(File, ClosedSnapshotIdentity)> {
+    let parent_identity = identity_from_file(&parent.root, &parent.display_path)?;
+    let (_opened_parent, _name, anchored_display) =
+        open_relative_parent(parent, Path::new(name), &parent_identity)?;
+    let file = open_windows_directory_for_exact_delete(&anchored_display)?;
+    let identity = identity_from_file(&file, display)?;
+    Ok((file, identity))
 }
 
 #[cfg(windows)]
@@ -4213,22 +4934,88 @@ fn publish_staging_replacing(
     // handle immediately before the target-to-backup move; the staging parent and its ancestor
     // locks remain retained, and the closed descendant manifest is never recaptured.
     drop(original_root);
-    super::rename_path_noreplace(target, backup)
-        .map_err(SecureSnapshotPublicationError::before_publication)?;
-    let (backup_handle, moved_backup) =
-        opened_windows_sibling_directory(&staging.parent, backup_name, backup).map_err(
-            |error| {
-                windows_prepublication_failure_with_rollback(
-                    error,
-                    &staging.parent,
-                    target,
-                    target_name,
-                    backup,
-                    backup_name,
-                    &expected_backup,
-                )
-            },
-        )?;
+    #[cfg(test)]
+    invoke_windows_publication_before_rename_hook(target, backup);
+    let backup_after_reported_rename_failure = match super::rename_path_noreplace(target, backup) {
+        Ok(()) => None,
+        Err(rename_error) => {
+            match opened_windows_sibling_directory_for_exact_delete(
+                &staging.parent,
+                backup_name,
+                backup,
+            ) {
+                Ok((backup_handle, moved_backup)) if moved_backup.stable_eq(expected_backup) => {
+                    // The exact original target is already visible at the backup name. The
+                    // move committed in the root-handle release window even though the later
+                    // MoveFileExW call reported failure, so continue from the committed state.
+                    Some((backup_handle, moved_backup))
+                }
+                Ok((backup_handle, moved_backup)) => {
+                    drop(backup_handle);
+                    return Err(SecureSnapshotPublicationError::before_publication(
+                            TsinkError::Other(format!(
+                                "Windows restore target-to-backup rename reported failure ({rename_error}), and an unexpected backup identity is visible at {}: expected {:?}, observed {:?}; staging and both namespace entries are retained",
+                                backup.display(),
+                                expected_backup,
+                                moved_backup
+                            )),
+                        ));
+                }
+                Err(backup_attestation_error) => {
+                    let target_attestation =
+                        opened_windows_sibling_directory(&staging.parent, target_name, target);
+                    return match target_attestation {
+                            Ok((_target_handle, target_identity))
+                                if target_identity.stable_eq(expected_backup) =>
+                            {
+                                Err(SecureSnapshotPublicationError::before_publication(
+                                    TsinkError::Other(format!(
+                                        "Windows restore target-to-backup rename failed before moving the exact original target: {rename_error}; backup attestation at {} also failed: {backup_attestation_error}",
+                                        backup.display()
+                                    )),
+                                ))
+                            }
+                            Ok((_target_handle, target_identity)) => {
+                                Err(SecureSnapshotPublicationError::before_publication(
+                                    TsinkError::Other(format!(
+                                        "Windows restore target-to-backup rename reported failure ({rename_error}); the expected identity was not verified at backup {} ({backup_attestation_error}), and target {} contains an unexpected identity {:?}; retaining every namespace entry",
+                                        backup.display(),
+                                        target.display(),
+                                        target_identity
+                                    )),
+                                ))
+                            }
+                            Err(target_attestation_error) => {
+                                Err(SecureSnapshotPublicationError::before_publication(
+                                    TsinkError::Other(format!(
+                                        "Windows restore target-to-backup rename reported failure ({rename_error}); the expected identity could not be verified at backup {} ({backup_attestation_error}) or target {} ({target_attestation_error}); retaining staging and every surviving namespace entry",
+                                        backup.display(),
+                                        target.display()
+                                    )),
+                                ))
+                            }
+                        };
+                }
+            }
+        }
+    };
+    let (backup_handle, moved_backup) = match backup_after_reported_rename_failure {
+        Some(moved) => moved,
+        None => {
+            opened_windows_sibling_directory_for_exact_delete(&staging.parent, backup_name, backup)
+                .map_err(|error| {
+                    windows_prepublication_failure_with_rollback(
+                        error,
+                        &staging.parent,
+                        target,
+                        target_name,
+                        backup,
+                        backup_name,
+                        &expected_backup,
+                    )
+                })?
+        }
+    };
     if !moved_backup.stable_eq(expected_backup) {
         drop(backup_handle);
         return Err(windows_prepublication_failure_with_rollback(
@@ -4260,19 +5047,93 @@ fn publish_staging_replacing(
     let expected_root = staging.created[0].identity;
     let expected_created = staging.created;
     let source_path = staging.display_path;
+    let source_name = staging.root_name;
     let parent = staging.parent;
     drop(staging.root);
+    #[cfg(test)]
+    invoke_windows_publication_before_rename_hook(&source_path, target);
     if let Err(error) = super::rename_path_noreplace(&source_path, target) {
-        drop(backup_handle);
-        return Err(windows_prepublication_failure_with_rollback(
-            error,
-            &parent,
-            target,
-            target_name,
-            backup,
-            backup_name,
-            &expected_backup,
-        ));
+        let reopened_source =
+            open_windows_directory_for_exact_delete(&source_path).and_then(|source_handle| {
+                let actual = identity_from_file(&source_handle, &source_path)?;
+                if !actual.stable_eq(expected_root) {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "restore staging identity changed after failed Windows publication: {}",
+                        source_path.display()
+                    )));
+                }
+                attest_root_entry(&parent, &source_name, &source_path, &expected_root)?;
+                Ok(source_handle)
+            });
+        match reopened_source {
+            Ok(source_handle) => {
+                // The exact staging root remains unpublished. Release its delete-denying handle
+                // before attempting to restore the original target from backup.
+                drop(source_handle);
+                drop(backup_handle);
+                return Err(windows_prepublication_failure_with_rollback(
+                    error,
+                    &parent,
+                    target,
+                    target_name,
+                    backup,
+                    backup_name,
+                    &expected_backup,
+                ));
+            }
+            Err(source_attestation_error) => {
+                match open_expected_windows_directory(target, &expected_root) {
+                    Ok(target_file) => {
+                        let post_publication = verify_windows_noreplace_published_target(
+                            &parent,
+                            requested_target,
+                            target,
+                            target_file,
+                            &expected_created,
+                            operation_live_retained,
+                        )
+                        .and_then(|()| {
+                            attest_requested_publication_parent(
+                                &parent,
+                                requested_backup,
+                                "restore ambiguous-publication backup-parent attestation",
+                            )
+                        });
+                        let published_error = match post_publication {
+                            Ok(()) => TsinkError::Other(format!(
+                                "Windows restore staging rename reported failure ({error}), but the expected staging identity is visible at {}; treating publication as committed and retaining it with backup {}",
+                                target.display(),
+                                backup.display()
+                            )),
+                            Err(post_error) => TsinkError::Other(format!(
+                                "Windows restore staging rename reported failure ({error}), and the expected staging identity is visible at {}, but post-publication verification failed: {post_error}; retaining the visible target and backup {}",
+                                target.display(),
+                                backup.display()
+                            )),
+                        };
+                        return Err(SecureSnapshotPublicationError::after_publication(
+                            published_error,
+                        ));
+                    }
+                    Err(target_attestation_error) => {
+                        drop(backup_handle);
+                        return Err(windows_prepublication_failure_with_rollback(
+                            TsinkError::Other(format!(
+                                "{error}; refusing to classify the staging transition as published because the source identity could not be re-attested at {}: {source_attestation_error}; the expected identity was not verified at target {}: {target_attestation_error}",
+                                source_path.display(),
+                                target.display()
+                            )),
+                            &parent,
+                            target,
+                            target_name,
+                            backup,
+                            backup_name,
+                            &expected_backup,
+                        ));
+                    }
+                }
+            }
+        }
     }
     let target_file = open_windows_directory(target)
         .map_err(SecureSnapshotPublicationError::after_publication)?;
@@ -4354,14 +5215,19 @@ fn publish_staging_replacing(
 }
 
 #[cfg(windows)]
-fn remove_published_backup_exact(mut backup: SecureSnapshotPublishedBackup) -> Result<()> {
+fn remove_published_backup_exact(backup: SecureSnapshotPublishedBackup) -> Result<()> {
     for entry in backup.entries.iter().rev() {
         let expected_parent = *backup.parent_identity(&entry.relative)?;
-        let (parent, name, display) =
+        let (parent, _name, display) =
             open_relative_parent(&backup.root, &entry.relative, &expected_parent)?;
-        let probe = open_relative_entry_probe(&backup.root, &entry.relative, &expected_parent)?;
-        let metadata = probe_metadata(&probe, &display)?;
-        let actual = identity_from_file(&probe.file, &display)?;
+        let delete_handle = open_windows_entry_for_exact_delete(&display)?;
+        let metadata = delete_handle
+            .metadata()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: display.clone(),
+                source,
+            })?;
+        let actual = identity_from_file(&delete_handle, &display)?;
         let matches = !is_link_or_reparse_point(&metadata)
             && match entry.kind {
                 SecureSourceKind::Directory => {
@@ -4379,18 +5245,9 @@ fn remove_published_backup_exact(mut backup: SecureSnapshotPublishedBackup) -> R
                 display.display()
             )));
         }
-        // Windows opens snapshot handles without FILE_SHARE_DELETE. Release only the final entry
-        // handle immediately before deleting its identity-attested path; retained parent/root
-        // handles keep every ancestor namespace pinned.
-        drop(probe);
-        match entry.kind {
-            SecureSourceKind::Directory => std::fs::remove_dir(&display),
-            SecureSourceKind::RegularFile => std::fs::remove_file(&display),
-        }
-        .map_err(|source| TsinkError::IoWithPath {
-            path: display.clone(),
-            source,
-        })?;
+        // The DELETE-capable handle denies a competing rename from final identity attestation
+        // through disposition.
+        remove_windows_entry_by_verified_handle(delete_handle, &display)?;
         sync_opened_directory(
             &parent,
             backup
@@ -4399,7 +5256,6 @@ fn remove_published_backup_exact(mut backup: SecureSnapshotPublishedBackup) -> R
                 .parent()
                 .unwrap_or(&backup.backup_path),
         )?;
-        let _ = name;
     }
 
     let current_root = identity_from_file(&backup.root.root, &backup.backup_path)?;
@@ -4415,17 +5271,95 @@ fn remove_published_backup_exact(mut backup: SecureSnapshotPublishedBackup) -> R
         &backup.backup_path,
         &backup.root_identity,
     )?;
-    // The root's no-delete handle is the only remaining handle that blocks removal.
-    drop(backup.root);
-    std::fs::remove_dir(&backup.backup_path).map_err(|source| TsinkError::IoWithPath {
-        path: backup.backup_path.clone(),
-        source,
-    })?;
-    sync_file_as_directory(&backup.parent.root, &backup.parent.display_path)?;
+    let SecureSnapshotPublishedBackup {
+        parent,
+        root,
+        requested_backup_path,
+        backup_path,
+        ..
+    } = backup;
+    let SecureDirectoryAnchor {
+        root: root_handle,
+        ancestor_locks,
+        ..
+    } = root;
+    remove_windows_entry_by_verified_handle(root_handle, &backup_path)?;
+    drop(ancestor_locks);
+    sync_file_as_directory(&parent.root, &parent.display_path)?;
     attest_requested_publication_parent(
-        &backup.parent,
-        &backup.requested_backup_path,
+        &parent,
+        &requested_backup_path,
         "restore post-cleanup backup-parent attestation",
+    )
+}
+
+#[cfg(windows)]
+fn remove_created_staging_exact(staging: SecureSnapshotStagingDirectory) -> Result<()> {
+    for entry in staging.created.iter().skip(1).rev() {
+        let expected_parent = *staging.created_parent_identity(&entry.relative)?;
+        let (parent, _name, display) =
+            open_relative_parent(&staging.root, &entry.relative, &expected_parent)?;
+        let delete_handle = open_windows_entry_for_exact_delete(&display)?;
+        let metadata = delete_handle
+            .metadata()
+            .map_err(|source| TsinkError::IoWithPath {
+                path: display.clone(),
+                source,
+            })?;
+        let actual = identity_from_file(&delete_handle, &display)?;
+        let matches = !is_link_or_reparse_point(&metadata)
+            && match entry.kind {
+                SecureSourceKind::Directory => {
+                    metadata.file_type().is_dir() && actual.stable_eq(entry.identity)
+                }
+                SecureSourceKind::RegularFile => {
+                    metadata.file_type().is_file() && actual == entry.identity
+                }
+            };
+        if !matches {
+            return Err(TsinkError::DataCorruption(format!(
+                "snapshot staging entry changed before exact cleanup: {}",
+                display.display()
+            )));
+        }
+        // Disposition the same DELETE-capable handle whose identity was just checked. Because it
+        // denies delete sharing, no pathname replacement can enter between attestation and
+        // deletion.
+        remove_windows_entry_by_verified_handle(delete_handle, &display)?;
+        sync_opened_directory(&parent, display.parent().unwrap_or(&staging.display_path))?;
+    }
+
+    let current_root = identity_from_file(&staging.root.root, &staging.display_path)?;
+    if !current_root.stable_eq(staging.created[0].identity) {
+        return Err(TsinkError::DataCorruption(format!(
+            "snapshot staging root changed before exact cleanup: {}",
+            staging.display_path.display()
+        )));
+    }
+    attest_root_entry(
+        &staging.parent,
+        &staging.root_name,
+        &staging.display_path,
+        &staging.created[0].identity,
+    )?;
+    let SecureSnapshotStagingDirectory {
+        parent,
+        root,
+        display_path,
+        ..
+    } = staging;
+    let SecureDirectoryAnchor {
+        root: root_handle,
+        ancestor_locks,
+        ..
+    } = root;
+    remove_windows_entry_by_verified_handle(root_handle, &display_path)?;
+    drop(ancestor_locks);
+    sync_file_as_directory(&parent.root, &parent.display_path)?;
+    attest_requested_publication_parent(
+        &parent,
+        &display_path,
+        "snapshot post-cleanup staging-parent attestation",
     )
 }
 
@@ -4523,14 +5457,36 @@ fn attest_root_entry(
     display: &Path,
     expected: &ClosedSnapshotIdentity,
 ) -> Result<()> {
-    attest_relative_identity(
-        parent,
-        Path::new(root_name),
-        display,
-        SecureSourceKind::Directory,
-        &identity_from_file(&parent.root, &parent.display_path)?,
-        expected,
-    )
+    let parent_identity = identity_from_file(&parent.root, &parent.display_path)?;
+    let (_opened_parent, _name, anchored_display) =
+        open_relative_parent(parent, Path::new(root_name), &parent_identity)?;
+    let probe = OpenOptions::new()
+        .access_mode(WINDOWS_FILE_READ_ATTRIBUTES)
+        // A staging root can itself retain DELETE access while denying delete sharing. This
+        // attestation handle must share that existing access; the root handle still prevents any
+        // third party from opening a competing delete/rename handle.
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE)
+        .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT | WINDOWS_FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&anchored_display)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: anchored_display.clone(),
+            source,
+        })?;
+    let metadata = probe.metadata().map_err(|source| TsinkError::IoWithPath {
+        path: anchored_display.clone(),
+        source,
+    })?;
+    let current = identity_from_file(&probe, display)?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+        || !current.stable_eq(*expected)
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "created staging root identity changed before attestation: {}",
+            display.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -4701,6 +5657,11 @@ fn remove_published_backup_exact(_backup: SecureSnapshotPublishedBackup) -> Resu
 }
 
 #[cfg(not(any(unix, windows)))]
+fn remove_created_staging_exact(_staging: SecureSnapshotStagingDirectory) -> Result<()> {
+    unsupported_secure_snapshot()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_relative_regular_file(
     _root: &SecureDirectoryAnchor,
     _relative: &Path,
@@ -4845,6 +5806,368 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn exact_created_staging_cleanup_removes_an_unchanged_verified_tree() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let mut staging =
+            SecureSnapshotStagingDirectory::create_unique(&target, "secure-test").unwrap();
+        staging.create_directory(Path::new("nested")).unwrap();
+        staging
+            .create_directory(Path::new("nested/deeper"))
+            .unwrap();
+        staging
+            .write_file(Path::new("nested/deeper/known"), b"owned", None)
+            .unwrap();
+        staging.sync_root().unwrap();
+        let staging_path = staging.path().to_path_buf();
+
+        staging.remove_exact_created_tree().unwrap();
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_created_staging_cleanup_retains_an_unchanged_verified_tree_without_conditional_unlink()
+    {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let staging_path = staging.path().to_path_buf();
+
+        let error = staging
+            .remove_exact_created_tree()
+            .expect_err("portable Unix must retain an exact tree instead of using racy unlink");
+        assert!(matches!(
+            &error,
+            TsinkError::UnsupportedOperation {
+                operation: "secure snapshot staging cleanup",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("identity-conditioned unlink"));
+        assert_eq!(std::fs::read(staging_path.join("known")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn exact_created_staging_cleanup_rejects_unknown_or_replaced_entries() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        for mutation in ["unknown", "replaced"] {
+            let staging = staging_with_file(&target, "known", b"owned");
+            let staging_path = staging.path().to_path_buf();
+            match mutation {
+                "unknown" => {
+                    std::fs::write(staging_path.join("foreign"), b"foreign").unwrap();
+                }
+                "replaced" => {
+                    std::fs::write(staging_path.join("known"), b"replacement-bytes").unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = staging
+                .remove_exact_created_tree()
+                .expect_err("an unverified or identity-replaced tree must be retained");
+            assert!(
+                error.to_string().contains("missing, unknown, or replaced")
+                    || error.to_string().contains("changed before exact cleanup"),
+                "{error}"
+            );
+            assert!(staging_path.exists());
+            if mutation == "unknown" {
+                assert_eq!(std::fs::read(staging_path.join("known")).unwrap(), b"owned");
+                assert_eq!(
+                    std::fs::read(staging_path.join("foreign")).unwrap(),
+                    b"foreign"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(staging_path.join("known")).unwrap(),
+                    b"replacement-bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_cleanup_scratch_admission_has_an_exact_operation_boundary() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let scratch = modeled_exact_cleanup_scratch_bytes(
+            &staging.display_path,
+            &staging.root_name,
+            staging
+                .created
+                .iter()
+                .skip(1)
+                .map(|entry| entry.relative.as_path()),
+        )
+        .unwrap();
+        assert!(scratch > 0);
+        let exact_retained = MAX_SECURE_SNAPSHOT_OPERATION_RETAINED_BYTES - scratch;
+
+        admit_operation_retained_bytes(
+            exact_retained,
+            scratch,
+            "secure snapshot exact cleanup scratch",
+            staging.path(),
+        )
+        .unwrap();
+        let error = admit_operation_retained_bytes(
+            exact_retained + 1,
+            scratch,
+            "secure snapshot exact cleanup scratch",
+            staging.path(),
+        )
+        .expect_err("one byte beyond the cleanup operation cap must be rejected");
+        assert!(error
+            .to_string()
+            .contains("secure snapshot exact cleanup scratch requires"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn requested_namespace_reattestation_has_an_exact_operation_boundary() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let fence = SecureSnapshotNamespaceFence::open_with_operation_baseline(&source, 0).unwrap();
+        let probe = open_existing_directory_chain_nofollow(
+            &source,
+            "requested namespace admission test probe",
+        )
+        .unwrap();
+        let transient = temporary_anchor_retained_bytes(&probe).unwrap();
+        drop(probe);
+        let exact_baseline = MAX_SECURE_SNAPSHOT_OPERATION_RETAINED_BYTES - transient;
+
+        fence.attest(exact_baseline).unwrap();
+        let error = fence
+            .attest(exact_baseline + 1)
+            .expect_err("one byte beyond the re-attestation peak must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot aggregate namespace re-attestation requires"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn absent_source_rechecks_a_parent_that_was_initially_missing() {
+        let temp = TempDir::new().unwrap();
+        let requested = temp.path().join("late-parent/catalog");
+        let parent = requested.parent().unwrap().to_path_buf();
+        let requested_for_hook = requested.clone();
+        let _hook = install_absent_source_between_parent_probes_hook(move |path| {
+            if path == requested_for_hook {
+                std::fs::create_dir(&parent).unwrap();
+            }
+        });
+
+        let error = attest_secure_snapshot_requested_path_absent(&requested, 0)
+            .expect_err("a parent appearing between the two absence probes must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requested parent appeared during absence re-attestation"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_created_staging_cleanup_pins_the_attested_identity_through_disposition() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let staging_path = staging.path().to_path_buf();
+        let known = staging_path.join("known");
+        let displaced = temp.path().join("displaced");
+        let hook_calls = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let hook_known = known.clone();
+        let hook_displaced = displaced.clone();
+        let hook_calls_for_hook = std::sync::Arc::clone(&hook_calls);
+        let _hook = install_windows_cleanup_before_disposition_hook(move |path| {
+            if path == hook_known {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    std::fs::rename(&hook_known, &hook_displaced).is_err(),
+                    "the DELETE-capable cleanup handle must deny a competing rename"
+                );
+            }
+        });
+
+        staging.remove_exact_created_tree().unwrap();
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert!(!staging_path.exists());
+        assert!(!displaced.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_noreplace_reports_published_when_expected_identity_is_at_target() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let hook_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = std::sync::Arc::clone(&hook_calls);
+        let _hook = install_windows_publication_before_rename_hook(move |source, target| {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            std::fs::rename(source, target).unwrap();
+        });
+
+        let publication = staging.publish_noreplace(&target).expect_err(
+            "the hook moves the exact root first, so MoveFileExW must report source missing",
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert!(publication.published, "{publication:?}");
+        assert!(publication
+            .error
+            .to_string()
+            .contains("expected staging identity is visible"));
+        assert_eq!(std::fs::read(target.join("known")).unwrap(), b"owned");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_target_to_backup_rename_continues_from_the_attested_committed_move() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let backup = temp.path().join("backup");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        let original_target = SecureSnapshotSourceTree::open_and_measure(&target).unwrap();
+        let mut staging = staging_with_file(&temp.path().join("incoming"), "new", b"new");
+        staging
+            .set_operation_baseline_retained_bytes(
+                original_target.retained_memory_bytes(),
+                "replacement ambiguity test",
+            )
+            .unwrap();
+        let hook_target = target.clone();
+        let hook_backup = backup.clone();
+        let _hook = install_windows_publication_before_rename_hook(move |source, destination| {
+            if source == hook_target && destination == hook_backup {
+                std::fs::rename(source, destination).unwrap();
+            }
+        });
+
+        let published_backup = staging
+            .publish_replacing(&target, &backup, original_target)
+            .expect("the attested target-to-backup move must be treated as committed");
+        assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(backup.join("old")).unwrap(), b"old");
+        published_backup.remove_and_sync_parent().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_staging_to_target_rename_reports_the_attested_visible_target_as_published() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let backup = temp.path().join("backup");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        let original_target = SecureSnapshotSourceTree::open_and_measure(&target).unwrap();
+        let mut staging = staging_with_file(&temp.path().join("incoming"), "new", b"new");
+        staging
+            .set_operation_baseline_retained_bytes(
+                original_target.retained_memory_bytes(),
+                "replacement ambiguity test",
+            )
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let hook_staging = staging_path.clone();
+        let hook_target = target.clone();
+        let _hook = install_windows_publication_before_rename_hook(move |source, destination| {
+            if source == hook_staging && destination == hook_target {
+                std::fs::rename(source, destination).unwrap();
+            }
+        });
+
+        let publication = staging
+            .publish_replacing(&target, &backup, original_target)
+            .expect_err("the second MoveFileExW observes the already-committed hook move");
+        assert!(publication.published, "{publication:?}");
+        assert!(publication
+            .error
+            .to_string()
+            .contains("treating publication as committed"));
+        assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(backup.join("old")).unwrap(), b"old");
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn failed_noreplace_cleanup_refuses_a_replaced_staged_entry() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let staging_path = staging.path().to_path_buf();
+        std::fs::create_dir(&target).unwrap();
+
+        let publication = staging
+            .publish_noreplace(&target)
+            .expect_err("the atomic no-replace publication must lose to the existing target");
+        assert!(!publication.published);
+        std::fs::remove_file(staging_path.join("known")).unwrap();
+        std::fs::write(staging_path.join("known"), b"replacement-bytes").unwrap();
+
+        let (_publication_error, cleanup) = publication.into_error_and_verified_cleanup();
+        let cleanup_error = cleanup
+            .expect("a verified losing staging tree must carry exact cleanup ownership")
+            .expect_err("identity replacement between failure and cleanup must be retained");
+        assert!(
+            cleanup_error
+                .to_string()
+                .contains("missing, unknown, or replaced")
+                || cleanup_error
+                    .to_string()
+                    .contains("changed before exact cleanup"),
+            "{cleanup_error}"
+        );
+        assert_eq!(
+            std::fs::read(staging_path.join("known")).unwrap(),
+            b"replacement-bytes"
+        );
+        assert!(target.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_noreplace_cleanup_refuses_a_replaced_staging_root() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        let staging = staging_with_file(&target, "known", b"owned");
+        let staging_path = staging.path().to_path_buf();
+        let displaced = temp.path().join("displaced-owned-staging");
+        std::fs::create_dir(&target).unwrap();
+
+        let publication = staging
+            .publish_noreplace(&target)
+            .expect_err("the atomic no-replace publication must lose to the existing target");
+        std::fs::rename(&staging_path, &displaced).unwrap();
+        std::fs::create_dir(&staging_path).unwrap();
+        std::fs::write(staging_path.join("foreign"), b"foreign").unwrap();
+
+        let (_publication_error, cleanup) = publication.into_error_and_verified_cleanup();
+        cleanup
+            .expect("a verified losing staging tree must carry exact cleanup ownership")
+            .expect_err("a replacement at the retained staging pathname must not be removed");
+        assert_eq!(
+            std::fs::read(staging_path.join("foreign")).unwrap(),
+            b"foreign"
+        );
+        assert_eq!(std::fs::read(displaced.join("known")).unwrap(), b"owned");
+        assert!(target.is_dir());
+    }
+
     #[test]
     fn validation_copy_cleanup_refreshes_only_known_entry_identities() {
         let temp = TempDir::new().unwrap();
@@ -4917,7 +6240,16 @@ mod tests {
         std::fs::rename(&data, &moved).unwrap();
         std::fs::create_dir_all(data.join("wal")).unwrap();
         std::fs::write(data.join("wal/segment"), b"replacement").unwrap();
-        let err = fence.attest().unwrap_err();
+        let live_retained = admit_secure_snapshot_operation_retained_bytes(
+            &[
+                fence.retained_memory_bytes(),
+                numeric.retained_memory_bytes(),
+            ],
+            "aggregate namespace test",
+            &data,
+        )
+        .unwrap();
+        let err = fence.attest(live_retained).unwrap_err();
         assert!(err
             .to_string()
             .contains("aggregate source namespace changed"));
@@ -4943,8 +6275,140 @@ mod tests {
         std::fs::rename(data.join("numeric"), &moved_numeric).unwrap();
         std::fs::create_dir(data.join("numeric")).unwrap();
         std::fs::write(data.join("numeric/segment"), b"replacement").unwrap();
-        let err = fence.attest().unwrap_err();
+        let live_retained = admit_secure_snapshot_operation_retained_bytes(
+            &[
+                fence.retained_memory_bytes(),
+                numeric.retained_memory_bytes(),
+            ],
+            "aggregate namespace test",
+            &data,
+        )
+        .unwrap();
+        let err = fence.attest(live_retained).unwrap_err();
         assert!(err
+            .to_string()
+            .contains("aggregate source namespace changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aggregate_namespace_fence_rebaseline_accepts_same_root_after_staging_creation() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let manifest_path = data.join("manifest");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(&manifest_path, b"manifest").unwrap();
+
+        let mut fence =
+            SecureSnapshotNamespaceFence::open_with_operation_baseline(&data, 0).unwrap();
+        let manifest = SecureSnapshotSourceFile::open_with_operation_baseline(
+            &manifest_path,
+            fence.retained_memory_bytes(),
+        )
+        .unwrap();
+        let absent_sources = [
+            data.join("numeric"),
+            data.join("blob"),
+            data.join("wal"),
+            data.join("rollups"),
+            data.join("catalog"),
+        ];
+        let live_retained = admit_secure_snapshot_operation_retained_bytes(
+            &[
+                fence.retained_memory_bytes(),
+                manifest.retained_memory_bytes(),
+            ],
+            "aggregate namespace rebaseline test",
+            &data,
+        )
+        .unwrap();
+        for path in &absent_sources {
+            attest_secure_snapshot_requested_path_absent(path, live_retained).unwrap();
+        }
+
+        std::fs::create_dir(data.join(".tmp-tsink-snapshot-test")).unwrap();
+        fence
+            .attest(live_retained)
+            .expect_err("staging creation must invalidate the original mutable root identity");
+        manifest
+            .verify_requested_namespace_unchanged(live_retained)
+            .unwrap();
+        for path in &absent_sources {
+            attest_secure_snapshot_requested_path_absent(path, live_retained).unwrap();
+        }
+        fence
+            .rebaseline_same_stable_identity(live_retained)
+            .unwrap();
+        manifest
+            .verify_requested_namespace_unchanged(live_retained)
+            .unwrap();
+        for path in &absent_sources {
+            attest_secure_snapshot_requested_path_absent(path, live_retained).unwrap();
+        }
+        fence.attest(live_retained).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aggregate_namespace_fence_rebaseline_still_rejects_data_root_replacement() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let moved = temp.path().join("moved-data");
+        let manifest_path = data.join("manifest");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(&manifest_path, b"manifest").unwrap();
+
+        let mut fence =
+            SecureSnapshotNamespaceFence::open_with_operation_baseline(&data, 0).unwrap();
+        let manifest = SecureSnapshotSourceFile::open_with_operation_baseline(
+            &manifest_path,
+            fence.retained_memory_bytes(),
+        )
+        .unwrap();
+        let absent_sources = [
+            data.join("numeric"),
+            data.join("blob"),
+            data.join("wal"),
+            data.join("rollups"),
+            data.join("catalog"),
+        ];
+        let live_retained = admit_secure_snapshot_operation_retained_bytes(
+            &[
+                fence.retained_memory_bytes(),
+                manifest.retained_memory_bytes(),
+            ],
+            "aggregate namespace replacement test",
+            &data,
+        )
+        .unwrap();
+        std::fs::create_dir(data.join(".tmp-tsink-snapshot-test")).unwrap();
+        manifest
+            .verify_requested_namespace_unchanged(live_retained)
+            .unwrap();
+        for path in &absent_sources {
+            attest_secure_snapshot_requested_path_absent(path, live_retained).unwrap();
+        }
+        fence
+            .rebaseline_same_stable_identity(live_retained)
+            .unwrap();
+
+        std::fs::rename(&data, &moved).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(&manifest_path, b"manifest").unwrap();
+        for path in &absent_sources {
+            attest_secure_snapshot_requested_path_absent(path, live_retained).unwrap();
+        }
+        manifest
+            .verify_unchanged()
+            .expect("retained-handle file verification alone still sees the old data root");
+        let file_err = manifest
+            .verify_requested_namespace_unchanged(live_retained)
+            .expect_err("standalone source requested-parent replacement must be rejected");
+        assert!(file_err.to_string().contains("requested parent changed"));
+        let fence_err = fence
+            .attest(live_retained)
+            .expect_err("aggregate data-root replacement must survive no rebaseline");
+        assert!(fence_err
             .to_string()
             .contains("aggregate source namespace changed"));
     }

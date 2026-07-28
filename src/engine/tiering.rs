@@ -13,6 +13,7 @@ mod policy;
 pub(super) use catalog::persist_segment_catalog;
 #[allow(unused_imports)]
 pub(super) use catalog::{
+    choose_next_segment_catalog_generation_after_observed,
     choose_next_segment_catalog_generation_with_namespace_count,
     cleanup_old_segment_catalog_generations, count_segment_catalog_generation_namespace,
     encode_legacy_segment_catalog_entry_fragment, encode_segment_catalog_generation_frame,
@@ -21,8 +22,8 @@ pub(super) use catalog::{
     load_segment_catalog, load_shared_segment_catalog_pointer,
     modeled_legacy_segment_catalog_publication_bytes,
     modeled_segment_catalog_generation_entry_read_bytes,
-    modeled_shared_segment_catalog_publication_bytes, persist_segment_catalog_budgeted,
-    persist_segment_catalog_budgeted_with_memory_admission,
+    modeled_shared_segment_catalog_publication_bytes, parse_segment_catalog_generation_file_name,
+    persist_segment_catalog_budgeted, persist_segment_catalog_budgeted_with_memory_admission,
     persist_shared_segment_catalog_budgeted,
     persist_shared_segment_catalog_budgeted_with_memory_admission,
     persist_shared_segment_catalog_budgeted_with_stage_hook, read_segment_catalog_generation_page,

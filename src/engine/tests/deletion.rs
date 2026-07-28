@@ -1132,9 +1132,7 @@ fn catalog_refresh_recovers_committing_tombstone_before_manifest_reload() {
         .is_empty());
 
     drop(guard);
-    let first_manifest = data_path
-        .join(NUMERIC_LANE_ROOT)
-        .join(TOMBSTONES_FILE_NAME);
+    let first_manifest = data_path.join(NUMERIC_LANE_ROOT).join(TOMBSTONES_FILE_NAME);
     assert!(
         !first_manifest.exists(),
         "the injected interruption precedes every manifest publication"

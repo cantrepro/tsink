@@ -140,8 +140,10 @@ impl TimeRangeFilterContext<'_> {
     ) -> Result<bool> {
         execution.checkpoint()?;
         let _visibility_guard = self.visibility_read_fence();
-        self.tombstones
-            .with_series_tombstone_ranges_for_query(series_id, Some(execution), |tombstone_ranges| {
+        self.tombstones.with_series_tombstone_ranges_for_query(
+            series_id,
+            Some(execution),
+            |tombstone_ranges| {
                 let active = self.chunks.active_shard(series_id).read();
                 let sealed = self.chunks.sealed_shard(series_id).read();
                 if let Some(chunks) = sealed.get(&series_id) {
@@ -171,16 +173,14 @@ impl TimeRangeFilterContext<'_> {
                     execution.charge_samples_scanned(1)?;
                     if point.ts >= start
                         && point.ts < end
-                        && ChunkStorage::timestamp_survives_tombstones(
-                            point.ts,
-                            tombstone_ranges,
-                        )
+                        && ChunkStorage::timestamp_survives_tombstones(point.ts, tombstone_ranges)
                     {
                         return Ok(true);
                     }
                 }
                 Ok(false)
-            })
+            },
+        )
     }
 
     fn prune_series_postings_without_persisted_segment_overlap_in_time_range(
@@ -241,8 +241,10 @@ impl TimeRangeFilterContext<'_> {
                 .invoke_metadata_time_range_persisted_exact_scan_hook();
         }
 
-        self.tombstones
-            .with_series_tombstone_ranges_for_query(series_id, Some(execution), |tombstone_ranges| {
+        self.tombstones.with_series_tombstone_ranges_for_query(
+            series_id,
+            Some(execution),
+            |tombstone_ranges| {
                 for chunk_ref in chunk_refs {
                     execution.checkpoint()?;
                     if self.persisted_chunk_has_visible_timestamp_in_time_range(
@@ -258,7 +260,8 @@ impl TimeRangeFilterContext<'_> {
                 }
 
                 Ok(false)
-            })
+            },
+        )
     }
 
     pub(super) fn series_postings_with_data_in_time_range(
@@ -289,8 +292,8 @@ impl TimeRangeFilterContext<'_> {
         let mut filtered = RoaringTreemap::new();
         let mut exact_scan_series_ids = RoaringTreemap::new();
         let mut control_error = None;
-        self.visibility_cache.with_visibility_cache_state(
-            |summaries, _, _| {
+        self.visibility_cache
+            .with_visibility_cache_state(|summaries, _, _| {
                 for series_id in series_ids {
                     if let Err(error) = execution.checkpoint() {
                         control_error = Some(error);
@@ -313,8 +316,7 @@ impl TimeRangeFilterContext<'_> {
                         }
                     }
                 }
-            },
-        );
+            });
         if let Some(error) = control_error {
             return Err(error.into());
         }

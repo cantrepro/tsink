@@ -294,11 +294,12 @@ The combined staged namespace, including generated manifest/registry files, is a
 restore's 100,000-entry limit; descendant depth is at most 128.
 
 Each secure session is capped at 64 MiB of modeled retained state. Every simultaneously live source
-session, staging manifest, verification manifest, and generated buffer shares one 128 MiB operation
-cap, admitted incrementally as manifests grow. Registry snapshot encoding admits its output and
-cloned-series scratch before either proportional allocation. The exact source identities are reused
-by the copy, and source and complete staged trees are remeasured through their anchors before
-publication. Copying uses length-bounded streams into a uniquely named sibling staging directory
+session, staging manifest, verification manifest, requested-path re-attestation anchor, and
+generated buffer shares one 128 MiB operation cap, admitted incrementally as manifests grow.
+Registry snapshot encoding admits its output and cloned-series scratch before either proportional
+allocation. The exact source identities are reused by the copy, and source and complete staged
+trees are remeasured through their anchors before publication. Copying uses length-bounded streams
+into a uniquely named sibling staging directory
 created relative to a retained parent handle. Permission changes apply to the already-open
 destination file, never its pathname. Every copied regular file is flushed and synchronized, every
 copied directory is synchronized, and source growth, shrinkage, change-time changes, type changes,
@@ -308,10 +309,13 @@ Publication uses an atomic no-replace rename, so a destination created by anothe
 preflight is preserved rather than overwritten. Linux and Android use
 `renameat2(RENAME_NOREPLACE)`, Apple platforms use `renamex_np(RENAME_EXCL)`, and Windows uses
 `MoveFileExW` without replacement. Other Unix targets fail explicitly when that safe primitive is
-not configured instead of using a racy check followed by an overwriting rename. Any failure before
-the rename reports and retains the handle-attested staging tree; it never rescans the staging
-pathname to “bless” a replacement for cleanup. Publication is relative to the retained parent and
-re-attests the caller-requested parent pathname afterward. If the rename succeeds but
+not configured instead of using a racy check followed by an overwriting rename. A failure before
+the rename never rescans the staging pathname to “bless” a replacement for cleanup. Cleanup first
+verifies the complete captured tree and admits bounded scratch. Windows dispositions the same
+exclusive `DELETE` handle whose identity was verified, closing the check/delete pathname window.
+Portable Unix has no identity-conditioned unlink primitive, so it reports that limitation and
+retains even a fully verified tree. Publication is relative to the retained parent and re-attests
+the caller-requested parent pathname afterward. If the rename succeeds but
 post-publication attestation or final parent synchronization fails, the visible destination is
 retained and the error says its durability or requested-path reachability is indeterminate. It is
 not recursively removed because another actor may already have created files below it. As
@@ -322,11 +326,13 @@ synchronization, not power-loss persistence of the new directory entry.
 The staging namespace is private to the operation: callers and other same-identity processes must
 not enumerate, rewrite, rename, or inject entries below `.tmp-tsink-snapshot-*` while a snapshot is
 running. Closed file identities, no-follow checks, and whole-tree verification detect ordinary
-pre-boundary replacements, but portable filesystems do not expose an atomic
-conditional rename by source identity. On Windows, `MoveFileExW` also requires a narrow release of
-the staging-root no-delete handle immediately before the move; retained parent/ancestor handles and
-post-move identity verification bound but do not eliminate a hostile same-UID race in that
-interval. Unix canonicalization of an existing alias (for example `/var` to `/private/var`) is
+pre-boundary replacements, but portable filesystems do not expose an atomic conditional rename by
+source identity. On Windows, `MoveFileExW` also requires a narrow release of the staging-root
+no-delete handle immediately before the move. A reported rename failure probes both the old and new
+names for the expected root identity: visibility at the destination is classified as committed and
+retained, while an exact source identity can carry cleanup ownership. Retained parent/ancestor
+handles and post-move identity verification bound but do not eliminate a hostile same-UID race in
+that interval. Unix canonicalization of an existing alias (for example `/var` to `/private/var`) is
 compatibility normalization before the anchor is acquired, not a claim that a hostile actor cannot
 mutate the alias during that initial resolution.
 
@@ -372,9 +378,12 @@ If a target already exists, activation identity-checks and moves it to a distinc
 relative to the retained parent, synchronizes that parent, publishes the staged tree into an absent
 target, and synchronizes the parent again. Both renames use atomic no-replace primitives, so a
 concurrently installed backup or target is preserved and makes restore fail rather than being
-overwritten. A failure before staging publication attempts an identity-attested backup-to-target
-rollback through the same parent anchor. Once staging is visible as the target, failure never rolls
-it back or deletes it; the visible target and backup are reported and retained.
+overwritten. On Windows, a reported failure from either replacement rename probes both names for
+the exact expected identity, so a move that committed before the error is classified from the
+observed namespace rather than retried blindly. A failure before staging publication attempts an
+identity-attested backup-to-target rollback through the same parent anchor. Once staging is visible
+as the target, failure never rolls it back or deletes it; the visible target and backup are reported
+and retained.
 
 After successful replacement publication, restore verifies the original target against its
 retained pre-move manifest and removes that exact backup with handle-relative cleanup. A normal
@@ -388,9 +397,12 @@ restore committed but accounting reconciliation failed.
 
 Restore is offline for the containing namespace as well as the target: callers must exclude
 same-identity processes that mutate the target, backup, or `.tmp-tsink-restore-*` entries during
-the operation. Unknown entries observed at a cleanup boundary are retained, but the same portable
-conditional-unlink limitation described for snapshot staging applies to an actor racing inside the
-last identity-check syscall window.
+the operation. Windows cleanup holds each exact `DELETE` handle through disposition. Unknown
+entries observed at a cleanup boundary are retained, but portable Unix backup/validation cleanup
+has no identity-conditioned unlink and is not safe against an actor racing inside the last
+identity-check syscall window. Its pathname deletion therefore relies on the caller-enforced
+offline namespace exclusion; retained handles and manifest verification do not replace that
+precondition.
 
 Server restore requires a separate offline root and finite limit and retains that root's process
 lease until listener drain and storage shutdown complete. Standalone restore, the compatibility

@@ -27,14 +27,11 @@ impl<'a> DeleteBridgeContext<'a> {
         let ranges = matched_series_ids.iter().fold(0usize, |total, series_id| {
             let existing_ranges = storage
                 .tombstone_read_context()
-                .with_series_tombstone_range_sources(
-                    *series_id,
-                    |local, remote| {
-                        local
-                            .map_or(0, |ranges| ranges.len())
-                            .saturating_add(remote.map_or(0, |ranges| ranges.len()))
-                    },
-                );
+                .with_series_tombstone_range_sources(*series_id, |local, remote| {
+                    local
+                        .map_or(0, |ranges| ranges.len())
+                        .saturating_add(remote.map_or(0, |ranges| ranges.len()))
+                });
             total.saturating_add(
                 existing_ranges
                     .saturating_add(1)

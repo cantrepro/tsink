@@ -362,7 +362,83 @@ impl ChunkStorage {
         Ok(true)
     }
 
+    pub(in super::super) fn drain_known_dirty_persisted_refresh_if_pending(&self) -> Result<bool> {
+        let ctx = self.catalog_refresh_context();
+        let mut progressed = false;
+        // Snapshot only the number of exact root intents, never their path payloads. Manual flush
+        // holds the compaction gate and close has stopped lifecycle producers, so this is a hard
+        // termination bound as well as a guard against an unexpected producer keeping this
+        // synchronous loop alive forever.
+        let root_pages = {
+            let pending = self.persisted.pending_persisted_segment_diff.lock();
+            pending
+                .added_roots
+                .len()
+                .checked_add(pending.removed_roots.len())
+                .ok_or_else(|| {
+                    TsinkError::Other(
+                        "known-dirty catalog drain page count exceeds the supported range"
+                            .to_string(),
+                    )
+                })?
+        };
+        for _ in 0..root_pages {
+            if !ctx.has_known_persisted_segment_changes() {
+                break;
+            }
+            if !self.apply_known_dirty_persisted_refresh_if_pending()? {
+                return Err(TsinkError::Other(
+                    "known-dirty catalog drain made no progress while work remained".to_string(),
+                ));
+            }
+            progressed = true;
+        }
+        if ctx.has_known_persisted_segment_changes() {
+            return Err(TsinkError::Other(
+                "known-dirty catalog drain observed new work after its fenced page snapshot"
+                    .to_string(),
+            ));
+        }
+
+        // A finite tiered transition can commit the in-memory root mutation while retaining a
+        // cursor for the complete shared catalog image. Drain the final cursor only after all
+        // one-root pages have applied: an intervening root mutation legitimately invalidates an
+        // older cursor, whereas the terminal cursor represents the complete resulting snapshot.
+        if self.finite_tiered_catalog_publication_enabled()
+            && self.bounded_tiered_catalog_publication_is_pending()
+        {
+            let publication = self.begin_persisted_catalog_publication();
+            let completed = self.advance_bounded_tiered_catalog_publication(true)?;
+            if !completed {
+                return Err(TsinkError::Other(
+                    "bounded tiered catalog drain returned without completing its cursor"
+                        .to_string(),
+                ));
+            }
+            ctx.synchronize_persisted_index_dirty_with_pending();
+            drop(publication);
+            progressed = true;
+        }
+
+        if ctx.has_known_persisted_segment_changes() {
+            return Err(TsinkError::Other(
+                "known-dirty catalog drain observed new work while completing its terminal catalog"
+                    .to_string(),
+            ));
+        }
+
+        Ok(progressed)
+    }
+
     pub(in super::super) fn refresh_dirty_persisted_segments_claimed(&self) -> Result<()> {
+        let ctx = self.catalog_refresh_context();
+        if self.coordination.lifecycle.load(Ordering::Acquire) != STORAGE_OPEN {
+            self.drain_known_dirty_persisted_refresh_if_pending()?;
+            if !ctx.persisted_index_dirty() {
+                return Ok(());
+            }
+        }
+
         if self.apply_known_dirty_persisted_refresh_if_pending()? {
             return Ok(());
         }
@@ -373,12 +449,6 @@ impl ChunkStorage {
             let publication = self.begin_persisted_catalog_publication();
             let completed = self.advance_bounded_tiered_catalog_publication(false)?;
             if completed {
-                let inventory = self.persisted_segment_inventory();
-                self.persist_series_registry_index_with_catalog_update(
-                    &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
-                        registry_catalog::inventory_sources(&inventory),
-                    ),
-                )?;
                 self.synchronize_persisted_index_dirty_with_pending();
             }
             drop(publication);
@@ -411,9 +481,49 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        // ExpertUnlimited preserves the explicit complete-snapshot behavior. A finite tiered
-        // writer still enters through this inventory transition, but its catalog publication is
-        // advanced by the bounded writer cursor rather than encoded synchronously.
+        if finite_maintenance && self.persisted.tiered_storage.is_some() {
+            self.reset_bounded_unknown_dirty_catalog_refresh();
+            let drain_catalog = self.coordination.lifecycle.load(Ordering::Acquire) != STORAGE_OPEN;
+            match self.runtime.runtime_mode {
+                StorageRuntimeMode::ReadWrite => {
+                    // A finite writer owns both its local data path and the shared tier lease.
+                    // Every ordinary root mutation carries an exact diff; an otherwise unknown
+                    // dirty bit therefore represents catalog/registry publication debt, not
+                    // permission to materialize every physical tier into one legacy transition.
+                    // Reconcile the authoritative visible state through the resumable complete
+                    // writer instead.
+                    self.validate_shared_object_store_writer_lock()?;
+                    self.coordination
+                        .bounded_registry_reconciliation_required
+                        .store(true, Ordering::Release);
+                    let publication = self.begin_persisted_catalog_publication();
+                    let completed =
+                        self.advance_bounded_tiered_catalog_publication(drain_catalog)?;
+                    drop(publication);
+                    if completed {
+                        ctx.synchronize_persisted_index_dirty_with_pending();
+                    } else {
+                        ctx.set_persisted_index_dirty(true);
+                    }
+                }
+                StorageRuntimeMode::ComputeOnly => {
+                    if drain_catalog {
+                        self.drain_remote_catalog_bounded()?;
+                        ctx.mark_remote_catalog_refresh_success();
+                        ctx.synchronize_persisted_index_dirty_with_pending();
+                    } else {
+                        // Compute-only visibility is defined by the remote catalog. Leave this
+                        // debt for the scheduled remote path above so its configured interval and
+                        // failure backoff remain authoritative; never fall through to the local
+                        // full scan.
+                        ctx.set_persisted_index_dirty(true);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // ExpertUnlimited preserves the explicit complete-snapshot behavior.
         self.reset_bounded_unknown_dirty_catalog_refresh();
         let loaded = self.load_scanned_catalog_refresh()?;
         let planned = self
@@ -426,13 +536,36 @@ impl ChunkStorage {
         Ok(())
     }
 
+    fn drain_remote_catalog_bounded(&self) -> Result<()> {
+        let config = self.persisted.tiered_storage.as_ref().ok_or_else(|| {
+            TsinkError::InvalidConfiguration(
+                "finite remote catalog drain requires tiered storage".to_string(),
+            )
+        })?;
+        let pinned = tiering::require_shared_segment_catalog_pointer(config)?;
+        loop {
+            let completed = self.refresh_remote_catalog_bounded()?;
+            let observed = tiering::require_shared_segment_catalog_pointer(config)?;
+            if observed != pinned {
+                self.reset_bounded_remote_catalog_refresh();
+                return Err(TsinkError::Other(
+                    "remote segment catalog changed during close drain".to_string(),
+                ));
+            }
+            if completed {
+                return Ok(());
+            }
+        }
+    }
+
     fn refresh_remote_catalog_claimed(&self) -> Result<()> {
         let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
             || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
         if finite_maintenance {
             if self.refresh_remote_catalog_bounded()? {
-                self.catalog_refresh_context()
-                    .mark_remote_catalog_refresh_success();
+                let ctx = self.catalog_refresh_context();
+                ctx.mark_remote_catalog_refresh_success();
+                ctx.synchronize_persisted_index_dirty_with_pending();
             }
             return Ok(());
         }

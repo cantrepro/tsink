@@ -104,8 +104,9 @@ pub(in crate::engine::storage_engine) use core_impl::{
     WriteResolveContext, WriteSeriesValidationContext,
 };
 pub(in crate::engine::storage_engine) use maintenance::{
-    BackgroundCatalogRefreshCursor, MemoryReservationAdmissionContext,
-    RemoteCatalogMemoryAccounting, WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
+    BackgroundCatalogRefreshCursor, BackgroundPostFlushRecoveryCursor,
+    MemoryReservationAdmissionContext, RemoteCatalogMemoryAccounting,
+    WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::{DataPathProcessLock, SharedObjectStoreProcessLock};
@@ -264,7 +265,7 @@ struct BackgroundTombstoneRecoverySnapshotCursor {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MaintenancePassSelection {
-    items: usize,
+    inspected_items: usize,
     input_bytes: u64,
 }
 
@@ -309,8 +310,7 @@ struct VisibilityState {
     /// Durable local/startup base view. Read-write mutation remains in-place under this lock.
     tombstones: Arc<RwLock<crate::engine::tombstone::TombstoneMap>>,
     /// Finite compute-only refresh publishes this fixed-fanout immutable overlay by `Arc` swap.
-    remote_tombstones:
-        RwLock<Arc<crate::engine::tombstone::ImmutableTombstoneSnapshot>>,
+    remote_tombstones: RwLock<Arc<crate::engine::tombstone::ImmutableTombstoneSnapshot>>,
     materialized_series: RwLock<BTreeSet<SeriesId>>,
     series_visibility_summaries: RwLock<HashMap<SeriesId, state::SeriesVisibilitySummary>>,
     series_visible_max_timestamps: RwLock<HashMap<SeriesId, Option<i64>>>,
@@ -402,7 +402,13 @@ struct MemoryAccountingState {
 struct CoordinationState {
     post_flush_maintenance_pending: AtomicBool,
     startup_metadata_reconcile_pending: AtomicBool,
+    prefer_metadata_reconcile_on_maintenance_tie: AtomicBool,
+    /// A finite tiered writer has made (or may have made) visible inventory changes whose
+    /// registry sidecar still needs an exact complete reconciliation. Unlike the process-local
+    /// publication cursor, this bit deliberately survives cursor invalidation.
+    bounded_registry_reconciliation_required: AtomicBool,
     background_retention_maintenance_cursor: Mutex<BackgroundRetentionMaintenanceCursor>,
+    background_post_flush_recovery_cursor: Mutex<BackgroundPostFlushRecoveryCursor>,
     background_metadata_reconciliation_cursor: Mutex<BackgroundMetadataReconciliationCursor>,
     background_tombstone_recovery_snapshot_cursor: Mutex<BackgroundTombstoneRecoverySnapshotCursor>,
     background_catalog_refresh_cursor: Mutex<BackgroundCatalogRefreshCursor>,
@@ -1377,7 +1383,7 @@ impl Storage for ChunkStorage {
                     })
                     .map(Path::to_path_buf)
             });
-        let aggregate_namespace_fence = aggregate_namespace_path
+        let mut aggregate_namespace_fence = aggregate_namespace_path
             .as_deref()
             .map(|path| {
                 crate::engine::fs_utils::SecureSnapshotNamespaceFence::open_with_operation_baseline(
@@ -1395,7 +1401,7 @@ impl Storage for ChunkStorage {
                 return Ok(None);
             };
             if let Some(fence) = &aggregate_namespace_fence {
-                fence.attest()?;
+                fence.attest(source_retained_bytes)?;
             }
             let tree = crate::engine::fs_utils::SecureSnapshotSourceTree::
                 open_optional_and_measure_with_operation_baseline(
@@ -1411,7 +1417,7 @@ impl Storage for ChunkStorage {
                     )?;
             }
             if let Some(fence) = &aggregate_namespace_fence {
-                fence.attest()?;
+                fence.attest(source_retained_bytes)?;
             }
             Ok(tree)
         };
@@ -1430,7 +1436,7 @@ impl Storage for ChunkStorage {
                 let path =
                     data_path.join(data_directory_manifest::DATA_DIRECTORY_MANIFEST_FILE_NAME);
                 if let Some(fence) = &aggregate_namespace_fence {
-                    fence.attest()?;
+                    fence.attest(source_retained_bytes)?;
                 }
                 let file = crate::engine::fs_utils::SecureSnapshotSourceFile::
                     open_with_operation_baseline(&path, source_retained_bytes)?;
@@ -1441,7 +1447,7 @@ impl Storage for ChunkStorage {
                         &path,
                     )?;
                 if let Some(fence) = &aggregate_namespace_fence {
-                    fence.attest()?;
+                    fence.attest(source_retained_bytes)?;
                 }
                 Some(file)
             } else {
@@ -1455,7 +1461,7 @@ impl Storage for ChunkStorage {
         let catalog_snapshot = match snapshot_catalog_path {
             Some(path) => {
                 if let Some(fence) = &aggregate_namespace_fence {
-                    fence.attest()?;
+                    fence.attest(source_retained_bytes)?;
                 }
                 let file = crate::engine::fs_utils::SecureSnapshotSourceFile::
                     open_optional_with_operation_baseline(path, source_retained_bytes)?;
@@ -1468,7 +1474,7 @@ impl Storage for ChunkStorage {
                         )?;
                 }
                 if let Some(fence) = &aggregate_namespace_fence {
-                    fence.attest()?;
+                    fence.attest(source_retained_bytes)?;
                 }
                 file
             }
@@ -1507,7 +1513,7 @@ impl Storage for ChunkStorage {
         }
         ensure_snapshot_aggregate_entry_limit(aggregate_snapshot_entries)?;
         if let Some(fence) = &aggregate_namespace_fence {
-            fence.attest()?;
+            fence.attest(source_retained_bytes)?;
         }
 
         crate::engine::fs_utils::create_dir_all_and_sync_parents(destination_parent)?;
@@ -1617,12 +1623,87 @@ impl Storage for ChunkStorage {
                 staging_path.display()
             )));
         }
-        #[cfg(test)]
-        if let Err(publication_err) = self.invoke_snapshot_pre_publication_hook() {
+
+        let attest_requested_source_namespaces =
+            |operation_live_retained_bytes: usize| -> Result<()> {
+                for (requested_path, source) in [
+                    (
+                        self.persisted.numeric_lane_path.as_deref(),
+                        numeric_snapshot.as_ref(),
+                    ),
+                    (
+                        self.persisted.blob_lane_path.as_deref(),
+                        blob_snapshot.as_ref(),
+                    ),
+                    (wal_dir.as_deref(), wal_snapshot.as_ref()),
+                    (rollup_snapshot_path, rollup_snapshot.as_ref()),
+                ] {
+                    let Some(requested_path) = requested_path else {
+                        continue;
+                    };
+                    if let Some(source) = source {
+                        source
+                            .verify_requested_namespace_unchanged(operation_live_retained_bytes)?;
+                    } else {
+                        crate::engine::fs_utils::attest_secure_snapshot_requested_path_absent(
+                            requested_path,
+                            operation_live_retained_bytes,
+                        )?;
+                    }
+                }
+                if let Some(manifest) = &manifest_snapshot {
+                    manifest.verify_requested_namespace_unchanged(operation_live_retained_bytes)?;
+                }
+                match (snapshot_catalog_path, catalog_snapshot.as_ref()) {
+                    (Some(_), Some(catalog)) => catalog
+                        .verify_requested_namespace_unchanged(operation_live_retained_bytes)?,
+                    (Some(path), None) => {
+                        crate::engine::fs_utils::attest_secure_snapshot_requested_path_absent(
+                            path,
+                            operation_live_retained_bytes,
+                        )?;
+                    }
+                    (None, _) => {}
+                }
+                Ok(())
+            };
+
+        let snapshot_live_retained_bytes =
+            crate::engine::fs_utils::admit_secure_snapshot_operation_retained_bytes(
+                &[source_retained_bytes, staging.retained_memory_bytes()],
+                "secure snapshot final namespace re-attestation",
+                destination,
+            )?;
+        let aggregate_rebaseline_result = (|| -> Result<()> {
+            attest_requested_source_namespaces(snapshot_live_retained_bytes)?;
+            if let Some(fence) = aggregate_namespace_fence.as_mut() {
+                fence.rebaseline_same_stable_identity(snapshot_live_retained_bytes)?;
+            }
+            attest_requested_source_namespaces(snapshot_live_retained_bytes)?;
+            if let Some(fence) = &aggregate_namespace_fence {
+                fence.attest(snapshot_live_retained_bytes)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = aggregate_rebaseline_result {
             return Err(TsinkError::Other(format!(
-                "snapshot pre-publication hook failed: {publication_err}; retaining handle-attested staging tree at {}",
+                "snapshot source changed while rebaselining after staging creation: {err}; retaining handle-attested staging tree at {}",
                 staging_path.display()
             )));
+        }
+
+        #[cfg(test)]
+        if let Err(publication_err) = self.invoke_snapshot_pre_publication_hook() {
+            return match staging.remove_exact_created_tree() {
+                Ok(()) => Err(TsinkError::Other(format!(
+                    "snapshot pre-publication hook failed: {publication_err}; removed the exactly verified owned staging tree at {}",
+                    staging_path.display()
+                ))),
+                Err(cleanup_err) => Err(TsinkError::Other(format!(
+                    "snapshot pre-publication hook failed: {publication_err}; exact identity-attested cleanup did not complete: {cleanup_err}; staging may remain at {}",
+                    staging_path.display()
+                ))),
+            };
         }
 
         let final_source_verification = (|| -> Result<()> {
@@ -1633,7 +1714,7 @@ impl Storage for ChunkStorage {
                     destination,
                 )?;
             if let Some(fence) = &aggregate_namespace_fence {
-                fence.attest()?;
+                fence.attest(verification_baseline)?;
             }
             for tree in [
                 numeric_snapshot.as_ref(),
@@ -1645,7 +1726,7 @@ impl Storage for ChunkStorage {
             .flatten()
             {
                 tree.verify_unchanged(verification_baseline)?;
-                tree.verify_requested_namespace_unchanged()?;
+                tree.verify_requested_namespace_unchanged(verification_baseline)?;
             }
             if let Some(manifest) = &manifest_snapshot {
                 manifest.verify_unchanged()?;
@@ -1653,8 +1734,9 @@ impl Storage for ChunkStorage {
             if let Some(catalog) = &catalog_snapshot {
                 catalog.verify_unchanged()?;
             }
+            attest_requested_source_namespaces(verification_baseline)?;
             if let Some(fence) = &aggregate_namespace_fence {
-                fence.attest()?;
+                fence.attest(verification_baseline)?;
             }
             Ok(())
         })();
@@ -1665,23 +1747,30 @@ impl Storage for ChunkStorage {
             )));
         }
 
-        staging
-            .publish_noreplace(destination)
-            .map_err(|publication| {
-                if publication.published {
-                    TsinkError::Other(format!(
-                        "snapshot reached visible destination {} but post-publication attestation or parent synchronization failed: {}; the visible destination is retained",
-                        destination.display(),
-                        publication.error
-                    ))
-                } else {
-                    TsinkError::Other(format!(
-                        "snapshot publication failed before rename: {}; retaining handle-attested staging tree at {}",
-                        publication.error,
-                        staging_path.display()
-                    ))
-                }
-            })?;
+        if let Err(publication) = staging.publish_noreplace(destination) {
+            if publication.published {
+                return Err(TsinkError::Other(format!(
+                    "snapshot reached visible destination {} but post-publication attestation or parent synchronization failed: {}; the visible destination is retained",
+                    destination.display(),
+                    publication.error
+                )));
+            }
+            let (publication_err, cleanup) = publication.into_error_and_verified_cleanup();
+            return match cleanup {
+                Some(Ok(())) => Err(TsinkError::Other(format!(
+                    "snapshot publication failed before rename: {publication_err}; removed the exactly verified losing staging tree at {}",
+                    staging_path.display()
+                ))),
+                Some(Err(cleanup_err)) => Err(TsinkError::Other(format!(
+                    "snapshot publication failed before rename: {publication_err}; exact identity-attested cleanup did not complete: {cleanup_err}; staging may remain at {}",
+                    staging_path.display()
+                ))),
+                None => Err(TsinkError::Other(format!(
+                    "snapshot publication failed before rename: {publication_err}; retaining unverified or identity-unattested staging tree at {}",
+                    staging_path.display()
+                ))),
+            };
+        }
         drop(write_permits);
         Ok(())
     }

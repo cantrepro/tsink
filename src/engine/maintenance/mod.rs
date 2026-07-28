@@ -18,7 +18,8 @@ pub(in crate::engine::storage_engine) use self::memory_accounting::{
 
 pub(in crate::engine::storage_engine) use self::post_flush::recovery::{
     ensure_no_pending_post_flush_replacement, finalize_pending_post_flush_replacements_for_startup,
-    is_post_flush_replacement_marker_name, POST_FLUSH_REPLACEMENT_DIR_NAME,
+    is_post_flush_replacement_marker_name, BackgroundPostFlushRecoveryCursor,
+    POST_FLUSH_REPLACEMENT_DIR_NAME,
 };
 
 use std::collections::BTreeSet;
@@ -199,12 +200,10 @@ impl<'a> PersistedCatalogPublicationGuard<'a> {
         &self,
         transition: PersistedCatalogTransition,
     ) -> Result<PersistedCatalogRefreshApply> {
-        self.publish_transition_with_finite_recovery_budget(
-            transition,
-            self.storage.runtime.maintenance_max_items_per_pass,
-            self.storage.runtime.maintenance_max_bytes_per_pass,
-            false,
-        )
+        // Generic foreground and lifecycle publications are not maintenance pages. They still
+        // reserve their transition staging and recover a committed tombstone transaction before
+        // mutation, but must not spend the background worker's finite per-pass allowance.
+        self.publish_transition_with_finite_recovery_budget(transition, usize::MAX, u64::MAX, false)
     }
 
     pub(super) fn publish_transition_with_finite_recovery_budget(

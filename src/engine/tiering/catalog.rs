@@ -529,7 +529,9 @@ fn segment_catalog_generation_file_name(generation: u64) -> String {
     )
 }
 
-fn parse_segment_catalog_generation_file_name(name: &str) -> Option<u64> {
+pub(in crate::engine::storage_engine) fn parse_segment_catalog_generation_file_name(
+    name: &str,
+) -> Option<u64> {
     let encoded = name
         .strip_prefix(SEGMENT_CATALOG_GENERATION_FILE_PREFIX)?
         .strip_suffix(SEGMENT_CATALOG_GENERATION_FILE_SUFFIX)?;
@@ -1533,6 +1535,42 @@ pub(in crate::engine::storage_engine) fn cleanup_old_segment_catalog_generations
 ) -> Result<()> {
     ensure_segment_catalog_generation_directory(directory)?;
     let _ = count_segment_catalog_generation_namespace(directory)?;
+    // Keep the current immutable generation and its nearest regular predecessor. A finite reader
+    // can retain the predecessor path until its next charged pointer fence; deleting every
+    // non-current generation immediately after pointer replacement turns ordinary churn into a
+    // spurious NotFound error.
+    let mut predecessor_generation = None;
+    if let Some(current_generation) = current_generation {
+        let reader = std::fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        for entry in reader {
+            let entry = entry.map_err(|source| TsinkError::IoWithPath {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+            let Some(generation) = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_segment_catalog_generation_file_name)
+            else {
+                continue;
+            };
+            if generation >= current_generation {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|source| TsinkError::IoWithPath {
+                path: entry.path(),
+                source,
+            })?;
+            if !file_type.is_symlink() && file_type.is_file() {
+                predecessor_generation = Some(
+                    predecessor_generation.map_or(generation, |prior: u64| prior.max(generation)),
+                );
+            }
+        }
+    }
     let reader = std::fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
         path: directory.to_path_buf(),
         source,
@@ -1548,7 +1586,7 @@ pub(in crate::engine::storage_engine) fn cleanup_old_segment_catalog_generations
         let Some(generation) = parse_segment_catalog_generation_file_name(&name) else {
             continue;
         };
-        if Some(generation) == current_generation {
+        if Some(generation) == current_generation || Some(generation) == predecessor_generation {
             continue;
         }
         let file_type = entry.file_type().map_err(|source| TsinkError::IoWithPath {
@@ -1566,6 +1604,55 @@ pub(in crate::engine::storage_engine) fn cleanup_old_segment_catalog_generations
         )?;
     }
     Ok(())
+}
+
+/// Chooses one collision-free generation after a caller has already enumerated the complete
+/// bounded namespace. Unlike the compatibility helper, this performs one exact final path probe
+/// rather than up to `namespace_count + 1` uncharged probes.
+pub(in crate::engine::storage_engine) fn choose_next_segment_catalog_generation_after_observed(
+    directory: &Path,
+    current: Option<SegmentCatalogPointer>,
+    namespace_count: usize,
+    max_observed_generation: Option<u64>,
+) -> Result<u64> {
+    if namespace_count >= MAX_RECOVERY_NAMESPACE_ENTRIES {
+        return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+            operation: "segment catalog generation publication",
+            limit: MAX_RECOVERY_NAMESPACE_ENTRIES,
+            required: namespace_count.saturating_add(1),
+        });
+    }
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    let after_current = match current {
+        Some(pointer) => pointer.generation.checked_add(1).ok_or_else(|| {
+            TsinkError::DataCorruption(
+                "segment catalog generation counter is exhausted".to_string(),
+            )
+        })?,
+        None => 1,
+    };
+    let after_observed = match max_observed_generation {
+        Some(generation) => generation.checked_add(1).ok_or_else(|| {
+            TsinkError::DataCorruption(
+                "segment catalog generation counter is exhausted".to_string(),
+            )
+        })?,
+        None => 1,
+    };
+    let candidate = wall_clock.max(after_current).max(after_observed).max(1);
+    let path = directory.join(segment_catalog_generation_file_name(candidate));
+    match std::fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+        Ok(_) => Err(TsinkError::DataCorruption(format!(
+            "segment catalog generation namespace changed after its bounded scan: {}",
+            path.display()
+        ))),
+        Err(source) => Err(TsinkError::IoWithPath { path, source }),
+    }
 }
 
 fn choose_next_segment_catalog_generation(
@@ -2367,8 +2454,32 @@ mod tests {
         let second =
             persist_shared_segment_catalog_budgeted(&config, &second_inventory, None).unwrap();
         assert!(second.generation > first.generation);
-        assert!(!shared_segment_catalog_generation_path(&config, first.generation).exists());
+        assert!(
+            shared_segment_catalog_generation_path(&config, first.generation).exists(),
+            "the immediate predecessor must remain readable across one pointer change"
+        );
         assert!(shared_segment_catalog_generation_path(&config, second.generation).exists());
+        assert!(
+            unknown.exists(),
+            "unknown namespace entries must never be deleted"
+        );
+
+        let third_inventory = SegmentInventory::from_entries(vec![inventory_entry(
+            &config,
+            SegmentLaneFamily::Numeric,
+            PersistedSegmentTier::Cold,
+            2,
+            3,
+        )]);
+        let third =
+            persist_shared_segment_catalog_budgeted(&config, &third_inventory, None).unwrap();
+        assert!(third.generation > second.generation);
+        assert!(
+            !shared_segment_catalog_generation_path(&config, first.generation).exists(),
+            "a generation older than the immediate predecessor must be collected"
+        );
+        assert!(shared_segment_catalog_generation_path(&config, second.generation).exists());
+        assert!(shared_segment_catalog_generation_path(&config, third.generation).exists());
         assert!(
             unknown.exists(),
             "unknown namespace entries must never be deleted"
@@ -2382,10 +2493,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.entries().len(), 1);
-        assert_eq!(legacy.entries()[0].manifest.segment_id, 2);
+        assert_eq!(legacy.entries()[0].manifest.segment_id, 3);
         assert_eq!(
             require_shared_segment_catalog_pointer(&config).unwrap(),
-            second
+            third
         );
     }
 
@@ -2419,8 +2530,23 @@ mod tests {
             persist_shared_segment_catalog_budgeted(&config, &second_inventory, Some(&budget))
                 .unwrap();
         assert!(second.generation > first.generation);
+        assert!(shared_segment_catalog_generation_path(&config, first.generation).exists());
+        assert!(shared_segment_catalog_generation_path(&config, second.generation).exists());
+
+        let third_inventory = SegmentInventory::from_entries(vec![inventory_entry(
+            &config,
+            SegmentLaneFamily::Numeric,
+            PersistedSegmentTier::Cold,
+            2,
+            3,
+        )]);
+        let third =
+            persist_shared_segment_catalog_budgeted(&config, &third_inventory, Some(&budget))
+                .unwrap();
+        assert!(third.generation > second.generation);
         assert!(!shared_segment_catalog_generation_path(&config, first.generation).exists());
         assert!(shared_segment_catalog_generation_path(&config, second.generation).exists());
+        assert!(shared_segment_catalog_generation_path(&config, third.generation).exists());
 
         let snapshot = budget.snapshot();
         assert_eq!(snapshot.active_reservations, 0);

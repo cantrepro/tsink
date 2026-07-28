@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use super::super::super::tiering::{
     self, SegmentCatalogGenerationReadCursor, SegmentCatalogPointer, SegmentInventoryEntry,
     SEGMENT_CATALOG_MAX_ENTRIES, SEGMENT_CATALOG_MAX_GENERATION_BYTES,
+    SEGMENT_CATALOG_POINTER_BYTES,
 };
 use super::bounded_scan::{
     modeled_removal_bytes, modeled_segment_source_bytes, CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD,
@@ -41,6 +42,7 @@ const REMOTE_CATALOG_APPLY_POSTINGS_COPIES: usize = 3;
 
 enum BoundedRemoteCatalogRefreshPhase {
     Scanning,
+    ValidatePointerBeforeApply,
     Tombstones,
     Adding { after_root: Option<PathBuf> },
     Removing { after_root: Option<PathBuf> },
@@ -72,6 +74,11 @@ pub(super) struct BoundedRemoteCatalogRefreshCycle {
     phase: BoundedRemoteCatalogRefreshPhase,
     tombstone_cycle: Option<BoundedRemoteTombstoneRefreshCycle>,
     pending_page: Option<PendingRemoteCatalogRefreshPage>,
+    /// Once publication has been entered, an error may have happened after the live index was
+    /// updated but before its exact registry-catalog delta was durable. Preserve that page across
+    /// error backoff until the same intent either applies or is invalidated by a newer visibility
+    /// generation.
+    publication_retry_pending: bool,
     invalidated: bool,
 }
 
@@ -116,6 +123,7 @@ impl BoundedRemoteCatalogRefreshCycle {
             phase: BoundedRemoteCatalogRefreshPhase::Scanning,
             tombstone_cycle: None,
             pending_page: None,
+            publication_retry_pending: false,
             invalidated: false,
         };
         debug_assert!(
@@ -489,6 +497,41 @@ impl ChunkStorage {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn bounded_remote_catalog_generation_for_test(
+        &self,
+    ) -> Option<u64> {
+        self.coordination
+            .background_catalog_refresh_cursor
+            .lock()
+            .remote_cycle
+            .as_ref()
+            .map(|cycle| cycle.pointer.generation)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn bounded_remote_catalog_addition_ready_for_test(
+        &self,
+    ) -> bool {
+        let cursor = self.coordination.background_catalog_refresh_cursor.lock();
+        cursor.remote_cycle.as_ref().is_some_and(|cycle| {
+            matches!(
+                cycle.pending_page.as_ref(),
+                Some(PendingRemoteCatalogRefreshPage::Add { .. })
+            ) || matches!(
+                &cycle.phase,
+                BoundedRemoteCatalogRefreshPhase::Adding { .. }
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn advance_bounded_remote_catalog_without_addition_for_test(
+        &self,
+    ) -> Result<bool> {
+        self.refresh_remote_catalog_bounded_impl(true)
+    }
+
     fn remote_catalog_pointer_matches(&self, pointer: SegmentCatalogPointer) -> Result<bool> {
         let config = self.persisted.tiered_storage.as_ref().ok_or_else(|| {
             TsinkError::InvalidConfiguration(
@@ -567,11 +610,7 @@ impl ChunkStorage {
                     cycle.pointer.entry_count
                 )));
             }
-            if !self.remote_catalog_pointer_matches(cycle.pointer)? {
-                cycle.invalidated = true;
-                return Ok(true);
-            }
-            cycle.phase = BoundedRemoteCatalogRefreshPhase::Tombstones;
+            cycle.phase = BoundedRemoteCatalogRefreshPhase::ValidatePointerBeforeApply;
         }
         Ok(!deferred_frame && (page_bytes != 0 || page_items != 0 || complete))
     }
@@ -1008,6 +1047,7 @@ impl ChunkStorage {
         let current_generation = self.visibility_state_generation();
         let outcome = match result {
             Ok(PersistedCatalogRefreshApply::Applied) => {
+                cycle.publication_retry_pending = false;
                 match cycle
                     .pending_page
                     .take()
@@ -1037,6 +1077,7 @@ impl ChunkStorage {
                 unreachable!("compute-only remote catalog deltas do not publish writer catalogs")
             }
             Ok(PersistedCatalogRefreshApply::SkippedStaleVisibleState) => {
+                cycle.publication_retry_pending = false;
                 cycle.expected_visibility_generation = current_generation;
                 cycle.invalidated = true;
                 Ok(false)
@@ -1046,6 +1087,7 @@ impl ChunkStorage {
                 // and rebase only its fence so retry finishes its sidecar work without double
                 // counting the visible tier.
                 cycle.expected_visibility_generation = current_generation;
+                cycle.publication_retry_pending = true;
                 Err(err)
             }
         };
@@ -1230,29 +1272,29 @@ impl ChunkStorage {
     /// The immutable generation is fully validated before any live mutation. Additions precede
     /// removals, and success requires a distinct terminal pointer fence.
     pub(in crate::engine::storage_engine) fn refresh_remote_catalog_bounded(&self) -> Result<bool> {
+        self.refresh_remote_catalog_bounded_impl(false)
+    }
+
+    fn refresh_remote_catalog_bounded_impl(&self, stop_before_addition: bool) -> Result<bool> {
         let config = self.persisted.tiered_storage.as_ref().ok_or_else(|| {
             TsinkError::InvalidConfiguration(
                 "finite remote catalog refresh requires tiered storage".to_string(),
             )
         })?;
-        let observed_pointer = match tiering::require_shared_segment_catalog_pointer(config) {
-            Ok(pointer) => pointer,
-            Err(err) => {
-                self.reset_bounded_remote_catalog_refresh();
-                return Err(err);
-            }
-        };
+        let mut budget = RemoteCatalogPassBudget::new(
+            self.runtime.maintenance_max_items_per_pass,
+            self.runtime.maintenance_max_bytes_per_pass,
+        );
         let mut cursor = self.coordination.background_catalog_refresh_cursor.lock();
-        if cursor
-            .remote_cycle
-            .as_ref()
-            .is_some_and(|cycle| cycle.pointer != observed_pointer)
-        {
-            if let Some(mut cycle) = cursor.remote_cycle.take() {
-                cycle.release_retained_tombstone_bytes(self);
-            }
-        }
         if cursor.remote_cycle.is_none() {
+            if !budget.charge_for(
+                REMOTE_CATALOG_SCAN_OPERATION,
+                1,
+                SEGMENT_CATALOG_POINTER_BYTES as u64,
+            )? {
+                return Ok(false);
+            }
+            let observed_pointer = tiering::require_shared_segment_catalog_pointer(config)?;
             cursor.remote_cycle = Some(BoundedRemoteCatalogRefreshCycle::new(
                 self,
                 config,
@@ -1279,17 +1321,43 @@ impl ChunkStorage {
             ));
         }
 
-        let mut budget = RemoteCatalogPassBudget::new(
-            self.runtime.maintenance_max_items_per_pass,
-            self.runtime.maintenance_max_bytes_per_pass,
-        );
         let mut clear_cycle = false;
         let mut completed = false;
         let mut cycle_error = None;
         loop {
+            if stop_before_addition
+                && matches!(
+                    &cycle.phase,
+                    BoundedRemoteCatalogRefreshPhase::Adding { .. }
+                )
+            {
+                break;
+            }
             let step = match cycle.phase {
                 BoundedRemoteCatalogRefreshPhase::Scanning => {
                     self.scan_bounded_remote_catalog_page(cycle, &mut budget)
+                }
+                BoundedRemoteCatalogRefreshPhase::ValidatePointerBeforeApply => {
+                    let charged = budget.charge_for(
+                        REMOTE_CATALOG_SCAN_OPERATION,
+                        1,
+                        SEGMENT_CATALOG_POINTER_BYTES as u64,
+                    );
+                    match charged {
+                        Ok(false) => break,
+                        Err(err) => Err(err),
+                        Ok(true) => match self.remote_catalog_pointer_matches(cycle.pointer) {
+                            Ok(false) => {
+                                cycle.invalidated = true;
+                                Ok(true)
+                            }
+                            Ok(true) => {
+                                cycle.phase = BoundedRemoteCatalogRefreshPhase::Tombstones;
+                                Ok(true)
+                            }
+                            Err(err) => Err(err),
+                        },
+                    }
                 }
                 BoundedRemoteCatalogRefreshPhase::Tombstones => {
                     self.advance_bounded_remote_tombstones(cycle, &mut budget)
@@ -1301,10 +1369,24 @@ impl ChunkStorage {
                     self.advance_bounded_remote_catalog_removal(cycle, &mut budget)
                 }
                 BoundedRemoteCatalogRefreshPhase::Terminal => {
-                    clear_cycle = true;
-                    match self.remote_catalog_pointer_matches(cycle.pointer) {
-                        Ok(matches) => completed = matches,
-                        Err(err) => cycle_error = Some(err),
+                    let charged = budget.charge_for(
+                        REMOTE_CATALOG_SCAN_OPERATION,
+                        1,
+                        SEGMENT_CATALOG_POINTER_BYTES as u64,
+                    );
+                    match charged {
+                        Ok(false) => break,
+                        Err(err) => {
+                            clear_cycle = true;
+                            cycle_error = Some(err);
+                        }
+                        Ok(true) => {
+                            clear_cycle = true;
+                            match self.remote_catalog_pointer_matches(cycle.pointer) {
+                                Ok(matches) => completed = matches,
+                                Err(err) => cycle_error = Some(err),
+                            }
+                        }
                     }
                     break;
                 }
@@ -1324,7 +1406,14 @@ impl ChunkStorage {
                 break;
             }
         }
-        if clear_cycle || cycle_error.is_some() {
+        // Scan, pointer, tombstone, and preflight failures cannot have published an exact page:
+        // discard their leases so a later wake restarts from authoritative state. Publication
+        // errors are different. Once publication is entered, the live index may already have
+        // changed while its registry sidecar is still stale, so retain that exact pending page
+        // (with the fence rebased above) for an idempotent retry.
+        let retain_publication_retry =
+            cycle_error.is_some() && cycle.publication_retry_pending && !cycle.invalidated;
+        if clear_cycle || (cycle_error.is_some() && !retain_publication_retry) {
             if let Some(mut cycle) = cursor.remote_cycle.take() {
                 cycle.release_retained_tombstone_bytes(self);
             }

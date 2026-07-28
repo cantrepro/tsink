@@ -429,27 +429,27 @@ impl ChunkStorage {
         let page = self
             .tombstone_read_context()
             .with_series_tombstone_ranges_for_query(
-            series_id,
-            execution,
-            |tombstone_ranges| -> Result<RawSeriesScanPage> {
-                let mut collector = SortedSeriesPageCollector::new(
-                    self.active_retention_cutoff(),
-                    tombstone_ranges,
-                    analysis.sorted_dedupe_mode(),
-                    pagination,
-                );
-                let reached_end = cursors.collect_page_with(&mut collector)?;
-                let final_rows_seen = collector.final_rows_seen();
-                let points = collector.into_points();
+                series_id,
+                execution,
+                |tombstone_ranges| -> Result<RawSeriesScanPage> {
+                    let mut collector = SortedSeriesPageCollector::new(
+                        self.active_retention_cutoff(),
+                        tombstone_ranges,
+                        analysis.sorted_dedupe_mode(),
+                        pagination,
+                    );
+                    let reached_end = cursors.collect_page_with(&mut collector)?;
+                    let final_rows_seen = collector.final_rows_seen();
+                    let points = collector.into_points();
 
-                Ok(RawSeriesScanPage {
-                    points,
-                    final_rows_seen,
-                    reached_end,
-                    stats: cursors.into_stats(),
-                })
-            },
-        )?;
+                    Ok(RawSeriesScanPage {
+                        points,
+                        final_rows_seen,
+                        reached_end,
+                        stats: cursors.into_stats(),
+                    })
+                },
+            )?;
         if let Some(reservation) = working_reservation.as_mut() {
             reservation.resize(modeled_points_bytes(&page.points))?;
         }

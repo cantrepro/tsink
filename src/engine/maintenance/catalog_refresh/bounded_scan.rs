@@ -162,8 +162,8 @@ impl CatalogRefreshPassBudget {
 }
 
 impl BackgroundCatalogRefreshCycle {
-    fn new(storage: &ChunkStorage, visibility_generation: u64) -> Result<Self> {
-        let target_construction_bytes = [
+    fn modeled_construction_bytes(storage: &ChunkStorage) -> usize {
+        [
             storage.persisted.numeric_lane_path.as_ref(),
             storage.persisted.blob_lane_path.as_ref(),
         ]
@@ -180,7 +180,11 @@ impl BackgroundCatalogRefreshCycle {
                         .saturating_add(CATALOG_SCAN_ENTRY_RETAINED_OVERHEAD as usize),
                 )
             },
-        );
+        )
+    }
+
+    fn new(storage: &ChunkStorage, visibility_generation: u64) -> Result<Self> {
+        let target_construction_bytes = Self::modeled_construction_bytes(storage);
         let target_construction_work = u64::try_from(target_construction_bytes).unwrap_or(u64::MAX);
         let byte_limit = storage.runtime.maintenance_max_bytes_per_pass;
         if target_construction_work > byte_limit {
@@ -427,6 +431,16 @@ pub(super) fn segment_root_is_missing(root: &Path) -> bool {
 }
 
 impl ChunkStorage {
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn modeled_unknown_dirty_catalog_construction_bytes_for_test(
+        &self,
+    ) -> u64 {
+        u64::try_from(BackgroundCatalogRefreshCycle::modeled_construction_bytes(
+            self,
+        ))
+        .unwrap_or(u64::MAX)
+    }
+
     pub(super) fn reset_bounded_unknown_dirty_catalog_refresh(&self) {
         self.coordination
             .background_catalog_refresh_cursor
@@ -517,7 +531,11 @@ impl ChunkStorage {
             if target_index >= cycle.targets.len() {
                 cycle.phase = CatalogRefreshPhase::Adding {
                     after_key: None,
-                    tombstones_refreshed: false,
+                    // Finite read-write runtimes hydrate tombstones at startup and publish every
+                    // delete durable-before-live. Unknown-dirty segment discovery must therefore
+                    // not schedule the legacy whole-map tombstone reload; committed coordinator
+                    // recovery remains fenced inside each actual catalog transition.
+                    tombstones_refreshed: true,
                 };
                 return Ok(true);
             }
@@ -966,13 +984,44 @@ impl ChunkStorage {
             return Ok(true);
         };
         let start = after_key.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
-        let next = cycle
-            .entries
-            .range((start, Bound::Unbounded))
-            .next()
-            .map(|(key, entry)| (key.clone(), entry.root.clone()));
+        let next = cycle.entries.range((start, Bound::Unbounded)).next();
         match next {
-            Some((key, root)) => {
+            Some((key, entry)) => {
+                let visible_state = self
+                    .persisted
+                    .persisted_index
+                    .read()
+                    .segments_by_root
+                    .get(entry.root.as_path())
+                    .map(|state| {
+                        state.lane == entry.lane
+                            && state.tier == entry.tier
+                            && state.manifest == entry.manifest
+                    });
+                match visible_state {
+                    Some(true) => {
+                        let descriptor_bytes =
+                            BackgroundCatalogRefreshCycle::modeled_retained_entry_bytes(entry);
+                        if !budget.charge(CATALOG_APPLY_OPERATION, 1, descriptor_bytes)? {
+                            return Ok(false);
+                        }
+                        let key = key.clone();
+                        let CatalogRefreshPhase::Adding { after_key, .. } = &mut cycle.phase else {
+                            unreachable!("bounded catalog addition cursor changed phase");
+                        };
+                        *after_key = Some(key);
+                        return Ok(true);
+                    }
+                    Some(false) => {
+                        return Err(TsinkError::DataCorruption(format!(
+                            "visible segment state disagrees with the scanned catalog at {}",
+                            entry.root.display()
+                        )))
+                    }
+                    None => {}
+                }
+                let key = key.clone();
+                let root = entry.root.clone();
                 cycle.pending_page = Some(PendingCatalogRefreshPage::Add {
                     key,
                     root,
@@ -1016,6 +1065,15 @@ impl ChunkStorage {
             .next()
             .map(|(root, state)| (root.clone(), state.manifest.clone()));
         let Some((root, manifest)) = next else {
+            // A cycle containing only already-visible roots performs no transition, so its
+            // terminal probe must still join the visibility fence. This both waits for an
+            // in-flight tombstone publication and rejects a scan whose generation changed
+            // before the dirty claim is cleared.
+            let _visibility_guard = self.visibility_write_fence();
+            if self.visibility_state_generation() != cycle.expected_visibility_generation {
+                cycle.invalidated = true;
+                return Ok(Some(false));
+            }
             return Ok(None);
         };
         if cycle.final_roots.contains(&root) {

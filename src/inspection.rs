@@ -7254,7 +7254,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(short_report.work.namespace_retained_bytes <= required - 1);
+        assert!(short_report.work.namespace_retained_bytes < required);
         assert!(short_report
             .completeness
             .bounds_hit

@@ -85,9 +85,9 @@ struct PersistedRegistryCatalogEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct PersistedRegistryCatalogEntryKey {
-    lane: SegmentLaneFamily,
-    level: u8,
-    segment_id: u64,
+    pub(super) lane: SegmentLaneFamily,
+    pub(super) level: u8,
+    pub(super) segment_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +491,125 @@ fn persist_registry_catalog_store_budgeted_with_kind(
     persist_store_manifest(&store_path, &complete, local_disk_budget, reservation_kind)
 }
 
+/// Starts an exact finite-writer reconciliation without enumerating or materializing the live
+/// inventory. The incomplete marker makes every interrupted prefix fail closed during startup;
+/// later cursor pages install the expected entries and remove stale ones before publishing the
+/// terminal complete manifest.
+pub(super) fn begin_bounded_registry_catalog_reconciliation(
+    snapshot_path: &Path,
+    expected_entries: usize,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    admit_catalog_namespace(expected_entries, expected_entries)?;
+    let store_path = catalog_store_path(snapshot_path);
+    ensure_catalog_store_directory(&store_path)?;
+    persist_store_manifest(
+        &store_path,
+        &PersistedRegistryCatalogStoreManifest {
+            version: REGISTRY_CATALOG_STORE_VERSION,
+            complete: false,
+            entry_count: 0,
+            series_fingerprint: None,
+            pending_delta: None,
+        },
+        local_disk_budget,
+        crate::DiskReservationKind::Maintenance,
+    )
+}
+
+pub(super) fn persist_bounded_registry_catalog_entry(
+    snapshot_path: &Path,
+    lane: SegmentLaneFamily,
+    root: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    let store_path = catalog_store_path(snapshot_path);
+    let entry = build_catalog_entry_from_parts(lane, root)?;
+    persist_store_entry(
+        &catalog_entry_path(&store_path, entry.key()),
+        &entry,
+        local_disk_budget,
+        crate::DiskReservationKind::Maintenance,
+    )
+}
+
+/// Reconciles exactly one already-enumerated store entry. The caller owns pagination and passes a
+/// predicate over the decoded canonical key, so this helper never scans or allocates the expected
+/// inventory itself.
+pub(super) fn reconcile_bounded_registry_catalog_store_entry(
+    directory_entry: fs::DirEntry,
+    expected: impl FnOnce(PersistedRegistryCatalogEntryKey) -> bool,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    let file_type = directory_entry.file_type()?;
+    if !file_type.is_file() || file_type.is_symlink() {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted registry catalog contains a non-regular entry: {}",
+            directory_entry.path().display()
+        )));
+    }
+    let file_name = directory_entry.file_name();
+    let Some(file_name) = file_name.to_str() else {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted registry catalog contains a non-UTF-8 entry: {}",
+            directory_entry.path().display()
+        )));
+    };
+    if file_name == REGISTRY_CATALOG_STORE_MANIFEST_FILE_NAME {
+        return Ok(());
+    }
+    let retain = parse_catalog_entry_file_name(file_name).is_some_and(expected);
+    if retain {
+        return Ok(());
+    }
+    if parse_catalog_entry_file_name(file_name).is_none()
+        && !is_catalog_atomic_temporary_file_name(file_name)
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "persisted registry catalog contains an unrecognized entry: {}",
+            directory_entry.path().display()
+        )));
+    }
+    remove_path_if_exists_and_sync_parent_budgeted(
+        &directory_entry.path(),
+        local_disk_budget,
+        crate::DiskCategory::Registry,
+    )
+}
+
+pub(super) fn complete_bounded_registry_catalog_reconciliation(
+    snapshot_path: &Path,
+    entry_count: usize,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    let store_path = catalog_store_path(snapshot_path);
+    persist_store_manifest(
+        &store_path,
+        &PersistedRegistryCatalogStoreManifest {
+            version: REGISTRY_CATALOG_STORE_VERSION,
+            complete: true,
+            entry_count,
+            // A finite reconciliation intentionally avoids the O(total series) aggregate
+            // fingerprint. Startup treats its absence as a request to load per-segment metadata.
+            series_fingerprint: None,
+            pending_delta: None,
+        },
+        local_disk_budget,
+        crate::DiskReservationKind::Maintenance,
+    )
+}
+
+pub(super) fn retire_legacy_registry_catalog_after_bounded_reconciliation(
+    snapshot_path: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    remove_path_if_exists_and_sync_parent_budgeted(
+        &catalog_path(snapshot_path),
+        local_disk_budget,
+        crate::DiskCategory::Registry,
+    )
+}
+
 pub(super) fn persist_registry_catalog_delta_budgeted_with_kind(
     snapshot_path: &Path,
     delta: &PersistedRegistryCatalogDelta,
@@ -791,14 +910,16 @@ fn catalog_entry_path(store_path: &Path, key: PersistedRegistryCatalogEntryKey) 
     ))
 }
 
-fn parse_catalog_entry_file_name(name: &str) -> Option<()> {
+fn parse_catalog_entry_file_name(name: &str) -> Option<PersistedRegistryCatalogEntryKey> {
     let encoded = name
         .strip_prefix(REGISTRY_CATALOG_ENTRY_PREFIX)?
         .strip_suffix(REGISTRY_CATALOG_ENTRY_SUFFIX)?;
     let (lane, remainder) = encoded.split_once('-')?;
-    if !matches!(lane, "numeric" | "blob") {
-        return None;
-    }
+    let lane = match lane {
+        "numeric" => SegmentLaneFamily::Numeric,
+        "blob" => SegmentLaneFamily::Blob,
+        _ => return None,
+    };
     let (level, segment_id) = remainder.split_once('-')?;
     if level.len() != 2
         || segment_id.len() != 16
@@ -807,7 +928,11 @@ fn parse_catalog_entry_file_name(name: &str) -> Option<()> {
     {
         return None;
     }
-    Some(())
+    Some(PersistedRegistryCatalogEntryKey {
+        lane,
+        level: u8::from_str_radix(level, 16).ok()?,
+        segment_id: u64::from_str_radix(segment_id, 16).ok()?,
+    })
 }
 
 fn is_catalog_atomic_temporary_file_name(name: &str) -> bool {
@@ -868,10 +993,17 @@ fn build_catalog_entries(
 fn build_catalog_entry(
     source: &PersistedRegistryCatalogSource,
 ) -> Result<PersistedRegistryCatalogEntry> {
-    let fingerprint = crate::engine::segment::read_segment_manifest_fingerprint(&source.root)?;
+    build_catalog_entry_from_parts(source.lane, &source.root)
+}
+
+fn build_catalog_entry_from_parts(
+    lane: SegmentLaneFamily,
+    root: &Path,
+) -> Result<PersistedRegistryCatalogEntry> {
+    let fingerprint = crate::engine::segment::read_segment_manifest_fingerprint(root)?;
     let [chunks, chunk_index, series, postings] = fingerprint.files;
     Ok(PersistedRegistryCatalogEntry {
-        lane: source.lane,
+        lane,
         level: fingerprint.manifest.level,
         segment_id: fingerprint.manifest.segment_id,
         chunk_count: fingerprint.manifest.chunk_count,

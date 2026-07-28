@@ -640,7 +640,35 @@ impl ChunkStorage {
     }
 
     pub(in super::super) fn refresh_memory_usage(&self) -> usize {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .persist_test_hooks
+            .full_memory_reconciliation_hook
+            .read()
+            .clone()
+        {
+            hook();
+        }
         self.memory_accounting_context().refresh_memory_usage()
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn set_full_memory_reconciliation_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .full_memory_reconciliation_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn clear_full_memory_reconciliation_hook(&self) {
+        self.persist_test_hooks
+            .full_memory_reconciliation_hook
+            .write()
+            .take();
     }
 
     pub(in super::super) fn memory_observability_snapshot(

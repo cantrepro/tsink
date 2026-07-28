@@ -158,10 +158,16 @@ impl CachedSeriesDefinitionIndex {
 }
 
 impl FramedWal {
+    pub(crate) fn with_cached_series_definition_index_memory_usage_bytes<R>(
+        &self,
+        observe: impl FnOnce(usize) -> R,
+    ) -> R {
+        let index = self.cached_series_definition_index.lock();
+        observe(index.memory_usage_bytes())
+    }
+
     pub(crate) fn cached_series_definition_index_memory_usage_bytes(&self) -> usize {
-        self.cached_series_definition_index
-            .lock()
-            .memory_usage_bytes()
+        self.with_cached_series_definition_index_memory_usage_bytes(|bytes| bytes)
     }
 
     pub(crate) fn committed_series_definitions_snapshot(
@@ -247,11 +253,15 @@ impl FramedWal {
         }
     }
 
-    pub(super) fn clear_cached_series_definition_index_if_initialized(&self) {
+    pub(super) fn clear_cached_series_definition_index_if_initialized(
+        &self,
+        observe: impl FnOnce(usize),
+    ) {
         let mut index = self.cached_series_definition_index.lock();
         // An uninitialized index can still retain pending definitions appended before its first
         // snapshot. Reset invalidates those definitions too and must release their memory.
         index.clear_for_reset();
+        observe(index.memory_usage_bytes());
     }
 
     pub(crate) fn prime_committed_series_definitions_snapshot<I>(&self, definitions: I)

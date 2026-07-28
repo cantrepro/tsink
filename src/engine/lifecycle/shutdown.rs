@@ -248,6 +248,7 @@ impl ChunkStorage {
         // background gate is exclusive, no worker can still use those continuations; release them
         // before any later close stage can time out so a failed/retried close does not pin memory.
         self.reset_bounded_catalog_refresh_continuations();
+        self.reset_background_post_flush_recovery_cursor();
         self.reset_background_metadata_reconciliation_cursor();
         let mut deferred_dirty_refresh = false;
         let _write_permits = shutdown.acquire_close_write_permits()?;
@@ -272,9 +273,6 @@ impl ChunkStorage {
             } else {
                 return Err(err);
             }
-        }
-        if self.memory_budget_value() != usize::MAX {
-            self.refresh_memory_usage();
         }
         if let Err(err) = shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES) {
             if Self::close_should_defer_resource_maintenance_error(&err) {
@@ -330,6 +328,8 @@ mod tests {
     use crate::engine::encoder::Encoder;
     use crate::engine::wal::FramedWal;
     use crate::{DataPoint, Row, Storage, Value, WalSyncMode};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -377,6 +377,69 @@ mod tests {
             },
         )
         .expect("build close-timeout test storage")
+    }
+
+    #[test]
+    fn close_pipeline_keeps_memory_accounting_incremental() {
+        let temp = TempDir::new().unwrap();
+        let wal =
+            FramedWal::open(temp.path().join("wal"), WalSyncMode::PerAppend).expect("open WAL");
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            64,
+            Some(wal),
+            Some(temp.path().join("lane_numeric")),
+            None,
+            1,
+            ChunkStorageOptions {
+                memory_budget_bytes: 32 * 1024 * 1024,
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .expect("build close accounting test storage");
+        Storage::insert_rows(
+            &storage,
+            &[Row::new(
+                "close_incremental_accounting",
+                DataPoint::new(1, 7.0),
+            )],
+        )
+        .expect("the WAL-backed write should be accepted");
+        assert!(
+            storage
+                .memory_observability_snapshot()
+                .wal_series_definition_cache_bytes
+                > 0
+        );
+
+        let full_reconciliations = Arc::new(AtomicUsize::new(0));
+        storage.set_full_memory_reconciliation_hook({
+            let full_reconciliations = Arc::clone(&full_reconciliations);
+            move || {
+                full_reconciliations.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        storage.close_impl().expect("close should finish");
+        assert_eq!(
+            full_reconciliations.load(Ordering::Relaxed),
+            0,
+            "close must rely on the flush, retention, and catalog incremental deltas"
+        );
+        let closed_memory = storage.memory_observability_snapshot();
+        let exact_cache_bytes = storage
+            .persisted
+            .wal
+            .as_ref()
+            .unwrap()
+            .cached_series_definition_index_memory_usage_bytes();
+        assert_eq!(
+            closed_memory.wal_series_definition_cache_bytes,
+            exact_cache_bytes
+        );
+
+        storage.clear_full_memory_reconciliation_hook();
+        super::super::super::tests::assert_engine_memory_usage_reconciled(&storage);
     }
 
     #[test]

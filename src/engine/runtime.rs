@@ -480,19 +480,26 @@ impl ChunkStorage {
                             };
                         }
 
-                        match control.handle_result(
-                            "flush_maintenance",
-                            storage.run_post_flush_maintenance_if_pending(),
-                        ) {
-                            BackgroundWorkerFlow::Continue => {}
-                            BackgroundWorkerFlow::Pause(duration) => {
-                                drop(maintenance_guard);
-                                break 'pass Some(duration);
-                            }
-                            BackgroundWorkerFlow::Exit => {
-                                drop(maintenance_guard);
-                                break 'pass None;
-                            }
+                        let post_flush_envelope =
+                            match storage.run_post_flush_maintenance_envelope_if_pending() {
+                                Ok(envelope_consumed) => envelope_consumed,
+                                Err(err) => {
+                                    let flow =
+                                        control.handle_result::<()>("flush_maintenance", Err(err));
+                                    drop(maintenance_guard);
+                                    break 'pass match flow {
+                                        BackgroundWorkerFlow::Continue => Some(interval),
+                                        BackgroundWorkerFlow::Pause(duration) => Some(duration),
+                                        BackgroundWorkerFlow::Exit => None,
+                                    };
+                                }
+                            };
+                        if post_flush_envelope {
+                            // Retention and metadata pages each own the full configured
+                            // maintenance envelope. End this wake instead of immediately
+                            // dispatching a fresh persisted-catalog page under the same guard.
+                            drop(maintenance_guard);
+                            break 'pass Some(interval);
                         }
 
                         let park_duration = match control.handle_result(
@@ -632,7 +639,7 @@ impl ChunkStorage {
                 .persist_segment_background_bounded_with_limits(
                     self.runtime
                         .maintenance_max_items_per_pass
-                        .saturating_sub(active_selection.items),
+                        .saturating_sub(active_selection.inspected_items),
                     self.runtime
                         .maintenance_max_bytes_per_pass
                         .saturating_sub(active_selection.input_bytes),

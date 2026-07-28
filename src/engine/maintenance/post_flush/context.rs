@@ -159,6 +159,8 @@ pub(super) struct BackgroundRetentionMaintenancePage {
     start_after_root: Option<PathBuf>,
     next_after_root: Option<PathBuf>,
     pub(super) cycle_complete: bool,
+    pub(super) selected_items: usize,
+    pub(super) selected_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +168,7 @@ pub(super) struct PostFlushWorkflowContext<'a> {
     retention: RetentionMaintenanceContext<'a>,
     post_flush_maintenance_pending: &'a AtomicBool,
     startup_metadata_reconcile_pending: &'a AtomicBool,
+    prefer_metadata_reconcile_on_tie: &'a AtomicBool,
 }
 
 pub(super) struct ClaimedPostFlushMaintenanceWork {
@@ -327,13 +330,18 @@ impl<'a> RetentionMaintenanceContext<'a> {
                 };
                 #[cfg(test)]
                 self.invoke_background_retention_inspect_hook();
-                inspected_items = inspected_items.saturating_add(1);
                 let entry = SegmentInventoryEntry {
                     lane: state.lane,
                     tier: state.tier,
                     root: root.clone(),
                     manifest: state.manifest.clone(),
                 };
+                // Inspecting a lookahead root consumes this wake's item allowance even when its
+                // modeled source work does not fit the remaining byte allowance. The cursor
+                // deliberately stays before that root so the next wake can admit it with a fresh
+                // envelope, but the current wake must not reuse the inspection slot for catalog
+                // recovery.
+                inspected_items = inspected_items.saturating_add(1);
                 let action = policy.post_flush_maintenance_action(&entry);
                 let candidate_bytes = Self::modeled_background_candidate_bytes(&entry, action)?;
                 if candidate_bytes > self.maintenance_max_bytes_per_pass {
@@ -341,7 +349,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                         operation: "retention/tiering inventory page",
                         item_limit: self.maintenance_max_items_per_pass,
                         byte_limit: self.maintenance_max_bytes_per_pass,
-                        selected_items: plan.action_count(),
+                        selected_items: inspected_items,
                         selected_bytes: modeled_bytes,
                     });
                 }
@@ -365,6 +373,8 @@ impl<'a> RetentionMaintenanceContext<'a> {
             start_after_root,
             next_after_root,
             cycle_complete,
+            selected_items: inspected_items,
+            selected_bytes: modeled_bytes,
         })
     }
 
@@ -1204,13 +1214,31 @@ impl<'a> PostFlushWorkflowContext<'a> {
     }
 
     pub(super) fn claim_pending_work(self) -> ClaimedPostFlushMaintenanceWork {
+        let mut run_post_flush = self
+            .post_flush_maintenance_pending
+            .swap(false, Ordering::AcqRel);
+        let mut run_metadata_reconcile = self
+            .startup_metadata_reconcile_pending
+            .swap(false, Ordering::AcqRel);
+        if run_post_flush && run_metadata_reconcile {
+            // Both workflows spend the complete configured maintenance envelope independently.
+            // Alternate ties and restore the unselected at-least-once bit so neither a
+            // continuously replenished retention cycle nor metadata generation churn can starve
+            // the other workflow.
+            if self
+                .prefer_metadata_reconcile_on_tie
+                .fetch_xor(true, Ordering::AcqRel)
+            {
+                self.restore_post_flush_pending();
+                run_post_flush = false;
+            } else {
+                self.restore_startup_metadata_reconcile_pending();
+                run_metadata_reconcile = false;
+            }
+        }
         ClaimedPostFlushMaintenanceWork {
-            run_post_flush: self
-                .post_flush_maintenance_pending
-                .swap(false, Ordering::AcqRel),
-            run_metadata_reconcile: self
-                .startup_metadata_reconcile_pending
-                .swap(false, Ordering::AcqRel),
+            run_post_flush,
+            run_metadata_reconcile,
         }
     }
 
@@ -1267,6 +1295,9 @@ impl ChunkStorage {
             startup_metadata_reconcile_pending: &self
                 .coordination
                 .startup_metadata_reconcile_pending,
+            prefer_metadata_reconcile_on_tie: &self
+                .coordination
+                .prefer_metadata_reconcile_on_maintenance_tie,
         }
     }
 }

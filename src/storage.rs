@@ -3540,11 +3540,13 @@ pub trait Storage: Send + Sync {
     /// creates its sibling staging directory with create-exclusive semantics before publishing the
     /// completed snapshot with an atomic no-replace directory rename. It bounds each copied source
     /// tree and the aggregate staged namespace by [`MAX_SNAPSHOT_RESTORE_ENTRIES`], bounds depth by
-    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`], and synchronizes every copied regular file. Error cleanup
-    /// verifies the staging directory's captured filesystem identity before bounded deletion, so a
-    /// foreign replacement at the same path is preserved. Snapshot support is backend-specific and
-    /// may not be available for all storage implementations. Restore built-in snapshots with
-    /// [`StorageBuilder::restore_from_snapshot`].
+    /// [`MAX_SNAPSHOT_RESTORE_DEPTH`], and synchronizes every copied regular file. Pre-publication
+    /// cleanup first verifies the complete captured staging identity and admits bounded scratch.
+    /// Windows deletes each verified identity through the same exclusive `DELETE` handle; portable
+    /// Unix lacks identity-conditioned unlink and therefore reports the limitation and retains the
+    /// tree instead of risking deletion of a pathname replacement. Snapshot support is
+    /// backend-specific and may not be available for all storage implementations. Restore built-in
+    /// snapshots with [`StorageBuilder::restore_from_snapshot`].
     fn snapshot(&self, _destination: &Path) -> Result<()> {
         Err(TsinkError::InvalidConfiguration(
             "snapshot is not implemented for this storage backend".to_string(),
@@ -4497,10 +4499,12 @@ impl StorageBuilder {
     /// finite [`ResourceProfile::Server`] memory/cardinality/WAL/disk limits, requires
     /// non-degraded health, disables workers, and exits without normal close/flush persistence.
     ///
-    /// The snapshot and its containing namespace must remain offline and immutable for the
-    /// duration of the call. Traversal is anchored to retained no-follow directory handles and
-    /// closed entry identities; the offline contract excludes a hostile same-identity actor
-    /// racing the platform's final namespace operations.
+    /// The snapshot source, restore target, and the target's complete containing namespace
+    /// (including backup and `.tmp-tsink-restore-*` siblings) must remain offline and immutable for
+    /// the duration of the call. Traversal is anchored to retained no-follow directory handles and
+    /// closed entry identities; on portable Unix this target-namespace exclusion is required
+    /// through validation-copy and published-backup cleanup because no identity-conditioned unlink
+    /// primitive exists.
     pub fn restore_from_snapshot(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,
@@ -4535,8 +4539,10 @@ impl StorageBuilder {
     /// open storage instance. After restore, open storage with its normal data-path budget rooted
     /// at the restored target. Before target capture or publication, a private copy must pass the
     /// same strict production-open validation described by
-    /// [`StorageBuilder::restore_from_snapshot`]. The snapshot and its containing namespace must
-    /// remain offline and immutable throughout the call.
+    /// [`StorageBuilder::restore_from_snapshot`]. The snapshot source, restore target, and the
+    /// target's complete containing namespace (including backup and `.tmp-tsink-restore-*`
+    /// siblings) must remain offline and immutable throughout the call. Portable Unix cleanup
+    /// relies on that target-namespace exclusion because it has no identity-conditioned unlink.
     pub fn restore_from_snapshot_with_disk_budget(
         snapshot_path: impl AsRef<Path>,
         data_path: impl AsRef<Path>,

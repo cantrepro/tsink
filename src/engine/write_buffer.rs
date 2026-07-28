@@ -267,7 +267,7 @@ impl ChunkStorage {
         }
 
         Ok(MaintenancePassSelection {
-            items: *flushed_chunks,
+            inspected_items: inspected,
             input_bytes: selected_bytes,
         })
     }
@@ -347,14 +347,17 @@ impl ChunkStorage {
                                     "bounded policies are handled by the cursor-driven pass"
                                 ),
                             };
-                            let Some(chunk) = chunk else {
-                                break;
-                            };
                             if account_memory {
                                 let state_bytes_after =
                                     Self::active_state_memory_usage_bytes(state);
                                 shard_delta.record_change(state_bytes_before, state_bytes_after);
                             }
+                            let Some(chunk) = chunk else {
+                                if state.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            };
 
                             if !flushed_any_for_series {
                                 flushed_series = flushed_series.saturating_add(1);
@@ -416,6 +419,85 @@ impl ChunkStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn flush_all_active_accounts_empty_head_removal_and_continues_to_later_heads() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                partition_window: 10,
+                max_active_partition_heads_per_series: 2,
+                memory_budget_bytes: 32 * 1024 * 1024,
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap();
+        storage
+            .insert_rows(&[
+                Row::new("empty_oldest_head", DataPoint::new(1, 1.0)),
+                Row::new("empty_oldest_head", DataPoint::new(2, 2.0)),
+                Row::new("empty_oldest_head", DataPoint::new(11, 3.0)),
+            ])
+            .unwrap();
+        let series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing("empty_oldest_head", &[])
+            .unwrap()
+            .series_id;
+        let shard_idx = ChunkStorage::series_shard_idx(series_id);
+        {
+            let active = storage.chunks.active_builders[shard_idx].read();
+            let state = active.get(&series_id).unwrap();
+            assert_eq!(state.partition_head_count(), 2);
+            assert_eq!(state.point_count(), 1);
+        }
+        assert_eq!(sealed_chunk_count(&storage), 1);
+
+        storage.flush_all_active().unwrap();
+
+        {
+            let active = storage.chunks.active_builders[shard_idx].read();
+            assert!(active.get(&series_id).unwrap().is_empty());
+        }
+        assert_eq!(
+            sealed_chunk_count(&storage),
+            2,
+            "full flush must continue past an empty oldest head"
+        );
+        let incremental = storage.memory_observability_snapshot();
+        let reconciled = storage.refresh_memory_usage();
+        assert_eq!(incremental.budgeted_bytes, reconciled);
+        assert_eq!(
+            incremental.active_and_sealed_bytes,
+            storage
+                .memory_observability_snapshot()
+                .active_and_sealed_bytes
+        );
+
+        let persisted = storage.persist_segment_with_outcome().unwrap();
+        assert!(persisted.persisted);
+        assert_eq!(persisted.chunks, 2);
+        assert_eq!(sealed_chunk_count(&storage), 0);
+        let incremental = storage.memory_observability_snapshot();
+        let reconciled = storage.refresh_memory_usage();
+        assert_eq!(incremental.budgeted_bytes, reconciled);
+        assert_eq!(
+            incremental.active_and_sealed_bytes,
+            storage
+                .memory_observability_snapshot()
+                .active_and_sealed_bytes
+        );
+    }
 
     fn bounded_flush_test_storage(max_items: usize, max_bytes: u64) -> ChunkStorage {
         ChunkStorage::new_with_data_path_and_options(
@@ -512,6 +594,129 @@ mod tests {
                 .flush
                 .active_flush_byte_limit_skips_total,
             1
+        );
+    }
+
+    #[test]
+    fn bounded_background_pipeline_does_not_reuse_byte_rejected_active_item_slot() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ChunkStorage::new_with_data_path_and_options(
+            256,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                maintenance_max_items_per_pass: 8,
+                maintenance_max_bytes_per_pass: u64::MAX,
+                background_threads_enabled: false,
+                background_fail_fast: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap();
+
+        storage
+            .insert_rows(&[Row::new(
+                "bounded_pipeline_presealed",
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+        storage.flush_background_bounded_active().unwrap();
+        let presealed_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_existing("bounded_pipeline_presealed", &[])
+            .unwrap()
+            .series_id;
+        storage.chunks.active_builders[ChunkStorage::series_shard_idx(presealed_id)]
+            .write()
+            .remove(&presealed_id);
+        assert_eq!(sealed_chunk_count(&storage), 1);
+        let presealed_input_bytes = storage
+            .chunks
+            .pending_sealed_chunks
+            .read()
+            .by_sequence
+            .values()
+            .next()
+            .unwrap()
+            .input_bytes;
+
+        let active_names = ["bounded_pipeline_active_a", "bounded_pipeline_active_b"];
+        storage
+            .insert_rows(&[
+                Row::new(active_names[0], DataPoint::new(1, 1.0)),
+                Row::new(active_names[1], DataPoint::new(1, 2.0)),
+            ])
+            .unwrap();
+        let mut active_series = active_names.map(|name| {
+            let series_id = storage
+                .catalog
+                .registry
+                .read()
+                .resolve_existing(name, &[])
+                .unwrap()
+                .series_id;
+            (ChunkStorage::series_shard_idx(series_id), series_id, name)
+        });
+        active_series.sort_by_key(|(shard_idx, series_id, _)| (*shard_idx, *series_id));
+        let large_series_name = active_series[1].2;
+        let large_rows = (2..130)
+            .map(|timestamp| {
+                Row::new(
+                    large_series_name,
+                    DataPoint::new(timestamp, timestamp as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage.insert_rows(&large_rows).unwrap();
+
+        let active_input_bytes = |series_id| {
+            let shard_idx = ChunkStorage::series_shard_idx(series_id);
+            u64::try_from(
+                storage.chunks.active_builders[shard_idx]
+                    .read()
+                    .get(&series_id)
+                    .unwrap()
+                    .background_bounded_flush_input_bytes(true, true)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let first_active_input_bytes = active_input_bytes(active_series[0].1);
+        let second_active_input_bytes = active_input_bytes(active_series[1].1);
+        assert!(
+            second_active_input_bytes > presealed_input_bytes,
+            "the second active head must be rejected by the bytes left after the first"
+        );
+
+        storage.runtime.maintenance_max_items_per_pass = 2;
+        storage.runtime.maintenance_max_bytes_per_pass =
+            first_active_input_bytes.saturating_add(presealed_input_bytes);
+        *storage.chunks.background_active_flush_cursor.lock() =
+            BackgroundActiveFlushCursor::default();
+
+        storage.background_flush_pipeline_once().unwrap();
+
+        let flush = storage.observability_snapshot().flush;
+        assert_eq!(flush.active_flush_inspected_series_total, 3);
+        assert_eq!(flush.active_flushed_chunks_total, 2);
+        assert_eq!(flush.active_flush_byte_limit_skips_total, 1);
+        assert_eq!(
+            sealed_chunk_count(&storage),
+            2,
+            "the finalized active head and preexisting sealed chunk must both remain buffered"
+        );
+        assert!(
+            storage
+                .persisted
+                .persisted_index
+                .read()
+                .chunk_refs
+                .is_empty(),
+            "the byte-rejected active lookahead consumed the second item slot, so sealed persistence cannot reuse it in the same wake"
         );
     }
 

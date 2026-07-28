@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::ReadDir;
 use std::io::Write;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,15 @@ const BOUNDED_TIERED_CATALOG_CURSOR_BASE_BYTES: usize = 16 * 1024;
 const BOUNDED_TIERED_CATALOG_ENTRY_ALLOWANCE_BYTES: usize = 512;
 const BOUNDED_TIERED_CATALOG_PAGE_SCRATCH_BYTES: usize = 16 * 1024;
 const BOUNDED_TIERED_CATALOG_STAGE_SUFFIX: &str = ".tiered-publish-stage";
+const BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES: u64 = 256 * 1024;
+const BOUNDED_REGISTRY_MANIFEST_WORK_BYTES: u64 = 16 * 1024;
+const BOUNDED_REGISTRY_ENTRY_WORK_BYTES: u64 =
+    crate::engine::segment::MAX_SEGMENT_MANIFEST_FILE_BYTES as u64 + 32 * 1024;
+const BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES: u64 = 256 * 1024;
+// Removal accounting can retain decoded series definitions, deduplicated accounting-scope keys,
+// registry keys/postings, and merged-postings keys at the same time. Keep this aligned with the
+// finite one-root remote-apply preflight, but aggregate it across every root in a transition.
+const FINITE_TRANSITION_REMOVAL_SERIES_METADATA_COPIES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct BoundedTieredCatalogKey {
@@ -37,8 +47,12 @@ impl BoundedTieredCatalogKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedTieredCatalogPublicationPhase {
-    Scanning,
     PrepareGeneration,
+    ScanGenerationNamespace,
+    OpenGenerationCleanup,
+    CleanupGenerationNamespace,
+    FinalizeGenerationPreparation,
+    Scanning,
     LocalLegacyHeader,
     LocalLegacyEntries,
     LocalLegacyFooter,
@@ -50,13 +64,21 @@ enum BoundedTieredCatalogPublicationPhase {
     SharedLegacyFooter,
     SharedLegacyPublish,
     Pointer,
+    RegistryPrepare,
+    RegistryEntries,
+    RegistrySweepOpen,
+    RegistrySweepEntries,
+    RegistryComplete,
+    RegistryLegacyRetire,
 }
 
-/// Process-local, file-handle-free continuation for a finite read-write catalog publication.
+/// Process-local continuation for a finite read-write catalog publication.
 ///
 /// The visible persisted index remains authoritative while this cursor constructs immutable
 /// staging files. A visibility-generation change discards the unpublished generation and restarts
-/// from the beginning. Only the final pointer replacement commits the v3 generation.
+/// from the beginning. Only the final pointer replacement commits the v3 generation. Registry
+/// reconciliation retains one bounded directory reader while sweeping stale sidecar entries; close
+/// and invalidation drop it with the rest of the process-local cursor.
 pub(super) struct BoundedTieredCatalogPublicationCycle {
     expected_visibility_generation: u64,
     phase: BoundedTieredCatalogPublicationPhase,
@@ -78,11 +100,25 @@ pub(super) struct BoundedTieredCatalogPublicationCycle {
     generation_directory: PathBuf,
     generation_path: Option<PathBuf>,
     generation: Option<u64>,
+    prior_pointer: Option<SegmentCatalogPointer>,
+    generation_namespace_reader: Option<ReadDir>,
+    generation_namespace_count: usize,
+    generation_cleanup_expected_entries: usize,
+    generation_cleanup_entries_seen: usize,
+    generation_max_observed: Option<u64>,
+    generation_predecessor: Option<u64>,
+    generation_current_observed: bool,
     local_file_len: u64,
     shared_file_len: u64,
     generation_file_len: u64,
     generation_hash: Xxh64,
     pointer_may_be_visible: bool,
+    reconcile_registry: bool,
+    registry_snapshot_path: Option<PathBuf>,
+    registry_store_path: Option<PathBuf>,
+    registry_after_key: Option<BoundedTieredCatalogKey>,
+    registry_reader: Option<ReadDir>,
+    registry_sweep_entries_seen: usize,
     memory_reservation: RemoteCatalogMemoryReservation,
 }
 
@@ -121,6 +157,10 @@ impl BoundedTieredCatalogPublicationCycle {
         let local_stage = local_target.as_deref().map(Self::stage_path).transpose()?;
         let pointer_path = tiering::shared_segment_catalog_pointer_path(config);
         let generation_directory = tiering::shared_segment_catalog_generation_directory(config);
+        let registry_snapshot_path = storage.persisted.series_index_path.clone();
+        let registry_store_path = registry_snapshot_path
+            .as_deref()
+            .map(registry_catalog::catalog_store_path);
         let retained_paths = local_target
             .iter()
             .chain(local_stage.iter())
@@ -130,6 +170,8 @@ impl BoundedTieredCatalogPublicationCycle {
                 &pointer_path,
                 &generation_directory,
             ])
+            .chain(registry_snapshot_path.iter())
+            .chain(registry_store_path.iter())
             .fold(BOUNDED_TIERED_CATALOG_CURSOR_BASE_BYTES, |total, path| {
                 total.saturating_add(
                     path.as_os_str()
@@ -141,7 +183,11 @@ impl BoundedTieredCatalogPublicationCycle {
         let memory_reservation = storage.remote_catalog_memory_reservation(retained_paths)?;
         Ok(Self {
             expected_visibility_generation,
-            phase: BoundedTieredCatalogPublicationPhase::Scanning,
+            // Admit and inspect the complete fixed namespace dependency before consuming any
+            // incremental inventory page. Doing this first preserves a single bounded pass for
+            // small catalogs; deferring preparation after the first scanned entry otherwise
+            // forced every non-empty publication to wait for an unrelated later wake.
+            phase: BoundedTieredCatalogPublicationPhase::PrepareGeneration,
             scan_after_root: None,
             entries: BTreeMap::new(),
             shared_keys: BTreeSet::new(),
@@ -160,11 +206,28 @@ impl BoundedTieredCatalogPublicationCycle {
             generation_directory,
             generation_path: None,
             generation: None,
+            prior_pointer: None,
+            generation_namespace_reader: None,
+            generation_namespace_count: 0,
+            generation_cleanup_expected_entries: 0,
+            generation_cleanup_entries_seen: 0,
+            generation_max_observed: None,
+            generation_predecessor: None,
+            generation_current_observed: false,
             local_file_len: 0,
             shared_file_len: 0,
             generation_file_len: 0,
             generation_hash: Xxh64::new(0),
             pointer_may_be_visible: false,
+            reconcile_registry: storage
+                .coordination
+                .bounded_registry_reconciliation_required
+                .load(Ordering::Acquire),
+            registry_snapshot_path,
+            registry_store_path,
+            registry_after_key: None,
+            registry_reader: None,
+            registry_sweep_entries_seen: 0,
             memory_reservation,
         })
     }
@@ -181,6 +244,8 @@ impl BoundedTieredCatalogPublicationCycle {
                         &self.pointer_path,
                         &self.generation_directory,
                     ])
+                    .chain(self.registry_snapshot_path.iter())
+                    .chain(self.registry_store_path.iter())
                     .fold(0usize, |total, path| {
                         total.saturating_add(
                             path.as_os_str()
@@ -197,6 +262,16 @@ impl BoundedTieredCatalogPublicationCycle {
                     .len()
                     .saturating_add(SEGMENT_CATALOG_SHARED_PATH_ALLOCATOR_BYTES)
             }))
+            .saturating_add(if self.registry_reader.is_some() {
+                BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize
+            } else {
+                0
+            })
+            .saturating_add(if self.generation_namespace_reader.is_some() {
+                BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize
+            } else {
+                0
+            })
     }
 
     fn resize_for_scratch(&mut self, storage: &ChunkStorage, scratch: usize) -> Result<()> {
@@ -512,6 +587,34 @@ enum BoundedTieredCatalogStep {
 }
 
 impl ChunkStorage {
+    pub(in crate::engine::storage_engine) fn remove_persisted_segment_roots_with_observability_delta(
+        &self,
+        roots: &[PathBuf],
+    ) -> Result<bool> {
+        let snapshot = || {
+            let persisted_index = self.persisted.persisted_index.read();
+            roots
+                .iter()
+                .filter_map(|root| {
+                    persisted_index
+                        .segments_by_root
+                        .get(root)
+                        .map(|state| SegmentInventoryEntry {
+                            lane: state.lane,
+                            tier: state.tier,
+                            root: root.clone(),
+                            manifest: state.manifest.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let result = self.remove_persisted_segment_roots(roots);
+        let after = snapshot();
+        self.publish_segment_inventory_delta(&before, &after);
+        result
+    }
+
     pub(in crate::engine::storage_engine) fn finite_tiered_catalog_publication_enabled(
         &self,
     ) -> bool {
@@ -608,6 +711,14 @@ impl ChunkStorage {
             cursor.writer_publication_cycle.take()
         };
         if let Some(cycle) = cycle {
+            if cycle.reconcile_registry {
+                self.coordination
+                    .bounded_registry_reconciliation_required
+                    .store(true, Ordering::Release);
+                self.persisted
+                    .persisted_index_dirty
+                    .store(true, Ordering::SeqCst);
+            }
             if let Err(err) = self.cleanup_bounded_tiered_catalog_cycle(&cycle) {
                 tracing::warn!(
                     error = %err,
@@ -656,15 +767,32 @@ impl ChunkStorage {
                     .next(),
                 None => index.segments_by_root.iter().next(),
             };
-            next.map(|(root, state)| SegmentInventoryEntry {
-                lane: state.lane,
-                tier: state.tier,
-                root: root.clone(),
-                manifest: state.manifest.clone(),
+            next.map(|(root, state)| {
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .persist_test_hooks
+                        .persisted_catalog_inventory_entry_hook
+                        .read()
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                SegmentInventoryEntry {
+                    lane: state.lane,
+                    tier: state.tier,
+                    root: root.clone(),
+                    manifest: state.manifest.clone(),
+                }
             })
         };
         let Some(entry) = next else {
-            cycle.phase = BoundedTieredCatalogPublicationPhase::PrepareGeneration;
+            cycle.phase = if cycle.local_target.is_some() {
+                BoundedTieredCatalogPublicationPhase::LocalLegacyHeader
+            } else {
+                BoundedTieredCatalogPublicationPhase::GenerationHeader
+            };
             return Ok(BoundedTieredCatalogStep::Progressed);
         };
         if cycle.entries.len() == tiering::SEGMENT_CATALOG_MAX_ENTRIES {
@@ -706,46 +834,23 @@ impl ChunkStorage {
         cycle: &mut BoundedTieredCatalogPublicationCycle,
         budget: &mut BoundedTieredCatalogPassBudget,
     ) -> Result<BoundedTieredCatalogStep> {
-        // Namespace discovery is a fixed hard-bounded dependency window. Run it only at the
-        // beginning of a fresh pass so its complete observed item count is charged to that pass.
+        // Fixed owned-path probes are metadata bytes, not catalog data items. Admit them at the
+        // beginning of a fresh pass, then enumerate the generation namespace through one charged
+        // item per later cursor step.
         if budget.used_any() {
             return Ok(BoundedTieredCatalogStep::Deferred);
         }
-        let namespace_count = match std::fs::symlink_metadata(&cycle.generation_directory) {
-            Ok(metadata)
-                if !crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
-                    && metadata.file_type().is_dir() =>
-            {
-                tiering::count_segment_catalog_generation_namespace(&cycle.generation_directory)?
-            }
-            Ok(_) => {
-                return Err(TsinkError::DataCorruption(format!(
-                    "segment catalog generation namespace is not a regular no-follow directory: {}",
-                    cycle.generation_directory.display()
-                )))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(source) => {
-                return Err(TsinkError::IoWithPath {
-                    path: cycle.generation_directory.clone(),
-                    source,
-                })
-            }
-        };
         let fixed_stage_probes = cycle.local_stage.is_some() as usize + 1;
-        let required_items = namespace_count
-            .saturating_add(fixed_stage_probes)
-            .saturating_add(1);
         let required_bytes = u64::try_from(
-            required_items.saturating_mul(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES),
+            fixed_stage_probes
+                .saturating_add(2)
+                .saturating_mul(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES),
         )
         .unwrap_or(u64::MAX);
-        if !budget.charge(required_items, required_bytes)? {
+        if !budget.charge(0, required_bytes)? {
             return Ok(BoundedTieredCatalogStep::Deferred);
         }
-
-        // Directory creation and orphan cleanup are mutations, so they follow successful
-        // admission of the complete namespace dependency window.
+        cycle.resize_for_scratch(self, required_bytes.min(usize::MAX as u64) as usize)?;
         tiering::ensure_segment_catalog_generation_directory(&cycle.generation_directory)?;
         self.cleanup_exact_bounded_tiered_catalog_stages(
             self.persisted
@@ -753,16 +858,223 @@ impl ChunkStorage {
                 .as_ref()
                 .expect("bounded writer publication requires tiered storage"),
         )?;
-        let current = tiering::load_shared_segment_catalog_pointer(
+        cycle.prior_pointer = tiering::load_shared_segment_catalog_pointer(
             self.persisted
                 .tiered_storage
                 .as_ref()
                 .expect("bounded writer publication requires tiered storage"),
         )?;
-        let generation = tiering::choose_next_segment_catalog_generation_with_namespace_count(
+        cycle.generation_namespace_reader = Some(
+            std::fs::read_dir(&cycle.generation_directory).map_err(|source| {
+                TsinkError::IoWithPath {
+                    path: cycle.generation_directory.clone(),
+                    source,
+                }
+            })?,
+        );
+        cycle.restore_retained_reservation(self)?;
+        cycle.phase = BoundedTieredCatalogPublicationPhase::ScanGenerationNamespace;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn scan_next_bounded_generation_namespace_entry(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if !budget.charge(1, BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let next = cycle
+            .generation_namespace_reader
+            .as_mut()
+            .expect("bounded generation namespace reader initialized")
+            .next();
+        let Some(directory_entry) = next else {
+            cycle.generation_namespace_reader = None;
+            cycle.restore_retained_reservation(self)?;
+            if cycle.prior_pointer.is_some() && !cycle.generation_current_observed {
+                return Err(TsinkError::DataCorruption(
+                    "current segment catalog pointer generation is missing from its namespace"
+                        .to_string(),
+                ));
+            }
+            cycle.generation_cleanup_expected_entries = cycle.generation_namespace_count;
+            cycle.phase = BoundedTieredCatalogPublicationPhase::OpenGenerationCleanup;
+            return Ok(BoundedTieredCatalogStep::Progressed);
+        };
+        let directory_entry = directory_entry.map_err(|source| TsinkError::IoWithPath {
+            path: cycle.generation_directory.clone(),
+            source,
+        })?;
+        cycle.generation_namespace_count = cycle.generation_namespace_count.saturating_add(1);
+        if cycle.generation_namespace_count
+            > crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES
+        {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: "segment catalog generation namespace",
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: cycle.generation_namespace_count,
+            });
+        }
+        if let Some(generation) = directory_entry
+            .file_name()
+            .to_str()
+            .and_then(tiering::parse_segment_catalog_generation_file_name)
+        {
+            cycle.generation_max_observed = Some(
+                cycle
+                    .generation_max_observed
+                    .map_or(generation, |current| current.max(generation)),
+            );
+            let file_type =
+                directory_entry
+                    .file_type()
+                    .map_err(|source| TsinkError::IoWithPath {
+                        path: directory_entry.path(),
+                        source,
+                    })?;
+            if !file_type.is_symlink() && file_type.is_file() {
+                if cycle
+                    .prior_pointer
+                    .is_some_and(|pointer| pointer.generation == generation)
+                {
+                    cycle.generation_current_observed = true;
+                } else if cycle
+                    .prior_pointer
+                    .is_some_and(|pointer| generation < pointer.generation)
+                {
+                    cycle.generation_predecessor = Some(
+                        cycle
+                            .generation_predecessor
+                            .map_or(generation, |prior| prior.max(generation)),
+                    );
+                }
+            }
+        }
+        cycle.restore_retained_reservation(self)?;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn open_bounded_generation_namespace_cleanup(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        let work = u64::try_from(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES).unwrap_or(u64::MAX);
+        if !budget.charge(0, work)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        cycle.generation_namespace_reader = Some(
+            std::fs::read_dir(&cycle.generation_directory).map_err(|source| {
+                TsinkError::IoWithPath {
+                    path: cycle.generation_directory.clone(),
+                    source,
+                }
+            })?,
+        );
+        cycle.restore_retained_reservation(self)?;
+        cycle.phase = BoundedTieredCatalogPublicationPhase::CleanupGenerationNamespace;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn cleanup_next_bounded_generation_namespace_entry(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if !budget.charge(1, BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let next = cycle
+            .generation_namespace_reader
+            .as_mut()
+            .expect("bounded generation cleanup reader initialized")
+            .next();
+        let Some(directory_entry) = next else {
+            cycle.generation_namespace_reader = None;
+            cycle.restore_retained_reservation(self)?;
+            if cycle.generation_cleanup_entries_seen != cycle.generation_cleanup_expected_entries {
+                return Err(TsinkError::DataCorruption(
+                    "segment catalog generation namespace changed during bounded cleanup"
+                        .to_string(),
+                ));
+            }
+            cycle.phase = BoundedTieredCatalogPublicationPhase::FinalizeGenerationPreparation;
+            return Ok(BoundedTieredCatalogStep::Progressed);
+        };
+        let directory_entry = directory_entry.map_err(|source| TsinkError::IoWithPath {
+            path: cycle.generation_directory.clone(),
+            source,
+        })?;
+        cycle.generation_cleanup_entries_seen =
+            cycle.generation_cleanup_entries_seen.saturating_add(1);
+        if cycle.generation_cleanup_entries_seen
+            > crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES
+        {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: "segment catalog generation namespace cleanup",
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: cycle.generation_cleanup_entries_seen,
+            });
+        }
+        let generation = directory_entry
+            .file_name()
+            .to_str()
+            .and_then(tiering::parse_segment_catalog_generation_file_name);
+        if let Some(generation) = generation {
+            let protected = cycle
+                .prior_pointer
+                .is_some_and(|pointer| pointer.generation == generation)
+                || cycle.generation_predecessor == Some(generation);
+            if !protected {
+                let file_type =
+                    directory_entry
+                        .file_type()
+                        .map_err(|source| TsinkError::IoWithPath {
+                            path: directory_entry.path(),
+                            source,
+                        })?;
+                if !file_type.is_symlink() && file_type.is_file() {
+                    self.remove_bounded_catalog_artifact(
+                        &directory_entry.path(),
+                        crate::DiskCategory::Registry,
+                    )?;
+                    cycle.generation_namespace_count =
+                        cycle.generation_namespace_count.saturating_sub(1);
+                }
+            }
+        }
+        cycle.restore_retained_reservation(self)?;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn finalize_bounded_tiered_catalog_generation(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        let work = u64::try_from(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES).unwrap_or(u64::MAX);
+        if !budget.charge(1, work)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        let generation = tiering::choose_next_segment_catalog_generation_after_observed(
             &cycle.generation_directory,
-            current,
-            namespace_count,
+            cycle.prior_pointer,
+            cycle.generation_namespace_count,
+            cycle.generation_max_observed,
         )?;
         let generation_path = cycle
             .generation_directory
@@ -776,11 +1088,7 @@ impl ChunkStorage {
         cycle.generation = Some(generation);
         cycle.generation_path = Some(generation_path);
         cycle.restore_retained_reservation(self)?;
-        cycle.phase = if cycle.local_target.is_some() {
-            BoundedTieredCatalogPublicationPhase::LocalLegacyHeader
-        } else {
-            BoundedTieredCatalogPublicationPhase::GenerationHeader
-        };
+        cycle.phase = BoundedTieredCatalogPublicationPhase::Scanning;
         Ok(BoundedTieredCatalogStep::Progressed)
     }
 
@@ -974,6 +1282,220 @@ impl ChunkStorage {
         Ok(BoundedTieredCatalogStep::Progressed)
     }
 
+    fn prepare_bounded_registry_catalog_reconciliation(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if cycle.registry_snapshot_path.is_none() {
+            cycle.phase = BoundedTieredCatalogPublicationPhase::Pointer;
+            return Ok(BoundedTieredCatalogStep::Progressed);
+        }
+        if !budget.charge(1, BOUNDED_REGISTRY_MANIFEST_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_MANIFEST_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        {
+            let snapshot_path = cycle
+                .registry_snapshot_path
+                .as_deref()
+                .expect("bounded registry preparation requires a registry snapshot");
+            let _registry_persistence_guard = self.catalog.persistence_lock.lock();
+            registry_catalog::begin_bounded_registry_catalog_reconciliation(
+                snapshot_path,
+                cycle.entries.len(),
+                self.persisted.local_disk_budget.as_ref(),
+            )?;
+        }
+        cycle.restore_retained_reservation(self)?;
+        // Remove stale identities before adding missing ones so a complete replacement cannot
+        // transiently exceed the same hard namespace ceiling that startup must enumerate.
+        cycle.phase = BoundedTieredCatalogPublicationPhase::RegistrySweepOpen;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn persist_next_bounded_registry_catalog_entry(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        let next_key = match cycle.registry_after_key {
+            Some(after) => cycle
+                .entries
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+            None => cycle.entries.keys().next().copied(),
+        };
+        let Some(key) = next_key else {
+            cycle.phase = BoundedTieredCatalogPublicationPhase::RegistryComplete;
+            return Ok(BoundedTieredCatalogStep::Progressed);
+        };
+        if !budget.charge(1, BOUNDED_REGISTRY_ENTRY_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        {
+            let entry = cycle
+                .entries
+                .get(&key)
+                .expect("bounded registry key must reference a retained inventory entry");
+            let snapshot_path = cycle
+                .registry_snapshot_path
+                .as_deref()
+                .expect("bounded registry entry phase requires a registry snapshot");
+            let _registry_persistence_guard = self.catalog.persistence_lock.lock();
+            registry_catalog::persist_bounded_registry_catalog_entry(
+                snapshot_path,
+                entry.lane,
+                &entry.root,
+                self.persisted.local_disk_budget.as_ref(),
+            )?;
+        }
+        cycle.restore_retained_reservation(self)?;
+        cycle.registry_after_key = Some(key);
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn open_bounded_registry_catalog_sweep(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if !budget.charge(1, BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let store_path = cycle
+            .registry_store_path
+            .as_ref()
+            .expect("bounded registry sweep requires a registry store");
+        cycle.registry_reader =
+            Some(
+                std::fs::read_dir(store_path).map_err(|source| TsinkError::IoWithPath {
+                    path: store_path.clone(),
+                    source,
+                })?,
+            );
+        cycle.restore_retained_reservation(self)?;
+        cycle.phase = BoundedTieredCatalogPublicationPhase::RegistrySweepEntries;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn sweep_next_bounded_registry_catalog_entry(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        // Charge the terminal directory probe as an item too. This keeps the observed namespace
+        // work at or below the configured per-pass item count even when the store is empty.
+        if !budget.charge(1, BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_SWEEP_ENTRY_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let next = cycle
+            .registry_reader
+            .as_mut()
+            .expect("bounded registry sweep reader initialized")
+            .next();
+        let Some(directory_entry) = next else {
+            cycle.registry_reader = None;
+            cycle.restore_retained_reservation(self)?;
+            cycle.phase = BoundedTieredCatalogPublicationPhase::RegistryEntries;
+            return Ok(BoundedTieredCatalogStep::Progressed);
+        };
+        let directory_entry = directory_entry?;
+        cycle.registry_sweep_entries_seen = cycle.registry_sweep_entries_seen.saturating_add(1);
+        if cycle.registry_sweep_entries_seen
+            > crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES
+        {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: "bounded persisted registry catalog reconciliation",
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: cycle.registry_sweep_entries_seen,
+            });
+        }
+        let _registry_persistence_guard = self.catalog.persistence_lock.lock();
+        registry_catalog::reconcile_bounded_registry_catalog_store_entry(
+            directory_entry,
+            |key| {
+                cycle.entries.contains_key(&BoundedTieredCatalogKey {
+                    lane: key.lane,
+                    level: key.level,
+                    segment_id: key.segment_id,
+                })
+            },
+            self.persisted.local_disk_budget.as_ref(),
+        )?;
+        cycle.restore_retained_reservation(self)?;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn complete_bounded_registry_catalog_reconciliation(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if !budget.charge(1, BOUNDED_REGISTRY_MANIFEST_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_MANIFEST_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let snapshot_path = cycle
+            .registry_snapshot_path
+            .as_deref()
+            .expect("bounded registry completion requires a registry snapshot");
+        let _registry_persistence_guard = self.catalog.persistence_lock.lock();
+        registry_catalog::complete_bounded_registry_catalog_reconciliation(
+            snapshot_path,
+            cycle.entries.len(),
+            self.persisted.local_disk_budget.as_ref(),
+        )?;
+        cycle.restore_retained_reservation(self)?;
+        cycle.phase = BoundedTieredCatalogPublicationPhase::RegistryLegacyRetire;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
+    fn retire_legacy_registry_catalog_after_bounded_reconciliation(
+        &self,
+        cycle: &mut BoundedTieredCatalogPublicationCycle,
+        budget: &mut BoundedTieredCatalogPassBudget,
+    ) -> Result<BoundedTieredCatalogStep> {
+        if !budget.charge(1, BOUNDED_REGISTRY_MANIFEST_WORK_BYTES)? {
+            return Ok(BoundedTieredCatalogStep::Deferred);
+        }
+        cycle.resize_for_scratch(
+            self,
+            BOUNDED_REGISTRY_MANIFEST_WORK_BYTES.min(usize::MAX as u64) as usize,
+        )?;
+        let snapshot_path = cycle
+            .registry_snapshot_path
+            .as_deref()
+            .expect("bounded registry legacy retirement requires a registry snapshot");
+        let _registry_persistence_guard = self.catalog.persistence_lock.lock();
+        registry_catalog::retire_legacy_registry_catalog_after_bounded_reconciliation(
+            snapshot_path,
+            self.persisted.local_disk_budget.as_ref(),
+        )?;
+        cycle.restore_retained_reservation(self)?;
+        cycle.phase = BoundedTieredCatalogPublicationPhase::Pointer;
+        Ok(BoundedTieredCatalogStep::Progressed)
+    }
+
     fn advance_bounded_tiered_catalog_step(
         &self,
         config: &super::super::config::TieredStorageConfig,
@@ -984,11 +1506,23 @@ impl ChunkStorage {
             return Ok(BoundedTieredCatalogStep::Deferred);
         }
         match cycle.phase {
-            BoundedTieredCatalogPublicationPhase::Scanning => {
-                self.scan_bounded_tiered_catalog_entry(config, cycle, budget)
-            }
             BoundedTieredCatalogPublicationPhase::PrepareGeneration => {
                 self.prepare_bounded_tiered_catalog_generation(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::ScanGenerationNamespace => {
+                self.scan_next_bounded_generation_namespace_entry(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::OpenGenerationCleanup => {
+                self.open_bounded_generation_namespace_cleanup(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::CleanupGenerationNamespace => {
+                self.cleanup_next_bounded_generation_namespace_entry(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::FinalizeGenerationPreparation => {
+                self.finalize_bounded_tiered_catalog_generation(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::Scanning => {
+                self.scan_bounded_tiered_catalog_entry(config, cycle, budget)
             }
             BoundedTieredCatalogPublicationPhase::LocalLegacyHeader => {
                 let Some(stage) = cycle.local_stage.clone() else {
@@ -1130,7 +1664,11 @@ impl ChunkStorage {
                     &cycle.shared_target,
                     self.persisted.local_disk_budget.as_ref(),
                 )?;
-                cycle.phase = BoundedTieredCatalogPublicationPhase::Pointer;
+                cycle.phase = if cycle.reconcile_registry {
+                    BoundedTieredCatalogPublicationPhase::RegistryPrepare
+                } else {
+                    BoundedTieredCatalogPublicationPhase::Pointer
+                };
                 Ok(BoundedTieredCatalogStep::Progressed)
             }
             BoundedTieredCatalogPublicationPhase::Pointer => {
@@ -1164,6 +1702,24 @@ impl ChunkStorage {
                         Err(err)
                     }
                 }
+            }
+            BoundedTieredCatalogPublicationPhase::RegistryPrepare => {
+                self.prepare_bounded_registry_catalog_reconciliation(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::RegistryEntries => {
+                self.persist_next_bounded_registry_catalog_entry(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::RegistrySweepOpen => {
+                self.open_bounded_registry_catalog_sweep(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::RegistrySweepEntries => {
+                self.sweep_next_bounded_registry_catalog_entry(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::RegistryComplete => {
+                self.complete_bounded_registry_catalog_reconciliation(cycle, budget)
+            }
+            BoundedTieredCatalogPublicationPhase::RegistryLegacyRetire => {
+                self.retire_legacy_registry_catalog_after_bounded_reconciliation(cycle, budget)
             }
         }
     }
@@ -1234,10 +1790,19 @@ impl ChunkStorage {
             } else {
                 None
             };
+            let completed_registry_reconciliation = completed
+                && finished_cycle
+                    .as_ref()
+                    .is_some_and(|cycle| cycle.reconcile_registry);
             if completed {
                 cursor.writer_publication_completed_visibility_generation = finished_cycle
                     .as_ref()
                     .map(|cycle| cycle.expected_visibility_generation);
+                if completed_registry_reconciliation {
+                    self.coordination
+                        .bounded_registry_reconciliation_required
+                        .store(false, Ordering::Release);
+                }
             }
             drop(cursor);
 
@@ -1255,20 +1820,8 @@ impl ChunkStorage {
                 return Err(err);
             }
             if completed {
-                if let Some(cycle) = finished_cycle {
-                    if let Some(pointer) = tiering::load_shared_segment_catalog_pointer(config)? {
-                        if let Err(err) = tiering::cleanup_old_segment_catalog_generations(
-                            &cycle.generation_directory,
-                            Some(pointer.generation),
-                            self.persisted.local_disk_budget.as_ref(),
-                            self.catalog_reconciliation_memory_limit(),
-                        ) {
-                            tracing::warn!(
-                                error = %err,
-                                "retryable cleanup of old bounded tiered catalog generations failed"
-                            );
-                        }
-                    }
+                if completed_registry_reconciliation {
+                    self.synchronize_persisted_index_dirty_with_pending();
                 }
                 return Ok(true);
             }
@@ -1674,19 +2227,74 @@ impl ChunkStorage {
                     .map(|entry| entry.root.as_path()),
             })
             .unwrap_or_else(|| std::path::Path::new(""));
-        let removed_manifest = transition.removed_roots.first().and_then(|root| {
-            self.persisted
-                .persisted_index
-                .read()
-                .segments_by_root
-                .get(root)
-                .map(|state| state.manifest.clone())
-        });
-        super::bounded_remote::modeled_transition_publication_capacity_bytes(
+        let base = super::bounded_remote::modeled_transition_publication_capacity_bytes(
             transition,
             representative_root,
-            removed_manifest.as_ref(),
-        )
+            None,
+        );
+        if transition.removed_roots.is_empty() {
+            return base;
+        }
+
+        // `remove_persisted_segment_roots` builds one accounting scope spanning the whole input,
+        // then decodes all affected series identities while the original visible states remain
+        // borrowed. Model that aggregate without cloning manifests, roots, or identities during
+        // preflight. Duplicate series across roots are deliberately charged more than once: this
+        // avoids allocating a temporary deduplication set and remains a safe upper bound.
+        let persisted_index = self.persisted.persisted_index.read();
+        let registry = self.catalog.registry.read();
+        let mut representative_removal_consumed = false;
+        transition
+            .removed_roots
+            .iter()
+            .fold(base, |staging_bytes, root| {
+                let additional_root_auxiliary =
+                    if !representative_removal_consumed && root.as_path() == representative_root {
+                        representative_removal_consumed = true;
+                        0
+                    } else {
+                        super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(
+                            root,
+                        )
+                    };
+                let Some(state) = persisted_index.segments_by_root.get(root) else {
+                    return staging_bytes.saturating_add(additional_root_auxiliary);
+                };
+                let mutation_bytes =
+                    super::bounded_scan::modeled_removal_bytes(root, &state.manifest)
+                        .min(usize::MAX as u64) as usize;
+                let identity_bytes = state.chunk_refs_by_series.keys().fold(
+                    0usize,
+                    |identity_bytes, &series_id| {
+                        let Some((metric_bytes, label_count, label_text_bytes)) =
+                            registry.decoded_series_key_shape(series_id)
+                        else {
+                            // The mutation itself will reject this corrupt state. Saturating the
+                            // preflight prevents an unreserved identity materialization first.
+                            return usize::MAX;
+                        };
+                        let one_identity = metric_bytes
+                            .saturating_add(label_text_bytes)
+                            .saturating_add(
+                                label_count.saturating_mul(std::mem::size_of::<crate::Label>()),
+                            )
+                            .saturating_add(
+                                1usize
+                                    .saturating_add(label_count.saturating_mul(2))
+                                    .saturating_mul(64),
+                            );
+                        identity_bytes
+                            .saturating_add(one_identity.saturating_mul(
+                                FINITE_TRANSITION_REMOVAL_SERIES_METADATA_COPIES,
+                            ))
+                            .saturating_add(std::mem::size_of::<SeriesId>().saturating_mul(4))
+                    },
+                );
+                staging_bytes
+                    .saturating_add(additional_root_auxiliary)
+                    .saturating_add(mutation_bytes)
+                    .saturating_add(identity_bytes)
+            })
     }
 
     pub(in super::super) fn apply_persisted_catalog_transition_phase(
@@ -1826,6 +2434,19 @@ impl ChunkStorage {
                 )?;
         }
 
+        if finite_tiered_writer {
+            // Either state-update call below can mutate the visible segment index before returning
+            // an error. Publish the durable-sidecar debt first so every post-mutation failure has
+            // a retry owner. A pre-mutation failure can leave a harmless false positive; only an
+            // exact terminal registry reconciliation clears this sticky bit.
+            self.coordination
+                .bounded_registry_reconciliation_required
+                .store(true, Ordering::Release);
+            self.persisted
+                .persisted_index_dirty
+                .store(true, Ordering::SeqCst);
+        }
+
         self.add_persisted_segments_from_loaded(transition.loaded_segments)?;
         self.remove_persisted_segment_roots(&transition.removed_roots)?;
 
@@ -1878,8 +2499,10 @@ impl ChunkStorage {
         #[cfg(test)]
         self.invoke_catalog_transition_post_catalog_publication_hook()?;
 
-        if let Some(registry_catalog_update) = transition.registry_catalog_update {
-            self.persist_series_registry_index_with_catalog_update(&registry_catalog_update)?;
+        if !finite_tiered_writer {
+            if let Some(registry_catalog_update) = transition.registry_catalog_update {
+                self.persist_series_registry_index_with_catalog_update(&registry_catalog_update)?;
+            }
         }
 
         Ok(PersistedCatalogRefreshApply::Applied)
@@ -2116,9 +2739,10 @@ mod tests {
             tiering::encode_segment_catalog_generation_header(1, u64::from(shared)).unwrap();
         let (_, generation_frame) =
             tiering::encode_segment_catalog_generation_frame(entry).unwrap();
-        let generation_len = generation_header
-            .len()
-            .saturating_add(shared.then_some(generation_frame.len()).unwrap_or(0));
+        let generation_len =
+            generation_header
+                .len()
+                .saturating_add(if shared { generation_frame.len() } else { 0 });
         let pointer = tiering::finalized_segment_catalog_pointer(
             1,
             usize::from(shared),
@@ -2132,13 +2756,14 @@ mod tests {
             .segment_catalog_path
             .as_ref()
             .is_some_and(|path| path != &shared_target);
-        let prepare_items = usize::from(local_stage).saturating_add(2);
+        let fixed_prepare_probes = usize::from(local_stage).saturating_add(3);
         [
             u64::try_from(retained).unwrap(),
             u64::try_from(
-                prepare_items.saturating_mul(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES),
+                fixed_prepare_probes.saturating_mul(SEGMENT_CATALOG_SHARED_PATH_ALLOWANCE_BYTES),
             )
             .unwrap(),
+            BOUNDED_GENERATION_NAMESPACE_ENTRY_WORK_BYTES,
             ChunkStorage::bounded_catalog_fragment_work_bytes(
                 tiering::SEGMENT_CATALOG_LEGACY_STREAM_PREFIX.len(),
             ),
@@ -2199,51 +2824,243 @@ mod tests {
     }
 
     #[test]
-    fn finite_writer_catalog_prepare_has_exact_item_n_minus_one_n_boundary() {
+    fn finite_registry_reconcile_scans_one_of_sixteen_thousand_roots_with_item_limit_one() {
+        use std::sync::atomic::AtomicUsize;
+
+        const LIVE_ROOTS: usize = 16_000;
+
         let temp = TempDir::new().unwrap();
         let config = config(temp.path());
-        let too_small = storage_with_items(temp.path(), config.clone(), 2, u64::MAX);
-        let err = too_small
-            .advance_bounded_tiered_catalog_publication(false)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            TsinkError::MaintenanceDependencyWindowExceeded {
-                operation: BOUNDED_TIERED_CATALOG_PUBLICATION_OPERATION,
-                item_limit: 2,
-                selected_items: 0,
-                selected_bytes: 0,
-                ..
+        let storage = storage_with_items(temp.path(), config.clone(), 1, u64::MAX);
+        seed_persisted_catalog_entries(&storage, &config, 1, LIVE_ROOTS);
+        let inspected = Arc::new(AtomicUsize::new(0));
+        storage.set_persisted_catalog_inventory_entry_hook({
+            let inspected = Arc::clone(&inspected);
+            move || {
+                inspected.fetch_add(1, Ordering::Relaxed);
             }
-        ));
-        assert!(tiering::load_shared_segment_catalog_pointer(&config)
-            .unwrap()
-            .is_none());
-        assert!(
-            !tiering::shared_segment_catalog_generation_directory(&config).exists(),
-            "an inadmissible preparation window must not create its generation namespace"
-        );
+        });
+        storage
+            .coordination
+            .bounded_registry_reconciliation_required
+            .store(true, Ordering::Release);
+        storage
+            .persisted
+            .persisted_index_dirty
+            .store(true, Ordering::SeqCst);
+
+        // Generation preparation has its own fixed namespace dependency window. Seed the cursor
+        // immediately after that already-admitted phase so this test isolates the live-inventory
+        // and registry-reconcile page boundary at the minimum logical item budget.
+        let mut cycle = BoundedTieredCatalogPublicationCycle::new(
+            &storage,
+            &config,
+            storage.visibility_state_generation(),
+        )
+        .unwrap();
+        cycle.phase = BoundedTieredCatalogPublicationPhase::Scanning;
+        storage
+            .coordination
+            .background_catalog_refresh_cursor
+            .lock()
+            .writer_publication_cycle = Some(cycle);
+
+        assert!(!storage
+            .advance_bounded_tiered_catalog_publication(false)
+            .unwrap());
+        assert_eq!(inspected.load(Ordering::Relaxed), 1);
+        let cursor = storage
+            .coordination
+            .background_catalog_refresh_cursor
+            .lock();
+        let cycle = cursor.writer_publication_cycle.as_ref().unwrap();
+        assert_eq!(cycle.entries.len(), 1);
+        assert!(cycle.reconcile_registry);
+        drop(cursor);
+        assert!(storage
+            .coordination
+            .bounded_registry_reconciliation_required
+            .load(Ordering::Acquire));
+        assert!(storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst));
+
+        storage.clear_persisted_catalog_inventory_entry_hook();
+        storage.reset_bounded_tiered_catalog_publication();
         assert_eq!(
-            too_small
+            storage
                 .observability_snapshot()
                 .memory
                 .remote_catalog_staging_bytes,
             0
         );
-        drop(too_small);
+    }
 
-        let exact = storage_with_items(temp.path(), config.clone(), 3, u64::MAX);
-        let passes = advance_until_bounded_catalog_complete(&exact, &config, None);
-        assert!(passes > 1);
+    #[test]
+    fn finite_writer_generation_namespace_scan_and_gc_are_one_item_per_pass() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let storage = storage_with_items(temp.path(), config.clone(), 1, u64::MAX);
+        let first = tiering::persist_shared_segment_catalog_budgeted(
+            &config,
+            &SegmentInventory::default(),
+            None,
+        )
+        .unwrap();
+        let second = tiering::persist_shared_segment_catalog_budgeted(
+            &config,
+            &SegmentInventory::default(),
+            None,
+        )
+        .unwrap();
+        assert!(second.generation > first.generation);
+
+        let generation_directory = tiering::shared_segment_catalog_generation_directory(&config);
+        let stale = tiering::shared_segment_catalog_generation_path(&config, 1);
+        std::fs::write(&stale, b"stale").unwrap();
+        let unknown = generation_directory.join("host-owned.entry");
+        std::fs::write(&unknown, b"unknown").unwrap();
+        let initial_namespace_entries = std::fs::read_dir(&generation_directory).unwrap().count();
+        assert_eq!(initial_namespace_entries, 4);
+
+        assert!(!storage
+            .advance_bounded_tiered_catalog_publication(false)
+            .unwrap());
+        {
+            let cursor = storage
+                .coordination
+                .background_catalog_refresh_cursor
+                .lock();
+            let cycle = cursor.writer_publication_cycle.as_ref().unwrap();
+            assert_eq!(
+                cycle.phase,
+                BoundedTieredCatalogPublicationPhase::ScanGenerationNamespace
+            );
+            assert_eq!(
+                cycle.generation_namespace_count, 1,
+                "prepare may inspect only the one namespace entry charged to this pass"
+            );
+        }
         assert_eq!(
-            tiering::require_shared_segment_catalog_pointer(&config)
-                .unwrap()
-                .entry_count,
-            0
+            tiering::load_shared_segment_catalog_pointer(&config).unwrap(),
+            Some(second)
         );
-        assert!(load_published_generation_entries(&config).is_empty());
+
+        loop {
+            let before = {
+                let cursor = storage
+                    .coordination
+                    .background_catalog_refresh_cursor
+                    .lock();
+                cursor
+                    .writer_publication_cycle
+                    .as_ref()
+                    .unwrap()
+                    .generation_namespace_count
+            };
+            assert!(!storage
+                .advance_bounded_tiered_catalog_publication(false)
+                .unwrap());
+            let cursor = storage
+                .coordination
+                .background_catalog_refresh_cursor
+                .lock();
+            let cycle = cursor.writer_publication_cycle.as_ref().unwrap();
+            match cycle.phase {
+                BoundedTieredCatalogPublicationPhase::ScanGenerationNamespace => {
+                    assert_eq!(cycle.generation_namespace_count, before + 1);
+                }
+                BoundedTieredCatalogPublicationPhase::OpenGenerationCleanup => {
+                    assert_eq!(cycle.generation_namespace_count, before);
+                    assert_eq!(cycle.generation_namespace_count, initial_namespace_entries);
+                    break;
+                }
+                phase => panic!("unexpected generation scan phase: {phase:?}"),
+            }
+        }
+
+        let regular_files = || {
+            std::fs::read_dir(&generation_directory)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_file())
+                        && entry
+                            .file_name()
+                            .to_str()
+                            .and_then(tiering::parse_segment_catalog_generation_file_name)
+                            .is_some()
+                })
+                .count()
+        };
+        loop {
+            let (before_seen, phase) = {
+                let cursor = storage
+                    .coordination
+                    .background_catalog_refresh_cursor
+                    .lock();
+                let cycle = cursor.writer_publication_cycle.as_ref().unwrap();
+                (cycle.generation_cleanup_entries_seen, cycle.phase)
+            };
+            assert!(matches!(
+                phase,
+                BoundedTieredCatalogPublicationPhase::OpenGenerationCleanup
+                    | BoundedTieredCatalogPublicationPhase::CleanupGenerationNamespace
+            ));
+            let before_files = regular_files();
+            assert!(!storage
+                .advance_bounded_tiered_catalog_publication(false)
+                .unwrap());
+            let after_files = regular_files();
+            assert!(
+                before_files.saturating_sub(after_files) <= 1,
+                "one finite pass may collect at most one generation"
+            );
+            let cursor = storage
+                .coordination
+                .background_catalog_refresh_cursor
+                .lock();
+            let cycle = cursor.writer_publication_cycle.as_ref().unwrap();
+            match cycle.phase {
+                BoundedTieredCatalogPublicationPhase::CleanupGenerationNamespace => {
+                    assert_eq!(cycle.generation_cleanup_entries_seen, before_seen + 1);
+                }
+                BoundedTieredCatalogPublicationPhase::FinalizeGenerationPreparation => {
+                    assert_eq!(cycle.generation_cleanup_entries_seen, before_seen);
+                    break;
+                }
+                phase => panic!("unexpected generation cleanup phase: {phase:?}"),
+            }
+        }
+
+        assert!(
+            !stale.exists(),
+            "stale regular generations must be collected"
+        );
+        assert!(
+            tiering::shared_segment_catalog_generation_path(&config, first.generation).exists()
+        );
+        assert!(
+            tiering::shared_segment_catalog_generation_path(&config, second.generation).exists()
+        );
+        assert!(unknown.exists(), "unknown namespace entries are host-owned");
+
+        let passes = advance_until_bounded_catalog_complete(&storage, &config, Some(second));
+        assert!(passes > 1);
+        let published = tiering::require_shared_segment_catalog_pointer(&config).unwrap();
+        assert!(published.generation > second.generation);
+        assert!(
+            tiering::shared_segment_catalog_generation_path(&config, first.generation).exists()
+        );
+        assert!(
+            tiering::shared_segment_catalog_generation_path(&config, second.generation).exists()
+        );
+        assert!(
+            tiering::shared_segment_catalog_generation_path(&config, published.generation).exists()
+        );
         assert_eq!(
-            exact
+            storage
                 .observability_snapshot()
                 .memory
                 .remote_catalog_staging_bytes,
@@ -2308,6 +3125,277 @@ mod tests {
                 .memory
                 .remote_catalog_staging_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn finite_multi_root_transition_staging_has_exact_aggregate_removal_boundary() {
+        fn transition(removed_roots: Vec<PathBuf>) -> PersistedCatalogTransition {
+            PersistedCatalogTransition {
+                visibility_fence: None,
+                loaded_segments: Vec::new(),
+                removed_roots,
+                publication: PersistedCatalogPublication::PersistedState {
+                    published_segment_roots: Vec::new(),
+                    refresh_tombstones: false,
+                },
+                registry_catalog_update: None,
+            }
+        }
+
+        fn identity_staging_bytes(storage: &ChunkStorage, series_id: SeriesId) -> usize {
+            let registry = storage.catalog.registry.read();
+            let (metric_bytes, label_count, label_text_bytes) =
+                registry.decoded_series_key_shape(series_id).unwrap();
+            metric_bytes
+                .saturating_add(label_text_bytes)
+                .saturating_add(label_count.saturating_mul(std::mem::size_of::<crate::Label>()))
+                .saturating_add(
+                    1usize
+                        .saturating_add(label_count.saturating_mul(2))
+                        .saturating_mul(64),
+                )
+                .saturating_mul(FINITE_TRANSITION_REMOVAL_SERIES_METADATA_COPIES)
+                .saturating_add(std::mem::size_of::<SeriesId>().saturating_mul(4))
+        }
+
+        let temp = TempDir::new().unwrap();
+        let lane_path = temp.path().join(NUMERIC_LANE_ROOT);
+        let storage = ChunkStorage::new_with_data_path_and_options(
+            2,
+            None,
+            None,
+            None,
+            3,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                maintenance_max_items_per_pass: 8,
+                maintenance_max_bytes_per_pass: u64::MAX,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap();
+        let first_root = lane_path
+            .join("segments")
+            .join("L0")
+            .join("seg-0000000000000001");
+        let second_root = lane_path
+            .join("segments")
+            .join("L0")
+            .join("seg-0000000000000002");
+        let first_labels = [crate::Label::new("host", "first")];
+        let second_labels = [crate::Label::new("host", "s".repeat(8 * 1024))];
+        let first_series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_or_insert("finite_transition_first", &first_labels)
+            .unwrap()
+            .series_id;
+        let second_series_id = storage
+            .catalog
+            .registry
+            .read()
+            .resolve_or_insert("finite_transition_second", &second_labels)
+            .unwrap()
+            .series_id;
+        let manifest = |segment_id| SegmentManifest {
+            segment_id,
+            level: 0,
+            chunk_count: 1,
+            point_count: 1,
+            series_count: 1,
+            min_ts: Some(segment_id as i64),
+            max_ts: Some(segment_id as i64),
+            wal_highwater: WalHighWatermark::default(),
+        };
+        {
+            let mut persisted = storage.persisted.persisted_index.write();
+            for (segment_slot, root, series_id) in [
+                (1usize, first_root.clone(), first_series_id),
+                (2usize, second_root.clone(), second_series_id),
+            ] {
+                let mut chunk_refs_by_series = HashMap::new();
+                chunk_refs_by_series.insert(series_id, Vec::new());
+                persisted.chunk_refs.insert(series_id, Vec::new());
+                persisted.segments_by_root.insert(
+                    root,
+                    crate::engine::storage_engine::state::PersistedSegmentState {
+                        segment_slot,
+                        lane: SegmentLaneFamily::Numeric,
+                        tier: PersistedSegmentTier::Hot,
+                        manifest: manifest(segment_slot as u64),
+                        time_bucket_postings: None,
+                        series_time_summaries: HashMap::new(),
+                        chunk_refs_by_series,
+                    },
+                );
+            }
+        }
+        storage.bump_visibility_state_generation();
+
+        let roots = vec![first_root.clone(), second_root.clone()];
+        let staged = transition(roots.clone());
+        let representative_root = first_root.as_path();
+        let base = super::bounded_remote::modeled_transition_publication_capacity_bytes(
+            &staged,
+            representative_root,
+            None,
+        );
+        let second_root_auxiliary =
+            super::bounded_remote::BoundedRemoteCatalogRefreshCycle::modeled_apply_auxiliary_bytes(
+                &second_root,
+            );
+        let expected = base
+            .saturating_add(
+                super::bounded_scan::modeled_removal_bytes(&first_root, &manifest(1))
+                    .min(usize::MAX as u64) as usize,
+            )
+            .saturating_add(identity_staging_bytes(&storage, first_series_id))
+            .saturating_add(second_root_auxiliary)
+            .saturating_add(
+                super::bounded_scan::modeled_removal_bytes(&second_root, &manifest(2))
+                    .min(usize::MAX as u64) as usize,
+            )
+            .saturating_add(identity_staging_bytes(&storage, second_series_id));
+        let required = storage.modeled_finite_transition_staging_bytes(&staged);
+        assert_eq!(
+            required, expected,
+            "the transition lease must aggregate every removed root, manifest, and identity",
+        );
+
+        let publication = storage.begin_persisted_catalog_publication();
+        let err = match publication.publish_transition_with_finite_recovery_budget(
+            transition(roots.clone()),
+            usize::MAX,
+            u64::try_from(required.saturating_sub(1)).unwrap(),
+            false,
+        ) {
+            Ok(_) => panic!("N-1 bytes must reject before either root is removed"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            TsinkError::MaintenanceWorkItemTooLarge {
+                operation: "finite catalog transition staging",
+                limit,
+                required: reported,
+            } if limit == u64::try_from(required - 1).unwrap()
+                && reported == u64::try_from(required).unwrap()
+        ));
+        assert!(roots.iter().all(|root| storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(root)));
+
+        assert!(matches!(
+            publication
+                .publish_transition_with_finite_recovery_budget(
+                    transition(roots.clone()),
+                    usize::MAX,
+                    u64::try_from(required).unwrap(),
+                    false,
+                )
+                .unwrap(),
+            PersistedCatalogRefreshApply::Applied
+        ));
+        assert!(roots.iter().all(|root| !storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(root)));
+    }
+
+    #[test]
+    fn finite_tiered_post_mutation_failure_keeps_registry_reconciliation_sticky() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let storage = storage_with_items(temp.path(), config.clone(), 8, u64::MAX);
+        seed_persisted_catalog_entries(&storage, &config, 1, 1);
+        let removed_root = storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .first_key_value()
+            .unwrap()
+            .0
+            .clone();
+        storage.set_catalog_transition_post_index_mutation_hook(|| {
+            Err(TsinkError::Other(
+                "injected finite tiered post-mutation failure".to_string(),
+            ))
+        });
+
+        let publication = storage.begin_persisted_catalog_publication();
+        let err = match publication.publish_transition(PersistedCatalogTransition {
+            visibility_fence: None,
+            loaded_segments: Vec::new(),
+            removed_roots: vec![removed_root.clone()],
+            publication: PersistedCatalogPublication::PersistedState {
+                published_segment_roots: Vec::new(),
+                refresh_tombstones: false,
+            },
+            registry_catalog_update: None,
+        }) {
+            Ok(_) => panic!("the injected post-mutation failure must be returned"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            TsinkError::Other(message)
+                if message == "injected finite tiered post-mutation failure"
+        ));
+        assert!(!storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(&removed_root));
+        assert!(storage
+            .coordination
+            .bounded_registry_reconciliation_required
+            .load(Ordering::Acquire));
+        assert!(storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst));
+        storage.clear_catalog_transition_post_index_mutation_hook();
+        drop(publication);
+
+        for pass in 0..128 {
+            if storage
+                .advance_bounded_tiered_catalog_publication(false)
+                .unwrap()
+            {
+                assert!(
+                    pass > 0,
+                    "finite tiered reconciliation should retain a paged continuation",
+                );
+                break;
+            }
+            assert!(
+                storage
+                    .coordination
+                    .bounded_registry_reconciliation_required
+                    .load(Ordering::Acquire),
+                "only exact terminal registry publication may clear the sticky debt",
+            );
+            assert!(pass < 127, "finite tiered reconciliation did not converge");
+        }
+        assert!(!storage
+            .coordination
+            .bounded_registry_reconciliation_required
+            .load(Ordering::Acquire));
+        assert_eq!(
+            tiering::require_shared_segment_catalog_pointer(&config)
+                .unwrap()
+                .entry_count,
+            0,
         );
     }
 
@@ -2960,9 +4048,19 @@ mod tests {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .count();
             assert_eq!(
-                generation_files, 1,
-                "retry cleanup must remove the failed attempt and prior generation"
+                generation_files, 2,
+                "retry cleanup must retain exactly the current generation and its predecessor"
             );
+            assert!(tiering::shared_segment_catalog_generation_path(
+                &config,
+                initial_pointer.generation
+            )
+            .exists());
+            assert!(tiering::shared_segment_catalog_generation_path(
+                &config,
+                replacement_pointer.generation
+            )
+            .exists());
         }
     }
 }

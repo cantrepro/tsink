@@ -1645,6 +1645,13 @@ fn bounded_non_tiered_flush_accounts_one_root_without_scanning_a_large_persisted
             catalog_inventory_inspections.fetch_add(1, Ordering::Relaxed);
         }
     });
+    let full_reconciliations = Arc::new(AtomicUsize::new(0));
+    storage.set_full_memory_reconciliation_hook({
+        let full_reconciliations = Arc::clone(&full_reconciliations);
+        move || {
+            full_reconciliations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 
     storage
         .insert_rows(&[Row::new(
@@ -1666,6 +1673,11 @@ fn bounded_non_tiered_flush_accounts_one_root_without_scanning_a_large_persisted
         catalog_inventory_inspections.load(Ordering::Relaxed),
         0,
         "a non-tiered flush should not rebuild the persisted segment inventory"
+    );
+    assert_eq!(
+        full_reconciliations.load(Ordering::Relaxed),
+        0,
+        "a bounded flush must not reconcile every in-memory shard and persisted root"
     );
     assert_eq!(
         storage.observability_snapshot().flush.hot_segments_visible,
@@ -1691,8 +1703,132 @@ fn bounded_non_tiered_flush_accounts_one_root_without_scanning_a_large_persisted
         2,
         "root removal accounting should inspect only the removed root before and after mutation"
     );
+    assert_eq!(
+        full_reconciliations.load(Ordering::Relaxed),
+        0,
+        "scoped root removal must not fall back to a full memory reconciliation"
+    );
     storage.clear_persisted_index_accounting_inspect_hook();
+    storage.clear_full_memory_reconciliation_hook();
     assert_engine_memory_usage_reconciled(&storage);
+    storage.close().unwrap();
+}
+
+#[test]
+fn failed_bounded_flush_records_exact_rollback_debt_without_full_repair() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const BACKLOG_SEGMENTS: usize = 8;
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 256 * 1024 * 1024;
+    let storage =
+        ChunkStorage::new_with_data_path_and_options(1, None, Some(lane_path), None, 1, options)
+            .unwrap();
+
+    for ts in 0..BACKLOG_SEGMENTS {
+        storage
+            .insert_rows(&[Row::new(
+                "bounded_flush_rollback_debt",
+                DataPoint::new(ts as i64, ts as f64),
+            )])
+            .unwrap();
+        assert!(
+            storage
+                .persist_segment_background_bounded_with_outcome()
+                .unwrap()
+                .persisted
+        );
+    }
+
+    let inventory_inspections = Arc::new(AtomicUsize::new(0));
+    storage.set_persisted_catalog_inventory_entry_hook({
+        let inventory_inspections = Arc::clone(&inventory_inspections);
+        move || {
+            inventory_inspections.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage.set_catalog_transition_post_index_mutation_hook(|| {
+        Err(TsinkError::Other(
+            "injected bounded flush publication failure".to_string(),
+        ))
+    });
+    storage
+        .insert_rows(&[Row::new(
+            "bounded_flush_rollback_debt",
+            DataPoint::new(BACKLOG_SEGMENTS as i64, BACKLOG_SEGMENTS as f64),
+        )])
+        .unwrap();
+
+    let err = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("injected bounded flush publication failure"));
+    assert_eq!(
+        inventory_inspections.load(Ordering::SeqCst),
+        0,
+        "finite rollback must not enumerate every persisted root for catalog/registry repair"
+    );
+    assert_eq!(
+        storage.observability_snapshot().flush.hot_segments_visible,
+        BACKLOG_SEGMENTS as u64,
+        "post-mutation rollback must reverse the failed transition's exact tier-counter delta"
+    );
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert_eq!(
+        storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .removed_roots
+            .len(),
+        1,
+        "the failed staged root must remain owned by one exact removal intent"
+    );
+
+    storage.clear_catalog_transition_post_index_mutation_hook();
+    storage.clear_persisted_catalog_inventory_entry_hook();
+    for _ in 0..8 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+    }
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(
+        storage
+            .persist_segment_background_bounded_with_outcome()
+            .unwrap()
+            .persisted
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len(),
+        BACKLOG_SEGMENTS + 1
+    );
     storage.close().unwrap();
 }
 
@@ -1915,6 +2051,9 @@ fn bounded_persistence_defers_a_dependency_that_only_exceeds_the_shared_remainde
 
 #[test]
 fn bounded_partial_persistence_restarts_exactly_across_numeric_and_blob_lanes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     let temp_dir = TempDir::new().unwrap();
     let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
@@ -1950,6 +2089,13 @@ fn bounded_partial_persistence_restarts_exactly_across_numeric_and_blob_lanes() 
     }
     assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 5);
 
+    let full_reconciliations = Arc::new(AtomicUsize::new(0));
+    storage.set_full_memory_reconciliation_hook({
+        let full_reconciliations = Arc::clone(&full_reconciliations);
+        move || {
+            full_reconciliations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     for expected_pending in [3, 1] {
         let outcome = storage
             .persist_segment_background_bounded_with_outcome()
@@ -1981,6 +2127,11 @@ fn bounded_partial_persistence_restarts_exactly_across_numeric_and_blob_lanes() 
         }
     }
     assert_eq!(
+        full_reconciliations.load(Ordering::Relaxed),
+        0,
+        "bounded numeric/blob persistence must use only scoped memory deltas"
+    );
+    assert_eq!(
         load_segments_for_level(&numeric_lane_path, 0)
             .unwrap()
             .len(),
@@ -1991,6 +2142,8 @@ fn bounded_partial_persistence_restarts_exactly_across_numeric_and_blob_lanes() 
         2
     );
 
+    storage.clear_full_memory_reconciliation_hook();
+    assert_engine_memory_usage_reconciled(&storage);
     storage.abandon_without_close_for_tests().unwrap();
     drop(storage);
 
@@ -2404,9 +2557,25 @@ fn dirty_known_diff_refresh_skips_full_inventory_scans_at_large_segment_counts()
         .persisted_index_dirty
         .store(true, Ordering::SeqCst);
 
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
+    let mut bounded_passes = 0usize;
+    while storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst)
+    {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        bounded_passes = bounded_passes.saturating_add(1);
+        assert!(
+            bounded_passes <= 2,
+            "the exact two-root known diff should finish in two one-root passes"
+        );
+    }
+    assert_eq!(
+        bounded_passes, 2,
+        "finite known-dirty selection must retain its one-root-per-pass boundary"
+    );
 
     assert_eq!(
         full_scans.load(Ordering::SeqCst),
@@ -3025,73 +3194,133 @@ fn finite_remote_catalog_refresh_uses_exact_item_pages_and_terminal_probe() {
     )
     .unwrap();
     let storage = finite_compute_only_remote_storage(tiered_storage, 3, 1);
-
-    for _ in 0..2 {
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
-        let memory = storage.memory_observability_snapshot();
-        assert!(
-            memory.remote_catalog_staging_bytes > 0,
-            "decoded catalog entries and the resumable reader must stay admitted between wakes",
-        );
-        assert!(memory.accounted_bytes >= memory.remote_catalog_staging_bytes);
-        assert!(
-            storage
-                .persisted
-                .persisted_index
-                .read()
-                .segments_by_root
-                .is_empty(),
-            "catalog entries must remain private until the full generation validates",
-        );
-        assert_eq!(
-            storage
-                .observability_snapshot()
-                .remote
-                .catalog_refreshes_total,
-            0,
-            "a validation page is not a completed refresh",
-        );
-    }
+    let entry_count = inventory.entries().len();
 
     storage
         .sync_persisted_segments_from_disk_if_dirty()
         .unwrap();
-    assert_eq!(
+    let pointer_only = storage.memory_observability_snapshot();
+    assert!(
+        pointer_only.remote_catalog_staging_bytes > 0,
+        "the charged initial pointer pass must retain its pinned generation cursor",
+    );
+    assert!(pointer_only.accounted_bytes >= pointer_only.remote_catalog_staging_bytes);
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let first_entry_page = storage.memory_observability_snapshot();
+    assert!(
+        first_entry_page.remote_catalog_staging_bytes > pointer_only.remote_catalog_staging_bytes,
+        "the pointer-only wake must not decode the first catalog entry",
+    );
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+
+    let mut visible_count = 0usize;
+    let mut private_wakes = 2usize;
+    for _ in 0..32 {
         storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        let next_visible_count = storage
             .persisted
             .persisted_index
             .read()
             .segments_by_root
-            .len(),
-        1,
-        "one exact item page should publish one addition",
-    );
-    assert_eq!(
-        storage
-            .observability_snapshot()
-            .remote
-            .catalog_refreshes_total,
-        0,
-    );
-
-    for _ in 0..3 {
-        storage
-            .sync_persisted_segments_from_disk_if_dirty()
-            .unwrap();
+            .len();
+        assert!(
+            next_visible_count <= visible_count.saturating_add(1),
+            "one exact item page must publish at most one catalog addition",
+        );
         assert_eq!(
             storage
                 .observability_snapshot()
                 .remote
                 .catalog_refreshes_total,
             0,
-            "exact-boundary addition/removal pages must not report success before the terminal probe",
+            "scan, pointer-fence, and apply pages must not report terminal success",
+        );
+        visible_count = next_visible_count;
+        if visible_count == 0 {
+            private_wakes = private_wakes.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(
+        visible_count, 1,
+        "the validated generation should eventually publish its first exact item page",
+    );
+    assert!(
+        private_wakes >= entry_count.saturating_add(2),
+        "initial and pre-apply pointer reads must be distinct charged pages around generation decoding",
+    );
+
+    for _ in 0..32 {
+        if visible_count == entry_count {
+            break;
+        }
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        let next_visible_count = storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .len();
+        assert!(
+            next_visible_count <= visible_count.saturating_add(1),
+            "one exact item page must publish at most one catalog addition",
+        );
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "addition pages must not report success before the terminal pointer probe",
+        );
+        visible_count = next_visible_count;
+    }
+    assert_eq!(visible_count, entry_count);
+
+    let mut saw_post_apply_in_progress = false;
+    for _ in 0..32 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if storage
+            .observability_snapshot()
+            .remote
+            .catalog_refreshes_total
+            == 1
+        {
+            break;
+        }
+        saw_post_apply_in_progress = true;
+        assert!(
+            storage
+                .memory_observability_snapshot()
+                .remote_catalog_staging_bytes
+                > 0,
+            "the cycle must remain retained until its distinct terminal pointer probe",
         );
     }
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
+    assert!(
+        saw_post_apply_in_progress,
+        "the final addition must not share an item page with terminal success",
+    );
     let completed = storage.observability_snapshot().remote;
     assert_eq!(completed.catalog_refreshes_total, 1);
     assert_eq!(completed.catalog_refresh_errors_total, 0);
@@ -3383,6 +3612,14 @@ fn finite_remote_catalog_reader_memory_admission_has_exact_boundaries_and_close_
         u64::try_from(construction_required).unwrap(),
         Ordering::Release,
     );
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0,
+        "the exact construction budget must admit the charged pointer-only continuation",
+    );
     let reader_required = match storage.refresh_remote_catalog_bounded().unwrap_err() {
         TsinkError::MemoryBudgetExceeded { required, .. } => required,
         err => panic!("expected generation page admission failure, got {err:?}"),
@@ -3400,6 +3637,10 @@ fn finite_remote_catalog_reader_memory_admission_has_exact_boundaries_and_close_
         u64::try_from(reader_required - 1).unwrap(),
         Ordering::Release,
     );
+    assert!(
+        !storage.refresh_remote_catalog_bounded().unwrap(),
+        "the below-reader budget must still admit the independent pointer-only page",
+    );
     assert!(matches!(
         storage.refresh_remote_catalog_bounded(),
         Err(TsinkError::MemoryBudgetExceeded { required, .. }) if required == reader_required
@@ -3408,6 +3649,10 @@ fn finite_remote_catalog_reader_memory_admission_has_exact_boundaries_and_close_
         .memory
         .budget_bytes
         .store(u64::try_from(reader_required).unwrap(), Ordering::Release);
+    assert!(
+        !storage.refresh_remote_catalog_bounded().unwrap(),
+        "a fresh cycle first consumes its charged pointer page",
+    );
     assert!(!storage.refresh_remote_catalog_bounded().unwrap());
     assert!(
         storage
@@ -3466,7 +3711,28 @@ fn finite_remote_catalog_addition_is_memory_admitted_before_visibility_mutation(
         .remote_catalog_add_apply_limits_for_test(&inventory.entries()[0])
         .unwrap();
 
-    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    let advance_to_addition = || {
+        for _ in 0..32 {
+            if storage.bounded_remote_catalog_addition_ready_for_test() {
+                return;
+            }
+            assert!(!storage
+                .advance_bounded_remote_catalog_without_addition_for_test()
+                .unwrap());
+            assert!(
+                !storage
+                    .persisted
+                    .persisted_index
+                    .read()
+                    .segments_by_root
+                    .contains_key(&root),
+                "scan, pointer-fence, and tombstone pages must remain private",
+            );
+        }
+        panic!("remote catalog did not reach its first bounded addition");
+    };
+
+    advance_to_addition();
     let staged = storage.memory_observability_snapshot();
     assert!(staged.remote_catalog_staging_bytes > 0);
     storage.memory.budget_bytes.store(
@@ -3494,7 +3760,7 @@ fn finite_remote_catalog_addition_is_memory_admitted_before_visibility_mutation(
         .memory
         .budget_bytes
         .store(u64::MAX, Ordering::Release);
-    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    advance_to_addition();
     let restaged = storage.memory_observability_snapshot();
     let modeled_apply_floor = restaged.accounted_bytes.saturating_add(apply_staging);
     assert!(modeled_apply_floor > restaged.accounted_bytes);
@@ -3523,7 +3789,7 @@ fn finite_remote_catalog_addition_is_memory_admitted_before_visibility_mutation(
         .memory
         .budget_bytes
         .store(u64::MAX, Ordering::Release);
-    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    advance_to_addition();
     storage.memory.budget_bytes.store(
         u64::try_from(apply_required - 1).unwrap(),
         Ordering::Release,
@@ -3543,7 +3809,7 @@ fn finite_remote_catalog_addition_is_memory_admitted_before_visibility_mutation(
         .memory
         .budget_bytes
         .store(u64::MAX, Ordering::Release);
-    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    advance_to_addition();
     storage
         .memory
         .budget_bytes
@@ -3644,6 +3910,262 @@ fn finite_remote_catalog_apply_preflight_failure_has_no_publication_or_residual_
         0,
         "preflight failure must release inspection, apply, and retained-cycle reservations",
     );
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_pointer_probe_error_releases_cycle_lease() {
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_pointer_error", &[])
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage.clone(), 2, 1);
+
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert_eq!(
+        storage.bounded_remote_catalog_generation_for_test(),
+        Some(pointer.generation),
+        "the decoded generation must remain pinned before its charged pointer fence",
+    );
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0
+    );
+
+    std::fs::write(
+        super::super::tiering::shared_segment_catalog_pointer_path(&tiered_storage),
+        b"corrupt",
+    )
+    .unwrap();
+    assert!(matches!(
+        storage.refresh_remote_catalog_bounded(),
+        Err(TsinkError::DataCorruption(_))
+    ));
+    assert_eq!(
+        storage.bounded_remote_catalog_generation_for_test(),
+        None,
+        "a failed pointer fence must discard the pinned generation",
+    );
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "a failed pointer fence must release the complete cycle lease",
+    );
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_remote_catalog_post_index_failure_retries_exact_page_and_sidecar() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let object_store_dir = TempDir::new().unwrap();
+    let local_data_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let labels = vec![Label::new("host", "publication-retry")];
+    let series_id = registry
+        .resolve_or_insert("remote_catalog_publication_retry", &labels)
+        .unwrap()
+        .series_id;
+    let root = write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    let pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let mut storage = finite_compute_only_remote_storage(tiered_storage, 2, 1);
+    let checkpoint_path = local_data_dir.path().join(SERIES_INDEX_FILE_NAME);
+    // Compute-only production fixtures intentionally have no local checkpoint. Install one here
+    // so the publication boundary exercises the exact incremental registry sidecar protocol
+    // without adding a local persisted lane to the remote-catalog authority set.
+    storage.persisted.series_index_path = Some(checkpoint_path.clone());
+    storage.persist_series_registry_index().unwrap();
+    let expected_sources = super::super::registry_catalog::inventory_sources(&inventory);
+    assert!(
+        super::super::registry_catalog::validate_registry_catalog(&checkpoint_path, &[])
+            .unwrap()
+            .is_some()
+    );
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_catalog_transition_post_index_mutation_hook({
+        let fail_once = Arc::clone(&fail_once);
+        let hook_calls = Arc::clone(&hook_calls);
+        move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            if fail_once.swap(false, Ordering::SeqCst) {
+                return Err(TsinkError::Other(
+                    "injected remote post-index publication failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    });
+
+    let error = (0..64)
+        .find_map(|_| storage.refresh_remote_catalog_bounded().err())
+        .expect("remote addition should reach the injected publication failure");
+    assert!(
+        matches!(
+            &error,
+            TsinkError::Other(message)
+                if message == "injected remote post-index publication failure"
+        ),
+        "unexpected remote publication error before/after {} hooks: {error:?}",
+        hook_calls.load(Ordering::SeqCst),
+    );
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        storage.bounded_remote_catalog_generation_for_test(),
+        Some(pointer.generation),
+        "publication failure must retain the exact pinned catalog cycle",
+    );
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0,
+        "publication failure must retain its admitted pending page",
+    );
+    {
+        let persisted = storage.persisted.persisted_index.read();
+        assert_eq!(persisted.segments_by_root.len(), 1);
+        assert!(persisted.segments_by_root.contains_key(&root));
+        assert_eq!(
+            persisted.chunk_refs.values().map(Vec::len).sum::<usize>(),
+            1
+        );
+    }
+    let hot_visible_after_failure = storage
+        .observability
+        .flush
+        .hot_segments_visible
+        .load(Ordering::Acquire);
+    assert_eq!(hot_visible_after_failure, 1);
+    assert!(
+        super::super::registry_catalog::validate_registry_catalog(
+            &checkpoint_path,
+            &expected_sources,
+        )
+        .unwrap()
+        .is_none(),
+        "the injected boundary must run before the exact registry sidecar delta",
+    );
+
+    assert!(
+        !storage.refresh_remote_catalog_bounded().unwrap(),
+        "the retried page must remain distinct from terminal completion",
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        2,
+        "retry must replay the retained publication page exactly once",
+    );
+    {
+        let persisted = storage.persisted.persisted_index.read();
+        assert_eq!(
+            persisted.segments_by_root.len(),
+            1,
+            "retry must not install the already-visible root twice",
+        );
+        assert_eq!(
+            persisted.chunk_refs.values().map(Vec::len).sum::<usize>(),
+            1,
+            "retry must not duplicate persisted chunk accounting",
+        );
+    }
+    assert_eq!(
+        storage
+            .observability
+            .flush
+            .hot_segments_visible
+            .load(Ordering::Acquire),
+        hot_visible_after_failure,
+        "retry must not double-count visible tier inventory",
+    );
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &expected_sources,
+    )
+    .unwrap()
+    .is_some());
+    let persisted_registry = SeriesRegistry::load_persisted_state(&checkpoint_path)
+        .unwrap()
+        .expect("retried sidecar publication should retain a registry snapshot");
+    assert_eq!(persisted_registry.registry.series_count(), 1);
+    assert!(persisted_registry
+        .registry
+        .resolve_existing("remote_catalog_publication_retry", &labels)
+        .is_some());
+
+    let mut completed = false;
+    for _ in 0..32 {
+        if storage.refresh_remote_catalog_bounded().unwrap() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the retained remote cycle must reach its terminal fence"
+    );
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "terminal completion must release the retried cycle lease",
+    );
+    storage.clear_catalog_transition_post_index_mutation_hook();
     storage.close().unwrap();
 }
 
@@ -3778,82 +4300,159 @@ fn finite_remote_catalog_refresh_restarts_on_pointer_change_during_scan_and_appl
                 .collect(),
         )
     };
-    super::super::tiering::persist_shared_segment_catalog_budgeted(
+    let first_inventory = inventory_for(&[1, 2]);
+    let second_inventory = inventory_for(&[3, 4]);
+    let final_inventory = inventory_for(&[5]);
+    let first_roots = first_inventory
+        .entries()
+        .iter()
+        .map(|entry| entry.root.clone())
+        .collect::<Vec<_>>();
+    let second_roots = second_inventory
+        .entries()
+        .iter()
+        .map(|entry| entry.root.clone())
+        .collect::<Vec<_>>();
+    let first_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
         &tiered_storage,
-        &inventory_for(&[1, 2]),
+        &first_inventory,
         None,
     )
     .unwrap();
     let storage = finite_compute_only_remote_storage(tiered_storage.clone(), 6, 1);
 
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
     let first_generation_staging = storage
         .memory_observability_snapshot()
         .remote_catalog_staging_bytes;
     assert!(first_generation_staging > 0);
+    assert_eq!(
+        storage.bounded_remote_catalog_generation_for_test(),
+        Some(first_pointer.generation),
+        "the initial charged pointer page must pin its observed generation",
+    );
     assert!(storage
         .persisted
         .persisted_index
         .read()
         .segments_by_root
         .is_empty());
-    super::super::tiering::persist_shared_segment_catalog_budgeted(
+    let second_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
         &tiered_storage,
-        &inventory_for(&[3, 4]),
+        &second_inventory,
         None,
     )
     .unwrap();
 
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
+    let mut released_stale_scan = false;
+    for _ in 0..32 {
+        assert!(
+            !storage.refresh_remote_catalog_bounded().unwrap(),
+            "a stale scan must not pass its charged pre-apply pointer fence",
+        );
+        let visible = storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            visible.iter().all(|root| !first_roots.contains(root)),
+            "a generation replaced during scan must never become visible",
+        );
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+        );
+        match storage.bounded_remote_catalog_generation_for_test() {
+            None => {
+                assert_eq!(
+                    storage
+                        .memory_observability_snapshot()
+                        .remote_catalog_staging_bytes,
+                    0,
+                    "the charged pre-apply pointer fence must release the stale generation",
+                );
+                released_stale_scan = true;
+                break;
+            }
+            Some(generation) => assert_eq!(
+                generation, first_pointer.generation,
+                "the reader must stay pinned to its immutable generation until the charged fence",
+            ),
+        }
+    }
+    assert!(
+        released_stale_scan,
+        "the pre-apply pointer fence did not invalidate the stale scan",
+    );
+
+    assert!(!storage.refresh_remote_catalog_bounded().unwrap());
+    assert_eq!(
+        storage.bounded_remote_catalog_generation_for_test(),
+        Some(second_pointer.generation),
+    );
     assert_eq!(
         storage
             .memory_observability_snapshot()
             .remote_catalog_staging_bytes,
         first_generation_staging,
-        "pointer churn must replace, not accumulate, the retained generation lease",
+        "the replacement pointer-only cycle must replace, not accumulate, the retained lease",
     );
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
-    assert!(storage
-        .persisted
-        .persisted_index
-        .read()
-        .segments_by_root
-        .is_empty());
-    storage
-        .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap();
-    assert_eq!(
-        storage
+
+    let mut reached_second_apply = false;
+    for _ in 0..32 {
+        assert!(
+            !storage.refresh_remote_catalog_bounded().unwrap(),
+            "a bounded replacement page must not report terminal success",
+        );
+        let visible = storage
             .persisted
             .persisted_index
             .read()
             .segments_by_root
-            .len(),
-        1,
-        "the second pointer should have reached its first bounded addition",
-    );
-    assert_eq!(
-        storage
-            .observability_snapshot()
-            .remote
-            .catalog_refreshes_total,
-        0,
-        "a pointer swap during apply must not report the older generation as complete",
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            visible.iter().all(|root| second_roots.contains(root)),
+            "only the replacement generation may publish after scan invalidation",
+        );
+        assert!(
+            visible.len() <= 1,
+            "an exact item page may publish at most one replacement addition",
+        );
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "a partial replacement apply must not report success",
+        );
+        if visible.len() == 1 {
+            reached_second_apply = true;
+            break;
+        }
+    }
+    assert!(
+        reached_second_apply,
+        "the replacement generation did not reach its first bounded addition",
     );
 
     let final_pointer = super::super::tiering::persist_shared_segment_catalog_budgeted(
         &tiered_storage,
-        &inventory_for(&[5]),
+        &final_inventory,
         None,
     )
     .unwrap();
-    for _ in 0..10 {
+    let mut completed_final_pointer = false;
+    for _ in 0..64 {
         storage
             .sync_persisted_segments_from_disk_if_dirty()
             .unwrap();
@@ -3863,9 +4462,32 @@ fn finite_remote_catalog_refresh_restarts_on_pointer_change_during_scan_and_appl
             .catalog_refreshes_total
             == 1
         {
+            completed_final_pointer = true;
             break;
         }
+        assert_eq!(
+            storage
+                .observability_snapshot()
+                .remote
+                .catalog_refreshes_total,
+            0,
+            "the generation replaced during apply must not report terminal success",
+        );
+        assert!(
+            storage
+                .persisted
+                .persisted_index
+                .read()
+                .segments_by_root
+                .keys()
+                .all(|root| !first_roots.contains(root)),
+            "the generation invalidated during scan must stay private",
+        );
     }
+    assert!(
+        completed_final_pointer,
+        "the stable final pointer did not reach its terminal charged probe",
+    );
     let visible = storage
         .persisted
         .persisted_index
@@ -4622,12 +5244,152 @@ fn unknown_dirty_catalog_cursor_is_discarded_on_restart_and_startup_recovers_exa
 }
 
 #[test]
+fn finite_tiered_unknown_dirty_reconciles_visible_state_without_full_inventory_transition() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let object_store_dir = TempDir::new().unwrap();
+    let local_data_dir = TempDir::new().unwrap();
+    let local_lane = local_data_dir.path().join(NUMERIC_LANE_ROOT);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(local_lane),
+        None,
+        2,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            maintenance_max_items_per_pass: 1,
+            maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
+            tiered_storage: Some(tiered_storage),
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
+
+    let full_scans = Arc::new(AtomicUsize::new(0));
+    storage.set_full_inventory_scan_hook({
+        let full_scans = Arc::clone(&full_scans);
+        move || {
+            full_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    for _ in 0..64 {
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        if !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+    }
+
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert_eq!(
+        full_scans.load(Ordering::SeqCst),
+        0,
+        "a finite tiered dirty retry must not enter the legacy complete inventory transition"
+    );
+    assert!(!storage.bounded_tiered_catalog_publication_is_pending());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage.close().unwrap();
+    assert_eq!(
+        full_scans.load(Ordering::SeqCst),
+        0,
+        "finite tiered close/drain must also avoid the legacy complete inventory transition"
+    );
+    storage.clear_full_inventory_scan_hook();
+}
+
+#[test]
+fn finite_compute_only_close_drains_remote_cursor_without_full_inventory_transition() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let object_store_dir = TempDir::new().unwrap();
+    let hot_lane = object_store_dir.path().join("hot").join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("finite_remote_close_drain", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let root = write_numeric_segment_to_path(&hot_lane, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: None,
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let inventory = super::super::tiering::build_segment_inventory_runtime_strict(
+        None,
+        None,
+        Some(&tiered_storage),
+    )
+    .unwrap();
+    super::super::tiering::persist_shared_segment_catalog_budgeted(
+        &tiered_storage,
+        &inventory,
+        None,
+    )
+    .unwrap();
+    let storage = finite_compute_only_remote_storage(tiered_storage, 2, 1);
+    let full_scans = Arc::new(AtomicUsize::new(0));
+    storage.set_full_inventory_scan_hook({
+        let full_scans = Arc::clone(&full_scans);
+        move || {
+            full_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    storage.close().unwrap();
+
+    assert_eq!(full_scans.load(Ordering::SeqCst), 0);
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&root));
+    storage.clear_full_inventory_scan_hook();
+}
+
+#[test]
 fn unknown_dirty_catalog_rejects_an_oversized_scan_dependency() {
     use std::sync::atomic::Ordering;
 
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let storage = bounded_catalog_refresh_storage(&lane_path, 1, 1, 4_095);
+    let construction_required = storage.modeled_unknown_dirty_catalog_construction_bytes_for_test();
+    assert!(construction_required > 4_095);
     storage
         .persisted
         .persisted_index_dirty
@@ -4641,8 +5403,8 @@ fn unknown_dirty_catalog_rejects_an_oversized_scan_dependency() {
         TsinkError::MaintenanceWorkItemTooLarge {
             operation: "unknown-dirty persisted catalog scan",
             limit: 4_095,
-            required: 4_096,
-        }
+            required,
+        } if required == construction_required
     ));
     assert!(storage
         .persisted
@@ -5457,6 +6219,9 @@ fn snapshot_rejects_earlier_source_tree_mutation_before_publication() {
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
     let wal_path = temp_dir.path().join(WAL_DIR_NAME);
     let snapshot_path = temp_dir.path().join("snapshot");
+    // This regression mutates an actual measured source tree. Direct ChunkStorage construction
+    // leaves an unused optional lane absent, so materialize the lane explicitly for the fixture.
+    std::fs::create_dir_all(&lane_path).unwrap();
     let wal = FramedWal::open(&wal_path, WalSyncMode::PerAppend).unwrap();
     let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
     options.retention_enforced = false;
@@ -5753,16 +6518,32 @@ fn snapshot_destination_created_during_copy_is_not_replaced() {
         0,
         "snapshot publication must not add entries to the raced destination"
     );
+    let retained_staging = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-tsink-snapshot-"))
+        })
+        .collect::<Vec<_>>();
+    #[cfg(windows)]
     assert!(
-        !std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".tmp-tsink-snapshot-")
-        }),
-        "the losing owned staging tree must be removed"
+        retained_staging.is_empty(),
+        "Windows must disposition the verified losing staging identities through their handles"
     );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            retained_staging.len(),
+            1,
+            "portable Unix must retain the verified losing tree without conditional unlink"
+        );
+        assert!(
+            err.to_string().contains("identity-conditioned unlink"),
+            "the retained staging debt must be explicit: {err}"
+        );
+    }
     assert_eq!(
         storage
             .select("snapshot_noreplace_race", &[], 0, 10)
@@ -6146,7 +6927,22 @@ fn background_retention_page_expires_only_one_bounded_inventory_page_per_wake() 
         .post_flush_maintenance_pending
         .load(Ordering::Acquire));
 
-    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    let mut second_page_dispatches = 0usize;
+    while storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .len()
+        > 1
+    {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        second_page_dispatches = second_page_dispatches.saturating_add(1);
+        assert!(
+            second_page_dispatches <= 2,
+            "metadata arbitration must not delay the next retention page beyond one wake"
+        );
+    }
     assert_eq!(
         storage
             .persisted
@@ -6167,7 +6963,21 @@ fn background_retention_page_expires_only_one_bounded_inventory_page_per_wake() 
         .post_flush_maintenance_pending
         .load(Ordering::Acquire));
 
-    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    let mut final_page_dispatches = 0usize;
+    while !storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty()
+    {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        final_page_dispatches = final_page_dispatches.saturating_add(1);
+        assert!(
+            final_page_dispatches <= 2,
+            "metadata arbitration must not delay the final retention page beyond one wake"
+        );
+    }
     assert!(storage
         .persisted
         .persisted_index
@@ -6220,18 +7030,38 @@ fn background_retention_page_respects_modeled_source_byte_limit_for_rewrites() {
     );
     let one_source_bytes = modeled_retention_rewrite_candidate_bytes(&first_root)
         .max(modeled_retention_rewrite_candidate_bytes(&second_root));
-    let storage = bounded_retention_page_storage_with_bytes(&lane_path, 3, 10, one_source_bytes);
+    let probe = bounded_retention_page_storage_with_bytes(&lane_path, 3, 10, one_source_bytes);
 
-    mark_post_flush_maintenance_pending(&storage);
-    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    mark_post_flush_maintenance_pending(&probe);
+    let required = match probe.run_post_flush_maintenance_if_pending() {
+        Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "bounded retention catalog publication",
+            limit,
+            required,
+        }) => {
+            assert_eq!(limit, one_source_bytes);
+            assert!(required > limit);
+            required
+        }
+        result => panic!("source-only retention envelope returned {result:?}"),
+    };
+    assert!(first_root.exists());
+    assert!(second_root.exists());
+    probe.abandon_without_close_for_tests().unwrap();
+    drop(probe);
+
+    let admitted =
+        bounded_retention_page_storage_with_bytes(&lane_path, 3, 1, required.saturating_mul(2));
+    mark_post_flush_maintenance_pending(&admitted);
+    assert!(admitted.run_post_flush_maintenance_if_pending().unwrap());
     assert!(!first_root.exists());
     assert!(second_root.exists());
-    assert!(storage
+    assert!(admitted
         .coordination
         .post_flush_maintenance_pending
         .load(std::sync::atomic::Ordering::Acquire));
 
-    storage.close().unwrap();
+    admitted.close().unwrap();
 }
 
 #[test]
@@ -6292,6 +7122,244 @@ fn background_retention_exact_page_multiple_needs_terminal_empty_page_before_cle
     );
 
     storage.clear_background_retention_inspect_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn background_retention_restarts_before_a_known_dirty_root_inserted_behind_its_cursor() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_retention_cursor_restart", &[])
+        .unwrap()
+        .series_id;
+    let second_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(1, 2.0)]);
+    let third_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 3, &[(1, 3.0)]);
+    let storage = bounded_retention_page_storage(&lane_path, 4, 1);
+
+    mark_post_flush_maintenance_pending(&storage);
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert!(!second_root.exists());
+    assert!(third_root.exists());
+    assert_eq!(
+        storage
+            .coordination
+            .background_retention_maintenance_cursor
+            .lock()
+            .after_root,
+        Some(second_root.clone()),
+    );
+
+    let first_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    assert!(first_root < second_root);
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(first_root.clone()), std::iter::empty());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert!(
+        first_root.exists(),
+        "the catalog-refresh page must not also spend a retention envelope"
+    );
+    assert_eq!(
+        storage
+            .coordination
+            .background_retention_maintenance_cursor
+            .lock()
+            .after_root,
+        None,
+        "a catalog mutation must invalidate the retained lexical cursor"
+    );
+
+    let mut restart_dispatches = 0usize;
+    while first_root.exists() {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        restart_dispatches = restart_dispatches.saturating_add(1);
+        assert!(
+            restart_dispatches <= 2,
+            "round-robin metadata arbitration must return to the restarted retention cycle"
+        );
+    }
+    assert!(third_root.exists());
+    storage.close().unwrap();
+}
+
+#[test]
+fn simultaneous_retention_and_metadata_bits_dispatch_one_bounded_page_at_a_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_simultaneous_maintenance", &[])
+        .unwrap()
+        .series_id;
+    for segment_id in 1..=2 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(95, segment_id as f64)],
+        );
+    }
+    let storage = bounded_retention_page_storage(&lane_path, 3, 1);
+    storage.mark_materialized_series_ids([0, 10]);
+    let materialized_before = storage.materialized_series_snapshot();
+    let inspected = Arc::new(AtomicUsize::new(0));
+    storage.set_background_retention_inspect_hook({
+        let inspected = Arc::clone(&inspected);
+        move || {
+            inspected.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    mark_post_flush_maintenance_pending(&storage);
+    storage
+        .coordination
+        .startup_metadata_reconcile_pending
+        .store(true, Ordering::Release);
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(inspected.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        storage.materialized_series_snapshot(),
+        materialized_before,
+        "the same dispatch must not also spend a metadata page"
+    );
+    assert!(storage
+        .coordination
+        .startup_metadata_reconcile_pending
+        .load(Ordering::Acquire));
+
+    assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+    assert_eq!(
+        inspected.load(Ordering::SeqCst),
+        1,
+        "the second tie must alternate to metadata instead of consuming another retention page"
+    );
+    assert_eq!(
+        storage.materialized_series_snapshot(),
+        vec![series_id, 10],
+        "metadata must make progress by the second simultaneous dispatch"
+    );
+
+    let mut passes = 2usize;
+    while storage
+        .coordination
+        .post_flush_maintenance_pending
+        .load(Ordering::Acquire)
+        || storage
+            .coordination
+            .startup_metadata_reconcile_pending
+            .load(Ordering::Acquire)
+    {
+        assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        passes = passes.saturating_add(1);
+        assert!(passes < 16, "both bounded workflows must make progress");
+    }
+    assert_eq!(storage.materialized_series_snapshot(), vec![series_id]);
+    storage.clear_background_retention_inspect_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn persisted_refresh_worker_wake_stops_after_a_post_flush_catalog_page() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_worker_wake_dispatch", &[])
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 3, &[(95, 3.0)]);
+    let storage = Arc::new(bounded_retention_page_storage(&lane_path, 4, 1));
+    let first_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(95, 1.0)]);
+    let second_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(95, 2.0)]);
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(
+            [first_root.clone(), second_root.clone()],
+            std::iter::empty(),
+        );
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    mark_post_flush_maintenance_pending(storage.as_ref());
+
+    let publications = Arc::new(AtomicUsize::new(0));
+    storage.set_catalog_transition_post_catalog_publication_hook({
+        let publications = Arc::clone(&publications);
+        move || {
+            publications.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    storage.start_background_persisted_refresh_thread().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while publications.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        1,
+        "the first worker wake did not publish its post-flush catalog page"
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        1,
+        "one worker wake must not immediately dispatch a second catalog page"
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .added_roots
+            .len(),
+        1,
+        "the unspent known-dirty page must remain pending for a later wake"
+    );
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&first_root));
+    assert!(!storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .contains_key(&second_root));
+
+    storage.clear_catalog_transition_post_catalog_publication_hook();
     storage.close().unwrap();
 }
 
@@ -6674,6 +7742,205 @@ fn finite_tiered_known_dirty_diff_advances_without_replaying_visibility_mutation
     )
     .unwrap()
     .is_some());
+
+    // A manual/foreground drain must preserve the same one-root finite admission boundary while
+    // completing every page and the final retained writer cursor before returning.
+    let second_root =
+        write_numeric_segment_to_path(&shared_hot_lane, &registry, series_id, 0, 2, &[(2, 2.0)]);
+    let third_root =
+        write_numeric_segment_to_path(&shared_hot_lane, &registry, series_id, 0, 3, &[(3, 3.0)]);
+    storage.persisted.next_segment_id.store(4, Ordering::SeqCst);
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(
+            [second_root.clone(), third_root.clone()],
+            std::iter::empty(),
+        );
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    let visibility_before_drain = storage.visibility_state_generation();
+
+    assert!(storage
+        .drain_known_dirty_persisted_refresh_if_pending()
+        .unwrap());
+    assert_eq!(
+        storage.visibility_state_generation(),
+        visibility_before_drain.saturating_add(2),
+        "two pending roots must publish as two exact finite transition pages"
+    );
+    assert!(!storage.has_known_persisted_segment_changes());
+    assert!(!storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(!storage.bounded_tiered_catalog_publication_is_pending());
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .memory
+            .remote_catalog_staging_bytes,
+        0
+    );
+    let pointer =
+        super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage).unwrap();
+    assert_eq!(pointer.entry_count, 3);
+    let inventory = storage.persisted_segment_inventory();
+    assert_eq!(inventory.entries().len(), 3);
+    assert!(inventory
+        .entries()
+        .iter()
+        .any(|entry| entry.root == second_root));
+    assert!(inventory
+        .entries()
+        .iter()
+        .any(|entry| entry.root == third_root));
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &data_dir.path().join(SERIES_INDEX_FILE_NAME),
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_tiered_registry_reconcile_survives_deferred_add_and_later_cursor_invalidations() {
+    use std::sync::atomic::Ordering;
+
+    const BASE_SEGMENTS: u64 = 12;
+
+    let data_dir = TempDir::new().unwrap();
+    let object_store_dir = TempDir::new().unwrap();
+    let local_lane = data_dir.path().join(NUMERIC_LANE_ROOT);
+    let tiered_storage = super::super::config::TieredStorageConfig {
+        object_store_root: object_store_dir.path().to_path_buf(),
+        segment_catalog_path: Some(data_dir.path().join("local-tiered-catalog.json")),
+        mirror_hot_segments: false,
+        hot_retention_window: 10,
+        warm_retention_window: 50,
+    };
+    let labels = vec![Label::new("host", "registry-reconcile")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("finite_tiered_registry_reconcile", &labels)
+        .unwrap()
+        .series_id;
+    let mut baseline_roots = Vec::new();
+    for segment_id in 1..=BASE_SEGMENTS {
+        baseline_roots.push(write_numeric_segment_to_path(
+            &local_lane,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        ));
+    }
+
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(local_lane.clone()),
+        None,
+        BASE_SEGMENTS + 1,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            maintenance_max_items_per_pass: 12,
+            maintenance_max_bytes_per_pass: u64::MAX,
+            tiered_storage: Some(tiered_storage.clone()),
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    install_shared_object_store_writer_lock_for_test(&storage, object_store_dir.path());
+    storage.persist_series_registry_index().unwrap();
+
+    let added_root = write_numeric_segment_to_path(
+        &local_lane,
+        &registry,
+        series_id,
+        0,
+        BASE_SEGMENTS + 1,
+        &[((BASE_SEGMENTS + 1) as i64, (BASE_SEGMENTS + 1) as f64)],
+    );
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(added_root.clone()), std::iter::empty());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage.bounded_tiered_catalog_publication_is_pending());
+    assert!(storage
+        .coordination
+        .bounded_registry_reconciliation_required
+        .load(Ordering::Acquire));
+
+    // Each later root mutation invalidates whatever complete-snapshot cursor was retained by the
+    // preceding page. The consumed add above must remain represented by a sticky complete
+    // reconciliation requirement; applying only the final removal Delta would leave the sidecar
+    // with stale baseline entries and no added entry.
+    for root in &baseline_roots {
+        storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .record_changes(std::iter::empty(), std::iter::once(root.clone()));
+        storage
+            .persisted
+            .persisted_index_dirty
+            .store(true, Ordering::SeqCst);
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+    }
+
+    for pass in 0..512 {
+        if !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+        storage
+            .sync_persisted_segments_from_disk_if_dirty()
+            .unwrap();
+        assert!(
+            pass < 511,
+            "finite registry reconciliation did not converge"
+        );
+    }
+
+    assert!(!storage
+        .coordination
+        .bounded_registry_reconciliation_required
+        .load(Ordering::Acquire));
+    assert!(!storage.bounded_tiered_catalog_publication_is_pending());
+    let inventory = storage.persisted_segment_inventory();
+    assert_eq!(inventory.entries().len(), 1);
+    assert_eq!(inventory.entries()[0].root, added_root);
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &data_dir.path().join(SERIES_INDEX_FILE_NAME),
+        &super::super::registry_catalog::inventory_sources(&inventory),
+    )
+    .unwrap()
+    .is_some());
+
+    // The roots intentionally remain on disk: this test exercises sidecar convergence against
+    // the exact query-visible inventory without introducing platform-specific open-file deletion.
+    drop(storage);
 }
 
 #[test]
@@ -6838,7 +8105,8 @@ fn background_post_flush_maintenance_stage_does_not_block_queries() {
 
 #[test]
 fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reapplying() {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     let data_dir = TempDir::new().unwrap();
     let object_store_dir = TempDir::new().unwrap();
@@ -6935,8 +8203,16 @@ fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reap
         .post_flush_maintenance_pending
         .store(true, Ordering::SeqCst);
     let marker_dir = data_dir.path().join(".post-flush-replacements");
+    let retention_inspections = Arc::new(AtomicUsize::new(0));
+    storage.set_background_retention_inspect_hook({
+        let retention_inspections = Arc::clone(&retention_inspections);
+        move || {
+            retention_inspections.fetch_add(1, Ordering::SeqCst);
+        }
+    });
     let mut passes = 0usize;
     let mut observed_deferred_marker = false;
+    let mut observed_metadata_reconcile_wake = false;
     while storage
         .coordination
         .post_flush_maintenance_pending
@@ -6946,12 +8222,27 @@ fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reap
             .startup_metadata_reconcile_pending
             .load(Ordering::SeqCst)
     {
+        let marker_present_before = marker_dir
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some());
+        let inspections_before = retention_inspections.load(Ordering::SeqCst);
         assert!(storage.run_post_flush_maintenance_if_pending().unwrap());
+        if marker_present_before {
+            assert_eq!(
+                retention_inspections.load(Ordering::SeqCst),
+                inspections_before,
+                "one recovery namespace/marker outcome must consume the wake before retention inspection"
+            );
+        }
         passes = passes.saturating_add(1);
         assert!(
             passes < 128,
             "finite post-flush marker/catalog publication failed to converge"
         );
+        observed_metadata_reconcile_wake |= storage
+            .coordination
+            .startup_metadata_reconcile_pending
+            .load(Ordering::SeqCst);
 
         let marker_present = marker_dir
             .read_dir()
@@ -6962,12 +8253,14 @@ fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reap
                 hot_root.exists(),
                 "the source root must remain durable until pointer publication completes"
             );
-            assert_eq!(
-                super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage)
-                    .unwrap(),
-                initial_pointer,
-                "a retained Committing marker must keep finite readers on the prior pointer"
-            );
+            if storage.bounded_tiered_catalog_publication_is_pending() {
+                assert_eq!(
+                    super::super::tiering::require_shared_segment_catalog_pointer(&tiered_storage)
+                        .unwrap(),
+                    initial_pointer,
+                    "an incomplete writer cursor must keep finite readers on the prior pointer"
+                );
+            }
         }
     }
 
@@ -6975,6 +8268,10 @@ fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reap
     assert!(
         observed_deferred_marker,
         "the finite publication should retain a real Committing marker across wakes"
+    );
+    assert!(
+        observed_metadata_reconcile_wake,
+        "recovered catalog publication must restore the metadata-reconciliation wake"
     );
     assert!(!hot_root.exists());
     assert!(warm_root.exists());
@@ -7005,6 +8302,7 @@ fn finite_tiered_post_flush_marker_advances_existing_catalog_cursor_without_reap
         .persisted
         .persisted_index_dirty
         .load(Ordering::SeqCst));
+    storage.clear_background_retention_inspect_hook();
 }
 
 #[test]

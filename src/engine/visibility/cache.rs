@@ -1,5 +1,5 @@
-use super::*;
 use super::super::core_impl::VisibilityCacheMapView;
+use super::*;
 
 #[path = "cache/materialized_series.rs"]
 mod materialized_series;

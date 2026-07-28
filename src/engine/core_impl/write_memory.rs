@@ -61,8 +61,8 @@ pub(super) fn reset_included_memory_component_bytes(
 }
 
 /// Raises a retained component to an observed value without allowing an older concurrent
-/// observation to move it backwards. Callers that release the component use a quiescent full
-/// reconciliation instead.
+/// observation to move it backwards. Callers that release the component either serialize an exact
+/// reset with the same source-state lock or use a quiescent full reconciliation.
 pub(super) fn grow_included_memory_component_to_bytes(
     accounting_enabled: bool,
     component: &AtomicU64,

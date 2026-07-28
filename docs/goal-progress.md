@@ -402,13 +402,18 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   path.
   Finite compute-only tombstone refresh now has its separate process-local continuation: it probes
   only six exact shared manifests, charges each existing manifest and immutable referenced shard,
-  retains admitted decoded fragments across wakes, terminally revalidates every manifest, and
-  publishes their monotonic union with the old live map under one visibility fence before segment
-  additions. Manifest/pointer/visibility changes restart without exposing the staged map, and no
-  tombstone root scan is used. The final mutable `HashMap` swap plus visibility-cache rebuild
-  remains one hard-bounded item; `MaintenanceWorkItemTooLarge` preserves old visibility when it
-  cannot fit. Replacing that structured strand point with an immutable sharded live snapshot and
-  epoch-tagged cache is still open. Finite explicit/manual
+  retains admitted decoded fragments across wakes, and terminally revalidates every manifest.
+  It then builds a fixed 256-shard immutable remote overlay, sharing unchanged shard `Arc`s and
+  copy-on-writing only affected shards, before an atomic visibility-fenced pointer exchange.
+  Queries union the local base with the requested remote shard. Manifest/pointer/visibility changes
+  restart without exposing the candidate, and no tombstone root scan is used. Per-series visibility
+  cache payloads are logically invalidated by a checked remote epoch rather than being globally
+  cleared; lazy reads retag only the requested series. A semantic no-op preserves the overlay
+  pointer, epoch, cache tags, and generations, while epoch exhaustion rejects before any
+  publication state changes. Candidate construction, predecessor/candidate overlap, and terminal
+  revalidation are admitted to the finite maintenance and modeled-memory envelopes. Finite
+  read-write publication likewise preflights the complete catalog transition plus any committed
+  tombstone-recovery dependency window before mutation. Finite explicit/manual
   rollup calls now advance the same shared cursor by
   one policy and one item/byte-bounded source-postings page, return structured continuation state,
   retain the cursor on global failure, and require an empty terminal page for an exact multiple.
@@ -608,10 +613,12 @@ caches, or every supported filesystem.
 Snapshot/restore now enforce aggregate 100,000-entry/depth-128 staging limits, reuse exact measured
 copy ceilings, create staging exclusively, publish through platform no-replace primitives, and
 preserve raced names. Cleanup never expands from the precomputed operation namespace; completed
-trees require captured descendant identities, unknown or replaced entries are retained, partial
-copies without complete identity evidence are retained, and a visible snapshot whose final parent
-sync fails is reported with indeterminate durability rather than recursively deleting possible
-consumer data. The final inspection/salvage acceptance audit is complete. Cross-platform
+trees require captured descendant identities, unknown or replaced entries observed at a cleanup
+boundary are retained, and partial copies without complete identity evidence are retained. Windows
+holds the verified identity through disposition; portable Unix restore cleanup requires the public
+offline target-containing-namespace contract through its final unlink window. A visible snapshot
+whose final parent sync fails is reported with indeterminate durability rather than recursively
+deleting possible consumer data. The final inspection/salvage acceptance audit is complete. Cross-platform
 handle-relative traversal/copy qualification remains open, so Phase 3 and the full crash-recovery
 gate remain in progress.
 
@@ -972,13 +979,44 @@ Phase 2 targeted verification completed since that full matrix:
   series identity), exact N/N-1 shared-memory admission for the complete add peak, no visibility
   mutation on rejection, source disappearance before load, capacity reconciliation before the
   visibility fence, and zero residual catalog staging after failure or terminal completion.
-- Finite remote tombstone continuation verification — `PASS`: `cargo check --lib`; all 3
-  `maintenance::catalog_refresh::bounded_tombstones::tests`; all 54 tombstone-filtered core tests;
-  the 3 finite-remote-catalog tests; and focused pointer-churn, corrupt-v3, and
-  ExpertUnlimited-compatibility tests. Deterministic coverage pins one-item manifest/shard/
-  revalidation/publication wakes, no root scan, unchanged live visibility before the terminal
-  swap, exact terminal byte admission versus N+1 structured rejection, retained-charge release,
-  and manifest replacement causing a clean restart before a complete retry.
+- Immutable remote tombstone overlay and bounded recovery verification — `PASS`: focused core
+  checks cover the 256-shard copy-on-write candidate, shared unchanged shards, local-plus-remote
+  query union, one-item manifest/shard/revalidation/publication wakes, no root scan, exact
+  terminal admission, retained-charge release, and clean restart on manifest replacement. They
+  also pin logical per-series epoch invalidation, lazy retagging without whole-cache enumeration,
+  no-op pointer/epoch/generation preservation, fail-closed epoch exhaustion, and committed
+  recovery/catalog-transition preflight before mutation.
+- Incremental WAL and finite-flush accounting verification — `PASS`: successful ordinary finite
+  persistence and finite close no longer invoke a whole-engine memory recount. WAL series-definition
+  cache growth and reset observations are serialized by the cache mutex; a successful physical
+  reset publishes the exact post-clear retained capacity, while a skipped or failed physical reset
+  publishes no decrement. Full active-head flushing now accounts an empty-head removal and
+  continues to later nonempty heads instead of leaving them stranded. Focused validation passed
+  all 50 WAL tests, 5 write-buffer tests, 17 write-transient-memory tests, 7 shutdown tests, and
+  the large-backlog, mixed numeric/blob restart, and reset-after-truncate failpoint cases. The
+  touched Rust files pass standalone rustfmt checking and the core library passes `cargo check`.
+  This closes the recount subtask, not Phase 2.
+- Finite catalog, retention, post-flush, and snapshot acceptance stage — `PASS` on 2026-07-27:
+  finite compute-only and read-write dirty reconciliation no longer enter a complete physical
+  inventory path; bounded flush rollback retains one exact retry intent and reverses its exact
+  tier-counter delta; active, sealed, and retention lookahead work shares one wake; and finite
+  post-flush marker recovery is paged, namespace-bounded, aggregate-memory-admitted, and leaves
+  only the true publication remainder. Snapshot/restore now re-attests requested namespaces under
+  the shared operation cap and uses the documented platform-safe cleanup/rename classification.
+  Verification passed `cargo fmt --all -- --check`, `git diff --check`,
+  `cargo check --workspace --all-targets --locked`, and warning-denied all-feature workspace
+  clippy. Serial focused results were 90/90 persistence-background, 38/38 post-flush, 19/19
+  bounded-tombstone, 30/30 secure-snapshot, 10/10 finite-remote-catalog, and 5/5
+  background-retention tests. A final baseline-excluded core sweep passed 1,175/1,175.
+- Clean-revision acceptance debt — `OPEN`, outside this stopping stage: the unfiltered serial core
+  run exposed 11 failures that each reproduce in a clean `ab10341` archive (four memory-pressure
+  expectations, three deletion/tombstone-transition expectations, and four runtime-refresh/flush/
+  WAL-salvage expectations). The current stage introduced three additional stale one-wake
+  tombstone-test assumptions; those were corrected without changing production accounting and the
+  complete bounded-tombstone module now passes. One later retention-cleanup failure from the first
+  panicking run passed independently on both clean and current trees. Per the maintainer's stop
+  instruction, the 11 clean-revision failures remain recorded rather than being expanded into new
+  implementation work.
 - Workflow and package hygiene validation — `PASS`: both GitHub workflow files parse as YAML,
   their embedded release shell fragments pass syntax checks, manual branch dispatch is rejected,
   artifact checkouts resolve to the verified commit, and both crates.io and PyPI publication remain
@@ -1115,8 +1153,8 @@ assigned to later roadmap phases.
   distributed merge state, and accounted internal-RPC request/header/raw/decode buffers when
   configured. Excluded byte totals remain honestly unknown; caller-provided aggregator/backend
   internals, compatibility results after transfer to caller ownership, public-adapter buffers not
-  explicitly reserved, caller-owned write inputs, rollup work, remote
-  refresh complete-inventory input materialization, thread stacks,
+  explicitly reserved, caller-owned write inputs, rollup work, `ExpertUnlimited` and explicit
+  compatibility remote-refresh complete-inventory input materialization, thread stacks,
   allocator/runtime/kernel/TLS overhead, and other server state are not charged to a complete
   process envelope. Atomic active-state staging is admitted through `write_transient_bytes`;
   metadata, exemplar, and rules replacement have separate finite store envelopes. Finite
@@ -1174,16 +1212,18 @@ assigned to later roadmap phases.
   security-disclosure contact/channel remain unresolved. A security address is not fabricated in
   repository metadata.
 
-## Recommended next three tasks
+## Deliberate stop point and unstarted next work
 
-1. Calibrate the implemented query envelope under constrained direct, async, PromQL, HTTP, and
+Work is intentionally paused after the finite catalog/retention/post-flush/snapshot acceptance
+stage at the maintainer's request. Phase 2 remains `IN PROGRESS`; no subsequent roadmap phase or
+feature work was started.
+
+1. Resolve or deliberately revise the 11 clean-`ab10341` core acceptance expectations recorded
+   above, keeping data-safety behavior and finite transition staging authoritative.
+2. Calibrate the implemented query envelope under constrained direct, async, PromQL, HTTP, and
    distributed workloads, and decide explicit contracts for remaining compatibility adapters and
    caller-owned result vectors. Keep cancellation/error release and logical-versus-physical byte
    evidence separate from process-memory measurements.
-2. Replace the hard-bounded monolithic remote-tombstone map/cache publication with an immutable
-   sharded live snapshot and epoch-tagged cache, and measure catalog/tombstone
-   cleanup/reconciliation throughput under a large managed namespace. Finite compute-only catalog,
-   tombstone-file staging, and read-write tiered catalog publication are now paged.
 3. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
    revise the shipped provisional constants and record the final evidence. Preserve the explicit
    expert-only unlimited migration path and deterministic base-plus-override contract.

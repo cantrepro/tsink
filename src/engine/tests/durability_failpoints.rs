@@ -265,6 +265,7 @@ fn wal_reset_after_truncate_failpoint_reopens_from_published_segment() {
         1,
         ChunkStorageOptions {
             partition_window: i64::MAX,
+            memory_budget_bytes: 32 * 1024 * 1024,
             retention_enforced: false,
             background_threads_enabled: false,
             ..ChunkStorageOptions::default()
@@ -275,6 +276,10 @@ fn wal_reset_after_truncate_failpoint_reopens_from_published_segment() {
         .insert_rows_with_result(&[Row::new(metric, DataPoint::new(1, 7.0))])
         .unwrap();
     assert_eq!(acknowledged.acknowledgement, WriteAcknowledgement::Durable);
+    let cache_bytes_before = storage
+        .memory_observability_snapshot()
+        .wal_series_definition_cache_bytes;
+    assert!(cache_bytes_before > 0);
     storage
         .persisted
         .wal
@@ -306,6 +311,21 @@ fn wal_reset_after_truncate_failpoint_reopens_from_published_segment() {
         vec![DataPoint::new(1, 7.0)],
         "the already-published segment must remain query-visible after reset failure"
     );
+    let exact_cache_bytes = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .cached_series_definition_index_memory_usage_bytes();
+    assert_eq!(exact_cache_bytes, cache_bytes_before);
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .wal_series_definition_cache_bytes,
+        exact_cache_bytes,
+        "a failed physical reset must not publish the post-clear decrement"
+    );
+    assert_engine_memory_usage_reconciled(&storage);
 
     storage.abandon_without_close_for_tests().unwrap();
     drop(storage);
@@ -346,7 +366,7 @@ fn wal_reset_after_truncate_failpoint_reopens_from_published_segment() {
 }
 
 #[test]
-fn snapshot_pre_final_rename_failpoint_cleans_staging_and_reopens_source() {
+fn snapshot_pre_final_rename_failpoint_uses_platform_safe_cleanup_and_reopens_source() {
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     let snapshot_path = temp.path().join("snapshot");
@@ -393,16 +413,32 @@ fn snapshot_pre_final_rename_failpoint_cleans_staging_and_reopens_source() {
         "unexpected snapshot pre-publication error: {err}"
     );
     assert!(!snapshot_path.exists());
+    let retained_staging = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-tsink-snapshot-"))
+        })
+        .collect::<Vec<_>>();
+    #[cfg(windows)]
     assert!(
-        std::fs::read_dir(temp.path()).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".tmp-tsink-snapshot-")
-        }),
-        "pre-final-rename failure must clean the fully synchronized owned staging tree"
+        retained_staging.is_empty(),
+        "Windows must disposition the verified staging identities through their DELETE handles"
     );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            retained_staging.len(),
+            1,
+            "portable Unix must retain the verified tree without identity-conditioned unlink"
+        );
+        assert!(
+            err.to_string().contains("identity-conditioned unlink"),
+            "the retained staging debt must be explicit: {err}"
+        );
+    }
     assert_eq!(
         storage
             .select("failpoint_snapshot_pre_rename", &[], 0, 10)

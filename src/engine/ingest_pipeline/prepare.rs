@@ -274,9 +274,8 @@ impl<'a> WritePrepareVisibilityContext<'a> {
                                     metadata_bytes = metadata_bytes.saturating_add(
                                         std::mem::size_of::<(SeriesId, SeriesVisibilitySummary)>(),
                                     );
-                                    metadata_bytes = metadata_bytes.saturating_add(
-                                        std::mem::size_of::<(SeriesId, u64)>(),
-                                    );
+                                    metadata_bytes = metadata_bytes
+                                        .saturating_add(std::mem::size_of::<(SeriesId, u64)>());
                                 }
                                 let needs_bounded_entry =
                                     indexes.iter().any(|idx| points[*idx].ts <= bounded_cutoff);

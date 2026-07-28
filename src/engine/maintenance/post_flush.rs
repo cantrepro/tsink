@@ -35,6 +35,17 @@ enum PostFlushCatalogPublication {
     Deferred,
 }
 
+enum BackgroundRetentionSweepOutcome {
+    EnvelopeConsumed { more_pages: bool },
+    CatalogRefreshRequired,
+}
+
+enum PostFlushMaintenanceRunOutcome {
+    NoWork,
+    EnvelopeConsumed,
+    CatalogRefreshRequired,
+}
+
 impl ChunkStorage {
     const CACHED_METADATA_RECONCILIATION_ITEM_BYTES: usize = 512;
 
@@ -103,6 +114,13 @@ impl ChunkStorage {
             .coordination
             .background_metadata_reconciliation_cursor
             .lock() = BackgroundMetadataReconciliationCursor::default();
+    }
+
+    pub(in crate::engine::storage_engine) fn reset_background_post_flush_recovery_cursor(&self) {
+        self.coordination
+            .background_post_flush_recovery_cursor
+            .lock()
+            .reset();
     }
 
     pub(in super::super) fn run_live_metadata_reconciliation_page(&self) -> Result<bool> {
@@ -257,7 +275,10 @@ impl ChunkStorage {
         &self,
         retention: RetentionMaintenanceContext<'_>,
         replacement: &PostFlushReplacement,
+        drain_catalog: bool,
+        bounded_recovery: Option<&BoundedRuntimeReplacement>,
     ) -> Result<PostFlushCatalogPublication> {
+        debug_assert_eq!(bounded_recovery.is_none(), drain_catalog);
         let publication = self.begin_persisted_catalog_publication();
         let resumed_catalog_completed = if self.finite_tiered_catalog_publication_enabled()
             && self.bounded_tiered_catalog_publication_is_pending()
@@ -277,26 +298,20 @@ impl ChunkStorage {
                     .store(true, Ordering::SeqCst);
                 return Ok(PostFlushCatalogPublication::Deferred);
             }
-
-            // A process-local cursor may have been created by this marker, a flush, or a known
-            // dirty transition. Its terminal pointer always describes the complete current
-            // persisted snapshot, so checkpoint that same complete registry image before
-            // attributing further work to this marker. This prevents one deferred caller from
-            // consuming another caller's delayed registry delta.
-            let inventory = self.persisted_segment_inventory();
-            if let Err(err) = self.persist_series_registry_index_with_catalog_update(
-                &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
-                    registry_catalog::inventory_sources(&inventory),
-                ),
-            ) {
+            if !drain_catalog {
+                // This finite writer page consumed the background wake's complete maintenance
+                // envelope. Resume the marker transition on a later wake even when this page
+                // happened to finish the writer cursor.
                 self.persisted
                     .persisted_index_dirty
                     .store(true, Ordering::SeqCst);
-                return Err(err);
+                return Ok(PostFlushCatalogPublication::Deferred);
             }
-            self.persisted
-                .persisted_index_dirty
-                .store(self.has_known_persisted_segment_changes(), Ordering::SeqCst);
+
+            // The finite writer cursor now owns both the segment catalog and the paged complete
+            // registry sidecar. Its terminal result is exact for this visibility generation, so
+            // no unbounded inventory materialization is needed here.
+            self.synchronize_persisted_index_dirty_with_pending();
             true
         } else {
             false
@@ -304,31 +319,23 @@ impl ChunkStorage {
         let catalog_snapshot_is_current =
             self.bounded_tiered_catalog_publication_matches_current_visibility();
         if catalog_snapshot_is_current && !resumed_catalog_completed {
-            // The generic dirty-refresh caller may have completed this marker's cursor between
-            // marker wakes. Reconfirm the complete registry image here before consuming the
-            // marker; process restart clears this completion token and safely republishes.
-            let inventory = self.persisted_segment_inventory();
-            if let Err(err) = self.persist_series_registry_index_with_catalog_update(
-                &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
-                    registry_catalog::inventory_sources(&inventory),
-                ),
-            ) {
-                self.persisted
-                    .persisted_index_dirty
-                    .store(true, Ordering::SeqCst);
-                return Err(err);
-            }
-            self.persisted
-                .persisted_index_dirty
-                .store(self.has_known_persisted_segment_changes(), Ordering::SeqCst);
+            // The generic dirty-refresh caller may have completed this marker's segment catalog
+            // and registry sidecar between marker wakes.
+            self.synchronize_persisted_index_dirty_with_pending();
         }
 
         // Rebuild only the marker-owned delta from the currently visible catalog. A prior
         // publication attempt may have inserted some outputs or removed some sources before a
         // later catalog/registry persistence error. Skipping already-visible outputs prevents
         // duplicate chunk refs while this exact transition converges on retry.
-        let output_entries = replacement.output_entries()?;
-        let source_roots = replacement.source_roots();
+        let output_entries = match bounded_recovery {
+            Some(bounded) => bounded.output_entries().to_vec(),
+            None => replacement.output_entries()?,
+        };
+        let source_roots = match bounded_recovery {
+            Some(bounded) => bounded.source_roots().to_vec(),
+            None => replacement.source_roots(),
+        };
         let (loaded_segments, removed_roots) = {
             let persisted = self.persisted.persisted_index.read();
             let removed = source_roots
@@ -374,7 +381,51 @@ impl ChunkStorage {
             || !transition.loaded_segments.is_empty()
             || !transition.removed_roots.is_empty()
         {
-            match publication.publish_transition(transition) {
+            let mut transition_reservation = None;
+            let result = if drain_catalog {
+                publication.publish_transition(transition)
+            } else {
+                let bounded = bounded_recovery.expect(
+                    "finite post-flush recovery must carry its admitted marker work envelope",
+                );
+                let item_limit = self.runtime.maintenance_max_items_per_pass;
+                let byte_limit = self.runtime.maintenance_max_bytes_per_pass;
+                let staging_bytes = self.modeled_finite_transition_staging_bytes(&transition);
+                let staging_work = u64::try_from(staging_bytes).unwrap_or(u64::MAX);
+                let transition_peak = bounded
+                    .retained_memory_bytes()
+                    .saturating_add(staging_bytes);
+                let selected_work = bounded
+                    .selected_bytes()
+                    .max(u64::try_from(transition_peak).unwrap_or(u64::MAX))
+                    .max(staging_work);
+                if bounded.selected_items() > item_limit {
+                    return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                        operation: "bounded post-flush replacement catalog publication",
+                        item_limit,
+                        byte_limit,
+                        selected_items: bounded.selected_items(),
+                        selected_bytes: selected_work,
+                    });
+                }
+                if selected_work > byte_limit {
+                    return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                        operation: "bounded post-flush replacement catalog publication",
+                        limit: byte_limit,
+                        required: selected_work,
+                    });
+                }
+                transition_reservation =
+                    Some(self.remote_catalog_memory_reservation(staging_bytes)?);
+                publication.publish_transition_with_finite_recovery_budget(
+                    transition,
+                    item_limit.saturating_sub(bounded.selected_items()),
+                    byte_limit.saturating_sub(selected_work),
+                    true,
+                )
+            };
+            drop(transition_reservation);
+            match result {
                 Ok(PersistedCatalogRefreshApply::Applied) => {}
                 Ok(PersistedCatalogRefreshApply::Deferred) => {
                     self.persisted
@@ -395,7 +446,17 @@ impl ChunkStorage {
         }
         drop(publication);
 
-        let expired = replacement.finish_committing(self.persisted.local_disk_budget.as_ref())?;
+        // Recovery publication changes the same persisted-series visibility metadata as the
+        // direct post-flush path. Preserve the at-least-once reconciliation wake before source
+        // retirement so a later cleanup error cannot erase that ownership.
+        self.post_flush_workflow_context()
+            .restore_startup_metadata_reconcile_pending();
+        let expired = match bounded_recovery {
+            Some(bounded) => {
+                bounded.finish_committing(self.persisted.local_disk_budget.as_ref())?
+            }
+            None => replacement.finish_committing(self.persisted.local_disk_budget.as_ref())?,
+        };
         retention.record_expired_segments(expired);
         retention.record_tier_moves(replacement.tier_moves());
         Ok(PostFlushCatalogPublication::Published(expired))
@@ -406,8 +467,79 @@ impl ChunkStorage {
         retention: RetentionMaintenanceContext<'_>,
         data_path: &Path,
         drain_catalog: bool,
-    ) -> Result<(usize, bool)> {
+    ) -> Result<(usize, bool, bool)> {
+        if !drain_catalog {
+            // A prior marker transition may already own the finite tiered writer cursor. Advancing
+            // that cursor consumes this wake's complete maintenance envelope; do not also scan or
+            // parse another marker even when the page happens to complete the writer.
+            if self.finite_tiered_catalog_publication_enabled()
+                && self.bounded_tiered_catalog_publication_is_pending()
+            {
+                let completed = self
+                    .advance_bounded_tiered_catalog_publication(false)
+                    .inspect_err(|_| {
+                        self.persisted
+                            .persisted_index_dirty
+                            .store(true, Ordering::SeqCst);
+                    })?;
+                if completed {
+                    self.synchronize_persisted_index_dirty_with_pending();
+                } else {
+                    self.persisted
+                        .persisted_index_dirty
+                        .store(true, Ordering::SeqCst);
+                }
+                return Ok((0, true, true));
+            }
+
+            let step = {
+                let mut cursor = self
+                    .coordination
+                    .background_post_flush_recovery_cursor
+                    .lock();
+                next_runtime_replacement_bounded(
+                    &mut cursor,
+                    data_path,
+                    self.post_flush_segment_path_resolver(),
+                    self.persisted.local_disk_budget.as_ref(),
+                    self.runtime.maintenance_max_items_per_pass,
+                    self.runtime.maintenance_max_bytes_per_pass,
+                    |bytes| self.remote_catalog_memory_reservation(bytes),
+                )
+            }?;
+            return match step {
+                BoundedRuntimeReplacementStep::NoPending => Ok((0, false, false)),
+                BoundedRuntimeReplacementStep::NamespaceEntryConsumed
+                | BoundedRuntimeReplacementStep::PreparedRolledBack => Ok((0, false, true)),
+                BoundedRuntimeReplacementStep::Committing(bounded) => {
+                    let replacement = bounded.replacement();
+                    match self.apply_committing_post_flush_replacement(
+                        retention,
+                        replacement,
+                        false,
+                        Some(&bounded),
+                    ) {
+                        Ok(PostFlushCatalogPublication::Published(removed)) => {
+                            Ok((removed, false, true))
+                        }
+                        Ok(PostFlushCatalogPublication::Deferred) => {
+                            self.reset_background_post_flush_recovery_cursor();
+                            Ok((0, true, true))
+                        }
+                        Err(err) => {
+                            self.reset_background_post_flush_recovery_cursor();
+                            Err(err)
+                        }
+                    }
+                }
+            };
+        }
+
+        // Foreground/lifecycle drains intentionally retain the strict complete namespace scan and
+        // may finish every Prepared and Committing marker in one call.
+        self.reset_background_post_flush_recovery_cursor();
         let mut expired = 0usize;
+        let mut recovered_any = false;
         loop {
             let Some(replacement) = next_runtime_replacement(
                 data_path,
@@ -415,14 +547,21 @@ impl ChunkStorage {
                 self.persisted.local_disk_budget.as_ref(),
             )?
             else {
-                return Ok((expired, false));
+                return Ok((expired, false, recovered_any));
             };
-            match self.apply_committing_post_flush_replacement(retention, &replacement)? {
+            recovered_any = true;
+            match self.apply_committing_post_flush_replacement(
+                retention,
+                &replacement,
+                drain_catalog,
+                None,
+            )? {
                 PostFlushCatalogPublication::Published(removed) => {
                     expired = expired.saturating_add(removed);
                 }
-                PostFlushCatalogPublication::Deferred if drain_catalog => continue,
-                PostFlushCatalogPublication::Deferred => return Ok((expired, true)),
+                PostFlushCatalogPublication::Deferred => {
+                    continue;
+                }
             }
         }
     }
@@ -475,17 +614,28 @@ impl ChunkStorage {
             .write() = None;
     }
 
-    pub(in super::super) fn run_post_flush_maintenance_if_pending(&self) -> Result<bool> {
+    fn run_post_flush_maintenance_if_pending_outcome(
+        &self,
+    ) -> Result<PostFlushMaintenanceRunOutcome> {
         let workflow = self.post_flush_workflow_context();
         let work = workflow.claim_pending_work();
         if !work.any() {
-            return Ok(false);
+            return Ok(PostFlushMaintenanceRunOutcome::NoWork);
         }
 
         if work.run_post_flush {
             let sweep = self.sweep_background_persisted_segments_for_retention_page();
-            let more_pages = match sweep {
-                Ok((_expired, more_pages)) => more_pages,
+            let envelope_consumed = match sweep {
+                Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages }) => {
+                    if more_pages {
+                        workflow.restore_post_flush_pending();
+                    }
+                    true
+                }
+                Ok(BackgroundRetentionSweepOutcome::CatalogRefreshRequired) => {
+                    workflow.restore_post_flush_pending();
+                    false
+                }
                 Err(err) => {
                     workflow.restore_post_flush_pending();
                     if work.run_metadata_reconcile {
@@ -494,8 +644,8 @@ impl ChunkStorage {
                     return Err(err);
                 }
             };
-            if more_pages {
-                workflow.restore_post_flush_pending();
+            if !envelope_consumed {
+                return Ok(PostFlushMaintenanceRunOutcome::CatalogRefreshRequired);
             }
         }
 
@@ -513,7 +663,22 @@ impl ChunkStorage {
             }
         }
 
-        Ok(true)
+        Ok(PostFlushMaintenanceRunOutcome::EnvelopeConsumed)
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn run_post_flush_maintenance_if_pending(&self) -> Result<bool> {
+        Ok(!matches!(
+            self.run_post_flush_maintenance_if_pending_outcome()?,
+            PostFlushMaintenanceRunOutcome::NoWork
+        ))
+    }
+
+    pub(in super::super) fn run_post_flush_maintenance_envelope_if_pending(&self) -> Result<bool> {
+        Ok(matches!(
+            self.run_post_flush_maintenance_if_pending_outcome()?,
+            PostFlushMaintenanceRunOutcome::EnvelopeConsumed
+        ))
     }
 
     pub(in super::super) fn schedule_post_flush_maintenance(&self) -> Result<()> {
@@ -528,8 +693,12 @@ impl ChunkStorage {
             return Ok(());
         }
 
-        while self.run_post_flush_maintenance_if_pending()?
-            && (self
+        loop {
+            let envelope_consumed = self.run_post_flush_maintenance_envelope_if_pending()?;
+            if !envelope_consumed && self.persisted.persisted_index_dirty.load(Ordering::Acquire) {
+                self.sync_persisted_segments_from_disk_if_dirty()?;
+            }
+            if !(self
                 .coordination
                 .post_flush_maintenance_pending
                 .load(Ordering::Acquire)
@@ -537,8 +706,9 @@ impl ChunkStorage {
                     .coordination
                     .startup_metadata_reconcile_pending
                     .load(Ordering::Acquire))
-        {
-            self.sync_persisted_segments_from_disk_if_dirty()?;
+            {
+                break;
+            }
         }
         Ok(())
     }
@@ -562,6 +732,7 @@ impl ChunkStorage {
         data_path: &Path,
         staged: StagedPostFlushMaintenance,
         drain_catalog: bool,
+        finite_page_work: Option<(usize, u64)>,
     ) -> Result<PostFlushCatalogPublication> {
         let StagedPostFlushMaintenance {
             publication,
@@ -601,6 +772,51 @@ impl ChunkStorage {
                 }
             }
         };
+        let mut transition_reservation = None;
+        let finite_recovery_budget =
+            if let Some((selected_items, selected_bytes)) = finite_page_work {
+                let item_limit = self.runtime.maintenance_max_items_per_pass;
+                let byte_limit = self.runtime.maintenance_max_bytes_per_pass;
+                if selected_items > item_limit {
+                    let primary = TsinkError::MaintenanceDependencyWindowExceeded {
+                        operation: "bounded retention catalog publication",
+                        item_limit,
+                        byte_limit,
+                        selected_items,
+                        selected_bytes,
+                    };
+                    let cleanup = retention
+                        .cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                    return Err(post_flush_failure_with_recovery(primary, Ok(()), cleanup));
+                }
+                let staging_bytes = self.modeled_finite_transition_staging_bytes(&transition);
+                let staging_work = u64::try_from(staging_bytes).unwrap_or(u64::MAX);
+                let selected_work = selected_bytes.max(staging_work);
+                if selected_work > byte_limit {
+                    let primary = TsinkError::MaintenanceWorkItemTooLarge {
+                        operation: "bounded retention catalog publication",
+                        limit: byte_limit,
+                        required: selected_work,
+                    };
+                    let cleanup = retention
+                        .cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                    return Err(post_flush_failure_with_recovery(primary, Ok(()), cleanup));
+                }
+                match self.remote_catalog_memory_reservation(staging_bytes) {
+                    Ok(reservation) => transition_reservation = Some(reservation),
+                    Err(primary) => {
+                        let cleanup = retention
+                            .cleanup_staged_post_flush_paths(&promotions, &staging_cleanup_paths);
+                        return Err(post_flush_failure_with_recovery(primary, Ok(()), cleanup));
+                    }
+                }
+                Some((
+                    item_limit.saturating_sub(selected_items),
+                    byte_limit.saturating_sub(selected_work),
+                ))
+            } else {
+                None
+            };
 
         let mut replacement = match publish_prepared_replacement(
             data_path,
@@ -641,7 +857,17 @@ impl ChunkStorage {
 
         let catalog_deferred = {
             let publication = self.begin_persisted_catalog_publication();
-            match publication.publish_transition(transition) {
+            let result = match finite_recovery_budget {
+                Some((remaining_items, remaining_bytes)) => publication
+                    .publish_transition_with_finite_recovery_budget(
+                        transition,
+                        remaining_items,
+                        remaining_bytes,
+                        true,
+                    ),
+                None => publication.publish_transition(transition),
+            };
+            match result {
                 Ok(PersistedCatalogRefreshApply::Applied) => false,
                 Ok(PersistedCatalogRefreshApply::Deferred) => true,
                 Ok(PersistedCatalogRefreshApply::SkippedStaleVisibleState) => unreachable!(
@@ -649,6 +875,7 @@ impl ChunkStorage {
                 ),
                 Err(err) => {
                     drop(publication);
+                    drop(transition_reservation);
                     self.persisted
                         .persisted_index_dirty
                         .store(true, Ordering::SeqCst);
@@ -658,6 +885,7 @@ impl ChunkStorage {
                 }
             }
         };
+        drop(transition_reservation);
         if catalog_deferred {
             self.persisted
                 .persisted_index_dirty
@@ -665,7 +893,12 @@ impl ChunkStorage {
             retention.cleanup_staged_post_flush_paths(&[], &staging_cleanup_paths)?;
             if drain_catalog {
                 loop {
-                    match self.apply_committing_post_flush_replacement(retention, &replacement)? {
+                    match self.apply_committing_post_flush_replacement(
+                        retention,
+                        &replacement,
+                        true,
+                        None,
+                    )? {
                         PostFlushCatalogPublication::Published(removed) => {
                             return Ok(PostFlushCatalogPublication::Published(removed));
                         }
@@ -710,55 +943,67 @@ impl ChunkStorage {
         }
     }
 
-    fn sweep_background_persisted_segments_for_retention_page(&self) -> Result<(usize, bool)> {
+    fn sweep_background_persisted_segments_for_retention_page(
+        &self,
+    ) -> Result<BackgroundRetentionSweepOutcome> {
         let retention = self.retention_maintenance_context();
         if !retention.has_persisted_lane_paths() {
             retention.reset_background_maintenance_cursor();
-            return Ok((0, false));
+            return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages: false });
         }
 
         self.validate_shared_object_store_writer_lock()?;
         let recency_reference = self.retention_recency_reference_timestamp();
         let Some(cutoff) = retention.active_retention_cutoff(recency_reference) else {
             retention.reset_background_maintenance_cursor();
-            return Ok((0, false));
+            return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages: false });
         };
         let policy = retention.retention_tier_policy(cutoff, recency_reference);
 
         let _compaction_guard = self.compaction_gate();
         let data_path = self.post_flush_replacement_data_path()?;
-        let (recovered_expired, catalog_publication_pending) =
+        let (_recovered_expired, catalog_publication_pending, recovered_replacement) =
             self.recover_pending_post_flush_replacements(retention, &data_path, false)?;
-        if catalog_publication_pending {
-            return Ok((recovered_expired, true));
+        if catalog_publication_pending || recovered_replacement {
+            return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages: true });
         }
         if retention.catalog_requires_refresh() {
-            self.apply_known_dirty_persisted_refresh_if_pending()?;
-            if retention.catalog_requires_refresh() {
-                // Unknown dirty state needs the catalog-refresh phase to establish a complete,
-                // validated visible inventory. Keep the page pending without claiming that the
-                // current cursor reached the end; the same worker runs refresh after this method.
-                return Ok((recovered_expired, true));
+            // Any catalog mutation can insert a lexically earlier root behind the retained
+            // inventory cursor. The compaction gate fences producers here, so restart before
+            // consuming a known-dirty page and never reuse the prior after-root boundary.
+            retention.reset_background_maintenance_cursor();
+            if self.apply_known_dirty_persisted_refresh_if_pending()? {
+                return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages: true });
             }
+            // Unknown dirty state needs the catalog-refresh phase to establish a complete,
+            // validated visible inventory. No retention envelope was spent, so let this worker
+            // wake dispatch exactly one catalog-refresh page before retrying retention later.
+            return Ok(BackgroundRetentionSweepOutcome::CatalogRefreshRequired);
         }
 
         let page = retention.select_background_maintenance_page(policy)?;
         if page.plan.is_empty() {
             let more_pages = !page.cycle_complete;
             retention.commit_background_maintenance_page(&page);
-            return Ok((recovered_expired, more_pages));
+            return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages });
         }
 
         let staged = retention.stage_post_flush_maintenance_page(page.plan.clone(), policy)?;
-        let removed = match self
-            .publish_staged_post_flush_maintenance(retention, &data_path, staged, false)?
-        {
-            PostFlushCatalogPublication::Published(removed) => removed,
-            PostFlushCatalogPublication::Deferred => return Ok((recovered_expired, true)),
-        };
+        match self.publish_staged_post_flush_maintenance(
+            retention,
+            &data_path,
+            staged,
+            false,
+            Some((page.selected_items, page.selected_bytes)),
+        )? {
+            PostFlushCatalogPublication::Published(_) => {}
+            PostFlushCatalogPublication::Deferred => {
+                return Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages: true });
+            }
+        }
         let more_pages = !page.cycle_complete;
         retention.commit_background_maintenance_page(&page);
-        Ok((recovered_expired.saturating_add(removed), more_pages))
+        Ok(BackgroundRetentionSweepOutcome::EnvelopeConsumed { more_pages })
     }
 
     fn sweep_persisted_segments_for_retention(&self, fully_expired_only: bool) -> Result<usize> {
@@ -780,7 +1025,7 @@ impl ChunkStorage {
 
         let _compaction_guard = self.compaction_gate();
         let data_path = self.post_flush_replacement_data_path()?;
-        let (recovered_expired, catalog_publication_pending) =
+        let (recovered_expired, catalog_publication_pending, _recovered_replacement) =
             self.recover_pending_post_flush_replacements(retention, &data_path, true)?;
         debug_assert!(
             !catalog_publication_pending,
@@ -815,11 +1060,7 @@ impl ChunkStorage {
                 PersistedCatalogRefreshApply::Applied => return Ok(recovered_expired),
                 PersistedCatalogRefreshApply::Deferred => {
                     self.advance_bounded_tiered_catalog_publication(true)?;
-                    self.persist_series_registry_index_with_catalog_update(
-                        &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
-                            registry_catalog::inventory_sources(&inventory),
-                        ),
-                    )?;
+                    self.synchronize_persisted_index_dirty_with_pending();
                     return Ok(recovered_expired);
                 }
                 PersistedCatalogRefreshApply::SkippedStaleVisibleState => unreachable!(
@@ -848,11 +1089,7 @@ impl ChunkStorage {
                     PersistedCatalogRefreshApply::Applied => return Ok(recovered_expired),
                     PersistedCatalogRefreshApply::Deferred => {
                         self.advance_bounded_tiered_catalog_publication(true)?;
-                        self.persist_series_registry_index_with_catalog_update(
-                            &registry_catalog::PersistedRegistryCatalogUpdate::Complete(
-                                registry_catalog::inventory_sources(&scanned_inventory),
-                            ),
-                        )?;
+                        self.synchronize_persisted_index_dirty_with_pending();
                         return Ok(recovered_expired);
                     }
                     PersistedCatalogRefreshApply::SkippedStaleVisibleState => unreachable!(
@@ -867,7 +1104,7 @@ impl ChunkStorage {
 
         let staged = retention.stage_post_flush_maintenance(&inventory, plan, policy)?;
         let removed = match self
-            .publish_staged_post_flush_maintenance(retention, &data_path, staged, true)?
+            .publish_staged_post_flush_maintenance(retention, &data_path, staged, true, None)?
         {
             PostFlushCatalogPublication::Published(removed) => removed,
             PostFlushCatalogPublication::Deferred => {

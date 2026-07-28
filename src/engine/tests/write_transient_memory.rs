@@ -7,7 +7,7 @@ use crate::{
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 
 fn sample_histogram(custom_values: usize) -> NativeHistogram {
@@ -1095,11 +1095,34 @@ fn retained_wal_cache_charge_releases_after_successful_flush_reset() {
     assert!(before.wal_series_definition_cache_bytes > 0);
     assert_memory_snapshot_component_sum(&before);
 
+    let full_reconciliations = Arc::new(AtomicUsize::new(0));
+    storage.set_full_memory_reconciliation_hook({
+        let full_reconciliations = Arc::clone(&full_reconciliations);
+        move || {
+            full_reconciliations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     storage.flush().unwrap();
     let after = storage.memory_observability_snapshot();
-    assert_eq!(after.wal_series_definition_cache_bytes, 0);
+    let exact_cache_bytes = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .cached_series_definition_index_memory_usage_bytes();
+    assert_eq!(
+        after.wal_series_definition_cache_bytes, exact_cache_bytes,
+        "successful reset must publish the exact retained cache capacity"
+    );
     assert_memory_snapshot_component_sum(&after);
     assert!(after.accounted_bytes < before.accounted_bytes);
+    assert_eq!(
+        full_reconciliations.load(Ordering::Relaxed),
+        0,
+        "flush must release the WAL cache incrementally"
+    );
+    storage.clear_full_memory_reconciliation_hook();
+    assert_engine_memory_usage_reconciled(&storage);
     storage.close().unwrap();
 }
 
