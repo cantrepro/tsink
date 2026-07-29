@@ -910,6 +910,9 @@ struct ServerRuntime {
 impl ServerRuntime {
     async fn bootstrap(config: ServerConfig) -> Result<Self, String> {
         let config = config.normalize_and_validate()?;
+        // Freeze every environment-backed request-protocol config before listener bind. This
+        // ensures the first request, including `/metrics`, cannot become the hidden initializer.
+        handlers::initialize_protocol_configs();
         let _ = admission::validate_public_write_admission_config()?;
         let _ = admission::validate_public_read_admission_config()?;
         admission::global_public_write_admission()?;

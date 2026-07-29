@@ -259,6 +259,13 @@ curl -X POST http://node-1:9201/api/v1/admin/cluster/rebalance/run
 curl http://node-1:9201/api/v1/admin/cluster/rebalance/status
 ```
 
+Each rebalance management request uses one root query execution for its metric list, live control
+and hotspot inputs, scheduler projection, and response encoding. The successful JSON schema is
+unchanged. For pause, resume, and run, the requested effect can succeed before a later projection
+or response limit fails; those errors include `data.effectApplied: true` and the resulting
+`rebalancePaused`/`rebalanceRunCompleted` state. Inspect that state before retrying. The
+request-time accounting does not yet impose the still-open retained hotspot identity policy.
+
 ---
 
 ## Adding and removing nodes
@@ -476,16 +483,20 @@ mTLS certificates can be rotated at runtime without restart. See the [secret rot
 ### Bounded internal read envelopes
 
 Internal `select_batch`, `select_series`, `query_exemplars`, and `list_metrics` requests can carry
-`query_limits`. Supplying the field opts into the bounded RPC contract: the serving node admits
-exactly one query execution, propagates its cancellation/deadline through blocking storage work and
-handoff reads, retains memory accounting through JSON response construction, and returns complete
-execution accounting. A backend or peer that cannot prove complete accounting is rejected with
-`query_accounting_unavailable` or `query_accounting_invalid`; it is never treated as zero work.
+`query_limits`. The serving node admits exactly one query execution, propagates its
+cancellation/deadline through blocking storage work and handoff reads, and retains memory
+accounting through JSON response construction. A backend or peer that cannot prove complete
+accounting is rejected with `query_accounting_unavailable` or `query_accounting_invalid`; it is
+never treated as zero work.
 
-For `list_metrics`, the bounded form uses the same metadata selection path as `select_series` with
-an empty selector. Omitting `query_limits` preserves the older response shape and behavior, and the
-response omits `accounting`. The legacy single-series `/internal/v1/select` route likewise remains
-unaccounted for wire compatibility, but a bounded coordinator does not fall back to it.
+For `select_series` and `list_metrics`, supplying `query_limits` tightens the request and returns
+complete execution accounting. Omitting the additive field preserves the older response shape by
+omitting `accounting`, but no longer selects an unbounded implementation: the request inherits the
+finite Server per-query ceiling tightened by the serving storage instance. `list_metrics` uses the
+same metadata selection path as `select_series` with an empty selector in both forms. The legacy
+single-series `/internal/v1/select` request has no additive limits or accounting fields, but current
+servers execute it through the same finite one-selector batch contract and preserve its exact
+`{"points": ...}` response shape.
 
 The anti-entropy `digest_window` route always requires `query_limits`, and every work-limit field
 must be finite. Missing limits fail with `query_limits_required`; incomplete limits fail with

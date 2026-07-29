@@ -2,10 +2,14 @@ use crate::tenant::{TenantAdmissionSurface, TenantRequestError};
 use crate::usage::UsageAccounting;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tsink::{QueryExecution, QueryMemoryReservation};
 
 const MANAGED_CONTROL_PLANE_DIR: &str = "managed-control-plane";
 const MANAGED_CONTROL_PLANE_STATE_FILE: &str = "state.json";
@@ -15,6 +19,11 @@ const DEFAULT_BACKUP_RETENTION_COPIES: u32 = 7;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 100;
 const MAX_RESOURCE_ID_LEN: usize = 128;
 const MANAGED_TENANT_INGEST_WINDOW_MS: u64 = 1_000;
+const MANAGED_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+// A one-entry BTreeMap can retain a whole fixed-capacity root node. Charge each logical entry
+// enough for that worst case rather than assuming the allocator packs labels densely.
+const MANAGED_STATUS_BTREE_ENTRY_ALLOWANCE_BYTES: u64 = 1_024;
+const MANAGED_STATUS_CHECKPOINT_INTERVAL: usize = 32;
 
 #[derive(Debug)]
 pub struct ManagedControlPlane {
@@ -22,6 +31,8 @@ pub struct ManagedControlPlane {
     local_disk_budget: Option<Arc<tsink::LocalDiskBudget>>,
     state: Mutex<ManagedControlPlaneStateFile>,
     request_runtimes: Mutex<BTreeMap<String, Arc<ManagedTenantRequestRuntime>>>,
+    #[cfg(test)]
+    status_projection_output_string_materializations: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -160,6 +171,35 @@ pub struct ManagedControlPlaneStatusSnapshot {
     pub backup_policies_total: u64,
     pub audit_records_total: u64,
     pub updated_unix_ms: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ManagedControlPlaneStatusProjection {
+    pub(crate) status: ManagedControlPlaneStatusSnapshot,
+    pub(crate) deployments: Vec<ManagedDeploymentSummary>,
+    pub(crate) current_tenant: Option<ManagedTenant>,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the projection releases its query-memory reservation"]
+pub(crate) struct AccountedManagedControlPlaneStatusProjection {
+    projection: ManagedControlPlaneStatusProjection,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedManagedControlPlaneStatusProjection {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedManagedControlPlaneStatusProjection {
+    type Target = ManagedControlPlaneStatusProjection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -593,6 +633,8 @@ impl ManagedControlPlane {
             local_disk_budget,
             state: Mutex::new(state),
             request_runtimes: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            status_projection_output_string_materializations: AtomicU64::new(0),
         })
     }
 
@@ -628,6 +670,7 @@ impl ManagedControlPlane {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn status_snapshot(&self) -> ManagedControlPlaneStatusSnapshot {
         let state = self
             .state
@@ -636,6 +679,7 @@ impl ManagedControlPlane {
         status_snapshot_for_state(&state, self.state_path.as_deref())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn deployment_summaries(&self) -> Vec<ManagedDeploymentSummary> {
         let state = self
             .state
@@ -650,6 +694,227 @@ impl ManagedControlPlane {
             .lock()
             .expect("managed control-plane state mutex should not be poisoned");
         state.tenants.get(tenant_id).cloned()
+    }
+
+    /// Captures the exact managed-control-plane inputs used by direct TSDB status.
+    ///
+    /// The authoritative state is locked once so status counts, deployment summaries, and the
+    /// optional current tenant all describe one generation. Every retained allocation is measured
+    /// and reserved before any output String, Vec, or BTreeMap is materialized.
+    pub(crate) fn status_projection_for_with_execution(
+        &self,
+        tenant_id: &str,
+        execution: &QueryExecution,
+    ) -> Result<AccountedManagedControlPlaneStatusProjection, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .expect("managed control-plane state mutex should not be poisoned");
+        execution.checkpoint()?;
+
+        let state_path_len = self
+            .state_path
+            .as_deref()
+            .map(displayed_managed_status_path_len);
+        let mut peak_bytes =
+            modeled_managed_status_vec_bytes::<ManagedDeploymentSummary>(state.deployments.len())
+                .saturating_add(
+                    state_path_len
+                        .map(modeled_managed_status_len_bytes)
+                        .unwrap_or(0),
+                );
+
+        let mut status_counts = ManagedStatusDerivedCounts::default();
+        for (index, deployment) in state.deployments.values().enumerate() {
+            checkpoint_managed_status(execution, index)?;
+            status_counts.maintenance_active = status_counts
+                .maintenance_active
+                .saturating_add(usize::from(deployment.maintenance.active));
+            status_counts.upgrade_rollouts_in_progress = status_counts
+                .upgrade_rollouts_in_progress
+                .saturating_add(usize::from(matches!(
+                    deployment.upgrade.state,
+                    UpgradeRolloutState::Pending
+                        | UpgradeRolloutState::InProgress
+                        | UpgradeRolloutState::Paused
+                )));
+            status_counts.backup_policies = status_counts
+                .backup_policies
+                .saturating_add(usize::from(deployment.backup_policy.enabled));
+            peak_bytes = peak_bytes
+                .saturating_add(modeled_managed_status_str_bytes(&deployment.id))
+                .saturating_add(modeled_managed_status_str_bytes(&deployment.region))
+                .saturating_add(modeled_managed_status_str_bytes(&deployment.plan))
+                .saturating_add(
+                    deployment
+                        .upgrade
+                        .desired_version
+                        .as_deref()
+                        .map(modeled_managed_status_str_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    deployment
+                        .upgrade
+                        .observed_version
+                        .as_deref()
+                        .map(modeled_managed_status_str_bytes)
+                        .unwrap_or(0),
+                );
+        }
+
+        for (index, tenant) in state.tenants.values().enumerate() {
+            checkpoint_managed_status(execution, index)?;
+            status_counts.active_tenants = status_counts.active_tenants.saturating_add(
+                usize::from(tenant.lifecycle == TenantLifecycleState::Active),
+            );
+        }
+
+        let source_tenant = state.tenants.get(tenant_id);
+        if let Some(tenant) = source_tenant {
+            execution.checkpoint()?;
+            peak_bytes = peak_bytes
+                .saturating_add(modeled_managed_status_str_bytes(&tenant.id))
+                .saturating_add(modeled_managed_status_str_bytes(&tenant.deployment_id))
+                .saturating_add(modeled_managed_status_str_bytes(&tenant.display_name))
+                .saturating_add(
+                    modeled_managed_status_btree_entries_bytes::<String, String>(
+                        tenant.labels.len(),
+                    ),
+                )
+                .saturating_add(
+                    tenant
+                        .lifecycle_note
+                        .as_deref()
+                        .map(modeled_managed_status_str_bytes)
+                        .unwrap_or(0),
+                );
+            for (key, value) in &tenant.labels {
+                execution.checkpoint()?;
+                peak_bytes = peak_bytes
+                    .saturating_add(modeled_managed_status_str_bytes(key))
+                    .saturating_add(modeled_managed_status_str_bytes(value));
+            }
+        }
+
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let state_path =
+            self.state_path
+                .as_deref()
+                .zip(state_path_len)
+                .map(|(path, displayed_len)| {
+                    self.materialize_status_projection_path(path, displayed_len)
+                });
+        let status =
+            status_snapshot_for_state_with_path_and_counts(&state, state_path, status_counts);
+
+        let mut deployments = Vec::with_capacity(state.deployments.len());
+        for (index, deployment) in state.deployments.values().enumerate() {
+            checkpoint_managed_status(execution, index)?;
+            let tenant_counts =
+                deployment_tenant_counts_for_state_with_execution(&state, deployment, execution)?;
+            deployments.push(deployment_summary_for_state_with_dynamic(
+                deployment,
+                tenant_counts,
+                self.clone_status_projection_string(&deployment.id),
+                self.clone_status_projection_string(&deployment.region),
+                self.clone_status_projection_string(&deployment.plan),
+                deployment
+                    .upgrade
+                    .desired_version
+                    .as_deref()
+                    .map(|value| self.clone_status_projection_string(value)),
+                deployment
+                    .upgrade
+                    .observed_version
+                    .as_deref()
+                    .map(|value| self.clone_status_projection_string(value)),
+            ));
+        }
+
+        let current_tenant = source_tenant
+            .map(|tenant| self.clone_status_projection_tenant(tenant, execution))
+            .transpose()?;
+        let projection = ManagedControlPlaneStatusProjection {
+            status,
+            deployments,
+            current_tenant,
+        };
+        reservation.resize(modeled_managed_status_projection_retained_bytes(
+            &projection,
+        ))?;
+        drop(state);
+        execution.checkpoint()?;
+
+        Ok(AccountedManagedControlPlaneStatusProjection {
+            projection,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_status_projection_tenant(
+        &self,
+        tenant: &ManagedTenant,
+        execution: &QueryExecution,
+    ) -> Result<ManagedTenant, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let mut labels = BTreeMap::new();
+        for (key, value) in &tenant.labels {
+            execution.checkpoint()?;
+            labels.insert(
+                self.clone_status_projection_string(key),
+                self.clone_status_projection_string(value),
+            );
+        }
+        Ok(ManagedTenant {
+            id: self.clone_status_projection_string(&tenant.id),
+            deployment_id: self.clone_status_projection_string(&tenant.deployment_id),
+            display_name: self.clone_status_projection_string(&tenant.display_name),
+            lifecycle: tenant.lifecycle,
+            retention_days: tenant.retention_days,
+            storage_limit_bytes: tenant.storage_limit_bytes,
+            ingest_rate_limit_per_sec: tenant.ingest_rate_limit_per_sec,
+            query_concurrency_limit: tenant.query_concurrency_limit,
+            labels,
+            created_unix_ms: tenant.created_unix_ms,
+            updated_unix_ms: tenant.updated_unix_ms,
+            lifecycle_note: tenant
+                .lifecycle_note
+                .as_deref()
+                .map(|value| self.clone_status_projection_string(value)),
+        })
+    }
+
+    fn clone_status_projection_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.status_projection_output_string_materializations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        clone_managed_status_string(value)
+    }
+
+    fn materialize_status_projection_path(&self, path: &Path, displayed_len: usize) -> String {
+        #[cfg(test)]
+        self.status_projection_output_string_materializations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let mut output = String::with_capacity(displayed_len);
+        write!(&mut output, "{}", path.display())
+            .expect("formatting a managed control-plane state path into a String should succeed");
+        output
+    }
+
+    #[cfg(test)]
+    fn reset_status_projection_output_string_materializations(&self) {
+        self.status_projection_output_string_materializations
+            .store(0, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_projection_output_string_materializations(&self) -> u64 {
+        self.status_projection_output_string_materializations
+            .load(AtomicOrdering::Relaxed)
     }
 
     pub fn query_audit(
@@ -1187,59 +1452,233 @@ impl ManagedControlPlane {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ManagedStatusDerivedCounts {
+    active_tenants: usize,
+    maintenance_active: usize,
+    upgrade_rollouts_in_progress: usize,
+    backup_policies: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ManagedDeploymentTenantCounts {
+    total: usize,
+    active: usize,
+}
+
+fn checkpoint_managed_status(
+    execution: &QueryExecution,
+    index: usize,
+) -> Result<(), tsink::QueryBudgetError> {
+    if index.is_multiple_of(MANAGED_STATUS_CHECKPOINT_INTERVAL) {
+        execution.checkpoint()?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ManagedStatusPathLen {
+    bytes: usize,
+}
+
+impl std::fmt::Write for ManagedStatusPathLen {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.bytes = self.bytes.saturating_add(value.len());
+        Ok(())
+    }
+}
+
+fn displayed_managed_status_path_len(path: &Path) -> usize {
+    let mut counter = ManagedStatusPathLen::default();
+    write!(&mut counter, "{}", path.display())
+        .expect("counting formatted managed control-plane path bytes should succeed");
+    counter.bytes
+}
+
+fn modeled_managed_status_len_bytes(len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(MANAGED_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_managed_status_str_bytes(value: &str) -> u64 {
+    modeled_managed_status_len_bytes(value.len())
+}
+
+fn modeled_managed_status_string_bytes(value: &String) -> u64 {
+    modeled_managed_status_len_bytes(value.capacity())
+}
+
+fn modeled_managed_status_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(MANAGED_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_managed_status_btree_entries_bytes<K, V>(entries: usize) -> u64 {
+    u64::try_from(entries).unwrap_or(u64::MAX).saturating_mul(
+        u64::try_from(std::mem::size_of::<K>())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(std::mem::size_of::<V>()).unwrap_or(u64::MAX))
+            .saturating_add(MANAGED_STATUS_BTREE_ENTRY_ALLOWANCE_BYTES),
+    )
+}
+
+fn clone_managed_status_string(value: &str) -> String {
+    let mut cloned = String::with_capacity(value.len());
+    cloned.push_str(value);
+    cloned
+}
+
+fn modeled_managed_tenant_retained_bytes(tenant: &ManagedTenant) -> u64 {
+    modeled_managed_status_string_bytes(&tenant.id)
+        .saturating_add(modeled_managed_status_string_bytes(&tenant.deployment_id))
+        .saturating_add(modeled_managed_status_string_bytes(&tenant.display_name))
+        .saturating_add(
+            modeled_managed_status_btree_entries_bytes::<String, String>(tenant.labels.len()),
+        )
+        .saturating_add(tenant.labels.iter().fold(0u64, |bytes, (key, value)| {
+            bytes
+                .saturating_add(modeled_managed_status_string_bytes(key))
+                .saturating_add(modeled_managed_status_string_bytes(value))
+        }))
+        .saturating_add(
+            tenant
+                .lifecycle_note
+                .as_ref()
+                .map(modeled_managed_status_string_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_managed_status_projection_retained_bytes(
+    projection: &ManagedControlPlaneStatusProjection,
+) -> u64 {
+    projection
+        .status
+        .state_path
+        .as_ref()
+        .map(modeled_managed_status_string_bytes)
+        .unwrap_or(0)
+        .saturating_add(
+            modeled_managed_status_vec_bytes::<ManagedDeploymentSummary>(
+                projection.deployments.capacity(),
+            ),
+        )
+        .saturating_add(
+            projection
+                .deployments
+                .iter()
+                .fold(0u64, |bytes, deployment| {
+                    bytes
+                        .saturating_add(modeled_managed_status_string_bytes(&deployment.id))
+                        .saturating_add(modeled_managed_status_string_bytes(&deployment.region))
+                        .saturating_add(modeled_managed_status_string_bytes(&deployment.plan))
+                        .saturating_add(
+                            deployment
+                                .desired_version
+                                .as_ref()
+                                .map(modeled_managed_status_string_bytes)
+                                .unwrap_or(0),
+                        )
+                        .saturating_add(
+                            deployment
+                                .observed_version
+                                .as_ref()
+                                .map(modeled_managed_status_string_bytes)
+                                .unwrap_or(0),
+                        )
+                }),
+        )
+        .saturating_add(
+            projection
+                .current_tenant
+                .as_ref()
+                .map(modeled_managed_tenant_retained_bytes)
+                .unwrap_or(0),
+        )
+}
+
 fn status_snapshot_for_state(
     state: &ManagedControlPlaneStateFile,
     state_path: Option<&Path>,
 ) -> ManagedControlPlaneStatusSnapshot {
+    status_snapshot_for_state_with_path(state, state_path.map(|path| path.display().to_string()))
+}
+
+fn status_snapshot_for_state_with_path(
+    state: &ManagedControlPlaneStateFile,
+    state_path: Option<String>,
+) -> ManagedControlPlaneStatusSnapshot {
+    status_snapshot_for_state_with_path_and_counts(
+        state,
+        state_path,
+        managed_status_derived_counts_for_state(state),
+    )
+}
+
+fn managed_status_derived_counts_for_state(
+    state: &ManagedControlPlaneStateFile,
+) -> ManagedStatusDerivedCounts {
+    ManagedStatusDerivedCounts {
+        active_tenants: state
+            .tenants
+            .values()
+            .filter(|tenant| tenant.lifecycle == TenantLifecycleState::Active)
+            .count(),
+        maintenance_active: state
+            .deployments
+            .values()
+            .filter(|deployment| deployment.maintenance.active)
+            .count(),
+        upgrade_rollouts_in_progress: state
+            .deployments
+            .values()
+            .filter(|deployment| {
+                matches!(
+                    deployment.upgrade.state,
+                    UpgradeRolloutState::Pending
+                        | UpgradeRolloutState::InProgress
+                        | UpgradeRolloutState::Paused
+                )
+            })
+            .count(),
+        backup_policies: state
+            .deployments
+            .values()
+            .filter(|deployment| deployment.backup_policy.enabled)
+            .count(),
+    }
+}
+
+fn status_snapshot_for_state_with_path_and_counts(
+    state: &ManagedControlPlaneStateFile,
+    state_path: Option<String>,
+    counts: ManagedStatusDerivedCounts,
+) -> ManagedControlPlaneStatusSnapshot {
     ManagedControlPlaneStatusSnapshot {
         durable: state_path.is_some(),
-        state_path: state_path.map(|path| path.display().to_string()),
+        state_path,
         deployments_total: u64::try_from(state.deployments.len()).unwrap_or(u64::MAX),
         tenants_total: u64::try_from(state.tenants.len()).unwrap_or(u64::MAX),
-        active_tenants_total: u64::try_from(
-            state
-                .tenants
-                .values()
-                .filter(|tenant| tenant.lifecycle == TenantLifecycleState::Active)
-                .count(),
-        )
-        .unwrap_or(u64::MAX),
-        maintenance_active_total: u64::try_from(
-            state
-                .deployments
-                .values()
-                .filter(|deployment| deployment.maintenance.active)
-                .count(),
-        )
-        .unwrap_or(u64::MAX),
-        upgrade_rollouts_in_progress_total: u64::try_from(
-            state
-                .deployments
-                .values()
-                .filter(|deployment| {
-                    matches!(
-                        deployment.upgrade.state,
-                        UpgradeRolloutState::Pending
-                            | UpgradeRolloutState::InProgress
-                            | UpgradeRolloutState::Paused
-                    )
-                })
-                .count(),
-        )
-        .unwrap_or(u64::MAX),
-        backup_policies_total: u64::try_from(
-            state
-                .deployments
-                .values()
-                .filter(|deployment| deployment.backup_policy.enabled)
-                .count(),
-        )
-        .unwrap_or(u64::MAX),
+        active_tenants_total: u64::try_from(counts.active_tenants).unwrap_or(u64::MAX),
+        maintenance_active_total: u64::try_from(counts.maintenance_active).unwrap_or(u64::MAX),
+        upgrade_rollouts_in_progress_total: u64::try_from(counts.upgrade_rollouts_in_progress)
+            .unwrap_or(u64::MAX),
+        backup_policies_total: u64::try_from(counts.backup_policies).unwrap_or(u64::MAX),
         audit_records_total: u64::try_from(state.audit_entries.len()).unwrap_or(u64::MAX),
         updated_unix_ms: state.updated_unix_ms,
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn deployment_summaries_for_state(
     state: &ManagedControlPlaneStateFile,
 ) -> Vec<ManagedDeploymentSummary> {
@@ -1247,34 +1686,79 @@ fn deployment_summaries_for_state(
         .deployments
         .values()
         .map(|deployment| {
-            let tenant_count = state
-                .tenants
-                .values()
-                .filter(|tenant| tenant.deployment_id == deployment.id)
-                .count();
-            let active_tenant_count = state
-                .tenants
-                .values()
-                .filter(|tenant| {
-                    tenant.deployment_id == deployment.id
-                        && tenant.lifecycle == TenantLifecycleState::Active
-                })
-                .count();
-            ManagedDeploymentSummary {
-                id: deployment.id.clone(),
-                region: deployment.region.clone(),
-                plan: deployment.plan.clone(),
-                lifecycle: deployment.lifecycle,
-                tenant_count: u64::try_from(tenant_count).unwrap_or(u64::MAX),
-                active_tenant_count: u64::try_from(active_tenant_count).unwrap_or(u64::MAX),
-                backup_enabled: deployment.backup_policy.enabled,
-                maintenance_active: deployment.maintenance.active,
-                upgrade_state: deployment.upgrade.state,
-                desired_version: deployment.upgrade.desired_version.clone(),
-                observed_version: deployment.upgrade.observed_version.clone(),
-            }
+            deployment_summary_for_state_with_dynamic(
+                deployment,
+                deployment_tenant_counts_for_state(state, deployment),
+                deployment.id.clone(),
+                deployment.region.clone(),
+                deployment.plan.clone(),
+                deployment.upgrade.desired_version.clone(),
+                deployment.upgrade.observed_version.clone(),
+            )
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deployment_summary_for_state_with_dynamic(
+    deployment: &ManagedDeployment,
+    tenant_counts: ManagedDeploymentTenantCounts,
+    id: String,
+    region: String,
+    plan: String,
+    desired_version: Option<String>,
+    observed_version: Option<String>,
+) -> ManagedDeploymentSummary {
+    ManagedDeploymentSummary {
+        id,
+        region,
+        plan,
+        lifecycle: deployment.lifecycle,
+        tenant_count: u64::try_from(tenant_counts.total).unwrap_or(u64::MAX),
+        active_tenant_count: u64::try_from(tenant_counts.active).unwrap_or(u64::MAX),
+        backup_enabled: deployment.backup_policy.enabled,
+        maintenance_active: deployment.maintenance.active,
+        upgrade_state: deployment.upgrade.state,
+        desired_version,
+        observed_version,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn deployment_tenant_counts_for_state(
+    state: &ManagedControlPlaneStateFile,
+    deployment: &ManagedDeployment,
+) -> ManagedDeploymentTenantCounts {
+    state.tenants.values().fold(
+        ManagedDeploymentTenantCounts::default(),
+        |mut counts, tenant| {
+            if tenant.deployment_id == deployment.id {
+                counts.total = counts.total.saturating_add(1);
+                if tenant.lifecycle == TenantLifecycleState::Active {
+                    counts.active = counts.active.saturating_add(1);
+                }
+            }
+            counts
+        },
+    )
+}
+
+fn deployment_tenant_counts_for_state_with_execution(
+    state: &ManagedControlPlaneStateFile,
+    deployment: &ManagedDeployment,
+    execution: &QueryExecution,
+) -> Result<ManagedDeploymentTenantCounts, tsink::QueryBudgetError> {
+    let mut counts = ManagedDeploymentTenantCounts::default();
+    for (index, tenant) in state.tenants.values().enumerate() {
+        checkpoint_managed_status(execution, index)?;
+        if tenant.deployment_id == deployment.id {
+            counts.total = counts.total.saturating_add(1);
+            if tenant.lifecycle == TenantLifecycleState::Active {
+                counts.active = counts.active.saturating_add(1);
+            }
+        }
+    }
+    Ok(counts)
 }
 
 impl ManagedTenantRequestPolicy {
@@ -1591,6 +2075,10 @@ fn unix_timestamp_millis() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tsink::{
+        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        QueryWorkLimits,
+    };
 
     fn actor() -> ManagedControlPlaneActor {
         ManagedControlPlaneActor {
@@ -1608,6 +2096,352 @@ mod tests {
             lifecycle: Some(DeploymentLifecycleState::Ready),
             ..ManagedDeploymentProvisionRequest::default()
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn status_projection_test_deployment(
+        id: &str,
+        region: &str,
+        plan: &str,
+        lifecycle: DeploymentLifecycleState,
+        backup_enabled: bool,
+        maintenance_active: bool,
+        upgrade_state: UpgradeRolloutState,
+        desired_version: Option<&str>,
+        observed_version: Option<&str>,
+    ) -> ManagedDeployment {
+        ManagedDeployment {
+            id: id.to_string(),
+            display_name: format!("display {id}"),
+            region: region.to_string(),
+            plan: plan.to_string(),
+            control_plane_endpoint: Some(format!("https://cp-{id}.example")),
+            data_plane_endpoint: Some(format!("https://dp-{id}.example")),
+            object_store_path: Some(format!("s3://bucket/{id}")),
+            lifecycle,
+            labels: BTreeMap::from([("environment".to_string(), "test".to_string())]),
+            created_unix_ms: 101,
+            updated_unix_ms: 102,
+            backup_policy: ManagedBackupPolicy {
+                enabled: backup_enabled,
+                ..ManagedBackupPolicy::default()
+            },
+            maintenance: ManagedMaintenancePolicy {
+                active: maintenance_active,
+                reason: Some("maintenance diagnostic".to_string()),
+                ..ManagedMaintenancePolicy::default()
+            },
+            upgrade: ManagedUpgradePlan {
+                desired_version: desired_version.map(str::to_string),
+                observed_version: observed_version.map(str::to_string),
+                state: upgrade_state,
+                notes: Some("upgrade diagnostic".to_string()),
+                ..ManagedUpgradePlan::default()
+            },
+        }
+    }
+
+    fn status_projection_test_store(temp_dir: &TempDir) -> ManagedControlPlane {
+        let store =
+            ManagedControlPlane::open(Some(temp_dir.path())).expect("test store should open");
+        let mut state = store
+            .state
+            .lock()
+            .expect("managed control-plane state mutex should not be poisoned");
+        state.updated_unix_ms = 777;
+        state.deployments = BTreeMap::from([
+            (
+                "z-map-key".to_string(),
+                status_projection_test_deployment(
+                    "deployment-alpha",
+                    "region-\"alpha",
+                    "plan-alpha\n",
+                    DeploymentLifecycleState::Ready,
+                    false,
+                    false,
+                    UpgradeRolloutState::Complete,
+                    Some("2.0.0"),
+                    None,
+                ),
+            ),
+            (
+                "a-map-key".to_string(),
+                status_projection_test_deployment(
+                    "deployment-zeta",
+                    "region-zeta",
+                    "plan-zeta",
+                    DeploymentLifecycleState::Provisioning,
+                    true,
+                    true,
+                    UpgradeRolloutState::InProgress,
+                    Some("3.0.0"),
+                    Some("2.9.0"),
+                ),
+            ),
+        ]);
+        state.tenants = BTreeMap::from([
+            (
+                "Current-Tenant-Key".to_string(),
+                ManagedTenant {
+                    id: "tenant-value-id".to_string(),
+                    deployment_id: "deployment-zeta".to_string(),
+                    display_name: "Current \"Tenant\"\n".to_string(),
+                    lifecycle: TenantLifecycleState::Suspended,
+                    retention_days: Some(31),
+                    storage_limit_bytes: Some(1_234_567),
+                    ingest_rate_limit_per_sec: Some(8_765),
+                    query_concurrency_limit: Some(9),
+                    labels: BTreeMap::from([
+                        ("z-label".to_string(), "z-value\n".to_string()),
+                        ("a-label".to_string(), "a-\"value".to_string()),
+                    ]),
+                    created_unix_ms: 201,
+                    updated_unix_ms: 202,
+                    lifecycle_note: Some("billing \"hold\"\n".to_string()),
+                },
+            ),
+            (
+                "other-tenant".to_string(),
+                ManagedTenant {
+                    id: "other-tenant".to_string(),
+                    deployment_id: "deployment-alpha".to_string(),
+                    display_name: "Other Tenant".to_string(),
+                    lifecycle: TenantLifecycleState::Active,
+                    retention_days: None,
+                    storage_limit_bytes: None,
+                    ingest_rate_limit_per_sec: None,
+                    query_concurrency_limit: None,
+                    labels: BTreeMap::new(),
+                    created_unix_ms: 301,
+                    updated_unix_ms: 302,
+                    lifecycle_note: None,
+                },
+            ),
+        ]);
+        state.audit_entries = vec![ManagedControlPlaneAuditEntry {
+            seq: 1,
+            unix_ms: 401,
+            actor_id: "status-test".to_string(),
+            actor_scope: "test".to_string(),
+            operation: "fixture".to_string(),
+            target_kind: "control-plane".to_string(),
+            target_id: "fixture".to_string(),
+            outcome: "success".to_string(),
+            detail: Some("not retained by status projection".to_string()),
+        }];
+        drop(state);
+        store
+    }
+
+    fn expected_status_projection_string_materializations(
+        status: &ManagedControlPlaneStatusSnapshot,
+        deployments: &[ManagedDeploymentSummary],
+        current_tenant: Option<&ManagedTenant>,
+    ) -> u64 {
+        let mut count = u64::from(status.state_path.is_some());
+        for deployment in deployments {
+            count = count
+                .saturating_add(3)
+                .saturating_add(u64::from(deployment.desired_version.is_some()))
+                .saturating_add(u64::from(deployment.observed_version.is_some()));
+        }
+        if let Some(tenant) = current_tenant {
+            count = count
+                .saturating_add(3)
+                .saturating_add(
+                    u64::try_from(tenant.labels.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(2),
+                )
+                .saturating_add(u64::from(tenant.lifecycle_note.is_some()));
+        }
+        count
+    }
+
+    #[test]
+    fn status_projection_preserves_all_legacy_inputs_and_map_order() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let store = status_projection_test_store(&temp_dir);
+        let legacy_status = store.status_snapshot();
+        let legacy_deployments = store.deployment_summaries();
+        let legacy_current_tenant = store.tenant_snapshot("Current-Tenant-Key");
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        store.reset_status_projection_output_string_materializations();
+
+        let projection = store
+            .status_projection_for_with_execution("Current-Tenant-Key", &execution)
+            .expect("schema-complete managed status projection should succeed");
+        assert_eq!(projection.status, legacy_status);
+        assert_eq!(projection.deployments, legacy_deployments);
+        assert_eq!(projection.current_tenant, legacy_current_tenant);
+        assert_eq!(
+            projection
+                .deployments
+                .iter()
+                .map(|deployment| deployment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deployment-zeta", "deployment-alpha"],
+            "deployment summaries must preserve BTreeMap key order rather than sort by value id"
+        );
+        assert_eq!(
+            projection
+                .current_tenant
+                .as_ref()
+                .expect("current tenant should be present")
+                .labels
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["a-label", "z-label"]
+        );
+        assert_eq!(
+            projection.accounted_bytes(),
+            modeled_managed_status_projection_retained_bytes(&projection)
+        );
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projection.accounted_bytes()
+        );
+        assert_eq!(
+            store.status_projection_output_string_materializations(),
+            expected_status_projection_string_materializations(
+                &projection.status,
+                &projection.deployments,
+                projection.current_tenant.as_ref(),
+            )
+        );
+
+        drop(projection);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_projection_enforces_exact_peak_before_any_output_clone() {
+        fn budget_with_memory_limit(limit: Option<u64>) -> QueryBudget {
+            QueryBudget::new(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: limit,
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: limit,
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .expect("managed status projection budget should build")
+        }
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let store = status_projection_test_store(&temp_dir);
+
+        let calibration_budget = budget_with_memory_limit(None);
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = store
+            .status_projection_for_with_execution("Current-Tenant-Key", &calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, exact_bytes);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            exact_bytes,
+            "the complete retained projection must be its materialization peak"
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_status = calibration_budget.snapshot();
+        assert_eq!(calibration_status.active_queries, 0);
+        assert_eq!(calibration_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(calibration_status.accounting_invariant_violations_total, 0);
+
+        let exact_budget = budget_with_memory_limit(Some(exact_bytes));
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        store.reset_status_projection_output_string_materializations();
+        let exact_projection = store
+            .status_projection_for_with_execution("Current-Tenant-Key", &exact)
+            .expect("the exact managed status peak should pass");
+        assert_eq!(exact_projection.accounted_bytes(), exact_bytes);
+        assert!(store.status_projection_output_string_materializations() > 0);
+        drop(exact_projection);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_status = exact_budget.snapshot();
+        assert_eq!(exact_status.active_queries, 0);
+        assert_eq!(exact_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_status.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = budget_with_memory_limit(Some(exact_bytes.saturating_sub(1)));
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        store.reset_status_projection_output_string_materializations();
+        let error = store
+            .status_projection_for_with_execution("Current-Tenant-Key", &one_under)
+            .expect_err("one byte below the complete managed status peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected managed status projection error: {other}"),
+        }
+        assert_eq!(
+            store.status_projection_output_string_materializations(),
+            0,
+            "N-1 admission must fail before any retained path, summary, or tenant string clone"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let store = status_projection_test_store(&temp_dir);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        store.reset_status_projection_output_string_materializations();
+        cancellation.cancel();
+
+        let error = store
+            .status_projection_for_with_execution("Current-Tenant-Key", &execution)
+            .expect_err("a pre-cancelled managed status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(store.status_projection_output_string_materializations(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.cancellations_total, 1);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
     }
 
     #[test]

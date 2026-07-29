@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::task::JoinSet;
 use tsink::{
-    BatchWriteResult, Label, Row, RowWriteStatus, Storage, Value, WriteAcknowledgement, WriteMode,
-    WriteRejection, WriteRejectionCategory,
+    BatchWriteResult, Label, QueryBudgetError, QueryExecution, QueryMemoryReservation, Row,
+    RowWriteStatus, Storage, Value, WriteAcknowledgement, WriteMode, WriteRejection,
+    WriteRejectionCategory,
 };
 
 pub const WRITE_CONSISTENCY_OVERRIDE_HEADER: &str = "x-tsink-write-consistency";
@@ -100,12 +101,14 @@ pub struct WriteRoutingMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct WriteRoutingShardMetricsSnapshot {
     pub shard: u32,
     pub rows_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct WriteRoutingPeerMetricsSnapshot {
     pub node_id: String,
     pub routed_rows_total: u64,
@@ -118,10 +121,56 @@ pub struct WriteRoutingPeerMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct WriteRoutingLabeledMetricsSnapshot {
     pub shards: Vec<WriteRoutingShardMetricsSnapshot>,
     pub peers: Vec<WriteRoutingPeerMetricsSnapshot>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRoutingShardMetricsExpositionSnapshot {
+    pub shard: u32,
+    pub rows_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRoutingPeerMetricsExpositionSnapshot {
+    pub node_id: String,
+    pub routed_rows_total: u64,
+    pub routed_batches_total: u64,
+    pub remote_requests_total: u64,
+    pub remote_failures_total: u64,
+    pub remote_request_duration_nanos_total: u64,
+    pub remote_request_duration_count: u64,
+    pub remote_request_duration_buckets: [u64; 8],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteRoutingLabeledMetricsExpositionSnapshot {
+    pub shards: Vec<WriteRoutingShardMetricsExpositionSnapshot>,
+    pub peers: Vec<WriteRoutingPeerMetricsExpositionSnapshot>,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub struct AccountedWriteRoutingLabeledMetricsSnapshot {
+    snapshot: WriteRoutingLabeledMetricsExpositionSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedWriteRoutingLabeledMetricsSnapshot {
+    #[must_use]
+    pub fn snapshot(&self) -> &WriteRoutingLabeledMetricsExpositionSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+const WRITE_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 const WRITE_REMOTE_REQUEST_LATENCY_BUCKETS_NANOS: [u64; 8] = [
     1_000_000,     // 1ms
@@ -1558,6 +1607,7 @@ pub fn write_routing_metrics_snapshot() -> WriteRoutingMetricsSnapshot {
     }
 }
 
+#[allow(dead_code)]
 pub fn write_routing_labeled_metrics_snapshot() -> WriteRoutingLabeledMetricsSnapshot {
     with_write_labeled_metrics(|metrics| {
         let shards = metrics
@@ -1584,6 +1634,104 @@ pub fn write_routing_labeled_metrics_snapshot() -> WriteRoutingLabeledMetricsSna
             .collect::<Vec<_>>();
         WriteRoutingLabeledMetricsSnapshot { shards, peers }
     })
+}
+
+pub fn write_routing_labeled_metrics_snapshot_with_execution(
+    execution: &QueryExecution,
+) -> Result<AccountedWriteRoutingLabeledMetricsSnapshot, QueryBudgetError> {
+    execution.checkpoint()?;
+    with_write_labeled_metrics(|metrics| {
+        write_routing_labeled_metrics_snapshot_from(metrics, execution)
+    })
+}
+
+fn write_routing_labeled_metrics_snapshot_from(
+    metrics: &WriteRoutingLabeledMetrics,
+    execution: &QueryExecution,
+) -> Result<AccountedWriteRoutingLabeledMetricsSnapshot, QueryBudgetError> {
+    execution.checkpoint()?;
+    let peak_bytes = modeled_write_metrics_vec_bytes::<WriteRoutingShardMetricsExpositionSnapshot>(
+        metrics.shard_rows_total.len(),
+    )
+    .saturating_add(modeled_write_metrics_vec_bytes::<
+        WriteRoutingPeerMetricsExpositionSnapshot,
+    >(metrics.peers.len()))
+    .saturating_add(metrics.peers.keys().fold(0u64, |bytes, node_id| {
+        bytes.saturating_add(modeled_write_metrics_string_bytes(node_id))
+    }));
+    let mut reservation = execution.reserve_memory(peak_bytes)?;
+
+    let mut shards = Vec::with_capacity(metrics.shard_rows_total.len());
+    for (shard, rows_total) in &metrics.shard_rows_total {
+        execution.checkpoint()?;
+        shards.push(WriteRoutingShardMetricsExpositionSnapshot {
+            shard: *shard,
+            rows_total: *rows_total,
+        });
+    }
+
+    let mut peers = Vec::with_capacity(metrics.peers.len());
+    for (node_id, peer) in &metrics.peers {
+        execution.checkpoint()?;
+        peers.push(WriteRoutingPeerMetricsExpositionSnapshot {
+            node_id: node_id.clone(),
+            routed_rows_total: peer.routed_rows_total,
+            routed_batches_total: peer.routed_batches_total,
+            remote_requests_total: peer.remote_requests_total,
+            remote_failures_total: peer.remote_failures_total,
+            remote_request_duration_nanos_total: peer.remote_request_latency.sum_nanos,
+            remote_request_duration_count: peer.remote_request_latency.count,
+            remote_request_duration_buckets: peer.remote_request_latency.bucket_counts,
+        });
+    }
+    let snapshot = WriteRoutingLabeledMetricsExpositionSnapshot { shards, peers };
+    reservation.resize(modeled_write_metrics_snapshot_bytes(&snapshot))?;
+    Ok(AccountedWriteRoutingLabeledMetricsSnapshot {
+        snapshot,
+        _reservation: reservation,
+    })
+}
+
+fn modeled_write_metrics_snapshot_bytes(
+    snapshot: &WriteRoutingLabeledMetricsExpositionSnapshot,
+) -> u64 {
+    modeled_write_metrics_vec_bytes::<WriteRoutingShardMetricsExpositionSnapshot>(
+        snapshot.shards.capacity(),
+    )
+    .saturating_add(modeled_write_metrics_vec_bytes::<
+        WriteRoutingPeerMetricsExpositionSnapshot,
+    >(snapshot.peers.capacity()))
+    .saturating_add(snapshot.peers.iter().fold(0u64, |bytes, peer| {
+        bytes.saturating_add(modeled_write_metrics_string_capacity_bytes(&peer.node_id))
+    }))
+}
+
+fn modeled_write_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(WRITE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_write_metrics_string_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(WRITE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_write_metrics_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(WRITE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
 }
 
 fn with_write_labeled_metrics<T>(mut f: impl FnMut(&mut WriteRoutingLabeledMetrics) -> T) -> T {
@@ -1793,7 +1941,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
-    use tsink::{DataPoint, StorageBuilder, TimestampPrecision};
+    use tsink::{
+        DataPoint, QueryBudget, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        QueryWorkLimits, StorageBuilder, TimestampPrecision,
+    };
 
     #[test]
     fn quorum_policy_requires_majority() {
@@ -3345,5 +3496,94 @@ mod tests {
 
         assert_eq!(key_a, key_b);
         validate_idempotency_key(&key_a).expect("generated key should be valid");
+    }
+
+    #[test]
+    fn write_metrics_projection_enforces_exact_memory_and_cancellation() {
+        let mut peer = PerPeerRoutingMetrics {
+            routed_rows_total: 7,
+            routed_batches_total: 3,
+            remote_requests_total: 2,
+            remote_failures_total: 1,
+            ..PerPeerRoutingMetrics::default()
+        };
+        peer.remote_request_latency.record(5_000_000);
+        let metrics = WriteRoutingLabeledMetrics {
+            shard_rows_total: BTreeMap::from([(3, 7), (9, 11)]),
+            peers: BTreeMap::from([("projection-peer".to_string(), peer)]),
+        };
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration execution should admit");
+        let snapshot = write_routing_labeled_metrics_snapshot_from(&metrics, &calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = snapshot.accounted_bytes();
+        assert!(exact_bytes > 1);
+        assert_eq!(snapshot.snapshot().peers[0].node_id, "projection-peer");
+        drop(snapshot);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact execution should admit");
+        let snapshot = write_routing_labeled_metrics_snapshot_from(&metrics, &exact)
+            .expect("the exact modeled limit should pass");
+        assert_eq!(snapshot.accounted_bytes(), exact_bytes);
+        drop(snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes - 1),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under execution should admit");
+        match write_routing_labeled_metrics_snapshot_from(&metrics, &one_under)
+            .expect_err("one byte below the modeled limit must fail")
+        {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+
+        let cancellation = QueryCancellationToken::new();
+        let cancelled_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancelled = cancelled_budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("cancelled execution should initially admit");
+        cancellation.cancel();
+        assert!(matches!(
+            write_routing_labeled_metrics_snapshot_from(&metrics, &cancelled),
+            Err(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(cancelled.snapshot().memory_reserved_bytes, 0);
     }
 }

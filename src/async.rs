@@ -1303,7 +1303,7 @@ fn read_worker_loop(
                 reply,
             } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         storage.select_with_execution(&metric, &labels, start, end, execution)
@@ -1319,7 +1319,7 @@ fn read_worker_loop(
             } => {
                 let options_with_execution = options.clone();
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         storage.select_with_options_with_execution(
@@ -1339,7 +1339,7 @@ fn read_worker_loop(
                 reply,
             } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| storage.select_all_with_execution(&metric, start, end, execution),
                     || storage.select_all(&metric, start, end),
@@ -1348,7 +1348,7 @@ fn read_worker_loop(
             }
             ReadCommand::ListMetrics { reply } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         if storage.list_metrics_execution_accounting()
@@ -1369,7 +1369,7 @@ fn read_worker_loop(
             }
             ReadCommand::SelectSeries { selection, reply } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         if storage.select_series_execution_accounting()
@@ -1399,7 +1399,7 @@ fn read_worker_loop(
                 reply,
             } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         if storage.scan_series_rows_execution_accounting()
@@ -1430,7 +1430,7 @@ fn read_worker_loop(
                 reply,
             } => {
                 let result = run_read_with_execution(
-                    execution.as_ref(),
+                    execution,
                     &cancellation,
                     |execution| {
                         if storage.scan_metric_rows_execution_accounting()
@@ -1547,7 +1547,7 @@ impl ReadCommand {
 }
 
 fn run_read_with_execution<T>(
-    execution: Option<&QueryExecution>,
+    execution: Option<QueryExecution>,
     cancellation: &QueryCancellationToken,
     with_execution: impl FnOnce(&QueryExecution) -> Result<T>,
     without_execution: impl FnOnce() -> Result<T>,
@@ -1555,8 +1555,9 @@ fn run_read_with_execution<T>(
     match execution {
         Some(execution) => {
             execution.checkpoint()?;
-            let value = with_execution(execution)?;
+            let value = with_execution(&execution)?;
             execution.checkpoint()?;
+            drop(execution);
             Ok(value)
         }
         None => {
@@ -1677,6 +1678,36 @@ fn runtime_stopped_error() -> TsinkError {
 mod tests {
     use super::*;
     use std::sync::{Barrier, Condvar, Mutex as StdMutex};
+
+    #[test]
+    fn plain_read_helper_releases_execution_before_result_handoff() {
+        let budget =
+            crate::QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let cancellation = QueryCancellationToken::new();
+        assert_eq!(budget.snapshot().active_queries, 1);
+
+        let value = run_read_with_execution(
+            Some(execution),
+            &cancellation,
+            |execution| {
+                let reservation = execution.reserve_memory(1)?;
+                assert_eq!(execution.snapshot().memory_reserved_bytes, 1);
+                drop(reservation);
+                Ok(7)
+            },
+            || unreachable!("the admitted query must use the execution-aware path"),
+        )
+        .expect("read helper should succeed");
+
+        assert_eq!(value, 7);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.queries_started_total, 1);
+        assert_eq!(snapshot.queries_completed_total, 1);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
 
     #[test]
     fn queue_byte_budget_is_exact_at_n_and_rejects_n_plus_one() {

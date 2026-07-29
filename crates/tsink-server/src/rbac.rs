@@ -434,6 +434,55 @@ pub struct RbacStateSnapshot {
     pub audit_entries: usize,
 }
 
+/// Allocation-free scalar projection used by the Prometheus collector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RbacServiceAccountMetricsSnapshot {
+    pub total: usize,
+    pub disabled: usize,
+    pub last_rotated_unix_ms: u64,
+}
+
+/// Allocation-free service-account summary used by the security status producer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RbacServiceAccountStatusSummary {
+    pub total: usize,
+    pub disabled: usize,
+    pub last_rotated_unix_ms: u64,
+    pub audit_entries: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbacMetricsSnapshotError {
+    StateLockPoisoned,
+}
+
+impl std::fmt::Display for RbacMetricsSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StateLockPoisoned => f.write_str("RBAC registry state lock is poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for RbacMetricsSnapshotError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbacServiceAccountStatusError {
+    StateLockPoisoned,
+    AuditLockPoisoned,
+}
+
+impl std::fmt::Display for RbacServiceAccountStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StateLockPoisoned => f.write_str("RBAC registry state lock is poisoned"),
+            Self::AuditLockPoisoned => f.write_str("RBAC registry audit lock is poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for RbacServiceAccountStatusError {}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RbacRoleSnapshot {
@@ -988,6 +1037,59 @@ impl RbacRegistry {
             oidc_providers,
             audit_entries,
         }
+    }
+
+    pub fn service_account_metrics_snapshot(
+        &self,
+    ) -> Result<RbacServiceAccountMetricsSnapshot, RbacMetricsSnapshotError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| RbacMetricsSnapshotError::StateLockPoisoned)?;
+        let mut snapshot = RbacServiceAccountMetricsSnapshot {
+            total: state.service_accounts.len(),
+            ..RbacServiceAccountMetricsSnapshot::default()
+        };
+        for account in state.service_accounts.values() {
+            if account.disabled {
+                snapshot.disabled += 1;
+            }
+            snapshot.last_rotated_unix_ms = snapshot
+                .last_rotated_unix_ms
+                .max(account.last_rotated_unix_ms);
+        }
+        Ok(snapshot)
+    }
+
+    /// Returns the complete scalar service-account status without cloning RBAC state.
+    ///
+    /// The state lock is acquired before the audit lock, matching [`RbacRegistry::state_snapshot`].
+    pub fn service_account_status_summary(
+        &self,
+    ) -> Result<RbacServiceAccountStatusSummary, RbacServiceAccountStatusError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| RbacServiceAccountStatusError::StateLockPoisoned)?;
+        let audit_entries = self
+            .audit
+            .lock()
+            .map_err(|_| RbacServiceAccountStatusError::AuditLockPoisoned)?
+            .len();
+        let mut summary = RbacServiceAccountStatusSummary {
+            total: state.service_accounts.len(),
+            audit_entries,
+            ..RbacServiceAccountStatusSummary::default()
+        };
+        for account in state.service_accounts.values() {
+            if account.disabled {
+                summary.disabled = summary.disabled.saturating_add(1);
+            }
+            summary.last_rotated_unix_ms = summary
+                .last_rotated_unix_ms
+                .max(account.last_rotated_unix_ms);
+        }
+        Ok(summary)
     }
 
     pub fn audit_snapshot(&self, limit: usize) -> Vec<RbacAuditEntry> {
@@ -1938,6 +2040,135 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn service_account_metrics_snapshot_is_copy_and_matches_full_snapshot() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<RbacServiceAccountMetricsSnapshot>();
+        assert_copy::<RbacServiceAccountStatusSummary>();
+        assert!(!std::mem::needs_drop::<RbacServiceAccountMetricsSnapshot>());
+        assert!(!std::mem::needs_drop::<RbacServiceAccountStatusSummary>());
+
+        let registry = RbacRegistry::from_json_str(
+            r#"{
+                "serviceAccounts": [
+                    {
+                        "id": "active",
+                        "token": "active-token",
+                        "lastRotatedUnixMs": 41
+                    },
+                    {
+                        "id": "disabled",
+                        "token": "disabled-token",
+                        "disabled": true,
+                        "lastRotatedUnixMs": 73
+                    },
+                    {
+                        "id": "never-rotated",
+                        "token": "never-rotated-token"
+                    }
+                ]
+            }"#,
+        )
+        .expect("RBAC config should parse");
+
+        let full = registry.state_snapshot();
+        let metrics = registry
+            .service_account_metrics_snapshot()
+            .expect("metrics snapshot should succeed");
+        let status = registry
+            .service_account_status_summary()
+            .expect("status summary should succeed");
+        assert_eq!(metrics.total, full.service_accounts.len());
+        assert_eq!(
+            metrics.disabled,
+            full.service_accounts
+                .iter()
+                .filter(|account| account.disabled)
+                .count()
+        );
+        assert_eq!(
+            metrics.last_rotated_unix_ms,
+            full.service_accounts
+                .iter()
+                .map(|account| account.last_rotated_unix_ms)
+                .max()
+                .unwrap_or(0)
+        );
+        assert_eq!(
+            metrics,
+            RbacServiceAccountMetricsSnapshot {
+                total: 3,
+                disabled: 1,
+                last_rotated_unix_ms: 73,
+            }
+        );
+        assert_eq!(
+            status,
+            RbacServiceAccountStatusSummary {
+                total: full.service_accounts.len(),
+                disabled: full
+                    .service_accounts
+                    .iter()
+                    .filter(|account| account.disabled)
+                    .count(),
+                last_rotated_unix_ms: full
+                    .service_accounts
+                    .iter()
+                    .map(|account| account.last_rotated_unix_ms)
+                    .max()
+                    .unwrap_or(0),
+                audit_entries: full.audit_entries,
+            }
+        );
+    }
+
+    #[test]
+    fn service_account_metrics_snapshot_reports_a_poisoned_state_lock() {
+        let registry =
+            Arc::new(RbacRegistry::from_json_str("{}").expect("empty RBAC config should parse"));
+        let poisoned_registry = Arc::clone(&registry);
+        assert!(thread::spawn(move || {
+            let _guard = poisoned_registry
+                .state
+                .write()
+                .expect("state lock should initially be available");
+            panic!("poison the RBAC state lock");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(
+            registry.service_account_metrics_snapshot(),
+            Err(RbacMetricsSnapshotError::StateLockPoisoned)
+        );
+        assert_eq!(
+            registry.service_account_status_summary(),
+            Err(RbacServiceAccountStatusError::StateLockPoisoned)
+        );
+    }
+
+    #[test]
+    fn service_account_status_summary_reports_a_poisoned_audit_lock() {
+        let registry =
+            Arc::new(RbacRegistry::from_json_str("{}").expect("empty RBAC config should parse"));
+        let poisoned_registry = Arc::clone(&registry);
+        assert!(thread::spawn(move || {
+            let _guard = poisoned_registry
+                .audit
+                .lock()
+                .expect("audit lock should initially be available");
+            panic!("poison the RBAC audit lock");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(
+            registry.service_account_status_summary(),
+            Err(RbacServiceAccountStatusError::AuditLockPoisoned)
+        );
+    }
 
     #[test]
     fn scoped_bindings_limit_tenant_access() {

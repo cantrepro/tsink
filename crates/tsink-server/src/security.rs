@@ -1,5 +1,5 @@
 use crate::cluster::rpc::{InternalApiConfig, RpcClient};
-use crate::rbac::RbacRegistry;
+use crate::rbac::{RbacRegistry, RbacServiceAccountStatusError, RbacServiceAccountStatusSummary};
 use crate::server::ServerConfig;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -17,10 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_rustls::TlsAcceptor;
+use tsink::{QueryBudgetError, QueryExecution, QueryMemoryReservation};
 
 const GENERATED_TOKEN_BYTES: usize = 32;
 const DEFAULT_ROTATION_OVERLAP_SECS: u64 = 300;
 const SECURITY_AUDIT_CAPACITY: usize = 128;
+pub const SECURITY_METRICS_TARGET_COUNT: usize = 5;
 static SECRET_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -53,6 +55,16 @@ impl SecretRotationTarget {
             Self::ClusterInternalMtls => "cluster internal mTLS",
         }
     }
+
+    const fn metrics_index(self) -> usize {
+        match self {
+            Self::PublicAuthToken => 0,
+            Self::AdminAuthToken => 1,
+            Self::ClusterInternalAuthToken => 2,
+            Self::ListenerTls => 3,
+            Self::ClusterInternalMtls => 4,
+        }
+    }
 }
 
 impl fmt::Display for SecretRotationTarget {
@@ -69,7 +81,7 @@ pub enum SecretRotationMode {
     Rotate,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaterialSourceSnapshot {
     pub path: Option<String>,
@@ -79,7 +91,7 @@ pub struct MaterialSourceSnapshot {
     pub rotate_supported: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenSecretSnapshot {
     pub target: SecretRotationTarget,
@@ -102,7 +114,7 @@ pub struct TokenSecretSnapshot {
     pub source: MaterialSourceSnapshot,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsSecretSnapshot {
     pub target: SecretRotationTarget,
@@ -125,14 +137,14 @@ pub struct TlsSecretSnapshot {
     pub client_ca: Option<MaterialSourceSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SecurityTargetSnapshot {
     Token(TokenSecretSnapshot),
     Tls(TlsSecretSnapshot),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityAuditEntry {
     pub sequence: u64,
@@ -146,7 +158,7 @@ pub struct SecurityAuditEntry {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceAccountRotationSummary {
     pub total: usize,
@@ -155,7 +167,7 @@ pub struct ServiceAccountRotationSummary {
     pub audit_entries: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityStateSnapshot {
     pub targets: Vec<SecurityTargetSnapshot>,
@@ -163,6 +175,123 @@ pub struct SecurityStateSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_accounts: Option<ServiceAccountRotationSummary>,
 }
+
+/// Security status output whose dynamic allocations remain charged to the caller's query.
+#[derive(Debug)]
+#[must_use = "dropping the security snapshot releases its query-memory reservation"]
+pub struct AccountedSecurityStateSnapshot {
+    snapshot: SecurityStateSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedSecurityStateSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedSecurityStateSnapshot {
+    type Target = SecurityStateSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug)]
+pub enum SecurityStateSnapshotError {
+    QueryBudget(QueryBudgetError),
+    TargetStatePoisoned(SecretRotationTarget),
+    AuditLockPoisoned,
+    Rbac(RbacServiceAccountStatusError),
+}
+
+impl fmt::Display for SecurityStateSnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueryBudget(error) => write!(f, "security status query budget failed: {error}"),
+            Self::TargetStatePoisoned(target) => {
+                write!(f, "{} state lock is poisoned", target.display_name())
+            }
+            Self::AuditLockPoisoned => f.write_str("security audit lock is poisoned"),
+            Self::Rbac(error) => write!(f, "security RBAC summary failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SecurityStateSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueryBudget(error) => Some(error),
+            Self::Rbac(error) => Some(error),
+            Self::TargetStatePoisoned(_) | Self::AuditLockPoisoned => None,
+        }
+    }
+}
+
+impl From<QueryBudgetError> for SecurityStateSnapshotError {
+    fn from(error: QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
+}
+
+const SECURITY_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const SECURITY_STATUS_CHECKPOINT_INTERVAL: usize = 32;
+
+/// Allocation-free scalar projection used by the Prometheus collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityTargetMetricsSnapshot {
+    pub target: SecretRotationTarget,
+    pub generation: u64,
+    pub reloads_total: u64,
+    pub rotations_total: u64,
+    pub failures_total: u64,
+    pub last_success_unix_ms: u64,
+    pub last_failure_unix_ms: u64,
+    pub previous_credential_active: bool,
+}
+
+/// Fixed-cardinality security projection with one slot per rotation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityMetricsSnapshot {
+    pub targets: [Option<SecurityTargetMetricsSnapshot>; SECURITY_METRICS_TARGET_COUNT],
+}
+
+impl SecurityMetricsSnapshot {
+    pub fn targets(&self) -> impl Iterator<Item = &SecurityTargetMetricsSnapshot> {
+        self.targets.iter().flatten()
+    }
+
+    fn insert(&mut self, target: SecurityTargetMetricsSnapshot) {
+        self.targets[target.target.metrics_index()] = Some(target);
+    }
+}
+
+impl Default for SecurityMetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            targets: [None; SECURITY_METRICS_TARGET_COUNT],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityMetricsSnapshotError {
+    TargetStatePoisoned(SecretRotationTarget),
+}
+
+impl fmt::Display for SecurityMetricsSnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TargetStatePoisoned(target) => {
+                write!(f, "{} state lock is poisoned", target.display_name())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SecurityMetricsSnapshotError {}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,6 +575,29 @@ impl ManagedStringSecret {
         }
     }
 
+    fn metrics_snapshot(
+        &self,
+        now: u64,
+    ) -> Result<SecurityTargetMetricsSnapshot, SecurityMetricsSnapshotError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| SecurityMetricsSnapshotError::TargetStatePoisoned(self.target))?;
+        Ok(SecurityTargetMetricsSnapshot {
+            target: self.target,
+            generation: state.generation,
+            reloads_total: self.reloads_total.load(Ordering::Relaxed),
+            rotations_total: self.rotations_total.load(Ordering::Relaxed),
+            failures_total: self.failures_total.load(Ordering::Relaxed),
+            last_success_unix_ms: state.last_success_unix_ms,
+            last_failure_unix_ms: state.last_failure_unix_ms,
+            previous_credential_active: state
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.expires_unix_ms > now),
+        })
+    }
+
     pub fn reload(&self, overlap_secs: Option<u64>) -> Result<(), String> {
         self.reloads_total.fetch_add(1, Ordering::Relaxed);
         self.load_current_from_source(overlap_secs.unwrap_or(DEFAULT_ROTATION_OVERLAP_SECS), false)
@@ -671,6 +823,25 @@ impl ManagedTlsBundle {
         }
     }
 
+    fn metrics_snapshot(
+        &self,
+    ) -> Result<SecurityTargetMetricsSnapshot, SecurityMetricsSnapshotError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| SecurityMetricsSnapshotError::TargetStatePoisoned(self.target))?;
+        Ok(SecurityTargetMetricsSnapshot {
+            target: self.target,
+            generation: state.generation,
+            reloads_total: self.reloads_total.load(Ordering::Relaxed),
+            rotations_total: self.rotations_total.load(Ordering::Relaxed),
+            failures_total: self.failures_total.load(Ordering::Relaxed),
+            last_success_unix_ms: state.last_success_unix_ms,
+            last_failure_unix_ms: state.last_failure_unix_ms,
+            previous_credential_active: false,
+        })
+    }
+
     pub fn reload_listener_acceptor(&self) -> Result<TlsAcceptor, String> {
         self.reloads_total.fetch_add(1, Ordering::Relaxed);
         let loaded = self.load_material(false)?;
@@ -783,6 +954,10 @@ pub struct SecurityManager {
     listener_acceptor: RwLock<Option<TlsAcceptor>>,
     audit: Mutex<VecDeque<SecurityAuditEntry>>,
     audit_seq: AtomicU64,
+    #[cfg(test)]
+    status_snapshot_output_string_clones: AtomicU64,
+    #[cfg(test)]
+    status_snapshot_generations: AtomicU64,
 }
 
 impl fmt::Debug for SecurityManager {
@@ -862,6 +1037,10 @@ impl SecurityManager {
             listener_acceptor: RwLock::new(listener_acceptor),
             audit: Mutex::new(VecDeque::with_capacity(SECURITY_AUDIT_CAPACITY)),
             audit_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            status_snapshot_output_string_clones: AtomicU64::new(0),
+            #[cfg(test)]
+            status_snapshot_generations: AtomicU64::new(0),
         }))
     }
 
@@ -937,6 +1116,363 @@ impl SecurityManager {
             audit_entries,
             service_accounts,
         }
+    }
+
+    /// Captures one complete security-status generation under authoritative target/audit locks.
+    ///
+    /// Target locks follow the same public/admin/cluster/listener/internal-mTLS order as the
+    /// legacy snapshot. The security audit lock is acquired last. Complete retained output is
+    /// measured and reserved before any status String is copied; the private wrapper then retains
+    /// that charge until every borrowed status field has been dropped.
+    pub fn state_snapshot_with_execution(
+        &self,
+        rbac_registry: Option<&RbacRegistry>,
+        execution: &QueryExecution,
+    ) -> Result<AccountedSecurityStateSnapshot, SecurityStateSnapshotError> {
+        execution.checkpoint()?;
+        let public_auth_state = self
+            .public_auth
+            .as_ref()
+            .map(|secret| {
+                secret
+                    .state
+                    .read()
+                    .map_err(|_| SecurityStateSnapshotError::TargetStatePoisoned(secret.target))
+            })
+            .transpose()?;
+        execution.checkpoint()?;
+        let admin_auth_state = self
+            .admin_auth
+            .as_ref()
+            .map(|secret| {
+                secret
+                    .state
+                    .read()
+                    .map_err(|_| SecurityStateSnapshotError::TargetStatePoisoned(secret.target))
+            })
+            .transpose()?;
+        execution.checkpoint()?;
+        let cluster_internal_auth_state = self
+            .cluster_internal_auth
+            .as_ref()
+            .map(|secret| {
+                secret
+                    .state
+                    .read()
+                    .map_err(|_| SecurityStateSnapshotError::TargetStatePoisoned(secret.target))
+            })
+            .transpose()?;
+        execution.checkpoint()?;
+        let listener_tls_state = self
+            .listener_tls
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .state
+                    .read()
+                    .map_err(|_| SecurityStateSnapshotError::TargetStatePoisoned(bundle.target))
+            })
+            .transpose()?;
+        execution.checkpoint()?;
+        let cluster_internal_mtls_state = self
+            .cluster_internal_mtls
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .state
+                    .read()
+                    .map_err(|_| SecurityStateSnapshotError::TargetStatePoisoned(bundle.target))
+            })
+            .transpose()?;
+        execution.checkpoint()?;
+        let audit = self
+            .audit
+            .lock()
+            .map_err(|_| SecurityStateSnapshotError::AuditLockPoisoned)?;
+        execution.checkpoint()?;
+
+        let target_count = usize::from(public_auth_state.is_some())
+            .saturating_add(usize::from(admin_auth_state.is_some()))
+            .saturating_add(usize::from(cluster_internal_auth_state.is_some()))
+            .saturating_add(usize::from(listener_tls_state.is_some()))
+            .saturating_add(usize::from(cluster_internal_mtls_state.is_some()));
+        let mut retained_bytes =
+            modeled_security_status_vec_bytes::<SecurityTargetSnapshot>(target_count);
+        if let Some(state) = public_auth_state.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_token_status_retained_bytes(state));
+        }
+        if let Some(state) = admin_auth_state.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_token_status_retained_bytes(state));
+        }
+        if let Some(state) = cluster_internal_auth_state.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_token_status_retained_bytes(state));
+        }
+        if let Some(state) = listener_tls_state.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_tls_status_retained_bytes(state));
+        }
+        if let Some(state) = cluster_internal_mtls_state.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_tls_status_retained_bytes(state));
+        }
+        retained_bytes = retained_bytes.saturating_add(modeled_security_status_vec_bytes::<
+            SecurityAuditEntry,
+        >(audit.len()));
+        for (index, entry) in audit.iter().enumerate() {
+            checkpoint_security_status(execution, index)?;
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_security_audit_entry_retained_bytes(entry));
+        }
+        let mut reservation = execution.reserve_memory(retained_bytes)?;
+        execution.checkpoint()?;
+
+        #[cfg(test)]
+        self.status_snapshot_generations
+            .fetch_add(1, Ordering::Relaxed);
+        let now = unix_time_ms();
+        let mut targets = Vec::with_capacity(target_count);
+        if let (Some(secret), Some(state)) =
+            (self.public_auth.as_deref(), public_auth_state.as_deref())
+        {
+            execution.checkpoint()?;
+            targets.push(SecurityTargetSnapshot::Token(
+                self.clone_token_status_snapshot(secret, state, now),
+            ));
+        }
+        if let (Some(secret), Some(state)) =
+            (self.admin_auth.as_deref(), admin_auth_state.as_deref())
+        {
+            execution.checkpoint()?;
+            targets.push(SecurityTargetSnapshot::Token(
+                self.clone_token_status_snapshot(secret, state, now),
+            ));
+        }
+        if let (Some(secret), Some(state)) = (
+            self.cluster_internal_auth.as_deref(),
+            cluster_internal_auth_state.as_deref(),
+        ) {
+            execution.checkpoint()?;
+            targets.push(SecurityTargetSnapshot::Token(
+                self.clone_token_status_snapshot(secret, state, now),
+            ));
+        }
+        if let (Some(bundle), Some(state)) =
+            (self.listener_tls.as_deref(), listener_tls_state.as_deref())
+        {
+            execution.checkpoint()?;
+            targets.push(SecurityTargetSnapshot::Tls(
+                self.clone_tls_status_snapshot(bundle, state),
+            ));
+        }
+        if let (Some(bundle), Some(state)) = (
+            self.cluster_internal_mtls.as_deref(),
+            cluster_internal_mtls_state.as_deref(),
+        ) {
+            execution.checkpoint()?;
+            targets.push(SecurityTargetSnapshot::Tls(
+                self.clone_tls_status_snapshot(bundle, state),
+            ));
+        }
+        let mut audit_entries = Vec::with_capacity(audit.len());
+        for (index, entry) in audit.iter().rev().enumerate() {
+            checkpoint_security_status(execution, index)?;
+            audit_entries.push(self.clone_security_audit_entry(entry));
+        }
+
+        // Preserve the legacy security-before-RBAC lock order without nesting the two domains.
+        drop(audit);
+        drop(cluster_internal_mtls_state);
+        drop(listener_tls_state);
+        drop(cluster_internal_auth_state);
+        drop(admin_auth_state);
+        drop(public_auth_state);
+        execution.checkpoint()?;
+        let service_accounts = rbac_registry
+            .map(|registry| {
+                registry
+                    .service_account_status_summary()
+                    .map(ServiceAccountRotationSummary::from)
+                    .map_err(SecurityStateSnapshotError::Rbac)
+            })
+            .transpose()?;
+        let snapshot = SecurityStateSnapshot {
+            targets,
+            audit_entries,
+            service_accounts,
+        };
+        reservation.resize(modeled_security_state_snapshot_retained_bytes(&snapshot))?;
+        Ok(AccountedSecurityStateSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_status_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.status_snapshot_output_string_clones
+            .fetch_add(1, Ordering::Relaxed);
+        value.to_owned()
+    }
+
+    fn clone_material_source_status(
+        &self,
+        source: &MaterialSourceSnapshot,
+    ) -> MaterialSourceSnapshot {
+        MaterialSourceSnapshot {
+            path: source
+                .path
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+            source_kind: self.clone_status_string(&source.source_kind),
+            provider: source
+                .provider
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+            rotate_supported: source.rotate_supported,
+        }
+    }
+
+    fn clone_token_status_snapshot(
+        &self,
+        secret: &ManagedStringSecret,
+        state: &TokenSecretState,
+        now: u64,
+    ) -> TokenSecretSnapshot {
+        let previous_credential_expires_unix_ms = state.previous.as_ref().and_then(|previous| {
+            (previous.expires_unix_ms > now).then_some(previous.expires_unix_ms)
+        });
+        TokenSecretSnapshot {
+            target: secret.target,
+            restart_safe: secret.restart_safe,
+            reloadable: matches!(secret.source, TokenSecretSource::Path(_)),
+            rotatable: match secret.source {
+                TokenSecretSource::Inline => false,
+                TokenSecretSource::Path(ref path) => material_resolver_for_path(path)
+                    .map(|resolver| resolver.is_rotatable() || secret.allow_generated_rotation)
+                    .unwrap_or(secret.allow_generated_rotation),
+            },
+            generation: state.generation,
+            last_loaded_unix_ms: state.last_loaded_unix_ms,
+            last_rotated_unix_ms: state.last_rotated_unix_ms,
+            last_success_unix_ms: state.last_success_unix_ms,
+            last_failure_unix_ms: state.last_failure_unix_ms,
+            last_error: state
+                .last_error
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+            previous_credential_expires_unix_ms,
+            accepts_previous_credential: previous_credential_expires_unix_ms.is_some(),
+            reloads_total: secret.reloads_total.load(Ordering::Relaxed),
+            rotations_total: secret.rotations_total.load(Ordering::Relaxed),
+            failures_total: secret.failures_total.load(Ordering::Relaxed),
+            source: self.clone_material_source_status(&state.source),
+        }
+    }
+
+    fn clone_tls_status_snapshot(
+        &self,
+        bundle: &ManagedTlsBundle,
+        state: &TlsMaterialState,
+    ) -> TlsSecretSnapshot {
+        let cert_rotatable = material_resolver_for_path(&bundle.cert_path)
+            .map(|resolver| resolver.is_rotatable())
+            .unwrap_or(false);
+        let key_rotatable = material_resolver_for_path(&bundle.key_path)
+            .map(|resolver| resolver.is_rotatable())
+            .unwrap_or(false);
+        let ca_rotatable = bundle
+            .client_ca_path
+            .as_deref()
+            .map(material_resolver_for_path)
+            .transpose()
+            .map(|resolver| resolver.is_some_and(|resolver| resolver.is_rotatable()))
+            .unwrap_or(false);
+        TlsSecretSnapshot {
+            target: bundle.target,
+            restart_safe: bundle.restart_safe,
+            reloadable: true,
+            rotatable: cert_rotatable || key_rotatable || ca_rotatable,
+            generation: state.generation,
+            last_loaded_unix_ms: state.last_loaded_unix_ms,
+            last_rotated_unix_ms: state.last_rotated_unix_ms,
+            last_success_unix_ms: state.last_success_unix_ms,
+            last_failure_unix_ms: state.last_failure_unix_ms,
+            last_error: state
+                .last_error
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+            reloads_total: bundle.reloads_total.load(Ordering::Relaxed),
+            rotations_total: bundle.rotations_total.load(Ordering::Relaxed),
+            failures_total: bundle.failures_total.load(Ordering::Relaxed),
+            cert: self.clone_material_source_status(&state.cert),
+            key: self.clone_material_source_status(&state.key),
+            client_ca: state
+                .client_ca
+                .as_ref()
+                .map(|source| self.clone_material_source_status(source)),
+        }
+    }
+
+    fn clone_security_audit_entry(&self, entry: &SecurityAuditEntry) -> SecurityAuditEntry {
+        SecurityAuditEntry {
+            sequence: entry.sequence,
+            timestamp_unix_ms: entry.timestamp_unix_ms,
+            target: entry.target,
+            operation: self.clone_status_string(&entry.operation),
+            outcome: self.clone_status_string(&entry.outcome),
+            actor: entry
+                .actor
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+            detail: entry
+                .detail
+                .as_deref()
+                .map(|value| self.clone_status_string(value)),
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_status_snapshot_counters(&self) {
+        self.status_snapshot_output_string_clones
+            .store(0, Ordering::Relaxed);
+        self.status_snapshot_generations.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_output_string_clones(&self) -> u64 {
+        self.status_snapshot_output_string_clones
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_generations(&self) -> u64 {
+        self.status_snapshot_generations.load(Ordering::Relaxed)
+    }
+
+    pub fn metrics_snapshot(
+        &self,
+    ) -> Result<SecurityMetricsSnapshot, SecurityMetricsSnapshotError> {
+        let mut snapshot = SecurityMetricsSnapshot::default();
+        let now = unix_time_ms();
+        if let Some(secret) = &self.public_auth {
+            snapshot.insert(secret.metrics_snapshot(now)?);
+        }
+        if let Some(secret) = &self.admin_auth {
+            snapshot.insert(secret.metrics_snapshot(now)?);
+        }
+        if let Some(secret) = &self.cluster_internal_auth {
+            snapshot.insert(secret.metrics_snapshot(now)?);
+        }
+        if let Some(bundle) = &self.listener_tls {
+            snapshot.insert(bundle.metrics_snapshot()?);
+        }
+        if let Some(bundle) = &self.cluster_internal_mtls {
+            snapshot.insert(bundle.metrics_snapshot()?);
+        }
+        Ok(snapshot)
     }
 
     pub fn rotate(
@@ -1489,24 +2025,192 @@ fn build_listener_tls_acceptor(
 }
 
 fn service_account_rotation_summary(registry: &RbacRegistry) -> ServiceAccountRotationSummary {
-    let state = registry.state_snapshot();
-    let disabled = state
-        .service_accounts
-        .iter()
-        .filter(|account| account.disabled)
-        .count();
-    let last_rotated_unix_ms = state
-        .service_accounts
-        .iter()
-        .map(|account| account.last_rotated_unix_ms)
-        .max()
-        .unwrap_or(0);
-    ServiceAccountRotationSummary {
-        total: state.service_accounts.len(),
-        disabled,
-        last_rotated_unix_ms,
-        audit_entries: state.audit_entries,
+    registry
+        .service_account_status_summary()
+        .map(ServiceAccountRotationSummary::from)
+        .expect("RBAC registry status locks should not be poisoned")
+}
+
+impl From<RbacServiceAccountStatusSummary> for ServiceAccountRotationSummary {
+    fn from(summary: RbacServiceAccountStatusSummary) -> Self {
+        Self {
+            total: summary.total,
+            disabled: summary.disabled,
+            last_rotated_unix_ms: summary.last_rotated_unix_ms,
+            audit_entries: summary.audit_entries,
+        }
     }
+}
+
+fn checkpoint_security_status(
+    execution: &QueryExecution,
+    index: usize,
+) -> Result<(), SecurityStateSnapshotError> {
+    if index.is_multiple_of(SECURITY_STATUS_CHECKPOINT_INTERVAL) {
+        execution.checkpoint()?;
+    }
+    Ok(())
+}
+
+fn modeled_security_status_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(SECURITY_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_security_status_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(SECURITY_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_security_status_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(SECURITY_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_material_source_retained_bytes(source: &MaterialSourceSnapshot) -> u64 {
+    source
+        .path
+        .as_deref()
+        .map(modeled_security_status_str_bytes)
+        .unwrap_or(0)
+        .saturating_add(modeled_security_status_str_bytes(&source.source_kind))
+        .saturating_add(
+            source
+                .provider
+                .as_deref()
+                .map(modeled_security_status_str_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_material_source_snapshot_bytes(source: &MaterialSourceSnapshot) -> u64 {
+    source
+        .path
+        .as_ref()
+        .map(modeled_security_status_string_bytes)
+        .unwrap_or(0)
+        .saturating_add(modeled_security_status_string_bytes(&source.source_kind))
+        .saturating_add(
+            source
+                .provider
+                .as_ref()
+                .map(modeled_security_status_string_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_token_status_retained_bytes(state: &TokenSecretState) -> u64 {
+    state
+        .last_error
+        .as_deref()
+        .map(modeled_security_status_str_bytes)
+        .unwrap_or(0)
+        .saturating_add(modeled_material_source_retained_bytes(&state.source))
+}
+
+fn modeled_tls_status_retained_bytes(state: &TlsMaterialState) -> u64 {
+    state
+        .last_error
+        .as_deref()
+        .map(modeled_security_status_str_bytes)
+        .unwrap_or(0)
+        .saturating_add(modeled_material_source_retained_bytes(&state.cert))
+        .saturating_add(modeled_material_source_retained_bytes(&state.key))
+        .saturating_add(
+            state
+                .client_ca
+                .as_ref()
+                .map(modeled_material_source_retained_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_security_audit_entry_retained_bytes(entry: &SecurityAuditEntry) -> u64 {
+    modeled_security_status_str_bytes(&entry.operation)
+        .saturating_add(modeled_security_status_str_bytes(&entry.outcome))
+        .saturating_add(
+            entry
+                .actor
+                .as_deref()
+                .map(modeled_security_status_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .detail
+                .as_deref()
+                .map(modeled_security_status_str_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_security_state_snapshot_retained_bytes(snapshot: &SecurityStateSnapshot) -> u64 {
+    modeled_security_status_vec_bytes::<SecurityTargetSnapshot>(snapshot.targets.capacity())
+        .saturating_add(snapshot.targets.iter().fold(0u64, |bytes, target| {
+            match target {
+                SecurityTargetSnapshot::Token(target) => bytes
+                    .saturating_add(
+                        target
+                            .last_error
+                            .as_ref()
+                            .map(modeled_security_status_string_bytes)
+                            .unwrap_or(0),
+                    )
+                    .saturating_add(modeled_material_source_snapshot_bytes(&target.source)),
+                SecurityTargetSnapshot::Tls(target) => bytes
+                    .saturating_add(
+                        target
+                            .last_error
+                            .as_ref()
+                            .map(modeled_security_status_string_bytes)
+                            .unwrap_or(0),
+                    )
+                    .saturating_add(modeled_material_source_snapshot_bytes(&target.cert))
+                    .saturating_add(modeled_material_source_snapshot_bytes(&target.key))
+                    .saturating_add(
+                        target
+                            .client_ca
+                            .as_ref()
+                            .map(modeled_material_source_snapshot_bytes)
+                            .unwrap_or(0),
+                    ),
+            }
+        }))
+        .saturating_add(modeled_security_status_vec_bytes::<SecurityAuditEntry>(
+            snapshot.audit_entries.capacity(),
+        ))
+        .saturating_add(snapshot.audit_entries.iter().fold(0u64, |bytes, entry| {
+            bytes
+                .saturating_add(modeled_security_status_string_bytes(&entry.operation))
+                .saturating_add(modeled_security_status_string_bytes(&entry.outcome))
+                .saturating_add(
+                    entry
+                        .actor
+                        .as_ref()
+                        .map(modeled_security_status_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .detail
+                        .as_ref()
+                        .map(modeled_security_status_string_bytes)
+                        .unwrap_or(0),
+                )
+        }))
 }
 
 fn ensure_rustls_crypto_provider() {
@@ -1532,10 +2236,122 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+    use tsink::{
+        QueryBudget, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason, QueryWorkLimits,
+    };
 
     const TEST_CERT: &str = include_str!("cluster/testdata/internal-mtls-server-cert.pem");
     const TEST_KEY: &str = include_str!("cluster/testdata/internal-mtls-server-key.pem");
     const TEST_CA: &str = include_str!("cluster/testdata/internal-mtls-ca-cert.pem");
+
+    fn status_test_manager(temp_dir: &TempDir) -> SecurityManager {
+        let cert_path = temp_dir.path().join("status-listener.pem");
+        let key_path = temp_dir.path().join("status-listener.key");
+        let ca_path = temp_dir.path().join("status-ca.pem");
+        fs::write(&cert_path, TEST_CERT).expect("status cert should write");
+        fs::write(&key_path, TEST_KEY).expect("status key should write");
+        fs::write(&ca_path, TEST_CA).expect("status CA should write");
+
+        let manager = SecurityManager {
+            public_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::PublicAuthToken,
+                "public-token",
+                true,
+            )),
+            admin_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::AdminAuthToken,
+                "admin-token",
+                true,
+            )),
+            cluster_internal_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::ClusterInternalAuthToken,
+                "cluster-token",
+                false,
+            )),
+            listener_tls: Some(
+                ManagedTlsBundle::new(
+                    SecretRotationTarget::ListenerTls,
+                    cert_path.clone(),
+                    key_path.clone(),
+                    None,
+                    true,
+                )
+                .expect("listener bundle should build"),
+            ),
+            cluster_internal_mtls: Some(
+                ManagedTlsBundle::new(
+                    SecretRotationTarget::ClusterInternalMtls,
+                    cert_path,
+                    key_path,
+                    Some(ca_path),
+                    true,
+                )
+                .expect("cluster bundle should build"),
+            ),
+            listener_acceptor: RwLock::new(None),
+            audit: Mutex::new(VecDeque::with_capacity(SECURITY_AUDIT_CAPACITY)),
+            audit_seq: AtomicU64::new(0),
+            status_snapshot_output_string_clones: AtomicU64::new(0),
+            status_snapshot_generations: AtomicU64::new(0),
+        };
+        {
+            let mut state = manager
+                .public_auth
+                .as_ref()
+                .expect("public secret should exist")
+                .state
+                .write()
+                .expect("public state should lock");
+            state.last_error = Some("public status fixture error".to_string());
+        }
+        {
+            let mut state = manager
+                .listener_tls
+                .as_ref()
+                .expect("listener TLS should exist")
+                .state
+                .write()
+                .expect("listener state should lock");
+            state.last_error = Some("listener status fixture error".to_string());
+        }
+        manager.push_audit_entry(
+            SecretRotationTarget::PublicAuthToken,
+            "rotate".to_string(),
+            "success".to_string(),
+            Some("status-operator".to_string()),
+            Some("status fixture detail".to_string()),
+        );
+        manager.push_audit_entry(
+            SecretRotationTarget::ListenerTls,
+            "reload".to_string(),
+            "error".to_string(),
+            None,
+            Some("listener fixture detail".to_string()),
+        );
+        manager.reset_status_snapshot_counters();
+        manager
+    }
+
+    fn status_test_rbac_registry() -> RbacRegistry {
+        RbacRegistry::from_json_str(
+            r#"{
+                "serviceAccounts": [
+                    {
+                        "id": "active",
+                        "token": "active-token",
+                        "lastRotatedUnixMs": 41
+                    },
+                    {
+                        "id": "disabled",
+                        "token": "disabled-token",
+                        "disabled": true,
+                        "lastRotatedUnixMs": 73
+                    }
+                ]
+            }"#,
+        )
+        .expect("status RBAC fixture should parse")
+    }
 
     #[test]
     fn file_backed_secret_rotates_with_overlap_window() {
@@ -1610,5 +2426,408 @@ mod tests {
         let snapshot = bundle.snapshot();
         assert_eq!(snapshot.target, SecretRotationTarget::ListenerTls);
         assert!(snapshot.last_success_unix_ms > 0);
+    }
+
+    #[test]
+    fn security_status_projection_matches_one_complete_legacy_generation() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let manager = status_test_manager(&temp_dir);
+        let rbac = status_test_rbac_registry();
+        let expected = manager.state_snapshot(Some(&rbac));
+        manager.reset_status_snapshot_counters();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+
+        let projected = manager
+            .state_snapshot_with_execution(Some(&rbac), &execution)
+            .expect("security status projection should succeed");
+
+        assert_eq!(&*projected, &expected);
+        assert_eq!(
+            projected
+                .targets
+                .iter()
+                .map(|target| match target {
+                    SecurityTargetSnapshot::Token(snapshot) => snapshot.target,
+                    SecurityTargetSnapshot::Tls(snapshot) => snapshot.target,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                SecretRotationTarget::PublicAuthToken,
+                SecretRotationTarget::AdminAuthToken,
+                SecretRotationTarget::ClusterInternalAuthToken,
+                SecretRotationTarget::ListenerTls,
+                SecretRotationTarget::ClusterInternalMtls,
+            ]
+        );
+        assert_eq!(manager.status_snapshot_generations(), 1);
+        assert!(manager.status_snapshot_output_string_clones() > 0);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn security_status_projection_enforces_exact_memory_before_output_clones() {
+        let calibration_temp = TempDir::new().expect("temp dir should exist");
+        let calibration_manager = status_test_manager(&calibration_temp);
+        let calibration_rbac = status_test_rbac_registry();
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = calibration_manager
+            .state_snapshot_with_execution(Some(&calibration_rbac), &calibration)
+            .expect("calibration status projection should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, exact_bytes);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            exact_bytes
+        );
+        assert_eq!(calibration_manager.status_snapshot_generations(), 1);
+        assert!(
+            calibration_manager.status_snapshot_output_string_clones() > 0,
+            "the successful projection should copy dynamic output"
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_released = calibration_budget.snapshot();
+        assert_eq!(calibration_released.active_queries, 0);
+        assert_eq!(calibration_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            calibration_released.accounting_invariant_violations_total,
+            0
+        );
+
+        let exact_temp = TempDir::new().expect("temp dir should exist");
+        let exact_manager = status_test_manager(&exact_temp);
+        let exact_rbac = status_test_rbac_registry();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = exact_manager
+            .state_snapshot_with_execution(Some(&exact_rbac), &exact)
+            .expect("the exact modeled status limit should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), exact_bytes);
+        assert_eq!(exact_manager.status_snapshot_generations(), 1);
+        assert!(exact_manager.status_snapshot_output_string_clones() > 0);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.active_queries, 0);
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        let one_under_temp = TempDir::new().expect("temp dir should exist");
+        let one_under_manager = status_test_manager(&one_under_temp);
+        let one_under_rbac = status_test_rbac_registry();
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = one_under_manager
+            .state_snapshot_with_execution(Some(&one_under_rbac), &one_under)
+            .expect_err("one byte below the exact status output must reject");
+        match error {
+            SecurityStateSnapshotError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected security status projection error: {other}"),
+        }
+        assert_eq!(
+            one_under_manager.status_snapshot_output_string_clones(),
+            0,
+            "failed admission must precede the first output String clone"
+        );
+        assert_eq!(one_under_manager.status_snapshot_generations(), 0);
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.active_queries, 0);
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn security_status_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let manager = status_test_manager(&temp_dir);
+        let rbac = status_test_rbac_registry();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = manager
+            .state_snapshot_with_execution(Some(&rbac), &execution)
+            .expect_err("a pre-cancelled status projection must stop");
+        assert!(matches!(
+            error,
+            SecurityStateSnapshotError::QueryBudget(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(manager.status_snapshot_output_string_clones(), 0);
+        assert_eq!(manager.status_snapshot_generations(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn security_status_projection_reports_poisoned_target_and_audit_locks() {
+        let target_temp = TempDir::new().expect("temp dir should exist");
+        let target_manager = status_test_manager(&target_temp);
+        let poisoned_secret = Arc::clone(
+            target_manager
+                .public_auth
+                .as_ref()
+                .expect("public secret should exist"),
+        );
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned_secret
+                .state
+                .write()
+                .expect("target lock should initially be available");
+            panic!("poison the security target lock");
+        })
+        .join()
+        .is_err());
+        let target_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let target_execution = target_budget.begin_query().expect("query should admit");
+        let target_error = target_manager
+            .state_snapshot_with_execution(None, &target_execution)
+            .expect_err("poisoned target lock must be reported");
+        assert!(matches!(
+            target_error,
+            SecurityStateSnapshotError::TargetStatePoisoned(SecretRotationTarget::PublicAuthToken)
+        ));
+        assert_eq!(target_execution.snapshot().memory_reserved_bytes, 0);
+        drop(target_execution);
+
+        let audit_temp = TempDir::new().expect("temp dir should exist");
+        let audit_manager = Arc::new(status_test_manager(&audit_temp));
+        let poisoned_manager = Arc::clone(&audit_manager);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned_manager
+                .audit
+                .lock()
+                .expect("audit lock should initially be available");
+            panic!("poison the security audit lock");
+        })
+        .join()
+        .is_err());
+        let audit_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let audit_execution = audit_budget.begin_query().expect("query should admit");
+        let audit_error = audit_manager
+            .state_snapshot_with_execution(None, &audit_execution)
+            .expect_err("poisoned audit lock must be reported");
+        assert!(matches!(
+            audit_error,
+            SecurityStateSnapshotError::AuditLockPoisoned
+        ));
+        assert_eq!(audit_execution.snapshot().memory_reserved_bytes, 0);
+        drop(audit_execution);
+        assert_eq!(target_budget.snapshot().active_queries, 0);
+        assert_eq!(audit_budget.snapshot().active_queries, 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_is_copy_and_matches_full_target_scalars() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<SecurityTargetMetricsSnapshot>();
+        assert_copy::<SecurityMetricsSnapshot>();
+        assert!(!std::mem::needs_drop::<SecurityTargetMetricsSnapshot>());
+        assert!(!std::mem::needs_drop::<SecurityMetricsSnapshot>());
+
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let cert_path = temp_dir.path().join("listener.pem");
+        let key_path = temp_dir.path().join("listener.key");
+        let ca_path = temp_dir.path().join("listener-ca.pem");
+        fs::write(&cert_path, TEST_CERT).expect("cert should write");
+        fs::write(&key_path, TEST_KEY).expect("key should write");
+        fs::write(&ca_path, TEST_CA).expect("ca should write");
+
+        let manager = SecurityManager {
+            public_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::PublicAuthToken,
+                "public-token",
+                true,
+            )),
+            admin_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::AdminAuthToken,
+                "admin-token",
+                true,
+            )),
+            cluster_internal_auth: Some(ManagedStringSecret::inline(
+                SecretRotationTarget::ClusterInternalAuthToken,
+                "cluster-token",
+                false,
+            )),
+            listener_tls: Some(
+                ManagedTlsBundle::new(
+                    SecretRotationTarget::ListenerTls,
+                    cert_path.clone(),
+                    key_path.clone(),
+                    None,
+                    true,
+                )
+                .expect("listener bundle should build"),
+            ),
+            cluster_internal_mtls: Some(
+                ManagedTlsBundle::new(
+                    SecretRotationTarget::ClusterInternalMtls,
+                    cert_path,
+                    key_path,
+                    Some(ca_path),
+                    true,
+                )
+                .expect("cluster bundle should build"),
+            ),
+            listener_acceptor: RwLock::new(None),
+            audit: Mutex::new(VecDeque::with_capacity(SECURITY_AUDIT_CAPACITY)),
+            audit_seq: AtomicU64::new(0),
+            status_snapshot_output_string_clones: AtomicU64::new(0),
+            status_snapshot_generations: AtomicU64::new(0),
+        };
+
+        let full = manager.state_snapshot(None);
+        let metrics = manager
+            .metrics_snapshot()
+            .expect("metrics snapshot should succeed");
+        assert_eq!(metrics.targets().count(), SECURITY_METRICS_TARGET_COUNT);
+
+        for full_target in full.targets {
+            let target = match &full_target {
+                SecurityTargetSnapshot::Token(snapshot) => snapshot.target,
+                SecurityTargetSnapshot::Tls(snapshot) => snapshot.target,
+            };
+            let metrics_target = metrics
+                .targets()
+                .find(|snapshot| snapshot.target == target)
+                .expect("configured target should be projected");
+            match full_target {
+                SecurityTargetSnapshot::Token(snapshot) => {
+                    assert_eq!(metrics_target.generation, snapshot.generation);
+                    assert_eq!(metrics_target.reloads_total, snapshot.reloads_total);
+                    assert_eq!(metrics_target.rotations_total, snapshot.rotations_total);
+                    assert_eq!(metrics_target.failures_total, snapshot.failures_total);
+                    assert_eq!(
+                        metrics_target.last_success_unix_ms,
+                        snapshot.last_success_unix_ms
+                    );
+                    assert_eq!(
+                        metrics_target.last_failure_unix_ms,
+                        snapshot.last_failure_unix_ms
+                    );
+                    assert_eq!(
+                        metrics_target.previous_credential_active,
+                        snapshot.accepts_previous_credential
+                    );
+                }
+                SecurityTargetSnapshot::Tls(snapshot) => {
+                    assert_eq!(metrics_target.generation, snapshot.generation);
+                    assert_eq!(metrics_target.reloads_total, snapshot.reloads_total);
+                    assert_eq!(metrics_target.rotations_total, snapshot.rotations_total);
+                    assert_eq!(metrics_target.failures_total, snapshot.failures_total);
+                    assert_eq!(
+                        metrics_target.last_success_unix_ms,
+                        snapshot.last_success_unix_ms
+                    );
+                    assert_eq!(
+                        metrics_target.last_failure_unix_ms,
+                        snapshot.last_failure_unix_ms
+                    );
+                    assert!(!metrics_target.previous_credential_active);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_snapshot_reports_a_poisoned_target_lock() {
+        let secret = ManagedStringSecret::inline(
+            SecretRotationTarget::PublicAuthToken,
+            "public-token",
+            true,
+        );
+        let poisoned_secret = Arc::clone(&secret);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned_secret
+                .state
+                .write()
+                .expect("state lock should initially be available");
+            panic!("poison the target state lock");
+        })
+        .join()
+        .is_err());
+
+        let manager = SecurityManager {
+            public_auth: Some(secret),
+            admin_auth: None,
+            cluster_internal_auth: None,
+            listener_tls: None,
+            cluster_internal_mtls: None,
+            listener_acceptor: RwLock::new(None),
+            audit: Mutex::new(VecDeque::with_capacity(SECURITY_AUDIT_CAPACITY)),
+            audit_seq: AtomicU64::new(0),
+            status_snapshot_output_string_clones: AtomicU64::new(0),
+            status_snapshot_generations: AtomicU64::new(0),
+        };
+        assert_eq!(
+            manager.metrics_snapshot(),
+            Err(SecurityMetricsSnapshotError::TargetStatePoisoned(
+                SecretRotationTarget::PublicAuthToken
+            ))
+        );
     }
 }

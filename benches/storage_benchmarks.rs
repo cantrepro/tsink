@@ -3,10 +3,10 @@
 //! Run all cases:
 //!   cargo bench --bench storage_benchmarks -- "^(insert_rows|select|live_head_merge_queries|concurrent_rw|hot_metric_fanout_writes|persist_refresh_long_history|retained_close_long_history|flush_large_sealed_snapshot|metadata_select_time_range|metadata_select_persisted_time_range|metadata_select_persisted_matchers|metadata_select_persisted_segment_scaling|metadata_list_metrics_high_cardinality|startup_persisted_segments|startup_wal_replay)/"
 //!
-//! Quick check:
-//!   cargo bench --bench storage_benchmarks -- "^(insert_rows|select|live_head_merge_queries|concurrent_rw|hot_metric_fanout_writes|persist_refresh_long_history|retained_close_long_history|flush_large_sealed_snapshot|metadata_select_time_range|metadata_select_persisted_time_range|metadata_select_persisted_matchers|metadata_select_persisted_segment_scaling|metadata_list_metrics_high_cardinality|startup_persisted_segments|startup_wal_replay)/" --quick --noplot
+//! CI-style quick smoke:
+//!   bash scripts/measure_perf.sh quick
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::collections::HashMap;
 use std::fs;
 use std::hint::black_box;
@@ -24,8 +24,8 @@ use tsink::engine::wal::FramedWal;
 use tsink::label::stable_series_identity_hash;
 use tsink::wal::WalSyncMode;
 use tsink::{
-    DataPoint, Label, MetadataShardScope, Row, SeriesMatcher, SeriesSelection, Storage,
-    StorageBuilder, TimestampPrecision, Value,
+    DataPoint, Label, MetadataShardScope, QueryBudgetLimits, ResourceLimits, Row, SeriesMatcher,
+    SeriesSelection, Storage, StorageBuilder, TimestampPrecision, Value,
 };
 
 const LARGE_SELECT_SIZE: usize = 1_000_000;
@@ -160,6 +160,22 @@ fn build_storage() -> Arc<dyn Storage> {
     StorageBuilder::new()
         .with_timestamp_precision(TimestampPrecision::Seconds)
         // Keep all generated points in one partition to reduce cross-partition variance.
+        .with_partition_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60))
+        .with_wal_enabled(false)
+        .build()
+        .unwrap()
+}
+
+fn build_large_select_storage() -> Arc<dyn Storage> {
+    let mut query_limits: QueryBudgetLimits = ResourceLimits::embedded().query;
+    query_limits.per_query.max_intermediate_vector_size = Some(LARGE_SELECT_SIZE as u64);
+    query_limits.per_query.max_memory_bytes = Some(64 * 1024 * 1024);
+    StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        // Keep the million-point case finite while widening only the Embedded profile's
+        // intermediate-vector and per-query memory boundaries needed by this explicit scaling
+        // benchmark. The 64 MiB per-query cap remains below Embedded's 128 MiB shared cap.
+        .with_query_budget_limits(query_limits)
         .with_partition_duration(Duration::from_secs(10 * 365 * 24 * 60 * 60))
         .with_wal_enabled(false)
         .build()
@@ -339,10 +355,16 @@ fn bench_select(c: &mut Criterion) {
 
     for size in [1usize, 10, 1000, LARGE_SELECT_SIZE] {
         let metric = format!("select_metric_{size}");
-        let storage = build_storage();
+        let storage = if size == LARGE_SELECT_SIZE {
+            build_large_select_storage()
+        } else {
+            build_storage()
+        };
         let start = base_ts_seconds();
         let rows = make_rows(&metric, start, size);
-        storage.insert_rows(&rows).unwrap();
+        for batch in rows.chunks(LOAD_BATCH_SIZE) {
+            storage.insert_rows(batch).unwrap();
+        }
         let end = start + size as i64;
 
         let mut warmup = Vec::with_capacity(size);
@@ -1856,4 +1878,28 @@ criterion_group!(
     bench_startup_persisted_segments,
     bench_startup_wal_replay
 );
-criterion_main!(benches);
+criterion_group!(
+    perf_benches,
+    bench_insert_rows,
+    bench_select,
+    bench_persist_refresh_long_history
+);
+
+fn main() {
+    match std::env::var("TSINK_STORAGE_BENCH_SUITE").as_deref() {
+        Ok("quick") | Ok("full") => perf_benches(),
+        Ok("all") | Err(std::env::VarError::NotPresent) => benches(),
+        Ok(other) => {
+            eprintln!(
+                "invalid TSINK_STORAGE_BENCH_SUITE={other:?}; expected \"quick\", \"full\", or \"all\""
+            );
+            std::process::exit(2);
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("TSINK_STORAGE_BENCH_SUITE must be valid UTF-8");
+            std::process::exit(2);
+        }
+    }
+
+    Criterion::default().configure_from_args().final_summary();
+}

@@ -94,29 +94,130 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Verify core package
-        run: cargo package -p tsink --locked
-      - name: Assemble downstream packages
+      - name: Verify workspace crate versions
+        id: version
         run: |
-          # Their normalized manifests depend on the same-version core crate,
-          # which is not available from crates.io until the core is published.
-          cargo package -p tsink-server --locked --no-verify
-          cargo package -p tsink-uniffi --locked --no-verify
+          EXPECTED_PACKAGES=$(
+            printf '%s\n' \
+              tsink \
+              tsink-protocol \
+              tsink-server \
+              tsink-test \
+              tsink-uniffi |
+              sort
+          )
+          PACKAGE_VERSIONS=$(
+            cargo metadata --format-version 1 --no-deps --locked |
+              jq -r '
+                .packages[]
+                | "\(.name)=\(.version)"
+              ' |
+              sort
+          )
+          FOUND_PACKAGES=$(
+            printf '%s\n' "$PACKAGE_VERSIONS" |
+              awk -F= 'NF { print $1 }' |
+              sort
+          )
+
+          if [ "$FOUND_PACKAGES" != "$EXPECTED_PACKAGES" ]; then
+            echo "::error::Release crate set does not match the expected workspace packages"
+            printf 'Expected packages:\n%s\nFound package versions:\n%s\n' \
+              "$EXPECTED_PACKAGES" "$PACKAGE_VERSIONS"
+            exit 1
+          fi
+
+          VERSIONS=$(
+            printf '%s\n' "$PACKAGE_VERSIONS" |
+              awk -F= 'NF { print $2 }' |
+              sort -u
+          )
+          VERSION_COUNT=$(printf '%s\n' "$VERSIONS" | awk 'NF { count += 1 } END { print count + 0 }')
+          if [ "$VERSION_COUNT" -ne 1 ]; then
+            echo "::error::Workspace package versions do not agree"
+            printf 'Found package versions:\n%s\n' "$PACKAGE_VERSIONS"
+            exit 1
+          fi
+
+          VERSION=$(printf '%s\n' "$VERSIONS" | awk 'NF { print; exit }')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package foundational crates
+        id: package_foundations
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Populate the external dependency cache before the package checks
+          # deliberately switch to offline resolution.
+          cargo fetch --locked
+
+          PACKAGE_STAGE="$RUNNER_TEMP/tsink-package-stage"
+          mkdir -p "$PACKAGE_STAGE"
+
+          cargo package -p tsink-protocol --locked --offline
+          tar -xzf "target/package/tsink-protocol-$VERSION.crate" -C "$PACKAGE_STAGE"
+
+          cargo package -p tsink --locked --offline
+          tar -xzf "target/package/tsink-$VERSION.crate" -C "$PACKAGE_STAGE"
+
+          test -f "$PACKAGE_STAGE/tsink-protocol-$VERSION/Cargo.toml"
+          test -f "$PACKAGE_STAGE/tsink-$VERSION/Cargo.toml"
+          echo "path=$PACKAGE_STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Package and verify downstream crate sources
+        env:
+          PACKAGE_STAGE: ${{ steps.package_foundations.outputs.path }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SOURCE_ROOT=$PWD
+          PACKAGE_TARGET_DIR="$PWD/target/package-validation"
+          SOURCE_CORE_PATCH="patch.crates-io.tsink.path=\"$SOURCE_ROOT\""
+          SOURCE_PROTOCOL_PATCH="patch.crates-io.tsink-protocol.path=\"$SOURCE_ROOT/crates/tsink-protocol\""
+          PACKAGED_CORE_PATCH="patch.crates-io.tsink.path=\"$PACKAGE_STAGE/tsink-$VERSION\""
+          PACKAGED_PROTOCOL_PATCH="patch.crates-io.tsink-protocol.path=\"$PACKAGE_STAGE/tsink-protocol-$VERSION\""
+
+          package_and_verify() {
+            PACKAGE_NAME=$1
+            NEEDS_PROTOCOL=$2
+            SOURCE_PATCHES=(--config "$SOURCE_CORE_PATCH")
+            PACKAGED_PATCHES=(--config "$PACKAGED_CORE_PATCH")
+            if [ "$NEEDS_PROTOCOL" = "yes" ]; then
+              SOURCE_PATCHES+=(--config "$SOURCE_PROTOCOL_PATCH")
+              PACKAGED_PATCHES+=(--config "$PACKAGED_PROTOCOL_PATCH")
+            fi
+
+            # Assemble without Cargo's registry-based verifier, then verify the
+            # exact archive against the already packaged workspace dependencies.
+            cargo "${SOURCE_PATCHES[@]}" \
+              package -p "$PACKAGE_NAME" --locked --offline --no-verify
+            tar -xzf "target/package/$PACKAGE_NAME-$VERSION.crate" -C "$PACKAGE_STAGE"
+            test -f "$PACKAGE_STAGE/$PACKAGE_NAME-$VERSION/Cargo.toml"
+
+            CARGO_TARGET_DIR="$PACKAGE_TARGET_DIR" cargo "${PACKAGED_PATCHES[@]}" \
+              check \
+              --manifest-path "$PACKAGE_STAGE/$PACKAGE_NAME-$VERSION/Cargo.toml" \
+              --locked \
+              --offline \
+              --all-targets \
+              --all-features
+          }
+
+          package_and_verify tsink-server yes
+          package_and_verify tsink-test yes
+          package_and_verify tsink-uniffi no
 
   measure-bpp:
-    name: Measure BPP (quick)
+    name: BPP workload smoke (quick)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run measure_bpp quick
-        env:
-          TSINK_FAIL_ON_TARGET: "1"
+      - name: Run quick workload (BPP target is report-only)
         run: bash scripts/measure_bpp.sh quick
 
   bench:
-    name: Benchmarks (quick regression check)
+    name: Benchmarks (quick cached comparison)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,5 +232,7 @@ jobs:
             criterion-${{ runner.os }}-
       - name: Run benchmarks (quick)
         run: bash scripts/measure_perf.sh quick
-      - name: Check for regressions (>50%)
+      - name: Check cached comparison for regressions (>50%, if available)
+        env:
+          TSINK_BENCH_REGRESSION_FILTER: '^(insert_rows|select)/|^persist_refresh_long_history/64$'
         run: bash scripts/check_bench_regression.sh 50

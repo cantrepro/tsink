@@ -17,9 +17,10 @@ pub(in crate::engine::storage_engine) use self::memory_accounting::{
 };
 
 pub(in crate::engine::storage_engine) use self::post_flush::recovery::{
-    ensure_no_pending_post_flush_replacement, finalize_pending_post_flush_replacements_for_startup,
-    is_post_flush_replacement_marker_name, BackgroundPostFlushRecoveryCursor,
-    POST_FLUSH_REPLACEMENT_DIR_NAME,
+    advance_background_post_flush_clean_fence, ensure_no_pending_post_flush_replacement,
+    finalize_pending_post_flush_replacements_for_startup, is_post_flush_replacement_marker_name,
+    BackgroundPostFlushCleanFenceCursor, BackgroundPostFlushCleanFenceStep,
+    BackgroundPostFlushRecoveryCursor, POST_FLUSH_REPLACEMENT_DIR_NAME,
 };
 
 use std::collections::BTreeSet;

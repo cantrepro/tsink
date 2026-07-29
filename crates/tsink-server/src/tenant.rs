@@ -50,6 +50,7 @@ static TENANT_ADMISSION_RETENTION_ACTIVE_UNITS: AtomicU64 = AtomicU64::new(0);
 const TENANT_DECISION_HISTORY_LIMIT: usize = 16;
 const UNLABELED_TENANT_FALLBACK_REGEX: &str = ".+";
 const TENANT_QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 fn tenant_query_vec_capacity_bytes<T>(capacity: usize) -> u64 {
     if capacity == 0 {
@@ -326,6 +327,107 @@ pub struct TenantRuntimeStatusSnapshot {
     pub recent_decisions: Vec<TenantDecisionSnapshot>,
 }
 
+/// Tenant-runtime status output whose dynamic allocations stay charged to the caller's query.
+///
+/// The inner snapshot is intentionally private and this wrapper has no extraction method, so a
+/// caller cannot move the output away from its reservation.
+#[derive(Debug)]
+#[must_use = "dropping the status snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedTenantRuntimeStatusSnapshot {
+    snapshot: TenantRuntimeStatusSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl AccountedTenantRuntimeStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedTenantRuntimeStatusSnapshot {
+    type Target = TenantRuntimeStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantStatusSnapshotError {
+    TenantRequest(TenantRequestError),
+    QueryBudget(tsink::QueryBudgetError),
+}
+
+impl From<TenantRequestError> for TenantStatusSnapshotError {
+    fn from(error: TenantRequestError) -> Self {
+        Self::TenantRequest(error)
+    }
+}
+
+impl From<tsink::QueryBudgetError> for TenantStatusSnapshotError {
+    fn from(error: tsink::QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
+}
+
+fn modeled_tenant_status_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_tenant_status_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_tenant_status_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_tenant_status_decision_str_bytes(decision: &TenantDecisionSnapshot) -> u64 {
+    modeled_tenant_status_str_bytes(&decision.access)
+        .saturating_add(modeled_tenant_status_str_bytes(&decision.surface))
+        .saturating_add(modeled_tenant_status_str_bytes(&decision.outcome))
+        .saturating_add(modeled_tenant_status_str_bytes(&decision.reason))
+}
+
+fn modeled_tenant_status_decision_string_bytes(decision: &TenantDecisionSnapshot) -> u64 {
+    modeled_tenant_status_string_bytes(&decision.access)
+        .saturating_add(modeled_tenant_status_string_bytes(&decision.surface))
+        .saturating_add(modeled_tenant_status_string_bytes(&decision.outcome))
+        .saturating_add(modeled_tenant_status_string_bytes(&decision.reason))
+}
+
+fn modeled_tenant_runtime_status_retained_bytes(snapshot: &TenantRuntimeStatusSnapshot) -> u64 {
+    modeled_tenant_status_string_bytes(&snapshot.tenant_id)
+        .saturating_add(modeled_tenant_status_vec_bytes::<TenantDecisionSnapshot>(
+            snapshot.recent_decisions.capacity(),
+        ))
+        .saturating_add(
+            snapshot
+                .recent_decisions
+                .iter()
+                .fold(0u64, |bytes, decision| {
+                    bytes.saturating_add(modeled_tenant_status_decision_string_bytes(decision))
+                }),
+        )
+}
+
 impl TenantRequestError {
     pub fn to_http_response(&self) -> HttpResponse {
         match self {
@@ -469,6 +571,8 @@ struct TenantPolicyRuntime {
     metadata: TenantSurfaceRuntime,
     retention: TenantSurfaceRuntime,
     recent_decisions: Mutex<VecDeque<TenantDecisionSnapshot>>,
+    #[cfg(test)]
+    status_snapshot_string_clones: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -730,6 +834,8 @@ impl TenantPolicyRuntime {
             metadata: TenantSurfaceRuntime::new(metadata_budget),
             retention: TenantSurfaceRuntime::new(retention_budget),
             recent_decisions: Mutex::new(VecDeque::with_capacity(TENANT_DECISION_HISTORY_LIMIT)),
+            #[cfg(test)]
+            status_snapshot_string_clones: AtomicU64::new(0),
         }
     }
 
@@ -970,6 +1076,7 @@ impl TenantPolicyRuntime {
         })
     }
 
+    #[allow(dead_code)]
     fn status_snapshot(&self, tenant_id: &str) -> TenantRuntimeStatusSnapshot {
         let active_reads = self
             .max_inflight_reads
@@ -1007,6 +1114,112 @@ impl TenantPolicyRuntime {
             retention: self.retention.snapshot(),
             recent_decisions,
         }
+    }
+
+    /// Captures every schema-visible tenant-runtime status field under one query execution.
+    ///
+    /// The decision log is the only mutable dynamic source. Its complete retained projection is
+    /// measured and reserved while the mutex is held, before any tenant identifier or decision
+    /// string is copied. The returned private wrapper keeps that reservation live for as long as
+    /// any projected field can be borrowed.
+    fn status_snapshot_with_execution(
+        &self,
+        tenant_id: &str,
+        execution: &QueryExecution,
+    ) -> Result<AccountedTenantRuntimeStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let active_reads = self
+            .max_inflight_reads
+            .zip(self.inflight_reads.as_ref())
+            .map(|(limit, slots)| {
+                u64::try_from(limit.saturating_sub(slots.available_permits())).unwrap_or(u64::MAX)
+            })
+            .unwrap_or(0);
+        let active_writes = self
+            .max_inflight_writes
+            .zip(self.inflight_writes.as_ref())
+            .map(|(limit, slots)| {
+                u64::try_from(limit.saturating_sub(slots.available_permits())).unwrap_or(u64::MAX)
+            })
+            .unwrap_or(0);
+        let recent = self
+            .recent_decisions
+            .lock()
+            .expect("tenant decision log mutex should not be poisoned");
+        execution.checkpoint()?;
+
+        let mut peak_bytes = modeled_tenant_status_str_bytes(tenant_id).saturating_add(
+            modeled_tenant_status_vec_bytes::<TenantDecisionSnapshot>(recent.len()),
+        );
+        for decision in recent.iter() {
+            execution.checkpoint()?;
+            peak_bytes =
+                peak_bytes.saturating_add(modeled_tenant_status_decision_str_bytes(decision));
+        }
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let tenant_id = self.clone_status_snapshot_string(tenant_id);
+        let mut recent_decisions = Vec::with_capacity(recent.len());
+        for decision in recent.iter() {
+            execution.checkpoint()?;
+            recent_decisions.push(TenantDecisionSnapshot {
+                unix_ms: decision.unix_ms,
+                access: self.clone_status_snapshot_string(&decision.access),
+                surface: self.clone_status_snapshot_string(&decision.surface),
+                outcome: self.clone_status_snapshot_string(&decision.outcome),
+                requested_units: decision.requested_units,
+                reason: self.clone_status_snapshot_string(&decision.reason),
+            });
+        }
+        execution.checkpoint()?;
+        drop(recent);
+
+        let snapshot = TenantRuntimeStatusSnapshot {
+            tenant_id,
+            policy: self.policy.clone(),
+            max_inflight_reads: self.max_inflight_reads,
+            max_inflight_writes: self.max_inflight_writes,
+            active_reads,
+            active_writes,
+            read_rejections_total: self.read_rejections_total.load(Ordering::Relaxed),
+            write_rejections_total: self.write_rejections_total.load(Ordering::Relaxed),
+            ingest: self.ingest.snapshot(),
+            query: self.query.snapshot(),
+            metadata: self.metadata.snapshot(),
+            retention: self.retention.snapshot(),
+            recent_decisions,
+        };
+        let retained_bytes = modeled_tenant_runtime_status_retained_bytes(&snapshot);
+        assert!(
+            retained_bytes <= peak_bytes,
+            "tenant status retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedTenantRuntimeStatusSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_status_snapshot_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.status_snapshot_string_clones
+            .fetch_add(1, Ordering::Relaxed);
+        let mut cloned = String::with_capacity(value.len());
+        cloned.push_str(value);
+        cloned
+    }
+
+    #[cfg(test)]
+    fn reset_status_snapshot_string_clones(&self) {
+        self.status_snapshot_string_clones
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_string_clones(&self) -> u64 {
+        self.status_snapshot_string_clones.load(Ordering::Relaxed)
     }
 }
 
@@ -1056,12 +1269,24 @@ impl TenantRegistry {
         Ok(runtime)
     }
 
+    #[allow(dead_code)]
     pub fn status_snapshot_for(
         &self,
         tenant_id: &str,
     ) -> Result<TenantRuntimeStatusSnapshot, TenantRequestError> {
         let runtime = self.runtime_for(tenant_id)?;
         Ok(runtime.status_snapshot(tenant_id))
+    }
+
+    pub(crate) fn status_snapshot_for_with_execution(
+        &self,
+        tenant_id: &str,
+        execution: &QueryExecution,
+    ) -> Result<AccountedTenantRuntimeStatusSnapshot, TenantStatusSnapshotError> {
+        // Resolve the tenant first so invalid identifiers retain the legacy request-error
+        // semantics even when the supplied execution has already been cancelled.
+        let runtime = self.runtime_for(tenant_id)?;
+        Ok(runtime.status_snapshot_with_execution(tenant_id, execution)?)
     }
 }
 
@@ -1993,6 +2218,22 @@ impl Storage for TenantScopedStorage {
         self.inner.query_budget()
     }
 
+    fn status_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<tsink::StorageStatusObservabilitySnapshot> {
+        self.inner
+            .status_observability_snapshot_with_execution(execution)
+    }
+
+    fn metrics_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<tsink::StorageMetricsObservabilitySnapshot> {
+        self.inner
+            .metrics_observability_snapshot_with_execution(execution)
+    }
+
     fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
         let scoped = scope_rows_for_tenant(rows.to_vec(), &self.tenant_id)
             .map_err(TsinkError::InvalidLabel)?;
@@ -2850,6 +3091,75 @@ mod tests {
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    fn tenant_status_projection_registry() -> TenantRegistry {
+        let registry = TenantRegistry::from_json_str(
+            r#"{
+                "tenants": {
+                    "team-a": {
+                        "quotas": {
+                            "maxWriteRowsPerRequest": 128,
+                            "maxReadQueriesPerRequest": 7,
+                            "maxMetadataMatchersPerRequest": 9,
+                            "maxQueryLengthBytes": 4096,
+                            "maxRangePointsPerQuery": 2048
+                        },
+                        "cluster": {
+                            "writeConsistency": "all",
+                            "readConsistency": "strict",
+                            "readPartialResponse": "deny"
+                        },
+                        "admission": {
+                            "maxInflightReads": 3,
+                            "maxInflightWrites": 2,
+                            "ingest": {
+                                "maxInflightRequests": 4,
+                                "maxInflightUnits": 64
+                            },
+                            "query": {
+                                "maxInflightRequests": 5,
+                                "maxInflightUnits": 32
+                            },
+                            "metadata": {
+                                "maxInflightRequests": 6,
+                                "maxInflightUnits": 16
+                            },
+                            "retention": {
+                                "maxInflightRequests": 1,
+                                "maxInflightUnits": 8
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("tenant status projection fixture should parse");
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("tenant status projection runtime should build");
+        runtime.record_decision(
+            TenantAccessScope::Read,
+            TenantAdmissionSurface::Query,
+            TenantDecisionOutcome::Admitted,
+            3,
+            "query projection admitted with a deliberately retained diagnostic".to_string(),
+        );
+        runtime.record_decision(
+            TenantAccessScope::Write,
+            TenantAdmissionSurface::Ingest,
+            TenantDecisionOutcome::Throttled,
+            65,
+            "ingest projection exceeded its configured unit budget".to_string(),
+        );
+        runtime.record_decision(
+            TenantAccessScope::Read,
+            TenantAdmissionSurface::Metadata,
+            TenantDecisionOutcome::Rejected,
+            11,
+            "metadata projection rejected an oversized matcher collection".to_string(),
+        );
+        registry
     }
 
     fn default_tenant_metadata_storage_with_limits(
@@ -4610,6 +4920,215 @@ mod tests {
             .iter()
             .any(|decision| decision.surface == "metadata" && decision.outcome == "rejected"));
         drop(held);
+    }
+
+    #[test]
+    fn tenant_status_projection_is_schema_complete_and_field_equivalent() {
+        let registry = tenant_status_projection_registry();
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("tenant status projection runtime should resolve");
+        let held = runtime
+            .admit(
+                "team-a",
+                TenantAccessScope::Read,
+                TenantAdmissionSurface::Query,
+                2,
+            )
+            .expect("tenant status fixture request should admit");
+        let expected = registry
+            .status_snapshot_for("team-a")
+            .expect("legacy tenant status snapshot should build");
+        runtime.reset_status_snapshot_string_clones();
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("tenant status projection budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("tenant status query should admit");
+        let projected = registry
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect("accounted tenant status snapshot should build");
+
+        assert_eq!(
+            &*projected, &expected,
+            "the accounted producer must preserve every legacy status field"
+        );
+        assert_eq!(
+            runtime.status_snapshot_string_clones(),
+            1 + u64::try_from(expected.recent_decisions.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4),
+            "the producer should copy exactly the tenant id and four strings per decision"
+        );
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        assert_eq!(projected.query.active_requests, 1);
+        assert_eq!(projected.query.active_units, 2);
+        assert_eq!(projected.active_reads, 1);
+
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        drop(held);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_status_projection_enforces_exact_peak_before_materialization() {
+        let registry = tenant_status_projection_registry();
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("tenant status projection runtime should resolve");
+        runtime.reset_status_snapshot_string_clones();
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = registry
+            .status_snapshot_for_with_execution("team-a", &calibration)
+            .expect("calibration status projection should build");
+        let required_bytes = calibrated.accounted_bytes();
+        assert!(required_bytes > 0);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            required_bytes,
+            "this projection has no dynamic scratch beyond its retained output"
+        );
+        assert!(runtime.status_snapshot_string_clones() > 0);
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_released = calibration_budget.snapshot();
+        assert_eq!(calibration_released.active_queries, 0);
+        assert_eq!(calibration_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            calibration_released.accounting_invariant_violations_total,
+            0
+        );
+
+        runtime.reset_status_snapshot_string_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact tenant status budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = registry
+            .status_snapshot_for_with_execution("team-a", &exact)
+            .expect("the exact modeled tenant status peak should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), required_bytes);
+        assert!(runtime.status_snapshot_string_clones() > 0);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.active_queries, 0);
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        runtime.reset_status_snapshot_string_clones();
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under tenant status budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = registry
+            .status_snapshot_for_with_execution("team-a", &one_under)
+            .expect_err("one byte below the tenant status model must reject");
+        match error {
+            TenantStatusSnapshotError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, required_bytes);
+            }
+            other => panic!("unexpected tenant status projection error: {other:?}"),
+        }
+        assert_eq!(
+            runtime.status_snapshot_string_clones(),
+            0,
+            "failed admission must precede every output string copy"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.active_queries, 0);
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_status_projection_honors_precancellation_and_preserves_request_errors() {
+        let registry = tenant_status_projection_registry();
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("tenant status projection runtime should resolve");
+        runtime.reset_status_snapshot_string_clones();
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("tenant status cancellation budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("tenant status cancellation query should admit");
+        cancellation.cancel();
+
+        let error = registry
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect_err("pre-cancelled tenant status projection must stop");
+        assert!(matches!(
+            error,
+            TenantStatusSnapshotError::QueryBudget(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(runtime.status_snapshot_string_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+
+        let expected_request_error = registry
+            .status_snapshot_for("")
+            .expect_err("legacy tenant status must reject an invalid id");
+        let projected_request_error = registry
+            .status_snapshot_for_with_execution("", &execution)
+            .expect_err("accounted tenant status must reject an invalid id");
+        assert_eq!(
+            projected_request_error,
+            TenantStatusSnapshotError::TenantRequest(expected_request_error),
+            "tenant-id validation must retain the legacy request error even when cancelled"
+        );
+
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 
     #[test]

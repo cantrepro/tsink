@@ -259,10 +259,12 @@ fn open_budgeted_rollup_storage(
 }
 
 fn open_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
-    let mut options = ChunkStorageOptions::default();
-    options.background_threads_enabled = false;
-    options.max_writers = 1;
-    options.write_timeout = std::time::Duration::ZERO;
+    let options = ChunkStorageOptions {
+        background_threads_enabled: false,
+        max_writers: 1,
+        write_timeout: std::time::Duration::ZERO,
+        ..ChunkStorageOptions::default()
+    };
     let storage = ChunkStorage::new_with_data_path_and_options(
         8,
         None,

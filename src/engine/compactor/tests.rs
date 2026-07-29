@@ -21,6 +21,17 @@ use crate::{
     NativeHistogram, TsinkError, Value,
 };
 
+fn background_recovery_limits(max_items: usize, max_bytes: u64) -> CompactionPassLimits {
+    CompactionPassLimits {
+        max_directory_entries: max_items,
+        max_manifest_inspections: max_items,
+        max_source_segments: 8,
+        max_source_chunks: usize::MAX,
+        max_source_points: usize::MAX,
+        max_decoded_bytes: max_bytes,
+    }
+}
+
 fn sample_histogram() -> NativeHistogram {
     NativeHistogram {
         count: Some(HistogramCount::Int(42)),
@@ -1916,6 +1927,330 @@ fn marker_name_collision_selects_unused_path_without_overwriting_stale_marker() 
 
     assert_ne!(marker, stale);
     assert_eq!(fs::read(stale).unwrap(), b"stale-ready-intent");
+    assert!(marker.exists());
+}
+
+#[test]
+fn background_recovery_cursor_continues_across_compactor_clones_and_stops_the_wake() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "recovery-cursor")])
+        .unwrap()
+        .series_id;
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(0, 1.0), (10, 1.0)],
+    );
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(5, 2.0), (15, 2.0)],
+    );
+    let marker_dir = temp.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    fs::create_dir_all(&marker_dir).unwrap();
+    fs::write(marker_dir.join("operator-note"), b"preserve").unwrap();
+    let compactor = Compactor::new(temp.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(2, u64::MAX));
+    let clone = compactor.clone();
+
+    let first = compactor.compact_background_once_with_changes().unwrap();
+    assert!(!first.stats.compacted);
+    assert_eq!(first.stats.planning_directory_entries_inspected, 0);
+    assert_eq!(load_segments_for_level(temp.path(), 0).unwrap().len(), 2);
+
+    let second = clone.compact_background_once_with_changes().unwrap();
+    assert!(second.stats.compacted);
+    assert!(load_segments_for_level(temp.path(), 0).unwrap().is_empty());
+    assert_eq!(load_segments_for_level(temp.path(), 1).unwrap().len(), 1);
+    assert_eq!(
+        fs::read(marker_dir.join("operator-note")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[test]
+fn background_recovery_restart_rescans_without_false_completion() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "recovery-restart")])
+        .unwrap()
+        .series_id;
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        1,
+        &[(0, 1.0), (10, 1.0)],
+    );
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(5, 2.0), (15, 2.0)],
+    );
+    let marker_dir = temp.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    fs::create_dir_all(&marker_dir).unwrap();
+    fs::write(marker_dir.join("operator-note"), b"preserve").unwrap();
+    let limits = background_recovery_limits(2, u64::MAX);
+
+    let before_restart = Compactor::new(temp.path(), 8).with_compaction_pass_limits(limits);
+    assert!(
+        !before_restart
+            .compact_background_once_with_changes()
+            .unwrap()
+            .stats
+            .compacted
+    );
+
+    let restarted = Compactor::new(temp.path(), 8).with_compaction_pass_limits(limits);
+    let rescanned = restarted.compact_background_once_with_changes().unwrap();
+    assert!(!rescanned.stats.compacted);
+    assert_eq!(rescanned.stats.planning_directory_entries_inspected, 0);
+    assert_eq!(load_segments_for_level(temp.path(), 0).unwrap().len(), 2);
+
+    assert!(
+        restarted
+            .compact_background_once_with_changes()
+            .unwrap()
+            .stats
+            .compacted
+    );
+}
+
+#[test]
+fn background_ready_recovery_accepts_exact_record_limit_and_owns_the_wake() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "recovery-exact")])
+        .unwrap()
+        .series_id;
+    let recovered_source =
+        write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(100, 1.0)]);
+    let recovered_output =
+        write_numeric_segment(temp.path(), &registry, series_id, 1, 10, &[(100, 10.0)]);
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        2,
+        &[(0, 2.0), (10, 2.0)],
+    );
+    write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        0,
+        3,
+        &[(5, 3.0), (15, 3.0)],
+    );
+    let marker = execution::write_compaction_replacement_marker(
+        temp.path(),
+        std::slice::from_ref(&recovered_source),
+        std::slice::from_ref(&recovered_output),
+    )
+    .unwrap();
+    let compactor = Compactor::new(temp.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(2, u64::MAX));
+
+    let recovered = compactor.compact_background_once_with_changes().unwrap();
+    assert!(recovered.stats.compacted);
+    assert_eq!(recovered.source_roots, vec![recovered_source]);
+    assert_eq!(recovered.output_roots, vec![recovered_output]);
+    assert!(!marker.exists());
+    assert_eq!(
+        load_segments_for_level(temp.path(), 0).unwrap().len(),
+        2,
+        "the exact two-record recovery must not also plan a compaction"
+    );
+
+    assert!(
+        compactor
+            .compact_background_once_with_changes()
+            .unwrap()
+            .stats
+            .compacted,
+        "the following wake may plan after the retained scan reaches its end"
+    );
+}
+
+#[test]
+fn background_ready_recovery_rejects_n_plus_one_records_before_mutation() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "recovery-n-plus-one")])
+        .unwrap()
+        .series_id;
+    let first_source = write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let second_source = write_numeric_segment(temp.path(), &registry, series_id, 0, 2, &[(2, 2.0)]);
+    let output = write_numeric_segment(
+        temp.path(),
+        &registry,
+        series_id,
+        1,
+        3,
+        &[(1, 1.0), (2, 2.0)],
+    );
+    let marker = execution::write_compaction_replacement_marker(
+        temp.path(),
+        &[first_source.clone(), second_source.clone()],
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let compactor = Compactor::new(temp.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(2, u64::MAX));
+
+    let error = compactor
+        .compact_background_once_with_changes()
+        .expect_err("three records must not fit a two-item recovery pass");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            item_limit: 2,
+            selected_items: 3,
+            ..
+        }
+    ));
+    assert!(first_source.exists());
+    assert!(second_source.exists());
+    assert!(output.exists());
+    assert!(marker.exists());
+}
+
+#[test]
+fn background_recovery_decoded_byte_envelope_is_exact_and_failure_resets_cursor() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "recovery-bytes")])
+        .unwrap()
+        .series_id;
+    let source = write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let output = write_numeric_segment(temp.path(), &registry, series_id, 1, 2, &[(1, 2.0)]);
+    let marker = execution::write_compaction_replacement_marker(
+        temp.path(),
+        std::slice::from_ref(&source),
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let marker_bytes = fs::symlink_metadata(&marker).unwrap().len();
+    let decoded_bytes =
+        execution::bounded_compaction_marker_decode_bytes(temp.path(), &marker, marker_bytes);
+    assert!(decoded_bytes > marker_bytes);
+    let compactor = Compactor::new(temp.path(), 8).with_compaction_pass_limits(
+        background_recovery_limits(2, decoded_bytes.saturating_sub(1)),
+    );
+
+    let error = compactor
+        .compact_background_once_with_changes()
+        .expect_err("one byte below the modeled decode heap must reject before decode");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceWorkItemTooLarge {
+            limit,
+            required,
+            ..
+        } if limit == decoded_bytes - 1 && required == decoded_bytes
+    ));
+    assert!(source.exists());
+    assert!(output.exists());
+    assert!(marker.exists());
+
+    let compactor =
+        compactor.with_compaction_pass_limits(background_recovery_limits(2, decoded_bytes));
+    let recovered = compactor
+        .compact_background_once_with_changes()
+        .expect("the failed cursor must restart and admit the exact decode envelope");
+    assert!(recovered.stats.compacted);
+    assert!(!source.exists());
+    assert!(output.exists());
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn background_recovery_rejects_same_size_marker_path_replacement() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "marker-identity")])
+        .unwrap()
+        .series_id;
+    let source = write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let output = write_numeric_segment(temp.path(), &registry, series_id, 1, 2, &[(1, 2.0)]);
+    let marker = execution::write_compaction_replacement_marker(
+        temp.path(),
+        std::slice::from_ref(&source),
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let marker_bytes = fs::symlink_metadata(&marker).unwrap().len();
+    let replacement = temp.path().join("same-size-marker-replacement");
+    fs::write(&replacement, vec![b'x'; marker_bytes as usize]).unwrap();
+    let _hook = execution::set_compaction_marker_post_open_hook({
+        let replacement = replacement.clone();
+        move |path| fs::rename(&replacement, path).unwrap()
+    });
+
+    let error = Compactor::new(temp.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(2, u64::MAX))
+        .compact_background_once_with_changes()
+        .expect_err("a same-size replacement must not be applied through the old open handle");
+    assert!(matches!(error, TsinkError::DataCorruption(_)));
+    assert!(source.exists());
+    assert!(output.exists());
+    assert!(marker.exists());
+    assert!(!replacement.exists());
+}
+
+#[test]
+fn compaction_replacement_marker_has_fixed_byte_and_record_decode_caps() {
+    let oversized = TempDir::new().unwrap();
+    let marker_dir = oversized.path().join(super::COMPACTION_REPLACEMENT_DIR);
+    fs::create_dir_all(&marker_dir).unwrap();
+    let marker = marker_dir.join("replace-0000000000000001-0000000000000001.json");
+    fs::write(
+        &marker,
+        vec![b'x'; super::MAX_COMPACTION_REPLACEMENT_MARKER_BYTES as usize + 1],
+    )
+    .unwrap();
+    let error = Compactor::new(oversized.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(usize::MAX, u64::MAX))
+        .compact_background_once_with_changes()
+        .expect_err("an oversized marker must be rejected before allocation or decode");
+    assert!(matches!(error, TsinkError::DataCorruption(_)));
+    assert!(marker.exists());
+
+    let too_many = TempDir::new().unwrap();
+    let repeated = "segments/L0/seg-0000000000000001";
+    let marker = write_raw_replacement_marker(
+        too_many.path(),
+        "replace-0000000000000001-0000000000000001.json",
+        serde_json::json!({
+            "version": 2,
+            "phase": "preparing",
+            "source_segments": vec![repeated; super::MAX_COMPACTION_REPLACEMENT_RECORDS + 1],
+            "output_segments": [],
+        }),
+    );
+    Compactor::new(too_many.path(), 8)
+        .with_compaction_pass_limits(background_recovery_limits(usize::MAX, u64::MAX))
+        .compact_background_once_with_changes()
+        .expect_err("a record list beyond the fixed cap must fail during bounded decode");
     assert!(marker.exists());
 }
 

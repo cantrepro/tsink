@@ -4,9 +4,14 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tsink::{DiskCategory, LocalDiskBudget, TsinkError};
+use tsink::{
+    DiskCategory, LocalDiskBudget, QueryBudgetError, QueryExecution, QueryMemoryReservation,
+    TsinkError,
+};
 
 pub const CLUSTER_AUDIT_RETENTION_SECS_ENV: &str = "TSINK_CLUSTER_AUDIT_RETENTION_SECS";
 pub const CLUSTER_AUDIT_MAX_LOG_BYTES_ENV: &str = "TSINK_CLUSTER_AUDIT_MAX_LOG_BYTES";
@@ -16,6 +21,7 @@ const DEFAULT_AUDIT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_AUDIT_MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_AUDIT_MAX_QUERY_LIMIT: usize = 1000;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 100;
+const AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClusterAuditConfig {
@@ -114,6 +120,38 @@ pub struct ClusterAuditHealthSnapshot {
     pub last_cleanup_error: Option<String>,
     pub persistence_fenced: bool,
     pub persistence_fence_reason: Option<String>,
+    pub degraded: bool,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the audit-health snapshot releases its query-memory reservation"]
+pub struct AccountedClusterAuditHealthSnapshot {
+    snapshot: ClusterAuditHealthSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedClusterAuditHealthSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedClusterAuditHealthSnapshot {
+    type Target = ClusterAuditHealthSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClusterAuditMetricsSnapshot {
+    pub enabled: bool,
+    pub retained_entries: u64,
+    pub log_bytes: u64,
+    pub cleanup_pending: bool,
+    pub persistence_fenced: bool,
     pub degraded: bool,
 }
 
@@ -259,6 +297,8 @@ pub struct ClusterAuditLog {
     config: ClusterAuditConfig,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: Arc<Mutex<ClusterAuditState>>,
+    #[cfg(test)]
+    health_projection_string_clones: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -445,6 +485,8 @@ impl ClusterAuditLog {
                 #[cfg(test)]
                 fail_next_append_indeterminate: false,
             })),
+            #[cfg(test)]
+            health_projection_string_clones: Arc::new(AtomicU64::new(0)),
         };
 
         {
@@ -592,6 +634,7 @@ impl ClusterAuditLog {
             .fail_next_append_indeterminate = true;
     }
 
+    #[allow(dead_code)]
     pub fn health_snapshot(&self) -> ClusterAuditHealthSnapshot {
         let state = self
             .state
@@ -607,6 +650,98 @@ impl ClusterAuditLog {
             last_cleanup_error: state.last_cleanup_error.clone(),
             persistence_fenced,
             persistence_fence_reason: state.persistence_fenced.clone(),
+            degraded: cleanup_pending || persistence_fenced,
+        }
+    }
+
+    /// Captures the full audit-health status after reserving both optional diagnostics.
+    pub fn health_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedClusterAuditHealthSnapshot, QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        let peak_bytes = state
+            .last_cleanup_error
+            .as_deref()
+            .map(modeled_audit_status_str_bytes)
+            .unwrap_or(0)
+            .saturating_add(
+                state
+                    .persistence_fenced
+                    .as_deref()
+                    .map(modeled_audit_status_str_bytes)
+                    .unwrap_or(0),
+            );
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let cleanup_pending = state.last_cleanup_error.is_some();
+        let persistence_fenced = state.persistence_fenced.is_some();
+        let snapshot = ClusterAuditHealthSnapshot {
+            enabled: true,
+            retained_entries: u64::try_from(state.entries.len()).unwrap_or(u64::MAX),
+            log_bytes: state.log_bytes,
+            cleanup_pending,
+            last_cleanup_error: state
+                .last_cleanup_error
+                .as_deref()
+                .map(|value| self.clone_health_projection_string(value)),
+            persistence_fenced,
+            persistence_fence_reason: state
+                .persistence_fenced
+                .as_deref()
+                .map(|value| self.clone_health_projection_string(value)),
+            degraded: cleanup_pending || persistence_fenced,
+        };
+        drop(state);
+        execution.checkpoint()?;
+        let retained_bytes = modeled_audit_health_snapshot_bytes(&snapshot);
+        debug_assert!(retained_bytes <= peak_bytes);
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedClusterAuditHealthSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_health_projection_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.health_projection_string_clones
+            .fetch_add(1, Ordering::Relaxed);
+        let mut cloned = String::with_capacity(value.len());
+        cloned.push_str(value);
+        cloned
+    }
+
+    #[cfg(test)]
+    fn reset_health_projection_string_clones(&self) {
+        self.health_projection_string_clones
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn health_projection_string_clones(&self) -> u64 {
+        self.health_projection_string_clones.load(Ordering::Relaxed)
+    }
+
+    pub fn metrics_snapshot(&self) -> ClusterAuditMetricsSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cleanup_pending = state.last_cleanup_error.is_some();
+        let persistence_fenced = state.persistence_fenced.is_some();
+        ClusterAuditMetricsSnapshot {
+            enabled: true,
+            retained_entries: u64::try_from(state.entries.len()).unwrap_or(u64::MAX),
+            log_bytes: state.log_bytes,
+            cleanup_pending,
+            persistence_fenced,
             degraded: cleanup_pending || persistence_fenced,
         }
     }
@@ -644,6 +779,39 @@ impl ClusterAuditLog {
         }
         Ok(encoded)
     }
+}
+
+fn modeled_audit_status_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_audit_status_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_audit_health_snapshot_bytes(snapshot: &ClusterAuditHealthSnapshot) -> u64 {
+    snapshot
+        .last_cleanup_error
+        .as_ref()
+        .map(modeled_audit_status_string_bytes)
+        .unwrap_or(0)
+        .saturating_add(
+            snapshot
+                .persistence_fence_reason
+                .as_ref()
+                .map(modeled_audit_status_string_bytes)
+                .unwrap_or(0),
+        )
 }
 
 fn serialize_record_line(record: &ClusterAuditRecord) -> Result<Vec<u8>, String> {
@@ -874,7 +1042,10 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
     use tempfile::TempDir;
-    use tsink::LocalDiskLimits;
+    use tsink::{
+        LocalDiskLimits, QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken,
+        QueryLimitReason, QueryWorkLimits,
+    };
 
     fn actor(id: &str) -> ClusterAuditActor {
         ClusterAuditActor {
@@ -909,6 +1080,148 @@ mod tests {
             .find(|usage| usage.category == category)
             .map(|usage| usage.bytes)
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn metrics_snapshot_matches_health_without_owned_diagnostics() {
+        assert!(!std::mem::needs_drop::<ClusterAuditMetricsSnapshot>());
+
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let log = ClusterAuditLog::open(
+            temp_dir.path().join("audit.log"),
+            ClusterAuditConfig::default(),
+        )
+        .expect("audit log should open");
+        log.append(input(unix_timestamp_millis(), "metrics"))
+            .expect("audit record should append");
+        {
+            let mut state = log
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_cleanup_error = Some("cleanup diagnostic".repeat(64));
+            state.persistence_fenced = Some("fence diagnostic".repeat(64));
+        }
+
+        let metrics = log.metrics_snapshot();
+        let health = log.health_snapshot();
+        assert_eq!(metrics.enabled, health.enabled);
+        assert_eq!(metrics.retained_entries, health.retained_entries);
+        assert_eq!(metrics.log_bytes, health.log_bytes);
+        assert_eq!(metrics.cleanup_pending, health.cleanup_pending);
+        assert_eq!(metrics.persistence_fenced, health.persistence_fenced);
+        assert_eq!(metrics.degraded, health.degraded);
+        assert!(health
+            .last_cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cleanup diagnostic")));
+        assert!(health
+            .persistence_fence_reason
+            .as_deref()
+            .is_some_and(|error| error.starts_with("fence diagnostic")));
+    }
+
+    #[test]
+    fn accounted_health_snapshot_preserves_values_and_enforces_exact_preclone_peak() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let log = ClusterAuditLog::open(
+            temp_dir.path().join("accounted-health.log"),
+            ClusterAuditConfig::default(),
+        )
+        .expect("audit log should open");
+        log.append(input(unix_timestamp_millis(), "accounted-health"))
+            .expect("audit record should append");
+        {
+            let mut state = log
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_cleanup_error = Some("cleanup diagnostic".repeat(32));
+            state.persistence_fenced = Some("fence diagnostic".repeat(48));
+        }
+        let expected = log.health_snapshot();
+        let peak_bytes = modeled_audit_health_snapshot_bytes(&expected);
+        assert!(peak_bytes > 0);
+
+        log.reset_health_projection_string_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact audit-health budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let projected = log
+            .health_snapshot_with_execution(&exact)
+            .expect("the exact modeled peak should pass");
+        assert_eq!(&*projected, &expected);
+        assert_eq!(projected.accounted_bytes(), peak_bytes);
+        assert_eq!(log.health_projection_string_clones(), 2);
+        drop(projected);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.active_queries, 0);
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        log.reset_health_projection_string_clones();
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes - 1),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under audit-health budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = log
+            .health_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the modeled peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, peak_bytes);
+            }
+            other => panic!("unexpected audit-health projection error: {other}"),
+        }
+        assert_eq!(log.health_projection_string_clones(), 0);
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.active_queries, 0);
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+
+        log.reset_health_projection_string_clones();
+        let cancelled_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let cancelled = cancelled_budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("cancelled query should admit");
+        cancellation.cancel();
+        let error = log
+            .health_snapshot_with_execution(&cancelled)
+            .expect_err("a pre-cancelled audit-health projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(log.health_projection_string_clones(), 0);
+        assert_eq!(cancelled.snapshot().memory_reserved_bytes, 0);
+        drop(cancelled);
+        let cancelled_released = cancelled_budget.snapshot();
+        assert_eq!(cancelled_released.active_queries, 0);
+        assert_eq!(cancelled_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(cancelled_released.cancellations_total, 1);
+        assert_eq!(cancelled_released.accounting_invariant_violations_total, 0);
     }
 
     #[test]

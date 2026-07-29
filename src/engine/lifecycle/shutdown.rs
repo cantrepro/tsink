@@ -1,7 +1,8 @@
+use super::super::{BackgroundPostFlushCleanFenceCursor, MemoryAccountingState};
 use super::*;
 use crate::engine::tombstone::TombstoneMap;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 #[derive(Clone, Copy)]
 struct LifecycleShutdownContext<'a> {
@@ -186,11 +187,66 @@ impl ChunkStorage {
         let Some(compactor) = selected else {
             return Ok(());
         };
-        let changes = Self::run_compactor_once(compactor, tombstones, observability)?;
+        let changes = Self::run_background_compactor_once(compactor, tombstones, observability)?;
         if !changes.is_empty() {
             record_changes(changes);
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn compact_next_background_compactor_with_bounded_post_flush_fence<F>(
+        post_flush_replacement_data_path: Option<&Path>,
+        clean_fence_cursor: &Mutex<BackgroundPostFlushCleanFenceCursor>,
+        post_flush_marker_generation: &AtomicU64,
+        memory: &MemoryAccountingState,
+        maintenance_max_items_per_pass: usize,
+        maintenance_max_bytes_per_pass: u64,
+        numeric_compactor: Option<&Compactor>,
+        blob_compactor: Option<&Compactor>,
+        prefer_blob: bool,
+        tombstones: Option<&RwLock<TombstoneMap>>,
+        observability: Option<&StorageObservabilityCounters>,
+        record_changes: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(PendingPersistedSegmentDiff),
+    {
+        if let Some(data_path) = post_flush_replacement_data_path {
+            let fence = super::super::maintenance::advance_background_post_flush_clean_fence(
+                &mut clean_fence_cursor.lock(),
+                data_path,
+                post_flush_marker_generation,
+                maintenance_max_items_per_pass,
+                maintenance_max_bytes_per_pass,
+                |bytes| memory.remote_catalog_memory_reservation(bytes),
+            )?;
+            if matches!(
+                fence,
+                super::super::maintenance::BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+            ) {
+                return Ok(false);
+            }
+        }
+
+        Self::compact_next_background_compactor_with_changes(
+            None,
+            numeric_compactor,
+            blob_compactor,
+            prefer_blob,
+            tombstones,
+            observability,
+            record_changes,
+        )?;
+        Ok(true)
+    }
+
+    fn run_background_compactor_once(
+        compactor: &Compactor,
+        tombstones: Option<&RwLock<TombstoneMap>>,
+        observability: Option<&StorageObservabilityCounters>,
+    ) -> Result<PendingPersistedSegmentDiff> {
+        Self::run_compactor_once_with_mode(compactor, tombstones, observability, true)
     }
 
     fn run_compactor_once(
@@ -198,12 +254,26 @@ impl ChunkStorage {
         tombstones: Option<&RwLock<TombstoneMap>>,
         observability: Option<&StorageObservabilityCounters>,
     ) -> Result<PendingPersistedSegmentDiff> {
+        Self::run_compactor_once_with_mode(compactor, tombstones, observability, false)
+    }
+
+    fn run_compactor_once_with_mode(
+        compactor: &Compactor,
+        tombstones: Option<&RwLock<TombstoneMap>>,
+        observability: Option<&StorageObservabilityCounters>,
+        background: bool,
+    ) -> Result<PendingPersistedSegmentDiff> {
         let started = Instant::now();
         let outcome = match tombstones {
             Some(tombstones) => {
                 let tombstones = tombstones.read();
-                compactor.compact_once_with_changes_using_tombstones(&tombstones)
+                if background {
+                    compactor.compact_background_once_with_changes_using_tombstones(&tombstones)
+                } else {
+                    compactor.compact_once_with_changes_using_tombstones(&tombstones)
+                }
             }
+            None if background => compactor.compact_background_once_with_changes(),
             None => compactor.compact_once_with_changes(),
         };
         match outcome {
@@ -260,7 +330,14 @@ impl ChunkStorage {
         // state before running another pass, so later internal acquisitions are uncontended by
         // engine-owned compaction work. The guard is intentionally released because flush,
         // retention, and catalog helpers own their existing non-reentrant gate boundaries.
-        drop(shutdown.compaction_gate()?);
+        {
+            let _compaction_guard = shutdown.compaction_gate()?;
+            // The background compactor owns this retained ReadDir under the compaction gate, not
+            // the background-maintenance gate. Release its directory handle and shared-memory
+            // reservation only after the active pass is drained and before successful close can
+            // release the data-path process lease.
+            self.reset_background_post_flush_clean_fence_cursor();
+        }
         self.flush_all_active()?;
         self.persist_segment()?;
         if let Err(err) = self.sweep_expired_persisted_segments() {
@@ -440,6 +517,79 @@ mod tests {
 
         storage.clear_full_memory_reconciliation_hook();
         super::super::super::tests::assert_engine_memory_usage_reconciled(&storage);
+    }
+
+    #[test]
+    fn close_releases_retained_post_flush_clean_fence_before_the_data_path_lease() {
+        let temp = TempDir::new().unwrap();
+        let storage = close_timeout_test_storage(&temp);
+        let marker_dir = temp
+            .path()
+            .join(super::super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+
+        let attempted = {
+            let _compaction_guard = storage.compaction_gate();
+            ChunkStorage::compact_next_background_compactor_with_bounded_post_flush_fence(
+                Some(temp.path()),
+                storage
+                    .coordination
+                    .background_post_flush_clean_fence_cursor
+                    .as_ref(),
+                storage.coordination.post_flush_marker_generation.as_ref(),
+                storage.memory.as_ref(),
+                1,
+                u64::MAX,
+                None,
+                None,
+                false,
+                None,
+                None,
+                |_| {},
+            )
+            .expect("one unknown entry should retain the clean-fence cursor")
+        };
+        assert!(!attempted);
+        assert!(storage
+            .coordination
+            .background_post_flush_clean_fence_cursor
+            .lock()
+            .has_active_scan());
+        assert!(
+            storage
+                .observability_snapshot_impl()
+                .memory
+                .remote_catalog_staging_bytes
+                > 0
+        );
+
+        storage.close_impl().expect("close should drain the cursor");
+
+        assert_eq!(
+            storage
+                .observability_snapshot_impl()
+                .memory
+                .remote_catalog_staging_bytes,
+            0
+        );
+        assert!(!storage
+            .coordination
+            .background_post_flush_clean_fence_cursor
+            .lock()
+            .has_active_scan());
+        assert!(
+            storage.coordination.data_path_process_lock.lock().is_none(),
+            "successful close must release the process lease only after cursor teardown"
+        );
+        assert_eq!(
+            marker_dir.read_dir().unwrap().count(),
+            1,
+            "the clean fence and close must preserve unknown operator entries"
+        );
+        let renamed_marker_dir = temp.path().join("renamed-post-flush-markers");
+        std::fs::rename(&marker_dir, &renamed_marker_dir)
+            .expect("no retained ReadDir handle may survive successful close");
     }
 
     #[test]
@@ -633,6 +783,103 @@ mod tests {
         )
         .expect_err("the following blob turn must inspect its selected corrupt lane");
         assert!(crate::engine::segment::segment_validation_error_message(&error).is_some());
+    }
+
+    #[test]
+    fn background_compaction_waits_for_incremental_post_flush_clean_fence() {
+        let temp = TempDir::new().unwrap();
+        let storage = close_timeout_test_storage(&temp);
+        let marker_dir = temp
+            .path()
+            .join(super::super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("operator-a"), b"keep").unwrap();
+        std::fs::write(marker_dir.join("operator-b"), b"keep").unwrap();
+
+        let corrupt_root = temp
+            .path()
+            .join("lane_numeric")
+            .join("segments")
+            .join("L0")
+            .join("seg-0000000000000001");
+        std::fs::create_dir_all(&corrupt_root).unwrap();
+        std::fs::write(corrupt_root.join("manifest.bin"), b"not-a-manifest").unwrap();
+
+        let recorded = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let attempted =
+                ChunkStorage::compact_next_background_compactor_with_bounded_post_flush_fence(
+                    Some(temp.path()),
+                    storage
+                        .coordination
+                        .background_post_flush_clean_fence_cursor
+                        .as_ref(),
+                    storage.coordination.post_flush_marker_generation.as_ref(),
+                    storage.memory.as_ref(),
+                    1,
+                    u64::MAX,
+                    storage.persisted.numeric_compactor.as_ref(),
+                    None,
+                    false,
+                    Some(storage.visibility.tombstones.as_ref()),
+                    Some(storage.observability.as_ref()),
+                    |_| {
+                        recorded.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .expect("one unknown fence entry must consume the wake without planning");
+            assert!(!attempted);
+            assert_eq!(recorded.load(Ordering::SeqCst), 0);
+            assert!(
+                storage
+                    .observability_snapshot_impl()
+                    .memory
+                    .remote_catalog_staging_bytes
+                    > 0,
+                "the retained clean-fence cursor must stay visible in shared memory accounting"
+            );
+            assert_eq!(
+                marker_dir.read_dir().unwrap().count(),
+                2,
+                "the clean fence must not mutate unknown operator entries"
+            );
+        }
+
+        let error = ChunkStorage::compact_next_background_compactor_with_bounded_post_flush_fence(
+            Some(temp.path()),
+            storage
+                .coordination
+                .background_post_flush_clean_fence_cursor
+                .as_ref(),
+            storage.coordination.post_flush_marker_generation.as_ref(),
+            storage.memory.as_ref(),
+            1,
+            u64::MAX,
+            storage.persisted.numeric_compactor.as_ref(),
+            None,
+            false,
+            Some(storage.visibility.tombstones.as_ref()),
+            Some(storage.observability.as_ref()),
+            |_| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect_err("only the generation-stable terminal probe may enter corrupt planning");
+        assert!(crate::engine::segment::segment_validation_error_message(&error).is_some());
+        assert_eq!(recorded.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage
+                .observability_snapshot_impl()
+                .memory
+                .remote_catalog_staging_bytes,
+            0,
+            "the terminal probe must release the clean-fence cursor before planning"
+        );
+
+        storage
+            .coordination
+            .lifecycle
+            .store(super::super::super::STORAGE_CLOSED, Ordering::SeqCst);
     }
 
     #[test]

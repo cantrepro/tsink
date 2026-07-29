@@ -151,6 +151,23 @@ After admission, replacement uses a crash-replayable marker protocol:
 
 The next `compact_once` call (or startup) replays pending markers in sorted order. Preparing replay
 rolls outputs back; Ready replay validates every complete output and finishes source retirement.
+The engine's periodic background path instead retains a directory cursor and consumes one raw
+namespace entry or one admitted marker per wake before planning. Marker input is limited to 4 MiB
+and 16,384 combined source/output records; conservative decoded String/Vec/path memory must fit the
+maintenance pass before decode, and path/opened/post-read file identities must agree. Startup,
+close, and standalone `compact_once` retain exhaustive replay.
+
+Before that lane-specific recovery or ordinary planning, production background compaction also
+advances the global post-flush clean fence. Its shared-memory-accounted `ReadDir` cursor consumes
+one admitted raw namespace entry per wake and requires an empty terminal probe under an unchanged
+marker-publication generation. Its portable model charges twice each simultaneously owned path/name
+payload plus 64 KiB for directory-stream and entry scratch; allocator metadata and runtime/kernel
+state remain outside that model. Marker publication invalidates the cursor while holding the same
+compaction gate, so a marker inserted behind a retained iterator cannot be missed. Close and drop
+release any retained cursor before the data-path lease. A recognized marker defers compaction for
+catalog-aware recovery; foreground, flush, catalog-refresh, close, and standalone callers retain
+their exhaustive post-flush fence.
+
 During a live aggregate operation, individual segment writes do not make nested per-output
 reservations. Completion instead installs an exact full-tree reconciliation, preserving the
 existing per-file/category accounting. The aggregate reservation is RAII-owned: ordinary error
@@ -171,11 +188,11 @@ The compaction background thread runs continuously while the storage engine is o
 sleeps for `compaction_interval` (default **5 seconds**) between passes and wakes
 immediately when the flush pipeline signals that new segments have been written.
 
-The thread runs both the numeric compactor and the blob compactor in sequence on each
-wakeup. A mutex (`compaction_lock`) serialises the thread against manual compaction
-calls and snapshot operations. Flush holds the same gate from before a segment root
-becomes directory-visible through index verification, recovery-metadata persistence,
-and the catalog visibility swap. A directory-scanning compactor therefore cannot
+The thread alternates one available numeric or blob compactor per wake, so one wake cannot double
+the configured pass envelope. A mutex (`compaction_lock`) serialises the thread against manual
+compaction calls and snapshot operations. Flush holds the same gate from before a segment root
+becomes directory-visible through index verification, recovery-metadata persistence, and the
+catalog visibility swap. A directory-scanning compactor therefore cannot
 consume and retire a newly staged root before its flush transaction commits.
 
 On `close()`, the engine acquires all write permits, flushes active state to segments,

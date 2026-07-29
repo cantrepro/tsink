@@ -3,14 +3,15 @@ use crate::admission::{
     WriteAdmissionController, WriteAdmissionError, WriteAdmissionMetricsSnapshot,
 };
 use crate::cluster::audit::{
-    ClusterAuditActor, ClusterAuditEntryInput, ClusterAuditOutcome, ClusterAuditQuery,
+    ClusterAuditActor, ClusterAuditEntryInput, ClusterAuditHealthSnapshot, ClusterAuditOutcome,
+    ClusterAuditQuery,
 };
 use crate::cluster::config::{
     ClusterReadConsistency, ClusterReadPartialResponsePolicy, ClusterWriteConsistency,
 };
 use crate::cluster::consensus::{
     ControlConsensusError, ControlLivenessSnapshot, ControlLogRecoverySnapshot,
-    ControlPeerLivenessStatus, ControlPersistenceStatus, ProposeOutcome,
+    ControlMetricsSnapshot, ControlPeerLivenessStatus, ControlPersistenceStatus, ProposeOutcome,
 };
 use crate::cluster::control::{
     ClusterHandoffSnapshot, ControlHandoffMutationOutcome, ControlMembershipMutationOutcome,
@@ -21,29 +22,32 @@ use crate::cluster::dedupe::{
     DedupeWindowStore,
 };
 use crate::cluster::distributed_storage::{DistributedPromqlReadBridge, DistributedStorageAdapter};
-use crate::cluster::hotspot::{self, build_cluster_hotspot_snapshot, ClusterHotspotSnapshot};
+use crate::cluster::hotspot::{self, ClusterHotspotSnapshot};
 use crate::cluster::membership::{ClusterNode, MembershipView};
 use crate::cluster::outbox::{
-    outbox_metrics_snapshot, OutboxMetricsSnapshot, OutboxStalledPeerSnapshot,
+    outbox_metrics_snapshot, OutboxMetricsExpositionSnapshot, OutboxMetricsSnapshot,
 };
 use crate::cluster::planner::{
-    read_planner_labeled_metrics_snapshot, read_planner_last_plans_snapshot,
-    read_planner_metrics_snapshot, ReadPlannerLabeledMetricsSnapshot, ReadPlannerMetricsSnapshot,
+    read_planner_labeled_metrics_exposition_snapshot, read_planner_metrics_snapshot,
+    read_planner_status_exposition_snapshot_with_execution,
+    ReadPlannerLabeledMetricsExpositionSnapshot, ReadPlannerMetricsSnapshot,
 };
 use crate::cluster::query::{
-    read_fanout_labeled_metrics_snapshot, read_fanout_metrics_snapshot, ReadFanoutError,
-    ReadFanoutExecutor, ReadFanoutLabeledMetricsSnapshot, ReadFanoutMetricsSnapshot,
-    ReadFanoutResponseMetadata, SeriesPoints, FANOUT_REMOTE_REQUEST_LATENCY_BUCKETS_SECONDS,
+    read_fanout_labeled_metrics_snapshot_with_execution, read_fanout_metrics_snapshot,
+    ReadFanoutError, ReadFanoutExecutor, ReadFanoutLabeledMetricsExpositionSnapshot,
+    ReadFanoutMetricsSnapshot, ReadFanoutResponseMetadata, SeriesPoints,
+    FANOUT_REMOTE_REQUEST_LATENCY_BUCKETS_SECONDS,
 };
 use crate::cluster::repair::{
-    DigestExchangeSnapshot, RebalanceRunTriggerError, RebalanceSchedulerControlSnapshot,
-    RebalanceSchedulerSnapshot, RepairControlSnapshot, RepairRunTriggerError,
+    DigestExchangeMetricsSnapshot, DigestExchangeSnapshot, RebalanceJobSnapshot,
+    RebalanceRunTriggerError, RebalanceSchedulerMetricsSnapshot, RebalanceSchedulerSnapshot,
+    RebalanceSloGuardSnapshot, RepairControlSnapshot, RepairRunTriggerError,
 };
 use crate::cluster::replication::{
-    stable_series_identity_hash, write_routing_labeled_metrics_snapshot,
+    stable_series_identity_hash, write_routing_labeled_metrics_snapshot_with_execution,
     write_routing_metrics_snapshot, WriteConsistencyOutcome, WriteRouter, WriteRoutingError,
-    WriteRoutingLabeledMetricsSnapshot, WRITE_CONSISTENCY_OVERRIDE_HEADER,
-    WRITE_REMOTE_REQUEST_LATENCY_BUCKETS_SECONDS,
+    WriteRoutingLabeledMetricsExpositionSnapshot, WriteRoutingShardMetricsExpositionSnapshot,
+    WRITE_CONSISTENCY_OVERRIDE_HEADER, WRITE_REMOTE_REQUEST_LATENCY_BUCKETS_SECONDS,
 };
 use crate::cluster::ring::ShardRing;
 use crate::cluster::rpc::{
@@ -56,22 +60,23 @@ use crate::cluster::rpc::{
     InternalDataSnapshotRequest, InternalDataSnapshotResponse, InternalDigestWindowRequest,
     InternalDigestWindowResponse, InternalExemplar, InternalExemplarSeries,
     InternalIngestRowsRequest, InternalIngestRowsResponse, InternalIngestWriteRequest,
-    InternalIngestWriteResponse, InternalListMetricsRequest, InternalListMetricsResponse,
-    InternalMetricMetadataUpdate, InternalQueryExemplarsRequest, InternalQueryExemplarsResponse,
-    InternalRepairBackfillRequest, InternalRepairBackfillResponse, InternalRow,
-    InternalSelectBatchRequest, InternalSelectBatchResponse, InternalSelectRequest,
-    InternalSelectResponse, InternalSelectSeriesRequest, InternalSelectSeriesResponse,
-    InternalWriteExemplar, RpcError, CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1,
+    InternalIngestWriteResponse, InternalListMetricsRequest, InternalMetricMetadataUpdate,
+    InternalQueryExemplarsRequest, InternalQueryExemplarsResponse, InternalRepairBackfillRequest,
+    InternalRepairBackfillResponse, InternalRow, InternalSelectBatchRequest,
+    InternalSelectBatchResponse, InternalSelectRequest, InternalSelectResponse,
+    InternalSelectSeriesRequest, InternalSelectSeriesResponse, InternalWriteExemplar, RpcError,
+    CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1, CLUSTER_CAPABILITY_CLUSTER_SNAPSHOT_V1,
+    CLUSTER_CAPABILITY_CONTROL_LOG_V1, CLUSTER_CAPABILITY_CONTROL_RECOVERY_SNAPSHOT_V1,
     CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1, CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1,
-    CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1, CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1,
-    CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1, CLUSTER_CAPABILITY_METADATA_INGEST_V1,
-    DEFAULT_INTERNAL_RING_VERSION, EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES,
-    HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES, INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS,
-    METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
+    CLUSTER_CAPABILITY_CONTROL_STATE_V1, CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1,
+    CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1, CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1,
+    CLUSTER_CAPABILITY_HISTOGRAM_STORAGE_V1, CLUSTER_CAPABILITY_METADATA_INGEST_V1,
+    CLUSTER_CAPABILITY_METADATA_STORE_V1, CLUSTER_CAPABILITY_RPC_V1, DEFAULT_INTERNAL_RING_VERSION,
+    EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES, HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES,
+    INTERNAL_RPC_AUTH_HEADER, MAX_INTERNAL_INGEST_ROWS, METADATA_PAYLOAD_REQUIRED_CAPABILITIES,
 };
 #[cfg(test)]
 use crate::cluster::rpc::{
-    CLUSTER_CAPABILITY_HISTOGRAM_STORAGE_V1, CLUSTER_CAPABILITY_RPC_V1,
     INTERNAL_RPC_CAPABILITIES_HEADER, INTERNAL_RPC_PROTOCOL_VERSION, INTERNAL_RPC_VERSION_HEADER,
 };
 use crate::cluster::ClusterRequestContext;
@@ -116,12 +121,17 @@ use crate::rbac::{self, RbacRegistry};
 use crate::rules::{self, RulesApplyError, RulesApplyRequest, RulesRunTriggerError, RulesRuntime};
 use crate::security::{
     SecretRotationMode, SecretRotationTarget, SecurityManager, SecurityRotateResult,
+    SecurityStateSnapshot, SecurityStateSnapshotError, ServiceAccountRotationSummary,
 };
 use crate::tenant;
-use crate::usage::{UsageAccounting, UsageBucketWidth, UsageCategory, UsageRecordInput};
+use crate::usage::{
+    UsageAccounting, UsageBucketWidth, UsageCategory, UsageLedgerStatus, UsageRecordInput,
+    UsageStatusReconciliationSnapshot,
+};
 use chrono::{DateTime, FixedOffset};
 use prost::Message;
 use serde::de::DeserializeOwned;
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use snap::raw::{decompress_len, Decoder as SnappyDecoder, Encoder as SnappyEncoder};
@@ -130,7 +140,7 @@ use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tsink::promql::ast::{Expr, MatchOp};
 use tsink::promql::types::{histogram_buckets, histogram_count_value, PromqlValue};
@@ -276,10 +286,75 @@ struct PayloadCounterSnapshot {
     throttled_total: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolLabelSet<'a> {
+    Borrowed(&'a [String]),
+    Static(&'static [&'static str]),
+}
+
+impl ProtocolLabelSet<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Borrowed(labels) => labels.len(),
+            Self::Static(labels) => labels.len(),
+        }
+    }
+}
+
+enum ProtocolLabelIter<'a> {
+    Borrowed(std::slice::Iter<'a, String>),
+    Static(std::slice::Iter<'static, &'static str>),
+}
+
+impl<'a> Iterator for ProtocolLabelIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Borrowed(labels) => labels.next().map(String::as_str),
+            Self::Static(labels) => labels.next().copied(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Borrowed(labels) => labels.size_hint(),
+            Self::Static(labels) => labels.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for ProtocolLabelIter<'_> {}
+
+impl<'a> IntoIterator for &ProtocolLabelSet<'a> {
+    type Item = &'a str;
+    type IntoIter = ProtocolLabelIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match *self {
+            ProtocolLabelSet::Borrowed(labels) => ProtocolLabelIter::Borrowed(labels.iter()),
+            ProtocolLabelSet::Static(labels) => ProtocolLabelIter::Static(labels.iter()),
+        }
+    }
+}
+
+impl Serialize for ProtocolLabelSet<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for label in self {
+            sequence.serialize_element(label)?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PayloadStatusSnapshot {
     enabled: bool,
-    required_capabilities: Vec<String>,
+    required_capabilities: ProtocolLabelSet<'static>,
     accepted_total: u64,
     rejected_total: u64,
     throttled_total: u64,
@@ -287,9 +362,9 @@ struct PayloadStatusSnapshot {
     max_bucket_entries_per_request: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrometheusPayloadStatusSnapshot {
-    local_capabilities: Vec<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrometheusPayloadStatusSnapshot<'a> {
+    local_capabilities: ProtocolLabelSet<'a>,
     metadata: PayloadStatusSnapshot,
     exemplars: PayloadStatusSnapshot,
     histograms: PayloadStatusSnapshot,
@@ -306,14 +381,14 @@ struct OtlpCounterSnapshot {
     rejected_total: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OtlpMetricsStatusSnapshot {
     enabled: bool,
     accepted_requests_total: u64,
     rejected_requests_total: u64,
     accepted_exemplars_total: u64,
     rejected_exemplars_total: u64,
-    supported_shapes: Vec<String>,
+    supported_shapes: ProtocolLabelSet<'static>,
     gauges: OtlpCounterSnapshot,
     sums: OtlpCounterSnapshot,
     histograms: OtlpCounterSnapshot,
@@ -321,7 +396,10 @@ struct OtlpMetricsStatusSnapshot {
     exponential_histograms: OtlpCounterSnapshot,
 }
 
-fn prometheus_payload_config() -> PrometheusPayloadConfig {
+static PROMETHEUS_PAYLOAD_CONFIG: OnceLock<PrometheusPayloadConfig> = OnceLock::new();
+static OTLP_METRICS_CONFIG: OnceLock<OtlpMetricsConfig> = OnceLock::new();
+
+fn resolve_prometheus_payload_config() -> PrometheusPayloadConfig {
     PrometheusPayloadConfig {
         metadata_enabled: parse_env_bool(REMOTE_WRITE_METADATA_ENABLED_ENV, true),
         exemplars_enabled: parse_env_bool(REMOTE_WRITE_EXEMPLARS_ENABLED_ENV, true),
@@ -339,20 +417,53 @@ fn prometheus_payload_config() -> PrometheusPayloadConfig {
     }
 }
 
-fn otlp_metrics_config() -> OtlpMetricsConfig {
+fn prometheus_payload_config() -> PrometheusPayloadConfig {
+    *PROMETHEUS_PAYLOAD_CONFIG.get_or_init(resolve_prometheus_payload_config)
+}
+
+fn resolve_otlp_metrics_config() -> OtlpMetricsConfig {
     OtlpMetricsConfig {
         enabled: parse_env_bool(OTLP_METRICS_ENABLED_ENV, true),
     }
 }
 
+fn otlp_metrics_config() -> OtlpMetricsConfig {
+    *OTLP_METRICS_CONFIG.get_or_init(resolve_otlp_metrics_config)
+}
+
+/// Resolves every environment-backed protocol config before the server can accept requests.
+///
+/// `/metrics` reads all of these values. Eager resolution keeps a first scrape from performing
+/// process-environment reads or their temporary String allocations outside its root query
+/// execution.
+pub(crate) fn initialize_protocol_configs() {
+    let _ = prometheus_payload_config();
+    let _ = otlp_metrics_config();
+    let _ = legacy_ingest::influx_line_protocol_config();
+    let _ = legacy_ingest::statsd_config();
+    let _ = legacy_ingest::graphite_config();
+}
+
 fn parse_env_bool(var: &str, default: bool) -> bool {
     match std::env::var(var) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
+        Ok(value) => parse_bool(value.trim()).unwrap_or(default),
         Err(_) => default,
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    if ["1", "true", "yes", "on"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(true)
+    } else if ["0", "false", "no", "off"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -414,6 +525,29 @@ pub(crate) struct RequestContext<'a> {
     pub internal_api: Option<&'a InternalApiConfig>,
 }
 
+const DEFAULT_CLUSTER_CAPABILITY_LABELS: [&str; 14] = [
+    CLUSTER_CAPABILITY_BUDGETED_RESTORE_V1,
+    CLUSTER_CAPABILITY_RPC_V1,
+    CLUSTER_CAPABILITY_CLUSTER_SNAPSHOT_V1,
+    CLUSTER_CAPABILITY_CONTROL_LOG_V1,
+    CLUSTER_CAPABILITY_CONTROL_RECOVERY_SNAPSHOT_V1,
+    CLUSTER_CAPABILITY_CONTROL_REPLICATION_V1,
+    CLUSTER_CAPABILITY_CONTROL_SNAPSHOT_RPC_V1,
+    CLUSTER_CAPABILITY_CONTROL_STATE_V1,
+    CLUSTER_CAPABILITY_EXEMPLAR_INGEST_V1,
+    CLUSTER_CAPABILITY_EXEMPLAR_QUERY_V1,
+    CLUSTER_CAPABILITY_HISTOGRAM_INGEST_V1,
+    CLUSTER_CAPABILITY_HISTOGRAM_STORAGE_V1,
+    CLUSTER_CAPABILITY_METADATA_INGEST_V1,
+    CLUSTER_CAPABILITY_METADATA_STORE_V1,
+];
+const OTLP_SUPPORTED_SHAPE_LABELS: [&str; 4] = [
+    "gauge",
+    "sum:cumulative",
+    "histogram:cumulative:explicit_buckets",
+    "summary",
+];
+
 fn payload_required_capabilities(kind: PrometheusPayloadKind) -> Vec<String> {
     match kind {
         PrometheusPayloadKind::Metadata => {
@@ -424,6 +558,20 @@ fn payload_required_capabilities(kind: PrometheusPayloadKind) -> Vec<String> {
         }
         PrometheusPayloadKind::Histogram => {
             normalize_capabilities(HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES)
+        }
+    }
+}
+
+fn payload_required_capability_labels(kind: PrometheusPayloadKind) -> ProtocolLabelSet<'static> {
+    match kind {
+        PrometheusPayloadKind::Metadata => {
+            ProtocolLabelSet::Static(&METADATA_PAYLOAD_REQUIRED_CAPABILITIES)
+        }
+        PrometheusPayloadKind::Exemplar => {
+            ProtocolLabelSet::Static(&EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES)
+        }
+        PrometheusPayloadKind::Histogram => {
+            ProtocolLabelSet::Static(&HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES)
         }
     }
 }
@@ -759,38 +907,33 @@ fn exemplar_query_units(series: &[ExemplarSeries]) -> usize {
     series.iter().map(|item| item.exemplars.len()).sum()
 }
 
-fn cluster_hotspot_snapshot_for_request(
-    metrics: &[MetricSeries],
-    cluster_context: Option<&ClusterRequestContext>,
-    tenant_scope: Option<&str>,
-) -> ClusterHotspotSnapshot {
-    let control_state = cluster_context
-        .and_then(|context| context.control_consensus.as_ref())
-        .map(|consensus| consensus.current_state());
-    build_cluster_hotspot_snapshot(
-        metrics,
-        cluster_context.map(|context| &context.runtime.ring),
-        control_state.as_ref(),
-        tenant_scope,
-    )
-}
-
-fn payload_status_snapshot(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> PrometheusPayloadStatusSnapshot {
+fn payload_status_snapshot<'a>(
+    cluster_context: Option<&'a ClusterRequestContext>,
+) -> PrometheusPayloadStatusSnapshot<'a> {
     let config = prometheus_payload_config();
-    let compatibility = cluster_context
-        .map(|context| context.runtime.internal_api.compatibility.clone())
-        .unwrap_or_default();
+    let local_capabilities = cluster_context
+        .map(|context| {
+            ProtocolLabelSet::Borrowed(
+                context
+                    .runtime
+                    .internal_api
+                    .compatibility
+                    .capabilities
+                    .as_slice(),
+            )
+        })
+        .unwrap_or(ProtocolLabelSet::Static(&DEFAULT_CLUSTER_CAPABILITY_LABELS));
     let metadata_counters = payload_counter_snapshot(PrometheusPayloadKind::Metadata);
     let exemplar_counters = payload_counter_snapshot(PrometheusPayloadKind::Exemplar);
     let histogram_counters = payload_counter_snapshot(PrometheusPayloadKind::Histogram);
 
     PrometheusPayloadStatusSnapshot {
-        local_capabilities: compatibility.capabilities,
+        local_capabilities,
         metadata: PayloadStatusSnapshot {
             enabled: config.metadata_enabled,
-            required_capabilities: payload_required_capabilities(PrometheusPayloadKind::Metadata),
+            required_capabilities: payload_required_capability_labels(
+                PrometheusPayloadKind::Metadata,
+            ),
             accepted_total: metadata_counters.accepted_total,
             rejected_total: metadata_counters.rejected_total,
             throttled_total: metadata_counters.throttled_total,
@@ -799,7 +942,9 @@ fn payload_status_snapshot(
         },
         exemplars: PayloadStatusSnapshot {
             enabled: config.exemplars_enabled,
-            required_capabilities: payload_required_capabilities(PrometheusPayloadKind::Exemplar),
+            required_capabilities: payload_required_capability_labels(
+                PrometheusPayloadKind::Exemplar,
+            ),
             accepted_total: exemplar_counters.accepted_total,
             rejected_total: exemplar_counters.rejected_total,
             throttled_total: exemplar_counters.throttled_total,
@@ -808,7 +953,9 @@ fn payload_status_snapshot(
         },
         histograms: PayloadStatusSnapshot {
             enabled: config.histograms_enabled,
-            required_capabilities: payload_required_capabilities(PrometheusPayloadKind::Histogram),
+            required_capabilities: payload_required_capability_labels(
+                PrometheusPayloadKind::Histogram,
+            ),
             accepted_total: histogram_counters.accepted_total,
             rejected_total: histogram_counters.rejected_total,
             throttled_total: histogram_counters.throttled_total,
@@ -826,12 +973,7 @@ fn otlp_metrics_status_snapshot() -> OtlpMetricsStatusSnapshot {
         rejected_requests_total: OTLP_REQUEST_REJECTED_TOTAL.load(Ordering::Relaxed),
         accepted_exemplars_total: OTLP_EXEMPLAR_ACCEPTED_TOTAL.load(Ordering::Relaxed),
         rejected_exemplars_total: OTLP_EXEMPLAR_REJECTED_TOTAL.load(Ordering::Relaxed),
-        supported_shapes: vec![
-            "gauge".to_string(),
-            "sum:cumulative".to_string(),
-            "histogram:cumulative:explicit_buckets".to_string(),
-            "summary".to_string(),
-        ],
+        supported_shapes: ProtocolLabelSet::Static(&OTLP_SUPPORTED_SHAPE_LABELS),
         gauges: otlp_counter_snapshot(OtlpMetricKind::Gauge),
         sums: otlp_counter_snapshot(OtlpMetricKind::Sum),
         histograms: otlp_counter_snapshot(OtlpMetricKind::Histogram),
@@ -2074,70 +2216,45 @@ fn security_status_json(
     security_manager: Option<&SecurityManager>,
     rbac_registry: Option<&RbacRegistry>,
 ) -> JsonValue {
-    let targets = security_manager
-        .map(|manager| manager.state_snapshot(rbac_registry).targets)
+    let snapshot = security_manager.map(|manager| manager.state_snapshot(rbac_registry));
+    let rbac_only_service_accounts = if security_manager.is_none() {
+        rbac_registry.map(|registry| {
+            ServiceAccountRotationSummary::from(
+                registry
+                    .service_account_status_summary()
+                    .expect("RBAC status locks should not be poisoned"),
+            )
+        })
+    } else {
+        None
+    };
+    security_status_snapshot_json(
+        security_manager.is_some() || rbac_registry.is_some(),
+        snapshot.as_ref(),
+        rbac_only_service_accounts,
+    )
+}
+
+fn security_status_snapshot_json(
+    enabled: bool,
+    snapshot: Option<&SecurityStateSnapshot>,
+    rbac_only_service_accounts: Option<ServiceAccountRotationSummary>,
+) -> JsonValue {
+    let targets = snapshot
+        .map(|snapshot| snapshot.targets.as_slice())
         .unwrap_or_default();
-    let audit_entries = security_manager
-        .map(|manager| manager.state_snapshot(rbac_registry).audit_entries)
+    let audit_entries = snapshot
+        .map(|snapshot| snapshot.audit_entries.as_slice())
         .unwrap_or_default();
+    let service_accounts = snapshot
+        .and_then(|snapshot| snapshot.service_accounts)
+        .or(rbac_only_service_accounts);
     json!({
-        "enabled": security_manager.is_some() || rbac_registry.is_some(),
+        "enabled": enabled,
         "targets": targets,
         "auditEntries": audit_entries,
-        "serviceAccounts": rbac_service_account_summary(rbac_registry),
+        "serviceAccounts": service_accounts,
     })
-}
-
-fn rbac_service_account_summary(
-    rbac_registry: Option<&RbacRegistry>,
-) -> Option<crate::security::ServiceAccountRotationSummary> {
-    let registry = rbac_registry?;
-    let state = registry.state_snapshot();
-    let disabled = state
-        .service_accounts
-        .iter()
-        .filter(|account| account.disabled)
-        .count();
-    let last_rotated_unix_ms = state
-        .service_accounts
-        .iter()
-        .map(|account| account.last_rotated_unix_ms)
-        .max()
-        .unwrap_or(0);
-    Some(crate::security::ServiceAccountRotationSummary {
-        total: state.service_accounts.len(),
-        disabled,
-        last_rotated_unix_ms,
-        audit_entries: state.audit_entries,
-    })
-}
-
-fn cluster_control_liveness_snapshot(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> ControlLivenessSnapshot {
-    cluster_context
-        .and_then(|context| context.control_consensus.as_ref())
-        .map(|consensus| consensus.liveness_snapshot())
-        .unwrap_or_else(|| {
-            let local_node_id = cluster_context
-                .map(|context| context.runtime.membership.local_node_id.clone())
-                .unwrap_or_else(|| "standalone".to_string());
-            ControlLivenessSnapshot::empty(local_node_id)
-        })
-}
-
-fn cluster_control_persistence_status(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> ControlPersistenceStatus {
-    cluster_context
-        .and_then(|context| context.control_consensus.as_ref())
-        .map(|consensus| consensus.persistence_status())
-        .unwrap_or(ControlPersistenceStatus {
-            fenced: false,
-            pending_checkpoint: None,
-            cleanup_debt: false,
-            detail: None,
-        })
 }
 
 fn cluster_control_persistence_status_json(status: &ControlPersistenceStatus) -> JsonValue {
@@ -2150,30 +2267,27 @@ fn cluster_control_persistence_status_json(status: &ControlPersistenceStatus) ->
     })
 }
 
-fn cluster_handoff_snapshot(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> ClusterHandoffSnapshot {
-    current_control_state(cluster_context)
-        .map(|state| state.handoff_snapshot())
-        .unwrap_or_else(ClusterHandoffSnapshot::empty)
-}
-
-fn cluster_digest_snapshot(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> DigestExchangeSnapshot {
-    cluster_context
-        .and_then(|context| context.digest_runtime.as_ref())
-        .map(|runtime| runtime.snapshot())
-        .unwrap_or_else(DigestExchangeSnapshot::empty)
-}
-
-fn cluster_rebalance_snapshot(
-    cluster_context: Option<&ClusterRequestContext>,
-) -> RebalanceSchedulerSnapshot {
-    cluster_context
-        .and_then(|context| context.digest_runtime.as_ref())
-        .map(|runtime| runtime.rebalance_snapshot())
-        .unwrap_or_else(RebalanceSchedulerSnapshot::empty)
+fn top_write_routing_shards(
+    shards: &[WriteRoutingShardMetricsExpositionSnapshot],
+) -> [Option<&WriteRoutingShardMetricsExpositionSnapshot>; 8] {
+    let mut top: [Option<&WriteRoutingShardMetricsExpositionSnapshot>; 8] = [None; 8];
+    for candidate in shards {
+        let insertion_index = top.iter().position(|current| {
+            current.is_none_or(|current| {
+                candidate.rows_total > current.rows_total
+                    || (candidate.rows_total == current.rows_total
+                        && candidate.shard < current.shard)
+            })
+        });
+        let Some(insertion_index) = insertion_index else {
+            continue;
+        };
+        for index in ((insertion_index + 1)..top.len()).rev() {
+            top[index] = top[index - 1];
+        }
+        top[insertion_index] = Some(candidate);
+    }
+    top
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2184,6 +2298,40 @@ fn local_disk_status_json(snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) -> 
     let categories = snapshot
         .categories
         .iter()
+        .map(|usage| {
+            json!({
+                "category": serde_json::to_value(usage.category)
+                    .unwrap_or_else(|_| JsonValue::String("unknown".to_string())),
+                "bytes": usage.bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "limits": {
+            "maxBytes": snapshot.limits.max_bytes,
+            "filesystemFreeHeadroomBytes": snapshot.limits.filesystem_free_headroom_bytes,
+            "maintenanceTempReserveBytes": snapshot.limits.maintenance_temp_reserve_bytes,
+        },
+        "accountedBytes": snapshot.accounted_bytes,
+        "reservedBytes": snapshot.reserved_bytes,
+        "maintenanceReservedBytes": snapshot.maintenance_reserved_bytes,
+        "unknownBytes": snapshot.unknown_bytes,
+        "filesystemAvailableBytes": snapshot.filesystem_available_bytes,
+        "overLimit": snapshot.over_limit,
+        "activeReservations": snapshot.active_reservations,
+        "rejectionsTotal": snapshot.rejections_total,
+        "reconciliationsTotal": snapshot.reconciliations_total,
+        "reservationOverrunsTotal": snapshot.reservation_overruns_total,
+        "categories": categories,
+    })
+}
+
+fn local_disk_metrics_status_json(snapshot: Option<&tsink::LocalDiskMetricsSnapshot>) -> JsonValue {
+    let Some(snapshot) = snapshot else {
+        return JsonValue::Null;
+    };
+    let categories = snapshot
+        .categories()
         .map(|usage| {
             json!({
                 "category": serde_json::to_value(usage.category)
@@ -2417,6 +2565,46 @@ fn tsdb_status_storage_error_response(error: tsink::TsinkError) -> HttpResponse 
     }
 }
 
+fn tsdb_status_observability_error_response(error: tsink::TsinkError) -> HttpResponse {
+    match error {
+        tsink::TsinkError::QueryBudget(error) => tsdb_status_query_budget_error_response(&error),
+        tsink::TsinkError::UnsupportedOperation { .. } => tsdb_status_error_response(
+            500,
+            "execution",
+            "status_observability_accounting_unavailable",
+            "TSDB status requires query-accounted storage observability",
+            None,
+        ),
+        _ => tsdb_status_error_response(
+            500,
+            "execution",
+            "status_observability_snapshot_failed",
+            "TSDB status storage observability failed",
+            None,
+        ),
+    }
+}
+
+fn tsdb_status_external_disk_error_response(error: tsink::TsinkError) -> HttpResponse {
+    match error {
+        tsink::TsinkError::QueryBudget(error) => tsdb_status_query_budget_error_response(&error),
+        _ => tsdb_status_error_response(
+            500,
+            "execution",
+            "status_local_disk_snapshot_failed",
+            "TSDB status local-disk snapshot failed",
+            None,
+        ),
+    }
+}
+
+#[derive(Debug)]
+enum TsdbStatusWorkerError {
+    MetricEnumeration(tsink::TsinkError),
+    MetricAccounting(MetricEnumerationAccountingError),
+    Observability(tsink::TsinkError),
+}
+
 fn tsdb_status_saturating_u64_from_usize(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -2560,15 +2748,39 @@ struct PreparedTsdbStatusResponse {
     reservation: tsink::QueryMemoryReservation,
 }
 
+#[derive(Debug)]
+struct AccountedHttpResponse {
+    // Field order is intentional: destroy the response allocation before releasing its guard.
+    response: HttpResponse,
+    reservation: tsink::QueryMemoryReservation,
+}
+
+fn account_completed_http_response(
+    response: HttpResponse,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedHttpResponse, tsink::QueryBudgetError> {
+    let retained_bytes = modeled_tsdb_status_response_retained_bytes(&response);
+    match execution.reserve_memory(retained_bytes) {
+        Ok(reservation) => Ok(AccountedHttpResponse {
+            response,
+            reservation,
+        }),
+        Err(error) => {
+            drop(response);
+            Err(error)
+        }
+    }
+}
+
 fn serialize_tsdb_status_response(
     payload: JsonValue,
     execution: &tsink::QueryExecution,
+    charge_http_returned_bytes: bool,
 ) -> Result<PreparedTsdbStatusResponse, HttpResponse> {
     let payload_retained_bytes = modeled_tsdb_status_json_retained_bytes(&payload);
-    // The status tree is assembled by legacy snapshot/projection helpers before this point. Its
-    // retained size is observable here, so keep it charged while the separately pre-admitted body
-    // is materialized. The source clones and tree-construction peak remain an explicit boundary in
-    // the resource-limit documentation.
+    // Storage-owned source clones retain their own execution reservation through projection. The
+    // completed status tree is observable here, so keep it charged while the separately
+    // pre-admitted body is materialized.
     let reservation = execution
         .reserve_memory(payload_retained_bytes)
         .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
@@ -2612,9 +2824,11 @@ fn serialize_tsdb_status_response(
             None,
         ));
     }
-    execution
-        .charge_returned_bytes(tsdb_status_saturating_u64_from_usize(body_len))
-        .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    if charge_http_returned_bytes {
+        execution
+            .charge_returned_bytes(tsdb_status_saturating_u64_from_usize(body_len))
+            .map_err(|error| tsdb_status_query_budget_error_response(&error))?;
+    }
 
     accounted_payload
         .reservation
@@ -2695,44 +2909,83 @@ fn serialize_tsdb_status_response(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricEnumerationAccountingError {
+    MissingResultReservation,
+    UndersizedResultReservation,
+}
+
+impl MetricEnumerationAccountingError {
+    fn status_message(self) -> &'static str {
+        match self {
+            Self::MissingResultReservation => {
+                "TSDB status metric enumeration omitted its result reservation"
+            }
+            Self::UndersizedResultReservation => {
+                "TSDB status metric enumeration returned an undersized result reservation"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MetricEnumerationAccountingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResultReservation => {
+                formatter.write_str("metric enumeration omitted its result reservation")
+            }
+            Self::UndersizedResultReservation => {
+                formatter.write_str("metric enumeration returned an undersized result reservation")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
-struct GuardedTsdbStatusMetrics {
+struct GuardedMetricEnumeration {
     series: Vec<MetricSeries>,
     reservation: tsink::QueryMemoryReservation,
 }
 
-fn validate_tsdb_status_metric_result(
+fn validate_complete_metric_enumeration_result(
     mut result: tsink::SelectSeriesExecutionResult,
-) -> Result<GuardedTsdbStatusMetrics, HttpResponse> {
-    let reservation = result.take_memory_reservation().ok_or_else(|| {
-        tsdb_status_error_response(
-            500,
-            "execution",
-            "status_query_accounting_invalid",
-            "TSDB status metric enumeration omitted its result reservation",
-            None,
-        )
-    })?;
+) -> Result<GuardedMetricEnumeration, MetricEnumerationAccountingError> {
+    let reservation = result
+        .take_memory_reservation()
+        .ok_or(MetricEnumerationAccountingError::MissingResultReservation)?;
     let required_metric_bytes =
         crate::cluster::query::modeled_metric_series_vec_retained_bytes(&result.series);
     if reservation.bytes() < required_metric_bytes {
-        let response = tsdb_status_error_response(
-            500,
-            "execution",
-            "status_query_accounting_invalid",
-            "TSDB status metric enumeration returned an undersized result reservation",
-            None,
-        );
         // The backend's series allocation must disappear before its undersized accounting guard.
         // This avoids briefly making live result memory appear released on the rejection path.
         drop(result);
         drop(reservation);
-        return Err(response);
+        return Err(MetricEnumerationAccountingError::UndersizedResultReservation);
     }
-    Ok(GuardedTsdbStatusMetrics {
+    Ok(GuardedMetricEnumeration {
         series: std::mem::take(&mut result.series),
         reservation,
     })
+}
+
+#[cfg(test)]
+fn validate_tsdb_status_metric_result(
+    result: tsink::SelectSeriesExecutionResult,
+) -> Result<GuardedMetricEnumeration, HttpResponse> {
+    validate_complete_metric_enumeration_result(result)
+        .map_err(tsdb_status_metric_accounting_error_response)
+}
+
+fn tsdb_status_metric_accounting_error_response(
+    error: MetricEnumerationAccountingError,
+) -> HttpResponse {
+    tsdb_status_error_response(
+        500,
+        "execution",
+        "status_query_accounting_invalid",
+        error.status_message(),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2750,6 +3003,93 @@ async fn handle_tsdb_status(
     managed_control_plane: Option<&ManagedControlPlane>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
     offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
+) -> HttpResponse {
+    handle_tsdb_status_impl(
+        storage,
+        metadata_store,
+        exemplar_store,
+        request,
+        cluster_context,
+        edge_sync_context,
+        tenant_registry,
+        rbac_registry,
+        security_manager,
+        usage_accounting,
+        managed_control_plane,
+        local_disk_budget,
+        offline_restore_disk_budget,
+        None,
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_tsdb_status_with_execution(
+    storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
+    exemplar_store: &Arc<ExemplarStore>,
+    request: &HttpRequest,
+    cluster_context: Option<&ClusterRequestContext>,
+    edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
+    tenant_registry: Option<&tenant::TenantRegistry>,
+    rbac_registry: Option<&RbacRegistry>,
+    security_manager: Option<&SecurityManager>,
+    usage_accounting: Option<&UsageAccounting>,
+    managed_control_plane: Option<&ManagedControlPlane>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedHttpResponse, HttpResponse> {
+    let mut response_reservation = None;
+    let response = handle_tsdb_status_impl(
+        storage,
+        metadata_store,
+        exemplar_store,
+        request,
+        cluster_context,
+        edge_sync_context,
+        tenant_registry,
+        rbac_registry,
+        security_manager,
+        usage_accounting,
+        managed_control_plane,
+        local_disk_budget,
+        offline_restore_disk_budget,
+        Some(execution),
+        Some(&mut response_reservation),
+        false,
+    )
+    .await;
+    match response_reservation {
+        Some(reservation) => Ok(AccountedHttpResponse {
+            response,
+            reservation,
+        }),
+        None => account_completed_http_response(response, execution)
+            .map_err(|error| tsdb_status_query_budget_error_response(&error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_tsdb_status_impl(
+    storage: &Arc<dyn Storage>,
+    metadata_store: &Arc<MetricMetadataStore>,
+    exemplar_store: &Arc<ExemplarStore>,
+    request: &HttpRequest,
+    cluster_context: Option<&ClusterRequestContext>,
+    edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
+    tenant_registry: Option<&tenant::TenantRegistry>,
+    rbac_registry: Option<&RbacRegistry>,
+    security_manager: Option<&SecurityManager>,
+    usage_accounting: Option<&UsageAccounting>,
+    managed_control_plane: Option<&ManagedControlPlane>,
+    local_disk_budget: Option<&tsink::LocalDiskBudget>,
+    offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
+    shared_execution: Option<&tsink::QueryExecution>,
+    retained_response_reservation: Option<&mut Option<tsink::QueryMemoryReservation>>,
+    charge_http_returned_bytes: bool,
 ) -> HttpResponse {
     let tenant_id = match tenant_id_for_text_request(request) {
         Ok(tenant_id) => tenant_id,
@@ -2777,8 +3117,6 @@ async fn handle_tsdb_status(
     let memory_used = storage.memory_used();
     let memory_budget = storage.memory_budget();
     let effective_storage_limits = storage.effective_storage_limits();
-    let local_disk = local_disk_budget.map(tsink::LocalDiskBudget::snapshot);
-    let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
     let server_disk_limits = local_disk_budget.map(tsink::LocalDiskBudget::limits);
     if storage.list_metrics_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
         return tsdb_status_error_response(
@@ -2789,47 +3127,82 @@ async fn handle_tsdb_status(
             None,
         );
     }
-    let cancellation = tsink::QueryCancellationToken::new();
-    let cancellation_guard = TsdbStatusCancellationGuard {
-        token: cancellation.clone(),
+    let (execution, cancellation_guard) = match shared_execution {
+        Some(execution) => (execution.clone(), None),
+        None => {
+            let cancellation = tsink::QueryCancellationToken::new();
+            let cancellation_guard = TsdbStatusCancellationGuard {
+                token: cancellation.clone(),
+            };
+            let execution = match storage
+                .begin_query_execution(tsink::QueryWorkLimits::default(), cancellation)
+            {
+                Ok(Some(execution)) => execution,
+                Ok(None) => {
+                    return tsdb_status_error_response(
+                        500,
+                        "execution",
+                        "status_query_accounting_unavailable",
+                        "TSDB status requires query execution admission",
+                        None,
+                    )
+                }
+                Err(tsink::TsinkError::QueryBudget(error)) => {
+                    return tsdb_status_query_budget_error_response(&error)
+                }
+                Err(_) => {
+                    return tsdb_status_error_response(
+                        500,
+                        "execution",
+                        "status_query_admission_failed",
+                        "TSDB status query admission failed",
+                        None,
+                    )
+                }
+            };
+            (execution, Some(cancellation_guard))
+        }
     };
-    let execution =
-        match storage.begin_query_execution(tsink::QueryWorkLimits::default(), cancellation) {
-            Ok(Some(execution)) => execution,
-            Ok(None) => {
-                return tsdb_status_error_response(
-                    500,
-                    "execution",
-                    "status_query_accounting_unavailable",
-                    "TSDB status requires query execution admission",
-                    None,
-                )
-            }
-            Err(tsink::TsinkError::QueryBudget(error)) => {
-                return tsdb_status_query_budget_error_response(&error)
-            }
-            Err(_) => {
-                return tsdb_status_error_response(
-                    500,
-                    "execution",
-                    "status_query_admission_failed",
-                    "TSDB status query admission failed",
-                    None,
-                )
-            }
-        };
+    let local_disk = match local_disk_budget
+        .map(|budget| budget.metrics_snapshot_with_execution(&execution))
+        .transpose()
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return tsdb_status_external_disk_error_response(error),
+    };
+    let offline_restore_disk = match offline_restore_disk_budget
+        .map(|budget| budget.metrics_snapshot_with_execution(&execution))
+        .transpose()
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return tsdb_status_external_disk_error_response(error),
+    };
     let worker_storage = Arc::clone(&storage);
     let worker_execution = execution.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let metrics = worker_storage.list_metrics_with_execution_result(&worker_execution)?;
-        let observability = worker_storage.observability_snapshot();
-        Ok::<_, tsink::TsinkError>((metrics, observability))
+        let metrics = worker_storage
+            .list_metrics_with_execution_result(&worker_execution)
+            .map_err(TsdbStatusWorkerError::MetricEnumeration)?;
+        let guarded_metrics = validate_complete_metric_enumeration_result(metrics)
+            .map_err(TsdbStatusWorkerError::MetricAccounting)?;
+        let observability = worker_storage
+            .status_observability_snapshot_with_execution(&worker_execution)
+            .map_err(TsdbStatusWorkerError::Observability)?;
+        Ok::<_, TsdbStatusWorkerError>((guarded_metrics, observability))
     })
     .await;
 
-    let (metrics_result, observability) = match result {
+    let (guarded_metrics, observability) = match result {
         Ok(Ok(values)) => values,
-        Ok(Err(error)) => return tsdb_status_storage_error_response(error),
+        Ok(Err(TsdbStatusWorkerError::MetricEnumeration(error))) => {
+            return tsdb_status_storage_error_response(error)
+        }
+        Ok(Err(TsdbStatusWorkerError::MetricAccounting(error))) => {
+            return tsdb_status_metric_accounting_error_response(error)
+        }
+        Ok(Err(TsdbStatusWorkerError::Observability(error))) => {
+            return tsdb_status_observability_error_response(error)
+        }
         Err(_) => {
             return tsdb_status_error_response(
                 500,
@@ -2840,11 +3213,7 @@ async fn handle_tsdb_status(
             )
         }
     };
-    let guarded_metrics = match validate_tsdb_status_metric_result(metrics_result) {
-        Ok(guarded) => guarded,
-        Err(response) => return response,
-    };
-    let GuardedTsdbStatusMetrics {
+    let GuardedMetricEnumeration {
         series: metrics_list,
         reservation: metrics_reservation,
     } = guarded_metrics;
@@ -2854,52 +3223,188 @@ async fn handle_tsdb_status(
     };
     let payload = {
         let metadata_store_status = metric_metadata_store_status_json(metadata_store);
-        let local_disk = local_disk.or_else(|| observability.local_disk.clone());
+        let local_disk = match local_disk.as_ref() {
+            Some(snapshot) => local_disk_metrics_status_json(Some(snapshot)),
+            None => local_disk_status_json(observability.local_disk.as_ref()),
+        };
+        let offline_restore_disk = local_disk_metrics_status_json(offline_restore_disk.as_ref());
         let cluster_write_metrics = write_routing_metrics_snapshot();
-        let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
+        let cluster_write_labeled_metrics_accounted =
+            match write_routing_labeled_metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return tsdb_status_query_budget_error_response(&error),
+            };
+        let cluster_write_labeled_metrics = cluster_write_labeled_metrics_accounted.snapshot();
         let cluster_fanout_metrics = read_fanout_metrics_snapshot();
-        let cluster_fanout_labeled_metrics = read_fanout_labeled_metrics_snapshot();
+        let cluster_fanout_labeled_metrics_accounted =
+            match read_fanout_labeled_metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return tsdb_status_query_budget_error_response(&error),
+            };
+        let cluster_fanout_labeled_metrics = cluster_fanout_labeled_metrics_accounted.snapshot();
         let cluster_read_planner_metrics = read_planner_metrics_snapshot();
-        let cluster_read_planner_labeled_metrics = read_planner_labeled_metrics_snapshot();
-        let mut cluster_read_planner_last_plans = read_planner_last_plans_snapshot();
+        let cluster_read_planner_status =
+            match read_planner_status_exposition_snapshot_with_execution(&execution) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return tsdb_status_query_budget_error_response(&error),
+            };
         let cluster_dedupe_metrics = dedupe_metrics_snapshot();
-        let cluster_outbox_metrics = outbox_metrics_snapshot();
         let read_admission_metrics = admission::read_admission_metrics_snapshot();
         let write_admission_metrics = admission::write_admission_metrics_snapshot();
         let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
-        let cluster_outbox_peers = cluster_context
+        let cluster_outbox_status = match cluster_context
             .and_then(|context| context.outbox.as_ref())
-            .map(|outbox| outbox.peer_backlog_snapshot())
-            .unwrap_or_default();
-        let cluster_outbox_stalled_peers = cluster_context
-            .and_then(|context| context.outbox.as_ref())
-            .map(|outbox| outbox.stalled_peer_snapshot())
-            .unwrap_or_default();
-        let cluster_outbox_config = cluster_context
-            .and_then(|context| context.outbox.as_ref())
-            .map(|outbox| outbox.config())
-            .unwrap_or_default();
-        let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
-        let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
-        let cluster_handoff = cluster_handoff_snapshot(cluster_context);
-        let cluster_digest = cluster_digest_snapshot(cluster_context);
-        let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
-        let hotspot_control_state = cluster_context
-            .and_then(|context| context.control_consensus.as_ref())
-            .map(|consensus| consensus.current_state());
-        let cluster_hotspot = match hotspot::build_cluster_hotspot_snapshot_with_execution(
-            &metrics_list,
-            cluster_context.map(|context| &context.runtime.ring),
-            hotspot_control_state.as_ref(),
-            Some(&tenant_id),
-            &execution,
-        ) {
+            .map(|outbox| outbox.status_snapshot_with_execution(&execution))
+            .transpose()
+        {
             Ok(snapshot) => snapshot,
             Err(error) => return tsdb_status_query_budget_error_response(&error),
         };
-        let tenant_runtime_status_json = tenant_registry
-            .and_then(|registry| registry.status_snapshot_for(&tenant_id).ok())
-            .map(|snapshot| tenant_runtime_status_json(&snapshot))
+        let cluster_outbox_metrics_fallback = cluster_outbox_status
+            .is_none()
+            .then(outbox_metrics_snapshot);
+        let cluster_outbox_metrics = cluster_outbox_status
+            .as_deref()
+            .map(|snapshot| &snapshot.metrics)
+            .or(cluster_outbox_metrics_fallback.as_ref())
+            .expect("outbox status always has an accounted or scalar fallback");
+        let cluster_outbox_config = cluster_outbox_status
+            .as_deref()
+            .map(|snapshot| snapshot.config)
+            .unwrap_or_default();
+        let cluster_outbox_peers = cluster_outbox_status
+            .as_deref()
+            .map(|snapshot| snapshot.peers.as_slice())
+            .unwrap_or_default();
+        let cluster_outbox_stalled_peers = cluster_outbox_status
+            .as_deref()
+            .map(|snapshot| snapshot.stalled_peers.as_slice())
+            .unwrap_or_default();
+        let digest_runtime = cluster_context.and_then(|context| context.digest_runtime.as_ref());
+        let cluster_digest_accounted = match digest_runtime
+            .map(|runtime| runtime.status_snapshot_with_execution(&execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let cluster_digest_fallback = DigestExchangeSnapshot::empty();
+        let cluster_digest = cluster_digest_accounted
+            .as_deref()
+            .unwrap_or(&cluster_digest_fallback);
+        let cluster_control_status = match cluster_context
+            .and_then(|context| context.control_consensus.as_ref())
+            .map(|consensus| consensus.status_snapshot_with_execution(&execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let rebalance_runtime = digest_runtime;
+        let rebalance_control_projection = match rebalance_runtime
+            .map(|runtime| runtime.rebalance_control_projection_with_execution(&execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let (cluster_hotspot_accounted, rebalance_hotspot_accounted) = if rebalance_runtime
+            .is_some()
+        {
+            let snapshot = match hotspot::build_rebalance_hotspot_snapshot_with_control_metrics_tenant_execution(
+                    &metrics_list,
+                    cluster_context.map(|context| &context.runtime.ring),
+                    cluster_control_status
+                        .as_deref()
+                        .map(|snapshot| &snapshot.hotspot),
+                    Some(&tenant_id),
+                    &execution,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return tsdb_status_query_budget_error_response(&error),
+                };
+            (None, Some(snapshot))
+        } else {
+            let snapshot =
+                match hotspot::build_cluster_hotspot_snapshot_with_control_metrics_execution(
+                    &metrics_list,
+                    cluster_context.map(|context| &context.runtime.ring),
+                    cluster_control_status
+                        .as_deref()
+                        .map(|snapshot| &snapshot.hotspot),
+                    Some(&tenant_id),
+                    &execution,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return tsdb_status_query_budget_error_response(&error),
+                };
+            (Some(snapshot), None)
+        };
+        let cluster_rebalance_accounted = match (
+            rebalance_runtime,
+            rebalance_control_projection.as_deref(),
+            rebalance_hotspot_accounted.as_ref(),
+        ) {
+            (Some(runtime), Some(control_projection), Some(hotspot_snapshot)) => {
+                match runtime.rebalance_status_snapshot_from_accounted_hotspot_with_execution(
+                    control_projection,
+                    hotspot_snapshot,
+                    &execution,
+                ) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => return tsdb_status_query_budget_error_response(&error),
+                }
+            }
+            _ => None,
+        };
+        let cluster_control_liveness = cluster_control_status
+            .as_deref()
+            .map(|snapshot| &snapshot.liveness);
+        let cluster_control_persistence_fallback = ControlPersistenceStatus {
+            fenced: false,
+            pending_checkpoint: None,
+            cleanup_debt: false,
+            detail: None,
+        };
+        let cluster_control_persistence = cluster_control_status
+            .as_deref()
+            .map(|snapshot| &snapshot.persistence)
+            .unwrap_or(&cluster_control_persistence_fallback);
+        let cluster_handoff_fallback = ClusterHandoffSnapshot::empty();
+        let cluster_handoff = cluster_control_status
+            .as_deref()
+            .map(|snapshot| &snapshot.handoff)
+            .unwrap_or(&cluster_handoff_fallback);
+        let cluster_rebalance_fallback = RebalanceSchedulerSnapshot::empty();
+        let cluster_rebalance = cluster_rebalance_accounted
+            .as_deref()
+            .unwrap_or(&cluster_rebalance_fallback);
+        let cluster_hotspot = rebalance_hotspot_accounted
+            .as_ref()
+            .map(|snapshot| &snapshot.snapshot)
+            .or(cluster_hotspot_accounted.as_deref())
+            .expect("exactly one accounted hotspot producer must run");
+        drop(metrics_list);
+        drop(metrics_reservation);
+        let cluster_control_local_node_id = cluster_control_liveness
+            .map(|snapshot| snapshot.local_node_id.as_str())
+            .or_else(|| {
+                cluster_context.map(|context| context.runtime.membership.local_node_id.as_str())
+            })
+            .unwrap_or("standalone");
+        let tenant_runtime_status_accounted = match tenant_registry
+            .map(|registry| registry.status_snapshot_for_with_execution(&tenant_id, &execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(tenant::TenantStatusSnapshotError::TenantRequest(_)) => None,
+            Err(tenant::TenantStatusSnapshotError::QueryBudget(error)) => {
+                return tsdb_status_query_budget_error_response(&error)
+            }
+        };
+        let tenant_runtime_status_json = tenant_runtime_status_accounted
+            .as_deref()
+            .map(tenant_runtime_status_json)
             .unwrap_or(JsonValue::Null);
         let cluster_read_guardrails =
             cluster_context.map(|context| context.read_fanout.resource_guardrails());
@@ -2942,22 +3447,85 @@ async fn handle_tsdb_status(
         let payload_status = payload_status_snapshot(cluster_context);
         let otlp_status = otlp_metrics_status_snapshot();
         let legacy_ingest_status = legacy_ingest::status_snapshot();
-        let edge_sync_source_status = edge_sync_context
-            .map(|context| context.source_status_snapshot())
-            .unwrap_or_default();
-        let edge_sync_accept_status = edge_sync_context
-            .map(|context| context.accept_status_snapshot())
-            .unwrap_or_default();
-        let cluster_audit_health = cluster_context
+        let edge_sync_status_accounted = match edge_sync::edge_sync_status_snapshot_with_execution(
+            edge_sync_context,
+            &execution,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let edge_sync_source_status = &edge_sync_status_accounted.source;
+        let edge_sync_accept_status = &edge_sync_status_accounted.accept;
+        let cluster_audit_health_accounted = match cluster_context
             .and_then(|context| context.audit_log.as_ref())
-            .map(|audit_log| audit_log.health_snapshot())
-            .unwrap_or_default();
-        let usage_journal = usage_accounting
-            .map(UsageAccounting::ledger_status)
-            .unwrap_or_default();
-        let usage_current_tenant = usage_accounting
-            .map(|accounting| accounting.tenant_summary(&tenant_id))
-            .map(|summary| {
+            .map(|audit_log| audit_log.health_snapshot_with_execution(&execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let cluster_audit_health_fallback = ClusterAuditHealthSnapshot::default();
+        let cluster_audit_health = cluster_audit_health_accounted
+            .as_deref()
+            .unwrap_or(&cluster_audit_health_fallback);
+        let security_state_accounted = match security_manager
+            .map(|manager| manager.state_snapshot_with_execution(rbac_registry, &execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(SecurityStateSnapshotError::QueryBudget(error)) => {
+                return tsdb_status_query_budget_error_response(&error)
+            }
+            Err(_) => {
+                return tsdb_status_error_response(
+                    500,
+                    "security",
+                    "status_security_snapshot_failed",
+                    "TSDB status security snapshot failed",
+                    None,
+                )
+            }
+        };
+        let rbac_only_service_accounts = if security_manager.is_none() {
+            match rbac_registry
+                .map(RbacRegistry::service_account_status_summary)
+                .transpose()
+            {
+                Ok(summary) => summary.map(ServiceAccountRotationSummary::from),
+                Err(_) => {
+                    return tsdb_status_error_response(
+                        500,
+                        "security",
+                        "status_security_snapshot_failed",
+                        "TSDB status security snapshot failed",
+                        None,
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let security_status = security_status_snapshot_json(
+            security_manager.is_some() || rbac_registry.is_some(),
+            security_state_accounted.as_deref(),
+            rbac_only_service_accounts,
+        );
+        let usage_status_accounted = match usage_accounting
+            .map(|accounting| accounting.status_snapshot_for_with_execution(&tenant_id, &execution))
+            .transpose()
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let usage_journal_fallback = UsageLedgerStatus::default();
+        let usage_journal = usage_status_accounted
+            .as_deref()
+            .map(|snapshot| &snapshot.journal)
+            .unwrap_or(&usage_journal_fallback);
+        let usage_current_tenant = usage_status_accounted
+            .as_deref()
+            .map(|snapshot| {
+                let summary = &snapshot.current_tenant;
                 json!({
                     "tenantId": summary.tenant_id,
                     "ingest": summary.ingest,
@@ -2968,44 +3536,34 @@ async fn handle_tsdb_status(
                 })
             })
             .unwrap_or(JsonValue::Null);
-        let usage_reconciliation = usage_accounting
-            .map(|accounting| {
-                let report =
-                    accounting.report(Some(&tenant_id), None, None, UsageBucketWidth::None);
-                usage_reconciliation_json(&report, &observability)
+        let usage_reconciliation = usage_status_accounted
+            .as_deref()
+            .map(|snapshot| {
+                usage_status_reconciliation_json(&snapshot.reconciliation, &observability)
             })
             .unwrap_or(JsonValue::Null);
-        let managed_control_plane_status = managed_control_plane
-            .map(ManagedControlPlane::status_snapshot)
-            .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(JsonValue::Null))
-            .unwrap_or(JsonValue::Null);
-        let managed_control_plane_deployments = managed_control_plane
-            .map(ManagedControlPlane::deployment_summaries)
-            .map(|summaries| serde_json::to_value(summaries).unwrap_or(JsonValue::Null))
-            .unwrap_or(JsonValue::Null);
-        let managed_control_plane_current_tenant = managed_control_plane
-            .and_then(|control_plane| control_plane.tenant_snapshot(&tenant_id))
-            .map(|tenant| serde_json::to_value(tenant).unwrap_or(JsonValue::Null))
-            .unwrap_or(JsonValue::Null);
+        let managed_control_plane_status_accounted = match managed_control_plane
+            .map(|control_plane| {
+                control_plane.status_projection_for_with_execution(&tenant_id, &execution)
+            })
+            .transpose()
+        {
+            Ok(projection) => projection,
+            Err(error) => return tsdb_status_query_budget_error_response(&error),
+        };
+        let managed_control_plane_status = managed_control_plane_status_accounted
+            .as_deref()
+            .map(|projection| &projection.status);
+        let managed_control_plane_deployments = managed_control_plane_status_accounted
+            .as_deref()
+            .map(|projection| projection.deployments.as_slice());
+        let managed_control_plane_current_tenant = managed_control_plane_status_accounted
+            .as_deref()
+            .and_then(|projection| projection.current_tenant.as_ref());
 
-        let mut hot_shards = cluster_write_labeled_metrics.shards.clone();
-        hot_shards.sort_by(|left, right| {
-            right
-                .rows_total
-                .cmp(&left.rows_total)
-                .then_with(|| left.shard.cmp(&right.shard))
-        });
-        hot_shards.truncate(8);
-
-        let mut write_peers = cluster_write_labeled_metrics.peers.clone();
-        write_peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        let mut fanout_peers = cluster_fanout_labeled_metrics.peers.clone();
-        fanout_peers.sort_by(|left, right| {
-            left.node_id
-                .cmp(&right.node_id)
-                .then(left.operation.cmp(&right.operation))
-        });
-        cluster_read_planner_last_plans.sort_by(|left, right| left.operation.cmp(&right.operation));
+        let hot_shards = top_write_routing_shards(&cluster_write_labeled_metrics.shards);
+        let write_peers = &cluster_write_labeled_metrics.peers;
+        let fanout_peers = &cluster_fanout_labeled_metrics.peers;
 
         json!({
             "status": "success",
@@ -3042,17 +3600,17 @@ async fn handle_tsdb_status(
                     "rollupIntervalNanos": effective_storage_limits.rollup_interval_nanos,
                     "maxActivePartitionHeadsPerSeries": effective_storage_limits.max_active_partition_heads_per_series
                 },
-                "resourceConfiguration": observability.resource_configuration,
+                "resourceConfiguration": &observability.resource_configuration,
                 "metricMetadataStore": metadata_store_status,
-                "localDisk": local_disk_status_json(local_disk.as_ref()),
-                "offlineRestoreDisk": local_disk_status_json(offline_restore_disk.as_ref()),
+                "localDisk": local_disk,
+                "offlineRestoreDisk": offline_restore_disk,
                 "memory": {
                     "accountedBytes": observability.memory.accounted_bytes,
                     "estimatedAccountedBytes": observability.memory.estimated_accounted_bytes,
                     "budgetedBytes": observability.memory.budgeted_bytes,
                     "excludedBytes": observability.memory.excluded_bytes,
                     "excludedBytesKnown": observability.memory.excluded_bytes_known,
-                    "excludedCategories": observability.memory.excluded_categories,
+                    "excludedCategories": &observability.memory.excluded_categories,
                     "activeAndSealedBytes": observability.memory.active_and_sealed_bytes,
                     "registryBytes": observability.memory.registry_bytes,
                     "metadataCacheBytes": observability.memory.metadata_cache_bytes,
@@ -3079,7 +3637,7 @@ async fn handle_tsdb_status(
                 },
                 "wal": {
                     "enabled": observability.wal.enabled,
-                    "syncMode": observability.wal.sync_mode.clone(),
+                    "syncMode": &observability.wal.sync_mode,
                     "acknowledgedWritesDurable": observability.wal.acknowledged_writes_durable,
                     "sizeBytes": observability.wal.size_bytes,
                     "segmentCount": observability.wal.segment_count,
@@ -3198,7 +3756,7 @@ async fn handle_tsdb_status(
                     "bucketsMaterializedTotal": observability.rollups.buckets_materialized_total,
                     "pointsMaterializedTotal": observability.rollups.points_materialized_total,
                     "lastRunDurationNanos": observability.rollups.last_run_duration_nanos,
-                    "policies": observability.rollups.policies
+                    "policies": &observability.rollups.policies
                 },
                 "remoteStorage": {
                     "enabled": observability.remote.enabled,
@@ -3214,7 +3772,7 @@ async fn handle_tsdb_status(
                     "consecutiveRefreshFailures": observability.remote.consecutive_refresh_failures,
                     "nextRefreshRetryUnixMs": observability.remote.next_refresh_retry_unix_ms,
                     "backoffActive": observability.remote.backoff_active,
-                    "lastRefreshError": observability.remote.last_refresh_error
+                    "lastRefreshError": &observability.remote.last_refresh_error
                 },
                 "backgroundWork": {
                     "maxThreads": observability.background.max_threads,
@@ -3442,9 +4000,9 @@ async fn handle_tsdb_status(
                         "retainedEntries": cluster_audit_health.retained_entries,
                         "logBytes": cluster_audit_health.log_bytes,
                         "cleanupPending": cluster_audit_health.cleanup_pending,
-                        "lastCleanupError": cluster_audit_health.last_cleanup_error,
+                        "lastCleanupError": cluster_audit_health.last_cleanup_error.as_deref(),
                         "persistenceFenced": cluster_audit_health.persistence_fenced,
-                        "persistenceFenceReason": cluster_audit_health.persistence_fence_reason,
+                        "persistenceFenceReason": cluster_audit_health.persistence_fence_reason.as_deref(),
                         "degraded": cluster_audit_health.degraded
                     },
                     "writeRouting": {
@@ -3453,7 +4011,7 @@ async fn handle_tsdb_status(
                         "routedRowsTotal": cluster_write_metrics.routed_rows_total,
                         "routedBatchesTotal": cluster_write_metrics.routed_batches_total,
                         "failuresTotal": cluster_write_metrics.failures_total,
-                        "hotShards": hot_shards.iter().map(|item| {
+                        "hotShards": hot_shards.iter().flatten().map(|item| {
                             json!({
                                 "shard": item.shard,
                                 "rowsTotal": item.rows_total
@@ -3510,18 +4068,18 @@ async fn handle_tsdb_status(
                         "localShardsTotal": cluster_read_planner_metrics.local_shards_total,
                         "remoteTargetsTotal": cluster_read_planner_metrics.remote_targets_total,
                         "remoteShardsTotal": cluster_read_planner_metrics.remote_shards_total,
-                        "operations": cluster_read_planner_labeled_metrics.operations.iter().map(|item| {
+                        "operations": cluster_read_planner_status.operations.iter().flatten().map(|item| {
                             json!({
-                                "operation": item.operation,
+                                "operation": item.operation.as_str(),
                                 "requestsTotal": item.requests_total,
                                 "candidateShardsTotal": item.candidate_shards_total,
                                 "prunedShardsTotal": item.pruned_shards_total,
                                 "remoteTargetsTotal": item.remote_targets_total
                             })
                         }).collect::<Vec<_>>(),
-                        "lastPlans": cluster_read_planner_last_plans.iter().map(|item| {
+                        "lastPlans": cluster_read_planner_status.last_plans.iter().flatten().map(|item| {
                             json!({
-                                "operation": item.operation,
+                                "operation": item.operation.as_str(),
                                 "ringVersion": item.ring_version,
                                 "timeRange": item.time_range.map(|(start, end)| json!({"start": start, "end": end})),
                                 "candidateShards": item.candidate_shards,
@@ -3588,17 +4146,17 @@ async fn handle_tsdb_status(
                         }).collect::<Vec<_>>()
                     },
                     "control": {
-                        "localNodeId": cluster_control_liveness.local_node_id.clone(),
-                        "currentTerm": cluster_control_liveness.current_term,
-                        "commitIndex": cluster_control_liveness.commit_index,
-                        "leaderNodeId": cluster_control_liveness.leader_node_id.clone(),
-                        "leaderStale": cluster_control_liveness.leader_stale,
-                        "leaderLastContactUnixMs": cluster_control_liveness.leader_last_contact_unix_ms,
-                        "leaderContactAgeMs": cluster_control_liveness.leader_contact_age_ms,
-                        "suspectPeers": cluster_control_liveness.suspect_peers,
-                        "deadPeers": cluster_control_liveness.dead_peers,
-                        "persistence": cluster_control_persistence_status_json(&cluster_control_persistence),
-                        "peers": cluster_control_liveness.peers.iter().map(|peer| {
+                        "localNodeId": cluster_control_local_node_id,
+                        "currentTerm": cluster_control_liveness.map(|snapshot| snapshot.current_term).unwrap_or(0),
+                        "commitIndex": cluster_control_liveness.map(|snapshot| snapshot.commit_index).unwrap_or(0),
+                        "leaderNodeId": cluster_control_liveness.and_then(|snapshot| snapshot.leader_node_id.as_deref()),
+                        "leaderStale": cluster_control_liveness.is_some_and(|snapshot| snapshot.leader_stale),
+                        "leaderLastContactUnixMs": cluster_control_liveness.and_then(|snapshot| snapshot.leader_last_contact_unix_ms),
+                        "leaderContactAgeMs": cluster_control_liveness.and_then(|snapshot| snapshot.leader_contact_age_ms),
+                        "suspectPeers": cluster_control_liveness.map(|snapshot| snapshot.suspect_peers).unwrap_or(0),
+                        "deadPeers": cluster_control_liveness.map(|snapshot| snapshot.dead_peers).unwrap_or(0),
+                        "persistence": cluster_control_persistence_status_json(cluster_control_persistence),
+                        "peers": cluster_control_liveness.into_iter().flat_map(|snapshot| snapshot.peers.iter()).map(|peer| {
                             json!({
                                 "nodeId": peer.node_id,
                                 "status": peer.status.as_str(),
@@ -3785,21 +4343,19 @@ async fn handle_tsdb_status(
                             })
                         }).collect::<Vec<_>>()
                     },
-                    "security": security_status_json(security_manager, rbac_registry)
+                    "security": security_status
                 }
             }
         })
     };
-    // The inner block released its named snapshots and hotspot guard after materializing their
-    // payload projections. Release the outer observability and metric-list sources in allocation-
-    // before-guard order before charging the retained JSON tree.
+    // The inner block released its named cluster snapshots after materializing their payload
+    // projections. Release the remaining observability source before charging the retained tree.
     drop(observability);
-    drop(metrics_list);
-    drop(metrics_reservation);
-    let prepared = match serialize_tsdb_status_response(payload, &execution) {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
+    let prepared =
+        match serialize_tsdb_status_response(payload, &execution, charge_http_returned_bytes) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
     let PreparedTsdbStatusResponse {
         payload,
         response,
@@ -3810,25 +4366,55 @@ async fn handle_tsdb_status(
     status_json_reservation
         .resize(modeled_tsdb_status_response_retained_bytes(&response))
         .expect("shrinking a TSDB status response reservation cannot fail");
-    drop(status_json_reservation);
+    if let Some(retained_response_reservation) = retained_response_reservation {
+        *retained_response_reservation = Some(status_json_reservation);
+    } else {
+        drop(status_json_reservation);
+    }
     drop(execution);
     drop(cancellation_guard);
     response
 }
 
 fn support_bundle_tenant_id(request: &HttpRequest) -> Result<String, HttpResponse> {
-    let mut tenant_request = request.clone();
-    if let Some(tenant_id) = non_empty_param(
-        request
-            .param("tenant")
-            .or_else(|| request.param("tenantId"))
-            .or_else(|| request.param("tenant_id")),
-    ) {
-        tenant_request
-            .headers
-            .insert(tenant::TENANT_HEADER.to_string(), tenant_id);
+    let raw_tenant_id = request
+        .raw_param("tenant")
+        .or_else(|| request.raw_param("tenantId"))
+        .or_else(|| request.raw_param("tenant_id"));
+    if let Some(raw_tenant_id) = raw_tenant_id {
+        if crate::http::percent_decoded_len(raw_tenant_id) > tsink::label::MAX_LABEL_VALUE_LEN {
+            return Err(text_response(
+                400,
+                &format!(
+                    "{} must be <= {} bytes",
+                    tenant::TENANT_HEADER,
+                    tsink::label::MAX_LABEL_VALUE_LEN
+                ),
+            ));
+        }
     }
-    tenant::tenant_id_for_request(&tenant_request).map_err(|err| text_response(400, &err))
+    if let Some(tenant_id) = non_empty_param(raw_tenant_id.map(crate::http::percent_decode)) {
+        // The support request body can be as large as the global HTTP body ceiling. Tenant
+        // resolution only needs the explicit override and the compatibility scope header, so do
+        // not clone the full request (or its body) merely to reuse the shared conflict check.
+        let mut headers = std::collections::HashMap::with_capacity(2);
+        headers.insert(tenant::TENANT_HEADER.to_string(), tenant_id);
+        if let Some(scope_org_id) = request.header(tenant::SCOPE_ORG_ID_HEADER) {
+            headers.insert(
+                tenant::SCOPE_ORG_ID_HEADER.to_string(),
+                scope_org_id.to_string(),
+            );
+        }
+        let tenant_request = HttpRequest {
+            method: String::new(),
+            path: String::new(),
+            headers,
+            body: Vec::new(),
+        };
+        return tenant::tenant_id_for_request(&tenant_request)
+            .map_err(|err| text_response(400, &err));
+    }
+    tenant::tenant_id_for_request(request).map_err(|err| text_response(400, &err))
 }
 
 fn support_bundle_request_with_path(
@@ -3866,65 +4452,6 @@ fn support_bundle_filename_component(value: &str) -> String {
     } else {
         cleaned
     }
-}
-
-fn support_bundle_text_section(status: u16, message: impl Into<String>) -> JsonValue {
-    json!({
-        "httpStatus": status,
-        "bodyText": message.into(),
-    })
-}
-
-fn truncate_support_bundle_text(input: &str, max_chars: usize) -> String {
-    let mut truncated = input.chars().take(max_chars).collect::<String>();
-    if input.chars().count() > max_chars {
-        truncated.push_str("...[truncated]");
-    }
-    truncated
-}
-
-fn support_bundle_section_from_response(response: HttpResponse) -> JsonValue {
-    let mut section = serde_json::Map::new();
-    section.insert("httpStatus".to_string(), json!(response.status));
-    if let Some((_, value)) = response
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-    {
-        section.insert("contentType".to_string(), json!(value));
-    }
-    if let Ok(body) = serde_json::from_slice::<JsonValue>(&response.body) {
-        section.insert("body".to_string(), body);
-    } else {
-        let body_text = String::from_utf8_lossy(&response.body);
-        section.insert(
-            "bodyText".to_string(),
-            JsonValue::String(truncate_support_bundle_text(&body_text, 8 * 1024)),
-        );
-    }
-    JsonValue::Object(section)
-}
-
-fn support_bundle_usage_section(
-    storage: &Arc<dyn Storage>,
-    usage_accounting: Option<&UsageAccounting>,
-    tenant_id: &str,
-) -> JsonValue {
-    let Some(usage_accounting) = usage_accounting else {
-        return support_bundle_text_section(503, "usage accounting is unavailable");
-    };
-    let report = usage_accounting.report(Some(tenant_id), None, None, UsageBucketWidth::None);
-    json!({
-        "httpStatus": 200,
-        "body": {
-            "status": "success",
-            "data": {
-                "report": report,
-                "journal": usage_accounting.ledger_status(),
-                "reconciliation": usage_reconciliation_json(&report, &storage.observability_snapshot())
-            }
-        }
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4074,46 +4601,10 @@ fn parse_usage_report_filter(
     ))
 }
 
-fn usage_reconciliation_json(
-    report: &crate::usage::UsageReport,
+fn usage_status_reconciliation_json(
+    reconciliation: &UsageStatusReconciliationSnapshot,
     observability: &tsink::StorageObservabilitySnapshot,
 ) -> JsonValue {
-    let accounted_ingest_rows = report
-        .tenants
-        .iter()
-        .map(|tenant| tenant.ingest.rows)
-        .sum::<u64>();
-    let accounted_query_units = report
-        .tenants
-        .iter()
-        .map(|tenant| tenant.query.result_units)
-        .sum::<u64>();
-    let accounted_retention_tombstones = report
-        .tenants
-        .iter()
-        .map(|tenant| tenant.retention.tombstones_applied)
-        .sum::<u64>();
-    let accounted_background_events = report
-        .tenants
-        .iter()
-        .map(|tenant| tenant.background.events_total)
-        .sum::<u64>();
-    let accounted_storage_bytes = report
-        .tenants
-        .iter()
-        .filter_map(|tenant| tenant.latest_storage_snapshot.as_ref())
-        .map(|snapshot| snapshot.logical_storage_bytes)
-        .sum::<u64>();
-    let latest_storage_reconciled_unix_ms = report
-        .tenants
-        .iter()
-        .filter_map(|tenant| {
-            tenant
-                .latest_storage_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.reconciled_unix_ms)
-        })
-        .max();
     let runtime_query_points_returned_total = observability
         .query
         .select_points_returned_total
@@ -4126,11 +4617,11 @@ fn usage_reconciliation_json(
 
     json!({
         "accounted": {
-            "ingestRowsTotal": accounted_ingest_rows,
-            "queryResultUnitsTotal": accounted_query_units,
-            "retentionTombstonesAppliedTotal": accounted_retention_tombstones,
-            "backgroundEventsTotal": accounted_background_events,
-            "latestStorageLogicalBytes": accounted_storage_bytes,
+            "ingestRowsTotal": reconciliation.ingest_rows_total,
+            "queryResultUnitsTotal": reconciliation.query_result_units_total,
+            "retentionTombstonesAppliedTotal": reconciliation.retention_tombstones_applied_total,
+            "backgroundEventsTotal": reconciliation.background_events_total,
+            "latestStorageLogicalBytes": reconciliation.latest_storage_logical_bytes,
         },
         "runtime": {
             "walAppendPointsTotal": observability.wal.append_points_total,
@@ -4140,8 +4631,49 @@ fn usage_reconciliation_json(
             "backgroundErrorsTotal": observability.health.background_errors_total,
             "degraded": observability.health.degraded,
         },
-        "latestStorageReconciledUnixMs": latest_storage_reconciled_unix_ms,
+        "latestStorageReconciledUnixMs": reconciliation.latest_storage_reconciled_unix_ms,
     })
+}
+
+fn usage_reconciliation_json(
+    report: &crate::usage::UsageReport,
+    observability: &tsink::StorageObservabilitySnapshot,
+) -> JsonValue {
+    let reconciliation = UsageStatusReconciliationSnapshot {
+        ingest_rows_total: report.tenants.iter().map(|tenant| tenant.ingest.rows).sum(),
+        query_result_units_total: report
+            .tenants
+            .iter()
+            .map(|tenant| tenant.query.result_units)
+            .sum(),
+        retention_tombstones_applied_total: report
+            .tenants
+            .iter()
+            .map(|tenant| tenant.retention.tombstones_applied)
+            .sum(),
+        background_events_total: report
+            .tenants
+            .iter()
+            .map(|tenant| tenant.background.events_total)
+            .sum(),
+        latest_storage_logical_bytes: report
+            .tenants
+            .iter()
+            .filter_map(|tenant| tenant.latest_storage_snapshot.as_ref())
+            .map(|snapshot| snapshot.logical_storage_bytes)
+            .sum(),
+        latest_storage_reconciled_unix_ms: report
+            .tenants
+            .iter()
+            .filter_map(|tenant| {
+                tenant
+                    .latest_storage_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.reconciled_unix_ms)
+            })
+            .max(),
+    };
+    usage_status_reconciliation_json(&reconciliation, observability)
 }
 
 fn managed_control_plane_actor(request: &HttpRequest) -> ManagedControlPlaneActor {
@@ -5203,19 +5735,191 @@ fn admin_repair_error_response(
     )
 }
 
+const ADMIN_REBALANCE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+enum AdminRebalanceResponseError {
+    Budget(tsink::QueryBudgetError),
+    EncodedLimit,
+    Measurement,
+    Allocation,
+    Serialization,
+    LengthChanged,
+}
+
+#[derive(Serialize)]
+struct AdminRebalanceResponsePayload<'a> {
+    status: &'static str,
+    data: AdminRebalanceResponseData<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminRebalanceResponseData<'a> {
+    operation: &'static str,
+    node_id: &'a str,
+    rebalance_paused: bool,
+    rebalance_run_in_flight: bool,
+    interval_secs: u64,
+    max_rows_per_tick: usize,
+    max_shards_per_tick: usize,
+    effective_max_rows_per_tick_last_run: usize,
+    is_local_control_leader: bool,
+    active_jobs: usize,
+    runs_total: u64,
+    jobs_considered_last_run: u64,
+    jobs_advanced_total: u64,
+    jobs_completed_total: u64,
+    rows_scheduled_total: u64,
+    rows_scheduled_last_run: u64,
+    proposals_committed_total: u64,
+    proposals_pending_total: u64,
+    proposal_failures_total: u64,
+    moves_blocked_by_slo_total: u64,
+    slo_guard: &'a RebalanceSloGuardSnapshot,
+    last_run_unix_ms: u64,
+    last_success_unix_ms: u64,
+    last_error: &'a Option<String>,
+    pending_rows_total: u64,
+    copied_rows_total: u64,
+    progress_percent: f64,
+    estimated_eta_seconds: Option<u64>,
+    event_unix_ms: u64,
+    error_summary: AdminRebalanceErrorSummary<'a>,
+    candidate_moves: &'a [crate::cluster::repair::RebalanceMoveCandidateSnapshot],
+    hotspot: &'a ClusterHotspotSnapshot,
+    jobs: AdminRebalanceJobs<'a>,
+    message: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminRebalanceErrorSummary<'a> {
+    proposal_failures_total: u64,
+    last_error: &'a Option<String>,
+}
+
+struct AdminRebalanceJobs<'a> {
+    snapshot: &'a RebalanceSchedulerSnapshot,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminRebalanceJob<'a> {
+    shard: u32,
+    from_node_id: &'a str,
+    to_node_id: &'a str,
+    activation_ring_version: u64,
+    phase: &'static str,
+    copied_rows: u64,
+    pending_rows: u64,
+    updated_unix_ms: u64,
+    progress_percent: f64,
+    eta_seconds: Option<u64>,
+}
+
+impl Serialize for AdminRebalanceJobs<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.snapshot.jobs.len()))?;
+        for job in &self.snapshot.jobs {
+            let total = job.pending_rows.saturating_add(job.copied_rows);
+            let progress_percent = if total == 0 {
+                if job.phase == ShardHandoffPhase::Completed {
+                    100.0
+                } else {
+                    0.0
+                }
+            } else {
+                (job.copied_rows as f64 * 100.0) / total as f64
+            };
+            let eta_seconds = admin_rebalance_job_eta_seconds(job, self.snapshot);
+            sequence.serialize_element(&AdminRebalanceJob {
+                shard: job.shard,
+                from_node_id: &job.from_node_id,
+                to_node_id: &job.to_node_id,
+                activation_ring_version: job.activation_ring_version,
+                phase: job.phase.as_str(),
+                copied_rows: job.copied_rows,
+                pending_rows: job.pending_rows,
+                updated_unix_ms: job.updated_unix_ms,
+                progress_percent,
+                eta_seconds,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+fn admin_rebalance_job_eta_seconds(
+    job: &RebalanceJobSnapshot,
+    snapshot: &RebalanceSchedulerSnapshot,
+) -> Option<u64> {
+    if snapshot.paused || snapshot.interval_secs == 0 || snapshot.rows_scheduled_last_run == 0 {
+        return (job.pending_rows == 0).then_some(0);
+    }
+    let active_jobs = u64::try_from(snapshot.active_jobs)
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let rows_per_job_per_run = ceil_div_u64(snapshot.rows_scheduled_last_run, active_jobs);
+    if rows_per_job_per_run == 0 {
+        None
+    } else {
+        Some(
+            ceil_div_u64(job.pending_rows, rows_per_job_per_run)
+                .saturating_mul(snapshot.interval_secs),
+        )
+    }
+}
+
+struct AdminRebalanceJsonLengthCounter<'a> {
+    bytes: usize,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+    fixed_limit_exceeded: bool,
+}
+
+impl IoWrite for AdminRebalanceJsonLengthCounter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return Err(io::Error::other(
+                "admin rebalance JSON measurement was canceled",
+            ));
+        }
+        let next = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("admin rebalance JSON length overflowed usize"))?;
+        if next > ADMIN_REBALANCE_MAX_RESPONSE_BYTES {
+            self.fixed_limit_exceeded = true;
+            return Err(io::Error::other(
+                "admin rebalance JSON exceeded its fixed encoded-byte limit",
+            ));
+        }
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admin_rebalance_success_response(
     status: u16,
     operation: AdminRebalanceOperation,
     node_id: &str,
-    control: RebalanceSchedulerControlSnapshot,
-    snapshot: RebalanceSchedulerSnapshot,
-    hotspot_snapshot: ClusterHotspotSnapshot,
+    snapshot: &RebalanceSchedulerSnapshot,
+    hotspot_snapshot: &ClusterHotspotSnapshot,
     run_inflight: bool,
     message: &str,
-) -> HttpResponse {
-    let event_unix_ms = unix_timestamp_millis();
-    let estimated_eta_seconds = estimate_rebalance_eta_seconds(&snapshot);
+    execution: &tsink::QueryExecution,
+    charge_http_returned_bytes: bool,
+) -> Result<AccountedHttpResponse, AdminRebalanceResponseError> {
     let total_pending_rows = snapshot
         .jobs
         .iter()
@@ -5234,141 +5938,109 @@ fn admin_rebalance_success_response(
             (total_copied_rows as f64 * 100.0) / total
         }
     };
-    json_response(
-        status,
-        &json!({
-            "status": "success",
-            "data": {
-                "operation": operation.as_str(),
-                "nodeId": node_id,
-                "rebalancePaused": control.paused,
-                "rebalanceRunInFlight": run_inflight,
-                "intervalSecs": snapshot.interval_secs,
-                "maxRowsPerTick": snapshot.max_rows_per_tick,
-                "maxShardsPerTick": snapshot.max_shards_per_tick,
-                "effectiveMaxRowsPerTickLastRun": snapshot.effective_max_rows_per_tick_last_run,
-                "isLocalControlLeader": snapshot.is_local_control_leader,
-                "activeJobs": snapshot.active_jobs,
-                "runsTotal": snapshot.runs_total,
-                "jobsConsideredLastRun": snapshot.jobs_considered_last_run,
-                "jobsAdvancedTotal": snapshot.jobs_advanced_total,
-                "jobsCompletedTotal": snapshot.jobs_completed_total,
-                "rowsScheduledTotal": snapshot.rows_scheduled_total,
-                "rowsScheduledLastRun": snapshot.rows_scheduled_last_run,
-                "proposalsCommittedTotal": snapshot.proposals_committed_total,
-                "proposalsPendingTotal": snapshot.proposals_pending_total,
-                "proposalFailuresTotal": snapshot.proposal_failures_total,
-                "movesBlockedBySloTotal": snapshot.moves_blocked_by_slo_total,
-                "sloGuard": {
-                    "writePressureRatio": snapshot.slo_guard.write_pressure_ratio,
-                    "queryPressureRatio": snapshot.slo_guard.query_pressure_ratio,
-                    "clusterQueryPressureRatio": snapshot.slo_guard.cluster_query_pressure_ratio,
-                    "effectiveMaxRowsPerTick": snapshot.slo_guard.effective_max_rows_per_tick,
-                    "blockNewHandoffs": snapshot.slo_guard.block_new_handoffs,
-                    "reason": snapshot.slo_guard.reason.clone()
-                },
-                "lastRunUnixMs": snapshot.last_run_unix_ms,
-                "lastSuccessUnixMs": snapshot.last_success_unix_ms,
-                "lastError": snapshot.last_error.clone(),
-                "pendingRowsTotal": total_pending_rows,
-                "copiedRowsTotal": total_copied_rows,
-                "progressPercent": progress_percent,
-                "estimatedEtaSeconds": estimated_eta_seconds,
-                "eventUnixMs": event_unix_ms,
-                "errorSummary": {
-                    "proposalFailuresTotal": snapshot.proposal_failures_total,
-                    "lastError": snapshot.last_error.clone()
-                },
-                "candidateMoves": snapshot.candidate_moves.iter().map(|candidate| {
-                    json!({
-                        "shard": candidate.shard,
-                        "fromNodeId": candidate.from_node_id,
-                        "toNodeId": candidate.to_node_id,
-                        "pressureScore": candidate.pressure_score,
-                        "movementCostScore": candidate.movement_cost_score,
-                        "imbalanceImprovementScore": candidate.imbalance_improvement_score,
-                        "decisionScore": candidate.decision_score,
-                        "sourceNodePressure": candidate.source_node_pressure,
-                        "targetNodePressure": candidate.target_node_pressure,
-                        "reason": candidate.reason
-                    })
-                }).collect::<Vec<_>>(),
-                "hotspot": {
-                    "generatedUnixMs": hotspot_snapshot.generated_unix_ms,
-                    "skewedShards": hotspot_snapshot.skewed_shards,
-                    "skewedTenants": hotspot_snapshot.skewed_tenants,
-                    "maxShardScore": hotspot_snapshot.max_shard_score,
-                    "maxTenantScore": hotspot_snapshot.max_tenant_score,
-                    "hotShards": hotspot_snapshot.hot_shards.iter().map(|item| {
-                        json!({
-                            "shard": item.shard,
-                            "ingestRowsTotal": item.ingest_rows_total,
-                            "queryShardHitsTotal": item.query_shard_hits_total,
-                            "storageSeries": item.storage_series,
-                            "repairMismatchesTotal": item.repair_mismatches_total,
-                            "repairSeriesGapTotal": item.repair_series_gap_total,
-                            "repairPointGapTotal": item.repair_point_gap_total,
-                            "repairRowsInsertedTotal": item.repair_rows_inserted_total,
-                            "handoffPendingRows": item.handoff_pending_rows,
-                            "pressureScore": item.pressure_score,
-                            "movementCostScore": item.movement_cost_score,
-                            "skewFactor": item.skew_factor,
-                            "recommendMove": item.recommend_move
-                        })
-                    }).collect::<Vec<_>>(),
-                    "tenantHotspots": hotspot_snapshot.tenant_hotspots.iter().map(|item| {
-                        json!({
-                            "tenantId": item.tenant_id,
-                            "ingestRowsTotal": item.ingest_rows_total,
-                            "queryRequestsTotal": item.query_requests_total,
-                            "queryUnitsTotal": item.query_units_total,
-                            "storageSeries": item.storage_series,
-                            "repairRowsInsertedTotal": item.repair_rows_inserted_total,
-                            "pressureScore": item.pressure_score,
-                            "skewFactor": item.skew_factor
-                        })
-                    }).collect::<Vec<_>>()
-                },
-                "jobs": snapshot.jobs.iter().map(|job| {
-                    let total = job.pending_rows.saturating_add(job.copied_rows);
-                    let progress_percent = if total == 0 {
-                        if job.phase == ShardHandoffPhase::Completed {
-                            100.0
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        (job.copied_rows as f64 * 100.0) / total as f64
-                    };
-                    let eta_seconds = if snapshot.paused || snapshot.interval_secs == 0 || snapshot.rows_scheduled_last_run == 0 {
-                        if job.pending_rows == 0 { Some(0) } else { None }
-                    } else {
-                        let active_jobs = u64::try_from(snapshot.active_jobs).unwrap_or(u64::MAX).max(1);
-                        let rows_per_job_per_run = ceil_div_u64(snapshot.rows_scheduled_last_run, active_jobs);
-                        if rows_per_job_per_run == 0 {
-                            None
-                        } else {
-                            let runs_remaining = ceil_div_u64(job.pending_rows, rows_per_job_per_run);
-                            Some(runs_remaining.saturating_mul(snapshot.interval_secs))
-                        }
-                    };
-                    json!({
-                        "shard": job.shard,
-                        "fromNodeId": job.from_node_id,
-                        "toNodeId": job.to_node_id,
-                        "activationRingVersion": job.activation_ring_version,
-                        "phase": job.phase.as_str(),
-                        "copiedRows": job.copied_rows,
-                        "pendingRows": job.pending_rows,
-                        "updatedUnixMs": job.updated_unix_ms,
-                        "progressPercent": progress_percent,
-                        "etaSeconds": eta_seconds
-                    })
-                }).collect::<Vec<_>>(),
-                "message": message
-            }
-        }),
-    )
+    let payload = AdminRebalanceResponsePayload {
+        status: "success",
+        data: AdminRebalanceResponseData {
+            operation: operation.as_str(),
+            node_id,
+            rebalance_paused: snapshot.paused,
+            rebalance_run_in_flight: run_inflight,
+            interval_secs: snapshot.interval_secs,
+            max_rows_per_tick: snapshot.max_rows_per_tick,
+            max_shards_per_tick: snapshot.max_shards_per_tick,
+            effective_max_rows_per_tick_last_run: snapshot.effective_max_rows_per_tick_last_run,
+            is_local_control_leader: snapshot.is_local_control_leader,
+            active_jobs: snapshot.active_jobs,
+            runs_total: snapshot.runs_total,
+            jobs_considered_last_run: snapshot.jobs_considered_last_run,
+            jobs_advanced_total: snapshot.jobs_advanced_total,
+            jobs_completed_total: snapshot.jobs_completed_total,
+            rows_scheduled_total: snapshot.rows_scheduled_total,
+            rows_scheduled_last_run: snapshot.rows_scheduled_last_run,
+            proposals_committed_total: snapshot.proposals_committed_total,
+            proposals_pending_total: snapshot.proposals_pending_total,
+            proposal_failures_total: snapshot.proposal_failures_total,
+            moves_blocked_by_slo_total: snapshot.moves_blocked_by_slo_total,
+            slo_guard: &snapshot.slo_guard,
+            last_run_unix_ms: snapshot.last_run_unix_ms,
+            last_success_unix_ms: snapshot.last_success_unix_ms,
+            last_error: &snapshot.last_error,
+            pending_rows_total: total_pending_rows,
+            copied_rows_total: total_copied_rows,
+            progress_percent,
+            estimated_eta_seconds: estimate_rebalance_eta_seconds(snapshot),
+            event_unix_ms: unix_timestamp_millis(),
+            error_summary: AdminRebalanceErrorSummary {
+                proposal_failures_total: snapshot.proposal_failures_total,
+                last_error: &snapshot.last_error,
+            },
+            candidate_moves: &snapshot.candidate_moves,
+            hotspot: hotspot_snapshot,
+            jobs: AdminRebalanceJobs { snapshot },
+            message,
+        },
+    };
+    let mut counter = AdminRebalanceJsonLengthCounter {
+        bytes: 0,
+        execution,
+        control_error: None,
+        fixed_limit_exceeded: false,
+    };
+    if serde_json::to_writer(&mut counter, &payload).is_err() {
+        return Err(match counter.control_error {
+            Some(error) => AdminRebalanceResponseError::Budget(error),
+            None if counter.fixed_limit_exceeded => AdminRebalanceResponseError::EncodedLimit,
+            None => AdminRebalanceResponseError::Measurement,
+        });
+    }
+    let body_len = counter.bytes;
+    if charge_http_returned_bytes {
+        execution
+            .charge_returned_bytes(tsdb_status_saturating_u64_from_usize(body_len))
+            .map_err(AdminRebalanceResponseError::Budget)?;
+    }
+    let mut reservation = execution
+        .reserve_memory(
+            modeled_tsdb_status_vec_capacity_bytes::<u8>(body_len)
+                .saturating_add(modeled_tsdb_status_header_preflight_bytes()),
+        )
+        .map_err(AdminRebalanceResponseError::Budget)?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len)
+        .map_err(|_| AdminRebalanceResponseError::Allocation)?;
+    reservation
+        .resize(
+            modeled_tsdb_status_vec_capacity_bytes::<u8>(body.capacity())
+                .saturating_add(modeled_tsdb_status_header_preflight_bytes()),
+        )
+        .map_err(AdminRebalanceResponseError::Budget)?;
+    body.resize(body_len, 0);
+    let written = {
+        let cursor = io::Cursor::new(body.as_mut_slice());
+        let mut writer = TsdbStatusControlledJsonWriter {
+            inner: cursor,
+            execution,
+            control_error: None,
+        };
+        if serde_json::to_writer(&mut writer, &payload).is_err() {
+            return Err(match writer.control_error {
+                Some(error) => AdminRebalanceResponseError::Budget(error),
+                None => AdminRebalanceResponseError::Serialization,
+            });
+        }
+        usize::try_from(writer.inner.position()).unwrap_or(usize::MAX)
+    };
+    if written != body_len {
+        return Err(AdminRebalanceResponseError::LengthChanged);
+    }
+    let response = HttpResponse::new(status, body).with_header("Content-Type", "application/json");
+    reservation
+        .resize(modeled_tsdb_status_response_retained_bytes(&response))
+        .map_err(AdminRebalanceResponseError::Budget)?;
+    Ok(AccountedHttpResponse {
+        response,
+        reservation,
+    })
 }
 
 fn admin_rebalance_error_response(
@@ -5384,6 +6056,130 @@ fn admin_rebalance_error_response(
             "error": message.into()
         }),
     )
+}
+
+const ADMIN_REBALANCE_EFFECT_FALLBACK_BASE_BYTES: u64 = 4096;
+
+#[derive(Clone, Copy)]
+struct AdminRebalanceAppliedEffect<'a> {
+    operation: AdminRebalanceOperation,
+    node_id: &'a str,
+    rebalance_paused: bool,
+    rebalance_run_completed: bool,
+}
+
+fn reserve_admin_rebalance_effect_fallback(
+    execution: &tsink::QueryExecution,
+    node_id: &str,
+) -> Result<tsink::QueryMemoryReservation, tsink::QueryBudgetError> {
+    let escaped_node_ceiling = u64::try_from(node_id.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(6);
+    execution.reserve_memory(
+        ADMIN_REBALANCE_EFFECT_FALLBACK_BASE_BYTES.saturating_add(escaped_node_ceiling),
+    )
+}
+
+fn admin_rebalance_response_error_response(
+    error: AdminRebalanceResponseError,
+    effect: Option<AdminRebalanceAppliedEffect<'_>>,
+) -> HttpResponse {
+    let (status, error_type, message, retry_after) = match error {
+        AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::InvalidLimits(_)) => (
+            400,
+            "invalid_query_limits".to_string(),
+            "invalid admin rebalance query limits".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::LimitExceeded(exceeded)) => {
+            let error_type = format!("query_limit_{}", exceeded.reason.as_str());
+            let retryable = matches!(
+                exceeded.reason,
+                tsink::QueryLimitReason::ConcurrentQueries
+                    | tsink::QueryLimitReason::SharedMemoryBytes
+            );
+            (
+                if retryable { 429 } else { 413 },
+                error_type,
+                format!(
+                    "admin rebalance response exceeded the {} limit",
+                    exceeded.reason.as_str()
+                ),
+                retryable.then_some("1"),
+            )
+        }
+        AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::Cancelled) => (
+            503,
+            "canceled".to_string(),
+            "admin rebalance response was canceled".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::DeadlineExceeded) => (
+            503,
+            "timeout".to_string(),
+            "admin rebalance response deadline exceeded".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Budget(_) => (
+            500,
+            "rebalance_query_budget_failed".to_string(),
+            "admin rebalance query budget failed".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::EncodedLimit => (
+            413,
+            "query_limit_returned_bytes".to_string(),
+            "admin rebalance response exceeds the fixed encoded-byte limit".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Measurement => (
+            500,
+            "rebalance_json_measurement_failed".to_string(),
+            "admin rebalance JSON measurement failed".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Allocation => (
+            500,
+            "rebalance_json_allocation_failed".to_string(),
+            "admin rebalance JSON allocation failed".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::Serialization => (
+            500,
+            "rebalance_json_serialization_failed".to_string(),
+            "admin rebalance JSON serialization failed".to_string(),
+            None,
+        ),
+        AdminRebalanceResponseError::LengthChanged => (
+            500,
+            "rebalance_json_length_changed".to_string(),
+            "admin rebalance JSON length changed after admission".to_string(),
+            None,
+        ),
+    };
+    let mut response = if let Some(effect) = effect {
+        json_response(
+            status,
+            &json!({
+                "status": "error",
+                "errorType": error_type,
+                "error": message,
+                "data": {
+                    "operation": effect.operation.as_str(),
+                    "nodeId": effect.node_id,
+                    "effectApplied": true,
+                    "rebalancePaused": effect.rebalance_paused,
+                    "rebalanceRunCompleted": effect.rebalance_run_completed,
+                }
+            }),
+        )
+    } else {
+        admin_rebalance_error_response(status, &error_type, message)
+    };
+    if let Some(retry_after) = retry_after {
+        response = response.with_header("Retry-After", retry_after);
+    }
+    response
 }
 
 fn admin_control_recovery_error_response(
@@ -8539,6 +9335,135 @@ mod tests {
         StorageRuntimeMode, TimestampPrecision, TsinkError, Value,
     };
 
+    #[test]
+    fn protocol_config_initialization_covers_every_metrics_source_and_is_idempotent() {
+        initialize_protocol_configs();
+        assert!(PROMETHEUS_PAYLOAD_CONFIG.get().is_some());
+        assert!(OTLP_METRICS_CONFIG.get().is_some());
+        assert!(legacy_ingest::protocol_configs_initialized_for_test());
+
+        let first = (
+            prometheus_payload_config(),
+            otlp_metrics_config(),
+            legacy_ingest::influx_line_protocol_config(),
+            legacy_ingest::statsd_config(),
+            legacy_ingest::graphite_config(),
+        );
+        initialize_protocol_configs();
+        let second = (
+            prometheus_payload_config(),
+            otlp_metrics_config(),
+            legacy_ingest::influx_line_protocol_config(),
+            legacy_ingest::statsd_config(),
+            legacy_ingest::graphite_config(),
+        );
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn protocol_metrics_snapshots_are_copy_and_preserve_every_status_label() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<ProtocolLabelSet<'static>>();
+        assert_copy::<PayloadStatusSnapshot>();
+        assert_copy::<PrometheusPayloadStatusSnapshot<'static>>();
+        assert_copy::<OtlpMetricsStatusSnapshot>();
+        assert_copy::<LegacyIngestStatusSnapshot>();
+
+        let payload = payload_status_snapshot(None);
+        let expected_local_capabilities = CompatibilityProfile::default().capabilities;
+        assert_eq!(
+            (&payload.local_capabilities)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            expected_local_capabilities
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        for (kind, labels) in [
+            (
+                PrometheusPayloadKind::Metadata,
+                payload.metadata.required_capabilities,
+            ),
+            (
+                PrometheusPayloadKind::Exemplar,
+                payload.exemplars.required_capabilities,
+            ),
+            (
+                PrometheusPayloadKind::Histogram,
+                payload.histograms.required_capabilities,
+            ),
+        ] {
+            let expected = payload_required_capabilities(kind);
+            assert_eq!(
+                (&labels).into_iter().collect::<Vec<_>>(),
+                expected.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+        }
+
+        let otlp = otlp_metrics_status_snapshot();
+        assert_eq!(
+            (&otlp.supported_shapes).into_iter().collect::<Vec<_>>(),
+            OTLP_SUPPORTED_SHAPE_LABELS
+        );
+
+        let encoded = json!({
+            "localCapabilities": payload.local_capabilities,
+            "metadataCapabilities": payload.metadata.required_capabilities,
+            "exemplarCapabilities": payload.exemplars.required_capabilities,
+            "histogramCapabilities": payload.histograms.required_capabilities,
+            "otlpShapes": otlp.supported_shapes,
+        });
+        assert_eq!(
+            encoded["localCapabilities"],
+            json!(expected_local_capabilities)
+        );
+        assert_eq!(
+            encoded["metadataCapabilities"],
+            json!(METADATA_PAYLOAD_REQUIRED_CAPABILITIES)
+        );
+        assert_eq!(
+            encoded["exemplarCapabilities"],
+            json!(EXEMPLAR_PAYLOAD_REQUIRED_CAPABILITIES)
+        );
+        assert_eq!(
+            encoded["histogramCapabilities"],
+            json!(HISTOGRAM_PAYLOAD_REQUIRED_CAPABILITIES)
+        );
+        assert_eq!(encoded["otlpShapes"], json!(OTLP_SUPPORTED_SHAPE_LABELS));
+    }
+
+    #[test]
+    fn protocol_label_view_borrows_dynamic_capabilities_without_dropping_order_or_duplicates() {
+        let capabilities = vec![
+            "custom_b".to_string(),
+            "custom_a".to_string(),
+            "custom_b".to_string(),
+        ];
+        let labels = ProtocolLabelSet::Borrowed(&capabilities);
+
+        assert_eq!(
+            (&labels).into_iter().collect::<Vec<_>>(),
+            ["custom_b", "custom_a", "custom_b"]
+        );
+        assert_eq!(
+            serde_json::to_value(labels).expect("label view should serialize"),
+            json!(["custom_b", "custom_a", "custom_b"])
+        );
+    }
+
+    #[test]
+    fn protocol_boolean_parser_is_ascii_case_insensitive_without_normalization() {
+        for value in ["1", "TRUE", "Yes", "oN"] {
+            assert_eq!(parse_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "FALSE", "No", "OfF"] {
+            assert_eq!(parse_bool(value), Some(false), "{value}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
     fn make_storage() -> Arc<dyn Storage> {
         StorageBuilder::new()
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
@@ -8596,6 +9521,440 @@ mod tests {
         }
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn status_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageStatusObservabilitySnapshot> {
+            self.inner
+                .status_observability_snapshot_with_execution(execution)
+        }
+
+        fn metrics_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageMetricsObservabilitySnapshot> {
+            self.inner
+                .metrics_observability_snapshot_with_execution(execution)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MetricsAccountingTestResult {
+        AccountedEmpty,
+        AccountedDistinctTenants,
+        MissingReservation,
+        UndersizedReservation,
+        StorageFailure,
+    }
+
+    struct MetricsAccountingTestStorage {
+        inner: Arc<dyn Storage>,
+        budget: tsink::QueryBudget,
+        result: MetricsAccountingTestResult,
+        accounting: tsink::QueryExecutionAccounting,
+        query_admission_available: bool,
+        cancel_on_admission: bool,
+        execution_list_calls: AtomicUsize,
+        uncontrolled_list_calls: AtomicUsize,
+    }
+
+    impl MetricsAccountingTestStorage {
+        fn new(
+            inner: Arc<dyn Storage>,
+            limits: QueryBudgetLimits,
+            result: MetricsAccountingTestResult,
+        ) -> Self {
+            Self {
+                inner,
+                budget: tsink::QueryBudget::new(limits)
+                    .expect("metrics accounting test budget should build"),
+                result,
+                accounting: tsink::QueryExecutionAccounting::Complete,
+                query_admission_available: true,
+                cancel_on_admission: false,
+                execution_list_calls: AtomicUsize::new(0),
+                uncontrolled_list_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_accounting(mut self, accounting: tsink::QueryExecutionAccounting) -> Self {
+            self.accounting = accounting;
+            self
+        }
+
+        fn without_query_admission(mut self) -> Self {
+            self.query_admission_available = false;
+            self
+        }
+
+        fn cancelling_on_admission(mut self) -> Self {
+            self.cancel_on_admission = true;
+            self
+        }
+    }
+
+    impl Storage for MetricsAccountingTestStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            Some(self.budget.clone())
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn begin_query_execution(
+            &self,
+            requested: QueryWorkLimits,
+            cancellation: tsink::QueryCancellationToken,
+        ) -> tsink::Result<Option<tsink::QueryExecution>> {
+            if !self.query_admission_available {
+                return Ok(None);
+            }
+            let cancellation_after_admission = cancellation.clone();
+            let admitted = self
+                .budget
+                .begin_query_with(requested, cancellation)
+                .map(Some)
+                .map_err(Into::into);
+            if self.cancel_on_admission && admitted.is_ok() {
+                cancellation_after_admission.cancel();
+            }
+            admitted
+        }
+
+        fn list_metrics(&self) -> tsink::Result<Vec<MetricSeries>> {
+            self.uncontrolled_list_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            Err(TsinkError::Other(
+                "uncontrolled metrics listing must not be called".to_string(),
+            ))
+        }
+
+        fn list_metrics_with_execution_result(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.execution_list_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            match self.result {
+                MetricsAccountingTestResult::AccountedEmpty => {
+                    let reservation = execution.reserve_memory(0).map_err(TsinkError::from)?;
+                    Ok(tsink::SelectSeriesExecutionResult::accounted(
+                        Vec::new(),
+                        reservation,
+                    ))
+                }
+                MetricsAccountingTestResult::AccountedDistinctTenants => {
+                    let series = vec![
+                        MetricSeries {
+                            name: "metrics_hotspot_fixture".to_string(),
+                            labels: vec![Label::new(tenant::TENANT_LABEL, "tenant-a")],
+                        },
+                        MetricSeries {
+                            name: "metrics_hotspot_fixture".to_string(),
+                            labels: vec![Label::new(tenant::TENANT_LABEL, "tenant-b")],
+                        },
+                    ];
+                    let retained_bytes =
+                        crate::cluster::query::modeled_metric_series_vec_retained_bytes(&series);
+                    let reservation = execution
+                        .reserve_memory(retained_bytes)
+                        .map_err(TsinkError::from)?;
+                    Ok(tsink::SelectSeriesExecutionResult::accounted(
+                        series,
+                        reservation,
+                    ))
+                }
+                MetricsAccountingTestResult::MissingReservation => {
+                    Ok(tsink::SelectSeriesExecutionResult::unaccounted(vec![
+                        MetricSeries {
+                            name: "metrics_missing_reservation".to_string(),
+                            labels: vec![Label::new("host", "a")],
+                        },
+                    ]))
+                }
+                MetricsAccountingTestResult::UndersizedReservation => {
+                    let reservation = execution.reserve_memory(1).map_err(TsinkError::from)?;
+                    Ok(tsink::SelectSeriesExecutionResult::accounted(
+                        vec![MetricSeries {
+                            name: "metrics_undersized_reservation".repeat(8),
+                            labels: vec![Label::new("host", "a".repeat(256))],
+                        }],
+                        reservation,
+                    ))
+                }
+                MetricsAccountingTestResult::StorageFailure => Err(TsinkError::Other(
+                    "injected accounted metrics listing failure".to_string(),
+                )),
+            }
+        }
+
+        fn list_metrics_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            self.accounting
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            _selection: &SeriesSelection,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            if self.cancel_on_admission {
+                execution.cancellation_token().cancel();
+                execution.checkpoint().map_err(TsinkError::from)?;
+            }
+            self.list_metrics_with_execution_result(execution)
+        }
+
+        fn select_series_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            self.accounting
+        }
+
+        fn memory_used(&self) -> usize {
+            self.inner.memory_used()
+        }
+
+        fn memory_budget(&self) -> usize {
+            self.inner.memory_budget()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.inner.observability_snapshot()
+        }
+
+        fn status_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageStatusObservabilitySnapshot> {
+            self.inner
+                .status_observability_snapshot_with_execution(execution)
+        }
+
+        fn metrics_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageMetricsObservabilitySnapshot> {
+            self.inner
+                .metrics_observability_snapshot_with_execution(execution)
+        }
+
+        fn close(&self) -> tsink::Result<()> {
+            self.inner.close()
+        }
+    }
+
+    async fn scrape_metrics_accounting_storage(
+        test_storage: &Arc<MetricsAccountingTestStorage>,
+    ) -> HttpResponse {
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await
+    }
+
+    async fn dispatch_admin_rebalance_accounting_storage(
+        test_storage: &Arc<MetricsAccountingTestStorage>,
+        cluster_context: &ClusterRequestContext,
+        method: &str,
+        path: &str,
+    ) -> HttpResponse {
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: method.to_string(),
+                path: path.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context),
+        )
+        .await
+    }
+
+    async fn dispatch_status_accounting_storage(
+        test_storage: &Arc<MetricsAccountingTestStorage>,
+    ) -> HttpResponse {
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::from([(
+                    tenant::TENANT_HEADER.to_string(),
+                    "status-accounting-test".to_string(),
+                )]),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await
+    }
+
+    async fn dispatch_status_accounting_storage_with_cluster(
+        test_storage: &Arc<MetricsAccountingTestStorage>,
+        cluster_context: &ClusterRequestContext,
+        tenant_id: &str,
+    ) -> HttpResponse {
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::from([(
+                    tenant::TENANT_HEADER.to_string(),
+                    tenant_id.to_string(),
+                )]),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            false,
+            None,
+            None,
+            Some(cluster_context),
+        )
+        .await
+    }
+
+    struct StatusObservabilityUnavailableStorage {
+        inner: Arc<dyn Storage>,
+        legacy_observability_calls: AtomicUsize,
+    }
+
+    impl Storage for StatusObservabilityUnavailableStorage {
+        fn query_budget(&self) -> Option<tsink::QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> tsink::Result<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            opts: tsink::QueryOptions,
+        ) -> tsink::Result<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, opts)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> tsink::Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn list_metrics_with_execution_result(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.inner.list_metrics_with_execution_result(execution)
+        }
+
+        fn list_metrics_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            self.inner.list_metrics_execution_accounting()
+        }
+
+        fn select_series_with_execution_result(
+            &self,
+            selection: &SeriesSelection,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::SelectSeriesExecutionResult> {
+            self.inner
+                .select_series_with_execution_result(selection, execution)
+        }
+
+        fn select_series_execution_accounting(&self) -> tsink::QueryExecutionAccounting {
+            self.inner.select_series_execution_accounting()
+        }
+
+        fn memory_used(&self) -> usize {
+            self.inner.memory_used()
+        }
+
+        fn memory_budget(&self) -> usize {
+            self.inner.memory_budget()
+        }
+
+        fn effective_storage_limits(&self) -> tsink::EffectiveStorageLimits {
+            self.inner.effective_storage_limits()
+        }
+
+        fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
+            self.legacy_observability_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.observability_snapshot()
         }
 
@@ -8672,6 +10031,14 @@ mod tests {
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
             self.inner.observability_snapshot()
+        }
+
+        fn status_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageStatusObservabilitySnapshot> {
+            self.inner
+                .status_observability_snapshot_with_execution(execution)
         }
 
         fn close(&self) -> tsink::Result<()> {
@@ -8781,6 +10148,14 @@ mod tests {
 
         fn observability_snapshot(&self) -> tsink::StorageObservabilitySnapshot {
             self.inner.observability_snapshot()
+        }
+
+        fn status_observability_snapshot_with_execution(
+            &self,
+            execution: &tsink::QueryExecution,
+        ) -> tsink::Result<tsink::StorageStatusObservabilitySnapshot> {
+            self.inner
+                .status_observability_snapshot_with_execution(execution)
         }
 
         fn close(&self) -> tsink::Result<()> {
@@ -9415,6 +10790,34 @@ mod tests {
             .map(|(_, value)| value.as_str())
     }
 
+    fn prometheus_sample_value<'a>(body: &'a str, metric: &str) -> Option<&'a str> {
+        body.lines().find_map(|line| {
+            let (sample, value) = line.split_once(' ')?;
+            (sample == metric).then_some(value)
+        })
+    }
+
+    fn assert_empty_metrics_hotspot(body: &str) {
+        for metric in [
+            "tsink_cluster_hotspot_skewed_shards",
+            "tsink_cluster_hotspot_skewed_tenants",
+            "tsink_cluster_hotspot_max_shard_score",
+            "tsink_cluster_hotspot_max_tenant_score",
+        ] {
+            assert_eq!(
+                prometheus_sample_value(body, metric),
+                Some("0"),
+                "{metric} should render the empty hotspot value"
+            );
+        }
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.starts_with("tsink_cluster_hotspot_shard_") && line.contains('{')),
+            "an empty hotspot must not render labeled shard samples"
+        );
+    }
+
     fn internal_api() -> InternalApiConfig {
         InternalApiConfig::new(
             "cluster-test-token".to_string(),
@@ -9762,6 +11165,62 @@ mod tests {
         ));
         context.digest_runtime = Some(digest_runtime);
         attach_cluster_audit_log(temp_dir, "cluster-audit-digest.log", &mut context);
+        Arc::new(context)
+    }
+
+    fn cluster_context_with_control_state_and_digest_runtime<F>(
+        temp_dir: &TempDir,
+        mutate: F,
+    ) -> Arc<ClusterRequestContext>
+    where
+        F: FnOnce(&mut ControlState),
+    {
+        let cfg = ClusterConfig {
+            enabled: true,
+            node_id: Some("node-a".to_string()),
+            bind: Some("127.0.0.1:9301".to_string()),
+            seeds: vec!["node-b@127.0.0.1:9302".to_string()],
+            ..ClusterConfig::default()
+        };
+        let runtime = ClusterRuntime::bootstrap(&with_test_cluster_auth_token(cfg))
+            .expect("cluster runtime should build")
+            .expect("cluster runtime should be enabled");
+        let mut context =
+            ClusterRequestContext::from_runtime(runtime).expect("cluster context should build");
+        let state_store = Arc::new(
+            ControlStateStore::open(temp_dir.path().join("control-state-status.json"))
+                .expect("control state store should open"),
+        );
+        let mut bootstrap_state =
+            ControlState::from_runtime(&context.runtime.membership, &context.runtime.ring);
+        mutate(&mut bootstrap_state);
+        bootstrap_state
+            .validate()
+            .expect("mutated control state should validate");
+        state_store
+            .persist(&bootstrap_state)
+            .expect("bootstrap control state should persist");
+        let consensus = Arc::new(
+            ControlConsensusRuntime::open(
+                context.runtime.membership.clone(),
+                Arc::clone(&state_store),
+                bootstrap_state,
+                temp_dir.path().join("control-log-status.json"),
+                ControlConsensusConfig::default(),
+            )
+            .expect("control consensus should open"),
+        );
+        context.control_state_store = Some(state_store);
+        context.control_consensus = Some(Arc::clone(&consensus));
+        context.digest_runtime = Some(Arc::new(
+            crate::cluster::repair::DigestExchangeRuntime::new(
+                context.runtime.membership.local_node_id.clone(),
+                context.rpc_client.clone(),
+                consensus,
+                crate::cluster::repair::DigestExchangeConfig::default(),
+            ),
+        ));
+        attach_cluster_audit_log(temp_dir, "cluster-audit-status-digest.log", &mut context);
         Arc::new(context)
     }
 
@@ -12197,6 +13656,10 @@ mod tests {
         assert!(bounded_snapshot.returned_bytes > 0);
         assert!(bounded_snapshot.intermediate_vector_size >= 1);
         assert!(remote_request_count.load(AtomicOrdering::Relaxed) > 0);
+        let budget = storage.query_budget_snapshot();
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
 
         shutdown_tx
             .send(())
@@ -13809,6 +15272,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_internal_select_has_exact_boundaries_and_zero_residual() {
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let start = 1_700_000_000_300;
+        let end = 1_700_000_000_320;
+        let expected_points = vec![
+            DataPoint::new(1_700_000_000_310, 3.0),
+            DataPoint::new(1_700_000_000_311, 4.0),
+        ];
+        let expected_returned_bytes =
+            crate::cluster::query::modeled_series_points_returned_bytes(&[tsink::SeriesPoints {
+                series: MetricSeries {
+                    name: metric.clone(),
+                    labels: labels.clone(),
+                },
+                points: expected_points.clone(),
+            }]);
+        assert!(expected_returned_bytes > 1);
+
+        let build_storage = |request_limits: QueryWorkLimits| {
+            let mut query_limits = tsink::ResourceLimits::server().query;
+            query_limits.per_query = query_limits.per_query.tightened_by(request_limits);
+            let storage: Arc<dyn Storage> = StorageBuilder::new()
+                .with_resource_profile(tsink::ResourceProfile::Server)
+                .with_query_budget_limits(query_limits)
+                .with_timestamp_precision(TimestampPrecision::Milliseconds)
+                .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+                .build()
+                .expect("bounded select storage should build");
+            let rows = expected_points
+                .iter()
+                .cloned()
+                .map(|point| Row::with_labels(metric.clone(), labels.clone(), point))
+                .collect::<Vec<_>>();
+            storage
+                .insert_rows(&rows)
+                .expect("bounded select fixture should seed");
+            storage
+        };
+        let dispatch = |storage: Arc<dyn Storage>| {
+            let internal_api = internal_api.clone();
+            let cluster_context = Arc::clone(&cluster_context);
+            let metric = metric.clone();
+            let labels = labels.clone();
+            async move {
+                let engine = make_engine(&storage);
+                let payload = serde_json::to_vec(&InternalSelectRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    metric,
+                    labels,
+                    start,
+                    end,
+                })
+                .expect("select payload should serialize");
+                dispatch_internal_request(
+                    &storage,
+                    &engine,
+                    &internal_api,
+                    Some(cluster_context.as_ref()),
+                    "POST",
+                    "/internal/v1/select",
+                    payload,
+                )
+                .await
+            }
+        };
+        let assert_released = |storage: &Arc<dyn Storage>| {
+            let snapshot = storage.query_budget_snapshot();
+            assert_eq!(snapshot.active_queries, 0);
+            assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+            assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+        };
+
+        let calibration_storage = build_storage(QueryWorkLimits::default());
+        let before = calibration_storage.query_budget_snapshot();
+        let calibration = dispatch(Arc::clone(&calibration_storage)).await;
+        assert_eq!(
+            calibration.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&calibration.body)
+        );
+        let calibration_json: JsonValue =
+            serde_json::from_slice(&calibration.body).expect("select JSON should decode");
+        let calibration_object = calibration_json
+            .as_object()
+            .expect("select response should be an object");
+        assert_eq!(calibration_object.len(), 1);
+        assert!(calibration_object.contains_key("points"));
+        let calibration_body: InternalSelectResponse =
+            serde_json::from_slice(&calibration.body).expect("select response should decode");
+        assert_eq!(calibration_body.points, expected_points);
+        let after = calibration_storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        let exact_memory_bytes = after.peak_shared_reserved_memory_bytes;
+        assert!(exact_memory_bytes > 1);
+        assert_released(&calibration_storage);
+
+        let exact_returned_storage = build_storage(QueryWorkLimits {
+            max_returned_bytes: Some(expected_returned_bytes),
+            ..QueryWorkLimits::default()
+        });
+        let exact_returned = dispatch(Arc::clone(&exact_returned_storage)).await;
+        assert_eq!(exact_returned.status, 200);
+        assert_eq!(exact_returned.body, calibration.body);
+        assert_released(&exact_returned_storage);
+
+        let below_returned_storage = build_storage(QueryWorkLimits {
+            max_returned_bytes: Some(expected_returned_bytes - 1),
+            ..QueryWorkLimits::default()
+        });
+        let below_returned = dispatch(Arc::clone(&below_returned_storage)).await;
+        assert_eq!(below_returned.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_returned.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_returned_bytes");
+        assert!(!error.retryable);
+        assert_released(&below_returned_storage);
+
+        let exact_samples_storage = build_storage(QueryWorkLimits {
+            max_samples_returned: Some(2),
+            ..QueryWorkLimits::default()
+        });
+        let exact_samples = dispatch(Arc::clone(&exact_samples_storage)).await;
+        assert_eq!(exact_samples.status, 200);
+        assert_released(&exact_samples_storage);
+
+        let below_samples_storage = build_storage(QueryWorkLimits {
+            max_samples_returned: Some(1),
+            ..QueryWorkLimits::default()
+        });
+        let below_samples = dispatch(Arc::clone(&below_samples_storage)).await;
+        assert_eq!(below_samples.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_samples.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_samples_returned");
+        assert!(!error.retryable);
+        assert_released(&below_samples_storage);
+
+        let exact_memory_storage = build_storage(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory_bytes),
+            ..QueryWorkLimits::default()
+        });
+        let exact_memory = dispatch(Arc::clone(&exact_memory_storage)).await;
+        assert_eq!(exact_memory.status, 200);
+        assert_eq!(exact_memory.body, calibration.body);
+        assert_released(&exact_memory_storage);
+
+        let below_memory_storage = build_storage(QueryWorkLimits {
+            max_memory_bytes: Some(exact_memory_bytes - 1),
+            ..QueryWorkLimits::default()
+        });
+        let below_memory = dispatch(Arc::clone(&below_memory_storage)).await;
+        assert_eq!(below_memory.status, 413);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&below_memory.body).expect("error should decode");
+        assert_eq!(error.code, "query_limit_per_query_memory_bytes");
+        assert!(!error.retryable);
+        assert_released(&below_memory_storage);
+    }
+
+    #[tokio::test]
     async fn internal_list_metrics_has_exact_bounded_accounting_and_zero_residual() {
         let storage = make_storage();
         let engine = make_engine(&storage);
@@ -13854,6 +15488,12 @@ mod tests {
         let budget_before = storage.query_budget_snapshot();
         let legacy = dispatch(None).await;
         assert_eq!(legacy.status, 200);
+        let legacy_json: JsonValue =
+            serde_json::from_slice(&legacy.body).expect("legacy JSON should decode");
+        assert!(
+            legacy_json.get("accounting").is_none(),
+            "legacy list_metrics wire shape must omit additive accounting"
+        );
         let legacy_body: InternalListMetricsResponse =
             serde_json::from_slice(&legacy.body).expect("legacy response should decode");
         assert!(legacy_body.accounting.is_none());
@@ -13958,7 +15598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_internal_list_metrics_rejects_false_complete_storage_accounting() {
+    async fn legacy_internal_list_metrics_rejects_false_complete_storage_accounting() {
         let inner = make_storage();
         let internal_api = internal_api();
         let temp_dir = TempDir::new().expect("tempdir should build");
@@ -13979,7 +15619,7 @@ mod tests {
                 cluster_context.as_ref(),
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
-            query_limits: Some(QueryWorkLimits::default()),
+            query_limits: None,
         })
         .expect("payload should serialize");
 
@@ -14004,12 +15644,15 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_bounded_internal_read_handlers_cancels_blocking_storage_work() {
-        for path in [
-            "/internal/v1/select_batch",
-            "/internal/v1/select_series",
-            "/internal/v1/list_metrics",
-            "/internal/v1/digest_window",
-            "/internal/v1/repair_backfill",
+        for (path, omit_metadata_query_limits) in [
+            ("/internal/v1/select", false),
+            ("/internal/v1/select_batch", false),
+            ("/internal/v1/select_series", false),
+            ("/internal/v1/select_series", true),
+            ("/internal/v1/list_metrics", false),
+            ("/internal/v1/list_metrics", true),
+            ("/internal/v1/digest_window", false),
+            ("/internal/v1/repair_backfill", false),
         ] {
             let inner = make_storage();
             let started = Arc::new(AtomicBool::new(false));
@@ -14028,6 +15671,14 @@ mod tests {
                 % u64::from(cluster_context.runtime.ring.shard_count()))
                 as u32;
             let payload = match path {
+                "/internal/v1/select" => serde_json::to_vec(&InternalSelectRequest {
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    metric,
+                    labels,
+                    start: 10,
+                    end: 20,
+                })
+                .expect("select payload should serialize"),
                 "/internal/v1/select_batch" => serde_json::to_vec(&InternalSelectBatchRequest {
                     ring_version: DEFAULT_INTERNAL_RING_VERSION,
                     selectors: vec![MetricSeries {
@@ -14046,7 +15697,8 @@ mod tests {
                         DEFAULT_INTERNAL_RING_VERSION,
                     )),
                     selection: SeriesSelection::new(),
-                    query_limits: Some(QueryWorkLimits::default()),
+                    query_limits: (!omit_metadata_query_limits)
+                        .then_some(QueryWorkLimits::default()),
                 })
                 .expect("select_series payload should serialize"),
                 "/internal/v1/list_metrics" => serde_json::to_vec(&InternalListMetricsRequest {
@@ -14055,7 +15707,8 @@ mod tests {
                         cluster_context.as_ref(),
                         DEFAULT_INTERNAL_RING_VERSION,
                     )),
-                    query_limits: Some(QueryWorkLimits::default()),
+                    query_limits: (!omit_metadata_query_limits)
+                        .then_some(QueryWorkLimits::default()),
                 })
                 .expect("list_metrics payload should serialize"),
                 "/internal/v1/digest_window" => serde_json::to_vec(&InternalDigestWindowRequest {
@@ -14138,7 +15791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_internal_select_series_rejects_a_false_complete_result_reservation() {
+    async fn legacy_internal_select_series_rejects_a_false_complete_result_reservation() {
         let inner = make_storage();
         let internal_api = internal_api();
         let temp_dir = TempDir::new().expect("tempdir should build");
@@ -14160,14 +15813,7 @@ mod tests {
                 DEFAULT_INTERNAL_RING_VERSION,
             )),
             selection: SeriesSelection::new(),
-            query_limits: Some(QueryWorkLimits {
-                max_memory_bytes: Some(8 * 1024 * 1024),
-                max_series_matched: Some(100),
-                max_returned_bytes: Some(1024 * 1024),
-                max_pattern_expansion: Some(10_000),
-                max_intermediate_vector_size: Some(100),
-                ..QueryWorkLimits::default()
-            }),
+            query_limits: None,
         })
         .expect("payload should serialize");
 
@@ -14188,6 +15834,86 @@ mod tests {
         assert_eq!(error.code, "query_accounting_invalid");
         assert!(!error.retryable);
         assert!(error.error.contains("reserved only"));
+    }
+
+    #[tokio::test]
+    async fn legacy_internal_select_rejects_false_complete_storage_accounting() {
+        let inner = make_storage();
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_control(&temp_dir);
+        let (metric, labels) = find_series_owned_by_local(cluster_context.as_ref());
+        let storage: Arc<dyn Storage> = Arc::new(LyingSelectSeriesAccountingStorage { inner });
+        let engine = make_engine(&storage);
+        let payload = serde_json::to_vec(&InternalSelectRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            metric,
+            labels,
+            start: 10,
+            end: 20,
+        })
+        .expect("payload should serialize");
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            Some(cluster_context.as_ref()),
+            "POST",
+            "/internal/v1/select",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_invalid");
+        assert!(!error.retryable);
+        assert!(error.error.contains("matched-series"));
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_internal_select_rejects_unaccounted_storage_before_admission() {
+        let storage: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage {
+            inner: make_storage(),
+        });
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let payload = serde_json::to_vec(&InternalSelectRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            metric: "legacy_unaccounted_select".to_string(),
+            labels: Vec::new(),
+            start: 10,
+            end: 20,
+        })
+        .expect("payload should serialize");
+        let before = storage.query_budget_snapshot();
+
+        let response = dispatch_internal_request(
+            &storage,
+            &engine,
+            &internal_api,
+            None,
+            "POST",
+            "/internal/v1/select",
+            payload,
+        )
+        .await;
+
+        assert_eq!(response.status, 409);
+        let error: InternalErrorResponse =
+            serde_json::from_slice(&response.body).expect("error should decode");
+        assert_eq!(error.code, "query_accounting_unavailable");
+        assert!(!error.retryable);
+        let after = storage.query_budget_snapshot();
+        assert_eq!(after.queries_started_total, before.queries_started_total);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
     }
 
     #[tokio::test]
@@ -14626,6 +16352,12 @@ mod tests {
         )
         .await;
         assert_eq!(select_series_response.status, 200);
+        let select_series_json: JsonValue = serde_json::from_slice(&select_series_response.body)
+            .expect("select_series JSON should decode");
+        assert!(
+            select_series_json.get("accounting").is_none(),
+            "legacy select_series wire shape must omit additive accounting"
+        );
         let select_series_body: InternalSelectSeriesResponse =
             serde_json::from_slice(&select_series_response.body).expect("valid JSON");
         assert!(select_series_body
@@ -20093,7 +21825,15 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_returns_exposition_format() {
         let storage = make_storage();
+        storage
+            .insert_rows(&[Row::with_labels(
+                "metrics_accounting_fixture",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1, 1.0),
+            )])
+            .expect("metrics accounting fixture should insert");
         let engine = make_engine(&storage);
+        let before = storage.query_budget_snapshot();
 
         let request = HttpRequest {
             method: "GET".to_string(),
@@ -20111,8 +21851,30 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 200);
+        assert_eq!(
+            response_header(&response, "Content-Type"),
+            Some("text/plain; version=0.0.4")
+        );
+        assert!(response.body.len() <= metrics::METRICS_MAX_RESPONSE_BYTES);
 
         let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_query_budget_active_queries 1\n"));
+        let reserved_during_render = body
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("tsink_query_budget_reserved_memory_bytes ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("query reserved-memory gauge should be present");
+        assert!(reserved_during_render > 0);
+        let max_tenant_score =
+            prometheus_sample_value(body, "tsink_cluster_hotspot_max_tenant_score")
+                .and_then(|value| value.parse::<f64>().ok())
+                .expect("tenant hotspot score should be present");
+        assert!(
+            max_tenant_score > 0.0,
+            "the stored fixture should contribute to rendered hotspot output"
+        );
         assert!(body.contains("tsink_memory_used_bytes"));
         assert!(body.contains("tsink_memory_excluded_bytes"));
         assert!(body.contains("tsink_memory_excluded_bytes_known"));
@@ -20239,13 +22001,32 @@ mod tests {
         assert!(body.contains("tsink_cluster_hotspot_skewed_shards"));
         assert!(body.contains("tsink_cluster_hotspot_shard_pressure_score"));
         assert!(body.contains("tsink_metrics_collection_errors 0"));
+
+        let after = storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert!(after.peak_shared_reserved_memory_bytes > 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     #[tokio::test]
-    async fn metrics_endpoint_reports_collection_errors() {
-        let inner = make_storage();
-        let storage: Arc<dyn Storage> = Arc::new(ListMetricsFailingStorage { inner });
+    async fn metrics_endpoint_reports_detailed_list_failure() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::StorageFailure,
+        ));
+        let storage: Arc<dyn Storage> = test_storage.clone();
         let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
 
         let response = handle_request(
             &storage,
@@ -20266,6 +22047,548 @@ mod tests {
         assert!(body.contains("tsink_metrics_collection_errors 1"));
         assert!(
             body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_incomplete_accounting_without_invocation() {
+        let test_storage = Arc::new(
+            MetricsAccountingTestStorage::new(
+                make_storage(),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .with_accounting(tsink::QueryExecutionAccounting::Unaccounted),
+        );
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(after.queries_started_total, before.queries_started_total);
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_unavailable_query_admission_without_fallback() {
+        let test_storage = Arc::new(
+            MetricsAccountingTestStorage::new(
+                make_storage(),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .without_query_admission(),
+        );
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(after.queries_started_total, before.queries_started_total);
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_admission_failure_without_uncontrolled_fallback() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                ..QueryBudgetLimits::default()
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let blocker = test_storage
+            .budget
+            .begin_query()
+            .expect("blocking metrics execution should admit");
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let blocked = test_storage.budget.snapshot();
+        assert_eq!(blocked.active_queries, 1);
+        assert_eq!(blocked.concurrency_rejections_total, 1);
+
+        drop(blocker);
+        let after = test_storage.budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_invalid_complete_result_and_releases_execution() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::MissingReservation,
+        ));
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_undersized_complete_result_and_releases_guard() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::UndersizedReservation,
+        ));
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(
+            body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_exposition_returned_byte_failure_and_releases_execution() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                per_query: QueryWorkLimits {
+                    max_returned_bytes: Some(1),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert_eq!(
+            response_header(&response, "Content-Type"),
+            Some("text/plain; version=0.0.4")
+        );
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(body.contains("tsink_metrics_collection_error{collector=\"exposition_body\"} 1"));
+        assert!(
+            !body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert!(!body.contains("tsink_metrics_collection_error{collector=\"cluster_hotspot\"} 1"));
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            after.returned_bytes_rejections_total,
+            before.returned_bytes_rejections_total + 1
+        );
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_hotspot_vector_failure_after_accounted_listing() {
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                per_query: QueryWorkLimits {
+                    max_intermediate_vector_size: Some(1),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            MetricsAccountingTestResult::AccountedDistinctTenants,
+        ));
+        let storage: Arc<dyn Storage> = test_storage.clone();
+        let engine = make_engine(&storage);
+        let before = test_storage.budget.snapshot();
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/metrics".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response_header(&response, "Content-Type"),
+            Some("text/plain; version=0.0.4")
+        );
+        let body = std::str::from_utf8(&response.body).expect("valid utf8");
+        assert!(body.contains("tsink_metrics_collection_errors 1"));
+        assert!(body.contains("tsink_metrics_collection_error{collector=\"cluster_hotspot\"} 1"));
+        assert!(
+            !body.contains("tsink_metrics_collection_error{collector=\"storage_list_metrics\"} 1")
+        );
+        assert!(!body.contains("tsink_metrics_collection_error{collector=\"exposition_body\"} 1"));
+        assert_empty_metrics_hotspot(body);
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(
+            after.intermediate_vector_size_rejections_total,
+            before.intermediate_vector_size_rejections_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_enforces_exact_returned_byte_boundary() {
+        let inner = make_storage();
+        let calibration = Arc::new(MetricsAccountingTestStorage::new(
+            Arc::clone(&inner),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let calibration_response = scrape_metrics_accounting_storage(&calibration).await;
+        assert_eq!(calibration_response.status, 200);
+        let calibration_body =
+            std::str::from_utf8(&calibration_response.body).expect("valid exposition");
+        assert!(calibration_body.contains("tsink_metrics_collection_errors 0\n"));
+        let exact_returned =
+            u64::try_from(calibration_response.body.len()).expect("body length should fit u64");
+        assert!(exact_returned > 1);
+
+        let returned_exact = Arc::new(MetricsAccountingTestStorage::new(
+            Arc::clone(&inner),
+            QueryBudgetLimits {
+                per_query: QueryWorkLimits {
+                    max_returned_bytes: Some(exact_returned),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let returned_exact_response = scrape_metrics_accounting_storage(&returned_exact).await;
+        assert_eq!(returned_exact_response.status, 200);
+        assert_eq!(returned_exact_response.body, calibration_response.body);
+        let returned_exact_after = returned_exact.budget.snapshot();
+        assert_eq!(returned_exact_after.queries_started_total, 1);
+        assert_eq!(returned_exact_after.queries_completed_total, 1);
+        assert_eq!(returned_exact_after.active_queries, 0);
+        assert_eq!(returned_exact_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(returned_exact_after.returned_bytes_rejections_total, 0);
+
+        let returned_one_under = Arc::new(MetricsAccountingTestStorage::new(
+            Arc::clone(&inner),
+            QueryBudgetLimits {
+                per_query: QueryWorkLimits {
+                    max_returned_bytes: Some(exact_returned - 1),
+                    ..QueryWorkLimits::default()
+                },
+                ..QueryBudgetLimits::default()
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let returned_one_under_response =
+            scrape_metrics_accounting_storage(&returned_one_under).await;
+        assert_eq!(returned_one_under_response.status, 200);
+        assert_eq!(
+            response_header(&returned_one_under_response, "Content-Type"),
+            Some("text/plain; version=0.0.4")
+        );
+        let returned_one_under_body =
+            std::str::from_utf8(&returned_one_under_response.body).expect("valid fallback");
+        assert!(returned_one_under_body.contains("tsink_metrics_collection_errors 1\n"));
+        assert!(returned_one_under_body
+            .contains("tsink_metrics_collection_error{collector=\"exposition_body\"} 1\n"));
+        assert!(!returned_one_under_body.contains("tsink_memory_used_bytes"));
+        let returned_one_under_after = returned_one_under.budget.snapshot();
+        assert_eq!(returned_one_under_after.queries_started_total, 1);
+        assert_eq!(returned_one_under_after.queries_completed_total, 1);
+        assert_eq!(returned_one_under_after.returned_bytes_rejections_total, 1);
+        assert_eq!(returned_one_under_after.active_queries, 0);
+        assert_eq!(returned_one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            returned_one_under_after.accounting_invariant_violations_total,
+            0
         );
     }
 
@@ -22578,6 +24901,373 @@ mod tests {
         assert_eq!(body["errorType"], "rebalance_run_in_progress");
     }
 
+    #[test]
+    fn admin_rebalance_json_enforces_exact_memory_returned_and_cancellation_boundaries() {
+        fn budget_and_execution(
+            memory: Option<u64>,
+            returned: Option<u64>,
+        ) -> (tsink::QueryBudget, tsink::QueryExecution) {
+            let budget = tsink::QueryBudget::new(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: memory,
+                per_query: QueryWorkLimits {
+                    max_returned_bytes: returned,
+                    max_memory_bytes: memory,
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .expect("rebalance response test budget should build");
+            let execution = budget
+                .begin_query()
+                .expect("rebalance response test query should admit");
+            (budget, execution)
+        }
+
+        let snapshot = RebalanceSchedulerSnapshot::empty();
+        let hotspot = ClusterHotspotSnapshot {
+            generated_unix_ms: 1,
+            hot_shards: Vec::new(),
+            tenant_hotspots: Vec::new(),
+            skewed_shards: 0,
+            skewed_tenants: 0,
+            max_shard_score: 0.0,
+            max_tenant_score: 0.0,
+        };
+        let (calibration_budget, calibration) = budget_and_execution(None, None);
+        let response = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &calibration,
+            true,
+        )
+        .expect("calibration response should serialize");
+        let exact_returned =
+            u64::try_from(response.response.body.len()).expect("response length should fit u64");
+        let exact_memory = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(exact_returned > 1);
+        assert!(exact_memory > 1);
+        drop(response);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let (embedded_budget, embedded) =
+            budget_and_execution(Some(exact_memory), Some(exact_returned));
+        let response = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &embedded,
+            false,
+        )
+        .expect("embedded rebalance response should serialize");
+        assert_eq!(embedded.snapshot().returned_bytes, 0);
+        drop(response);
+        drop(embedded);
+        assert_eq!(embedded_budget.snapshot().active_queries, 0);
+        assert_eq!(embedded_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let (returned_budget, returned_exact) =
+            budget_and_execution(Some(exact_memory), Some(exact_returned));
+        let response = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &returned_exact,
+            true,
+        )
+        .expect("the exact returned-byte boundary should pass");
+        assert_eq!(
+            u64::try_from(response.response.body.len()).unwrap(),
+            exact_returned
+        );
+        drop(response);
+        drop(returned_exact);
+        let returned_after = returned_budget.snapshot();
+        assert_eq!(returned_after.active_queries, 0);
+        assert_eq!(returned_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(returned_after.returned_bytes_rejections_total, 0);
+
+        let (below_returned_budget, below_returned) =
+            budget_and_execution(Some(exact_memory), Some(exact_returned - 1));
+        let error = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &below_returned,
+            true,
+        )
+        .expect_err("one returned byte below the exact body must fail");
+        assert!(matches!(
+            error,
+            AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::LimitExceeded(
+                exceeded
+            )) if exceeded.reason == tsink::QueryLimitReason::ReturnedBytes
+        ));
+        drop(below_returned);
+        let below_returned_after = below_returned_budget.snapshot();
+        assert_eq!(below_returned_after.active_queries, 0);
+        assert_eq!(below_returned_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(below_returned_after.returned_bytes_rejections_total, 1);
+
+        let (memory_budget, memory_exact) =
+            budget_and_execution(Some(exact_memory), Some(exact_returned));
+        let response = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &memory_exact,
+            true,
+        )
+        .expect("the exact memory boundary should pass");
+        drop(response);
+        drop(memory_exact);
+        let memory_after = memory_budget.snapshot();
+        assert_eq!(memory_after.peak_shared_reserved_memory_bytes, exact_memory);
+        assert_eq!(memory_after.active_queries, 0);
+        assert_eq!(memory_after.shared_reserved_memory_bytes, 0);
+
+        let (below_memory_budget, below_memory) =
+            budget_and_execution(Some(exact_memory - 1), Some(exact_returned));
+        let error = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &below_memory,
+            true,
+        )
+        .expect_err("one memory byte below the exact peak must fail");
+        assert!(matches!(
+            error,
+            AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::LimitExceeded(
+                exceeded
+            )) if matches!(
+                exceeded.reason,
+                tsink::QueryLimitReason::PerQueryMemoryBytes
+                    | tsink::QueryLimitReason::SharedMemoryBytes
+            )
+        ));
+        drop(below_memory);
+        let below_memory_after = below_memory_budget.snapshot();
+        assert_eq!(below_memory_after.active_queries, 0);
+        assert_eq!(below_memory_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            below_memory_after
+                .per_query_memory_rejections_total
+                .saturating_add(below_memory_after.shared_memory_rejections_total),
+            1
+        );
+
+        let cancellation = tsink::QueryCancellationToken::new();
+        let cancellation_budget =
+            tsink::QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancelled = cancellation_budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+        let error = admin_rebalance_success_response(
+            200,
+            AdminRebalanceOperation::Status,
+            "node-a",
+            &snapshot,
+            &hotspot,
+            false,
+            "cluster rebalance scheduler status",
+            &cancelled,
+            true,
+        )
+        .expect_err("cancellation must interrupt measurement");
+        assert!(matches!(
+            error,
+            AdminRebalanceResponseError::Budget(tsink::QueryBudgetError::Cancelled)
+        ));
+        drop(cancelled);
+        let cancelled_after = cancellation_budget.snapshot();
+        assert_eq!(cancelled_after.active_queries, 0);
+        assert_eq!(cancelled_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(cancelled_after.cancellations_total, 1);
+        assert_eq!(cancelled_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_rebalance_status_uses_one_execution_and_releases_all_reservations() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context =
+            cluster_context_with_single_node_control_and_digest_runtime(&temp_dir);
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::AccountedDistinctTenants,
+        ));
+        let before = test_storage.budget.snapshot();
+        let response = dispatch_admin_rebalance_accounting_storage(
+            &test_storage,
+            cluster_context.as_ref(),
+            "GET",
+            "/api/v1/admin/cluster/rebalance/status",
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["operation"], "rebalance_status");
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_rebalance_cancellation_releases_the_root_execution() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context =
+            cluster_context_with_single_node_control_and_digest_runtime(&temp_dir);
+        let test_storage = Arc::new(
+            MetricsAccountingTestStorage::new(
+                make_storage(),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .cancelling_on_admission(),
+        );
+        let response = dispatch_admin_rebalance_accounting_storage(
+            &test_storage,
+            cluster_context.as_ref(),
+            "GET",
+            "/api/v1/admin/cluster/rebalance/status",
+        )
+        .await;
+
+        assert_eq!(response.status, 503);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "canceled");
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(after.queries_started_total, 1);
+        assert_eq!(after.queries_completed_total, 1);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_rebalance_pause_reports_post_effect_memory_failure_truthfully() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context =
+            cluster_context_with_single_node_control_and_digest_runtime(&temp_dir);
+        let test_storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(8 * 1024),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(8 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let response = dispatch_admin_rebalance_accounting_storage(
+            &test_storage,
+            cluster_context.as_ref(),
+            "POST",
+            "/api/v1/admin/cluster/rebalance/pause",
+        )
+        .await;
+
+        assert!(matches!(response.status, 413 | 429));
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["data"]["operation"], "pause_rebalance");
+        assert_eq!(body["data"]["effectApplied"], true);
+        assert_eq!(body["data"]["rebalancePaused"], true);
+        assert_eq!(body["data"]["rebalanceRunCompleted"], false);
+        assert!(
+            cluster_context
+                .digest_runtime
+                .as_ref()
+                .expect("digest runtime should exist")
+                .rebalance_control_snapshot()
+                .paused
+        );
+        assert_eq!(
+            test_storage
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            test_storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = test_storage.budget.snapshot();
+        assert_eq!(after.queries_started_total, 1);
+        assert_eq!(after.queries_completed_total, 1);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
     #[tokio::test]
     async fn admin_cluster_membership_operations_are_idempotent() {
         let storage = make_storage();
@@ -23014,6 +25704,46 @@ mod tests {
 
         let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
         assert_eq!(body["status"], "success");
+        assert_eq!(
+            body["data"]["cluster"]["control"],
+            json!({
+                "localNodeId": "standalone",
+                "currentTerm": 0,
+                "commitIndex": 0,
+                "leaderNodeId": null,
+                "leaderStale": false,
+                "leaderLastContactUnixMs": null,
+                "leaderContactAgeMs": null,
+                "suspectPeers": 0,
+                "deadPeers": 0,
+                "persistence": {
+                    "fenced": false,
+                    "pendingCheckpoint": null,
+                    "cleanupDebt": false,
+                    "detail": null,
+                    "degraded": false
+                },
+                "peers": []
+            }),
+            "the zero-allocation standalone control fallback must preserve the legacy schema"
+        );
+        assert_eq!(
+            body["data"]["cluster"]["handoff"],
+            json!({
+                "totalShards": 0,
+                "inProgressShards": 0,
+                "warmupShards": 0,
+                "cutoverShards": 0,
+                "finalSyncShards": 0,
+                "completedShards": 0,
+                "failedShards": 0,
+                "resumedShards": 0,
+                "copiedRowsTotal": 0,
+                "pendingRowsTotal": 0,
+                "shards": []
+            }),
+            "the empty handoff fallback must remain byte-for-byte schema equivalent"
+        );
         assert!(body["data"]["seriesCount"].is_number());
         assert!(body["data"]["memoryUsedBytes"].is_number());
         assert_eq!(
@@ -23322,6 +26052,469 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_tsdb_cluster_projections_preserve_values_tenant_scope_and_one_execution() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context =
+            cluster_context_with_control_state_and_digest_runtime(&temp_dir, |state| {
+                state.leader_node_id = Some("node-b".to_string());
+                state.transitions = vec![ShardOwnershipTransition {
+                    shard: 0,
+                    from_node_id: "node-a".to_string(),
+                    to_node_id: "node-b".to_string(),
+                    activation_ring_version: state.ring_version,
+                    handoff: ShardHandoffProgress {
+                        phase: ShardHandoffPhase::Warmup,
+                        copied_rows: 41,
+                        pending_rows: 37,
+                        resumed_count: 2,
+                        started_unix_ms: 11,
+                        updated_unix_ms: 22,
+                        last_error: Some("status handoff diagnostic".to_string()),
+                    },
+                }];
+            });
+        let expected_handoff = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should exist")
+            .current_state()
+            .handoff_snapshot();
+        let expected_rebalance = cluster_context
+            .digest_runtime
+            .as_ref()
+            .expect("digest runtime should exist")
+            .rebalance_snapshot();
+        hotspot::record_tenant_query("tenant-a", 3, 17);
+        hotspot::record_tenant_query("tenant-b", 5, 29);
+        let storage = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits::default(),
+            MetricsAccountingTestResult::AccountedDistinctTenants,
+        ));
+
+        let response = dispatch_status_accounting_storage_with_cluster(
+            &storage,
+            cluster_context.as_ref(),
+            "tenant-a",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid status JSON");
+        let cluster = &body["data"]["cluster"];
+        assert_eq!(cluster["control"]["localNodeId"], "node-a");
+        assert_eq!(cluster["control"]["leaderNodeId"], "node-b");
+        assert_eq!(cluster["control"]["persistence"]["fenced"], false);
+        assert_eq!(
+            cluster["handoff"]["totalShards"],
+            expected_handoff.total_shards
+        );
+        assert_eq!(
+            cluster["handoff"]["pendingRowsTotal"],
+            expected_handoff.pending_rows_total
+        );
+        assert_eq!(cluster["handoff"]["shards"][0]["shard"], 0);
+        assert_eq!(
+            cluster["handoff"]["shards"][0]["lastError"],
+            "status handoff diagnostic"
+        );
+        assert_eq!(
+            cluster["rebalance"]["activeJobs"],
+            expected_rebalance.active_jobs
+        );
+        assert_eq!(
+            cluster["rebalance"]["runsTotal"],
+            expected_rebalance.runs_total
+        );
+        assert_eq!(cluster["rebalance"]["jobs"][0]["shard"], 0);
+        assert_eq!(
+            cluster["rebalance"]["jobs"][0]["fromNodeId"],
+            expected_rebalance.jobs[0].from_node_id
+        );
+        assert_eq!(
+            cluster["rebalance"]["jobs"][0]["toNodeId"],
+            expected_rebalance.jobs[0].to_node_id
+        );
+        let tenant_pressure = cluster["hotspot"]["tenantPressure"]
+            .as_array()
+            .expect("tenant pressure should be an array");
+        assert!(!tenant_pressure.is_empty());
+        assert!(tenant_pressure
+            .iter()
+            .all(|tenant| tenant["tenantId"] == "tenant-a"));
+        assert!(!tenant_pressure
+            .iter()
+            .any(|tenant| tenant["tenantId"] == "tenant-b"));
+
+        assert_eq!(
+            storage.execution_list_calls.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            storage
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let budget = storage.budget.snapshot();
+        assert_eq!(budget.queries_started_total, 1);
+        assert_eq!(budget.queries_completed_total, 1);
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_cluster_producer_failure_and_cancellation_release_root_execution() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context =
+            cluster_context_with_control_state_and_digest_runtime(&temp_dir, |state| {
+                state.transitions = vec![ShardOwnershipTransition {
+                    shard: 0,
+                    from_node_id: "node-a".to_string(),
+                    to_node_id: "node-b".to_string(),
+                    activation_ring_version: state.ring_version,
+                    handoff: ShardHandoffProgress {
+                        phase: ShardHandoffPhase::Warmup,
+                        copied_rows: 1,
+                        pending_rows: 1,
+                        resumed_count: 0,
+                        started_unix_ms: 1,
+                        updated_unix_ms: 1,
+                        last_error: Some("x".repeat(2 * 1024 * 1024)),
+                    },
+                }];
+            });
+        let constrained = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(512 * 1024),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(512 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let response = dispatch_status_accounting_storage_with_cluster(
+            &constrained,
+            cluster_context.as_ref(),
+            "tenant-a",
+        )
+        .await;
+        assert!(matches!(response.status, 413 | 429));
+        assert!(matches!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("query_limit_per_query_memory_bytes") | Some("query_limit_shared_memory_bytes")
+        ));
+        assert_eq!(
+            constrained
+                .execution_list_calls
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            constrained
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let failed_budget = constrained.budget.snapshot();
+        assert_eq!(failed_budget.queries_started_total, 1);
+        assert_eq!(failed_budget.queries_completed_total, 1);
+        assert_eq!(failed_budget.active_queries, 0);
+        assert_eq!(failed_budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(failed_budget.accounting_invariant_violations_total, 0);
+
+        let cancelled = Arc::new(
+            MetricsAccountingTestStorage::new(
+                make_storage(),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .cancelling_on_admission(),
+        );
+        let response = dispatch_status_accounting_storage_with_cluster(
+            &cancelled,
+            cluster_context.as_ref(),
+            "tenant-a",
+        )
+        .await;
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("query_cancelled")
+        );
+        let cancelled_budget = cancelled.budget.snapshot();
+        assert_eq!(cancelled_budget.queries_started_total, 1);
+        assert_eq!(cancelled_budget.queries_completed_total, 1);
+        assert_eq!(cancelled_budget.cancellations_total, 1);
+        assert_eq!(cancelled_budget.active_queries, 0);
+        assert_eq!(cancelled_budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(cancelled_budget.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_tsdb_cluster_path_uses_only_accounted_single_generation_producers() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers.rs"))
+                .expect("handlers source should be readable");
+        let start = source
+            .find("async fn handle_tsdb_status(")
+            .expect("TSDB status handler should exist");
+        let end = source[start..]
+            .find("\nfn support_bundle_tenant_id(")
+            .map(|offset| start + offset)
+            .expect("TSDB status handler boundary should exist");
+        let handler = &source[start..end];
+
+        assert!(handler.contains("status_snapshot_with_execution(&execution)"));
+        assert!(handler
+            .contains("build_rebalance_hotspot_snapshot_with_control_metrics_tenant_execution"));
+        assert!(handler.contains("rebalance_status_snapshot_from_accounted_hotspot_with_execution"));
+        for accounted_source in [
+            "write_routing_labeled_metrics_snapshot_with_execution(&execution)",
+            "read_fanout_labeled_metrics_snapshot_with_execution(&execution)",
+            "read_planner_status_exposition_snapshot_with_execution(&execution)",
+            "edge_sync::edge_sync_status_snapshot_with_execution(",
+            "outbox.status_snapshot_with_execution(&execution)",
+            "status_snapshot_for_with_execution(&tenant_id, &execution)",
+            "accounting.status_snapshot_for_with_execution(&tenant_id, &execution)",
+            "control_plane.status_projection_for_with_execution(&tenant_id, &execution)",
+            "audit_log.health_snapshot_with_execution(&execution)",
+            "runtime.status_snapshot_with_execution(&execution)",
+            "manager.state_snapshot_with_execution(rbac_registry, &execution)",
+            "RbacRegistry::service_account_status_summary",
+        ] {
+            assert!(
+                handler.contains(accounted_source),
+                "TSDB status must use accounted source {accounted_source}"
+            );
+        }
+        assert_eq!(
+            handler
+                .matches("build_rebalance_hotspot_snapshot_with_control_metrics_tenant_execution")
+                .count(),
+            1,
+            "the rebalance path must materialize the global tracker exactly once"
+        );
+        for legacy_source in [
+            ".current_state()",
+            ".liveness_snapshot()",
+            ".persistence_status()",
+            ".handoff_snapshot()",
+            ".rebalance_snapshot()",
+            "hotspot_tracker_snapshot()",
+            "write_routing_labeled_metrics_snapshot()",
+            "read_fanout_labeled_metrics_snapshot()",
+            "read_planner_labeled_metrics_snapshot()",
+            "read_planner_last_plans_snapshot()",
+            "context.source_status_snapshot()",
+            "context.accept_status_snapshot()",
+            ".peer_backlog_snapshot()",
+            ".stalled_peer_snapshot()",
+            "registry.status_snapshot_for(&tenant_id)",
+            "UsageAccounting::ledger_status",
+            "accounting.tenant_summary(&tenant_id)",
+            "accounting.report(",
+            "ManagedControlPlane::status_snapshot",
+            "ManagedControlPlane::deployment_summaries",
+            "control_plane.tenant_snapshot(&tenant_id)",
+            "audit_log.health_snapshot()",
+            "cluster_digest_snapshot(",
+            "runtime.snapshot()",
+            "manager.state_snapshot(rbac_registry)",
+            "rbac_service_account_summary(",
+            ".shards.clone()",
+        ] {
+            assert!(
+                !handler.contains(legacy_source),
+                "TSDB status must not call legacy source {legacy_source}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_tsdb_top_write_shards_matches_legacy_order_without_allocating_output() {
+        let shards = [
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 9,
+                rows_total: 4,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 3,
+                rows_total: 10,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 7,
+                rows_total: 10,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 1,
+                rows_total: 2,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 11,
+                rows_total: 8,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 5,
+                rows_total: 6,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 2,
+                rows_total: 7,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 4,
+                rows_total: 5,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 8,
+                rows_total: 3,
+            },
+            WriteRoutingShardMetricsExpositionSnapshot {
+                shard: 6,
+                rows_total: 9,
+            },
+        ];
+
+        assert_eq!(
+            top_write_routing_shards(&shards)
+                .iter()
+                .flatten()
+                .map(|item| (item.shard, item.rows_total))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, 10),
+                (7, 10),
+                (6, 9),
+                (11, 8),
+                (2, 7),
+                (5, 6),
+                (4, 5),
+                (9, 4),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_fails_closed_without_calling_legacy_observability() {
+        let inner = make_storage();
+        let before = inner.query_budget_snapshot();
+        let wrapped = Arc::new(StatusObservabilityUnavailableStorage {
+            inner: Arc::clone(&inner),
+            legacy_observability_calls: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn Storage> = wrapped.clone();
+        let engine = make_engine(&storage);
+
+        let response = handle_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("status_observability_accounting_unavailable")
+        );
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("error JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(
+            body["error"],
+            "TSDB status requires query-accounted storage observability"
+        );
+        assert_eq!(
+            wrapped
+                .legacy_observability_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let after = inner.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn status_tsdb_projection_budget_and_cancellation_release_the_root_execution() {
+        let limited = Arc::new(MetricsAccountingTestStorage::new(
+            make_storage(),
+            QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(1),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(1),
+                    ..QueryWorkLimits::default()
+                },
+            },
+            MetricsAccountingTestResult::AccountedEmpty,
+        ));
+        let response = dispatch_status_accounting_storage(&limited).await;
+        assert!(matches!(response.status, 413 | 429));
+        assert!(matches!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("query_limit_per_query_memory_bytes") | Some("query_limit_shared_memory_bytes")
+        ));
+        assert_eq!(
+            limited.execution_list_calls.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            limited
+                .uncontrolled_list_calls
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        let limited_after = limited.budget.snapshot();
+        assert_eq!(limited_after.queries_started_total, 1);
+        assert_eq!(limited_after.queries_completed_total, 1);
+        assert_eq!(limited_after.active_queries, 0);
+        assert_eq!(limited_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(limited_after.accounting_invariant_violations_total, 0);
+
+        let cancelled = Arc::new(
+            MetricsAccountingTestStorage::new(
+                make_storage(),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .cancelling_on_admission(),
+        );
+        let response = dispatch_status_accounting_storage(&cancelled).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("query_cancelled")
+        );
+        let cancelled_after = cancelled.budget.snapshot();
+        assert_eq!(cancelled_after.queries_started_total, 1);
+        assert_eq!(cancelled_after.queries_completed_total, 1);
+        assert_eq!(cancelled_after.cancellations_total, 1);
+        assert_eq!(cancelled_after.active_queries, 0);
+        assert_eq!(cancelled_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(cancelled_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
     async fn status_tsdb_expert_unlimited_still_uses_detailed_execution() {
         let storage: Arc<dyn Storage> = StorageBuilder::new()
             .with_resource_profile(tsink::ResourceProfile::ExpertUnlimited)
@@ -23584,7 +26777,7 @@ mod tests {
             }
         });
         let calibration = execution_with_limits(None, None);
-        let prepared = serialize_tsdb_status_response(payload.clone(), &calibration)
+        let prepared = serialize_tsdb_status_response(payload.clone(), &calibration, true)
             .expect("calibration response should serialize");
         let exact_returned_bytes =
             u64::try_from(prepared.response.body.len()).expect("body length should fit u64");
@@ -23598,9 +26791,20 @@ mod tests {
         drop(prepared);
         drop(calibration);
 
+        let embedded = execution_with_limits(None, Some(exact_returned_bytes));
+        let prepared = serialize_tsdb_status_response(payload.clone(), &embedded, false)
+            .expect("embedded status response should serialize");
+        assert_eq!(embedded.snapshot().returned_bytes, 0);
+        assert_eq!(
+            u64::try_from(prepared.response.body.len()).unwrap(),
+            exact_returned_bytes
+        );
+        drop(prepared);
+        drop(embedded);
+
         let below_returned =
             execution_with_limits(Some(exact_memory_bytes), Some(exact_returned_bytes - 1));
-        let error = serialize_tsdb_status_response(payload.clone(), &below_returned)
+        let error = serialize_tsdb_status_response(payload.clone(), &below_returned, true)
             .expect_err("one byte below the encoded response must fail");
         assert_eq!(error.status, 413);
         assert_eq!(
@@ -23611,7 +26815,7 @@ mod tests {
 
         let below_memory =
             execution_with_limits(Some(exact_memory_bytes - 1), Some(exact_returned_bytes));
-        let error = serialize_tsdb_status_response(payload.clone(), &below_memory)
+        let error = serialize_tsdb_status_response(payload.clone(), &below_memory, true)
             .expect_err("one byte below the retained response peak must fail");
         assert_eq!(error.status, 413);
         assert_eq!(
@@ -23621,7 +26825,7 @@ mod tests {
         drop(below_memory);
 
         let exact = execution_with_limits(Some(exact_memory_bytes), Some(exact_returned_bytes));
-        let prepared = serialize_tsdb_status_response(payload.clone(), &exact)
+        let prepared = serialize_tsdb_status_response(payload.clone(), &exact, true)
             .expect("the exact retained and returned-byte boundary must pass");
         assert_eq!(prepared.reservation.bytes(), exact_memory_bytes);
         assert_eq!(
@@ -23635,6 +26839,7 @@ mod tests {
         let error = serialize_tsdb_status_response(
             json!({"oversized": "x".repeat(TSDB_STATUS_MAX_RESPONSE_BYTES)}),
             &oversized,
+            true,
         )
         .expect_err("the fixed encoded ceiling must stop measurement early");
         assert_eq!(error.status, 413);
@@ -23702,6 +26907,44 @@ mod tests {
         );
 
         storage.close().unwrap();
+    }
+
+    #[test]
+    fn status_external_disk_metrics_projection_preserves_the_legacy_json_schema() {
+        let dir = TempDir::new().expect("tempdir should build");
+        std::fs::write(dir.path().join("server-state.bin"), b"server-state")
+            .expect("disk fixture should write");
+        let disk = tsink::LocalDiskBudget::open(
+            dir.path(),
+            tsink::LocalDiskLimits {
+                max_bytes: Some(12_345),
+                filesystem_free_headroom_bytes: 17,
+                maintenance_temp_reserve_bytes: 29,
+            },
+        )
+        .expect("disk budget should open");
+        let legacy = disk.snapshot();
+        let budget =
+            tsink::QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let projected = disk
+            .metrics_snapshot_with_execution(&execution)
+            .expect("allocation-free disk projection should succeed");
+
+        let projected_json = local_disk_metrics_status_json(Some(&projected));
+        let mut legacy_json = local_disk_status_json(Some(&legacy));
+        assert_eq!(
+            projected_json["filesystemAvailableBytes"].is_null(),
+            legacy_json["filesystemAvailableBytes"].is_null(),
+            "both independent best-effort filesystem probes must preserve the same JSON shape"
+        );
+        legacy_json["filesystemAvailableBytes"] =
+            projected_json["filesystemAvailableBytes"].clone();
+        assert_eq!(projected_json, legacy_json);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
     }
 
     #[tokio::test]
@@ -23984,6 +27227,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_tsdb_usage_projection_preserves_tenant_filtered_schema_values() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let usage_accounting =
+            UsageAccounting::open(None).expect("in-memory usage accounting should open");
+        let mut current =
+            UsageRecordInput::success("team-a", UsageCategory::Ingest, "write", "status-test");
+        current.rows = 17;
+        usage_accounting
+            .record(current)
+            .expect("current-tenant usage should record");
+        let mut other =
+            UsageRecordInput::success("team-b", UsageCategory::Ingest, "write", "status-test");
+        other.rows = 101;
+        usage_accounting
+            .record(other)
+            .expect("other-tenant usage should record");
+        let budget_before = storage.query_budget_snapshot();
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/status/tsdb".to_string(),
+                headers: HashMap::from([(tenant::TENANT_HEADER.to_string(), "team-a".to_string())]),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                usage_accounting: Some(usage_accounting.as_ref()),
+                ..TestRequestOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("valid status JSON");
+        let usage = &body["data"]["usageAccounting"];
+        assert_eq!(usage["journal"]["recordsTotal"], 2);
+        assert_eq!(usage["journal"]["tenantCount"], 2);
+        assert_eq!(usage["currentTenant"]["tenantId"], "team-a");
+        assert_eq!(usage["currentTenant"]["ingest"]["rows"], 17);
+        assert_eq!(
+            usage["reconciliation"]["accounted"]["ingestRowsTotal"], 17,
+            "the direct projection must not leak another tenant into reconciliation"
+        );
+        let budget_after = storage.query_budget_snapshot();
+        assert_eq!(
+            budget_after.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            budget_after.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(budget_after.active_queries, 0);
+        assert_eq!(budget_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
     async fn managed_tenant_lifecycle_blocks_public_query_routes() {
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
@@ -24168,9 +27472,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn support_bundle_tenant_resolution_is_bounded_and_preserves_header_conflicts() {
+        let oversized = "x".repeat(tsink::label::MAX_LABEL_VALUE_LEN.saturating_add(1));
+        let oversized_request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/admin/support_bundle".to_string(),
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            )]),
+            body: format!("tenant={oversized}").into_bytes(),
+        };
+        let oversized_response = support_bundle_tenant_id(&oversized_request)
+            .expect_err("an oversized decoded tenant must reject before allocation");
+        assert_eq!(oversized_response.status, 400);
+
+        let conflicting_request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/admin/support_bundle?tenant=team-a".to_string(),
+            headers: HashMap::from([(
+                tenant::SCOPE_ORG_ID_HEADER.to_string(),
+                "team-b".to_string(),
+            )]),
+            body: Vec::new(),
+        };
+        let conflicting_response = support_bundle_tenant_id(&conflicting_request)
+            .expect_err("the explicit override must retain the scope-header conflict check");
+        assert_eq!(conflicting_response.status, 400);
+
+        let empty_override = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/admin/support_bundle?tenant=".to_string(),
+            headers: HashMap::from([(
+                tenant::TENANT_HEADER.to_string(),
+                "team-header".to_string(),
+            )]),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            support_bundle_tenant_id(&empty_override).unwrap(),
+            "team-header"
+        );
+    }
+
+    #[test]
+    fn support_bundle_tenant_resolution_does_not_clone_the_full_http_request() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers.rs"))
+                .expect("handlers source should be readable");
+        let start = source
+            .find("\nfn support_bundle_tenant_id(")
+            .expect("support-bundle tenant helper should exist");
+        let end = source[start..]
+            .find("\nfn support_bundle_request_with_path(")
+            .map(|offset| start + offset)
+            .expect("support-bundle request helper boundary should exist");
+        let helper = &source[start..end];
+        assert!(
+            !helper.contains("request.clone()"),
+            "tenant resolution must not clone a potentially 64 MiB HTTP request body"
+        );
+        assert!(helper.contains("percent_decoded_len(raw_tenant_id)"));
+    }
+
     #[tokio::test]
     async fn admin_support_bundle_downloads_selected_tenant_without_public_read_auth() {
         let storage = make_storage();
+        let budget_before = storage.query_budget_snapshot();
         let metadata_store = make_metadata_store(None);
         let exemplar_store = make_exemplar_store(None);
         let usage_limits = crate::usage::UsageLedgerLimits {
@@ -24268,6 +27637,271 @@ mod tests {
             body["sections"]["statusTsdb"]["body"]["data"]["localDisk"]["limits"]["maxBytes"],
             4_096
         );
+        let budget_after = storage.query_budget_snapshot();
+        assert_eq!(
+            budget_after.queries_started_total,
+            budget_before.queries_started_total + 1
+        );
+        assert_eq!(
+            budget_after.queries_completed_total,
+            budget_before.queries_completed_total + 1
+        );
+        assert_eq!(budget_after.active_queries, 0);
+        assert_eq!(budget_after.shared_reserved_memory_bytes, 0);
+        assert!(budget_after.peak_shared_reserved_memory_bytes > 0);
+        assert_eq!(budget_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_support_bundle_composes_under_test_edge_and_single_query_profiles() {
+        for (case, profile, max_concurrent_queries) in [
+            ("test", tsink::ResourceProfile::Test, None),
+            ("edge", tsink::ResourceProfile::Edge, None),
+            ("single-query", tsink::ResourceProfile::Test, Some(1)),
+        ] {
+            let mut builder = StorageBuilder::new()
+                .with_resource_profile(profile)
+                .with_timestamp_precision(TimestampPrecision::Milliseconds)
+                .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS);
+            if let Some(max_concurrent_queries) = max_concurrent_queries {
+                let mut query_limits = tsink::ResourceLimits::test().query;
+                query_limits.max_concurrent_queries = Some(max_concurrent_queries);
+                builder = builder.with_query_budget_limits(query_limits);
+            }
+            let storage: Arc<dyn Storage> = builder
+                .build()
+                .expect("support-bundle profile storage should build");
+            let metadata_store = make_metadata_store(None);
+            let exemplar_store = make_exemplar_store(None);
+            let engine = make_engine(&storage);
+            let before = storage.query_budget_snapshot();
+            if let Some(max_concurrent_queries) = max_concurrent_queries {
+                assert_eq!(
+                    before.limits.max_concurrent_queries,
+                    Some(max_concurrent_queries)
+                );
+            }
+
+            let response = handle_test_request(
+                &storage,
+                &engine,
+                HttpRequest {
+                    method: "GET".to_string(),
+                    path: "/api/v1/admin/support_bundle".to_string(),
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                },
+                TestRequestOptions {
+                    metadata_store: Some(&metadata_store),
+                    exemplar_store: Some(&exemplar_store),
+                    server_start: start_time(),
+                    timestamp_precision: TimestampPrecision::Milliseconds,
+                    admin_api_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert_eq!(response.status, 200, "{case}");
+            assert!(
+                response.body.len() <= SUPPORT_BUNDLE_MAX_RESPONSE_BYTES,
+                "{case}"
+            );
+            let body: JsonValue =
+                serde_json::from_slice(&response.body).expect("support bundle should decode");
+            assert_eq!(body["sections"]["statusTsdb"]["httpStatus"], 200);
+            assert_eq!(body["sections"]["clusterRebalance"]["httpStatus"], 503);
+            let after = storage.query_budget_snapshot();
+            assert_eq!(
+                after.queries_started_total,
+                before.queries_started_total + 1,
+                "{case}"
+            );
+            assert_eq!(
+                after.queries_completed_total,
+                before.queries_completed_total + 1,
+                "{case}"
+            );
+            assert_eq!(after.peak_active_queries, 1, "{case}");
+            assert_eq!(after.active_queries, 0, "{case}");
+            assert_eq!(after.shared_reserved_memory_bytes, 0, "{case}");
+            assert_eq!(after.accounting_invariant_violations_total, 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_support_bundle_reuses_one_execution_for_status_and_cluster_rebalance() {
+        let mut query_limits = tsink::ResourceLimits::test().query;
+        query_limits.max_concurrent_queries = Some(1);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_resource_profile(tsink::ResourceProfile::Test)
+            .with_query_budget_limits(query_limits)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("single-query support-bundle storage should build");
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+        let temp_dir = TempDir::new().expect("cluster fixture should build");
+        let cluster_context =
+            cluster_context_with_single_node_control_and_digest_runtime(&temp_dir);
+        let before = storage.query_budget_snapshot();
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/admin/support_bundle".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                metadata_store: Some(&metadata_store),
+                exemplar_store: Some(&exemplar_store),
+                server_start: start_time(),
+                timestamp_precision: TimestampPrecision::Milliseconds,
+                admin_api_enabled: true,
+                cluster_context: Some(cluster_context.as_ref()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("support bundle should decode");
+        assert_eq!(body["sections"]["statusTsdb"]["httpStatus"], 200);
+        assert_eq!(body["sections"]["clusterRebalance"]["httpStatus"], 200);
+        let after = storage.query_budget_snapshot();
+        assert_eq!(
+            after.queries_started_total,
+            before.queries_started_total + 1
+        );
+        assert_eq!(
+            after.queries_completed_total,
+            before.queries_completed_total + 1
+        );
+        assert_eq!(after.peak_active_queries, 1);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.concurrency_rejections_total, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_support_bundle_returns_structured_pressure_when_parent_admission_is_blocked() {
+        let mut query_limits = tsink::ResourceLimits::test().query;
+        query_limits.max_concurrent_queries = Some(1);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_resource_profile(tsink::ResourceProfile::Test)
+            .with_query_budget_limits(query_limits)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("blocked support-bundle storage should build");
+        let blocker = storage
+            .begin_query_execution(
+                QueryWorkLimits::default(),
+                tsink::QueryCancellationToken::new(),
+            )
+            .expect("blocking query admission should execute")
+            .expect("blocking query execution should be available");
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/admin/support_bundle".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                metadata_store: Some(&metadata_store),
+                exemplar_store: Some(&exemplar_store),
+                server_start: start_time(),
+                timestamp_precision: TimestampPrecision::Milliseconds,
+                admin_api_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 429);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("query_limit_concurrent_queries")
+        );
+        assert_eq!(response_header(&response, "Retry-After"), Some("1"));
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("pressure response should be JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "query_limit_concurrent_queries");
+        assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+        drop(blocker);
+        let after = storage.query_budget_snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_support_bundle_fails_closed_when_composition_admission_is_unavailable() {
+        let inner = make_storage();
+        let wrapped = Arc::new(
+            MetricsAccountingTestStorage::new(
+                Arc::clone(&inner),
+                QueryBudgetLimits::default(),
+                MetricsAccountingTestResult::AccountedEmpty,
+            )
+            .without_query_admission(),
+        );
+        let storage: Arc<dyn Storage> = wrapped.clone();
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+
+        let response = handle_test_request(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/v1/admin/support_bundle".to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            TestRequestOptions {
+                metadata_store: Some(&metadata_store),
+                exemplar_store: Some(&exemplar_store),
+                server_start: start_time(),
+                timestamp_precision: TimestampPrecision::Milliseconds,
+                admin_api_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response_header(&response, READ_ERROR_CODE_HEADER),
+            Some("support_bundle_query_accounting_unavailable")
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("admission response should be JSON");
+        assert_eq!(body["status"], "error");
+        assert_eq!(
+            body["error"],
+            "support-bundle composition requires query execution admission"
+        );
+        let budget = wrapped.budget.snapshot();
+        assert_eq!(budget.active_queries, 0);
+        assert_eq!(budget.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget.accounting_invariant_violations_total, 0);
     }
 
     #[tokio::test]

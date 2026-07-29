@@ -144,6 +144,38 @@ pub struct LocalDiskBudgetSnapshot {
     pub categories: Vec<DiskCategoryUsage>,
 }
 
+/// Allocation-free local-disk state consumed by the Prometheus metrics adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDiskMetricsSnapshot {
+    pub limits: LocalDiskLimits,
+    pub accounted_bytes: u64,
+    pub reserved_bytes: u64,
+    pub maintenance_reserved_bytes: u64,
+    pub unknown_bytes: u64,
+    pub filesystem_available_bytes: Option<u64>,
+    pub over_limit: bool,
+    pub active_reservations: u64,
+    pub rejections_total: u64,
+    pub reconciliations_total: u64,
+    pub reservation_overruns_total: u64,
+    category_bytes: [u64; DISK_CATEGORY_COUNT],
+}
+
+impl LocalDiskMetricsSnapshot {
+    /// Iterates non-empty categories in the same stable order as [`LocalDiskBudgetSnapshot`].
+    ///
+    /// The iterator borrows the fixed inline category array and never reconstructs a `Vec`.
+    pub fn categories(&self) -> impl Iterator<Item = DiskCategoryUsage> + '_ {
+        DISK_CATEGORIES
+            .iter()
+            .copied()
+            .zip(self.category_bytes)
+            .filter_map(|(category, bytes)| {
+                (bytes > 0).then_some(DiskCategoryUsage { category, bytes })
+            })
+    }
+}
+
 /// One complete replacement to stage beneath a shared local-disk budget.
 ///
 /// Grouped replacements reserve the sum of every replacement's encoded length, plus one
@@ -2769,6 +2801,92 @@ impl LocalDiskBudget {
         }
     }
 
+    pub(crate) fn status_snapshot_modeled_retained_bytes(&self) -> Result<u64> {
+        crate::storage::modeled_status_observability_vec_bytes::<DiskCategoryUsage>(
+            DISK_CATEGORY_COUNT,
+        )
+    }
+
+    /// Materializes the complete local-disk status shape after its fixed category capacity has
+    /// already been reserved on the caller's query execution.
+    pub(crate) fn status_snapshot_after_reservation(
+        &self,
+        execution: &crate::QueryExecution,
+    ) -> Result<LocalDiskBudgetSnapshot> {
+        execution.checkpoint()?;
+        let filesystem_available_bytes = self.space_probe.available_space(&self.root).ok();
+        execution.checkpoint()?;
+        let state = self.state.lock();
+        execution.checkpoint()?;
+        let accounted_bytes = state.accounted_bytes();
+        let mut categories = Vec::new();
+        categories
+            .try_reserve_exact(DISK_CATEGORY_COUNT)
+            .map_err(|_| {
+                TsinkError::Other(
+                    "storage status local-disk category allocation failed".to_string(),
+                )
+            })?;
+        for category in DISK_CATEGORIES {
+            let bytes = state.category_bytes(category);
+            if bytes > 0 {
+                categories.push(DiskCategoryUsage { category, bytes });
+            }
+        }
+        Ok(LocalDiskBudgetSnapshot {
+            limits: self.limits,
+            accounted_bytes,
+            reserved_bytes: state.reserved_bytes,
+            maintenance_reserved_bytes: state.maintenance_reserved_bytes,
+            unknown_bytes: state.category_bytes(DiskCategory::Unknown),
+            filesystem_available_bytes,
+            over_limit: self
+                .limits
+                .max_bytes
+                .is_some_and(|max_bytes| accounted_bytes > max_bytes),
+            active_reservations: state.active_reservations,
+            rejections_total: state.rejections_total,
+            reconciliations_total: state.reconciliations_total,
+            reservation_overruns_total: state.reservation_overruns_total,
+            categories,
+        })
+    }
+
+    /// Returns the allocation-free metrics projection under an existing query execution.
+    ///
+    /// The fixed category array is populated directly while the producer lock is held. Call
+    /// [`LocalDiskMetricsSnapshot::categories`] to iterate its non-empty entries without
+    /// reconstructing an owned collection.
+    pub fn metrics_snapshot_with_execution(
+        &self,
+        execution: &crate::QueryExecution,
+    ) -> Result<LocalDiskMetricsSnapshot> {
+        execution.checkpoint()?;
+        let filesystem_available_bytes = self.space_probe.available_space(&self.root).ok();
+        execution.checkpoint()?;
+        let state = self.state.lock();
+        execution.checkpoint()?;
+        let accounted_bytes = state.accounted_bytes();
+        let category_bytes = DISK_CATEGORIES.map(|category| state.category_bytes(category));
+        Ok(LocalDiskMetricsSnapshot {
+            limits: self.limits,
+            accounted_bytes,
+            reserved_bytes: state.reserved_bytes,
+            maintenance_reserved_bytes: state.maintenance_reserved_bytes,
+            unknown_bytes: state.category_bytes(DiskCategory::Unknown),
+            filesystem_available_bytes,
+            over_limit: self
+                .limits
+                .max_bytes
+                .is_some_and(|max_bytes| accounted_bytes > max_bytes),
+            active_reservations: state.active_reservations,
+            rejections_total: state.rejections_total,
+            reconciliations_total: state.reconciliations_total,
+            reservation_overruns_total: state.reservation_overruns_total,
+            category_bytes,
+        })
+    }
+
     fn finish_reservation(
         &self,
         category: DiskCategory,
@@ -3886,6 +4004,39 @@ mod tests {
             Arc::new(FixedSpaceProbe::new(available)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn metrics_snapshot_iterates_fixed_categories_in_stable_order() {
+        let dir = TempDir::new().unwrap();
+        let budget = budget_with_space(dir.path(), LocalDiskLimits::default(), 1_000_000);
+        {
+            let mut state = budget.state.lock();
+            state.committed_by_category.insert(DiskCategory::Unknown, 7);
+            state.committed_by_category.insert(DiskCategory::Rollups, 5);
+            state.committed_by_category.insert(DiskCategory::Wal, 3);
+        }
+        let query_budget = crate::QueryBudget::new(crate::QueryBudgetLimits::default()).unwrap();
+        let execution = query_budget.begin_query().unwrap();
+        let snapshot = budget.metrics_snapshot_with_execution(&execution).unwrap();
+        assert_eq!(
+            snapshot.categories().collect::<Vec<_>>(),
+            vec![
+                DiskCategoryUsage {
+                    category: DiskCategory::Wal,
+                    bytes: 3,
+                },
+                DiskCategoryUsage {
+                    category: DiskCategory::Rollups,
+                    bytes: 5,
+                },
+                DiskCategoryUsage {
+                    category: DiskCategory::Unknown,
+                    bytes: 7,
+                },
+            ]
+        );
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
     }
 
     #[test]

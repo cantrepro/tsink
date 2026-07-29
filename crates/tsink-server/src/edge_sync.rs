@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::{DiskCategory, Label, LocalDiskBudget, Row, TsinkError, WriteAcknowledgement};
+use tsink::{
+    DiskCategory, Label, LocalDiskBudget, QueryExecution, QueryMemoryReservation, Row, TsinkError,
+    WriteAcknowledgement,
+};
 
 pub const EDGE_SYNC_MAX_ENTRIES_ENV: &str = "TSINK_EDGE_SYNC_MAX_ENTRIES";
 pub const EDGE_SYNC_MAX_BYTES_ENV: &str = "TSINK_EDGE_SYNC_MAX_BYTES";
@@ -49,6 +52,16 @@ const DEFAULT_EDGE_SYNC_DEDUPE_WINDOW_SECS: u64 = 24 * 3600;
 const EDGE_SYNC_DIR_NAME: &str = "edge_sync";
 const EDGE_SYNC_QUEUE_FILE_NAME: &str = "queue.log";
 const EDGE_SYNC_DEDUPE_FILE_NAME: &str = "dedupe.log";
+const EDGE_SYNC_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const EDGE_SYNC_TENANT_MAPPING_PRESERVE: &str = "preserve";
+const EDGE_SYNC_TENANT_MAPPING_STATIC: &str = "static";
+const EDGE_SYNC_CONFLICT_SEMANTICS: &str = "idempotent_batch_only";
+
+#[cfg(test)]
+thread_local! {
+    static EDGE_SYNC_STATUS_OUTPUT_STRING_MATERIALIZATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 fn injected_append_failure_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
@@ -466,6 +479,7 @@ impl std::fmt::Display for EdgeSyncTypedEnqueueError {
 impl std::error::Error for EdgeSyncTypedEnqueueError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct EdgeSyncQueueSnapshot {
     pub queued_entries: u64,
     pub queued_bytes: u64,
@@ -475,6 +489,44 @@ pub struct EdgeSyncQueueSnapshot {
     pub persistence_fence_reason: Option<String>,
     pub cleanup_pending: bool,
     pub last_cleanup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeSyncSourceMetricsSnapshot {
+    pub enabled: bool,
+    pub queued_entries: u64,
+    pub queued_bytes: u64,
+    pub log_bytes: u64,
+    pub oldest_queued_age_ms: Option<u64>,
+    pub pre_ack_retention_secs: u64,
+    pub enqueued_total: u64,
+    pub enqueue_rejected_total: u64,
+    pub replay_attempts_total: u64,
+    pub replay_success_total: u64,
+    pub replay_failures_total: u64,
+    pub replayed_rows_total: u64,
+    pub expired_entries_total: u64,
+    pub persistence_fenced: bool,
+    pub cleanup_pending: bool,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeSyncAcceptMetricsSnapshot {
+    pub enabled: bool,
+    pub dedupe_window_secs: u64,
+    pub max_entries: usize,
+    pub max_log_bytes: u64,
+    pub cleanup_interval_secs: u64,
+    pub active_keys: u64,
+    pub inflight_keys: u64,
+    pub log_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeSyncMetricsSnapshot {
+    pub source: EdgeSyncSourceMetricsSnapshot,
+    pub accept: EdgeSyncAcceptMetricsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,13 +572,22 @@ pub struct EdgeSyncSourceStatusSnapshot {
 
 impl Default for EdgeSyncSourceStatusSnapshot {
     fn default() -> Self {
+        Self::disabled_with_dynamic(
+            EDGE_SYNC_TENANT_MAPPING_PRESERVE.to_string(),
+            EDGE_SYNC_CONFLICT_SEMANTICS.to_string(),
+        )
+    }
+}
+
+impl EdgeSyncSourceStatusSnapshot {
+    fn disabled_with_dynamic(tenant_mapping_mode: String, conflict_semantics: String) -> Self {
         Self {
             enabled: false,
             source_id: None,
             upstream_endpoint: None,
-            tenant_mapping_mode: "preserve".to_string(),
+            tenant_mapping_mode,
             static_tenant_id: None,
-            conflict_semantics: "idempotent_batch_only".to_string(),
+            conflict_semantics,
             queued_entries: 0,
             queued_bytes: 0,
             log_bytes: 0,
@@ -582,6 +643,34 @@ pub struct EdgeSyncAcceptStatusSnapshot {
     pub active_keys: u64,
     pub inflight_keys: u64,
     pub log_bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EdgeSyncStatusProjection {
+    pub(crate) source: EdgeSyncSourceStatusSnapshot,
+    pub(crate) accept: EdgeSyncAcceptStatusSnapshot,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the projection releases its query-memory reservation"]
+pub(crate) struct AccountedEdgeSyncStatusProjection {
+    projection: EdgeSyncStatusProjection,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedEdgeSyncStatusProjection {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedEdgeSyncStatusProjection {
+    type Target = EdgeSyncStatusProjection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,6 +848,142 @@ impl EdgeSyncSourceRuntime {
         }
     }
 
+    /// Captures the complete source status without materializing retained output before admission.
+    ///
+    /// The stable authoritative lock order is queue state, last enqueue error, last replay error,
+    /// then last upstream acknowledgement. Writers in this module never hold these locks in the
+    /// reverse order.
+    fn status_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<(EdgeSyncSourceStatusSnapshot, QueryMemoryReservation), tsink::QueryBudgetError>
+    {
+        execution.checkpoint()?;
+        let queue = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let oldest_enqueued_unix_ms = queue
+            .pending
+            .values()
+            .map(|entry| entry.enqueued_unix_ms)
+            .min();
+        // Legacy status captures "now" immediately after the queue snapshot and before the
+        // diagnostic locks, so retain that timing boundary.
+        let now = unix_timestamp_millis();
+
+        let last_enqueue_error = self
+            .last_enqueue_error
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        let last_replay_error = self
+            .last_replay_error
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        let last_upstream_acknowledgement_guard = self
+            .last_upstream_acknowledgement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let tenant_mapping_mode = edge_sync_tenant_mapping_mode(self.tenant_mapping.mode);
+        let peak_bytes = [
+            Some(self.source_id.as_str()),
+            Some(self.upstream_endpoint.as_str()),
+            Some(tenant_mapping_mode),
+            self.tenant_mapping.static_tenant_id.as_deref(),
+            Some(EDGE_SYNC_CONFLICT_SEMANTICS),
+            last_enqueue_error.as_deref(),
+            last_replay_error.as_deref(),
+            queue.persistence_fenced.as_deref(),
+            queue.last_cleanup_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, |bytes, value| {
+            bytes.saturating_add(modeled_edge_sync_status_str_bytes(value))
+        });
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let persistence_fenced = queue.persistence_fenced.is_some();
+        let cleanup_pending = queue.last_cleanup_error.is_some();
+        let degraded = persistence_fenced
+            || cleanup_pending
+            || (!queue.pending.is_empty()
+                && (last_enqueue_error.is_some() || last_replay_error.is_some()));
+        let last_upstream_acknowledgement = *last_upstream_acknowledgement_guard;
+        let snapshot = EdgeSyncSourceStatusSnapshot {
+            enabled: true,
+            source_id: Some(materialize_edge_sync_status_string(&self.source_id)),
+            upstream_endpoint: Some(materialize_edge_sync_status_string(&self.upstream_endpoint)),
+            tenant_mapping_mode: materialize_edge_sync_status_string(tenant_mapping_mode),
+            static_tenant_id: self
+                .tenant_mapping
+                .static_tenant_id
+                .as_deref()
+                .map(materialize_edge_sync_status_string),
+            conflict_semantics: materialize_edge_sync_status_string(EDGE_SYNC_CONFLICT_SEMANTICS),
+            queued_entries: queue.pending.len() as u64,
+            queued_bytes: queue.queued_bytes,
+            log_bytes: queue.log_bytes,
+            oldest_queued_age_ms: oldest_enqueued_unix_ms.map(|oldest| now.saturating_sub(oldest)),
+            max_entries: self.config.max_entries,
+            max_bytes: self.config.max_bytes,
+            max_log_bytes: self.config.max_log_bytes,
+            max_record_bytes: self.config.max_record_bytes,
+            replay_interval_secs: self.config.replay_interval_secs,
+            replay_batch_size: self.config.replay_batch_size,
+            max_backoff_secs: self.config.max_backoff_secs,
+            cleanup_interval_secs: self.config.cleanup_interval_secs,
+            pre_ack_retention_secs: self.config.pre_ack_retention_secs,
+            enqueued_total: self.enqueued_total.load(Ordering::Relaxed),
+            enqueue_rejected_total: self.enqueue_rejected_total.load(Ordering::Relaxed),
+            replay_attempts_total: self.replay_attempts_total.load(Ordering::Relaxed),
+            replay_success_total: self.replay_success_total.load(Ordering::Relaxed),
+            replay_failures_total: self.replay_failures_total.load(Ordering::Relaxed),
+            replayed_rows_total: self.replayed_rows_total.load(Ordering::Relaxed),
+            cleanup_runs_total: self.cleanup_runs_total.load(Ordering::Relaxed),
+            expired_entries_total: self.expired_entries_total.load(Ordering::Relaxed),
+            expired_bytes_total: self.expired_bytes_total.load(Ordering::Relaxed),
+            last_successful_replay_unix_ms: option_atomic_millis(
+                &self.last_successful_replay_unix_ms,
+            ),
+            last_enqueue_error: last_enqueue_error
+                .as_deref()
+                .map(materialize_edge_sync_status_string),
+            last_replay_error: last_replay_error
+                .as_deref()
+                .map(materialize_edge_sync_status_string),
+            last_upstream_acknowledgement,
+            persistence_fenced,
+            persistence_fence_reason: queue
+                .persistence_fenced
+                .as_deref()
+                .map(materialize_edge_sync_status_string),
+            cleanup_pending,
+            last_cleanup_error: queue
+                .last_cleanup_error
+                .as_deref()
+                .map(materialize_edge_sync_status_string),
+            degraded,
+        };
+        reservation.resize(modeled_edge_sync_source_status_snapshot_bytes(&snapshot))?;
+
+        drop(last_upstream_acknowledgement_guard);
+        drop(last_replay_error);
+        drop(last_enqueue_error);
+        drop(queue);
+        execution.checkpoint()?;
+        Ok((snapshot, reservation))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn status_snapshot(&self) -> EdgeSyncSourceStatusSnapshot {
         let queue = self.queue.snapshot();
         let now = unix_timestamp_millis();
@@ -785,13 +1010,10 @@ impl EdgeSyncSourceRuntime {
             enabled: true,
             source_id: Some(self.source_id.clone()),
             upstream_endpoint: Some(self.upstream_endpoint.clone()),
-            tenant_mapping_mode: match self.tenant_mapping.mode {
-                EdgeSyncTenantMappingMode::Preserve => "preserve",
-                EdgeSyncTenantMappingMode::Static => "static",
-            }
-            .to_string(),
+            tenant_mapping_mode: edge_sync_tenant_mapping_mode(self.tenant_mapping.mode)
+                .to_string(),
             static_tenant_id: self.tenant_mapping.static_tenant_id.clone(),
-            conflict_semantics: "idempotent_batch_only".to_string(),
+            conflict_semantics: EDGE_SYNC_CONFLICT_SEMANTICS.to_string(),
             queued_entries: queue.queued_entries,
             queued_bytes: queue.queued_bytes,
             log_bytes: queue.log_bytes,
@@ -826,6 +1048,68 @@ impl EdgeSyncSourceRuntime {
                 || queue.cleanup_pending
                 || (queue.queued_entries > 0
                     && (last_enqueue_error.is_some() || last_replay_error.is_some())),
+        }
+    }
+
+    pub fn metrics_snapshot(&self) -> EdgeSyncSourceMetricsSnapshot {
+        let (
+            queued_entries,
+            queued_bytes,
+            log_bytes,
+            oldest_enqueued_unix_ms,
+            persistence_fenced,
+            cleanup_pending,
+        ) = {
+            let state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                u64::try_from(state.pending.len()).unwrap_or(u64::MAX),
+                state.queued_bytes,
+                state.log_bytes,
+                state
+                    .pending
+                    .values()
+                    .map(|entry| entry.enqueued_unix_ms)
+                    .min(),
+                state.persistence_fenced.is_some(),
+                state.last_cleanup_error.is_some(),
+            )
+        };
+        let oldest_queued_age_ms =
+            oldest_enqueued_unix_ms.map(|oldest| unix_timestamp_millis().saturating_sub(oldest));
+        let last_enqueue_failed = self
+            .last_enqueue_error
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let last_replay_failed = self
+            .last_replay_error
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+
+        EdgeSyncSourceMetricsSnapshot {
+            enabled: true,
+            queued_entries,
+            queued_bytes,
+            log_bytes,
+            oldest_queued_age_ms,
+            pre_ack_retention_secs: self.config.pre_ack_retention_secs,
+            enqueued_total: self.enqueued_total.load(Ordering::Relaxed),
+            enqueue_rejected_total: self.enqueue_rejected_total.load(Ordering::Relaxed),
+            replay_attempts_total: self.replay_attempts_total.load(Ordering::Relaxed),
+            replay_success_total: self.replay_success_total.load(Ordering::Relaxed),
+            replay_failures_total: self.replay_failures_total.load(Ordering::Relaxed),
+            replayed_rows_total: self.replayed_rows_total.load(Ordering::Relaxed),
+            expired_entries_total: self.expired_entries_total.load(Ordering::Relaxed),
+            persistence_fenced,
+            cleanup_pending,
+            degraded: persistence_fenced
+                || cleanup_pending
+                || (queued_entries > 0 && (last_enqueue_failed || last_replay_failed)),
         }
     }
 
@@ -925,7 +1209,52 @@ impl EdgeSyncSourceRuntime {
     }
 }
 
+/// Produces the complete edge-sync status payload for the direct TSDB handler.
+///
+/// Source output is measured and admitted before materialization. The accept half has no retained
+/// dynamic storage and is sampled only after all source guards have been released, matching the
+/// legacy source-then-accept timing.
+pub(crate) fn edge_sync_status_snapshot_with_execution(
+    context: Option<&EdgeSyncRuntimeContext>,
+    execution: &QueryExecution,
+) -> Result<AccountedEdgeSyncStatusProjection, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let (source, reservation) = match context.and_then(|context| context.source.as_deref()) {
+        Some(source) => source.status_snapshot_with_execution(execution)?,
+        None => disabled_edge_sync_source_status_with_execution(execution)?,
+    };
+    execution.checkpoint()?;
+    let accept = context
+        .map(EdgeSyncRuntimeContext::accept_status_snapshot)
+        .unwrap_or_default();
+    execution.checkpoint()?;
+    Ok(AccountedEdgeSyncStatusProjection {
+        projection: EdgeSyncStatusProjection { source, accept },
+        _reservation: reservation,
+    })
+}
+
+fn disabled_edge_sync_source_status_with_execution(
+    execution: &QueryExecution,
+) -> Result<(EdgeSyncSourceStatusSnapshot, QueryMemoryReservation), tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let peak_bytes = modeled_edge_sync_status_str_bytes(EDGE_SYNC_TENANT_MAPPING_PRESERVE)
+        .saturating_add(modeled_edge_sync_status_str_bytes(
+            EDGE_SYNC_CONFLICT_SEMANTICS,
+        ));
+    let mut reservation = execution.reserve_memory(peak_bytes)?;
+    execution.checkpoint()?;
+    let snapshot = EdgeSyncSourceStatusSnapshot::disabled_with_dynamic(
+        materialize_edge_sync_status_string(EDGE_SYNC_TENANT_MAPPING_PRESERVE),
+        materialize_edge_sync_status_string(EDGE_SYNC_CONFLICT_SEMANTICS),
+    );
+    reservation.resize(modeled_edge_sync_source_status_snapshot_bytes(&snapshot))?;
+    execution.checkpoint()?;
+    Ok((snapshot, reservation))
+}
+
 impl EdgeSyncRuntimeContext {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn source_status_snapshot(&self) -> EdgeSyncSourceStatusSnapshot {
         self.source
             .as_ref()
@@ -958,6 +1287,31 @@ impl EdgeSyncRuntimeContext {
             inflight_keys: snapshot.inflight_keys,
             log_bytes: snapshot.log_bytes,
         }
+    }
+
+    pub fn metrics_snapshot(&self) -> EdgeSyncMetricsSnapshot {
+        let source = self
+            .source
+            .as_ref()
+            .map(|runtime| runtime.metrics_snapshot())
+            .unwrap_or_default();
+        let accept = match self.accept_dedupe_config {
+            Some(config) => {
+                let snapshot = dedupe_metrics_snapshot();
+                EdgeSyncAcceptMetricsSnapshot {
+                    enabled: self.accept_dedupe_store.is_some(),
+                    dedupe_window_secs: config.window_secs,
+                    max_entries: config.max_entries,
+                    max_log_bytes: config.max_log_bytes,
+                    cleanup_interval_secs: config.cleanup_interval_secs,
+                    active_keys: snapshot.active_keys,
+                    inflight_keys: snapshot.inflight_keys,
+                    log_bytes: snapshot.log_bytes,
+                }
+            }
+            None => EdgeSyncAcceptMetricsSnapshot::default(),
+        };
+        EdgeSyncMetricsSnapshot { source, accept }
     }
 }
 
@@ -1203,6 +1557,7 @@ impl EdgeSyncQueue {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn snapshot(&self) -> EdgeSyncQueueSnapshot {
         let state = self
             .state
@@ -1818,6 +2173,74 @@ fn parse_env_u64(var: &str, default: u64, positive_only: bool) -> Result<u64, St
     }
 }
 
+fn edge_sync_tenant_mapping_mode(mode: EdgeSyncTenantMappingMode) -> &'static str {
+    match mode {
+        EdgeSyncTenantMappingMode::Preserve => EDGE_SYNC_TENANT_MAPPING_PRESERVE,
+        EdgeSyncTenantMappingMode::Static => EDGE_SYNC_TENANT_MAPPING_STATIC,
+    }
+}
+
+fn modeled_edge_sync_source_status_snapshot_bytes(snapshot: &EdgeSyncSourceStatusSnapshot) -> u64 {
+    [
+        snapshot.source_id.as_ref(),
+        snapshot.upstream_endpoint.as_ref(),
+        Some(&snapshot.tenant_mapping_mode),
+        snapshot.static_tenant_id.as_ref(),
+        Some(&snapshot.conflict_semantics),
+        snapshot.last_enqueue_error.as_ref(),
+        snapshot.last_replay_error.as_ref(),
+        snapshot.persistence_fence_reason.as_ref(),
+        snapshot.last_cleanup_error.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0u64, |bytes, value| {
+        bytes.saturating_add(modeled_edge_sync_status_string_capacity_bytes(value))
+    })
+}
+
+fn modeled_edge_sync_status_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(EDGE_SYNC_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_edge_sync_status_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(EDGE_SYNC_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn materialize_edge_sync_status_string(value: &str) -> String {
+    #[cfg(test)]
+    EDGE_SYNC_STATUS_OUTPUT_STRING_MATERIALIZATIONS.with(|materializations| {
+        materializations.set(materializations.get().saturating_add(1));
+    });
+    let mut materialized = String::with_capacity(value.len());
+    materialized.push_str(value);
+    materialized
+}
+
+#[cfg(test)]
+fn reset_edge_sync_status_output_string_materializations() {
+    EDGE_SYNC_STATUS_OUTPUT_STRING_MATERIALIZATIONS.with(|materializations| {
+        materializations.set(0);
+    });
+}
+
+#[cfg(test)]
+fn edge_sync_status_output_string_materializations() -> u64 {
+    EDGE_SYNC_STATUS_OUTPUT_STRING_MATERIALIZATIONS.with(std::cell::Cell::get)
+}
+
 fn unix_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1838,7 +2261,10 @@ mod tests {
     use crate::cluster::rpc::InternalIngestRowsResponse;
     use crate::http::read_http_request;
     use tokio::io::AsyncWriteExt;
-    use tsink::LocalDiskLimits;
+    use tsink::{
+        LocalDiskLimits, QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken,
+        QueryLimitReason, QueryWorkLimits,
+    };
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("tempdir")
@@ -1871,6 +2297,344 @@ mod tests {
             .iter()
             .find(|usage| usage.category == category)
             .map_or(0, |usage| usage.bytes)
+    }
+
+    fn populated_status_context() -> (tempfile::TempDir, EdgeSyncRuntimeContext) {
+        let dir = tempdir();
+        let runtime = Arc::new(
+            EdgeSyncSourceRuntime::open_with_config(
+                dir.path(),
+                EdgeSyncSourceBootstrap {
+                    source_id: "edge-status-\"source".to_string(),
+                    upstream_endpoint: "https://upstream.example/status".to_string(),
+                    shared_auth_token: "secret".to_string(),
+                    tenant_mapping: EdgeSyncTenantMapping::static_tenant(" raw-static-tenant \n"),
+                },
+                EdgeSyncQueueConfig {
+                    max_entries: 101,
+                    max_bytes: 102,
+                    max_log_bytes: 103,
+                    max_record_bytes: 104,
+                    replay_interval_secs: 105,
+                    replay_batch_size: 106,
+                    max_backoff_secs: 107,
+                    cleanup_interval_secs: 108,
+                    pre_ack_retention_secs: 109,
+                },
+            )
+            .expect("status runtime should open"),
+        );
+        runtime.enqueued_total.store(201, Ordering::Relaxed);
+        runtime.enqueue_rejected_total.store(202, Ordering::Relaxed);
+        runtime.replay_attempts_total.store(203, Ordering::Relaxed);
+        runtime.replay_success_total.store(204, Ordering::Relaxed);
+        runtime.replay_failures_total.store(205, Ordering::Relaxed);
+        runtime.replayed_rows_total.store(206, Ordering::Relaxed);
+        runtime.cleanup_runs_total.store(207, Ordering::Relaxed);
+        runtime.expired_entries_total.store(208, Ordering::Relaxed);
+        runtime.expired_bytes_total.store(209, Ordering::Relaxed);
+        runtime
+            .last_successful_replay_unix_ms
+            .store(210, Ordering::Relaxed);
+        runtime.set_last_enqueue_error(Some("enqueue status diagnostic".to_string()));
+        runtime.set_last_replay_error(Some("replay status diagnostic\n".to_string()));
+        *runtime
+            .last_upstream_acknowledgement
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(WriteAcknowledgement::Durable);
+        {
+            let mut queue = runtime
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.queued_bytes = 301;
+            queue.log_bytes = 302;
+            queue.persistence_fenced = Some("queue fence diagnostic".to_string());
+            queue.last_cleanup_error = Some("queue cleanup diagnostic".to_string());
+        }
+
+        (
+            dir,
+            EdgeSyncRuntimeContext {
+                source: Some(runtime),
+                accept_dedupe_store: None,
+                accept_dedupe_config: Some(DedupeConfig {
+                    window_secs: 401,
+                    max_entries: 402,
+                    max_log_bytes: 403,
+                    cleanup_interval_secs: 404,
+                }),
+            },
+        )
+    }
+
+    fn edge_sync_status_budget(memory_limit: Option<u64>) -> QueryBudget {
+        QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: memory_limit,
+            per_query: QueryWorkLimits {
+                max_memory_bytes: memory_limit,
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("edge-sync status budget should build")
+    }
+
+    #[test]
+    fn status_projection_preserves_populated_and_disabled_legacy_values() {
+        let (_dir, context) = populated_status_context();
+        let expected_source = context.source_status_snapshot();
+        let expected_accept = context.accept_status_snapshot();
+        let budget = edge_sync_status_budget(None);
+        let execution = budget.begin_query().expect("status query should admit");
+        reset_edge_sync_status_output_string_materializations();
+        let projection = edge_sync_status_snapshot_with_execution(Some(&context), &execution)
+            .expect("populated status projection should build");
+
+        assert_eq!(projection.source, expected_source);
+        assert_eq!(projection.accept, expected_accept);
+        assert_eq!(
+            projection.accounted_bytes(),
+            modeled_edge_sync_source_status_snapshot_bytes(&projection.source)
+        );
+        assert_eq!(
+            edge_sync_status_output_string_materializations(),
+            9,
+            "every populated retained source string should be materialized exactly once"
+        );
+        drop(projection);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+
+        let default_budget = edge_sync_status_budget(None);
+        let default_execution = default_budget
+            .begin_query()
+            .expect("default status query should admit");
+        reset_edge_sync_status_output_string_materializations();
+        let projection = edge_sync_status_snapshot_with_execution(None, &default_execution)
+            .expect("disabled status projection should build");
+        assert_eq!(projection.source, EdgeSyncSourceStatusSnapshot::default());
+        assert_eq!(projection.accept, EdgeSyncAcceptStatusSnapshot::default());
+        assert_eq!(
+            edge_sync_status_output_string_materializations(),
+            2,
+            "disabled status still owns both fixed schema strings"
+        );
+        assert_eq!(
+            projection.accounted_bytes(),
+            modeled_edge_sync_source_status_snapshot_bytes(&projection.source)
+        );
+        drop(projection);
+        assert_eq!(default_execution.snapshot().memory_reserved_bytes, 0);
+        drop(default_execution);
+        let after = default_budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_projection_enforces_exact_peak_before_output_clones() {
+        let (_dir, context) = populated_status_context();
+        let calibration_budget = edge_sync_status_budget(None);
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let projection = edge_sync_status_snapshot_with_execution(Some(&context), &calibration)
+            .expect("calibration projection should build");
+        let exact_bytes = projection.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, exact_bytes);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            exact_bytes
+        );
+        drop(projection);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let after = calibration_budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+
+        let exact_budget = edge_sync_status_budget(Some(exact_bytes));
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact status query should admit");
+        reset_edge_sync_status_output_string_materializations();
+        let projection = edge_sync_status_snapshot_with_execution(Some(&context), &exact)
+            .expect("the exact status peak should pass");
+        assert_eq!(projection.accounted_bytes(), exact_bytes);
+        assert!(edge_sync_status_output_string_materializations() > 0);
+        drop(projection);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let after = exact_budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under status budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under status query should admit");
+        reset_edge_sync_status_output_string_materializations();
+        let error = edge_sync_status_snapshot_with_execution(Some(&context), &one_under)
+            .expect_err("one byte below the complete status peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected edge-sync status projection error: {other}"),
+        }
+        assert_eq!(
+            edge_sync_status_output_string_materializations(),
+            0,
+            "N-1 must reject before any retained output string is materialized"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let after = one_under_budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_projection_honors_precancellation_without_residual_memory() {
+        let (_dir, context) = populated_status_context();
+        let budget = edge_sync_status_budget(None);
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("status query should admit");
+        reset_edge_sync_status_output_string_materializations();
+        cancellation.cancel();
+
+        let error = edge_sync_status_snapshot_with_execution(Some(&context), &execution)
+            .expect_err("pre-cancelled edge-sync status must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(edge_sync_status_output_string_materializations(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_matches_status_without_owned_diagnostics() {
+        assert!(!std::mem::needs_drop::<EdgeSyncSourceMetricsSnapshot>());
+        assert!(!std::mem::needs_drop::<EdgeSyncAcceptMetricsSnapshot>());
+        assert!(!std::mem::needs_drop::<EdgeSyncMetricsSnapshot>());
+
+        let dir = tempdir();
+        let runtime = Arc::new(
+            EdgeSyncSourceRuntime::open_with_config(
+                dir.path(),
+                EdgeSyncSourceBootstrap {
+                    source_id: "edge-metrics".to_string(),
+                    upstream_endpoint: "127.0.0.1:1".to_string(),
+                    shared_auth_token: "secret".to_string(),
+                    tenant_mapping: EdgeSyncTenantMapping::preserve(),
+                },
+                EdgeSyncQueueConfig {
+                    pre_ack_retention_secs: 321,
+                    ..EdgeSyncQueueConfig::default()
+                },
+            )
+            .expect("runtime should open"),
+        );
+        runtime
+            .enqueue_rows_typed(&test_rows())
+            .expect("rows should enqueue");
+        runtime.set_last_enqueue_error(Some("enqueue diagnostic".repeat(64)));
+        runtime.set_last_replay_error(Some("replay diagnostic".repeat(64)));
+        {
+            let mut state = runtime
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_cleanup_error = Some("cleanup diagnostic".repeat(64));
+            state.persistence_fenced = Some("fence diagnostic".repeat(64));
+        }
+
+        let metrics = runtime.metrics_snapshot();
+        let status = runtime.status_snapshot();
+        assert_eq!(metrics.enabled, status.enabled);
+        assert_eq!(metrics.queued_entries, status.queued_entries);
+        assert_eq!(metrics.queued_bytes, status.queued_bytes);
+        assert_eq!(metrics.log_bytes, status.log_bytes);
+        assert!(metrics
+            .oldest_queued_age_ms
+            .zip(status.oldest_queued_age_ms)
+            .is_some_and(|(metrics_age, status_age)| metrics_age.abs_diff(status_age) <= 100));
+        assert_eq!(
+            metrics.pre_ack_retention_secs,
+            status.pre_ack_retention_secs
+        );
+        assert_eq!(metrics.enqueued_total, status.enqueued_total);
+        assert_eq!(
+            metrics.enqueue_rejected_total,
+            status.enqueue_rejected_total
+        );
+        assert_eq!(metrics.replay_attempts_total, status.replay_attempts_total);
+        assert_eq!(metrics.replay_success_total, status.replay_success_total);
+        assert_eq!(metrics.replay_failures_total, status.replay_failures_total);
+        assert_eq!(metrics.replayed_rows_total, status.replayed_rows_total);
+        assert_eq!(metrics.expired_entries_total, status.expired_entries_total);
+        assert_eq!(metrics.persistence_fenced, status.persistence_fenced);
+        assert_eq!(metrics.cleanup_pending, status.cleanup_pending);
+        assert_eq!(metrics.degraded, status.degraded);
+
+        let context = EdgeSyncRuntimeContext {
+            source: Some(Arc::clone(&runtime)),
+            accept_dedupe_store: None,
+            accept_dedupe_config: Some(DedupeConfig {
+                window_secs: 654,
+                max_entries: 789,
+                max_log_bytes: 987,
+                cleanup_interval_secs: 12,
+            }),
+        };
+        let context_metrics = context.metrics_snapshot();
+        assert_eq!(
+            context_metrics.source.queued_entries,
+            metrics.queued_entries
+        );
+        assert!(!context_metrics.accept.enabled);
+        assert_eq!(context_metrics.accept.dedupe_window_secs, 654);
+        assert_eq!(context_metrics.accept.max_entries, 789);
+        assert_eq!(context_metrics.accept.max_log_bytes, 987);
+        assert_eq!(context_metrics.accept.cleanup_interval_secs, 12);
     }
 
     #[test]

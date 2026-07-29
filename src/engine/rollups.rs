@@ -12,7 +12,10 @@ use crate::engine::fs_utils::write_file_atomically_and_sync_parent_budgeted;
 use crate::engine::query::TieredQueryPlan;
 use crate::engine::tombstone::{TombstoneMap, TombstoneRange};
 use crate::query_aggregation::{bucket_start_for_origin, downsample_points_with_origin};
-use crate::storage::{RollupObservabilitySnapshot, RollupPolicy, RollupPolicyStatus};
+use crate::storage::{
+    RollupMetricsObservabilitySnapshot, RollupMetricsPolicyStatus, RollupObservabilitySnapshot,
+    RollupPolicy, RollupPolicyStatus,
+};
 use crate::validation::{validate_labels, validate_metric};
 use crate::Aggregation;
 
@@ -66,6 +69,8 @@ struct RollupTestHooks {
     source_read_hook: RwLock<Option<Arc<RollupSourceReadHook>>>,
     state_persist_hook: RwLock<Option<Arc<RollupStatePersistHook>>>,
     policy_persist_hook: RwLock<Option<Arc<RollupPolicyPersistHook>>>,
+    metrics_snapshot_policy_copies: AtomicU64,
+    status_snapshot_policy_copies: AtomicU64,
 }
 
 #[cfg(test)]

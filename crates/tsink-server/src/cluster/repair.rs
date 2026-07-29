@@ -1,6 +1,9 @@
 use crate::admission;
 use crate::cluster::consensus::{ControlConsensusRuntime, ProposeOutcome};
-use crate::cluster::control::{ControlNodeStatus, ControlState, ShardHandoffPhase};
+use crate::cluster::control::{
+    AccountedControlRebalanceProjection, ControlNodeStatus, ControlRebalanceProjection,
+    ControlState, ShardHandoffPhase,
+};
 use crate::cluster::hotspot;
 use crate::cluster::membership::{ClusterNode, MembershipView};
 use crate::cluster::replication::stable_series_identity_hash;
@@ -12,6 +15,8 @@ use crate::cluster::rpc::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -48,6 +53,9 @@ pub const DEFAULT_REPAIR_FAILURE_BACKOFF_SECS: u64 = 30;
 pub const DEFAULT_REBALANCE_INTERVAL_SECS: u64 = 5;
 pub const DEFAULT_REBALANCE_MAX_ROWS_PER_TICK: usize = 10_000;
 pub const DEFAULT_REBALANCE_MAX_SHARDS_PER_TICK: usize = 4;
+
+const DIGEST_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const REBALANCE_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DigestExchangeConfig {
@@ -255,6 +263,22 @@ impl DigestExchangeSnapshot {
         metrics: &DigestExchangeMetrics,
         control: RepairControlSnapshot,
     ) -> Self {
+        Self::from_state_with_dynamic(
+            config,
+            metrics,
+            control,
+            metrics.last_error.clone(),
+            metrics.mismatches.iter().cloned().collect(),
+        )
+    }
+
+    fn from_state_with_dynamic(
+        config: DigestExchangeConfig,
+        metrics: &DigestExchangeMetrics,
+        control: RepairControlSnapshot,
+        last_error: Option<String>,
+        mismatches: Vec<DigestMismatchReport>,
+    ) -> Self {
         Self {
             interval_secs: config.interval.as_secs(),
             window_secs: config.window.as_secs(),
@@ -309,9 +333,206 @@ impl DigestExchangeSnapshot {
             repairs_cancelled_last_run: metrics.repairs_cancelled_last_run,
             repairs_skipped_backoff_last_run: metrics.repairs_skipped_backoff_last_run,
             repair_rows_inserted_last_run: metrics.repair_rows_inserted_last_run,
-            last_error: metrics.last_error.clone(),
-            mismatches: metrics.mismatches.iter().cloned().collect(),
+            last_error,
+            mismatches,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DigestMismatchMetricsReport {
+    pub shard: u32,
+    pub peer_node_id: String,
+    pub peer_endpoint: String,
+    pub ring_version: u64,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub local_fingerprint: u64,
+    pub remote_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DigestExchangeMetricsSnapshot {
+    pub interval_secs: u64,
+    pub window_secs: u64,
+    pub max_shards_per_tick: usize,
+    pub max_mismatch_reports: usize,
+    pub max_bytes_per_tick: usize,
+    pub max_repair_mismatches_per_tick: usize,
+    pub max_repair_series_per_tick: usize,
+    pub max_repair_rows_per_tick: usize,
+    pub max_repair_runtime_ms_per_tick: u64,
+    pub repair_failure_backoff_secs: u64,
+    pub repair_paused: bool,
+    pub repair_cancel_generation: u64,
+    pub repair_cancellations_total: u64,
+    pub runs_total: u64,
+    pub windows_compared_total: u64,
+    pub windows_success_total: u64,
+    pub windows_failed_total: u64,
+    pub local_compute_failures_total: u64,
+    pub mismatches_total: u64,
+    pub bytes_exchanged_total: u64,
+    pub bytes_exchanged_last_run: u64,
+    pub budget_exhaustions_total: u64,
+    pub windows_skipped_budget_total: u64,
+    pub budget_exhausted_last_run: bool,
+    pub last_run_unix_ms: u64,
+    pub last_success_unix_ms: u64,
+    pub last_ring_version: u64,
+    pub compared_shards_last_run: u64,
+    pub prioritized_shards_last_run: u64,
+    pub compared_peers_last_run: u64,
+    pub repairs_attempted_total: u64,
+    pub repairs_succeeded_total: u64,
+    pub repairs_failed_total: u64,
+    pub repairs_skipped_budget_total: u64,
+    pub repairs_skipped_non_additive_total: u64,
+    pub repairs_skipped_backoff_total: u64,
+    pub repairs_skipped_paused_total: u64,
+    pub repairs_skipped_time_budget_total: u64,
+    pub repairs_cancelled_total: u64,
+    pub repair_time_budget_exhaustions_total: u64,
+    pub repair_time_budget_exhausted_last_run: bool,
+    pub repair_series_scanned_total: u64,
+    pub repair_rows_scanned_total: u64,
+    pub repair_rows_inserted_total: u64,
+    pub repairs_attempted_last_run: u64,
+    pub repairs_succeeded_last_run: u64,
+    pub repairs_failed_last_run: u64,
+    pub repairs_cancelled_last_run: u64,
+    pub repairs_skipped_backoff_last_run: u64,
+    pub repair_rows_inserted_last_run: u64,
+    pub mismatches: Vec<DigestMismatchMetricsReport>,
+}
+
+impl DigestExchangeMetricsSnapshot {
+    pub(crate) fn empty() -> Self {
+        Self::from_state(
+            DigestExchangeConfig::default(),
+            &DigestExchangeMetrics::default(),
+            RepairControlSnapshot::default(),
+            Vec::new(),
+        )
+    }
+
+    fn from_state(
+        config: DigestExchangeConfig,
+        metrics: &DigestExchangeMetrics,
+        control: RepairControlSnapshot,
+        mismatches: Vec<DigestMismatchMetricsReport>,
+    ) -> Self {
+        Self {
+            interval_secs: config.interval.as_secs(),
+            window_secs: config.window.as_secs(),
+            max_shards_per_tick: config.max_shards_per_tick,
+            max_mismatch_reports: config.max_mismatch_reports,
+            max_bytes_per_tick: config.max_bytes_per_tick,
+            max_repair_mismatches_per_tick: config.max_repair_mismatches_per_tick,
+            max_repair_series_per_tick: config.max_repair_series_per_tick,
+            max_repair_rows_per_tick: config.max_repair_rows_per_tick,
+            max_repair_runtime_ms_per_tick: u64::try_from(
+                config.max_repair_runtime_per_tick.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            repair_failure_backoff_secs: config.repair_failure_backoff.as_secs(),
+            repair_paused: control.paused,
+            repair_cancel_generation: control.cancel_generation,
+            repair_cancellations_total: control.cancellations_total,
+            runs_total: metrics.runs_total,
+            windows_compared_total: metrics.windows_compared_total,
+            windows_success_total: metrics.windows_success_total,
+            windows_failed_total: metrics.windows_failed_total,
+            local_compute_failures_total: metrics.local_compute_failures_total,
+            mismatches_total: metrics.mismatches_total,
+            bytes_exchanged_total: metrics.bytes_exchanged_total,
+            bytes_exchanged_last_run: metrics.bytes_exchanged_last_run,
+            budget_exhaustions_total: metrics.budget_exhaustions_total,
+            windows_skipped_budget_total: metrics.windows_skipped_budget_total,
+            budget_exhausted_last_run: metrics.budget_exhausted_last_run,
+            last_run_unix_ms: metrics.last_run_unix_ms,
+            last_success_unix_ms: metrics.last_success_unix_ms,
+            last_ring_version: metrics.last_ring_version,
+            compared_shards_last_run: metrics.compared_shards_last_run,
+            prioritized_shards_last_run: metrics.prioritized_shards_last_run,
+            compared_peers_last_run: metrics.compared_peers_last_run,
+            repairs_attempted_total: metrics.repairs_attempted_total,
+            repairs_succeeded_total: metrics.repairs_succeeded_total,
+            repairs_failed_total: metrics.repairs_failed_total,
+            repairs_skipped_budget_total: metrics.repairs_skipped_budget_total,
+            repairs_skipped_non_additive_total: metrics.repairs_skipped_non_additive_total,
+            repairs_skipped_backoff_total: metrics.repairs_skipped_backoff_total,
+            repairs_skipped_paused_total: metrics.repairs_skipped_paused_total,
+            repairs_skipped_time_budget_total: metrics.repairs_skipped_time_budget_total,
+            repairs_cancelled_total: metrics.repairs_cancelled_total,
+            repair_time_budget_exhaustions_total: metrics.repair_time_budget_exhaustions_total,
+            repair_time_budget_exhausted_last_run: metrics.repair_time_budget_exhausted_last_run,
+            repair_series_scanned_total: metrics.repair_series_scanned_total,
+            repair_rows_scanned_total: metrics.repair_rows_scanned_total,
+            repair_rows_inserted_total: metrics.repair_rows_inserted_total,
+            repairs_attempted_last_run: metrics.repairs_attempted_last_run,
+            repairs_succeeded_last_run: metrics.repairs_succeeded_last_run,
+            repairs_failed_last_run: metrics.repairs_failed_last_run,
+            repairs_cancelled_last_run: metrics.repairs_cancelled_last_run,
+            repairs_skipped_backoff_last_run: metrics.repairs_skipped_backoff_last_run,
+            repair_rows_inserted_last_run: metrics.repair_rows_inserted_last_run,
+            mismatches,
+        }
+    }
+}
+
+impl Default for DigestExchangeMetricsSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedDigestExchangeMetricsSnapshot {
+    snapshot: DigestExchangeMetricsSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedDigestExchangeMetricsSnapshot {
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> &DigestExchangeMetricsSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedDigestExchangeMetricsSnapshot {
+    type Target = DigestExchangeMetricsSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot()
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedDigestExchangeStatusSnapshot {
+    snapshot: DigestExchangeSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedDigestExchangeStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedDigestExchangeStatusSnapshot {
+    type Target = DigestExchangeSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
     }
 }
 
@@ -469,6 +690,115 @@ pub struct RebalanceSloGuardSnapshot {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RebalanceSloMetricsSnapshot {
+    pub write_pressure_ratio: f64,
+    pub query_pressure_ratio: f64,
+    pub cluster_query_pressure_ratio: f64,
+    pub effective_max_rows_per_tick: usize,
+    pub block_new_handoffs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RebalanceCandidateMetricsSnapshot {
+    pub shard: u32,
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub decision_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RebalanceSchedulerMetricsSnapshot {
+    pub interval_secs: u64,
+    pub max_rows_per_tick: usize,
+    pub max_shards_per_tick: usize,
+    pub paused: bool,
+    pub is_local_control_leader: bool,
+    pub active_jobs: usize,
+    pub runs_total: u64,
+    pub jobs_considered_last_run: u64,
+    pub jobs_advanced_total: u64,
+    pub jobs_completed_total: u64,
+    pub rows_scheduled_total: u64,
+    pub rows_scheduled_last_run: u64,
+    pub proposals_committed_total: u64,
+    pub proposals_pending_total: u64,
+    pub proposal_failures_total: u64,
+    pub moves_blocked_by_slo_total: u64,
+    pub effective_max_rows_per_tick_last_run: usize,
+    pub last_run_unix_ms: u64,
+    pub last_success_unix_ms: u64,
+    pub slo_guard: RebalanceSloMetricsSnapshot,
+    pub candidate_moves: Vec<RebalanceCandidateMetricsSnapshot>,
+}
+
+impl RebalanceSchedulerMetricsSnapshot {
+    pub(crate) fn empty() -> Self {
+        Self {
+            interval_secs: DEFAULT_REBALANCE_INTERVAL_SECS,
+            max_rows_per_tick: DEFAULT_REBALANCE_MAX_ROWS_PER_TICK,
+            max_shards_per_tick: DEFAULT_REBALANCE_MAX_SHARDS_PER_TICK,
+            paused: false,
+            is_local_control_leader: false,
+            active_jobs: 0,
+            runs_total: 0,
+            jobs_considered_last_run: 0,
+            jobs_advanced_total: 0,
+            jobs_completed_total: 0,
+            rows_scheduled_total: 0,
+            rows_scheduled_last_run: 0,
+            proposals_committed_total: 0,
+            proposals_pending_total: 0,
+            proposal_failures_total: 0,
+            moves_blocked_by_slo_total: 0,
+            effective_max_rows_per_tick_last_run: DEFAULT_REBALANCE_MAX_ROWS_PER_TICK,
+            last_run_unix_ms: 0,
+            last_success_unix_ms: 0,
+            slo_guard: RebalanceSloMetricsSnapshot {
+                write_pressure_ratio: 0.0,
+                query_pressure_ratio: 0.0,
+                cluster_query_pressure_ratio: 0.0,
+                effective_max_rows_per_tick: DEFAULT_REBALANCE_MAX_ROWS_PER_TICK,
+                block_new_handoffs: false,
+            },
+            candidate_moves: Vec::new(),
+        }
+    }
+}
+
+impl Default for RebalanceSchedulerMetricsSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedRebalanceSchedulerMetricsSnapshot {
+    snapshot: RebalanceSchedulerMetricsSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedRebalanceSchedulerMetricsSnapshot {
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> &RebalanceSchedulerMetricsSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedRebalanceSchedulerMetricsSnapshot {
+    type Target = RebalanceSchedulerMetricsSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RebalanceSchedulerSnapshot {
     pub interval_secs: u64,
@@ -494,6 +824,21 @@ pub struct RebalanceSchedulerSnapshot {
     pub slo_guard: RebalanceSloGuardSnapshot,
     pub candidate_moves: Vec<RebalanceMoveCandidateSnapshot>,
     pub jobs: Vec<RebalanceJobSnapshot>,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedRebalanceSchedulerSnapshot {
+    pub snapshot: RebalanceSchedulerSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl std::ops::Deref for AccountedRebalanceSchedulerSnapshot {
+    type Target = RebalanceSchedulerSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 impl RebalanceSchedulerSnapshot {
@@ -547,6 +892,7 @@ struct RebalanceSchedulerRunOutcome {
     moves_blocked_by_slo: u64,
     effective_max_rows_per_tick: usize,
     last_error: Option<String>,
+    candidate_moves: Vec<RebalanceCandidateMetricsSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -567,6 +913,7 @@ struct RebalanceSchedulerMetrics {
     last_run_unix_ms: u64,
     last_success_unix_ms: u64,
     last_error: Option<String>,
+    candidate_moves: Vec<RebalanceCandidateMetricsSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -616,6 +963,8 @@ pub struct DigestExchangeRuntime {
     control_consensus: Arc<ControlConsensusRuntime>,
     config: DigestExchangeConfig,
     metrics: Arc<Mutex<DigestExchangeMetrics>>,
+    #[cfg(test)]
+    status_snapshot_string_clones: Arc<AtomicU64>,
     repair_control: Arc<Mutex<RepairControlState>>,
     repair_run_inflight: Arc<Mutex<bool>>,
     rebalance_control: Arc<Mutex<RebalanceSchedulerControlState>>,
@@ -742,6 +1091,8 @@ impl DigestExchangeRuntime {
             control_consensus,
             config,
             metrics: Arc::new(Mutex::new(DigestExchangeMetrics::default())),
+            #[cfg(test)]
+            status_snapshot_string_clones: Arc::new(AtomicU64::new(0)),
             repair_control: Arc::new(Mutex::new(RepairControlState::default())),
             repair_run_inflight: Arc::new(Mutex::new(false)),
             rebalance_control: Arc::new(Mutex::new(RebalanceSchedulerControlState::default())),
@@ -766,6 +1117,7 @@ impl DigestExchangeRuntime {
         self
     }
 
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> DigestExchangeSnapshot {
         let metrics = self
             .metrics
@@ -773,6 +1125,170 @@ impl DigestExchangeRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let control = self.repair_control_snapshot();
         DigestExchangeSnapshot::from_state(self.config, &metrics, control)
+    }
+
+    /// Captures the complete TSDB-status digest snapshot under the authoritative lock order.
+    ///
+    /// Every retained String and Vec is measured while the metrics and repair-control locks are
+    /// held, then the complete output is reserved before any diagnostic or mismatch label clone.
+    pub(crate) fn status_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedDigestExchangeStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+        let control = self
+            .repair_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let mut peak_bytes =
+            modeled_digest_metrics_vec_bytes::<DigestMismatchReport>(metrics.mismatches.len());
+        if let Some(last_error) = metrics.last_error.as_deref() {
+            peak_bytes = peak_bytes.saturating_add(modeled_digest_metrics_str_bytes(last_error));
+        }
+        for report in &metrics.mismatches {
+            execution.checkpoint()?;
+            peak_bytes = peak_bytes
+                .saturating_add(modeled_digest_metrics_str_bytes(&report.peer_node_id))
+                .saturating_add(modeled_digest_metrics_str_bytes(&report.peer_endpoint));
+        }
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let last_error = metrics
+            .last_error
+            .as_deref()
+            .map(|value| self.clone_digest_status_string(value));
+        let mut mismatches = Vec::with_capacity(metrics.mismatches.len());
+        for report in &metrics.mismatches {
+            execution.checkpoint()?;
+            mismatches.push(DigestMismatchReport {
+                shard: report.shard,
+                peer_node_id: self.clone_digest_status_string(&report.peer_node_id),
+                peer_endpoint: self.clone_digest_status_string(&report.peer_endpoint),
+                ring_version: report.ring_version,
+                window_start: report.window_start,
+                window_end: report.window_end,
+                local_series_count: report.local_series_count,
+                local_point_count: report.local_point_count,
+                local_fingerprint: report.local_fingerprint,
+                remote_series_count: report.remote_series_count,
+                remote_point_count: report.remote_point_count,
+                remote_fingerprint: report.remote_fingerprint,
+                detected_unix_ms: report.detected_unix_ms,
+            });
+        }
+        let snapshot = DigestExchangeSnapshot::from_state_with_dynamic(
+            self.config,
+            &metrics,
+            RepairControlSnapshot {
+                paused: control.paused,
+                cancel_generation: control.cancel_generation,
+                cancellations_total: control.cancellations_total,
+            },
+            last_error,
+            mismatches,
+        );
+        reservation.resize(modeled_digest_status_snapshot_bytes(&snapshot))?;
+        drop(control);
+        drop(metrics);
+        execution.checkpoint()?;
+
+        Ok(AccountedDigestExchangeStatusSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_digest_status_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.status_snapshot_string_clones
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        clone_digest_metrics_string(value)
+    }
+
+    #[cfg(test)]
+    fn reset_status_snapshot_string_clones(&self) {
+        self.status_snapshot_string_clones
+            .store(0, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_string_clones(&self) -> u64 {
+        self.status_snapshot_string_clones
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Captures the digest values exported by `/metrics` without cloning status-only diagnostics.
+    ///
+    /// The caller's execution owns every dynamic byte in the returned projection. The projection
+    /// is measured and reserved while the source locks are held, before any mismatch label is
+    /// cloned.
+    pub(crate) fn metrics_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedDigestExchangeMetricsSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+        let control = self
+            .repair_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let peak_bytes = modeled_digest_metrics_vec_bytes::<DigestMismatchMetricsReport>(
+            metrics.mismatches.len(),
+        )
+        .saturating_add(metrics.mismatches.iter().fold(0u64, |bytes, report| {
+            bytes
+                .saturating_add(modeled_digest_metrics_str_bytes(&report.peer_node_id))
+                .saturating_add(modeled_digest_metrics_str_bytes(&report.peer_endpoint))
+        }));
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let mut mismatches = Vec::with_capacity(metrics.mismatches.len());
+        for report in &metrics.mismatches {
+            execution.checkpoint()?;
+            mismatches.push(DigestMismatchMetricsReport {
+                shard: report.shard,
+                peer_node_id: clone_digest_metrics_string(&report.peer_node_id),
+                peer_endpoint: clone_digest_metrics_string(&report.peer_endpoint),
+                ring_version: report.ring_version,
+                window_start: report.window_start,
+                window_end: report.window_end,
+                local_fingerprint: report.local_fingerprint,
+                remote_fingerprint: report.remote_fingerprint,
+            });
+        }
+
+        let snapshot = DigestExchangeMetricsSnapshot::from_state(
+            self.config,
+            &metrics,
+            RepairControlSnapshot {
+                paused: control.paused,
+                cancel_generation: control.cancel_generation,
+                cancellations_total: control.cancellations_total,
+            },
+            mismatches,
+        );
+        reservation.resize(modeled_digest_metrics_snapshot_bytes(&snapshot))?;
+        execution.checkpoint()?;
+
+        Ok(AccountedDigestExchangeMetricsSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
     }
 
     pub fn repair_control_snapshot(&self) -> RepairControlSnapshot {
@@ -949,6 +1465,218 @@ impl DigestExchangeRuntime {
         }
     }
 
+    pub(crate) fn rebalance_control_projection_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedControlRebalanceProjection, tsink::QueryBudgetError> {
+        self.control_consensus
+            .rebalance_projection_with_execution(execution)
+    }
+
+    /// Builds rebalance status from the exact accounted tracker generation used by hotspot.
+    pub(crate) fn rebalance_status_snapshot_from_accounted_hotspot_with_execution(
+        &self,
+        control_projection: &ControlRebalanceProjection,
+        hotspot_snapshot: &hotspot::AccountedRebalanceHotspotSnapshot,
+        execution: &QueryExecution,
+    ) -> Result<AccountedRebalanceSchedulerSnapshot, tsink::QueryBudgetError> {
+        self.rebalance_status_snapshot_with_execution(
+            control_projection,
+            &hotspot_snapshot.tracker,
+            execution,
+        )
+    }
+
+    /// Builds the full admin status snapshot from already-accounted live control and hotspot
+    /// inputs. Candidate and job labels are measured under the scheduler lock and reserved before
+    /// cloning; candidate selection uses a fixed eight-slot stack buffer.
+    pub(crate) fn rebalance_status_snapshot_with_execution(
+        &self,
+        control_projection: &ControlRebalanceProjection,
+        tracker: &hotspot::HotspotTrackerSnapshot,
+        execution: &QueryExecution,
+    ) -> Result<AccountedRebalanceSchedulerSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let candidate_moves = collect_rebalance_move_candidates_from_projection_with_execution(
+            control_projection,
+            tracker,
+            execution,
+        )?;
+        let control = self.rebalance_control_snapshot();
+        let metrics = self
+            .rebalance_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let active_jobs = control_projection
+            .handoff
+            .shards
+            .iter()
+            .filter(|transition| transition.phase.is_active())
+            .count();
+        let peak_bytes = modeled_rebalance_status_projection_peak_bytes(
+            &candidate_moves,
+            &control_projection.handoff.shards,
+            active_jobs,
+            metrics.last_error.as_deref(),
+        );
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let slo_guard = compute_rebalance_slo_guard(self.config.rebalance_max_rows_per_tick);
+        let mut candidates = Vec::with_capacity(candidate_moves.len);
+        for candidate in candidate_moves.iter() {
+            execution.checkpoint()?;
+            candidates.push(RebalanceMoveCandidateSnapshot {
+                shard: candidate.shard,
+                from_node_id: clone_rebalance_metrics_string(candidate.from_node_id),
+                to_node_id: clone_rebalance_metrics_string(candidate.to_node_id),
+                pressure_score: candidate.pressure_score,
+                movement_cost_score: candidate.movement_cost_score,
+                imbalance_improvement_score: candidate.imbalance_improvement_score,
+                decision_score: candidate.decision_score,
+                source_node_pressure: candidate.source_node_pressure,
+                target_node_pressure: candidate.target_node_pressure,
+                reason: clone_rebalance_metrics_string(candidate.reason),
+            });
+        }
+        let mut jobs = Vec::with_capacity(active_jobs);
+        for transition in &control_projection.handoff.shards {
+            execution.checkpoint()?;
+            if !transition.phase.is_active() {
+                continue;
+            }
+            jobs.push(RebalanceJobSnapshot {
+                shard: transition.shard,
+                from_node_id: clone_rebalance_metrics_string(&transition.from_node_id),
+                to_node_id: clone_rebalance_metrics_string(&transition.to_node_id),
+                activation_ring_version: transition.activation_ring_version,
+                phase: transition.phase,
+                copied_rows: transition.copied_rows,
+                pending_rows: transition.pending_rows,
+                updated_unix_ms: transition.updated_unix_ms,
+            });
+        }
+        let last_error = metrics
+            .last_error
+            .as_deref()
+            .map(clone_rebalance_metrics_string);
+        let snapshot = RebalanceSchedulerSnapshot {
+            interval_secs: self.config.rebalance_interval.as_secs(),
+            max_rows_per_tick: self.config.rebalance_max_rows_per_tick,
+            max_shards_per_tick: self.config.rebalance_max_shards_per_tick,
+            paused: control.paused,
+            is_local_control_leader: metrics.is_local_control_leader,
+            active_jobs: jobs.len(),
+            runs_total: metrics.runs_total,
+            jobs_considered_last_run: metrics.jobs_considered_last_run,
+            jobs_advanced_total: metrics.jobs_advanced_total,
+            jobs_completed_total: metrics.jobs_completed_total,
+            rows_scheduled_total: metrics.rows_scheduled_total,
+            rows_scheduled_last_run: metrics.rows_scheduled_last_run,
+            proposals_committed_total: metrics.proposals_committed_total,
+            proposals_pending_total: metrics.proposals_pending_total,
+            proposal_failures_total: metrics.proposal_failures_total,
+            moves_blocked_by_slo_total: metrics.moves_blocked_by_slo_total,
+            effective_max_rows_per_tick_last_run: metrics.effective_max_rows_per_tick_last_run,
+            last_run_unix_ms: metrics.last_run_unix_ms,
+            last_success_unix_ms: metrics.last_success_unix_ms,
+            last_error,
+            slo_guard,
+            candidate_moves: candidates,
+            jobs,
+        };
+        reservation.resize(modeled_rebalance_status_snapshot_bytes(&snapshot))?;
+        drop(metrics);
+        execution.checkpoint()?;
+        Ok(AccountedRebalanceSchedulerSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    /// Captures rebalance scalars and already-computed candidate labels for `/metrics`.
+    ///
+    /// Detailed job labels are supplied by the consensus handoff projection, and candidate scores
+    /// come from the scheduler cache, so this path never clones control state, recomputes move
+    /// candidates, or formats diagnostic strings. Cached label clones are measured and charged to
+    /// the caller's execution before materialization.
+    pub(crate) fn rebalance_metrics_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedRebalanceSchedulerMetricsSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let control = self.rebalance_control_snapshot();
+        execution.checkpoint()?;
+        let slo_guard =
+            compute_rebalance_slo_metrics_snapshot(self.config.rebalance_max_rows_per_tick);
+        execution.checkpoint()?;
+        let metrics = self
+            .rebalance_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let peak_bytes =
+            modeled_rebalance_metrics_vec_bytes::<RebalanceCandidateMetricsSnapshot>(
+                metrics.candidate_moves.len(),
+            )
+            .saturating_add(metrics.candidate_moves.iter().fold(
+                0u64,
+                |bytes, candidate| {
+                    bytes
+                        .saturating_add(modeled_rebalance_metrics_str_bytes(
+                            &candidate.from_node_id,
+                        ))
+                        .saturating_add(modeled_rebalance_metrics_str_bytes(&candidate.to_node_id))
+                },
+            ));
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+        let mut candidate_moves = Vec::with_capacity(metrics.candidate_moves.len());
+        for candidate in &metrics.candidate_moves {
+            execution.checkpoint()?;
+            candidate_moves.push(RebalanceCandidateMetricsSnapshot {
+                shard: candidate.shard,
+                from_node_id: clone_rebalance_metrics_string(&candidate.from_node_id),
+                to_node_id: clone_rebalance_metrics_string(&candidate.to_node_id),
+                decision_score: candidate.decision_score,
+            });
+        }
+
+        let snapshot = RebalanceSchedulerMetricsSnapshot {
+            interval_secs: self.config.rebalance_interval.as_secs(),
+            max_rows_per_tick: self.config.rebalance_max_rows_per_tick,
+            max_shards_per_tick: self.config.rebalance_max_shards_per_tick,
+            paused: control.paused,
+            is_local_control_leader: metrics.is_local_control_leader,
+            active_jobs: metrics.active_jobs,
+            runs_total: metrics.runs_total,
+            jobs_considered_last_run: metrics.jobs_considered_last_run,
+            jobs_advanced_total: metrics.jobs_advanced_total,
+            jobs_completed_total: metrics.jobs_completed_total,
+            rows_scheduled_total: metrics.rows_scheduled_total,
+            rows_scheduled_last_run: metrics.rows_scheduled_last_run,
+            proposals_committed_total: metrics.proposals_committed_total,
+            proposals_pending_total: metrics.proposals_pending_total,
+            proposal_failures_total: metrics.proposal_failures_total,
+            moves_blocked_by_slo_total: metrics.moves_blocked_by_slo_total,
+            effective_max_rows_per_tick_last_run: metrics.effective_max_rows_per_tick_last_run,
+            last_run_unix_ms: metrics.last_run_unix_ms,
+            last_success_unix_ms: metrics.last_success_unix_ms,
+            slo_guard,
+            candidate_moves,
+        };
+        reservation.resize(modeled_rebalance_metrics_snapshot_bytes(&snapshot))?;
+        drop(metrics);
+        execution.checkpoint()?;
+        Ok(AccountedRebalanceSchedulerMetricsSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
     pub fn start_rebalance_worker(&self) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
@@ -980,14 +1708,12 @@ impl DigestExchangeRuntime {
         Ok(self.snapshot())
     }
 
-    pub async fn trigger_rebalance_run(
-        &self,
-    ) -> Result<RebalanceSchedulerSnapshot, RebalanceRunTriggerError> {
+    pub async fn trigger_rebalance_run(&self) -> Result<(), RebalanceRunTriggerError> {
         let Some(_guard) = RunInflightGuard::try_acquire(&self.rebalance_run_inflight) else {
             return Err(RebalanceRunTriggerError::AlreadyRunning);
         };
         self.run_rebalance_once_with_guard().await;
-        Ok(self.rebalance_snapshot())
+        Ok(())
     }
 
     pub async fn run_rebalance_once(&self) {
@@ -1036,6 +1762,7 @@ impl DigestExchangeRuntime {
             metrics.last_success_unix_ms = now_ms;
         }
         metrics.last_error = outcome.last_error;
+        metrics.candidate_moves = outcome.candidate_moves;
     }
 
     pub async fn run_once(&self, storage: Arc<dyn Storage>) {
@@ -1155,6 +1882,15 @@ impl DigestExchangeRuntime {
         let state = self.control_consensus.current_state();
         let slo_guard = compute_rebalance_slo_guard(self.config.rebalance_max_rows_per_tick);
         let candidate_moves = collect_rebalance_move_candidates(&self.local_node_id, &state);
+        outcome.candidate_moves = candidate_moves
+            .iter()
+            .map(|candidate| RebalanceCandidateMetricsSnapshot {
+                shard: candidate.shard,
+                from_node_id: candidate.from_node_id.clone(),
+                to_node_id: candidate.to_node_id.clone(),
+                decision_score: candidate.decision_score,
+            })
+            .collect();
         outcome.effective_max_rows_per_tick = slo_guard.effective_max_rows_per_tick;
         let mut transitions = state
             .transitions
@@ -2237,7 +2973,260 @@ fn elastic_rebalance_command_label(command: &InternalControlCommand) -> &'static
     }
 }
 
+fn modeled_digest_metrics_snapshot_bytes(snapshot: &DigestExchangeMetricsSnapshot) -> u64 {
+    modeled_digest_metrics_vec_bytes::<DigestMismatchMetricsReport>(snapshot.mismatches.capacity())
+        .saturating_add(snapshot.mismatches.iter().fold(0u64, |bytes, report| {
+            bytes
+                .saturating_add(modeled_digest_metrics_string_capacity_bytes(
+                    &report.peer_node_id,
+                ))
+                .saturating_add(modeled_digest_metrics_string_capacity_bytes(
+                    &report.peer_endpoint,
+                ))
+        }))
+}
+
+fn modeled_digest_status_snapshot_bytes(snapshot: &DigestExchangeSnapshot) -> u64 {
+    modeled_digest_metrics_vec_bytes::<DigestMismatchReport>(snapshot.mismatches.capacity())
+        .saturating_add(
+            snapshot
+                .last_error
+                .as_ref()
+                .map(modeled_digest_metrics_string_capacity_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(snapshot.mismatches.iter().fold(0u64, |bytes, report| {
+            bytes
+                .saturating_add(modeled_digest_metrics_string_capacity_bytes(
+                    &report.peer_node_id,
+                ))
+                .saturating_add(modeled_digest_metrics_string_capacity_bytes(
+                    &report.peer_endpoint,
+                ))
+        }))
+}
+
+fn modeled_digest_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(DIGEST_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_digest_metrics_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(DIGEST_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_digest_metrics_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(DIGEST_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn clone_digest_metrics_string(value: &str) -> String {
+    let mut cloned = String::with_capacity(value.len());
+    cloned.push_str(value);
+    cloned
+}
+
+fn modeled_rebalance_metrics_snapshot_bytes(snapshot: &RebalanceSchedulerMetricsSnapshot) -> u64 {
+    modeled_rebalance_metrics_vec_bytes::<RebalanceCandidateMetricsSnapshot>(
+        snapshot.candidate_moves.capacity(),
+    )
+    .saturating_add(
+        snapshot
+            .candidate_moves
+            .iter()
+            .fold(0u64, |bytes, candidate| {
+                bytes
+                    .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                        &candidate.from_node_id,
+                    ))
+                    .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                        &candidate.to_node_id,
+                    ))
+            }),
+    )
+}
+
+fn modeled_rebalance_status_projection_peak_bytes(
+    candidates: &BorrowedRebalanceMoveCandidates<'_>,
+    handoff_shards: &[crate::cluster::control::ShardHandoffSnapshot],
+    active_jobs: usize,
+    last_error: Option<&str>,
+) -> u64 {
+    modeled_rebalance_metrics_vec_bytes::<RebalanceMoveCandidateSnapshot>(candidates.len)
+        .saturating_add(candidates.iter().fold(0u64, |bytes, candidate| {
+            bytes
+                .saturating_add(modeled_rebalance_metrics_str_bytes(candidate.from_node_id))
+                .saturating_add(modeled_rebalance_metrics_str_bytes(candidate.to_node_id))
+                .saturating_add(modeled_rebalance_metrics_str_bytes(candidate.reason))
+        }))
+        .saturating_add(modeled_rebalance_metrics_vec_bytes::<RebalanceJobSnapshot>(
+            active_jobs,
+        ))
+        .saturating_add(handoff_shards.iter().fold(0u64, |bytes, handoff| {
+            if handoff.phase.is_active() {
+                bytes
+                    .saturating_add(modeled_rebalance_metrics_str_bytes(&handoff.from_node_id))
+                    .saturating_add(modeled_rebalance_metrics_str_bytes(&handoff.to_node_id))
+            } else {
+                bytes
+            }
+        }))
+        .saturating_add(
+            last_error
+                .map(modeled_rebalance_metrics_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_rebalance_metrics_len_bytes(
+            REBALANCE_STATUS_SLO_REASON_MAX_BYTES,
+        ))
+}
+
+fn modeled_rebalance_status_snapshot_bytes(snapshot: &RebalanceSchedulerSnapshot) -> u64 {
+    modeled_rebalance_metrics_vec_bytes::<RebalanceMoveCandidateSnapshot>(
+        snapshot.candidate_moves.capacity(),
+    )
+    .saturating_add(
+        snapshot
+            .candidate_moves
+            .iter()
+            .fold(0u64, |bytes, candidate| {
+                bytes
+                    .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                        &candidate.from_node_id,
+                    ))
+                    .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                        &candidate.to_node_id,
+                    ))
+                    .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                        &candidate.reason,
+                    ))
+            }),
+    )
+    .saturating_add(modeled_rebalance_metrics_vec_bytes::<RebalanceJobSnapshot>(
+        snapshot.jobs.capacity(),
+    ))
+    .saturating_add(snapshot.jobs.iter().fold(0u64, |bytes, job| {
+        bytes
+            .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                &job.from_node_id,
+            ))
+            .saturating_add(modeled_rebalance_metrics_string_capacity_bytes(
+                &job.to_node_id,
+            ))
+    }))
+    .saturating_add(
+        snapshot
+            .last_error
+            .as_ref()
+            .map(modeled_rebalance_metrics_string_capacity_bytes)
+            .unwrap_or(0),
+    )
+    .saturating_add(
+        snapshot
+            .slo_guard
+            .reason
+            .as_ref()
+            .map(modeled_rebalance_metrics_string_capacity_bytes)
+            .unwrap_or(0),
+    )
+}
+
+fn modeled_rebalance_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(REBALANCE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rebalance_metrics_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(REBALANCE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_rebalance_metrics_len_bytes(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        u64::try_from(len)
+            .unwrap_or(u64::MAX)
+            .saturating_add(REBALANCE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_rebalance_metrics_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(REBALANCE_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn clone_rebalance_metrics_string(value: &str) -> String {
+    let mut cloned = String::with_capacity(value.len());
+    cloned.push_str(value);
+    cloned
+}
+
 fn compute_rebalance_slo_guard(max_rows_per_tick: usize) -> RebalanceSloGuardSnapshot {
+    let metrics = compute_rebalance_slo_metrics_snapshot(max_rows_per_tick);
+    let reason = if !metrics.block_new_handoffs {
+        None
+    } else if metrics.write_pressure_ratio >= metrics.query_pressure_ratio
+        && metrics.write_pressure_ratio >= metrics.cluster_query_pressure_ratio
+    {
+        Some(format!(
+            "rebalance SLO guard blocked a new handoff because public write pressure is {:.2}x capacity",
+            metrics.write_pressure_ratio
+        ))
+    } else if metrics.query_pressure_ratio >= metrics.cluster_query_pressure_ratio {
+        Some(format!(
+            "rebalance SLO guard blocked a new handoff because public read pressure is {:.2}x capacity",
+            metrics.query_pressure_ratio
+        ))
+    } else {
+        Some(format!(
+            "rebalance SLO guard blocked a new handoff because cluster query fanout pressure is {:.2}x capacity",
+            metrics.cluster_query_pressure_ratio
+        ))
+    };
+
+    RebalanceSloGuardSnapshot {
+        write_pressure_ratio: metrics.write_pressure_ratio,
+        query_pressure_ratio: metrics.query_pressure_ratio,
+        cluster_query_pressure_ratio: metrics.cluster_query_pressure_ratio,
+        effective_max_rows_per_tick: metrics.effective_max_rows_per_tick,
+        block_new_handoffs: metrics.block_new_handoffs,
+        reason,
+    }
+}
+
+fn compute_rebalance_slo_metrics_snapshot(max_rows_per_tick: usize) -> RebalanceSloMetricsSnapshot {
     let write_metrics = admission::write_admission_metrics_snapshot();
     let write_guardrails = admission::global_public_write_admission()
         .ok()
@@ -2294,35 +3283,264 @@ fn compute_rebalance_slo_guard(max_rows_per_tick: usize) -> RebalanceSloGuardSna
         max_rows_per_tick
     };
     let block_new_handoffs = dominant_pressure >= 0.85;
-    let reason = if !block_new_handoffs {
-        None
-    } else if write_pressure_ratio >= query_pressure_ratio
-        && write_pressure_ratio >= cluster_query_pressure_ratio
-    {
-        Some(format!(
-            "rebalance SLO guard blocked a new handoff because public write pressure is {:.2}x capacity",
-            write_pressure_ratio
-        ))
-    } else if query_pressure_ratio >= cluster_query_pressure_ratio {
-        Some(format!(
-            "rebalance SLO guard blocked a new handoff because public read pressure is {:.2}x capacity",
-            query_pressure_ratio
-        ))
-    } else {
-        Some(format!(
-            "rebalance SLO guard blocked a new handoff because cluster query fanout pressure is {:.2}x capacity",
-            cluster_query_pressure_ratio
-        ))
-    };
 
-    RebalanceSloGuardSnapshot {
+    RebalanceSloMetricsSnapshot {
         write_pressure_ratio,
         query_pressure_ratio,
         cluster_query_pressure_ratio,
         effective_max_rows_per_tick,
         block_new_handoffs,
-        reason,
     }
+}
+
+const REBALANCE_STATUS_MAX_CANDIDATES: usize = 8;
+const REBALANCE_STATUS_SLO_REASON_MAX_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct BorrowedRebalanceMoveCandidate<'a> {
+    shard: u32,
+    from_node_id: &'a str,
+    to_node_id: &'a str,
+    pressure_score: f64,
+    movement_cost_score: f64,
+    imbalance_improvement_score: f64,
+    decision_score: f64,
+    source_node_pressure: f64,
+    target_node_pressure: f64,
+    reason: &'static str,
+}
+
+#[derive(Debug)]
+struct BorrowedRebalanceMoveCandidates<'a> {
+    entries: [Option<BorrowedRebalanceMoveCandidate<'a>>; REBALANCE_STATUS_MAX_CANDIDATES],
+    len: usize,
+}
+
+impl<'a> BorrowedRebalanceMoveCandidates<'a> {
+    fn new() -> Self {
+        Self {
+            entries: [None; REBALANCE_STATUS_MAX_CANDIDATES],
+            len: 0,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = BorrowedRebalanceMoveCandidate<'a>> + '_ {
+        self.entries[..self.len].iter().filter_map(|entry| *entry)
+    }
+
+    fn insert(&mut self, candidate: BorrowedRebalanceMoveCandidate<'a>) {
+        let mut position = 0usize;
+        while position < self.len {
+            let current = self.entries[position].expect("occupied candidate prefix");
+            if rebalance_candidate_precedes(candidate, current) {
+                break;
+            }
+            position = position.saturating_add(1);
+        }
+        if position >= REBALANCE_STATUS_MAX_CANDIDATES {
+            return;
+        }
+        let next_len = self
+            .len
+            .saturating_add(1)
+            .min(REBALANCE_STATUS_MAX_CANDIDATES);
+        for idx in (position.saturating_add(1)..next_len).rev() {
+            self.entries[idx] = self.entries[idx - 1];
+        }
+        self.entries[position] = Some(candidate);
+        self.len = next_len;
+    }
+}
+
+fn rebalance_candidate_precedes(
+    left: BorrowedRebalanceMoveCandidate<'_>,
+    right: BorrowedRebalanceMoveCandidate<'_>,
+) -> bool {
+    right
+        .decision_score
+        .total_cmp(&left.decision_score)
+        .then_with(|| right.pressure_score.total_cmp(&left.pressure_score))
+        .then_with(|| left.shard.cmp(&right.shard))
+        .is_lt()
+}
+
+fn collect_rebalance_move_candidates_from_projection_with_execution<'a>(
+    projection: &'a ControlRebalanceProjection,
+    tracker: &hotspot::HotspotTrackerSnapshot,
+    execution: &QueryExecution,
+) -> Result<BorrowedRebalanceMoveCandidates<'a>, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let Some(desired_assignments) = projection.desired_assignments.as_deref() else {
+        return Ok(BorrowedRebalanceMoveCandidates::new());
+    };
+    let unique_nodes = projected_rebalance_unique_node_count(projection, execution)?.max(1);
+    let mut total_node_pressure = 0.0;
+    for (shard, owners) in projection.current_assignments.iter().enumerate() {
+        execution.checkpoint()?;
+        let pressure = u32::try_from(shard)
+            .ok()
+            .and_then(|shard| tracker.shards.iter().find(|tracked| tracked.shard == shard))
+            .map(|tracked| tracked_shard_pressure_score(tracked, tracker))
+            .unwrap_or(0.0);
+        total_node_pressure += pressure * owners.len() as f64;
+    }
+    let average_node_pressure = total_node_pressure / unique_nodes as f64;
+
+    let mut candidates = BorrowedRebalanceMoveCandidates::new();
+    for (shard, (current_owners, desired_owners)) in projection
+        .current_assignments
+        .iter()
+        .zip(desired_assignments)
+        .enumerate()
+    {
+        execution.checkpoint()?;
+        if ownership_sets_match(current_owners, desired_owners) {
+            continue;
+        }
+        let from_node_id = current_owners
+            .iter()
+            .find(|owner| {
+                !desired_owners.contains(owner)
+                    && projected_rebalance_node_is_leaving(projection, owner)
+            })
+            .or_else(|| {
+                current_owners
+                    .iter()
+                    .find(|owner| !desired_owners.contains(owner))
+            });
+        let to_node_id = desired_owners
+            .iter()
+            .find(|owner| !current_owners.contains(owner));
+        let (Some(from_node_id), Some(to_node_id)) = (from_node_id, to_node_id) else {
+            continue;
+        };
+        let Some(shard_u32) = u32::try_from(shard).ok() else {
+            continue;
+        };
+        let (pressure_score, movement_cost_score) = tracker
+            .shards
+            .iter()
+            .find(|tracked| tracked.shard == shard_u32)
+            .map(|tracked| {
+                (
+                    tracked_shard_pressure_score(tracked, tracker),
+                    tracked_shard_movement_cost(tracked, tracker),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let source_node_pressure =
+            projected_rebalance_node_pressure(from_node_id, projection, tracker, execution)?;
+        let target_node_pressure =
+            projected_rebalance_node_pressure(to_node_id, projection, tracker, execution)?;
+        let before = deviation_from_average(source_node_pressure, average_node_pressure)
+            + deviation_from_average(target_node_pressure, average_node_pressure);
+        let after = deviation_from_average(
+            (source_node_pressure - pressure_score).max(0.0),
+            average_node_pressure,
+        ) + deviation_from_average(
+            target_node_pressure + pressure_score,
+            average_node_pressure,
+        );
+        let imbalance_improvement_score = (before - after).max(0.0);
+        let leaving = projected_rebalance_node_is_leaving(projection, from_node_id);
+        let leaving_bonus = if leaving { 1_000.0 } else { 0.0 };
+        let underloaded_bonus = if target_node_pressure < average_node_pressure {
+            5.0
+        } else {
+            0.0
+        };
+        let decision_score = leaving_bonus + imbalance_improvement_score * 10.0 + underloaded_bonus
+            - movement_cost_score;
+        let reason = if leaving {
+            "drain_leaving_node"
+        } else if imbalance_improvement_score > movement_cost_score {
+            "reduce_hot_source_pressure"
+        } else {
+            "lowest_cost_membership_move"
+        };
+        candidates.insert(BorrowedRebalanceMoveCandidate {
+            shard: shard_u32,
+            from_node_id,
+            to_node_id,
+            pressure_score,
+            movement_cost_score,
+            imbalance_improvement_score,
+            decision_score,
+            source_node_pressure,
+            target_node_pressure,
+            reason,
+        });
+    }
+    execution
+        .observe_intermediate_vector_size(u64::try_from(candidates.len).unwrap_or(u64::MAX))?;
+    Ok(candidates)
+}
+
+fn projected_rebalance_node_is_leaving(
+    projection: &ControlRebalanceProjection,
+    node_id: &str,
+) -> bool {
+    projection
+        .nodes
+        .iter()
+        .any(|node| node.id == node_id && node.status == ControlNodeStatus::Leaving)
+}
+
+fn projected_rebalance_unique_node_count(
+    projection: &ControlRebalanceProjection,
+    execution: &QueryExecution,
+) -> Result<usize, tsink::QueryBudgetError> {
+    let mut unique = 0usize;
+    for (assignment_idx, owners) in projection.current_assignments.iter().enumerate() {
+        for (owner_idx, owner) in owners.iter().enumerate() {
+            execution.checkpoint()?;
+            let appeared_before = projection.current_assignments[..assignment_idx]
+                .iter()
+                .any(|prior| prior.iter().any(|candidate| candidate == owner))
+                || owners[..owner_idx]
+                    .iter()
+                    .any(|candidate| candidate == owner);
+            if !appeared_before {
+                unique = unique.saturating_add(1);
+            }
+        }
+    }
+    for (node_idx, node) in projection.nodes.iter().enumerate() {
+        execution.checkpoint()?;
+        let in_assignments = projection
+            .current_assignments
+            .iter()
+            .any(|owners| owners.iter().any(|owner| owner == &node.id));
+        let prior_node = projection.nodes[..node_idx]
+            .iter()
+            .any(|prior| prior.id == node.id);
+        if !in_assignments && !prior_node {
+            unique = unique.saturating_add(1);
+        }
+    }
+    Ok(unique)
+}
+
+fn projected_rebalance_node_pressure(
+    node_id: &str,
+    projection: &ControlRebalanceProjection,
+    tracker: &hotspot::HotspotTrackerSnapshot,
+    execution: &QueryExecution,
+) -> Result<f64, tsink::QueryBudgetError> {
+    let mut pressure = 0.0;
+    for tracked in &tracker.shards {
+        execution.checkpoint()?;
+        let Some(owners) = usize::try_from(tracked.shard)
+            .ok()
+            .and_then(|shard| projection.current_assignments.get(shard))
+        else {
+            continue;
+        };
+        if owners.iter().any(|owner| owner == node_id) {
+            pressure += tracked_shard_pressure_score(tracked, tracker);
+        }
+    }
+    Ok(pressure)
 }
 
 fn collect_rebalance_move_candidates(
@@ -3042,9 +4260,955 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
-    use tsink::{Row, StorageBuilder, TimestampPrecision};
+    use tsink::{
+        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryLimitReason, Row, StorageBuilder,
+        TimestampPrecision,
+    };
 
     const TEST_DIGEST_SHARD_COUNT: u32 = 4;
+
+    #[test]
+    fn balanced_joiner_can_be_planned_for_activation_without_control_catchup_evidence() {
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: Some("node-a".to_string()),
+            bind: Some("127.0.0.1:9301".to_string()),
+            seeds: vec!["node-b@127.0.0.1:9302".to_string()],
+            shards: 16,
+            replication_factor: 2,
+            ..ClusterConfig::default()
+        };
+        let membership = MembershipView::from_config(&config).expect("membership should build");
+        let ring = ShardRing::build(16, 2, &membership).expect("ring should build");
+        let mut state = ControlState::from_runtime(&membership, &ring);
+        state
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "node-b")
+            .expect("joining node should exist")
+            .status = ControlNodeStatus::Joining;
+        state.validate().expect("planner fixture should validate");
+
+        let command = plan_elastic_membership_command("node-a", &state, &[])
+            .expect("membership planning should succeed");
+        assert_eq!(
+            command,
+            Some(InternalControlCommand::ActivateNode {
+                node_id: "node-b".to_string(),
+            }),
+            "the current planner uses balanced shard ownership without any control-log catch-up input"
+        );
+    }
+
+    fn configure_digest_metrics_projection_fixture(runtime: &DigestExchangeRuntime) {
+        let mut metrics = runtime
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *metrics = DigestExchangeMetrics {
+            runs_total: 1,
+            windows_compared_total: 2,
+            windows_success_total: 3,
+            windows_failed_total: 4,
+            local_compute_failures_total: 5,
+            mismatches_total: 6,
+            bytes_exchanged_total: 7,
+            bytes_exchanged_last_run: 8,
+            budget_exhaustions_total: 9,
+            windows_skipped_budget_total: 10,
+            budget_exhausted_last_run: true,
+            last_run_unix_ms: 11,
+            last_success_unix_ms: 12,
+            last_ring_version: 13,
+            compared_shards_last_run: 14,
+            prioritized_shards_last_run: 15,
+            compared_peers_last_run: 16,
+            repairs_attempted_total: 17,
+            repairs_succeeded_total: 18,
+            repairs_failed_total: 19,
+            repairs_skipped_budget_total: 20,
+            repairs_skipped_non_additive_total: 21,
+            repairs_skipped_backoff_total: 22,
+            repairs_skipped_paused_total: 23,
+            repairs_skipped_time_budget_total: 24,
+            repairs_cancelled_total: 25,
+            repair_time_budget_exhaustions_total: 26,
+            repair_time_budget_exhausted_last_run: true,
+            repair_series_scanned_total: 27,
+            repair_rows_scanned_total: 28,
+            repair_rows_inserted_total: 29,
+            repairs_attempted_last_run: 30,
+            repairs_succeeded_last_run: 31,
+            repairs_failed_last_run: 32,
+            repairs_cancelled_last_run: 33,
+            repairs_skipped_backoff_last_run: 34,
+            repair_rows_inserted_last_run: 35,
+            next_shard_cursor: 36,
+            last_error: Some("status-only diagnostic".to_string()),
+            mismatches: VecDeque::from([
+                DigestMismatchReport {
+                    shard: 1,
+                    peer_node_id: "node-quote-\"".to_string(),
+                    peer_endpoint: "127.0.0.1:9401".to_string(),
+                    ring_version: 41,
+                    window_start: 42,
+                    window_end: 43,
+                    local_series_count: 44,
+                    local_point_count: 45,
+                    local_fingerprint: 46,
+                    remote_series_count: 47,
+                    remote_point_count: 48,
+                    remote_fingerprint: 49,
+                    detected_unix_ms: 50,
+                },
+                DigestMismatchReport {
+                    shard: 2,
+                    peer_node_id: "node-newline-\n".to_string(),
+                    peer_endpoint: "127.0.0.1:9402".to_string(),
+                    ring_version: 51,
+                    window_start: 52,
+                    window_end: 53,
+                    local_series_count: 54,
+                    local_point_count: 55,
+                    local_fingerprint: 56,
+                    remote_series_count: 57,
+                    remote_point_count: 58,
+                    remote_fingerprint: 59,
+                    detected_unix_ms: 60,
+                },
+            ]),
+        };
+        drop(metrics);
+
+        let mut control = runtime
+            .repair_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        control.paused = true;
+        control.cancel_generation = 61;
+        control.cancellations_total = 62;
+    }
+
+    #[test]
+    fn digest_metrics_projection_is_exactly_accounted_and_preserves_exporter_values() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_digest_runtime_for_test(
+            temp_dir.path(),
+            "127.0.0.1:9302",
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        configure_digest_metrics_projection_fixture(&runtime);
+        let status = runtime.snapshot();
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let projection = runtime
+            .metrics_snapshot_with_execution(&calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = projection.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(
+            calibration.snapshot().memory_reserved_bytes,
+            exact_bytes,
+            "the accounted wrapper must retain the entire projection reservation"
+        );
+
+        macro_rules! assert_exporter_scalars_match {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    assert_eq!(
+                        projection.$field,
+                        status.$field,
+                        "digest exporter field `{}` diverged from the status snapshot",
+                        stringify!($field)
+                    );
+                )+
+            };
+        }
+        assert_exporter_scalars_match!(
+            interval_secs,
+            window_secs,
+            max_shards_per_tick,
+            max_mismatch_reports,
+            max_bytes_per_tick,
+            max_repair_mismatches_per_tick,
+            max_repair_series_per_tick,
+            max_repair_rows_per_tick,
+            max_repair_runtime_ms_per_tick,
+            repair_failure_backoff_secs,
+            repair_paused,
+            repair_cancel_generation,
+            repair_cancellations_total,
+            runs_total,
+            windows_compared_total,
+            windows_success_total,
+            windows_failed_total,
+            local_compute_failures_total,
+            mismatches_total,
+            bytes_exchanged_total,
+            bytes_exchanged_last_run,
+            budget_exhaustions_total,
+            windows_skipped_budget_total,
+            budget_exhausted_last_run,
+            last_run_unix_ms,
+            last_success_unix_ms,
+            last_ring_version,
+            compared_shards_last_run,
+            prioritized_shards_last_run,
+            compared_peers_last_run,
+            repairs_attempted_total,
+            repairs_succeeded_total,
+            repairs_failed_total,
+            repairs_skipped_budget_total,
+            repairs_skipped_non_additive_total,
+            repairs_skipped_backoff_total,
+            repairs_skipped_paused_total,
+            repairs_skipped_time_budget_total,
+            repairs_cancelled_total,
+            repair_time_budget_exhaustions_total,
+            repair_time_budget_exhausted_last_run,
+            repair_series_scanned_total,
+            repair_rows_scanned_total,
+            repair_rows_inserted_total,
+            repairs_attempted_last_run,
+            repairs_succeeded_last_run,
+            repairs_failed_last_run,
+            repairs_cancelled_last_run,
+            repairs_skipped_backoff_last_run,
+            repair_rows_inserted_last_run,
+        );
+        assert_eq!(projection.mismatches.len(), status.mismatches.len());
+        for (projected, expected) in projection.mismatches.iter().zip(&status.mismatches) {
+            assert_eq!(projected.shard, expected.shard);
+            assert_eq!(projected.peer_node_id, expected.peer_node_id);
+            assert_eq!(projected.peer_endpoint, expected.peer_endpoint);
+            assert_eq!(projected.ring_version, expected.ring_version);
+            assert_eq!(projected.window_start, expected.window_start);
+            assert_eq!(projected.window_end, expected.window_end);
+            assert_eq!(projected.local_fingerprint, expected.local_fingerprint);
+            assert_eq!(projected.remote_fingerprint, expected.remote_fingerprint);
+        }
+        drop(projection);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_projection = runtime
+            .metrics_snapshot_with_execution(&exact)
+            .expect("the exact projection limit should pass");
+        assert_eq!(exact_projection.accounted_bytes(), exact_bytes);
+        drop(exact_projection);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().active_queries, 0);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .metrics_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the projection model must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected digest metrics projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the failed reservation must precede all projection allocation"
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn digest_metrics_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_digest_runtime_for_test(
+            temp_dir.path(),
+            "127.0.0.1:9302",
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        configure_digest_metrics_projection_fixture(&runtime);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .metrics_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.cancellations_total, 1);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn digest_status_projection_preserves_every_legacy_field_and_order() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_digest_runtime_for_test(
+            temp_dir.path(),
+            "127.0.0.1:9302",
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        configure_digest_metrics_projection_fixture(&runtime);
+        let legacy = runtime.snapshot();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        runtime.reset_status_snapshot_string_clones();
+
+        let projected = runtime
+            .status_snapshot_with_execution(&execution)
+            .expect("schema-complete status projection should succeed");
+        assert_eq!(
+            &*projected, &legacy,
+            "every scalar, diagnostic, full mismatch field, and deque order must match legacy"
+        );
+        assert_eq!(
+            projected.accounted_bytes(),
+            modeled_digest_status_snapshot_bytes(&projected)
+        );
+        assert_eq!(
+            runtime.status_snapshot_string_clones(),
+            1 + u64::try_from(legacy.mismatches.len()).unwrap_or(u64::MAX) * 2
+        );
+
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn digest_status_projection_enforces_exact_peak_before_any_clone() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_digest_runtime_for_test(
+            temp_dir.path(),
+            "127.0.0.1:9302",
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        configure_digest_metrics_projection_fixture(&runtime);
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = runtime
+            .status_snapshot_with_execution(&calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, exact_bytes);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            exact_bytes,
+            "the retained schema-complete output must be the complete materialization peak"
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_status = calibration_budget.snapshot();
+        assert_eq!(calibration_status.active_queries, 0);
+        assert_eq!(calibration_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(calibration_status.accounting_invariant_violations_total, 0);
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        runtime.reset_status_snapshot_string_clones();
+        let exact_projection = runtime
+            .status_snapshot_with_execution(&exact)
+            .expect("the exact status projection limit should pass");
+        assert_eq!(exact_projection.accounted_bytes(), exact_bytes);
+        assert!(runtime.status_snapshot_string_clones() > 0);
+        drop(exact_projection);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_status = exact_budget.snapshot();
+        assert_eq!(exact_status.active_queries, 0);
+        assert_eq!(exact_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_status.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        runtime.reset_status_snapshot_string_clones();
+        let error = runtime
+            .status_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the complete status peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected digest status projection error: {other}"),
+        }
+        assert_eq!(
+            runtime.status_snapshot_string_clones(),
+            0,
+            "N-1 admission must fail before any diagnostic or mismatch string clone"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn digest_status_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_digest_runtime_for_test(
+            temp_dir.path(),
+            "127.0.0.1:9302",
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        configure_digest_metrics_projection_fixture(&runtime);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        runtime.reset_status_snapshot_string_clones();
+        cancellation.cancel();
+
+        let error = runtime
+            .status_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(runtime.status_snapshot_string_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.cancellations_total, 1);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn rebalance_metrics_projection_is_exactly_accounted_and_uses_cached_values() {
+        fn assert_copy<T: Copy>() {}
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let config = DigestExchangeConfig {
+            rebalance_interval: Duration::from_secs(17),
+            rebalance_max_rows_per_tick: 123,
+            rebalance_max_shards_per_tick: 7,
+            ..DigestExchangeConfig::default()
+        };
+        let runtime = build_single_node_rebalance_runtime_for_test(temp_dir.path(), config, |_| {});
+        {
+            let mut control = runtime
+                .rebalance_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            control.paused = true;
+        }
+        {
+            let mut metrics = runtime
+                .rebalance_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            metrics.is_local_control_leader = true;
+            metrics.active_jobs = 11;
+            metrics.runs_total = 12;
+            metrics.rows_scheduled_total = 13;
+            metrics.last_success_unix_ms = 14;
+            metrics.last_error = Some("status-only rebalance diagnostic".to_string());
+            metrics.candidate_moves = vec![
+                RebalanceCandidateMetricsSnapshot {
+                    shard: 3,
+                    from_node_id: "node-from-\"".to_string(),
+                    to_node_id: "node-to-\n".to_string(),
+                    decision_score: 1.25,
+                },
+                RebalanceCandidateMetricsSnapshot {
+                    shard: 4,
+                    from_node_id: "node-c".to_string(),
+                    to_node_id: "node-d".to_string(),
+                    decision_score: 0.75,
+                },
+            ];
+        }
+
+        assert_copy::<RebalanceSloMetricsSnapshot>();
+        assert!(std::mem::needs_drop::<RebalanceSchedulerMetricsSnapshot>());
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let snapshot = runtime
+            .rebalance_metrics_snapshot_with_execution(&calibration)
+            .expect("rebalance metrics projection should succeed");
+        let exact_bytes = snapshot.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(
+            calibration.snapshot().memory_reserved_bytes,
+            exact_bytes,
+            "the accounted wrapper must retain all cloned candidate labels"
+        );
+        assert_eq!(snapshot.interval_secs, 17);
+        assert_eq!(snapshot.max_rows_per_tick, 123);
+        assert_eq!(snapshot.max_shards_per_tick, 7);
+        assert!(snapshot.paused);
+        assert!(snapshot.is_local_control_leader);
+        assert_eq!(snapshot.active_jobs, 11);
+        assert_eq!(snapshot.runs_total, 12);
+        assert_eq!(snapshot.rows_scheduled_total, 13);
+        assert_eq!(snapshot.last_success_unix_ms, 14);
+        assert_eq!(
+            snapshot.candidate_moves,
+            vec![
+                RebalanceCandidateMetricsSnapshot {
+                    shard: 3,
+                    from_node_id: "node-from-\"".to_string(),
+                    to_node_id: "node-to-\n".to_string(),
+                    decision_score: 1.25,
+                },
+                RebalanceCandidateMetricsSnapshot {
+                    shard: 4,
+                    from_node_id: "node-c".to_string(),
+                    to_node_id: "node-d".to_string(),
+                    decision_score: 0.75,
+                },
+            ]
+        );
+        drop(snapshot);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = runtime
+            .rebalance_metrics_snapshot_with_execution(&exact)
+            .expect("the exact projection limit should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), exact_bytes);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().active_queries, 0);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .rebalance_metrics_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the projection model must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected rebalance metrics projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the failed reservation must precede all candidate label allocation"
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn admin_rebalance_live_control_and_full_status_producers_enforce_exact_peak_limits() {
+        fn budget_with_memory_limit(limit: Option<u64>) -> QueryBudget {
+            QueryBudget::new(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: limit,
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: limit,
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .expect("rebalance producer test budget should build")
+        }
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_single_node_rebalance_runtime_for_test(
+            temp_dir.path(),
+            DigestExchangeConfig::default(),
+            |state| {
+                state
+                    .apply_join_node("node-b-dynamic", "127.0.0.1:9302")
+                    .expect("join should apply");
+                let activation_ring_version = state.ring_version.saturating_add(1);
+                state
+                    .apply_begin_shard_handoff(
+                        0,
+                        "node-a",
+                        "node-b-dynamic",
+                        activation_ring_version,
+                    )
+                    .expect("handoff should begin");
+                state
+                    .apply_shard_handoff_progress(
+                        0,
+                        ShardHandoffPhase::Warmup,
+                        Some(3),
+                        Some(7),
+                        None,
+                    )
+                    .expect("handoff progress should apply");
+            },
+        );
+        {
+            let mut metrics = runtime
+                .rebalance_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            metrics.last_error = Some("bounded full-status diagnostic".to_string());
+        }
+
+        let control_calibration_budget = budget_with_memory_limit(None);
+        let control_calibration = control_calibration_budget
+            .begin_query()
+            .expect("control calibration should admit");
+        let control_projection = runtime
+            .rebalance_control_projection_with_execution(&control_calibration)
+            .expect("control calibration projection should build");
+        let control_retained = control_calibration.snapshot().memory_reserved_bytes;
+        let control_peak = control_calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(control_peak >= control_retained);
+        assert!(control_retained > 0);
+        drop(control_projection);
+        assert_eq!(control_calibration.snapshot().memory_reserved_bytes, 0);
+        drop(control_calibration);
+        assert_eq!(control_calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            control_calibration_budget
+                .snapshot()
+                .shared_reserved_memory_bytes,
+            0
+        );
+
+        let control_exact_budget = budget_with_memory_limit(Some(control_peak));
+        let control_exact = control_exact_budget
+            .begin_query()
+            .expect("exact control query should admit");
+        let control_projection = runtime
+            .rebalance_control_projection_with_execution(&control_exact)
+            .expect("the exact live-control peak should pass");
+        assert_eq!(
+            control_exact_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            control_peak
+        );
+        drop(control_projection);
+        assert_eq!(control_exact.snapshot().memory_reserved_bytes, 0);
+        drop(control_exact);
+        assert_eq!(control_exact_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            control_exact_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let control_one_under_budget =
+            budget_with_memory_limit(Some(control_peak.saturating_sub(1)));
+        let control_one_under = control_one_under_budget
+            .begin_query()
+            .expect("one-under control query should admit");
+        let error = runtime
+            .rebalance_control_projection_with_execution(&control_one_under)
+            .expect_err("one byte below the live-control peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, control_peak);
+            }
+            other => panic!("unexpected live-control projection error: {other}"),
+        }
+        assert_eq!(control_one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            control_one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the failed control reservation must precede ownership and handoff clones"
+        );
+        drop(control_one_under);
+        let control_one_under_after = control_one_under_budget.snapshot();
+        assert_eq!(control_one_under_after.active_queries, 0);
+        assert_eq!(control_one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            control_one_under_after.accounting_invariant_violations_total,
+            0
+        );
+
+        let source_budget = budget_with_memory_limit(None);
+        let source_execution = source_budget
+            .begin_query()
+            .expect("status source query should admit");
+        let source_projection = runtime
+            .rebalance_control_projection_with_execution(&source_execution)
+            .expect("status source projection should build");
+        let tracker = hotspot::HotspotTrackerSnapshot {
+            generated_unix_ms: 1,
+            shards: vec![hotspot::HotspotShardCountersSnapshot {
+                shard: 0,
+                ingest_rows_total: 10,
+                query_requests_total: 2,
+                query_shard_hits_total: 2,
+                repair_mismatches_total: 1,
+                repair_series_gap_total: 1,
+                repair_point_gap_total: 1,
+                repair_rows_inserted_total: 0,
+            }],
+            tenants: Vec::new(),
+        };
+
+        let status_calibration_budget = budget_with_memory_limit(None);
+        let status_calibration = status_calibration_budget
+            .begin_query()
+            .expect("status calibration should admit");
+        let status_snapshot = runtime
+            .rebalance_status_snapshot_with_execution(
+                &source_projection,
+                &tracker,
+                &status_calibration,
+            )
+            .expect("full status calibration should build");
+        let status_retained = status_calibration.snapshot().memory_reserved_bytes;
+        let status_peak = status_calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(status_peak >= status_retained);
+        assert!(status_retained > 0);
+        assert_eq!(
+            status_snapshot.last_error.as_deref(),
+            Some("bounded full-status diagnostic")
+        );
+        assert_eq!(status_snapshot.jobs.len(), 1);
+        drop(status_snapshot);
+        assert_eq!(status_calibration.snapshot().memory_reserved_bytes, 0);
+        drop(status_calibration);
+        assert_eq!(status_calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            status_calibration_budget
+                .snapshot()
+                .shared_reserved_memory_bytes,
+            0
+        );
+
+        let status_exact_budget = budget_with_memory_limit(Some(status_peak));
+        let status_exact = status_exact_budget
+            .begin_query()
+            .expect("exact status query should admit");
+        let status_snapshot = runtime
+            .rebalance_status_snapshot_with_execution(&source_projection, &tracker, &status_exact)
+            .expect("the exact full-status peak should pass");
+        assert_eq!(
+            status_exact_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            status_peak
+        );
+        drop(status_snapshot);
+        assert_eq!(status_exact.snapshot().memory_reserved_bytes, 0);
+        drop(status_exact);
+        assert_eq!(status_exact_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            status_exact_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let status_one_under_budget = budget_with_memory_limit(Some(status_peak.saturating_sub(1)));
+        let status_one_under = status_one_under_budget
+            .begin_query()
+            .expect("one-under status query should admit");
+        let error = runtime
+            .rebalance_status_snapshot_with_execution(
+                &source_projection,
+                &tracker,
+                &status_one_under,
+            )
+            .expect_err("one byte below the full-status peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, status_peak);
+            }
+            other => panic!("unexpected full-status projection error: {other}"),
+        }
+        assert_eq!(status_one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            status_one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the failed full-status reservation must precede label and job clones"
+        );
+        drop(status_one_under);
+        let status_one_under_after = status_one_under_budget.snapshot();
+        assert_eq!(status_one_under_after.active_queries, 0);
+        assert_eq!(status_one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            status_one_under_after.accounting_invariant_violations_total,
+            0
+        );
+
+        drop(source_projection);
+        assert_eq!(source_execution.snapshot().memory_reserved_bytes, 0);
+        drop(source_execution);
+        assert_eq!(source_budget.snapshot().active_queries, 0);
+        assert_eq!(source_budget.snapshot().shared_reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn rebalance_metrics_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_single_node_rebalance_runtime_for_test(
+            temp_dir.path(),
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .rebalance_metrics_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.cancellations_total, 1);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
 
     #[test]
     fn repair_remote_accounting_rejects_underreported_heap_payload() {
@@ -5203,6 +7367,211 @@ mod tests {
             ranked[ranked_index].pressure_score > baseline[baseline_index].pressure_score,
             "expected hotspot pressure to increase the shard pressure score"
         );
+
+        let budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("projection budget should build");
+        let execution = budget.begin_query().expect("projection query should admit");
+        let projection = state
+            .rebalance_projection_with_execution("node-a", &execution)
+            .expect("live rebalance projection should build");
+        let projected = collect_rebalance_move_candidates_from_projection_with_execution(
+            &projection,
+            &tracker,
+            &execution,
+        )
+        .expect("projected candidate ranking should build")
+        .iter()
+        .map(|candidate| RebalanceMoveCandidateSnapshot {
+            shard: candidate.shard,
+            from_node_id: candidate.from_node_id.to_string(),
+            to_node_id: candidate.to_node_id.to_string(),
+            pressure_score: candidate.pressure_score,
+            movement_cost_score: candidate.movement_cost_score,
+            imbalance_improvement_score: candidate.imbalance_improvement_score,
+            decision_score: candidate.decision_score,
+            source_node_pressure: candidate.source_node_pressure,
+            target_node_pressure: candidate.target_node_pressure,
+            reason: candidate.reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            projected, ranked,
+            "the minimal accounted projection must preserve live candidate semantics"
+        );
+        drop(projection);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn removing_or_merging_shard_identities_changes_rebalance_scores_and_order() {
+        fn tracked_shard(shard: u32) -> hotspot::HotspotShardCountersSnapshot {
+            hotspot::HotspotShardCountersSnapshot {
+                shard,
+                ingest_rows_total: 0,
+                query_requests_total: 0,
+                query_shard_hits_total: 0,
+                // A mismatch with zero gap is a retained identity, but contributes no pressure
+                // to the current automatic-rebalance score.
+                repair_mismatches_total: 1,
+                repair_series_gap_total: 0,
+                repair_point_gap_total: 0,
+                repair_rows_inserted_total: 0,
+            }
+        }
+
+        let cluster_config = ClusterConfig {
+            enabled: true,
+            node_id: Some("node-a".to_string()),
+            bind: Some("127.0.0.1:9301".to_string()),
+            seeds: vec![
+                "node-b@127.0.0.1:9302".to_string(),
+                "node-c@127.0.0.1:9303".to_string(),
+            ],
+            shards: 16,
+            replication_factor: 1,
+            ..ClusterConfig::default()
+        };
+        let membership =
+            MembershipView::from_config(&cluster_config).expect("membership should build");
+        let ring = ShardRing::build(
+            cluster_config.shards,
+            cluster_config.replication_factor,
+            &membership,
+        )
+        .expect("ring should build");
+        let mut state = ControlState::from_runtime(&membership, &ring);
+        state
+            .apply_join_node("node-d", "127.0.0.1:9304")
+            .expect("join should apply");
+        state.leader_node_id = Some("node-a".to_string());
+
+        let baseline = collect_rebalance_move_candidates_with_tracker(
+            "node-a",
+            &state,
+            &hotspot::HotspotTrackerSnapshot {
+                generated_unix_ms: 0,
+                shards: Vec::new(),
+                tenants: Vec::new(),
+            },
+        );
+        assert!(baseline.len() >= 2);
+
+        let hot_shard = baseline[0].shard;
+        let mut complete_shards = (0..cluster_config.shards)
+            .map(tracked_shard)
+            .collect::<Vec<_>>();
+        complete_shards
+            .iter_mut()
+            .find(|shard| shard.shard == hot_shard)
+            .expect("hot candidate must be in the configured ring")
+            .ingest_rows_total = 1;
+        let removed_identity = complete_shards
+            .iter()
+            .find(|shard| shard.shard != hot_shard)
+            .expect("fixture must contain an unrelated identity")
+            .shard;
+        let removed_shards = complete_shards
+            .iter()
+            .filter(|shard| shard.shard != removed_identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        let complete_ranked = collect_rebalance_move_candidates_with_tracker(
+            "node-a",
+            &state,
+            &hotspot::HotspotTrackerSnapshot {
+                generated_unix_ms: 0,
+                shards: complete_shards,
+                tenants: Vec::new(),
+            },
+        );
+        let removed_ranked = collect_rebalance_move_candidates_with_tracker(
+            "node-a",
+            &state,
+            &hotspot::HotspotTrackerSnapshot {
+                generated_unix_ms: 0,
+                shards: removed_shards,
+                tenants: Vec::new(),
+            },
+        );
+        let complete_hot = complete_ranked
+            .iter()
+            .find(|candidate| candidate.shard == hot_shard)
+            .expect("hot candidate must remain eligible");
+        let removed_hot = removed_ranked
+            .iter()
+            .find(|candidate| candidate.shard == hot_shard)
+            .expect("hot candidate must remain eligible after unrelated removal");
+        assert!(
+            complete_hot.pressure_score > removed_hot.pressure_score,
+            "removing an unrelated zero-pressure identity changes the slot denominator"
+        );
+
+        let mut changed_order = None;
+        for source in &baseline {
+            for target in &baseline {
+                if source.shard == target.shard {
+                    continue;
+                }
+                let mut separate = (0..cluster_config.shards)
+                    .map(tracked_shard)
+                    .collect::<Vec<_>>();
+                separate
+                    .iter_mut()
+                    .find(|shard| shard.shard == source.shard)
+                    .expect("source candidate must be in the configured ring")
+                    .ingest_rows_total = 1;
+                let separate_order = collect_rebalance_move_candidates_with_tracker(
+                    "node-a",
+                    &state,
+                    &hotspot::HotspotTrackerSnapshot {
+                        generated_unix_ms: 0,
+                        shards: separate.clone(),
+                        tenants: Vec::new(),
+                    },
+                )
+                .into_iter()
+                .map(|candidate| candidate.shard)
+                .collect::<Vec<_>>();
+
+                separate.retain(|shard| shard.shard != source.shard);
+                separate
+                    .iter_mut()
+                    .find(|shard| shard.shard == target.shard)
+                    .expect("merge target must be in the configured ring")
+                    .ingest_rows_total = 1;
+                let merged_order = collect_rebalance_move_candidates_with_tracker(
+                    "node-a",
+                    &state,
+                    &hotspot::HotspotTrackerSnapshot {
+                        generated_unix_ms: 0,
+                        shards: separate,
+                        tenants: Vec::new(),
+                    },
+                )
+                .into_iter()
+                .map(|candidate| candidate.shard)
+                .collect::<Vec<_>>();
+                if separate_order != merged_order {
+                    changed_order =
+                        Some((source.shard, target.shard, separate_order, merged_order));
+                    break;
+                }
+            }
+            if changed_order.is_some() {
+                break;
+            }
+        }
+
+        let (source, target, separate_order, merged_order) = changed_order.expect(
+            "merging one candidate shard identity into another must expose an ordering change",
+        );
+        assert_ne!(source, target);
+        assert_ne!(separate_order, merged_order);
     }
 
     fn find_label_for_shard(

@@ -4,7 +4,7 @@ use crate::prom_write::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tsink::label::{MAX_LABEL_NAME_LEN, MAX_METRIC_NAME_LEN};
 use tsink::{DataPoint, TimestampPrecision, WriteAcknowledgement};
 
@@ -39,6 +39,10 @@ static GRAPHITE_REJECTED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_THROTTLED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_ACCEPTED_SAMPLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GRAPHITE_REJECTED_SAMPLES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static INFLUX_LINE_PROTOCOL_CONFIG: OnceLock<InfluxLineProtocolConfig> = OnceLock::new();
+static STATSD_CONFIG: OnceLock<StatsdConfig> = OnceLock::new();
+static GRAPHITE_CONFIG: OnceLock<GraphiteConfig> = OnceLock::new();
 
 pub const LEGACY_WRITE_ERROR_REASON_NAMES: [&str; 22] = [
     "none",
@@ -592,7 +596,7 @@ pub fn normalize_graphite_plaintext_line(
     })
 }
 
-pub fn influx_line_protocol_config() -> InfluxLineProtocolConfig {
+fn resolve_influx_line_protocol_config() -> InfluxLineProtocolConfig {
     InfluxLineProtocolConfig {
         enabled: parse_env_bool(INFLUX_LINE_PROTOCOL_ENABLED_ENV, true),
         max_lines_per_request: parse_env_usize(
@@ -603,7 +607,11 @@ pub fn influx_line_protocol_config() -> InfluxLineProtocolConfig {
     }
 }
 
-pub fn statsd_config() -> StatsdConfig {
+pub fn influx_line_protocol_config() -> InfluxLineProtocolConfig {
+    *INFLUX_LINE_PROTOCOL_CONFIG.get_or_init(resolve_influx_line_protocol_config)
+}
+
+fn resolve_statsd_config() -> StatsdConfig {
     StatsdConfig {
         max_packet_bytes: parse_env_usize(
             STATSD_MAX_PACKET_BYTES_ENV,
@@ -618,7 +626,11 @@ pub fn statsd_config() -> StatsdConfig {
     }
 }
 
-pub fn graphite_config() -> GraphiteConfig {
+pub fn statsd_config() -> StatsdConfig {
+    *STATSD_CONFIG.get_or_init(resolve_statsd_config)
+}
+
+fn resolve_graphite_config() -> GraphiteConfig {
     GraphiteConfig {
         max_line_bytes: parse_env_usize(
             GRAPHITE_MAX_LINE_BYTES_ENV,
@@ -626,6 +638,17 @@ pub fn graphite_config() -> GraphiteConfig {
         )
         .max(64),
     }
+}
+
+pub fn graphite_config() -> GraphiteConfig {
+    *GRAPHITE_CONFIG.get_or_init(resolve_graphite_config)
+}
+
+#[cfg(test)]
+pub(crate) fn protocol_configs_initialized_for_test() -> bool {
+    INFLUX_LINE_PROTOCOL_CONFIG.get().is_some()
+        && STATSD_CONFIG.get().is_some()
+        && GRAPHITE_CONFIG.get().is_some()
 }
 
 pub fn set_listener_enabled(kind: LegacyAdapterKind, enabled: bool) {
@@ -716,10 +739,13 @@ pub fn record_adapter_write(kind: LegacyAdapterKind, observation: AdapterWriteOb
 }
 
 pub fn status_snapshot() -> LegacyIngestStatusSnapshot {
+    let influx_config = influx_line_protocol_config();
+    let statsd_config = statsd_config();
+    let graphite_config = graphite_config();
     LegacyIngestStatusSnapshot {
         influx: InfluxLineProtocolStatusSnapshot {
-            enabled: influx_line_protocol_config().enabled,
-            max_lines_per_request: influx_line_protocol_config().max_lines_per_request,
+            enabled: influx_config.enabled,
+            max_lines_per_request: influx_config.max_lines_per_request,
             counters: snapshot_counters(LegacyAdapterKind::InfluxLineProtocol),
             write_observability: snapshot_write_observability(
                 LegacyAdapterKind::InfluxLineProtocol,
@@ -727,14 +753,14 @@ pub fn status_snapshot() -> LegacyIngestStatusSnapshot {
         },
         statsd: StatsdStatusSnapshot {
             enabled: STATSD_LISTENER_ENABLED.load(Ordering::Relaxed) > 0,
-            max_packet_bytes: statsd_config().max_packet_bytes,
-            max_events_per_packet: statsd_config().max_events_per_packet,
+            max_packet_bytes: statsd_config.max_packet_bytes,
+            max_events_per_packet: statsd_config.max_events_per_packet,
             counters: snapshot_counters(LegacyAdapterKind::Statsd),
             write_observability: snapshot_write_observability(LegacyAdapterKind::Statsd),
         },
         graphite: GraphiteStatusSnapshot {
             enabled: GRAPHITE_LISTENER_ENABLED.load(Ordering::Relaxed) > 0,
-            max_line_bytes: graphite_config().max_line_bytes,
+            max_line_bytes: graphite_config.max_line_bytes,
             counters: snapshot_counters(LegacyAdapterKind::Graphite),
             write_observability: snapshot_write_observability(LegacyAdapterKind::Graphite),
         },
@@ -1351,11 +1377,24 @@ fn split_first_unescaped_unquoted(raw: &str, needle: u8) -> Option<(&str, &str)>
 
 fn parse_env_bool(var: &str, default: bool) -> bool {
     match std::env::var(var) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
+        Ok(value) => parse_bool(value.trim()).unwrap_or(false),
         Err(_) => default,
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    if ["1", "true", "yes", "on"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(true)
+    } else if ["0", "false", "no", "off"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1370,6 +1409,44 @@ fn parse_env_usize(var: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use crate::tenant;
+
+    #[test]
+    fn legacy_metrics_snapshot_is_copy_and_preserves_resolved_adapter_limits() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<InfluxLineProtocolConfig>();
+        assert_copy::<StatsdConfig>();
+        assert_copy::<GraphiteConfig>();
+        assert_copy::<LegacyIngestStatusSnapshot>();
+
+        let influx = influx_line_protocol_config();
+        let statsd = statsd_config();
+        let graphite = graphite_config();
+        let snapshot = status_snapshot();
+
+        assert_eq!(snapshot.influx.enabled, influx.enabled);
+        assert_eq!(
+            snapshot.influx.max_lines_per_request,
+            influx.max_lines_per_request
+        );
+        assert_eq!(snapshot.statsd.max_packet_bytes, statsd.max_packet_bytes);
+        assert_eq!(
+            snapshot.statsd.max_events_per_packet,
+            statsd.max_events_per_packet
+        );
+        assert_eq!(snapshot.graphite.max_line_bytes, graphite.max_line_bytes);
+    }
+
+    #[test]
+    fn legacy_boolean_parser_preserves_case_insensitive_environment_semantics() {
+        for value in ["1", "TRUE", "Yes", "oN"] {
+            assert_eq!(parse_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "FALSE", "No", "OfF"] {
+            assert_eq!(parse_bool(value), Some(false), "{value}");
+        }
+        assert_eq!(parse_bool("not-a-boolean"), None);
+    }
 
     #[test]
     fn statsd_adapter_normalizes_common_events() {

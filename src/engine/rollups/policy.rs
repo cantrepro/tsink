@@ -98,6 +98,238 @@ pub(super) fn encode_rollup_policies(policies: &[RollupPolicy]) -> Result<Vec<u8
     Ok(serde_json::to_vec_pretty(&payload)?)
 }
 
+pub(in crate::engine) struct RollupStatusSnapshotSource<'a> {
+    #[cfg(test)]
+    state: &'a RollupRuntimeState,
+    counters: &'a RollupObservabilityCounters,
+    max_observed_timestamp: i64,
+    cursor: parking_lot::MutexGuard<'a, BackgroundRollupCursor>,
+    _snapshot_visibility: parking_lot::RwLockReadGuard<'a, ()>,
+    policies: parking_lot::RwLockReadGuard<'a, Vec<RollupPolicy>>,
+    policy_stats: parking_lot::RwLockReadGuard<'a, BTreeMap<String, PolicyRunState>>,
+    _run_guard: parking_lot::MutexGuard<'a, ()>,
+}
+
+fn add_status_snapshot_bytes(total: &mut u64, bytes: u64) -> Result<()> {
+    *total = total.checked_add(bytes).ok_or_else(|| {
+        TsinkError::Other(
+            "rollup status observability retained-byte model exceeds the supported range"
+                .to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+fn modeled_status_string_bytes(value: &str) -> Result<u64> {
+    crate::storage::modeled_status_observability_string_bytes(value.len())
+}
+
+fn clone_status_string(value: &str) -> Result<String> {
+    let mut cloned = String::new();
+    cloned.try_reserve_exact(value.len()).map_err(|_| {
+        TsinkError::Other("rollup status observability string allocation failed".to_string())
+    })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+impl RollupStatusSnapshotSource<'_> {
+    fn traversal_progress(&self) -> (bool, Option<&str>, Option<SeriesId>) {
+        if !self.cursor.cycle_complete {
+            return (
+                false,
+                self.cursor.policy_id.as_deref(),
+                self.cursor.after_series_id,
+            );
+        }
+        if let Some(policy) = self.policies.iter().find(|policy| {
+            !self
+                .policy_stats
+                .get(&policy.id)
+                .is_some_and(|state| state.source_traversal_complete)
+        }) {
+            return (false, Some(policy.id.as_str()), None);
+        }
+        (true, None, None)
+    }
+
+    pub(in crate::engine) fn modeled_retained_bytes(&self) -> Result<u64> {
+        let mut total = crate::storage::modeled_status_observability_vec_bytes::<RollupPolicyStatus>(
+            self.policies.len(),
+        )?;
+        let (_, continuation_policy_id, _) = self.traversal_progress();
+        if let Some(policy_id) = continuation_policy_id {
+            add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(policy_id)?)?;
+        }
+        for policy in self.policies.iter() {
+            add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(&policy.id)?)?;
+            add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(&policy.metric)?)?;
+            add_status_snapshot_bytes(
+                &mut total,
+                crate::storage::modeled_status_observability_vec_bytes::<Label>(
+                    policy.match_labels.len(),
+                )?,
+            )?;
+            for label in &policy.match_labels {
+                add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(&label.name)?)?;
+                add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(&label.value)?)?;
+            }
+            if let Some(error) = self
+                .policy_stats
+                .get(&policy.id)
+                .and_then(|state| state.last_error.as_deref())
+            {
+                add_status_snapshot_bytes(&mut total, modeled_status_string_bytes(error)?)?;
+            }
+        }
+        Ok(total)
+    }
+
+    pub(in crate::engine) fn materialize(
+        self,
+        execution: &QueryExecution,
+    ) -> Result<RollupObservabilitySnapshot> {
+        execution.checkpoint()?;
+        let (source_traversal_complete, continuation_policy_id, continuation_after_series_id) =
+            self.traversal_progress();
+        let continuation_policy_id = continuation_policy_id
+            .map(clone_status_string)
+            .transpose()?;
+
+        let mut policies = Vec::new();
+        policies
+            .try_reserve_exact(self.policies.len())
+            .map_err(|_| {
+                TsinkError::Other(
+                    "rollup status observability policy allocation failed".to_string(),
+                )
+            })?;
+        for policy in self.policies.iter() {
+            execution.checkpoint()?;
+            #[cfg(test)]
+            self.state
+                .test_hooks
+                .status_snapshot_policy_copies
+                .fetch_add(1, Ordering::Relaxed);
+
+            let mut match_labels = Vec::new();
+            match_labels
+                .try_reserve_exact(policy.match_labels.len())
+                .map_err(|_| {
+                    TsinkError::Other(
+                        "rollup status observability label allocation failed".to_string(),
+                    )
+                })?;
+            for label in &policy.match_labels {
+                match_labels.push(Label {
+                    name: clone_status_string(&label.name)?,
+                    value: clone_status_string(&label.value)?,
+                });
+            }
+            let runtime = self.policy_stats.get(&policy.id);
+            let materialized_through = runtime
+                .filter(|state| state.source_traversal_complete)
+                .and_then(|state| state.materialized_through);
+            policies.push(RollupPolicyStatus {
+                policy: RollupPolicy {
+                    id: clone_status_string(&policy.id)?,
+                    metric: clone_status_string(&policy.metric)?,
+                    match_labels,
+                    interval: policy.interval,
+                    aggregation: policy.aggregation,
+                    bucket_origin: policy.bucket_origin,
+                },
+                matched_series: runtime.map_or(0, |state| state.matched_series),
+                materialized_series: runtime.map_or(0, |state| state.materialized_series),
+                materialized_through,
+                lag: materialized_through.and_then(|through| {
+                    (self.max_observed_timestamp != i64::MIN)
+                        .then_some(self.max_observed_timestamp.saturating_sub(through))
+                }),
+                source_traversal_complete: runtime
+                    .is_some_and(|state| state.source_traversal_complete),
+                last_run_started_at_ms: runtime.and_then(|state| state.last_run_started_at_ms),
+                last_run_completed_at_ms: runtime.and_then(|state| state.last_run_completed_at_ms),
+                last_run_duration_nanos: runtime.map_or(0, |state| state.last_run_duration_nanos),
+                last_error: runtime
+                    .and_then(|state| state.last_error.as_deref())
+                    .map(clone_status_string)
+                    .transpose()?,
+            });
+        }
+
+        Ok(RollupObservabilitySnapshot {
+            worker_runs_total: self.counters.worker_runs_total.load(Ordering::Relaxed),
+            worker_success_total: self.counters.worker_success_total.load(Ordering::Relaxed),
+            worker_errors_total: self.counters.worker_errors_total.load(Ordering::Relaxed),
+            policy_runs_total: self.counters.policy_runs_total.load(Ordering::Relaxed),
+            buckets_materialized_total: self
+                .counters
+                .buckets_materialized_total
+                .load(Ordering::Relaxed),
+            points_materialized_total: self
+                .counters
+                .points_materialized_total
+                .load(Ordering::Relaxed),
+            last_run_duration_nanos: self
+                .counters
+                .last_run_duration_nanos
+                .load(Ordering::Relaxed),
+            source_traversal_complete,
+            continuation_policy_id,
+            continuation_after_series_id,
+            policies,
+        })
+    }
+}
+
+impl ChunkStorage {
+    pub(in crate::engine) fn rollup_status_snapshot_source(
+        &self,
+    ) -> RollupStatusSnapshotSource<'_> {
+        let max_observed_timestamp = self
+            .rollup_source_read_context()
+            .bounded_recency_reference_timestamp()
+            .unwrap_or(i64::MIN);
+        let coordination = self.rollup_run_coordination_context();
+        let run_guard = coordination.run_lock.lock();
+        let cursor = coordination.traversal_cursor.lock();
+        let store = self.rollup_state_store_context();
+        let snapshot_visibility = store.state.snapshot_visibility.read();
+        let policies = store.state.policies.read();
+        let policy_stats = store.state.policy_stats.read();
+        RollupStatusSnapshotSource {
+            #[cfg(test)]
+            state: store.state,
+            counters: &self.observability.rollup,
+            max_observed_timestamp,
+            cursor,
+            _snapshot_visibility: snapshot_visibility,
+            policies,
+            policy_stats,
+            _run_guard: run_guard,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn rollup_status_snapshot_policy_copies(&self) -> u64 {
+        self.rollup_state_store_context()
+            .state
+            .test_hooks
+            .status_snapshot_policy_copies
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn reset_rollup_status_snapshot_policy_copies(&self) {
+        self.rollup_state_store_context()
+            .state
+            .test_hooks
+            .status_snapshot_policy_copies
+            .store(0, Ordering::Relaxed);
+    }
+}
+
 impl RollupQuerySelectionContext<'_> {
     fn rollup_query_candidate(
         self,
@@ -352,6 +584,69 @@ impl ChunkStorage {
     ) -> RollupObservabilitySnapshot {
         self.rollup_query_selection_context()
             .rollup_observability_snapshot(progress)
+    }
+
+    pub(in crate::engine) fn rollup_metrics_observability_snapshot(
+        &self,
+        execution: &QueryExecution,
+        reservation: &mut crate::QueryMemoryReservation,
+    ) -> Result<RollupMetricsObservabilitySnapshot> {
+        let traversal_cycle_complete = self.rollup_traversal_cycle_complete();
+        let max_observed_timestamp = self
+            .rollup_source_read_context()
+            .bounded_recency_reference_timestamp();
+        let (policies, label_arena, source_traversal_complete) =
+            self.rollup_state_store_context().metrics_policy_snapshot(
+                execution,
+                reservation,
+                max_observed_timestamp,
+                traversal_cycle_complete,
+            )?;
+        Ok(RollupMetricsObservabilitySnapshot::new(
+            self.observability
+                .rollup
+                .worker_runs_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .worker_success_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .worker_errors_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .policy_runs_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .buckets_materialized_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .points_materialized_total
+                .load(Ordering::Relaxed),
+            self.observability
+                .rollup
+                .last_run_duration_nanos
+                .load(Ordering::Relaxed),
+            source_traversal_complete,
+            policies,
+            label_arena,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn reset_rollup_metrics_snapshot_policy_copies(&self) {
+        self.rollup_state_store_context()
+            .reset_metrics_snapshot_policy_copies();
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn rollup_metrics_snapshot_policy_copies(&self) -> u64 {
+        self.rollup_state_store_context()
+            .metrics_snapshot_policy_copies()
     }
 
     #[cfg(test)]

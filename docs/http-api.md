@@ -428,6 +428,17 @@ the indeterminate publication. `cleanupDebt` without a fence means the log and m
 durable but grouped finalization, owned-temp cleanup, or accounting reconciliation remains to be
 retried; cleanup is attempted before any separate fence repair.
 
+The built-in storage engine has a schema-complete execution-aware status projection that reserves
+its dynamic clone before materialization and retains the reservation with the snapshot. The
+`Storage` default fails closed, and tenant-scoped and distributed adapters forward this contract.
+The direct handler now consumes that projection under the same root execution as complete metric
+enumeration. Its allocation-bearing write/fanout, outbox, consensus/handoff, digest,
+hotspot/rebalance, tenant, audit, security/RBAC, usage, managed-control-plane, and edge-sync
+producers likewise reserve before materialization and retain their guards through response-tree
+materialization; the fixed planner projection is allocation-free. The remaining adapter boundary
+is the `serde_json::Value` tree itself: the handler measures and retains it once complete, but
+still constructs it before that tree reservation is established.
+
 **Authentication:** public scope, read permission.
 
 **Response:** `200 application/json` — Large nested object; contents vary by configuration.
@@ -1005,7 +1016,38 @@ Download a bounded JSON diagnostic snapshot for a tenant. Includes status, usage
 |---|---|---|
 | `tenant` | `default` | Tenant to scope the bundle to. |
 
-**Response:** `200 application/json` — downloaded as `tsink-support-bundle-<tenant>-<timestamp>.json`.
+**Response:** `200 application/json` — downloaded as
+`tsink-support-bundle-<tenant>-<timestamp>.json`.
+
+The adapter caps simultaneously retained child responses and the final encoded bundle at 16 MiB.
+It admits one query execution before collecting children. TSDB status and rebalance reuse that
+execution, and every completed child response acquires an exact same-execution retained-memory
+guard inside its support-specific child API before returning to the bundle orchestrator. All child
+guards remain live through final composition; the parent base reservation excludes those already
+guarded bytes, and only the final bundle charges HTTP response-body bytes. Child source operations
+still charge canonical logical returned work such as metric identities.
+It returns the standard structured read-error body with
+`X-Tsink-Read-Error-Code` for composition failures:
+
+| Status | Meaning |
+|---|---|
+| `413` | The child-response aggregate, encoded bundle, returned-byte budget, or modeled composition-memory budget is too large. |
+| `429` | Query concurrency or shared modeled-memory admission is currently exhausted; `Retry-After` is included. |
+| `500` | Query admission is unavailable or accounting/serialization failed. |
+| `503` | The request was canceled or timed out. |
+
+Individual diagnostic sections retain their child endpoint status inside `httpStatus`; a child
+failure does not by itself change a successfully encoded bundle's outer `200`.
+
+The 16 MiB child aggregate is both a fixed size ceiling and a cumulatively guarded retained
+response envelope. This closes the completed child-to-parent response handoff, including
+cluster-enabled finite profiles with `max_concurrent_queries = 1`. It does not retrospectively
+account legacy operational snapshot and serialization work performed before a child has built its
+completed response; those producer transients remain in progress. Tenant/actor parsing and the
+synthetic child-request/header copies are also prepared before the parent setup reservation and
+remain an explicit adapter boundary. Tenant override decoding is capped at the 16 KiB tenant
+label-value ceiling and does not clone the HTTP request body. Socket, runtime, allocator, kernel,
+and TLS allocations after `HttpResponse` construction remain outside the portable model.
 
 ---
 
@@ -1109,6 +1151,14 @@ Shard handoff is the mechanism for migrating a shard between nodes.
 | `POST` | `/api/v1/admin/cluster/rebalance/pause` | Pause rebalance. |
 | `POST` | `/api/v1/admin/cluster/rebalance/resume` | Resume rebalance. |
 | `GET` | `/api/v1/admin/cluster/rebalance/status` | Return rebalance state. |
+
+All four operations use one root query execution for metric enumeration, live control and hotspot
+inputs, scheduler status, and exact response encoding. Successful responses retain their existing
+schema. Pause, resume, and run can apply their requested effect before a later status projection or
+response limit fails; such an error includes `data.effectApplied: true`, `data.operation`, and the
+resulting `rebalancePaused`/`rebalanceRunCompleted` values. Callers must inspect this field before
+retrying a failed mutation. These request-time bounds do not bound the process-global retained
+hotspot identity maps.
 
 ---
 

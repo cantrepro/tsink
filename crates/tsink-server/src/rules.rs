@@ -1248,6 +1248,118 @@ pub struct RulesStatusSnapshot {
     pub groups: Vec<RuleGroupStatusSnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RulesExpositionMetrics {
+    pub scheduler_runs_total: u64,
+    pub scheduler_skipped_not_leader_total: u64,
+    pub scheduler_skipped_inflight_total: u64,
+    pub evaluated_rules_total: u64,
+    pub evaluation_failures_total: u64,
+    pub recording_rows_written_total: u64,
+    pub configured_groups: u64,
+    pub configured_rules: u64,
+    pub pending_alerts: u64,
+    pub firing_alerts: u64,
+    pub local_scheduler_active: bool,
+    pub retained_state_bytes: u64,
+    pub peak_retained_state_bytes: u64,
+    pub durable_file_bytes: u64,
+    pub peak_startup_transient_bytes: u64,
+    pub peak_replacement_transient_bytes: u64,
+    pub peak_runtime_update_transient_bytes: u64,
+    pub peak_snapshot_status_bytes: u64,
+    pub peak_snapshot_file_bytes: u64,
+    pub limit_rejections_total: u64,
+    pub startup_rejections_total: u64,
+    pub replacement_rejections_total: u64,
+    pub runtime_update_rejections_total: u64,
+    pub snapshot_rejections_total: u64,
+    pub persistence_failures_total: u64,
+}
+
+impl Default for RulesExpositionMetrics {
+    fn default() -> Self {
+        Self {
+            scheduler_runs_total: 0,
+            scheduler_skipped_not_leader_total: 0,
+            scheduler_skipped_inflight_total: 0,
+            evaluated_rules_total: 0,
+            evaluation_failures_total: 0,
+            recording_rows_written_total: 0,
+            configured_groups: 0,
+            configured_rules: 0,
+            pending_alerts: 0,
+            firing_alerts: 0,
+            local_scheduler_active: true,
+            retained_state_bytes: 0,
+            peak_retained_state_bytes: 0,
+            durable_file_bytes: 0,
+            peak_startup_transient_bytes: 0,
+            peak_replacement_transient_bytes: 0,
+            peak_runtime_update_transient_bytes: 0,
+            peak_snapshot_status_bytes: 0,
+            peak_snapshot_file_bytes: 0,
+            limit_rejections_total: 0,
+            startup_rejections_total: 0,
+            replacement_rejections_total: 0,
+            runtime_update_rejections_total: 0,
+            snapshot_rejections_total: 0,
+            persistence_failures_total: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RulesExpositionSnapshot {
+    pub scheduler_tick_ms: u64,
+    pub max_recording_rows_per_eval: usize,
+    pub max_alert_instances_per_rule: usize,
+    pub store_limits: RulesStoreLimits,
+    pub metrics: RulesExpositionMetrics,
+}
+
+impl Default for RulesExpositionSnapshot {
+    fn default() -> Self {
+        Self {
+            scheduler_tick_ms: DEFAULT_RULES_SCHEDULER_TICK_MS,
+            max_recording_rows_per_eval: DEFAULT_MAX_RECORDING_ROWS_PER_EVAL,
+            max_alert_instances_per_rule: DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
+            store_limits: RulesStoreLimits::default(),
+            metrics: RulesExpositionMetrics::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RulesExpositionError {
+    QueryBudget(tsink::QueryBudgetError),
+    StoreReadPoisoned,
+}
+
+impl std::fmt::Display for RulesExpositionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryBudget(error) => write!(formatter, "{error}"),
+            Self::StoreReadPoisoned => formatter.write_str("rules store read lock poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for RulesExpositionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueryBudget(error) => Some(error),
+            Self::StoreReadPoisoned => None,
+        }
+    }
+}
+
+impl From<tsink::QueryBudgetError> for RulesExpositionError {
+    fn from(error: tsink::QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
+}
+
 #[derive(Serialize)]
 struct RulesSuccessEnvelope<'a> {
     status: &'static str,
@@ -1518,6 +1630,89 @@ impl RulesRuntime {
         snapshot.metrics.snapshot_rejections_total = latest_accounting.snapshot_rejections_total;
         snapshot.metrics.limit_rejections_total = latest_accounting.limit_rejections_total;
         Ok(snapshot)
+    }
+
+    pub(crate) fn metrics_snapshot_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<RulesExpositionSnapshot, RulesExpositionError> {
+        execution.checkpoint()?;
+        let local_scheduler_active = self.scheduler_enabled_here();
+        execution.checkpoint()?;
+
+        let mut metrics = {
+            let metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            RulesExpositionMetrics {
+                scheduler_runs_total: metrics.scheduler_runs_total,
+                scheduler_skipped_not_leader_total: metrics.scheduler_skipped_not_leader_total,
+                scheduler_skipped_inflight_total: metrics.scheduler_skipped_inflight_total,
+                evaluated_rules_total: metrics.evaluated_rules_total,
+                evaluation_failures_total: metrics.evaluation_failures_total,
+                recording_rows_written_total: metrics.recording_rows_written_total,
+                local_scheduler_active,
+                ..RulesExpositionMetrics::default()
+            }
+        };
+        execution.checkpoint()?;
+
+        let store = self
+            .store
+            .state
+            .read()
+            .map_err(|_| RulesExpositionError::StoreReadPoisoned)?;
+        metrics.configured_groups = u64::try_from(store.groups.len()).unwrap_or(u64::MAX);
+        for group in &store.groups {
+            execution.checkpoint()?;
+            metrics.configured_rules = metrics
+                .configured_rules
+                .saturating_add(u64::try_from(group.rules.len()).unwrap_or(u64::MAX));
+        }
+        for runtime in store.runtime.values() {
+            execution.checkpoint()?;
+            for instance in &runtime.alert_instances {
+                execution.checkpoint()?;
+                match instance.state {
+                    AlertInstanceStatus::Pending => {
+                        metrics.pending_alerts = metrics.pending_alerts.saturating_add(1);
+                    }
+                    AlertInstanceStatus::Firing => {
+                        metrics.firing_alerts = metrics.firing_alerts.saturating_add(1);
+                    }
+                }
+            }
+        }
+        drop(store);
+
+        let store_accounting = self.store.accounting.snapshot();
+        metrics.retained_state_bytes = store_accounting.retained_state_bytes;
+        metrics.peak_retained_state_bytes = store_accounting.peak_retained_state_bytes;
+        metrics.durable_file_bytes = store_accounting.durable_file_bytes;
+        metrics.peak_startup_transient_bytes = store_accounting.peak_startup_transient_bytes;
+        metrics.peak_replacement_transient_bytes =
+            store_accounting.peak_replacement_transient_bytes;
+        metrics.peak_runtime_update_transient_bytes =
+            store_accounting.peak_runtime_update_transient_bytes;
+        metrics.peak_snapshot_status_bytes = store_accounting.peak_snapshot_status_bytes;
+        metrics.peak_snapshot_file_bytes = store_accounting.peak_snapshot_file_bytes;
+        metrics.limit_rejections_total = store_accounting.limit_rejections_total;
+        metrics.startup_rejections_total = store_accounting.startup_rejections_total;
+        metrics.replacement_rejections_total = store_accounting.replacement_rejections_total;
+        metrics.runtime_update_rejections_total = store_accounting.runtime_update_rejections_total;
+        metrics.snapshot_rejections_total = store_accounting.snapshot_rejections_total;
+        metrics.persistence_failures_total = store_accounting.persistence_failures_total;
+        execution.checkpoint()?;
+
+        Ok(RulesExpositionSnapshot {
+            scheduler_tick_ms: u64::try_from(self.config.scheduler_tick.as_millis())
+                .unwrap_or(u64::MAX),
+            max_recording_rows_per_eval: self.config.max_recording_rows_per_eval,
+            max_alert_instances_per_rule: self.config.max_alert_instances_per_rule,
+            store_limits: self.config.store_limits,
+            metrics,
+        })
     }
 
     pub(crate) fn encode_success_snapshot(
@@ -3261,47 +3456,6 @@ fn load_rules_store_state(path: &Path) -> Result<PersistedRulesStoreState, Strin
         .map_err(|error| error.to_string())
 }
 
-pub fn empty_rules_snapshot() -> RulesStatusSnapshot {
-    RulesStatusSnapshot {
-        scheduler_tick_ms: DEFAULT_RULES_SCHEDULER_TICK_MS,
-        max_recording_rows_per_eval: DEFAULT_MAX_RECORDING_ROWS_PER_EVAL,
-        max_alert_instances_per_rule: DEFAULT_MAX_ALERT_INSTANCES_PER_RULE,
-        store_limits: RulesStoreLimits::default(),
-        cluster_enabled: false,
-        cluster_leader: true,
-        metrics: RulesMetricsSnapshot {
-            scheduler_runs_total: 0,
-            scheduler_skipped_not_leader_total: 0,
-            scheduler_skipped_inflight_total: 0,
-            evaluated_rules_total: 0,
-            evaluation_failures_total: 0,
-            recording_rows_written_total: 0,
-            last_run_unix_ms: None,
-            last_error: None,
-            configured_groups: 0,
-            configured_rules: 0,
-            pending_alerts: 0,
-            firing_alerts: 0,
-            local_scheduler_active: true,
-            retained_state_bytes: 0,
-            peak_retained_state_bytes: 0,
-            durable_file_bytes: 0,
-            peak_startup_transient_bytes: 0,
-            peak_replacement_transient_bytes: 0,
-            peak_runtime_update_transient_bytes: 0,
-            peak_snapshot_status_bytes: 0,
-            peak_snapshot_file_bytes: 0,
-            limit_rejections_total: 0,
-            startup_rejections_total: 0,
-            replacement_rejections_total: 0,
-            runtime_update_rejections_total: 0,
-            snapshot_rejections_total: 0,
-            persistence_failures_total: 0,
-        },
-        groups: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3465,6 +3619,101 @@ mod tests {
             max_runtime_update_transient_bytes: 16 * 1024 * 1024,
             max_snapshot_status_bytes: 16 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn metrics_exposition_snapshot_is_copy_and_bypasses_status_tree_limit() {
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let limits = RulesStoreLimits {
+            max_snapshot_status_bytes: 1,
+            ..test_store_limits()
+        };
+        let runtime = RulesRuntime::open_with_config(
+            None,
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            RulesRuntimeConfig {
+                store_limits: limits,
+                max_alert_instances_per_rule: limits.max_alert_instances_per_rule,
+                ..RulesRuntimeConfig::default()
+            },
+        )
+        .expect("runtime should open");
+        runtime
+            .store
+            .apply_groups(vec![sample_recording_group(
+                "metrics-copy",
+                "metrics_copy_recording",
+            )])
+            .expect("rule state should fit independently of the status-tree limit");
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("query budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let before = runtime.store.accounting.snapshot();
+
+        let snapshot = runtime
+            .metrics_snapshot_with_execution(&execution)
+            .expect("copy-only metrics projection should bypass the status-tree allocation limit");
+        assert_eq!(snapshot.metrics.configured_groups, 1);
+        assert_eq!(snapshot.metrics.configured_rules, 1);
+        assert!(!std::mem::needs_drop::<RulesExpositionSnapshot>());
+        let after = runtime.store.accounting.snapshot();
+        assert_eq!(
+            after.peak_snapshot_status_bytes,
+            before.peak_snapshot_status_bytes
+        );
+        assert_eq!(
+            after.snapshot_rejections_total,
+            before.snapshot_rejections_total
+        );
+        assert!(
+            runtime.snapshot().is_err(),
+            "the ordinary owned status tree must still enforce its one-byte limit"
+        );
+    }
+
+    #[test]
+    fn metrics_exposition_snapshot_uses_forwarded_execution_and_honors_cancellation() {
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let runtime =
+            RulesRuntime::open(None, storage, TimestampPrecision::Milliseconds, None, None)
+                .expect("runtime should open");
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            ..tsink::QueryBudgetLimits::default()
+        })
+        .expect("query budget should build");
+        let cancellation = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(cancellation.clone())
+            .expect("one root execution should admit");
+
+        runtime
+            .metrics_snapshot_with_execution(&execution)
+            .expect("the projection must reuse the forwarded execution");
+        let active = budget.snapshot();
+        assert_eq!(active.queries_started_total, 1);
+        assert_eq!(active.active_queries, 1);
+        assert_eq!(active.concurrency_rejections_total, 0);
+
+        cancellation.cancel();
+        assert!(matches!(
+            runtime.metrics_snapshot_with_execution(&execution),
+            Err(RulesExpositionError::QueryBudget(
+                tsink::QueryBudgetError::Cancelled
+            ))
+        ));
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.queries_completed_total, 1);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     fn write_rules_fixture(path: &Path, state: &PersistedRulesStoreState) -> Vec<u8> {

@@ -2322,6 +2322,239 @@ pub struct StorageObservabilitySnapshot {
     pub health: StorageHealthSnapshot,
 }
 
+/// Complete query-accounted storage state consumed by status and support-bundle adapters.
+///
+/// The private reservation remains alive for the complete lifetime of every owned field in the
+/// snapshot. Borrow the schema through [`Self::as_snapshot`] or [`std::ops::Deref`]; deliberately
+/// not exposing an owned extraction prevents the dynamic fields from outliving their accounting.
+#[derive(Debug)]
+pub struct StorageStatusObservabilitySnapshot {
+    snapshot: StorageObservabilitySnapshot,
+    memory_reservation: crate::QueryMemoryReservation,
+}
+
+impl StorageStatusObservabilitySnapshot {
+    pub(crate) fn new(
+        snapshot: StorageObservabilitySnapshot,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            snapshot,
+            memory_reservation,
+        }
+    }
+
+    /// Returns the complete storage observability schema while retaining its query reservation.
+    #[must_use]
+    pub fn as_snapshot(&self) -> &StorageObservabilitySnapshot {
+        &self.snapshot
+    }
+
+    /// Modeled query memory retained by the complete snapshot.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for StorageStatusObservabilitySnapshot {
+    type Target = StorageObservabilitySnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_snapshot()
+    }
+}
+
+impl serde::Serialize for StorageStatusObservabilitySnapshot {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.snapshot.serialize(serializer)
+    }
+}
+
+pub(crate) const STATUS_OBSERVABILITY_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+
+pub(crate) fn modeled_status_observability_vec_bytes<T>(len: usize) -> Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let elements = u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .checked_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .ok_or_else(|| {
+            TsinkError::Other(
+                "storage status observability vector exceeds the supported range".to_string(),
+            )
+        })?;
+    elements
+        .checked_add(STATUS_OBSERVABILITY_ALLOCATION_ALLOWANCE_BYTES)
+        .ok_or_else(|| {
+            TsinkError::Other(
+                "storage status observability vector exceeds the supported range".to_string(),
+            )
+        })
+}
+
+pub(crate) fn modeled_status_observability_string_bytes(len: usize) -> Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .checked_add(STATUS_OBSERVABILITY_ALLOCATION_ALLOWANCE_BYTES)
+        .ok_or_else(|| {
+            TsinkError::Other(
+                "storage status observability string exceeds the supported range".to_string(),
+            )
+        })
+}
+
+/// Query-accounted storage state consumed by the Prometheus metrics adapter.
+///
+/// This projection intentionally excludes diagnostic and configuration ownership that the
+/// adapter does not expose: resource-override provenance, excluded-memory category names, WAL
+/// sync-mode text, remote/health error strings, retention diagnostics, and full rollup policies.
+/// The private reservation remains alive until every projected allocation has been dropped.
+#[derive(Debug)]
+pub struct StorageMetricsObservabilitySnapshot {
+    pub local_disk: Option<crate::LocalDiskMetricsSnapshot>,
+    pub memory: MemoryMetricsObservabilitySnapshot,
+    pub cardinality: CardinalityObservabilitySnapshot,
+    pub wal: WalMetricsObservabilitySnapshot,
+    pub flush: FlushObservabilitySnapshot,
+    pub compaction: CompactionObservabilitySnapshot,
+    pub query: QueryObservabilitySnapshot,
+    pub query_budget: QueryBudgetSnapshot,
+    pub rollups: RollupMetricsObservabilitySnapshot,
+    pub remote: RemoteStorageMetricsObservabilitySnapshot,
+    pub background: BackgroundWorkObservabilitySnapshot,
+    memory_reservation: crate::QueryMemoryReservation,
+}
+
+impl StorageMetricsObservabilitySnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        local_disk: Option<crate::LocalDiskMetricsSnapshot>,
+        memory: MemoryMetricsObservabilitySnapshot,
+        cardinality: CardinalityObservabilitySnapshot,
+        wal: WalMetricsObservabilitySnapshot,
+        flush: FlushObservabilitySnapshot,
+        compaction: CompactionObservabilitySnapshot,
+        query: QueryObservabilitySnapshot,
+        query_budget: QueryBudgetSnapshot,
+        rollups: RollupMetricsObservabilitySnapshot,
+        remote: RemoteStorageMetricsObservabilitySnapshot,
+        background: BackgroundWorkObservabilitySnapshot,
+        memory_reservation: crate::QueryMemoryReservation,
+    ) -> Self {
+        Self {
+            local_disk,
+            memory,
+            cardinality,
+            wal,
+            flush,
+            compaction,
+            query,
+            query_budget,
+            rollups,
+            remote,
+            background,
+            memory_reservation,
+        }
+    }
+
+    /// Modeled query memory retained by the owned projection.
+    #[must_use]
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        self.memory_reservation.bytes()
+    }
+}
+
+/// Memory fields emitted by the Prometheus metrics adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryMetricsObservabilitySnapshot {
+    pub excluded_bytes: usize,
+    pub excluded_bytes_known: bool,
+    pub registry_bytes: usize,
+    pub metadata_cache_bytes: usize,
+    pub persisted_index_bytes: usize,
+    pub persisted_mmap_bytes: usize,
+    pub tombstone_bytes: usize,
+    pub remote_catalog_staging_bytes: usize,
+    pub wal_writer_buffer_bytes: usize,
+    pub wal_series_definition_cache_bytes: usize,
+    pub write_transient_bytes: usize,
+    pub peak_write_transient_bytes: usize,
+    pub write_transient_reservations_total: u64,
+    pub write_transient_rejections_total: u64,
+    pub pressure: MemoryPressureMetricsSnapshot,
+}
+
+/// Memory-pressure fields emitted by the Prometheus metrics adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryPressureMetricsSnapshot {
+    pub level: Option<MemoryPressureLevel>,
+    pub active_backpressured_writers: u64,
+    pub backpressure_events_total: u64,
+    pub rejections_total: u64,
+}
+
+/// WAL fields emitted by the Prometheus metrics adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalMetricsObservabilitySnapshot {
+    pub enabled: bool,
+    pub acknowledged_writes_durable: bool,
+    pub size_bytes: u64,
+    pub segment_count: u64,
+    pub active_segment: u64,
+    pub highwater_segment: u64,
+    pub highwater_frame: u64,
+    pub durable_highwater_segment: u64,
+    pub durable_highwater_frame: u64,
+    pub replay_runs_total: u64,
+    pub replay_frames_total: u64,
+    pub replay_series_definitions_total: u64,
+    pub replay_sample_batches_total: u64,
+    pub replay_points_total: u64,
+    pub replay_errors_total: u64,
+    pub replay_duration_nanos_total: u64,
+    pub append_series_definitions_total: u64,
+    pub append_sample_batches_total: u64,
+    pub append_points_total: u64,
+    pub append_bytes_total: u64,
+    pub append_errors_total: u64,
+    pub resets_total: u64,
+    pub reset_errors_total: u64,
+}
+
+/// Remote-storage fields emitted by the Prometheus metrics adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteStorageMetricsObservabilitySnapshot {
+    pub runtime_mode: StorageRuntimeMode,
+    pub mirror_hot_segments: bool,
+    pub catalog_refreshes_total: u64,
+    pub catalog_refresh_errors_total: u64,
+    pub accessible: bool,
+    pub consecutive_refresh_failures: u64,
+    pub backoff_active: bool,
+}
+
+impl Default for RemoteStorageMetricsObservabilitySnapshot {
+    fn default() -> Self {
+        Self {
+            runtime_mode: StorageRuntimeMode::ReadWrite,
+            mirror_hot_segments: false,
+            catalog_refreshes_total: 0,
+            catalog_refresh_errors_total: 0,
+            accessible: true,
+            consecutive_refresh_failures: 0,
+            backoff_active: false,
+        }
+    }
+}
+
 /// Lifecycle and bounded-work counters for one named background worker slot.
 ///
 /// `installed` describes whether the instance still owns a join handle;
@@ -2754,6 +2987,83 @@ pub struct RollupObservabilitySnapshot {
     pub continuation_after_series_id: Option<u64>,
     #[serde(default)]
     pub policies: Vec<RollupPolicyStatus>,
+}
+
+/// One rollup policy's fields emitted by the Prometheus metrics adapter.
+///
+/// Policy and metric text are stored once in the owning
+/// [`RollupMetricsObservabilitySnapshot`] label arena. Keeping ranges here avoids two heap
+/// allocations per policy while preserving stable policy order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollupMetricsPolicyStatus {
+    pub(crate) policy_id: std::ops::Range<usize>,
+    pub(crate) metric: std::ops::Range<usize>,
+    pub aggregation: Aggregation,
+    pub interval: i64,
+    pub matched_series: u64,
+    pub materialized_series: u64,
+    pub materialized_through: Option<i64>,
+    pub lag: Option<i64>,
+    pub source_traversal_complete: bool,
+    pub last_run_started_at_ms: Option<u64>,
+    pub last_run_completed_at_ms: Option<u64>,
+    pub last_run_duration_nanos: u64,
+}
+
+/// Query-accounted rollup state consumed by the Prometheus metrics adapter.
+#[derive(Debug, Default)]
+pub struct RollupMetricsObservabilitySnapshot {
+    pub worker_runs_total: u64,
+    pub worker_success_total: u64,
+    pub worker_errors_total: u64,
+    pub policy_runs_total: u64,
+    pub buckets_materialized_total: u64,
+    pub points_materialized_total: u64,
+    pub last_run_duration_nanos: u64,
+    pub source_traversal_complete: bool,
+    pub policies: Vec<RollupMetricsPolicyStatus>,
+    label_arena: String,
+}
+
+impl RollupMetricsObservabilitySnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        worker_runs_total: u64,
+        worker_success_total: u64,
+        worker_errors_total: u64,
+        policy_runs_total: u64,
+        buckets_materialized_total: u64,
+        points_materialized_total: u64,
+        last_run_duration_nanos: u64,
+        source_traversal_complete: bool,
+        policies: Vec<RollupMetricsPolicyStatus>,
+        label_arena: String,
+    ) -> Self {
+        Self {
+            worker_runs_total,
+            worker_success_total,
+            worker_errors_total,
+            policy_runs_total,
+            buckets_materialized_total,
+            points_materialized_total,
+            last_run_duration_nanos,
+            source_traversal_complete,
+            policies,
+            label_arena,
+        }
+    }
+
+    /// Returns a policy identifier from the projection's owned label arena.
+    #[must_use]
+    pub fn policy_id<'a>(&'a self, policy: &RollupMetricsPolicyStatus) -> &'a str {
+        &self.label_arena[policy.policy_id.clone()]
+    }
+
+    /// Returns a metric name from the projection's owned label arena.
+    #[must_use]
+    pub fn metric<'a>(&'a self, policy: &RollupMetricsPolicyStatus) -> &'a str {
+        &self.label_arena[policy.metric.clone()]
+    }
 }
 
 /// Declares whether one execution-aware storage operation accounts for its returned work.
@@ -3576,6 +3886,42 @@ pub trait Storage: Send + Sync {
             resource_configuration: self.resource_configuration_snapshot(),
             ..StorageObservabilitySnapshot::default()
         }
+    }
+
+    /// Returns the complete storage status schema under an existing query execution.
+    ///
+    /// Implementations must checkpoint the execution, reserve the complete retained clone peak
+    /// before cloning or materializing any dynamic field, and retain that reservation in the
+    /// returned wrapper. The conservative default fails closed instead of delegating to the
+    /// unaccounted [`Self::observability_snapshot`].
+    fn status_observability_snapshot_with_execution(
+        &self,
+        _execution: &QueryExecution,
+    ) -> Result<StorageStatusObservabilitySnapshot> {
+        Err(TsinkError::UnsupportedOperation {
+            operation: "status_observability_snapshot_with_execution",
+            reason:
+                "query-accounted status observability is not implemented by this storage backend"
+                    .to_string(),
+        })
+    }
+
+    /// Returns the storage state consumed by one metrics exposition under an existing query.
+    ///
+    /// Implementations must reserve every tsink-owned dynamic allocation on `execution` before
+    /// allocating or cloning it, and the returned projection must retain those reservations for
+    /// its complete lifetime. The conservative default refuses the operation rather than
+    /// returning a falsely-accounted clone of [`Self::observability_snapshot`].
+    fn metrics_observability_snapshot_with_execution(
+        &self,
+        _execution: &QueryExecution,
+    ) -> Result<StorageMetricsObservabilitySnapshot> {
+        Err(TsinkError::UnsupportedOperation {
+            operation: "metrics_observability_snapshot_with_execution",
+            reason:
+                "query-accounted metrics observability is not implemented by this storage backend"
+                    .to_string(),
+        })
     }
 
     fn apply_rollup_policies(

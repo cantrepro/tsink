@@ -39,7 +39,12 @@ readinessProbe:
 GET /metrics
 ```
 
-Returns all internal metrics in [Prometheus text exposition format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/). The response is suitable for direct Prometheus scraping.
+Normally returns the internal metrics in
+[Prometheus text exposition format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/).
+The response is suitable for direct Prometheus scraping. A normal exposition is capped at 1 MiB.
+Collection, accounting, cancellation, or body-limit failures deliberately retain HTTP 200 and
+return a Prometheus-parseable fallback capped at 4 KiB; use the collection-error metrics below to
+distinguish a degraded scrape from a complete one.
 
 ```bash
 curl http://127.0.0.1:9201/metrics
@@ -78,6 +83,8 @@ All metrics use the `tsink_` prefix. The sections below enumerate every metric g
 | `tsink_series_creation_admitted_total` | counter | New-series reservations admitted since the storage instance opened |
 | `tsink_series_creation_committed_total` | counter | New series successfully published since the storage instance opened |
 | `tsink_series_creation_rejections_total` | counter | Fixed-window new-series admission rejections |
+| `tsink_metrics_collection_errors` | gauge | Number of collectors that failed during the current scrape |
+| `tsink_metrics_collection_error{collector}` | gauge | `1` for each failed collector in the current scrape; `collector` is one of `storage_list_metrics`, `cluster_hotspot`, `metric_metadata_store`, `exemplar_store`, `rules_runtime`, `operational_snapshots`, or `exposition_body` |
 
 ### Background workers
 
@@ -637,6 +644,7 @@ The following metrics are good starting points for alerts:
 | Read admission rejections | `tsink_read_admission_rejections_total` | Rate sustained > 0 |
 | Core query-budget rejections | `tsink_query_budget_limit_rejections_total` | Alert on sustained rate; split by `reason` before changing a limit |
 | Query-budget accounting invariant | `tsink_query_budget_accounting_invariant_violations_total` | Any increase |
+| Degraded self-scrape | `tsink_metrics_collection_errors` | > 0 on any scrape; inspect `tsink_metrics_collection_error{collector}` |
 | Object-store inaccessible | `tsink_remote_storage_accessible` | == 0 for 2 minutes |
 | Remote catalog backoff | `tsink_remote_storage_catalog_refresh_consecutive_failures` | > 3 |
 | Dead cluster peers | `tsink_cluster_control_dead_peers` | > 0 |
@@ -657,6 +665,20 @@ GET /api/v1/admin/support_bundle?tenant=<id>
 ```
 
 Downloads a bounded JSON diagnostic snapshot for a single tenant. Requires the `admin:read` RBAC permission. The response is returned as a downloadable `.json` file with a `Content-Disposition: attachment` header.
+
+The support-bundle adapter caps all simultaneously retained child response bodies and headers at
+16 MiB under one query execution admitted before child collection. Each completed child response
+acquires an exact retained-memory guard inside its support-specific child API and keeps that guard
+through final composition. TSDB status and rebalance reuse the root execution, the parent base
+reservation excludes already-guarded child bytes, and only the final bundle charges HTTP
+response-body bytes; child source operations still charge canonical logical returned work. Valid
+JSON sections are streamed from borrowed child bodies; non-JSON text is limited to 8,192
+characters. The final encoded bundle has its own 16 MiB ceiling. These are adapter bounds: legacy
+work and operational snapshots used before a child response is completed remain governed by that
+child endpoint's documented envelope or remain an explicit producer boundary. Tenant/actor
+parsing and synthetic child-request/header setup before the parent reservation are not yet covered
+by this envelope. Tenant override decoding is capped at 16 KiB and does not clone the HTTP request
+body.
 
 The bundle includes:
 

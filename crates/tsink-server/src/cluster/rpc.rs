@@ -589,6 +589,8 @@ pub struct InternalIngestWriteResponse {
 pub struct InternalSelectRequest {
     #[serde(default = "default_internal_ring_version")]
     pub ring_version: u64,
+    /// Current servers apply a finite compatibility ceiling because this legacy request predates
+    /// the additive `query_limits` fields used by newer internal reads.
     pub metric: String,
     #[serde(default)]
     pub labels: Vec<Label>,
@@ -649,6 +651,9 @@ pub struct InternalSelectSeriesRequest {
     pub shard_scope: Option<MetadataShardScope>,
     pub selection: SeriesSelection,
     /// Optional request-specific limits for one metadata execution on the serving node.
+    ///
+    /// When omitted, current servers apply a finite compatibility ceiling while preserving the
+    /// legacy response shape without an `accounting` object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_limits: Option<QueryWorkLimits>,
 }
@@ -714,8 +719,9 @@ pub struct InternalListMetricsRequest {
     pub shard_scope: Option<MetadataShardScope>,
     /// Optional request-specific limits for one metadata execution on the serving node.
     ///
-    /// Omission preserves the legacy unaccounted RPC contract. A node that accepts this field
-    /// returns complete serving-node accounting or an explicit compatibility error.
+    /// Omission preserves the legacy response shape while current servers still execute under a
+    /// finite compatibility ceiling. A node that accepts this field returns complete serving-node
+    /// accounting or an explicit compatibility error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_limits: Option<QueryWorkLimits>,
 }

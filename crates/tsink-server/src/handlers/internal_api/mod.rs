@@ -2376,21 +2376,97 @@ pub(super) async fn handle_internal_select(
     let labels = payload.labels;
     let start = payload.start;
     let end = payload.end;
-    let storage = Arc::clone(storage);
-    let storage_metric = metric.clone();
-    let storage_labels = labels.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        match storage.select(&storage_metric, &storage_labels, start, end) {
-            Ok(points) => Ok(points),
-            Err(tsink::TsinkError::NoDataPoints { .. }) => Ok(Vec::new()),
-            Err(err) => Err(err.to_string()),
+    if storage.select_many_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+        return internal_select_batch_accounting_unavailable(
+            "storage does not provide complete select query accounting",
+        );
+    }
+    let cancellation = tsink::QueryCancellationToken::new();
+    let execution = match storage.begin_query_execution(
+        default_internal_read_query_limits(storage.as_ref()),
+        cancellation.clone(),
+    ) {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
+            return internal_select_batch_accounting_unavailable(
+                "storage does not expose query execution admission",
+            )
         }
+        Err(tsink::TsinkError::QueryBudget(error)) => {
+            return internal_select_batch_query_error_response(&error)
+        }
+        Err(error) => {
+            return internal_error_response(
+                503,
+                "query_admission_failed",
+                format!("internal select query admission failed: {error}"),
+                true,
+            )
+        }
+    };
+    let _cancellation_guard = InternalSelectCancellationGuard {
+        token: cancellation,
+    };
+    let storage = Arc::clone(storage);
+    let selectors = vec![MetricSeries {
+        name: metric,
+        labels,
+    }];
+    let worker_execution = execution.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_bounded_internal_select_batch(
+            storage.as_ref(),
+            &selectors,
+            start,
+            end,
+            &worker_execution,
+        )
     })
     .await;
 
     match result {
-        Ok(Ok(points)) => {
-            let mut points = points;
+        Ok(Ok(mut selected)) => {
+            let mut series = std::mem::take(&mut selected.series);
+            let mut matched_selectors = selected.matched_selectors.take().unwrap_or_default();
+            let Some(mut result_reservation) = selected.take_memory_reservation() else {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select storage omitted its result reservation",
+                    false,
+                );
+            };
+            let Some(local) = series.pop() else {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select storage omitted its ordered result",
+                    false,
+                );
+            };
+            let Some(mut matched) = matched_selectors.pop() else {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select storage omitted selector-existence accounting",
+                    false,
+                );
+            };
+            if !series.is_empty() || !matched_selectors.is_empty() {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select storage returned results outside its single selector",
+                    false,
+                );
+            }
+            let SeriesPoints {
+                series: selector,
+                mut points,
+            } = local;
+            drop(series);
+            drop(matched_selectors);
+
             if let Some(bridge_source) = ring_validation.bridge_source.as_ref() {
                 let Some(cluster_context) = cluster_context else {
                     return internal_error_response(
@@ -2400,22 +2476,33 @@ pub(super) async fn handle_internal_select(
                         true,
                     );
                 };
-                let bridge_request = InternalSelectRequest {
+                let bridge_query_limits = match remaining_internal_select_batch_limits(&execution) {
+                    Ok(limits) => limits,
+                    Err(error) => return internal_select_batch_query_error_response(&error),
+                };
+                let bridge_request = InternalSelectBatchRequest {
                     ring_version: bridge_source.stale_ring_version,
-                    metric: metric.clone(),
-                    labels: labels.clone(),
+                    selectors: vec![selector],
                     start,
                     end,
+                    query_limits: Some(bridge_query_limits),
                 };
-                match cluster_context
+                let accounted = match cluster_context
                     .rpc_client
-                    .select(&bridge_source.endpoint, &bridge_request)
+                    .select_batch_accounted(&bridge_source.endpoint, &bridge_request, &execution)
                     .await
                 {
-                    Ok(response) => {
-                        points = merge_handoff_points(points, response.points);
+                    Ok(accounted) => accounted,
+                    Err(crate::cluster::rpc::RpcError::HttpStatus { status: 404, .. }) => {
+                        return internal_select_batch_accounting_unavailable(format!(
+                            "handoff source node '{}' ({}) does not support bounded select accounting",
+                            bridge_source.source_node_id, bridge_source.endpoint
+                        ));
                     }
                     Err(err) => {
+                        if let Some(response) = internal_select_batch_bridge_query_error(&err) {
+                            return response;
+                        }
                         return internal_error_response(
                             503,
                             "handoff_bridge_failed",
@@ -2426,16 +2513,106 @@ pub(super) async fn handle_internal_select(
                             true,
                         );
                     }
+                };
+                let mut bridge_response = accounted.response;
+                let bridge_transport_reservation = accounted.reservation;
+                let Some(accounting) = bridge_response.accounting.as_ref() else {
+                    return internal_select_batch_accounting_unavailable(format!(
+                        "handoff source node '{}' ({}) returned no bounded select accounting",
+                        bridge_source.source_node_id, bridge_source.endpoint
+                    ));
+                };
+                let Some(bridge_matched_selectors) = accounting.matched_selectors.as_deref() else {
+                    return internal_select_batch_accounting_unavailable(format!(
+                        "handoff source node '{}' ({}) returned aggregate-only select accounting",
+                        bridge_source.source_node_id, bridge_source.endpoint
+                    ));
+                };
+                if let Err(message) = validate_internal_select_batch_accounting(
+                    &bridge_request.selectors,
+                    &bridge_response.series,
+                    accounting.execution,
+                    bridge_matched_selectors,
+                ) {
+                    return internal_error_response(
+                        502,
+                        "query_accounting_invalid",
+                        format!(
+                            "handoff source node '{}' ({}) returned invalid select accounting: {message}",
+                            bridge_source.source_node_id, bridge_source.endpoint
+                        ),
+                        false,
+                    );
                 }
+                let bridge_matched = bridge_matched_selectors[0];
+                if let Err(error) = aggregate_internal_select_batch_accounting(
+                    &execution,
+                    accounting.execution,
+                    u64::from(bridge_matched && !matched),
+                ) {
+                    return internal_select_batch_query_error_response(&error);
+                }
+                matched |= bridge_matched;
+                let Some(bridge) = bridge_response.series.pop() else {
+                    return internal_error_response(
+                        502,
+                        "query_accounting_invalid",
+                        "bounded handoff select response omitted its ordered result",
+                        false,
+                    );
+                };
+                if let Err(error) = result_reservation.resize(
+                    result_reservation
+                        .bytes()
+                        .saturating_add(bridge_transport_reservation.bytes())
+                        .saturating_mul(2),
+                ) {
+                    return internal_select_batch_query_error_response(&error);
+                }
+                points = merge_handoff_points(points, bridge.points);
+                drop(bridge_response);
+                drop(bridge_transport_reservation);
+                drop(bridge_request);
+            } else {
+                drop(selector);
             }
-            json_response(200, &InternalSelectResponse { points })
+
+            if execution.snapshot().series_matched != u64::from(matched) {
+                return internal_error_response(
+                    500,
+                    "query_accounting_invalid",
+                    "bounded select aggregate matched-series accounting is inconsistent",
+                    false,
+                );
+            }
+            let payload = InternalSelectResponse { points };
+            let (response, response_reservation) =
+                match encode_internal_accounted_json_response(&payload, &execution) {
+                    Ok(prepared) => prepared,
+                    Err(response) => return response,
+                };
+            drop(payload);
+            drop(result_reservation);
+            drop(response_reservation);
+            response
         }
-        Ok(Err(err)) => internal_error_response(
+        Ok(Err(InternalSelectBatchExecutionError::Storage(tsink::TsinkError::QueryBudget(
+            error,
+        )))) => internal_select_batch_query_error_response(&error),
+        Ok(Err(InternalSelectBatchExecutionError::Storage(err))) => internal_error_response(
             503,
             "storage_select_failed",
             format!("internal select failed: {err}"),
             true,
         ),
+        Ok(Err(InternalSelectBatchExecutionError::InvalidAccounting(message))) => {
+            internal_error_response(
+                500,
+                "query_accounting_invalid",
+                format!("internal select storage accounting is invalid: {message}"),
+                false,
+            )
+        }
         Err(err) => internal_error_response(
             503,
             "storage_select_task_failed",
@@ -2737,6 +2914,17 @@ fn execute_bounded_internal_select_series(
             InternalSelectSeriesExecutionError::InvalidAccounting(message.to_string())
         })?;
     Ok(selected)
+}
+
+/// Bounds legacy internal reads that predate an additive `query_limits` field.
+///
+/// The Server profile supplies a finite ceiling even for ExpertUnlimited storage, while the
+/// instance budget remains authoritative whenever it is tighter.
+fn default_internal_read_query_limits(storage: &dyn Storage) -> tsink::QueryWorkLimits {
+    tsink::ResourceLimits::server()
+        .query
+        .per_query
+        .tightened_by(storage.query_budget_snapshot().limits.per_query)
 }
 
 fn internal_select_batch_bridge_query_error(error: &RpcError) -> Option<HttpResponse> {
@@ -3230,8 +3418,11 @@ async fn handle_internal_select_series_payload(
         Err(response) => return response,
     };
     let selection = payload.selection;
-    let query_limits = payload.query_limits;
-    let (execution, _cancellation_guard) = if let Some(query_limits) = query_limits {
+    let expose_accounting = payload.query_limits.is_some();
+    let query_limits = payload
+        .query_limits
+        .unwrap_or_else(|| default_internal_read_query_limits(storage.as_ref()));
+    let (execution, _cancellation_guard) = {
         if storage.select_series_in_shards_execution_accounting()
             != tsink::QueryExecutionAccounting::Complete
         {
@@ -3242,10 +3433,10 @@ async fn handle_internal_select_series_payload(
         let cancellation = tsink::QueryCancellationToken::new();
         match storage.begin_query_execution(query_limits, cancellation.clone()) {
             Ok(Some(execution)) => (
-                Some(execution),
-                Some(InternalSelectCancellationGuard {
+                execution,
+                InternalSelectCancellationGuard {
                     token: cancellation,
-                }),
+                },
             ),
             Ok(None) => {
                 return internal_select_batch_accounting_unavailable(
@@ -3264,40 +3455,33 @@ async fn handle_internal_select_series_payload(
                 )
             }
         }
-    } else {
-        (None, None)
     };
 
     let storage = Arc::clone(storage);
     let selection_for_storage = selection.clone();
     let shard_scope_for_storage = shard_scope.clone();
     let worker_execution = execution.clone();
-    let result = tokio::task::spawn_blocking(move || match worker_execution.as_ref() {
-        Some(execution) => execute_bounded_internal_select_series(
+    let result = tokio::task::spawn_blocking(move || {
+        execute_bounded_internal_select_series(
             storage.as_ref(),
             &selection_for_storage,
             &shard_scope_for_storage,
-            execution,
-        ),
-        None => storage
-            .select_series_in_shards(&selection_for_storage, &shard_scope_for_storage)
-            .map(tsink::SelectSeriesExecutionResult::unaccounted)
-            .map_err(InternalSelectSeriesExecutionError::Storage),
+            &worker_execution,
+        )
     })
     .await;
 
     match result {
         Ok(Ok(mut selected)) => {
             let mut series = std::mem::take(&mut selected.series);
-            let mut result_reservation = selected.take_memory_reservation();
-            if execution.is_some() && result_reservation.is_none() {
+            let Some(mut result_reservation) = selected.take_memory_reservation() else {
                 return internal_error_response(
                     500,
                     "query_accounting_invalid",
                     "bounded select_series storage omitted its result reservation",
                     false,
                 );
-            }
+            };
             if !ring_validation.bridge_sources.is_empty() {
                 let Some(cluster_context) = cluster_context else {
                     return internal_error_response(
@@ -3308,17 +3492,13 @@ async fn handle_internal_select_series_payload(
                     );
                 };
                 for bridge_source in &ring_validation.bridge_sources {
-                    let bridge_query_limits = match execution.as_ref() {
-                        Some(execution) => {
-                            match remaining_internal_select_batch_limits(execution) {
-                                Ok(limits) => Some(limits),
-                                Err(error) => {
-                                    return internal_select_batch_query_error_response(&error)
-                                }
+                    let bridge_query_limits =
+                        match remaining_internal_select_batch_limits(&execution) {
+                            Ok(limits) => limits,
+                            Err(error) => {
+                                return internal_select_batch_query_error_response(&error)
                             }
-                        }
-                        None => None,
-                    };
+                        };
                     let request = InternalSelectSeriesRequest {
                         ring_version: bridge_source.stale_ring_version,
                         shard_scope: Some(MetadataShardScope::new(
@@ -3326,71 +3506,59 @@ async fn handle_internal_select_series_payload(
                             bridge_source.shards.iter().copied().collect(),
                         )),
                         selection: selection.clone(),
-                        query_limits: bridge_query_limits,
+                        query_limits: Some(bridge_query_limits),
                     };
-                    let bridge_rpc = match execution.as_ref() {
-                        Some(execution) => cluster_context
-                            .rpc_client
-                            .select_series_accounted(&bridge_source.endpoint, &request, execution)
-                            .await
-                            .map(|accounted| (accounted.response, Some(accounted.reservation))),
-                        None => cluster_context
-                            .rpc_client
-                            .select_series(&bridge_source.endpoint, &request)
-                            .await
-                            .map(|response| (response, None)),
-                    };
+                    let bridge_rpc = cluster_context
+                        .rpc_client
+                        .select_series_accounted(&bridge_source.endpoint, &request, &execution)
+                        .await;
                     match bridge_rpc {
-                        Ok((response, bridge_transport_reservation)) => {
-                            if let Some(execution) = execution.as_ref() {
-                                let Some(accounting) = response.accounting.as_ref() else {
-                                    return internal_select_batch_accounting_unavailable(
-                                        "bounded handoff select_series response omitted execution accounting",
-                                    );
-                                };
-                                if let Err(message) = validate_internal_select_series_accounting(
+                        Ok(accounted) => {
+                            let response = accounted.response;
+                            let bridge_transport_reservation = accounted.reservation;
+                            let Some(accounting) = response.accounting.as_ref() else {
+                                return internal_select_batch_accounting_unavailable(
+                                    "bounded handoff select_series response omitted execution accounting",
+                                );
+                            };
+                            if let Err(message) = validate_internal_select_series_accounting(
+                                &response.series,
+                                tsink::QueryExecutionSnapshot::default(),
+                                accounting.execution,
+                            ) {
+                                return internal_error_response(
+                                    502,
+                                    "query_accounting_invalid",
+                                    format!(
+                                        "bounded handoff select_series returned invalid accounting: {message}"
+                                    ),
+                                    false,
+                                );
+                            }
+                            let current =
+                                crate::cluster::query::modeled_metric_series_vec_retained_bytes(
+                                    &series,
+                                );
+                            let additional =
+                                crate::cluster::query::modeled_metric_series_vec_retained_bytes(
                                     &response.series,
-                                    tsink::QueryExecutionSnapshot::default(),
-                                    accounting.execution,
-                                ) {
-                                    return internal_error_response(
-                                        502,
-                                        "query_accounting_invalid",
-                                        format!(
-                                            "bounded handoff select_series returned invalid accounting: {message}"
-                                        ),
-                                        false,
-                                    );
-                                }
-                                if let Some(reservation) = result_reservation.as_mut() {
-                                    let current =
-                                        crate::cluster::query::modeled_metric_series_vec_retained_bytes(
-                                            &series,
-                                        );
-                                    let additional =
-                                        crate::cluster::query::modeled_metric_series_vec_retained_bytes(
-                                            &response.series,
-                                        );
-                                    if let Err(error) = reservation.resize(
-                                        current.saturating_add(additional).saturating_mul(2),
-                                    ) {
-                                        return internal_select_batch_query_error_response(&error);
-                                    }
-                                }
-                                let previous_len = series.len();
-                                series = merge_metric_series(series, response.series);
-                                let additional_series_matched =
-                                    u64::try_from(series.len().saturating_sub(previous_len))
-                                        .unwrap_or(u64::MAX);
-                                if let Err(error) = aggregate_internal_select_batch_accounting(
-                                    execution,
-                                    accounting.execution,
-                                    additional_series_matched,
-                                ) {
-                                    return internal_select_batch_query_error_response(&error);
-                                }
-                            } else {
-                                series = merge_metric_series(series, response.series);
+                                );
+                            if let Err(error) = result_reservation
+                                .resize(current.saturating_add(additional).saturating_mul(2))
+                            {
+                                return internal_select_batch_query_error_response(&error);
+                            }
+                            let previous_len = series.len();
+                            series = merge_metric_series(series, response.series);
+                            let additional_series_matched =
+                                u64::try_from(series.len().saturating_sub(previous_len))
+                                    .unwrap_or(u64::MAX);
+                            if let Err(error) = aggregate_internal_select_batch_accounting(
+                                &execution,
+                                accounting.execution,
+                                additional_series_matched,
+                            ) {
+                                return internal_select_batch_query_error_response(&error);
                             }
                             drop(bridge_transport_reservation);
                         }
@@ -3411,28 +3579,21 @@ async fn handle_internal_select_series_payload(
                     }
                 }
             }
-            if let Some(reservation) = result_reservation.as_mut() {
-                if let Err(error) = reservation.resize(
-                    crate::cluster::query::modeled_metric_series_vec_retained_bytes(&series),
-                ) {
-                    return internal_select_batch_query_error_response(&error);
-                }
+            if let Err(error) = result_reservation
+                .resize(crate::cluster::query::modeled_metric_series_vec_retained_bytes(&series))
+            {
+                return internal_select_batch_query_error_response(&error);
             }
-            let accounting = execution.as_ref().map(|execution| {
-                crate::cluster::rpc::InternalSelectSeriesAccounting {
+            let accounting =
+                expose_accounting.then(|| crate::cluster::rpc::InternalSelectSeriesAccounting {
                     execution: execution.snapshot(),
-                }
-            });
+                });
             let payload = InternalSelectSeriesResponse { series, accounting };
-            let (response, response_reservation) = match execution.as_ref() {
-                Some(execution) => {
-                    match encode_internal_accounted_json_response(&payload, execution) {
-                        Ok((response, reservation)) => (response, Some(reservation)),
-                        Err(response) => return response,
-                    }
-                }
-                None => (json_response(200, &payload), None),
-            };
+            let (response, response_reservation) =
+                match encode_internal_accounted_json_response(&payload, &execution) {
+                    Ok(prepared) => prepared,
+                    Err(response) => return response,
+                };
             drop(payload);
             drop(result_reservation);
             drop(response_reservation);
@@ -3484,102 +3645,17 @@ pub(super) async fn handle_internal_list_metrics(
             Err(response) => return response,
         }
     };
-    if payload.query_limits.is_some() {
-        return handle_internal_select_series_payload(
-            storage,
-            InternalSelectSeriesRequest {
-                ring_version: payload.ring_version,
-                shard_scope: payload.shard_scope,
-                selection: SeriesSelection::new(),
-                query_limits: payload.query_limits,
-            },
-            cluster_context,
-        )
-        .await;
-    }
-    let ring_validation =
-        match validate_internal_metadata_ring_version(payload.ring_version, cluster_context) {
-            Ok(validation) => validation,
-            Err(response) => return response,
-        };
-    let shard_scope = match resolve_internal_metadata_shard_scope(
-        payload.shard_scope.as_ref(),
-        payload.ring_version,
+    handle_internal_select_series_payload(
+        storage,
+        InternalSelectSeriesRequest {
+            ring_version: payload.ring_version,
+            shard_scope: payload.shard_scope,
+            selection: SeriesSelection::new(),
+            query_limits: payload.query_limits,
+        },
         cluster_context,
-        ring_validation.shard_count,
-    ) {
-        Ok(scope) => scope,
-        Err(response) => return response,
-    };
-
-    let storage = Arc::clone(storage);
-    let result =
-        tokio::task::spawn_blocking(move || storage.list_metrics_in_shards(&shard_scope)).await;
-
-    match result {
-        Ok(Ok(series)) => {
-            let mut series = series;
-            if !ring_validation.bridge_sources.is_empty() {
-                let Some(cluster_context) = cluster_context else {
-                    return internal_error_response(
-                        503,
-                        "control_plane_unavailable",
-                        "handoff read bridge requires cluster context",
-                        true,
-                    );
-                };
-                for bridge_source in &ring_validation.bridge_sources {
-                    let request = InternalListMetricsRequest {
-                        ring_version: bridge_source.stale_ring_version,
-                        shard_scope: Some(MetadataShardScope::new(
-                            ring_validation.shard_count,
-                            bridge_source.shards.iter().copied().collect(),
-                        )),
-                        query_limits: None,
-                    };
-                    match cluster_context
-                        .rpc_client
-                        .list_metrics_with_request(&bridge_source.endpoint, &request)
-                        .await
-                    {
-                        Ok(response) => {
-                            series = merge_metric_series(series, response.series);
-                        }
-                        Err(err) => {
-                            return internal_error_response(
-                                503,
-                                "handoff_bridge_failed",
-                                format!(
-                                    "handoff read bridge list_metrics failed for source node '{}' ({}): {err}",
-                                    bridge_source.source_node_id, bridge_source.endpoint
-                                ),
-                                true,
-                            );
-                        }
-                    }
-                }
-            }
-            json_response(
-                200,
-                &InternalListMetricsResponse {
-                    series,
-                    accounting: None,
-                },
-            )
-        }
-        Ok(Err(err)) => internal_error_response(
-            503,
-            "storage_list_metrics_failed",
-            format!("internal list_metrics failed: {err}"),
-            true,
-        ),
-        Err(err) => internal_error_response(
-            503,
-            "storage_list_metrics_task_failed",
-            format!("internal list_metrics task failed: {err}"),
-            true,
-        ),
-    }
+    )
+    .await
 }
 
 enum InternalDigestExecutionError {
@@ -4566,6 +4642,38 @@ mod tests {
             .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
             .build()
             .expect("storage should build")
+    }
+
+    #[test]
+    fn legacy_internal_read_limits_are_finite_and_tightened_by_storage() {
+        let mut configured = tsink::ResourceLimits::test().query;
+        configured.per_query.max_series_matched = Some(7);
+        let storage: Arc<dyn Storage> = StorageBuilder::new()
+            .with_resource_profile(tsink::ResourceProfile::Test)
+            .with_query_budget_limits(configured)
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_metadata_shard_count(crate::cluster::config::DEFAULT_CLUSTER_SHARDS)
+            .build()
+            .expect("bounded storage should build");
+
+        let limits = default_internal_read_query_limits(storage.as_ref());
+
+        assert_eq!(
+            limits,
+            tsink::ResourceLimits::server()
+                .query
+                .per_query
+                .tightened_by(configured.per_query)
+        );
+        assert_eq!(limits.max_series_matched, Some(7));
+        assert!(limits.max_samples_scanned.is_some());
+        assert!(limits.max_samples_returned.is_some());
+        assert!(limits.max_returned_bytes.is_some());
+        assert!(limits.max_pattern_expansion.is_some());
+        assert!(limits.max_steps.is_some());
+        assert!(limits.max_intermediate_vector_size.is_some());
+        assert!(limits.max_memory_bytes.is_some());
+        assert!(limits.max_wall_time.is_some());
     }
 
     fn internal_api() -> InternalApiConfig {

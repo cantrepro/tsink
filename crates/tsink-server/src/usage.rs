@@ -39,6 +39,7 @@ const STORAGE_RECONCILE_MANIFESTS_PER_ATTEMPT: u64 = 2;
 const STORAGE_RECONCILE_FINGERPRINT_SEED_A: u64 = 0x9e37_79b1_85eb_ca87;
 const STORAGE_RECONCILE_FINGERPRINT_SEED_B: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const STORAGE_RECONCILE_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const USAGE_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 const USAGE_LEDGER_STARTUP_READER_MAX_BYTES: usize = 8 * 1024;
 const USAGE_LEDGER_STARTUP_INDEX_ALLOWANCE_BYTES: usize = 64;
 
@@ -343,6 +344,19 @@ pub struct UsageLedgerStatus {
     pub limits: UsageLedgerLimits,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageAccountingMetricsSnapshot {
+    pub durable: bool,
+    pub records_total: u64,
+    pub retained_records: u64,
+    pub earliest_retained_sequence: Option<u64>,
+    pub recent_record_limit: usize,
+    pub tenant_count: u64,
+    pub tenant_limit: usize,
+    pub storage_reconciliations_total: u64,
+    pub record_failures_total: u64,
+}
+
 #[derive(Debug)]
 pub enum UsageAccountingError {
     Disk(tsink::TsinkError),
@@ -430,6 +444,114 @@ pub struct UsageReport {
     pub tenants: Vec<UsageTenantSummary>,
     #[serde(default)]
     pub buckets: Vec<UsageBucketSummary>,
+}
+
+/// Allocation-free reconciliation inputs consumed by direct TSDB status.
+///
+/// These values are exactly the aggregates produced by filtering an all-time, unbucketed usage
+/// report to one tenant, without retaining a duplicate report/filter/vector tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UsageStatusReconciliationSnapshot {
+    pub ingest_rows_total: u64,
+    pub query_result_units_total: u64,
+    pub retention_tombstones_applied_total: u64,
+    pub background_events_total: u64,
+    pub latest_storage_logical_bytes: u64,
+    pub latest_storage_reconciled_unix_ms: Option<u64>,
+}
+
+/// Schema-complete usage-accounting inputs consumed by direct TSDB status.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UsageStatusSnapshot {
+    pub journal: UsageLedgerStatus,
+    pub current_tenant: UsageTenantSummary,
+    pub reconciliation: UsageStatusReconciliationSnapshot,
+}
+
+/// Usage status output whose dynamic allocations remain charged to the caller's query.
+///
+/// The inner snapshot is intentionally private and this wrapper has no extraction method, so a
+/// caller cannot move the output away from its reservation.
+#[derive(Debug)]
+#[must_use = "dropping the status snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedUsageStatusSnapshot {
+    snapshot: UsageStatusSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedUsageStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedUsageStatusSnapshot {
+    type Target = UsageStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+fn modeled_usage_status_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(USAGE_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_usage_status_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(USAGE_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_usage_status_path_peak_bytes(path: &Path) -> u64 {
+    if let Some(value) = path.to_str() {
+        return modeled_usage_status_str_bytes(value);
+    }
+
+    // `Path::display` replaces invalid encoded units before writing the result. Reserve a
+    // conservative simultaneous allowance for that temporary lossy buffer and the retained
+    // output; ordinary UTF-8 paths use the exact branch above.
+    u64::try_from(path.as_os_str().len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(8)
+        .saturating_add(USAGE_STATUS_ALLOCATION_ALLOWANCE_BYTES.saturating_mul(2))
+}
+
+fn modeled_usage_status_snapshot_retained_bytes(snapshot: &UsageStatusSnapshot) -> u64 {
+    snapshot
+        .journal
+        .ledger_path
+        .as_ref()
+        .map(modeled_usage_status_string_bytes)
+        .unwrap_or(0)
+        .saturating_add(
+            snapshot
+                .journal
+                .last_record_error_code
+                .as_ref()
+                .map(modeled_usage_status_string_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_usage_status_string_bytes(
+            &snapshot.current_tenant.tenant_id,
+        ))
+        .saturating_add(
+            snapshot
+                .current_tenant
+                .latest_storage_snapshot
+                .as_ref()
+                .map(|storage| modeled_usage_status_string_bytes(&storage.tenant_id))
+                .unwrap_or(0),
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +851,8 @@ struct UsageAccountingInner {
     writer: Mutex<Option<File>>,
     state: Mutex<UsageLedgerState>,
     health: Mutex<UsageLedgerHealth>,
+    #[cfg(test)]
+    status_snapshot_string_clones: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +946,8 @@ impl UsageAccounting {
                 writer: Mutex::new(writer),
                 state: Mutex::new(state),
                 health: Mutex::new(UsageLedgerHealth::default()),
+                #[cfg(test)]
+                status_snapshot_string_clones: std::sync::atomic::AtomicU64::new(0),
             }),
         }))
     }
@@ -843,6 +969,202 @@ impl UsageAccounting {
             &health,
             self.inner.limits,
         )
+    }
+
+    /// Captures the journal, current tenant, and reconciliation inputs used by direct TSDB status.
+    ///
+    /// State and health are sampled under their established lock order exactly once. Every
+    /// retained string is measured and reserved before the first output copy, and the returned
+    /// private guard keeps the reconciled reservation live while any projected field is borrowed.
+    pub(crate) fn status_snapshot_for_with_execution(
+        &self,
+        tenant_id: &str,
+        execution: &QueryExecution,
+    ) -> Result<AccountedUsageStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let summary = state.tenant_summaries.get(tenant_id);
+        let peak_bytes = self
+            .inner
+            .ledger_path
+            .as_deref()
+            .map(modeled_usage_status_path_peak_bytes)
+            .unwrap_or(0)
+            .saturating_add(
+                health
+                    .last_record_error_code
+                    .as_deref()
+                    .map(modeled_usage_status_str_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(modeled_usage_status_str_bytes(tenant_id))
+            .saturating_add(
+                summary
+                    .and_then(|summary| summary.latest_storage_snapshot.as_ref())
+                    .map(|storage| modeled_usage_status_str_bytes(&storage.tenant_id))
+                    .unwrap_or(0),
+            );
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let ledger_path = self
+            .inner
+            .ledger_path
+            .as_deref()
+            .map(|path| self.status_snapshot_path_string(path));
+        execution.checkpoint()?;
+        let last_record_error_code = health
+            .last_record_error_code
+            .as_deref()
+            .map(|error| self.clone_status_snapshot_string(error));
+        execution.checkpoint()?;
+
+        let reconciliation = summary
+            .map(|summary| UsageStatusReconciliationSnapshot {
+                ingest_rows_total: summary.ingest.rows,
+                query_result_units_total: summary.query.result_units,
+                retention_tombstones_applied_total: summary.retention.tombstones_applied,
+                background_events_total: summary.background.events_total,
+                latest_storage_logical_bytes: summary
+                    .latest_storage_snapshot
+                    .as_ref()
+                    .map(|storage| storage.logical_storage_bytes)
+                    .unwrap_or(0),
+                latest_storage_reconciled_unix_ms: summary
+                    .latest_storage_snapshot
+                    .as_ref()
+                    .map(|storage| storage.reconciled_unix_ms),
+            })
+            .unwrap_or_default();
+        let latest_storage_snapshot = summary
+            .and_then(|summary| summary.latest_storage_snapshot.as_ref())
+            .map(|storage| UsageStorageSnapshot {
+                tenant_id: self.clone_status_snapshot_string(&storage.tenant_id),
+                reconciled_unix_ms: storage.reconciled_unix_ms,
+                series_total: storage.series_total,
+                samples_total: storage.samples_total,
+                logical_storage_bytes: storage.logical_storage_bytes,
+            });
+        execution.checkpoint()?;
+        let current_tenant = UsageTenantSummary {
+            tenant_id: self.clone_status_snapshot_string(tenant_id),
+            ingest: summary
+                .map(|summary| summary.ingest.clone())
+                .unwrap_or_default(),
+            query: summary
+                .map(|summary| summary.query.clone())
+                .unwrap_or_default(),
+            retention: summary
+                .map(|summary| summary.retention.clone())
+                .unwrap_or_default(),
+            background: summary
+                .map(|summary| summary.background.clone())
+                .unwrap_or_default(),
+            latest_storage_snapshot,
+        };
+        let journal = UsageLedgerStatus {
+            durable: self.inner.ledger_path.is_some(),
+            ledger_path,
+            records_total: state.records_total,
+            retained_records: state.records.len() as u64,
+            earliest_retained_sequence: state.records.front().map(|record| record.seq),
+            tenant_count: state.tenant_summaries.len() as u64,
+            last_sequence: state.last_sequence,
+            last_record_unix_ms: state.last_record_unix_ms,
+            storage_reconciliations_total: state.storage_reconciliations_total,
+            record_failures_total: health.record_failures_total,
+            last_record_error_code,
+            limits: self.inner.limits,
+        };
+        execution.checkpoint()?;
+        drop(health);
+        drop(state);
+
+        let snapshot = UsageStatusSnapshot {
+            journal,
+            current_tenant,
+            reconciliation,
+        };
+        let retained_bytes = modeled_usage_status_snapshot_retained_bytes(&snapshot);
+        assert!(
+            retained_bytes <= peak_bytes,
+            "usage status retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedUsageStatusSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_status_snapshot_string(&self, value: &str) -> String {
+        #[cfg(test)]
+        self.inner
+            .status_snapshot_string_clones
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cloned = String::with_capacity(value.len());
+        cloned.push_str(value);
+        cloned
+    }
+
+    fn status_snapshot_path_string(&self, path: &Path) -> String {
+        if let Some(value) = path.to_str() {
+            return self.clone_status_snapshot_string(value);
+        }
+        #[cfg(test)]
+        self.inner
+            .status_snapshot_string_clones
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.display().to_string()
+    }
+
+    #[cfg(test)]
+    fn reset_status_snapshot_string_clones(&self) {
+        self.inner
+            .status_snapshot_string_clones
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_string_clones(&self) -> u64 {
+        self.inner
+            .status_snapshot_string_clones
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn metrics_snapshot(&self) -> UsageAccountingMetricsSnapshot {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        UsageAccountingMetricsSnapshot {
+            durable: self.inner.ledger_path.is_some(),
+            records_total: state.records_total,
+            retained_records: state.records.len() as u64,
+            earliest_retained_sequence: state.records.front().map(|record| record.seq),
+            recent_record_limit: self.inner.limits.recent_records,
+            tenant_count: state.tenant_summaries.len() as u64,
+            tenant_limit: self.inner.limits.max_tenants,
+            storage_reconciliations_total: state.storage_reconciliations_total,
+            record_failures_total: health.record_failures_total,
+        }
     }
 
     pub fn limits(&self) -> UsageLedgerLimits {
@@ -1401,6 +1723,7 @@ impl UsageAccounting {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn tenant_summary(&self, tenant_id: &str) -> UsageTenantSummary {
         let state = self
             .inner
@@ -3981,8 +4304,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tsink::{
-        DataPoint, Label, LocalDiskLimits, QueryBudgetLimits, QueryOptions, Row, SeriesPoints,
-        StorageBuilder, TimestampPrecision,
+        DataPoint, Label, LocalDiskLimits, QueryBudget, QueryBudgetError, QueryBudgetLimits,
+        QueryLimitReason, QueryOptions, Row, SeriesPoints, StorageBuilder, TimestampPrecision,
     };
 
     #[derive(Debug, Default)]
@@ -4011,6 +4334,112 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
             self.wake.notify_all();
+        }
+    }
+
+    fn populated_usage_status_accounting(data_path: &Path) -> Arc<UsageAccounting> {
+        let accounting =
+            UsageAccounting::open(Some(data_path)).expect("usage status fixture should open");
+
+        let mut ingest =
+            UsageRecordInput::success("team-a", UsageCategory::Ingest, "write", "status-test");
+        ingest.rows = 17;
+        accounting
+            .record(ingest)
+            .expect("usage status ingest record should append");
+
+        let mut query =
+            UsageRecordInput::success("team-a", UsageCategory::Query, "query", "status-test");
+        query.result_units = 23;
+        accounting
+            .record(query)
+            .expect("usage status query record should append");
+
+        let mut retention = UsageRecordInput::success(
+            "team-a",
+            UsageCategory::Retention,
+            "retention",
+            "status-test",
+        );
+        retention.tombstones_applied = 5;
+        accounting
+            .record(retention)
+            .expect("usage status retention record should append");
+
+        accounting
+            .record(UsageRecordInput::success(
+                "team-a",
+                UsageCategory::Background,
+                "background",
+                "status-test",
+            ))
+            .expect("usage status background record should append");
+
+        let mut storage =
+            UsageRecordInput::success("team-a", UsageCategory::Storage, "reconcile", "status-test");
+        storage.logical_storage_series = 7;
+        storage.logical_storage_samples = 31;
+        storage.logical_storage_bytes = 8_192;
+        accounting
+            .record(storage)
+            .expect("usage status storage record should append");
+
+        let mut other_tenant =
+            UsageRecordInput::success("team-b", UsageCategory::Ingest, "write", "status-test");
+        other_tenant.rows = 101;
+        accounting
+            .record(other_tenant)
+            .expect("usage status other-tenant record should append");
+
+        {
+            let mut health = accounting
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            health.record_failures_total = 9;
+            health.last_record_error_code =
+                Some("usage_ledger_status_projection_fixture_error".to_string());
+        }
+        accounting
+    }
+
+    fn status_reconciliation_from_report(
+        report: &UsageReport,
+    ) -> UsageStatusReconciliationSnapshot {
+        UsageStatusReconciliationSnapshot {
+            ingest_rows_total: report.tenants.iter().map(|tenant| tenant.ingest.rows).sum(),
+            query_result_units_total: report
+                .tenants
+                .iter()
+                .map(|tenant| tenant.query.result_units)
+                .sum(),
+            retention_tombstones_applied_total: report
+                .tenants
+                .iter()
+                .map(|tenant| tenant.retention.tombstones_applied)
+                .sum(),
+            background_events_total: report
+                .tenants
+                .iter()
+                .map(|tenant| tenant.background.events_total)
+                .sum(),
+            latest_storage_logical_bytes: report
+                .tenants
+                .iter()
+                .filter_map(|tenant| tenant.latest_storage_snapshot.as_ref())
+                .map(|storage| storage.logical_storage_bytes)
+                .sum(),
+            latest_storage_reconciled_unix_ms: report
+                .tenants
+                .iter()
+                .filter_map(|tenant| {
+                    tenant
+                        .latest_storage_snapshot
+                        .as_ref()
+                        .map(|storage| storage.reconciled_unix_ms)
+                })
+                .max(),
         }
     }
 
@@ -4466,6 +4895,296 @@ mod tests {
             .insert_rows(&team_b)
             .expect("team-b rows should insert");
         storage
+    }
+
+    #[test]
+    fn usage_accounting_metrics_snapshot_is_copy_and_default() {
+        fn assert_copy_default<T: Copy + Default>() {}
+
+        assert_copy_default::<UsageAccountingMetricsSnapshot>();
+        assert!(!std::mem::needs_drop::<UsageAccountingMetricsSnapshot>());
+        assert_eq!(
+            UsageAccountingMetricsSnapshot::default(),
+            UsageAccountingMetricsSnapshot {
+                durable: false,
+                records_total: 0,
+                retained_records: 0,
+                earliest_retained_sequence: None,
+                recent_record_limit: 0,
+                tenant_count: 0,
+                tenant_limit: 0,
+                storage_reconciliations_total: 0,
+                record_failures_total: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_accounting_metrics_snapshot_projects_scrape_scalars_without_status_strings() {
+        let dir = tempdir().expect("temp dir should build");
+        let limits = UsageLedgerLimits {
+            recent_records: 2,
+            max_tenants: 4,
+            ..UsageLedgerLimits::default()
+        };
+        let accounting =
+            UsageAccounting::open_with_limits_and_disk_budget(Some(dir.path()), limits, None)
+                .expect("usage store should open");
+
+        for tenant_id in ["team-a", "team-b", "team-a"] {
+            accounting
+                .record(UsageRecordInput::success(
+                    tenant_id,
+                    UsageCategory::Query,
+                    "instant_query",
+                    "/api/v1/query",
+                ))
+                .expect("usage record should append");
+        }
+        accounting
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .storage_reconciliations_total = 5;
+        {
+            let mut health = accounting
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            health.record_failures_total = 7;
+            health.last_record_error_code = Some("usage_ledger_test_error".to_string());
+        }
+
+        let snapshot = accounting.metrics_snapshot();
+        assert_eq!(
+            snapshot,
+            UsageAccountingMetricsSnapshot {
+                durable: true,
+                records_total: 3,
+                retained_records: 2,
+                earliest_retained_sequence: Some(2),
+                recent_record_limit: 2,
+                tenant_count: 2,
+                tenant_limit: 4,
+                storage_reconciliations_total: 5,
+                record_failures_total: 7,
+            }
+        );
+
+        let legacy_status = accounting.ledger_status();
+        assert!(legacy_status.ledger_path.is_some());
+        assert_eq!(
+            legacy_status.last_record_error_code.as_deref(),
+            Some("usage_ledger_test_error")
+        );
+    }
+
+    #[test]
+    fn usage_status_projection_preserves_legacy_schema_values_and_absent_tenant_defaults() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        let expected_journal = accounting.ledger_status();
+        let expected_current = accounting.tenant_summary("team-a");
+        let expected_report = accounting.report(Some("team-a"), None, None, UsageBucketWidth::None);
+        accounting.reset_status_snapshot_string_clones();
+
+        let budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("status budget should build");
+        let execution = budget.begin_query().expect("status query should admit");
+        let projected = accounting
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect("accounted usage status should build");
+
+        assert_eq!(projected.journal, expected_journal);
+        assert_eq!(projected.current_tenant, expected_current);
+        assert_eq!(
+            projected.reconciliation,
+            status_reconciliation_from_report(&expected_report),
+            "the scalar projection must exactly reproduce the filtered all-time report inputs"
+        );
+        assert_eq!(projected.reconciliation.ingest_rows_total, 17);
+        assert_eq!(projected.reconciliation.query_result_units_total, 23);
+        assert_eq!(
+            projected.reconciliation.retention_tombstones_applied_total,
+            5
+        );
+        assert_eq!(projected.reconciliation.background_events_total, 1);
+        assert_eq!(projected.reconciliation.latest_storage_logical_bytes, 8_192);
+        assert_eq!(
+            accounting.status_snapshot_string_clones(),
+            4,
+            "durable path, health error, tenant id, and storage tenant id should each copy once"
+        );
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+
+        let expected_absent_current = accounting.tenant_summary("missing-tenant");
+        let expected_absent_report =
+            accounting.report(Some("missing-tenant"), None, None, UsageBucketWidth::None);
+        accounting.reset_status_snapshot_string_clones();
+        let absent = accounting
+            .status_snapshot_for_with_execution("missing-tenant", &execution)
+            .expect("absent tenant usage status should still build");
+        assert_eq!(absent.journal, expected_journal);
+        assert_eq!(absent.current_tenant, expected_absent_current);
+        assert_eq!(
+            absent.reconciliation,
+            status_reconciliation_from_report(&expected_absent_report)
+        );
+        assert_eq!(
+            absent.reconciliation,
+            UsageStatusReconciliationSnapshot::default()
+        );
+        assert_eq!(
+            accounting.status_snapshot_string_clones(),
+            3,
+            "an absent tenant should copy only the path, error code, and requested tenant id"
+        );
+        drop(absent);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn usage_status_projection_enforces_exact_peak_before_output_clones() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        accounting.reset_status_snapshot_string_clones();
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = accounting
+            .status_snapshot_for_with_execution("team-a", &calibration)
+            .expect("calibration usage status should build");
+        let retained_bytes = calibrated.accounted_bytes();
+        let peak_bytes = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(retained_bytes > 0);
+        assert_eq!(
+            peak_bytes, retained_bytes,
+            "UTF-8 ledger paths and exact-capacity strings need no transient over-reservation"
+        );
+        assert_eq!(accounting.status_snapshot_string_clones(), 4);
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_released = calibration_budget.snapshot();
+        assert_eq!(calibration_released.active_queries, 0);
+        assert_eq!(calibration_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            calibration_released.accounting_invariant_violations_total,
+            0
+        );
+
+        accounting.reset_status_snapshot_string_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact usage status budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = accounting
+            .status_snapshot_for_with_execution("team-a", &exact)
+            .expect("the exact modeled usage status peak should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), retained_bytes);
+        assert_eq!(accounting.status_snapshot_string_clones(), 4);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.active_queries, 0);
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        accounting.reset_status_snapshot_string_clones();
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under usage status budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = accounting
+            .status_snapshot_for_with_execution("team-a", &one_under)
+            .expect_err("one byte below the usage status peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, peak_bytes);
+            }
+            other => panic!("unexpected usage status projection error: {other}"),
+        }
+        assert_eq!(
+            accounting.status_snapshot_string_clones(),
+            0,
+            "failed admission must precede every retained output copy"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.active_queries, 0);
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn usage_status_projection_honors_precancellation_without_residual_memory() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        accounting.reset_status_snapshot_string_clones();
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("usage status cancellation budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("usage status cancellation query should admit");
+        cancellation.cancel();
+
+        let error = accounting
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect_err("pre-cancelled usage status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(accounting.status_snapshot_string_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 
     #[test]

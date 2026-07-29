@@ -684,6 +684,26 @@ pub(crate) fn fail_directory_sync_once(
     fail_directory_sync_matching_once(move |candidate| candidate == path.as_path(), message)
 }
 
+/// Installs a one-shot directory-sync failure whose matcher is only invoked beneath `scope`.
+///
+/// Directory-sync hooks are process-global so they can observe work performed by helper threads.
+/// Keeping the scope check outside the caller's matcher prevents observation or mutation side
+/// effects from unrelated tests that synchronize directories concurrently.
+#[cfg(test)]
+pub(crate) fn fail_directory_sync_matching_once_under<F>(
+    scope: PathBuf,
+    matcher: F,
+    message: impl Into<String>,
+) -> DirectorySyncHookGuard
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    fail_directory_sync_matching_once(
+        move |candidate| candidate.starts_with(scope.as_path()) && matcher(candidate),
+        message,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn fail_directory_sync_matching_once<F>(
     matcher: F,
@@ -2703,6 +2723,39 @@ mod tests {
             1,
             "the failed publication must not leave an orphan temporary file"
         );
+    }
+
+    #[test]
+    fn scoped_directory_sync_failpoint_does_not_invoke_matcher_outside_its_root() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let scoped_dir = TempDir::new().expect("scoped tempdir should build");
+        let unrelated_dir = TempDir::new().expect("unrelated tempdir should build");
+        let matcher_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&matcher_calls);
+        let guard = fail_directory_sync_matching_once_under(
+            scoped_dir.path().to_path_buf(),
+            move |_| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+            "the non-failing matcher should not inject an error",
+        );
+
+        sync_dir(unrelated_dir.path()).expect("an unrelated directory sync should succeed");
+        assert_eq!(
+            matcher_calls.load(Ordering::SeqCst),
+            0,
+            "a process-global hook must not invoke a scoped matcher for another test's path"
+        );
+
+        sync_dir(scoped_dir.path()).expect("the scoped directory sync should succeed");
+        assert_eq!(
+            matcher_calls.load(Ordering::SeqCst),
+            1,
+            "the scoped matcher must still observe directory syncs beneath its own root"
+        );
+        drop(guard);
     }
 
     #[test]

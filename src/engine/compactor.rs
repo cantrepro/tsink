@@ -38,6 +38,13 @@ const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const LEGACY_COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 const COMPACTION_REPLACEMENT_VERSION: u16 = 2;
+const MAX_COMPACTION_REPLACEMENT_MARKER_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_COMPACTION_REPLACEMENT_RECORDS: usize = 16 * 1024;
+const BOUNDED_COMPACTION_MARKER_DECODE_BASE_BYTES: usize = 16 * 1024;
+const BOUNDED_COMPACTION_MARKER_PAYLOAD_COPIES: usize = 6;
+const BOUNDED_COMPACTION_MARKER_RECORD_BYTES: usize = 1024;
+const BOUNDED_COMPACTION_MARKER_PATH_PREFIX_COPIES: usize = 2;
+const BOUNDED_COMPACTION_RECOVERY_OPERATION: &str = "bounded compaction replacement recovery";
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 type SeriesChunkRefs<'a> = HashMap<SeriesId, Vec<&'a Chunk>>;
@@ -55,8 +62,54 @@ struct CompactionReplacementMarker {
     version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     phase: Option<CompactionReplacementPhase>,
+    #[serde(deserialize_with = "deserialize_bounded_compaction_marker_records")]
     source_segments: Vec<String>,
+    #[serde(deserialize_with = "deserialize_bounded_compaction_marker_records")]
     output_segments: Vec<String>,
+}
+
+fn deserialize_bounded_compaction_marker_records<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedRecordsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedRecordsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_COMPACTION_REPLACEMENT_RECORDS} compaction segment records"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let hinted = sequence.size_hint().unwrap_or(0);
+            if hinted > MAX_COMPACTION_REPLACEMENT_RECORDS {
+                return Err(serde::de::Error::custom(format!(
+                    "compaction replacement marker record list exceeds the {MAX_COMPACTION_REPLACEMENT_RECORDS} record limit"
+                )));
+            }
+            let mut records = Vec::with_capacity(hinted.min(MAX_COMPACTION_REPLACEMENT_RECORDS));
+            while let Some(record) = sequence.next_element()? {
+                if records.len() == MAX_COMPACTION_REPLACEMENT_RECORDS {
+                    return Err(serde::de::Error::custom(format!(
+                        "compaction replacement marker record list exceeds the {MAX_COMPACTION_REPLACEMENT_RECORDS} record limit"
+                    )));
+                }
+                records.push(record);
+            }
+            Ok(records)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedRecordsVisitor)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,10 +187,31 @@ struct LevelPlanningCursor {
     candidates: VecDeque<SegmentCandidate>,
 }
 
+#[derive(Debug)]
+struct BackgroundCompactionMarkerScan {
+    marker_dir: PathBuf,
+    entries: fs::ReadDir,
+    observed_entries: usize,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundCompactionRecoveryCursor {
+    scan: Option<BackgroundCompactionMarkerScan>,
+}
+
 #[derive(Debug, Default)]
 struct CompactionPlanningState {
     levels: [LevelPlanningCursor; 2],
     next_level: usize,
+    background_recovery: BackgroundCompactionRecoveryCursor,
+}
+
+enum BackgroundCompactionRecoveryStep {
+    NoPending,
+    AllowanceExhausted,
+    NamespaceEntryConsumed,
+    PreparingRolledBack,
+    Ready(CompactionOutcome),
 }
 
 #[allow(dead_code)]

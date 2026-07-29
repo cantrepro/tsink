@@ -105,9 +105,9 @@ pub(in crate::engine::storage_engine) use core_impl::{
     WriteResolveContext, WriteSeriesValidationContext,
 };
 pub(in crate::engine::storage_engine) use maintenance::{
-    BackgroundCatalogRefreshCursor, BackgroundPostFlushRecoveryCursor,
-    MemoryReservationAdmissionContext, RemoteCatalogMemoryAccounting,
-    WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
+    BackgroundCatalogRefreshCursor, BackgroundPostFlushCleanFenceCursor,
+    BackgroundPostFlushRecoveryCursor, MemoryReservationAdmissionContext,
+    RemoteCatalogMemoryAccounting, WriteTransientMemoryAccounting, WriteTransientMemoryReservation,
 };
 use metrics::StorageObservabilityCounters;
 use process_lock::{DataPathProcessLock, SharedObjectStoreProcessLock};
@@ -402,6 +402,7 @@ struct MemoryAccountingState {
 /// Storage lifecycle, process-lock ownership, and outer coordination locks.
 struct CoordinationState {
     post_flush_maintenance_pending: AtomicBool,
+    post_flush_marker_generation: Arc<AtomicU64>,
     startup_metadata_reconcile_pending: AtomicBool,
     prefer_metadata_reconcile_on_maintenance_tie: AtomicBool,
     /// A finite tiered writer has made (or may have made) visible inventory changes whose
@@ -410,6 +411,7 @@ struct CoordinationState {
     bounded_registry_reconciliation_required: AtomicBool,
     background_retention_maintenance_cursor: Mutex<BackgroundRetentionMaintenanceCursor>,
     background_post_flush_recovery_cursor: Mutex<BackgroundPostFlushRecoveryCursor>,
+    background_post_flush_clean_fence_cursor: Arc<Mutex<BackgroundPostFlushCleanFenceCursor>>,
     background_metadata_reconciliation_cursor: Mutex<BackgroundMetadataReconciliationCursor>,
     background_tombstone_recovery_snapshot_cursor: Mutex<BackgroundTombstoneRecoverySnapshotCursor>,
     background_catalog_refresh_cursor: Mutex<BackgroundCatalogRefreshCursor>,
@@ -471,7 +473,7 @@ pub struct ChunkStorage {
     visibility: VisibilityState,
     persisted: PersistedStorageState,
     runtime: RuntimeConfigState,
-    memory: MemoryAccountingState,
+    memory: Arc<MemoryAccountingState>,
     coordination: CoordinationState,
     background: BackgroundWorkerSupervisorState,
     rollups: RollupState,
@@ -1332,6 +1334,20 @@ impl Storage for ChunkStorage {
         self.observability_snapshot_impl()
     }
 
+    fn status_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<crate::StorageStatusObservabilitySnapshot> {
+        self.status_observability_snapshot_impl(execution)
+    }
+
+    fn metrics_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<crate::StorageMetricsObservabilitySnapshot> {
+        self.metrics_observability_snapshot_impl(execution)
+    }
+
     fn apply_rollup_policies(
         &self,
         policies: Vec<crate::storage::RollupPolicy>,
@@ -1843,6 +1859,7 @@ impl Storage for ChunkStorage {
             .store(STORAGE_CLOSED, Ordering::SeqCst);
         self.notify_background_threads();
         self.join_background_threads()?;
+        self.reset_background_post_flush_clean_fence_cursor();
         self.release_data_path_process_lock();
         Ok(())
     }
@@ -1861,6 +1878,9 @@ impl Drop for ChunkStorage {
             .store(STORAGE_CLOSED, Ordering::SeqCst);
         self.notify_background_threads();
         let _ = self.join_background_threads();
+        // A failed best-effort close may not have reached the compaction-gate drain. Once every
+        // worker is joined, release any retained directory handle before surrendering the path.
+        self.reset_background_post_flush_clean_fence_cursor();
         self.release_data_path_process_lock();
     }
 }

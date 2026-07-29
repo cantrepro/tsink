@@ -73,24 +73,46 @@ jobs:
         env:
           TRIGGER_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
         run: |
-          VERSIONS=$(
+          EXPECTED_PACKAGES=$(
+            printf '%s\n' \
+              tsink \
+              tsink-protocol \
+              tsink-server \
+              tsink-test \
+              tsink-uniffi |
+              sort
+          )
+          PACKAGE_VERSIONS=$(
             cargo metadata --format-version 1 --no-deps --locked |
               jq -r '
                 .packages[]
-                | select(
-                    .name == "tsink"
-                    or .name == "tsink-server"
-                    or .name == "tsink-uniffi"
-                  )
-                | .version
+                | "\(.name)=\(.version)"
               ' |
+              sort
+          )
+          FOUND_PACKAGES=$(
+            printf '%s\n' "$PACKAGE_VERSIONS" |
+              awk -F= 'NF { print $1 }' |
+              sort
+          )
+
+          if [ "$FOUND_PACKAGES" != "$EXPECTED_PACKAGES" ]; then
+            echo "::error::Release crate set does not match the expected workspace packages"
+            printf 'Expected packages:\n%s\nFound package versions:\n%s\n' \
+              "$EXPECTED_PACKAGES" "$PACKAGE_VERSIONS"
+            exit 1
+          fi
+
+          VERSIONS=$(
+            printf '%s\n' "$PACKAGE_VERSIONS" |
+              awk -F= 'NF { print $2 }' |
               sort -u
           )
           VERSION_COUNT=$(printf '%s\n' "$VERSIONS" | awk 'NF { count += 1 } END { print count + 0 }')
 
           if [ "$VERSION_COUNT" -ne 1 ]; then
             echo "::error::Workspace package versions do not agree"
-            printf 'Found versions:\n%s\n' "$VERSIONS"
+            printf 'Found package versions:\n%s\n' "$PACKAGE_VERSIONS"
             exit 1
           fi
 
@@ -166,13 +188,69 @@ jobs:
             exit 1
           fi
 
-      - name: Dry-run core package
-        run: cargo package -p tsink --locked
-
-      - name: Dry-run downstream packages
+      - name: Package foundational crates
+        id: package_foundations
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          cargo package -p tsink-server --locked --no-verify
-          cargo package -p tsink-uniffi --locked --no-verify
+          # Populate the external dependency cache before the package checks
+          # deliberately switch to offline resolution.
+          cargo fetch --locked
+
+          PACKAGE_STAGE="$RUNNER_TEMP/tsink-package-stage"
+          mkdir -p "$PACKAGE_STAGE"
+
+          cargo package -p tsink-protocol --locked --offline
+          tar -xzf "target/package/tsink-protocol-$VERSION.crate" -C "$PACKAGE_STAGE"
+
+          cargo package -p tsink --locked --offline
+          tar -xzf "target/package/tsink-$VERSION.crate" -C "$PACKAGE_STAGE"
+
+          test -f "$PACKAGE_STAGE/tsink-protocol-$VERSION/Cargo.toml"
+          test -f "$PACKAGE_STAGE/tsink-$VERSION/Cargo.toml"
+          echo "path=$PACKAGE_STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Package and verify downstream crate sources
+        env:
+          PACKAGE_STAGE: ${{ steps.package_foundations.outputs.path }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SOURCE_ROOT=$PWD
+          PACKAGE_TARGET_DIR="$PWD/target/package-validation"
+          SOURCE_CORE_PATCH="patch.crates-io.tsink.path=\"$SOURCE_ROOT\""
+          SOURCE_PROTOCOL_PATCH="patch.crates-io.tsink-protocol.path=\"$SOURCE_ROOT/crates/tsink-protocol\""
+          PACKAGED_CORE_PATCH="patch.crates-io.tsink.path=\"$PACKAGE_STAGE/tsink-$VERSION\""
+          PACKAGED_PROTOCOL_PATCH="patch.crates-io.tsink-protocol.path=\"$PACKAGE_STAGE/tsink-protocol-$VERSION\""
+
+          package_and_verify() {
+            PACKAGE_NAME=$1
+            NEEDS_PROTOCOL=$2
+            SOURCE_PATCHES=(--config "$SOURCE_CORE_PATCH")
+            PACKAGED_PATCHES=(--config "$PACKAGED_CORE_PATCH")
+            if [ "$NEEDS_PROTOCOL" = "yes" ]; then
+              SOURCE_PATCHES+=(--config "$SOURCE_PROTOCOL_PATCH")
+              PACKAGED_PATCHES+=(--config "$PACKAGED_PROTOCOL_PATCH")
+            fi
+
+            # Assemble without Cargo's registry-based verifier, then verify the
+            # exact archive against the already packaged workspace dependencies.
+            cargo "${SOURCE_PATCHES[@]}" \
+              package -p "$PACKAGE_NAME" --locked --offline --no-verify
+            tar -xzf "target/package/$PACKAGE_NAME-$VERSION.crate" -C "$PACKAGE_STAGE"
+            test -f "$PACKAGE_STAGE/$PACKAGE_NAME-$VERSION/Cargo.toml"
+
+            CARGO_TARGET_DIR="$PACKAGE_TARGET_DIR" cargo "${PACKAGED_PATCHES[@]}" \
+              check \
+              --manifest-path "$PACKAGE_STAGE/$PACKAGE_NAME-$VERSION/Cargo.toml" \
+              --locked \
+              --offline \
+              --all-targets \
+              --all-features
+          }
+
+          package_and_verify tsink-server yes
+          package_and_verify tsink-test yes
+          package_and_verify tsink-uniffi no
 
   crate-publication-disabled:
     name: crates.io publication disabled (missing release gates)

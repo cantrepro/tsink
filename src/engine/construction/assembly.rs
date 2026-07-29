@@ -7,7 +7,7 @@ pub(super) struct StorageStateAssembly {
     pub(super) visibility: VisibilityState,
     pub(super) persisted: PersistedStorageState,
     pub(super) runtime: RuntimeConfigState,
-    pub(super) memory: MemoryAccountingState,
+    pub(super) memory: Arc<MemoryAccountingState>,
     pub(super) coordination: CoordinationState,
     pub(super) background: BackgroundWorkerSupervisorState,
     pub(super) rollups: RollupState,
@@ -174,7 +174,7 @@ impl StorageStateAssembly {
     fn build_memory_accounting_state(
         options: &ChunkStorageOptions,
         wal_writer_buffer_bytes: usize,
-    ) -> MemoryAccountingState {
+    ) -> Arc<MemoryAccountingState> {
         let initial_tombstone_bytes =
             crate::engine::tombstone::ImmutableTombstoneSnapshot::empty_memory_usage_bytes();
         let initial_wal_writer_buffer_bytes =
@@ -183,7 +183,7 @@ impl StorageStateAssembly {
             u64::try_from(wal_writer_buffer_bytes.saturating_add(initial_tombstone_bytes))
                 .unwrap_or(u64::MAX);
         let initial_tombstone_bytes = u64::try_from(initial_tombstone_bytes).unwrap_or(u64::MAX);
-        MemoryAccountingState {
+        Arc::new(MemoryAccountingState {
             accounting_enabled: options.memory_budget_bytes != u64::MAX,
             used_bytes: AtomicU64::new(initial_accounted_bytes),
             used_bytes_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -205,7 +205,7 @@ impl StorageStateAssembly {
             rejections_total: AtomicU64::new(0),
             backpressure_lock: Mutex::new(()),
             admission_backpressure_lock: Mutex::new(()),
-        }
+        })
     }
 
     fn build_coordination_state(
@@ -214,6 +214,7 @@ impl StorageStateAssembly {
     ) -> CoordinationState {
         CoordinationState {
             post_flush_maintenance_pending: AtomicBool::new(false),
+            post_flush_marker_generation: Arc::new(AtomicU64::new(0)),
             startup_metadata_reconcile_pending: AtomicBool::new(false),
             prefer_metadata_reconcile_on_maintenance_tie: AtomicBool::new(false),
             bounded_registry_reconciliation_required: AtomicBool::new(false),
@@ -223,6 +224,9 @@ impl StorageStateAssembly {
             background_post_flush_recovery_cursor: Mutex::new(
                 BackgroundPostFlushRecoveryCursor::default(),
             ),
+            background_post_flush_clean_fence_cursor: Arc::new(Mutex::new(
+                BackgroundPostFlushCleanFenceCursor::default(),
+            )),
             background_metadata_reconciliation_cursor: Mutex::new(
                 BackgroundMetadataReconciliationCursor::default(),
             ),

@@ -1,11 +1,491 @@
 use super::*;
 
+macro_rules! metrics_write {
+    ($body:expr, $($argument:tt)*) => {{
+        let _ = std::fmt::Write::write_fmt($body, format_args!($($argument)*));
+    }};
+}
+
 mod cluster;
 
 use self::cluster::ClusterMetrics;
 
-struct MetricsCollectionError {
-    collector: &'static str,
+pub(crate) const METRICS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const METRICS_FALLBACK_RESPONSE_BYTES: usize = 4 * 1024;
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
+
+pub(super) trait MetricsBodyWriter: std::fmt::Write {
+    fn push_str(&mut self, value: &str);
+}
+
+impl MetricsBodyWriter for String {
+    fn push_str(&mut self, value: &str) {
+        String::push_str(self, value);
+    }
+}
+
+struct BoundedMetricsBody {
+    output: String,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedMetricsBody {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_limit(METRICS_MAX_RESPONSE_BYTES)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            output: String::with_capacity(limit),
+            limit,
+            overflowed: false,
+        }
+    }
+
+    fn try_with_exact_capacity(limit: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut output = String::new();
+        output.try_reserve_exact(limit)?;
+        Ok(Self {
+            output,
+            limit,
+            overflowed: false,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.output.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.output.capacity()
+    }
+
+    fn into_bytes(self) -> Result<Vec<u8>, ()> {
+        if self.overflowed {
+            Err(())
+        } else {
+            Ok(self.output.into_bytes())
+        }
+    }
+}
+
+impl MetricsBodyWriter for BoundedMetricsBody {
+    fn push_str(&mut self, value: &str) {
+        if self.overflowed {
+            return;
+        }
+        let Some(next_len) = self.output.len().checked_add(value.len()) else {
+            self.overflowed = true;
+            return;
+        };
+        if next_len > self.limit {
+            self.overflowed = true;
+            return;
+        }
+        self.output.push_str(value);
+    }
+}
+
+impl std::fmt::Write for BoundedMetricsBody {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.push_str(value);
+        if self.overflowed {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct CountingMetricsBody<'a> {
+    len: usize,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+    overflowed: bool,
+}
+
+impl<'a> CountingMetricsBody<'a> {
+    fn new(execution: &'a tsink::QueryExecution) -> Self {
+        Self {
+            len: 0,
+            execution,
+            control_error: None,
+            overflowed: false,
+        }
+    }
+}
+
+impl MetricsBodyWriter for CountingMetricsBody<'_> {
+    fn push_str(&mut self, value: &str) {
+        if self.control_error.is_some() || self.overflowed {
+            return;
+        }
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return;
+        }
+        let Some(next_len) = self.len.checked_add(value.len()) else {
+            self.overflowed = true;
+            return;
+        };
+        if next_len > METRICS_MAX_RESPONSE_BYTES {
+            self.overflowed = true;
+            return;
+        }
+        self.len = next_len;
+    }
+}
+
+impl std::fmt::Write for CountingMetricsBody<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.push_str(value);
+        if self.control_error.is_some() || self.overflowed {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct ControlledMetricsBody<'a> {
+    body: BoundedMetricsBody,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+}
+
+impl<'a> ControlledMetricsBody<'a> {
+    fn new(body: BoundedMetricsBody, execution: &'a tsink::QueryExecution) -> Self {
+        Self {
+            body,
+            execution,
+            control_error: None,
+        }
+    }
+}
+
+impl MetricsBodyWriter for ControlledMetricsBody<'_> {
+    fn push_str(&mut self, value: &str) {
+        if self.control_error.is_some() || self.body.overflowed {
+            return;
+        }
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return;
+        }
+        self.body.push_str(value);
+    }
+}
+
+impl std::fmt::Write for ControlledMetricsBody<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.push_str(value);
+        if self.control_error.is_some() || self.body.overflowed {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PrometheusEscapedLabel<'a>(&'a str);
+
+impl std::fmt::Display for PrometheusEscapedLabel<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut remainder = self.0;
+        while let Some(index) = remainder.find(['\\', '\n', '"']) {
+            formatter.write_str(&remainder[..index])?;
+            let escaped = match remainder.as_bytes()[index] {
+                b'\\' => "\\\\",
+                b'\n' => "\\n",
+                b'"' => "\\\"",
+                _ => unreachable!("find only returns configured label escape characters"),
+            };
+            formatter.write_str(escaped)?;
+            remainder = &remainder[index + 1..];
+        }
+        formatter.write_str(remainder)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum MetricsCollector {
+    StorageListMetrics,
+    ClusterHotspot,
+    MetricMetadataStore,
+    ExemplarStore,
+    RulesRuntime,
+    OperationalSnapshots,
+    ExpositionBody,
+}
+
+impl MetricsCollector {
+    const ALL: [Self; 7] = [
+        Self::StorageListMetrics,
+        Self::ClusterHotspot,
+        Self::MetricMetadataStore,
+        Self::ExemplarStore,
+        Self::RulesRuntime,
+        Self::OperationalSnapshots,
+        Self::ExpositionBody,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::StorageListMetrics => "storage_list_metrics",
+            Self::ClusterHotspot => "cluster_hotspot",
+            Self::MetricMetadataStore => "metric_metadata_store",
+            Self::ExemplarStore => "exemplar_store",
+            Self::RulesRuntime => "rules_runtime",
+            Self::OperationalSnapshots => "operational_snapshots",
+            Self::ExpositionBody => "exposition_body",
+        }
+    }
+
+    const fn bit(self) -> u16 {
+        1_u16 << (self as u8)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetricsCollectionErrors {
+    bits: u16,
+}
+
+impl MetricsCollectionErrors {
+    fn insert(&mut self, collector: MetricsCollector) {
+        self.bits |= collector.bit();
+    }
+
+    fn len(self) -> usize {
+        self.bits.count_ones() as usize
+    }
+
+    fn iter(self) -> impl Iterator<Item = MetricsCollector> {
+        MetricsCollector::ALL
+            .into_iter()
+            .filter(move |collector| self.bits & collector.bit() != 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriteRejectionMetricsSnapshot {
+    reason_totals: [u64; WRITE_REJECTION_REASON_COUNT],
+    indeterminate_requests_total: u64,
+}
+
+fn write_rejection_metrics_snapshot() -> WriteRejectionMetricsSnapshot {
+    let mut reason_totals = [0; WRITE_REJECTION_REASON_COUNT];
+    for (index, total) in WRITE_REJECTION_REASON_TOTALS.iter().enumerate() {
+        reason_totals[index] = total.load(Ordering::Relaxed);
+    }
+    WriteRejectionMetricsSnapshot {
+        reason_totals,
+        indeterminate_requests_total: WRITE_INDETERMINATE_REQUESTS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug)]
+enum MetricsHotspotCollectionError {
+    IncompleteMetricAccounting,
+    QueryAdmissionUnavailable,
+    QueryAdmission(tsink::TsinkError),
+    MetricEnumeration(tsink::TsinkError),
+    InvalidMetricAccounting(MetricEnumerationAccountingError),
+    Hotspot(tsink::QueryBudgetError),
+}
+
+impl MetricsHotspotCollectionError {
+    fn collector(&self) -> MetricsCollector {
+        match self {
+            Self::Hotspot(_) => MetricsCollector::ClusterHotspot,
+            Self::IncompleteMetricAccounting
+            | Self::QueryAdmissionUnavailable
+            | Self::QueryAdmission(_)
+            | Self::MetricEnumeration(_)
+            | Self::InvalidMetricAccounting(_) => MetricsCollector::StorageListMetrics,
+        }
+    }
+}
+
+impl std::fmt::Display for MetricsHotspotCollectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteMetricAccounting => {
+                formatter.write_str("storage does not provide complete metric-list accounting")
+            }
+            Self::QueryAdmissionUnavailable => {
+                formatter.write_str("storage does not expose query execution admission")
+            }
+            Self::QueryAdmission(error) => write!(formatter, "query admission failed: {error}"),
+            Self::MetricEnumeration(error) => {
+                write!(formatter, "metric enumeration failed: {error}")
+            }
+            Self::InvalidMetricAccounting(error) => {
+                write!(
+                    formatter,
+                    "metric enumeration accounting is invalid: {error}"
+                )
+            }
+            Self::Hotspot(error) => write!(formatter, "hotspot accounting failed: {error}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AccountedMetricsHotspot {
+    hotspot: hotspot::AccountedClusterHotspotSnapshot,
+}
+
+impl AccountedMetricsHotspot {
+    fn snapshot(&self) -> &ClusterHotspotSnapshot {
+        &self.hotspot
+    }
+}
+
+struct AccountedEmptyControlMetrics {
+    snapshot: ControlMetricsSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+fn empty_control_metrics_with_execution(
+    local_node_id: &str,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedEmptyControlMetrics, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let modeled_bytes = if local_node_id.is_empty() {
+        0
+    } else {
+        u64::try_from(local_node_id.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(64)
+    };
+    let mut reservation = execution.reserve_memory(modeled_bytes)?;
+    let snapshot = ControlMetricsSnapshot::empty(local_node_id.to_string());
+    let retained_bytes = if snapshot.liveness.local_node_id.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(snapshot.liveness.local_node_id.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(64)
+    };
+    reservation.resize(retained_bytes)?;
+    Ok(AccountedEmptyControlMetrics {
+        snapshot,
+        _reservation: reservation,
+    })
+}
+
+fn empty_metrics_hotspot_snapshot() -> ClusterHotspotSnapshot {
+    ClusterHotspotSnapshot {
+        generated_unix_ms: 0,
+        hot_shards: Vec::new(),
+        tenant_hotspots: Vec::new(),
+        skewed_shards: 0,
+        skewed_tenants: 0,
+        max_shard_score: 0.0,
+        max_tenant_score: 0.0,
+    }
+}
+
+fn collect_accounted_metrics_hotspot(
+    storage: &Arc<dyn Storage>,
+    cluster_context: Option<&ClusterRequestContext>,
+    control: Option<&crate::cluster::control::ControlHotspotSnapshot>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedMetricsHotspot, MetricsHotspotCollectionError> {
+    if storage.list_metrics_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+        return Err(MetricsHotspotCollectionError::IncompleteMetricAccounting);
+    }
+    let metrics = storage
+        .list_metrics_with_execution_result(execution)
+        .map_err(MetricsHotspotCollectionError::MetricEnumeration)?;
+    let guarded_metrics = validate_complete_metric_enumeration_result(metrics)
+        .map_err(MetricsHotspotCollectionError::InvalidMetricAccounting)?;
+    let hotspot = hotspot::build_cluster_hotspot_snapshot_with_control_metrics_execution(
+        &guarded_metrics.series,
+        cluster_context.map(|context| &context.runtime.ring),
+        control,
+        None,
+        execution,
+    )
+    .map_err(MetricsHotspotCollectionError::Hotspot)?;
+    drop(guarded_metrics);
+    Ok(AccountedMetricsHotspot { hotspot })
+}
+
+fn begin_metrics_execution(
+    storage: &Arc<dyn Storage>,
+) -> Result<tsink::QueryExecution, MetricsHotspotCollectionError> {
+    storage
+        .begin_query_execution(
+            tsink::QueryWorkLimits::default(),
+            tsink::QueryCancellationToken::new(),
+        )
+        .map_err(MetricsHotspotCollectionError::QueryAdmission)?
+        .ok_or(MetricsHotspotCollectionError::QueryAdmissionUnavailable)
+}
+
+fn modeled_metrics_header_preflight_bytes() -> u64 {
+    modeled_tsdb_status_vec_capacity_bytes::<(String, String)>(4).saturating_add(
+        tsdb_status_saturating_u64_from_usize(
+            "Content-Type"
+                .len()
+                .saturating_add(METRICS_CONTENT_TYPE.len()),
+        )
+        .saturating_add(TSDB_STATUS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES.saturating_mul(2)),
+    )
+}
+
+fn modeled_metrics_response_preflight_bytes(body_capacity: usize) -> u64 {
+    modeled_tsdb_status_vec_capacity_bytes::<u8>(body_capacity)
+        .saturating_add(modeled_metrics_header_preflight_bytes())
+}
+
+fn metrics_fallback_response(errors: MetricsCollectionErrors) -> HttpResponse {
+    let mut body = BoundedMetricsBody::with_limit(METRICS_FALLBACK_RESPONSE_BYTES);
+    body.push_str(
+        "# HELP tsink_cluster_hotspot_skewed_shards Number of shards currently above hotspot skew threshold\n\
+         # TYPE tsink_cluster_hotspot_skewed_shards gauge\n\
+         tsink_cluster_hotspot_skewed_shards 0\n\
+         # HELP tsink_cluster_hotspot_skewed_tenants Number of tenants currently above hotspot skew threshold\n\
+         # TYPE tsink_cluster_hotspot_skewed_tenants gauge\n\
+         tsink_cluster_hotspot_skewed_tenants 0\n\
+         # HELP tsink_cluster_hotspot_max_shard_score Highest hotspot pressure score among tracked shards\n\
+         # TYPE tsink_cluster_hotspot_max_shard_score gauge\n\
+         tsink_cluster_hotspot_max_shard_score 0\n\
+         # HELP tsink_cluster_hotspot_max_tenant_score Highest hotspot pressure score among tracked tenants\n\
+         # TYPE tsink_cluster_hotspot_max_tenant_score gauge\n\
+         tsink_cluster_hotspot_max_tenant_score 0\n",
+    );
+    append_metrics_collection_errors(&mut body, errors);
+    if body.overflowed {
+        body.output.clear();
+        body.overflowed = false;
+        body.push_str(
+            "# TYPE tsink_cluster_hotspot_skewed_shards gauge\n\
+             tsink_cluster_hotspot_skewed_shards 0\n\
+             # TYPE tsink_cluster_hotspot_skewed_tenants gauge\n\
+             tsink_cluster_hotspot_skewed_tenants 0\n\
+             # TYPE tsink_cluster_hotspot_max_shard_score gauge\n\
+             tsink_cluster_hotspot_max_shard_score 0\n\
+             # TYPE tsink_cluster_hotspot_max_tenant_score gauge\n\
+             tsink_cluster_hotspot_max_tenant_score 0\n\
+             # TYPE tsink_metrics_collection_errors gauge\n\
+             tsink_metrics_collection_errors 1\n\
+             # TYPE tsink_metrics_collection_error gauge\n\
+             tsink_metrics_collection_error{collector=\"exposition_body\"} 1\n",
+        );
+    }
+    HttpResponse::new(
+        200,
+        body.into_bytes()
+            .unwrap_or_else(|_| b"tsink_metrics_collection_errors 1\n".to_vec()),
+    )
+    .with_header("Content-Type", METRICS_CONTENT_TYPE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23,26 +503,114 @@ pub(super) fn render_metrics(
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
     offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
-    let mut collection_errors = Vec::new();
-    let memory_used = storage.memory_used();
-    let memory_budget = storage.memory_budget();
-    let metrics_list = match storage.list_metrics() {
-        Ok(metrics) => metrics,
+    if storage.list_metrics_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+        let mut errors = MetricsCollectionErrors::default();
+        errors.insert(MetricsCollector::StorageListMetrics);
+        eprintln!(
+            "metrics collection error in {}: storage does not provide complete metric-list accounting",
+            MetricsCollector::StorageListMetrics.name()
+        );
+        return metrics_fallback_response(errors);
+    }
+    let execution = match begin_metrics_execution(storage) {
+        Ok(execution) => execution,
         Err(err) => {
-            eprintln!("metrics collection error in storage_list_metrics: {err}");
-            collection_errors.push(MetricsCollectionError {
-                collector: "storage_list_metrics",
-            });
-            Vec::new()
+            let collector = err.collector();
+            eprintln!("metrics collection error in {}: {err}", collector.name());
+            let mut errors = MetricsCollectionErrors::default();
+            errors.insert(collector);
+            return metrics_fallback_response(errors);
         }
     };
+    let mut collection_errors = MetricsCollectionErrors::default();
+    let memory_used = storage.memory_used();
+    let memory_budget = storage.memory_budget();
+    let accounted_cluster_control = cluster_context
+        .and_then(|context| context.control_consensus.as_ref())
+        .and_then(
+            |consensus| match consensus.metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    eprintln!("metrics collection error in operational_snapshots: {err}");
+                    collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                    None
+                }
+            },
+        );
+    let empty_cluster_control = if accounted_cluster_control.is_none() {
+        let local_node_id = cluster_context
+            .map(|context| context.runtime.membership.local_node_id.as_str())
+            .unwrap_or("standalone");
+        match empty_control_metrics_with_execution(local_node_id, &execution) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                return metrics_fallback_response(collection_errors);
+            }
+        }
+    } else {
+        None
+    };
+    let cluster_control = accounted_cluster_control
+        .as_deref()
+        .or_else(|| {
+            empty_cluster_control
+                .as_ref()
+                .map(|snapshot| &snapshot.snapshot)
+        })
+        .expect("one control metrics projection is always present");
+    let accounted_cluster_hotspot = match collect_accounted_metrics_hotspot(
+        storage,
+        cluster_context,
+        Some(&cluster_control.hotspot),
+        &execution,
+    ) {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            let collector = err.collector();
+            eprintln!("metrics collection error in {}: {err}", collector.name());
+            collection_errors.insert(collector);
+            None
+        }
+    };
+    let empty_cluster_hotspot = empty_metrics_hotspot_snapshot();
+    let cluster_hotspot = accounted_cluster_hotspot
+        .as_ref()
+        .map(AccountedMetricsHotspot::snapshot)
+        .unwrap_or(&empty_cluster_hotspot);
     let uptime = server_start.elapsed().as_secs();
-    let obs = storage.observability_snapshot();
+    let obs = match storage.metrics_observability_snapshot_with_execution(&execution) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("metrics collection error in operational_snapshots: {err}");
+            collection_errors.insert(MetricsCollector::OperationalSnapshots);
+            return metrics_fallback_response(collection_errors);
+        }
+    };
     let series_count = obs.cardinality.series_count;
-    let local_disk = local_disk_budget
-        .map(tsink::LocalDiskBudget::snapshot)
-        .or_else(|| obs.local_disk.clone());
-    let offline_restore_disk = offline_restore_disk_budget.map(tsink::LocalDiskBudget::snapshot);
+    let local_disk = match local_disk_budget {
+        Some(budget) => match budget.metrics_snapshot_with_execution(&execution) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                None
+            }
+        },
+        None => obs.local_disk,
+    };
+    let offline_restore_disk = match offline_restore_disk_budget {
+        Some(budget) => match budget.metrics_snapshot_with_execution(&execution) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                None
+            }
+        },
+        None => None,
+    };
     let memory_obs = &obs.memory;
     let memory_pressure_normal = u8::from(matches!(
         memory_obs.pressure.level,
@@ -66,23 +634,49 @@ pub(super) fn render_metrics(
     ));
     let wal_enabled = u8::from(obs.wal.enabled);
     let cluster_write_metrics = write_routing_metrics_snapshot();
-    let cluster_write_labeled_metrics = write_routing_labeled_metrics_snapshot();
+    let accounted_cluster_write_labeled_metrics =
+        match write_routing_labeled_metrics_snapshot_with_execution(&execution) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                None
+            }
+        };
+    let empty_cluster_write_labeled_metrics =
+        WriteRoutingLabeledMetricsExpositionSnapshot::default();
+    let cluster_write_labeled_metrics = accounted_cluster_write_labeled_metrics
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot())
+        .unwrap_or(&empty_cluster_write_labeled_metrics);
     let cluster_fanout_metrics = read_fanout_metrics_snapshot();
-    let cluster_fanout_labeled_metrics = read_fanout_labeled_metrics_snapshot();
+    let accounted_cluster_fanout_labeled_metrics =
+        match read_fanout_labeled_metrics_snapshot_with_execution(&execution) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                None
+            }
+        };
+    let empty_cluster_fanout_labeled_metrics =
+        ReadFanoutLabeledMetricsExpositionSnapshot::default();
+    let cluster_fanout_labeled_metrics = accounted_cluster_fanout_labeled_metrics
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot())
+        .unwrap_or(&empty_cluster_fanout_labeled_metrics);
     let cluster_read_planner_metrics = read_planner_metrics_snapshot();
-    let cluster_read_planner_labeled_metrics = read_planner_labeled_metrics_snapshot();
+    let cluster_read_planner_labeled_metrics = read_planner_labeled_metrics_exposition_snapshot();
     let cluster_dedupe_metrics = dedupe_metrics_snapshot();
-    let cluster_outbox_metrics = outbox_metrics_snapshot();
     let read_admission_metrics = admission::read_admission_metrics_snapshot();
     let write_admission_metrics = admission::write_admission_metrics_snapshot();
+    let write_rejection_metrics = write_rejection_metrics_snapshot();
     let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
     let metadata_store_metrics = match metadata_store.metrics_snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) => {
             eprintln!("metrics collection error in metric_metadata_store: {err}");
-            collection_errors.push(MetricsCollectionError {
-                collector: "metric_metadata_store",
-            });
+            collection_errors.insert(MetricsCollector::MetricMetadataStore);
             MetricMetadataStoreMetricsSnapshot {
                 limits: metadata_store.config(),
                 entries: 0,
@@ -109,9 +703,7 @@ pub(super) fn render_metrics(
         Ok(snapshot) => snapshot,
         Err(err) => {
             eprintln!("metrics collection error in exemplar_store: {err}");
-            collection_errors.push(MetricsCollectionError {
-                collector: "exemplar_store",
-            });
+            collection_errors.insert(MetricsCollector::ExemplarStore);
             ExemplarStoreMetricsSnapshot {
                 accepted_total: 0,
                 rejected_total: 0,
@@ -128,49 +720,105 @@ pub(super) fn render_metrics(
     let payload_status = payload_status_snapshot(cluster_context);
     let otlp_status = otlp_metrics_status_snapshot();
     let legacy_ingest_status = legacy_ingest::status_snapshot();
-    let edge_sync_source_status = edge_sync_context
-        .map(|context| context.source_status_snapshot())
-        .unwrap_or_default();
-    let edge_sync_accept_status = edge_sync_context
-        .map(|context| context.accept_status_snapshot())
+    let edge_sync_metrics = edge_sync_context
+        .map(edge_sync::EdgeSyncRuntimeContext::metrics_snapshot)
         .unwrap_or_default();
     let cluster_audit_health = cluster_context
         .and_then(|context| context.audit_log.as_ref())
-        .map(|audit_log| audit_log.health_snapshot())
+        .map(|audit_log| audit_log.metrics_snapshot())
         .unwrap_or_default();
-    let cluster_outbox_peers = cluster_context
+    let accounted_cluster_outbox = cluster_context
         .and_then(|context| context.outbox.as_ref())
-        .map(|outbox| outbox.peer_backlog_snapshot())
-        .unwrap_or_default();
-    let cluster_outbox_stalled_peers = cluster_context
-        .and_then(|context| context.outbox.as_ref())
-        .map(|outbox| outbox.stalled_peer_snapshot())
-        .unwrap_or_default();
-    let cluster_control_liveness = cluster_control_liveness_snapshot(cluster_context);
-    let cluster_control_persistence = cluster_control_persistence_status(cluster_context);
-    let cluster_handoff = cluster_handoff_snapshot(cluster_context);
-    let cluster_digest = cluster_digest_snapshot(cluster_context);
-    let cluster_rebalance = cluster_rebalance_snapshot(cluster_context);
-    let cluster_hotspot =
-        cluster_hotspot_snapshot_for_request(&metrics_list, cluster_context, None);
+        .and_then(
+            |outbox| match outbox.metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    eprintln!("metrics collection error in operational_snapshots: {err}");
+                    collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                    None
+                }
+            },
+        );
+    let empty_cluster_outbox = OutboxMetricsExpositionSnapshot { peers: Vec::new() };
+    let cluster_outbox_peers = accounted_cluster_outbox
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot())
+        .unwrap_or(&empty_cluster_outbox);
+    let cluster_outbox_metrics = outbox_metrics_snapshot();
+    let accounted_cluster_digest = cluster_context
+        .and_then(|context| context.digest_runtime.as_ref())
+        .and_then(
+            |runtime| match runtime.metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    eprintln!("metrics collection error in operational_snapshots: {err}");
+                    collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                    None
+                }
+            },
+        );
+    let empty_cluster_digest = DigestExchangeMetricsSnapshot::default();
+    let cluster_digest = accounted_cluster_digest
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot())
+        .unwrap_or(&empty_cluster_digest);
+    let accounted_cluster_rebalance = cluster_context
+        .and_then(|context| context.digest_runtime.as_ref())
+        .and_then(
+            |runtime| match runtime.rebalance_metrics_snapshot_with_execution(&execution) {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    eprintln!("metrics collection error in operational_snapshots: {err}");
+                    collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                    None
+                }
+            },
+        );
+    let empty_cluster_rebalance = RebalanceSchedulerMetricsSnapshot::default();
+    let cluster_rebalance = accounted_cluster_rebalance
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot())
+        .unwrap_or(&empty_cluster_rebalance);
     let rules_snapshot = match rules_runtime {
-        Some(runtime) => match runtime.snapshot() {
+        Some(runtime) => match runtime.metrics_snapshot_with_execution(&execution) {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 eprintln!("metrics collection error in rules_runtime: {err}");
-                collection_errors.push(MetricsCollectionError {
-                    collector: "rules_runtime",
-                });
-                rules::empty_rules_snapshot()
+                collection_errors.insert(MetricsCollector::RulesRuntime);
+                rules::RulesExpositionSnapshot::default()
             }
         },
-        None => rules::empty_rules_snapshot(),
+        None => rules::RulesExpositionSnapshot::default(),
     };
     let usage_status = usage_accounting
-        .map(UsageAccounting::ledger_status)
+        .map(UsageAccounting::metrics_snapshot)
         .unwrap_or_default();
+    let security_metrics = match security_manager {
+        Some(manager) => match manager.metrics_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                crate::security::SecurityMetricsSnapshot::default()
+            }
+        },
+        None => crate::security::SecurityMetricsSnapshot::default(),
+    };
+    let rbac_metrics = match rbac_registry {
+        Some(registry) => match registry.service_account_metrics_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                eprintln!("metrics collection error in operational_snapshots: {err}");
+                collection_errors.insert(MetricsCollector::OperationalSnapshots);
+                None
+            }
+        },
+        None => None,
+    };
+    let rendered_collection_errors = collection_errors;
 
-    let mut body = format!(
+    let append_body = |body: &mut dyn MetricsBodyWriter| {
+        metrics_write!(body,
         "# HELP tsink_memory_used_bytes Estimated bytes counted against the configured memory budget\n\
          # TYPE tsink_memory_used_bytes gauge\n\
          tsink_memory_used_bytes {memory_used}\n\
@@ -766,80 +1414,188 @@ pub(super) fn render_metrics(
         cluster_dedupe_log_bytes = cluster_dedupe_metrics.log_bytes,
     );
 
-    append_local_disk_metrics(&mut body, local_disk.as_ref());
-    append_offline_restore_disk_metrics(&mut body, offline_restore_disk.as_ref());
-    cluster::append_metrics(
-        &mut body,
-        ClusterMetrics {
-            write_labeled: &cluster_write_labeled_metrics,
-            fanout: cluster_fanout_metrics,
-            fanout_labeled: &cluster_fanout_labeled_metrics,
-            read_planner: cluster_read_planner_metrics,
-            read_planner_labeled: &cluster_read_planner_labeled_metrics,
-            outbox: cluster_outbox_metrics,
-            outbox_peers: &cluster_outbox_peers,
-            outbox_stalled_peers: &cluster_outbox_stalled_peers,
-            control: &cluster_control_liveness,
-            handoff: &cluster_handoff,
-            digest: &cluster_digest,
-            rebalance: &cluster_rebalance,
-            hotspot: &cluster_hotspot,
-        },
-    );
-    append_cluster_audit_metrics(&mut body, &cluster_audit_health);
-    append_cluster_control_persistence_metrics(&mut body, &cluster_control_persistence);
-    append_metric_metadata_store_metrics(&mut body, &metadata_store_metrics);
-    append_exemplar_metrics(
-        &mut body,
-        &exemplar_metrics,
-        exemplar_store.config(),
-        exemplar_store.resource_limits(),
-    );
-    append_rules_metrics(&mut body, &rules_snapshot);
-    append_rollup_metrics(&mut body, &obs.rollups, &obs.query);
-    append_cardinality_metrics(&mut body, &obs.cardinality);
-    append_query_budget_metrics(&mut body, &obs.query_budget);
-    append_background_work_metrics(&mut body, &obs.background);
-    append_prometheus_payload_metrics(&mut body, &payload_status);
-    append_otlp_metrics(&mut body, &otlp_status);
-    append_legacy_ingest_metrics(&mut body, &legacy_ingest_status);
-    append_edge_sync_metrics(
-        &mut body,
-        &edge_sync_source_status,
-        &edge_sync_accept_status,
-    );
-    append_read_admission_metrics(&mut body, read_admission_metrics);
-    append_write_admission_metrics(&mut body, write_admission_metrics);
-    append_write_rejection_metrics(&mut body);
-    append_tenant_admission_metrics(&mut body, tenant_admission_metrics);
-    append_security_metrics(&mut body, security_manager, rbac_registry);
-    append_usage_metrics(&mut body, &usage_status);
-    append_metrics_collection_errors(&mut body, &collection_errors);
+        append_local_disk_metrics(body, local_disk.as_ref());
+        append_offline_restore_disk_metrics(body, offline_restore_disk.as_ref());
+        cluster::append_metrics(
+            body,
+            ClusterMetrics {
+                write_labeled: cluster_write_labeled_metrics,
+                fanout: cluster_fanout_metrics,
+                fanout_labeled: cluster_fanout_labeled_metrics,
+                read_planner: cluster_read_planner_metrics,
+                read_planner_labeled: &cluster_read_planner_labeled_metrics,
+                outbox: cluster_outbox_metrics,
+                outbox_peers: cluster_outbox_peers,
+                control: &cluster_control.liveness,
+                handoff: &cluster_control.handoff,
+                digest: cluster_digest,
+                rebalance: cluster_rebalance,
+                hotspot: cluster_hotspot,
+            },
+        );
+        append_cluster_audit_metrics(body, &cluster_audit_health);
+        append_cluster_control_persistence_metrics(body, &cluster_control.persistence);
+        append_metric_metadata_store_metrics(body, &metadata_store_metrics);
+        append_exemplar_metrics(
+            body,
+            &exemplar_metrics,
+            exemplar_store.config(),
+            exemplar_store.resource_limits(),
+        );
+        append_rules_metrics(body, &rules_snapshot);
+        append_rollup_metrics(body, &obs.rollups, &obs.query);
+        append_cardinality_metrics(body, &obs.cardinality);
+        append_query_budget_metrics(body, &obs.query_budget);
+        append_background_work_metrics(body, &obs.background);
+        append_prometheus_payload_metrics(body, &payload_status);
+        append_otlp_metrics(body, &otlp_status);
+        append_legacy_ingest_metrics(body, &legacy_ingest_status);
+        append_edge_sync_metrics(body, &edge_sync_metrics.source, &edge_sync_metrics.accept);
+        append_read_admission_metrics(body, read_admission_metrics);
+        append_write_admission_metrics(body, write_admission_metrics);
+        append_write_rejection_metrics(body, write_rejection_metrics);
+        append_tenant_admission_metrics(body, tenant_admission_metrics);
+        append_security_metrics(body, &security_metrics, rbac_metrics.as_ref());
+        append_usage_metrics(body, &usage_status);
+        append_metrics_collection_errors(body, rendered_collection_errors);
+    };
 
-    HttpResponse::new(200, body.into_bytes())
-        .with_header("Content-Type", "text/plain; version=0.0.4")
+    let mut counter = CountingMetricsBody::new(&execution);
+    append_body(&mut counter);
+    let CountingMetricsBody {
+        len: body_len,
+        control_error,
+        overflowed,
+        ..
+    } = counter;
+    if let Some(err) = control_error {
+        eprintln!(
+            "metrics collection error in {}: {err}",
+            MetricsCollector::ExpositionBody.name()
+        );
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    if overflowed {
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    if let Err(err) = execution.charge_returned_bytes(u64::try_from(body_len).unwrap_or(u64::MAX)) {
+        eprintln!(
+            "metrics collection error in {}: {err}",
+            MetricsCollector::ExpositionBody.name()
+        );
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    let mut response_reservation =
+        match execution.reserve_memory(modeled_metrics_response_preflight_bytes(body_len)) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                eprintln!(
+                    "metrics collection error in {}: {err}",
+                    MetricsCollector::ExpositionBody.name()
+                );
+                collection_errors.insert(MetricsCollector::ExpositionBody);
+                return metrics_fallback_response(collection_errors);
+            }
+        };
+    let body = match BoundedMetricsBody::try_with_exact_capacity(body_len) {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!(
+                "metrics collection error in {}: body allocation failed: {err}",
+                MetricsCollector::ExpositionBody.name()
+            );
+            drop(response_reservation);
+            collection_errors.insert(MetricsCollector::ExpositionBody);
+            return metrics_fallback_response(collection_errors);
+        }
+    };
+    if let Err(err) =
+        response_reservation.resize(modeled_metrics_response_preflight_bytes(body.capacity()))
+    {
+        eprintln!(
+            "metrics collection error in {}: {err}",
+            MetricsCollector::ExpositionBody.name()
+        );
+        drop(body);
+        drop(response_reservation);
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    let mut controlled_body = ControlledMetricsBody::new(body, &execution);
+    append_body(&mut controlled_body);
+    let ControlledMetricsBody {
+        body,
+        control_error,
+        ..
+    } = controlled_body;
+    if let Some(err) = control_error {
+        eprintln!(
+            "metrics collection error in {}: {err}",
+            MetricsCollector::ExpositionBody.name()
+        );
+        drop(body);
+        drop(response_reservation);
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    if body.overflowed || body.len() != body_len {
+        drop(body);
+        drop(response_reservation);
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    let body = match body.into_bytes() {
+        Ok(body) => body,
+        Err(()) => {
+            drop(response_reservation);
+            collection_errors.insert(MetricsCollector::ExpositionBody);
+            return metrics_fallback_response(collection_errors);
+        }
+    };
+    let response = HttpResponse::new(200, body).with_header("Content-Type", METRICS_CONTENT_TYPE);
+    let retained_bytes = modeled_tsdb_status_response_retained_bytes(&response);
+    drop(accounted_cluster_hotspot);
+    if let Err(err) = response_reservation.resize(retained_bytes) {
+        eprintln!(
+            "metrics collection error in {}: {err}",
+            MetricsCollector::ExpositionBody.name()
+        );
+        drop(response);
+        drop(response_reservation);
+        collection_errors.insert(MetricsCollector::ExpositionBody);
+        return metrics_fallback_response(collection_errors);
+    }
+    drop(response_reservation);
+    drop(execution);
+    response
 }
 
 fn append_background_work_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &tsink::BackgroundWorkObservabilitySnapshot,
 ) {
     body.push_str(
         "# HELP tsink_background_threads Instance-owned background thread bounds and current state\n\
          # TYPE tsink_background_threads gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_background_threads{{state=\"limit\"}} {}\n",
         snapshot.max_threads
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_background_threads{{state=\"installed\"}} {}\n",
         snapshot.installed_threads
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_background_threads{{state=\"running\"}} {}\n",
         snapshot.running_threads
-    ));
+    );
     body.push_str(
         "# HELP tsink_background_worker_state Fixed-cardinality lifecycle and cadence state for each engine worker slot\n\
          # TYPE tsink_background_worker_state gauge\n\
@@ -852,22 +1608,26 @@ fn append_background_work_metrics(
         ("persisted_refresh", snapshot.persisted_refresh),
         ("rollup", snapshot.rollup),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_background_worker_state{{worker=\"{worker}\",state=\"installed\"}} {}\n",
             u8::from(state.installed)
-        ));
-        body.push_str(&format!(
+        );
+        metrics_write!(
+            body,
             "tsink_background_worker_state{{worker=\"{worker}\",state=\"running\"}} {}\n",
             u8::from(state.running)
-        ));
-        body.push_str(&format!(
+        );
+        metrics_write!(
+            body,
             "tsink_background_worker_state{{worker=\"{worker}\",state=\"max_concurrency\"}} {}\n",
             state.max_concurrency
-        ));
-        body.push_str(&format!(
+        );
+        metrics_write!(
+            body,
             "tsink_background_worker_state{{worker=\"{worker}\",state=\"interval_nanos\"}} {}\n",
             state.interval_nanos.unwrap_or(0)
-        ));
+        );
         for (event, value) in [
             ("starts", state.starts_total),
             ("exits", state.exits_total),
@@ -877,9 +1637,9 @@ fn append_background_work_metrics(
             ("passes_completed", state.passes_completed_total),
             ("shutdown_joins", state.shutdown_joins_total),
         ] {
-            body.push_str(&format!(
+            metrics_write!(body,
                 "tsink_background_worker_events_total{{worker=\"{worker}\",event=\"{event}\"}} {value}\n"
-            ));
+            );
         }
     }
     body.push_str(
@@ -903,96 +1663,108 @@ fn append_background_work_metrics(
             snapshot.close_coordination_timeouts_total,
         ),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_storage_close_events_total{{event=\"{event}\"}} {value}\n"
-        ));
+        );
     }
     for (wait, value) in [
         ("coordination", snapshot.close_coordination_wait_nanos_total),
         ("worker_join", snapshot.shutdown_join_wait_nanos_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_storage_close_wait_nanos_total{{wait=\"{wait}\"}} {value}\n"
-        ));
+        );
     }
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_storage_close_duration_nanos_total {}\n",
         snapshot.close_duration_nanos_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_storage_close_compaction_passes_total {}\n",
         snapshot.close_compaction_passes_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_storage_close_compaction_pass_limit {}\n",
         snapshot.close_compaction_pass_limit
-    ));
+    );
 }
 
 fn append_cardinality_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &tsink::CardinalityObservabilitySnapshot,
 ) {
     body.push_str(
         "# HELP tsink_series_creation_pending New-series reservations awaiting write publication\n\
          # TYPE tsink_series_creation_pending gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_pending {}\n",
         snapshot.pending_new_series
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_committed_in_window New series committed in the current fixed creation-rate window\n\
          # TYPE tsink_series_creation_committed_in_window gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_committed_in_window {}\n",
         snapshot.committed_in_window
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_window_initialized Whether a creation-rate window has been initialized\n\
          # TYPE tsink_series_creation_window_initialized gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_window_initialized {}\n",
         u8::from(snapshot.current_window_start.is_some())
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_window_start Storage timestamp-unit start of the current creation-rate window, or zero when uninitialized\n\
          # TYPE tsink_series_creation_window_start gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_window_start {}\n",
         snapshot.current_window_start.unwrap_or(0)
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_admitted_total New-series reservations admitted since the storage instance opened\n\
          # TYPE tsink_series_creation_admitted_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_admitted_total {}\n",
         snapshot.admitted_new_series_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_committed_total New series successfully published since the storage instance opened\n\
          # TYPE tsink_series_creation_committed_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_committed_total {}\n",
         snapshot.committed_new_series_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_series_creation_rejections_total New-series creation-rate admission rejections since the storage instance opened\n\
          # TYPE tsink_series_creation_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_series_creation_rejections_total {}\n",
         snapshot.creation_rate_rejections_total
-    ));
+    );
 }
 
 pub(super) fn append_query_budget_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &tsink::QueryBudgetSnapshot,
 ) {
     body.push_str(
@@ -1005,7 +1777,8 @@ pub(super) fn append_query_budget_metrics(
          # HELP tsink_query_budget_peak_reserved_memory_bytes Peak modeled query memory reserved across live queries\n\
          # TYPE tsink_query_budget_peak_reserved_memory_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_budget_active_queries {}\n\
          tsink_query_budget_peak_active_queries {}\n\
          tsink_query_budget_reserved_memory_bytes {}\n\
@@ -1014,7 +1787,7 @@ pub(super) fn append_query_budget_metrics(
         snapshot.peak_active_queries,
         snapshot.shared_reserved_memory_bytes,
         snapshot.peak_shared_reserved_memory_bytes,
-    ));
+    );
     body.push_str(
         "# HELP tsink_query_budget_queries_started_total Core queries admitted since the storage instance opened\n\
          # TYPE tsink_query_budget_queries_started_total counter\n\
@@ -1025,14 +1798,15 @@ pub(super) fn append_query_budget_metrics(
          # HELP tsink_query_budget_limit_rejections_by_reason_total Core query limit rejections by stable reason\n\
          # TYPE tsink_query_budget_limit_rejections_by_reason_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_budget_queries_started_total {}\n\
          tsink_query_budget_queries_completed_total {}\n\
          tsink_query_budget_limit_rejections_total {}\n",
         snapshot.queries_started_total,
         snapshot.queries_completed_total,
         snapshot.limit_rejections_total,
-    ));
+    );
     for (reason, value) in [
         ("concurrent_queries", snapshot.concurrency_rejections_total),
         (
@@ -1060,9 +1834,10 @@ pub(super) fn append_query_budget_metrics(
             snapshot.intermediate_vector_size_rejections_total,
         ),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_query_budget_limit_rejections_by_reason_total{{reason=\"{reason}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_query_budget_cancellations_total Query admission or execution attempts that observed cooperative cancellation\n\
@@ -1072,14 +1847,15 @@ pub(super) fn append_query_budget_metrics(
          # HELP tsink_query_budget_accounting_invariant_violations_total Internal query permit or memory release inconsistencies\n\
          # TYPE tsink_query_budget_accounting_invariant_violations_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_budget_cancellations_total {}\n\
          tsink_query_budget_deadline_exceeded_total {}\n\
          tsink_query_budget_accounting_invariant_violations_total {}\n",
         snapshot.cancellations_total,
         snapshot.deadline_exceeded_total,
         snapshot.accounting_invariant_violations_total,
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_query_budget_configured_limit Effective finite core query limits; absent kinds are unbounded\n\
@@ -1112,14 +1888,18 @@ pub(super) fn append_query_budget_metrics(
         ("max_wall_time_nanos", wall_time_nanos),
     ] {
         if let Some(value) = value {
-            body.push_str(&format!(
+            metrics_write!(
+                body,
                 "tsink_query_budget_configured_limit{{kind=\"{kind}\"}} {value}\n"
-            ));
+            );
         }
     }
 }
 
-fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDiskBudgetSnapshot>) {
+fn append_local_disk_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: Option<&tsink::LocalDiskMetricsSnapshot>,
+) {
     let Some(snapshot) = snapshot else {
         return;
     };
@@ -1128,82 +1908,91 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
         "# HELP tsink_local_disk_accounted_bytes Bytes accounted beneath the shared managed data directory\n\
          # TYPE tsink_local_disk_accounted_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_accounted_bytes {}\n",
         snapshot.accounted_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_reserved_bytes Bytes held by live managed local-disk reservations\n\
          # TYPE tsink_local_disk_reserved_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_reserved_bytes {}\n",
         snapshot.reserved_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_maintenance_reserved_bytes Live reservation bytes held by managed maintenance work\n\
          # TYPE tsink_local_disk_maintenance_reserved_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_maintenance_reserved_bytes {}\n",
         snapshot.maintenance_reserved_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_unknown_bytes Accounted bytes not recognized as tsink-owned files\n\
          # TYPE tsink_local_disk_unknown_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_unknown_bytes {}\n",
         snapshot.unknown_bytes
-    ));
+    );
     if let Some(available) = snapshot.filesystem_available_bytes {
         body.push_str(
             "# HELP tsink_local_disk_filesystem_available_bytes Filesystem bytes available to the current user for the managed data directory\n\
              # TYPE tsink_local_disk_filesystem_available_bytes gauge\n",
         );
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_local_disk_filesystem_available_bytes {available}\n"
-        ));
+        );
     }
     if let Some(limit) = snapshot.limits.max_bytes {
         body.push_str(
             "# HELP tsink_local_disk_limit_bytes Configured logical byte limit for the shared managed data directory\n\
              # TYPE tsink_local_disk_limit_bytes gauge\n",
         );
-        body.push_str(&format!("tsink_local_disk_limit_bytes {limit}\n"));
+        metrics_write!(body, "tsink_local_disk_limit_bytes {limit}\n");
     }
     body.push_str(
         "# HELP tsink_local_disk_filesystem_headroom_bytes Configured filesystem free-space floor for managed local storage\n\
          # TYPE tsink_local_disk_filesystem_headroom_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_filesystem_headroom_bytes {}\n",
         snapshot.limits.filesystem_free_headroom_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_maintenance_reserve_bytes Configured logical bytes reserved for managed maintenance output\n\
          # TYPE tsink_local_disk_maintenance_reserve_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_maintenance_reserve_bytes {}\n",
         snapshot.limits.maintenance_temp_reserve_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_over_limit Whether reconciled managed usage exceeds its logical limit\n\
          # TYPE tsink_local_disk_over_limit gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_over_limit {}\n",
         u8::from(snapshot.over_limit)
-    ));
+    );
     body.push_str(
         "# HELP tsink_local_disk_active_reservations Live managed local-disk reservations\n\
          # TYPE tsink_local_disk_active_reservations gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_local_disk_active_reservations {}\n",
         snapshot.active_reservations
-    ));
+    );
     for (name, help, value) in [
         (
             "tsink_local_disk_rejections_total",
@@ -1221,26 +2010,28 @@ fn append_local_disk_metrics(body: &mut String, snapshot: Option<&tsink::LocalDi
             snapshot.reservation_overruns_total,
         ),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_local_disk_category_bytes Accounted bytes beneath the shared managed data directory by category\n\
          # TYPE tsink_local_disk_category_bytes gauge\n",
     );
-    for usage in &snapshot.categories {
-        body.push_str(&format!(
+    for usage in snapshot.categories() {
+        metrics_write!(
+            body,
             "tsink_local_disk_category_bytes{{category=\"{}\"}} {}\n",
             disk_category_name(usage.category),
             usage.bytes
-        ));
+        );
     }
 }
 
 fn append_offline_restore_disk_metrics(
-    body: &mut String,
-    snapshot: Option<&tsink::LocalDiskBudgetSnapshot>,
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: Option<&tsink::LocalDiskMetricsSnapshot>,
 ) {
     let Some(snapshot) = snapshot else {
         return;
@@ -1314,10 +2105,12 @@ fn append_offline_restore_disk_metrics(
             "counter",
         ),
     ] {
-        let name = format!("tsink_offline_restore_disk_{suffix}");
-        body.push_str(&format!(
-            "# HELP {name} {help}\n# TYPE {name} {metric_type}\n{name} {value}\n"
-        ));
+        metrics_write!(
+            body,
+            "# HELP tsink_offline_restore_disk_{suffix} {help}\n\
+             # TYPE tsink_offline_restore_disk_{suffix} {metric_type}\n\
+             tsink_offline_restore_disk_{suffix} {value}\n"
+        );
     }
 
     if let Some(available) = snapshot.filesystem_available_bytes {
@@ -1325,27 +2118,29 @@ fn append_offline_restore_disk_metrics(
             "# HELP tsink_offline_restore_disk_filesystem_available_bytes Filesystem bytes available to the current user for the offline restore root\n\
              # TYPE tsink_offline_restore_disk_filesystem_available_bytes gauge\n",
         );
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_offline_restore_disk_filesystem_available_bytes {available}\n"
-        ));
+        );
     }
     if let Some(limit) = snapshot.limits.max_bytes {
         body.push_str(
             "# HELP tsink_offline_restore_disk_limit_bytes Configured logical byte limit for the offline restore root\n\
              # TYPE tsink_offline_restore_disk_limit_bytes gauge\n",
         );
-        body.push_str(&format!("tsink_offline_restore_disk_limit_bytes {limit}\n"));
+        metrics_write!(body, "tsink_offline_restore_disk_limit_bytes {limit}\n");
     }
     body.push_str(
         "# HELP tsink_offline_restore_disk_category_bytes Accounted bytes beneath the offline restore root by category\n\
          # TYPE tsink_offline_restore_disk_category_bytes gauge\n",
     );
-    for usage in &snapshot.categories {
-        body.push_str(&format!(
+    for usage in snapshot.categories() {
+        metrics_write!(
+            body,
             "tsink_offline_restore_disk_category_bytes{{category=\"{}\"}} {}\n",
             disk_category_name(usage.category),
             usage.bytes
-        ));
+        );
     }
 }
 
@@ -1367,291 +2162,300 @@ fn disk_category_name(category: tsink::DiskCategory) -> &'static str {
     }
 }
 
-fn append_metrics_collection_errors(body: &mut String, errors: &[MetricsCollectionError]) {
+fn append_metrics_collection_errors(
+    body: &mut dyn MetricsBodyWriter,
+    errors: MetricsCollectionErrors,
+) {
     body.push_str(
         "# HELP tsink_metrics_collection_errors Number of metrics collectors that failed during this scrape\n\
          # TYPE tsink_metrics_collection_errors gauge\n",
     );
-    body.push_str(&format!(
-        "tsink_metrics_collection_errors {}\n",
-        errors.len()
-    ));
+    metrics_write!(body, "tsink_metrics_collection_errors {}\n", errors.len());
     body.push_str(
         "# HELP tsink_metrics_collection_error Whether a metrics collector failed during this scrape\n\
          # TYPE tsink_metrics_collection_error gauge\n",
     );
-    for error in errors {
-        let collector = prometheus_escape_label_value(error.collector);
-        body.push_str(&format!(
+    for collector in errors.iter() {
+        let collector = prometheus_escape_label_value(collector.name());
+        metrics_write!(
+            body,
             "tsink_metrics_collection_error{{collector=\"{collector}\"}} 1\n"
-        ));
+        );
     }
 }
 
 fn append_security_metrics(
-    body: &mut String,
-    security_manager: Option<&SecurityManager>,
-    rbac_registry: Option<&RbacRegistry>,
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &crate::security::SecurityMetricsSnapshot,
+    service_accounts: Option<&crate::rbac::RbacServiceAccountMetricsSnapshot>,
 ) {
-    if let Some(security_manager) = security_manager {
-        let snapshot = security_manager.state_snapshot(rbac_registry);
-        if !snapshot.targets.is_empty() {
-            body.push_str(
-                "# HELP tsink_secret_rotation_generation Current secret rotation generation\n\
-                 # TYPE tsink_secret_rotation_generation gauge\n\
-                 # HELP tsink_secret_rotation_reload_total Secret reload operations attempted\n\
-                 # TYPE tsink_secret_rotation_reload_total counter\n\
-                 # HELP tsink_secret_rotation_total Secret rotation operations attempted\n\
-                 # TYPE tsink_secret_rotation_total counter\n\
-                 # HELP tsink_secret_rotation_failures_total Secret reload or rotation failures\n\
-                 # TYPE tsink_secret_rotation_failures_total counter\n\
-                 # HELP tsink_secret_rotation_last_success_unix_ms Last successful secret reload or rotation\n\
-                 # TYPE tsink_secret_rotation_last_success_unix_ms gauge\n\
-                 # HELP tsink_secret_rotation_last_failure_unix_ms Last failed secret reload or rotation\n\
-                 # TYPE tsink_secret_rotation_last_failure_unix_ms gauge\n\
-                 # HELP tsink_secret_rotation_previous_credential_active Previous credential overlap window active (1 yes, 0 no)\n\
-                 # TYPE tsink_secret_rotation_previous_credential_active gauge\n",
-            );
-        }
-        for target in &snapshot.targets {
-            match target {
-                crate::security::SecurityTargetSnapshot::Token(secret) => {
-                    let target = secret.target.as_str();
-                    body.push_str(&format!(
-                        "tsink_secret_rotation_generation{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_reload_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_failures_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_last_success_unix_ms{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_last_failure_unix_ms{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_previous_credential_active{{target=\"{target}\"}} {}\n",
-                        secret.generation,
-                        secret.reloads_total,
-                        secret.rotations_total,
-                        secret.failures_total,
-                        secret.last_success_unix_ms,
-                        secret.last_failure_unix_ms,
-                        u8::from(secret.accepts_previous_credential),
-                    ));
-                }
-                crate::security::SecurityTargetSnapshot::Tls(secret) => {
-                    let target = secret.target.as_str();
-                    body.push_str(&format!(
-                        "tsink_secret_rotation_generation{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_reload_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_failures_total{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_last_success_unix_ms{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_last_failure_unix_ms{{target=\"{target}\"}} {}\n\
-                         tsink_secret_rotation_previous_credential_active{{target=\"{target}\"}} 0\n",
-                        secret.generation,
-                        secret.reloads_total,
-                        secret.rotations_total,
-                        secret.failures_total,
-                        secret.last_success_unix_ms,
-                        secret.last_failure_unix_ms,
-                    ));
-                }
-            }
-        }
+    if snapshot.targets().next().is_some() {
+        body.push_str(
+            "# HELP tsink_secret_rotation_generation Current secret rotation generation\n\
+             # TYPE tsink_secret_rotation_generation gauge\n\
+             # HELP tsink_secret_rotation_reload_total Secret reload operations attempted\n\
+             # TYPE tsink_secret_rotation_reload_total counter\n\
+             # HELP tsink_secret_rotation_total Secret rotation operations attempted\n\
+             # TYPE tsink_secret_rotation_total counter\n\
+             # HELP tsink_secret_rotation_failures_total Secret reload or rotation failures\n\
+             # TYPE tsink_secret_rotation_failures_total counter\n\
+             # HELP tsink_secret_rotation_last_success_unix_ms Last successful secret reload or rotation\n\
+             # TYPE tsink_secret_rotation_last_success_unix_ms gauge\n\
+             # HELP tsink_secret_rotation_last_failure_unix_ms Last failed secret reload or rotation\n\
+             # TYPE tsink_secret_rotation_last_failure_unix_ms gauge\n\
+             # HELP tsink_secret_rotation_previous_credential_active Previous credential overlap window active (1 yes, 0 no)\n\
+             # TYPE tsink_secret_rotation_previous_credential_active gauge\n",
+        );
+    }
+    for secret in snapshot.targets() {
+        let target = secret.target.as_str();
+        metrics_write!(
+            body,
+            "tsink_secret_rotation_generation{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_reload_total{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_total{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_failures_total{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_last_success_unix_ms{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_last_failure_unix_ms{{target=\"{target}\"}} {}\n\
+             tsink_secret_rotation_previous_credential_active{{target=\"{target}\"}} {}\n",
+            secret.generation,
+            secret.reloads_total,
+            secret.rotations_total,
+            secret.failures_total,
+            secret.last_success_unix_ms,
+            secret.last_failure_unix_ms,
+            u8::from(secret.previous_credential_active),
+        );
     }
 
-    if let Some(summary) = rbac_service_account_summary(rbac_registry) {
+    if let Some(summary) = service_accounts {
         body.push_str(
             "# HELP tsink_rbac_service_accounts_total Configured RBAC service accounts\n\
              # TYPE tsink_rbac_service_accounts_total gauge\n",
         );
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rbac_service_accounts_total {}\n",
             summary.total
-        ));
+        );
         body.push_str(
             "# HELP tsink_rbac_service_accounts_disabled Total disabled RBAC service accounts\n\
              # TYPE tsink_rbac_service_accounts_disabled gauge\n",
         );
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rbac_service_accounts_disabled {}\n",
             summary.disabled
-        ));
+        );
         body.push_str(
             "# HELP tsink_rbac_service_accounts_last_rotated_unix_ms Latest RBAC service-account rotation timestamp\n\
              # TYPE tsink_rbac_service_accounts_last_rotated_unix_ms gauge\n",
         );
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rbac_service_accounts_last_rotated_unix_ms {}\n",
             summary.last_rotated_unix_ms
-        ));
+        );
     }
 }
 
-fn append_usage_metrics(body: &mut String, snapshot: &crate::usage::UsageLedgerStatus) {
+fn append_usage_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &crate::usage::UsageAccountingMetricsSnapshot,
+) {
     body.push_str(
         "# HELP tsink_usage_ledger_records_total Cumulative durable or in-memory tenant usage ledger records\n\
          # TYPE tsink_usage_ledger_records_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_records_total {}\n",
         snapshot.records_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_retained_records Records retained in memory for bounded raw and bucketed reads\n\
          # TYPE tsink_usage_ledger_retained_records gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_retained_records {}\n",
         snapshot.retained_records
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_earliest_retained_sequence Earliest raw sequence available for bounded reads, or zero when empty\n\
          # TYPE tsink_usage_ledger_earliest_retained_sequence gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_earliest_retained_sequence {}\n",
         snapshot.earliest_retained_sequence.unwrap_or(0)
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_recent_record_limit Configured in-memory recent-record bound\n\
          # TYPE tsink_usage_ledger_recent_record_limit gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_recent_record_limit {}\n",
-        snapshot.limits.recent_records
-    ));
+        snapshot.recent_record_limit
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_tenants_total Distinct tenants observed in the usage ledger\n\
          # TYPE tsink_usage_ledger_tenants_total gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_tenants_total {}\n",
         snapshot.tenant_count
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_tenant_limit Configured exact-summary tenant bound\n\
          # TYPE tsink_usage_ledger_tenant_limit gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_tenant_limit {}\n",
-        snapshot.limits.max_tenants
-    ));
+        snapshot.tenant_limit
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_storage_reconciliations_total Storage reconciliation snapshots recorded in the usage ledger\n\
          # TYPE tsink_usage_ledger_storage_reconciliations_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_storage_reconciliations_total {}\n",
         snapshot.storage_reconciliations_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_record_failures_total Usage ledger append attempts that did not complete successfully\n\
          # TYPE tsink_usage_ledger_record_failures_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_record_failures_total {}\n",
         snapshot.record_failures_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_usage_ledger_durable Whether usage accounting is backed by a durable on-disk ledger\n\
          # TYPE tsink_usage_ledger_durable gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_usage_ledger_durable {}\n",
         u8::from(snapshot.durable)
-    ));
+    );
 }
 
-fn append_rules_metrics(body: &mut String, snapshot: &rules::RulesStatusSnapshot) {
+fn append_rules_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &rules::RulesExpositionSnapshot,
+) {
     body.push_str(
         "# HELP tsink_rules_scheduler_runs_total Rules scheduler ticks attempted on this node\n\
          # TYPE tsink_rules_scheduler_runs_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_scheduler_runs_total {}\n",
         snapshot.metrics.scheduler_runs_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_scheduler_skipped_not_leader_total Rules scheduler ticks skipped because this node is not the active cluster leader\n\
          # TYPE tsink_rules_scheduler_skipped_not_leader_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_scheduler_skipped_not_leader_total {}\n",
         snapshot.metrics.scheduler_skipped_not_leader_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_scheduler_skipped_inflight_total Rules scheduler ticks skipped because a previous evaluation run was still in flight\n\
          # TYPE tsink_rules_scheduler_skipped_inflight_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_scheduler_skipped_inflight_total {}\n",
         snapshot.metrics.scheduler_skipped_inflight_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_evaluated_total Rules evaluated by the built-in rules engine\n\
          # TYPE tsink_rules_evaluated_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_evaluated_total {}\n",
         snapshot.metrics.evaluated_rules_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_evaluation_failures_total Rules evaluations that ended in an error\n\
          # TYPE tsink_rules_evaluation_failures_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_evaluation_failures_total {}\n",
         snapshot.metrics.evaluation_failures_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_recording_rows_written_total Samples written by recording rules\n\
          # TYPE tsink_rules_recording_rows_written_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_recording_rows_written_total {}\n",
         snapshot.metrics.recording_rows_written_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_configured Configured rules-engine inventory and alert state gauges\n\
          # TYPE tsink_rules_configured gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_configured{{kind=\"groups\"}} {}\n",
         snapshot.metrics.configured_groups
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_configured{{kind=\"rules\"}} {}\n",
         snapshot.metrics.configured_rules
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_configured{{kind=\"pending_alerts\"}} {}\n",
         snapshot.metrics.pending_alerts
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_configured{{kind=\"firing_alerts\"}} {}\n",
         snapshot.metrics.firing_alerts
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_scheduler_active Whether this node is currently allowed to execute scheduled rule evaluations (1=yes,0=no)\n\
          # TYPE tsink_rules_scheduler_active gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_scheduler_active {}\n",
         u8::from(snapshot.metrics.local_scheduler_active)
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_runtime_limits Rules runtime configuration guardrails\n\
          # TYPE tsink_rules_runtime_limits gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_runtime_limits{{kind=\"scheduler_tick_ms\"}} {}\n",
         snapshot.scheduler_tick_ms
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_runtime_limits{{kind=\"max_recording_rows_per_eval\"}} {}\n",
         snapshot.max_recording_rows_per_eval
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_runtime_limits{{kind=\"max_alert_instances_per_rule\"}} {}\n",
         snapshot.max_alert_instances_per_rule
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_store_limits Finite rules sidecar count and byte limits\n\
          # TYPE tsink_rules_store_limits gauge\n",
@@ -1709,22 +2513,25 @@ fn append_rules_metrics(body: &mut String, snapshot: &rules::RulesStatusSnapshot
             snapshot.store_limits.max_snapshot_status_bytes,
         ),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rules_store_limits{{kind=\"{kind}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_rules_store_bytes Current modeled rules sidecar bytes\n\
          # TYPE tsink_rules_store_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_store_bytes{{kind=\"retained_state\"}} {}\n",
         snapshot.metrics.retained_state_bytes
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_rules_store_bytes{{kind=\"durable_file\"}} {}\n",
         snapshot.metrics.durable_file_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_rules_store_peak_bytes Peak modeled rules sidecar bytes by bounded operation\n\
          # TYPE tsink_rules_store_peak_bytes gauge\n",
@@ -1749,9 +2556,10 @@ fn append_rules_metrics(body: &mut String, snapshot: &rules::RulesStatusSnapshot
         ),
         ("snapshot_file", snapshot.metrics.peak_snapshot_file_bytes),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rules_store_peak_bytes{{kind=\"{kind}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_rules_store_rejections_total Rules sidecar limit rejections by bounded operation\n\
@@ -1767,200 +2575,204 @@ fn append_rules_metrics(body: &mut String, snapshot: &rules::RulesStatusSnapshot
         ),
         ("snapshot", snapshot.metrics.snapshot_rejections_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_rules_store_rejections_total{{kind=\"{kind}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_rules_store_persistence_failures_total Rules sidecar durable write failures\n\
          # TYPE tsink_rules_store_persistence_failures_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rules_store_persistence_failures_total {}\n",
         snapshot.metrics.persistence_failures_total
-    ));
+    );
 }
 
 fn append_rollup_metrics(
-    body: &mut String,
-    snapshot: &tsink::RollupObservabilitySnapshot,
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &tsink::RollupMetricsObservabilitySnapshot,
     query: &tsink::QueryObservabilitySnapshot,
 ) {
     body.push_str(
         "# HELP tsink_rollup_worker_runs_total Rollup maintenance passes attempted by the background worker or admin trigger\n\
          # TYPE tsink_rollup_worker_runs_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_worker_runs_total {}\n",
         snapshot.worker_runs_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_worker_success_total Successful rollup maintenance passes\n\
          # TYPE tsink_rollup_worker_success_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_worker_success_total {}\n",
         snapshot.worker_success_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_worker_errors_total Rollup maintenance passes that ended in an error\n\
          # TYPE tsink_rollup_worker_errors_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_worker_errors_total {}\n",
         snapshot.worker_errors_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_policy_runs_total Individual rollup policy evaluations attempted\n\
          # TYPE tsink_rollup_policy_runs_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_policy_runs_total {}\n",
         snapshot.policy_runs_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_buckets_materialized_total Materialized rollup buckets written as persisted artifacts\n\
          # TYPE tsink_rollup_buckets_materialized_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_buckets_materialized_total {}\n",
         snapshot.buckets_materialized_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_points_materialized_total Materialized rollup points written as persisted artifacts\n\
          # TYPE tsink_rollup_points_materialized_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_points_materialized_total {}\n",
         snapshot.points_materialized_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_last_run_duration_nanoseconds Duration of the most recent rollup maintenance pass\n\
          # TYPE tsink_rollup_last_run_duration_nanoseconds gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_last_run_duration_nanoseconds {}\n",
         snapshot.last_run_duration_nanos
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_source_traversal_complete Whether the current bounded source traversal reached every active policy\n\
          # TYPE tsink_rollup_source_traversal_complete gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_rollup_source_traversal_complete {}\n",
         u8::from(snapshot.source_traversal_complete)
-    ));
+    );
     body.push_str(
         "# HELP tsink_query_rollup_plans_total Queries that used persisted rollup artifacts\n\
          # TYPE tsink_query_rollup_plans_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_rollup_plans_total {}\n",
         query.rollup_query_plans_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_query_partial_rollup_plans_total Queries that mixed persisted rollups with raw tail reads\n\
          # TYPE tsink_query_partial_rollup_plans_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_partial_rollup_plans_total {}\n",
         query.partial_rollup_query_plans_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_query_rollup_points_read_total Persisted rollup points read by query planning\n\
          # TYPE tsink_query_rollup_points_read_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_query_rollup_points_read_total {}\n",
         query.rollup_points_read_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_rollup_policy_status Rollup policy coverage, freshness, and runtime state\n\
          # TYPE tsink_rollup_policy_status gauge\n",
     );
     for policy in &snapshot.policies {
-        let policy_id = prometheus_escape_label_value(&policy.policy.id);
-        let metric = prometheus_escape_label_value(&policy.policy.metric);
-        let aggregation =
-            prometheus_escape_label_value(&format!("{:?}", policy.policy.aggregation));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"matched_series\"}} {}\n",
+        let policy_id = prometheus_escape_label_value(snapshot.policy_id(policy));
+        let metric = prometheus_escape_label_value(snapshot.metric(policy));
+        let aggregation = policy.aggregation;
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"matched_series\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.matched_series
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"materialized_series\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"materialized_series\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.materialized_series
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"source_traversal_complete\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"source_traversal_complete\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             u8::from(policy.source_traversal_complete)
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"interval\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"interval\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
-            policy.policy.interval
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"materialized_through\"}} {}\n",
+            policy.interval
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"materialized_through\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.materialized_through.unwrap_or(0)
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"lag\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"lag\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.lag.unwrap_or(0)
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"last_run_duration_nanos\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"last_run_duration_nanos\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.last_run_duration_nanos
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"last_run_started_at_ms\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"last_run_started_at_ms\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.last_run_started_at_ms.unwrap_or(0)
-        ));
-        body.push_str(&format!(
-            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{}\",kind=\"last_run_completed_at_ms\"}} {}\n",
+        );
+        metrics_write!(body,
+            "tsink_rollup_policy_status{{policy=\"{}\",metric=\"{}\",aggregation=\"{aggregation:?}\",kind=\"last_run_completed_at_ms\"}} {}\n",
             policy_id,
             metric,
-            aggregation,
             policy.last_run_completed_at_ms.unwrap_or(0)
-        ));
+        );
     }
 }
 
 fn append_metric_metadata_store_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &MetricMetadataStoreMetricsSnapshot,
 ) {
     body.push_str(
         "# HELP tsink_metric_metadata_store_entries Metric-family metadata records retained by the sidecar store\n\
          # TYPE tsink_metric_metadata_store_entries gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_metric_metadata_store_entries {}\n",
         snapshot.entries
-    ));
+    );
     body.push_str(
         "# HELP tsink_metric_metadata_store_memory_bytes Modeled current and peak heap bytes owned by metric-metadata operations\n\
          # TYPE tsink_metric_metadata_store_memory_bytes gauge\n",
@@ -1973,18 +2785,20 @@ fn append_metric_metadata_store_metrics(
         ("query_result", snapshot.query_result_bytes),
         ("peak_query_result", snapshot.peak_query_result_bytes),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_metric_metadata_store_memory_bytes{{kind=\"{kind}\"}} {bytes}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_metric_metadata_store_durable_file_bytes Bytes in the current durable metric-metadata sidecar file\n\
          # TYPE tsink_metric_metadata_store_durable_file_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_metric_metadata_store_durable_file_bytes {}\n",
         snapshot.durable_file_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_metric_metadata_store_rejections_total Metric-metadata operations rejected by bounded-resource category\n\
          # TYPE tsink_metric_metadata_store_rejections_total counter\n",
@@ -2000,9 +2814,10 @@ fn append_metric_metadata_store_metrics(
         ("query", snapshot.query_rejections_total),
         ("persistence", snapshot.persistence_rejections_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_metric_metadata_store_rejections_total{{reason=\"{reason}\"}} {count}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_metric_metadata_store_limit Configured hard limits for the metric-metadata sidecar\n\
@@ -2029,14 +2844,15 @@ fn append_metric_metadata_store_metrics(
         ("query_records", snapshot.limits.max_query_records),
         ("query_result_bytes", snapshot.limits.max_query_result_bytes),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_metric_metadata_store_limit{{kind=\"{kind}\"}} {limit}\n"
-        ));
+        );
     }
 }
 
 fn append_exemplar_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &ExemplarStoreMetricsSnapshot,
     config: ExemplarStoreConfig,
     resource_limits: crate::exemplar_store::ExemplarStoreResourceLimits,
@@ -2045,62 +2861,70 @@ fn append_exemplar_metrics(
         "# HELP tsink_exemplars_accepted_total Exemplars accepted into the bounded exemplar store\n\
          # TYPE tsink_exemplars_accepted_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_accepted_total {}\n",
         snapshot.accepted_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_rejected_total Exemplars rejected before storage due to unsupported payloads or configured quotas\n\
          # TYPE tsink_exemplars_rejected_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_rejected_total {}\n",
         snapshot.rejected_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_dropped_total Exemplars dropped from the bounded exemplar store due to retention guardrails\n\
          # TYPE tsink_exemplars_dropped_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_dropped_total {}\n",
         snapshot.dropped_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_query_requests_total Exemplar query requests served by the exemplar store\n\
          # TYPE tsink_exemplars_query_requests_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_query_requests_total {}\n",
         snapshot.query_requests_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_query_series_total Exemplar series returned by exemplar queries\n\
          # TYPE tsink_exemplars_query_series_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_query_series_total {}\n",
         snapshot.query_series_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_query_results_total Exemplars returned by exemplar queries\n\
          # TYPE tsink_exemplars_query_results_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_query_results_total {}\n",
         snapshot.query_exemplars_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplars_stored Series currently present in the exemplar sidecar store\n\
          # TYPE tsink_exemplars_stored gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplars_stored{{kind=\"series\"}} {}\n",
         snapshot.stored_series
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplars_stored{{kind=\"exemplars\"}} {}\n",
         snapshot.stored_exemplars
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplar_store_memory_bytes Current and peak modeled bytes owned by exemplar-store state and operations\n\
          # TYPE tsink_exemplar_store_memory_bytes gauge\n",
@@ -2111,22 +2935,25 @@ fn append_exemplar_metrics(
         ("transient", snapshot.transient_bytes),
         ("peak_transient", snapshot.peak_transient_bytes),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_exemplar_store_memory_bytes{{kind=\"{kind}\"}} {bytes}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_exemplar_store_durable_file_bytes Current and peak bytes in the durable exemplar sidecar file\n\
          # TYPE tsink_exemplar_store_durable_file_bytes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplar_store_durable_file_bytes{{kind=\"current\"}} {}\n",
         snapshot.durable_file_bytes
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplar_store_durable_file_bytes{{kind=\"peak\"}} {}\n",
         snapshot.peak_durable_file_bytes
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplar_store_resource_rejections_total Exemplar-store operations rejected by bounded-resource category\n\
          # TYPE tsink_exemplar_store_resource_rejections_total counter\n",
@@ -2141,45 +2968,52 @@ fn append_exemplar_metrics(
         ("startup", snapshot.startup_rejections_total),
         ("snapshot", snapshot.snapshot_rejections_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_exemplar_store_resource_rejections_total{{reason=\"{reason}\"}} {count}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_exemplar_store_last_rejection Last stable exemplar-store rejection code observed by this live store\n\
          # TYPE tsink_exemplar_store_last_rejection gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplar_store_last_rejection{{code=\"{}\"}} 1\n",
         snapshot.last_rejection_code.map_or(
             "none",
             crate::exemplar_store::ExemplarStoreErrorCode::as_str
         )
-    ));
+    );
     body.push_str(
         "# HELP tsink_exemplar_limits Configured exemplar request, query, and storage guardrails\n\
          # TYPE tsink_exemplar_limits gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_exemplar_limits{{kind=\"max_total\"}} {}\n",
         config.max_total_exemplars
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplar_limits{{kind=\"max_per_series\"}} {}\n",
         config.max_exemplars_per_series
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplar_limits{{kind=\"max_per_request\"}} {}\n",
         config.max_exemplars_per_request
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplar_limits{{kind=\"max_query_results\"}} {}\n",
         config.max_query_results
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_exemplar_limits{{kind=\"max_query_selectors\"}} {}\n",
         config.max_query_selectors
-    ));
+    );
     for (kind, limit) in [
         (
             "max_total_series",
@@ -2251,14 +3085,12 @@ fn append_exemplar_metrics(
             resource_limits.max_concurrent_transient_bytes,
         ),
     ] {
-        body.push_str(&format!(
-            "tsink_exemplar_limits{{kind=\"{kind}\"}} {limit}\n"
-        ));
+        metrics_write!(body, "tsink_exemplar_limits{{kind=\"{kind}\"}} {limit}\n");
     }
 }
 
 fn append_prometheus_payload_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &PrometheusPayloadStatusSnapshot,
 ) {
     body.push_str(
@@ -2270,10 +3102,11 @@ fn append_prometheus_payload_metrics(
         ("exemplar", snapshot.exemplars.enabled),
         ("histogram", snapshot.histograms.enabled),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_prometheus_payload_feature_enabled{{payload=\"{payload}\"}} {}\n",
             u8::from(enabled)
-        ));
+        );
     }
 
     body.push_str(
@@ -2285,10 +3118,11 @@ fn append_prometheus_payload_metrics(
         ("exemplar", &snapshot.exemplars),
         ("histogram", &snapshot.histograms),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_prometheus_payload_accepted_total{{payload=\"{payload}\"}} {}\n",
             counters.accepted_total
-        ));
+        );
     }
 
     body.push_str(
@@ -2300,10 +3134,11 @@ fn append_prometheus_payload_metrics(
         ("exemplar", &snapshot.exemplars),
         ("histogram", &snapshot.histograms),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_prometheus_payload_rejected_total{{payload=\"{payload}\"}} {}\n",
             counters.rejected_total
-        ));
+        );
     }
 
     body.push_str(
@@ -2315,10 +3150,11 @@ fn append_prometheus_payload_metrics(
         ("exemplar", &snapshot.exemplars),
         ("histogram", &snapshot.histograms),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_prometheus_payload_throttled_total{{payload=\"{payload}\"}} {}\n",
             counters.throttled_total
-        ));
+        );
     }
 
     body.push_str(
@@ -2332,9 +3168,9 @@ fn append_prometheus_payload_metrics(
     ] {
         for capability in capabilities {
             let capability = prometheus_escape_label_value(capability);
-            body.push_str(&format!(
+            metrics_write!(body,
                 "tsink_prometheus_payload_capability_required{{payload=\"{payload}\",capability=\"{capability}\"}} 1\n"
-            ));
+            );
         }
     }
 
@@ -2344,9 +3180,10 @@ fn append_prometheus_payload_metrics(
     );
     for capability in &snapshot.local_capabilities {
         let capability = prometheus_escape_label_value(capability);
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_cluster_capability_enabled{{capability=\"{capability}\"}} 1\n"
-        ));
+        );
     }
 
     body.push_str(
@@ -2354,41 +3191,45 @@ fn append_prometheus_payload_metrics(
          # TYPE tsink_prometheus_payload_limits gauge\n",
     );
     if let Some(limit) = snapshot.metadata.max_per_request {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_prometheus_payload_limits{{payload=\"metadata\",kind=\"max_per_request\"}} {}\n",
             limit
-        ));
+        );
     }
     if let Some(limit) = snapshot.histograms.max_bucket_entries_per_request {
-        body.push_str(&format!(
+        metrics_write!(body,
             "tsink_prometheus_payload_limits{{payload=\"histogram\",kind=\"max_bucket_entries_per_request\"}} {}\n",
             limit
-        ));
+        );
     }
 }
 
-fn append_otlp_metrics(body: &mut String, snapshot: &OtlpMetricsStatusSnapshot) {
+fn append_otlp_metrics(body: &mut dyn MetricsBodyWriter, snapshot: &OtlpMetricsStatusSnapshot) {
     body.push_str(
         "# HELP tsink_otlp_metrics_enabled OTLP metrics ingest feature flag (1 enabled, 0 disabled)\n\
          # TYPE tsink_otlp_metrics_enabled gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_otlp_metrics_enabled {}\n",
         u8::from(snapshot.enabled)
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_otlp_requests_total OTLP /v1/metrics requests accepted or rejected by this node\n\
          # TYPE tsink_otlp_requests_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_otlp_requests_total{{outcome=\"accepted\"}} {}\n",
         snapshot.accepted_requests_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_otlp_requests_total{{outcome=\"rejected\"}} {}\n",
         snapshot.rejected_requests_total
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_otlp_data_points_total OTLP data points accepted or rejected by metric kind\n\
@@ -2401,28 +3242,32 @@ fn append_otlp_metrics(body: &mut String, snapshot: &OtlpMetricsStatusSnapshot) 
         ("summary", snapshot.summaries),
         ("exponential_histogram", snapshot.exponential_histograms),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_otlp_data_points_total{{kind=\"{kind}\",outcome=\"accepted\"}} {}\n",
             counters.accepted_total
-        ));
-        body.push_str(&format!(
+        );
+        metrics_write!(
+            body,
             "tsink_otlp_data_points_total{{kind=\"{kind}\",outcome=\"rejected\"}} {}\n",
             counters.rejected_total
-        ));
+        );
     }
 
     body.push_str(
         "# HELP tsink_otlp_exemplars_total OTLP exemplars accepted or rejected by this node\n\
          # TYPE tsink_otlp_exemplars_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_otlp_exemplars_total{{outcome=\"accepted\"}} {}\n",
         snapshot.accepted_exemplars_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_otlp_exemplars_total{{outcome=\"rejected\"}} {}\n",
         snapshot.rejected_exemplars_total
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_otlp_supported_shape OTLP metric shapes supported by /v1/metrics\n\
@@ -2430,13 +3275,14 @@ fn append_otlp_metrics(body: &mut String, snapshot: &OtlpMetricsStatusSnapshot) 
     );
     for shape in &snapshot.supported_shapes {
         let shape = prometheus_escape_label_value(shape);
-        body.push_str(&format!(
-            "tsink_otlp_supported_shape{{shape=\"{shape}\"}} 1\n"
-        ));
+        metrics_write!(body, "tsink_otlp_supported_shape{{shape=\"{shape}\"}} 1\n");
     }
 }
 
-fn append_legacy_ingest_metrics(body: &mut String, snapshot: &LegacyIngestStatusSnapshot) {
+fn append_legacy_ingest_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &LegacyIngestStatusSnapshot,
+) {
     body.push_str(
         "# HELP tsink_legacy_ingest_enabled Legacy protocol adapter availability on this node (1 enabled, 0 disabled)\n\
          # TYPE tsink_legacy_ingest_enabled gauge\n",
@@ -2446,10 +3292,11 @@ fn append_legacy_ingest_metrics(body: &mut String, snapshot: &LegacyIngestStatus
         ("statsd", snapshot.statsd.enabled),
         ("graphite", snapshot.graphite.enabled),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_legacy_ingest_enabled{{adapter=\"{adapter}\"}} {}\n",
             u8::from(enabled)
-        ));
+        );
     }
 
     body.push_str(
@@ -2496,66 +3343,76 @@ fn append_legacy_ingest_metrics(body: &mut String, snapshot: &LegacyIngestStatus
         "# HELP tsink_legacy_ingest_limits Legacy protocol adapter request and listener guardrails\n\
          # TYPE tsink_legacy_ingest_limits gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(body,
         "tsink_legacy_ingest_limits{{adapter=\"influx_line_protocol\",kind=\"max_lines_per_request\"}} {}\n",
         snapshot.influx.max_lines_per_request
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_limits{{adapter=\"statsd\",kind=\"max_packet_bytes\"}} {}\n",
         snapshot.statsd.max_packet_bytes
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_limits{{adapter=\"statsd\",kind=\"max_events_per_packet\"}} {}\n",
         snapshot.statsd.max_events_per_packet
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_limits{{adapter=\"graphite\",kind=\"max_line_bytes\"}} {}\n",
         snapshot.graphite.max_line_bytes
-    ));
+    );
 }
 
 fn append_edge_sync_metrics(
-    body: &mut String,
-    source: &edge_sync::EdgeSyncSourceStatusSnapshot,
-    accept: &edge_sync::EdgeSyncAcceptStatusSnapshot,
+    body: &mut dyn MetricsBodyWriter,
+    source: &edge_sync::EdgeSyncSourceMetricsSnapshot,
+    accept: &edge_sync::EdgeSyncAcceptMetricsSnapshot,
 ) {
     body.push_str(
         "# HELP tsink_edge_sync_enabled Edge sync source and accept mode enablement on this node\n\
          # TYPE tsink_edge_sync_enabled gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_edge_sync_enabled{{role=\"source\"}} {}\n",
         u8::from(source.enabled)
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_edge_sync_enabled{{role=\"accept\"}} {}\n",
         u8::from(accept.enabled)
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_edge_sync_queue Gauge view of the local edge sync backlog and retention window\n\
          # TYPE tsink_edge_sync_queue gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_edge_sync_queue{{kind=\"queued_entries\"}} {}\n",
         source.queued_entries
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_edge_sync_queue{{kind=\"queued_bytes\"}} {}\n",
         source.queued_bytes
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_edge_sync_queue{{kind=\"log_bytes\"}} {}\n",
         source.log_bytes
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_edge_sync_queue{{kind=\"oldest_queued_age_ms\"}} {}\n",
         source.oldest_queued_age_ms.unwrap_or(0)
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_edge_sync_queue{{kind=\"pre_ack_retention_secs\"}} {}\n",
         source.pre_ack_retention_secs
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_edge_sync_queue_health Durable edge sync queue health flags\n\
@@ -2566,10 +3423,11 @@ fn append_edge_sync_metrics(
         ("cleanup_pending", source.cleanup_pending),
         ("degraded", source.degraded),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_edge_sync_queue_health{{state=\"{state}\"}} {}\n",
             u8::from(active)
-        ));
+        );
     }
 
     body.push_str(
@@ -2584,19 +3442,21 @@ fn append_edge_sync_metrics(
         ("replay_failure", source.replay_failures_total),
         ("expired_entry", source.expired_entries_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_edge_sync_events_total{{event=\"{event}\"}} {value}\n"
-        ));
+        );
     }
 
     body.push_str(
         "# HELP tsink_edge_sync_replayed_rows_total Rows successfully replayed upstream by edge sync\n\
          # TYPE tsink_edge_sync_replayed_rows_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_edge_sync_replayed_rows_total {}\n",
         source.replayed_rows_total
-    ));
+    );
 
     body.push_str(
         "# HELP tsink_edge_sync_accept_dedupe Edge sync accept-side idempotency window gauges and counters\n\
@@ -2611,15 +3471,16 @@ fn append_edge_sync_metrics(
         ("inflight_keys", accept.inflight_keys),
         ("log_bytes", accept.log_bytes),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_edge_sync_accept_dedupe{{kind=\"{kind}\"}} {value}\n"
-        ));
+        );
     }
 }
 
 fn append_cluster_audit_metrics(
-    body: &mut String,
-    snapshot: &crate::cluster::audit::ClusterAuditHealthSnapshot,
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: &crate::cluster::audit::ClusterAuditMetricsSnapshot,
 ) {
     body.push_str(
         "# HELP tsink_cluster_audit_log Durable cluster audit log gauges\n\
@@ -2630,9 +3491,7 @@ fn append_cluster_audit_metrics(
         ("retained_entries", snapshot.retained_entries),
         ("log_bytes", snapshot.log_bytes),
     ] {
-        body.push_str(&format!(
-            "tsink_cluster_audit_log{{kind=\"{kind}\"}} {value}\n"
-        ));
+        metrics_write!(body, "tsink_cluster_audit_log{{kind=\"{kind}\"}} {value}\n");
     }
     body.push_str(
         "# HELP tsink_cluster_audit_health Durable cluster audit persistence health flags\n\
@@ -2643,15 +3502,16 @@ fn append_cluster_audit_metrics(
         ("cleanup_pending", snapshot.cleanup_pending),
         ("degraded", snapshot.degraded),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_cluster_audit_health{{state=\"{state}\"}} {}\n",
             u8::from(active)
-        ));
+        );
     }
 }
 
 fn append_cluster_control_persistence_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: &ControlPersistenceStatus,
 ) {
     let checkpoint_pending = snapshot.pending_checkpoint.is_some();
@@ -2668,10 +3528,11 @@ fn append_cluster_control_persistence_metrics(
             snapshot.fenced || checkpoint_pending || snapshot.cleanup_debt,
         ),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_cluster_control_persistence_health{{state=\"{state}\"}} {}\n",
             u8::from(active)
-        ));
+        );
     }
     let pending = snapshot
         .pending_checkpoint
@@ -2680,56 +3541,63 @@ fn append_cluster_control_persistence_metrics(
         "# HELP tsink_cluster_control_persistence_pending_checkpoint_index Durable control-log index whose state mirror is pending repair, or zero when none is pending\n\
          # TYPE tsink_cluster_control_persistence_pending_checkpoint_index gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_cluster_control_persistence_pending_checkpoint_index {}\n",
         pending.index
-    ));
+    );
     body.push_str(
         "# HELP tsink_cluster_control_persistence_pending_checkpoint_term Durable control-log term whose state mirror is pending repair, or zero when none is pending\n\
          # TYPE tsink_cluster_control_persistence_pending_checkpoint_term gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_cluster_control_persistence_pending_checkpoint_term {}\n",
         pending.term
-    ));
+    );
 }
 
 fn append_legacy_request_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     adapter: &str,
     counters: AdapterCounterSnapshot,
 ) {
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_requests_total{{adapter=\"{adapter}\",outcome=\"accepted\"}} {}\n",
         counters.accepted_requests_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_requests_total{{adapter=\"{adapter}\",outcome=\"rejected\"}} {}\n",
         counters.rejected_requests_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_requests_total{{adapter=\"{adapter}\",outcome=\"throttled\"}} {}\n",
         counters.throttled_requests_total
-    ));
+    );
 }
 
 fn append_legacy_sample_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     adapter: &str,
     counters: AdapterCounterSnapshot,
 ) {
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_samples_total{{adapter=\"{adapter}\",outcome=\"accepted\"}} {}\n",
         counters.accepted_samples_total
-    ));
-    body.push_str(&format!(
+    );
+    metrics_write!(
+        body,
         "tsink_legacy_ingest_samples_total{{adapter=\"{adapter}\",outcome=\"rejected\"}} {}\n",
         counters.rejected_samples_total
-    ));
+    );
 }
 
 fn append_legacy_write_observability(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     adapter: &str,
     snapshot: &legacy_ingest::AdapterWriteObservabilitySnapshot,
 ) {
@@ -2737,28 +3605,28 @@ fn append_legacy_write_observability(
         .iter()
         .enumerate()
     {
-        body.push_str(&format!(
+        metrics_write!(body,
             "tsink_legacy_ingest_write_acknowledgements_total{{adapter=\"{adapter}\",level=\"{level}\"}} {}\n",
             snapshot.acknowledgements_total[index]
-        ));
+        );
     }
     for (index, outcome) in ["complete", "rejected", "partial", "indeterminate"]
         .iter()
         .enumerate()
     {
-        body.push_str(&format!(
+        metrics_write!(body,
             "tsink_legacy_ingest_write_outcomes_total{{adapter=\"{adapter}\",outcome=\"{outcome}\"}} {}\n",
             snapshot.outcomes_total[index]
-        ));
+        );
     }
     for (index, reason) in legacy_ingest::LEGACY_WRITE_ERROR_REASON_NAMES
         .iter()
         .enumerate()
     {
-        body.push_str(&format!(
+        metrics_write!(body,
             "tsink_legacy_ingest_write_errors_total{{adapter=\"{adapter}\",reason=\"{reason}\"}} {}\n",
             snapshot.error_reasons_total[index]
-        ));
+        );
     }
     for (kind, value) in [
         (
@@ -2768,187 +3636,216 @@ fn append_legacy_write_observability(
         ("metadata_applied", snapshot.applied_metadata_updates_total),
         ("exemplars_accepted", snapshot.accepted_exemplars_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(body,
             "tsink_legacy_ingest_sidecar_items_total{{adapter=\"{adapter}\",kind=\"{kind}\"}} {value}\n"
-        ));
+        );
     }
 }
 
-fn append_write_admission_metrics(body: &mut String, snapshot: WriteAdmissionMetricsSnapshot) {
+fn append_write_admission_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: WriteAdmissionMetricsSnapshot,
+) {
     body.push_str(
         "# HELP tsink_write_admission_rejections_total Public write admission rejections across request-slot, row-budget, and oversize guardrails\n\
          # TYPE tsink_write_admission_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_rejections_total {}\n",
         snapshot.rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_request_slot_rejections_total Public write request-slot admission rejections due to global concurrency saturation\n\
          # TYPE tsink_write_admission_request_slot_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_request_slot_rejections_total {}\n",
         snapshot.request_slot_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_row_budget_rejections_total Public write row-budget admission rejections due to global in-flight row saturation\n\
          # TYPE tsink_write_admission_row_budget_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_row_budget_rejections_total {}\n",
         snapshot.row_budget_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_oversize_rows_rejections_total Public write rejections for single requests that exceed the global row budget\n\
          # TYPE tsink_write_admission_oversize_rows_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_oversize_rows_rejections_total {}\n",
         snapshot.oversize_rows_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_acquire_wait_nanoseconds_total Total wait time for admitted public writes to acquire request-slot and row-budget permits\n\
          # TYPE tsink_write_admission_acquire_wait_nanoseconds_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_acquire_wait_nanoseconds_total {}\n",
         snapshot.acquire_wait_nanos_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_active_requests Active public write requests currently holding global admission request slots\n\
          # TYPE tsink_write_admission_active_requests gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_active_requests {}\n",
         snapshot.active_requests
-    ));
+    );
     body.push_str(
         "# HELP tsink_write_admission_active_rows Active public write rows currently reserved against the global admission budget\n\
          # TYPE tsink_write_admission_active_rows gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_admission_active_rows {}\n",
         snapshot.active_rows
-    ));
+    );
 }
 
-fn append_write_rejection_metrics(body: &mut String) {
+fn append_write_rejection_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: WriteRejectionMetricsSnapshot,
+) {
     body.push_str(
         "# HELP tsink_write_rejections_total Rows rejected by the canonical storage write path, partitioned by structured reason\n\
          # TYPE tsink_write_rejections_total counter\n",
     );
     for (index, reason) in WRITE_REJECTION_REASON_NAMES.iter().enumerate() {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_write_rejections_total{{reason=\"{reason}\"}} {}\n",
-            WRITE_REJECTION_REASON_TOTALS[index].load(Ordering::Relaxed)
-        ));
+            snapshot.reason_totals[index]
+        );
     }
     body.push_str(
         "# HELP tsink_write_indeterminate_requests_total Write requests whose failure may nevertheless have committed rows\n\
          # TYPE tsink_write_indeterminate_requests_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_write_indeterminate_requests_total {}\n",
-        WRITE_INDETERMINATE_REQUESTS_TOTAL.load(Ordering::Relaxed)
-    ));
+        snapshot.indeterminate_requests_total
+    );
 }
 
-fn append_read_admission_metrics(body: &mut String, snapshot: ReadAdmissionMetricsSnapshot) {
+fn append_read_admission_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: ReadAdmissionMetricsSnapshot,
+) {
     body.push_str(
         "# HELP tsink_read_admission_rejections_total Public read admission rejections across request-slot, query-budget, and oversize guardrails\n\
          # TYPE tsink_read_admission_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_rejections_total {}\n",
         snapshot.rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_request_slot_rejections_total Public read request-slot admission rejections due to global concurrency saturation\n\
          # TYPE tsink_read_admission_request_slot_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_request_slot_rejections_total {}\n",
         snapshot.request_slot_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_query_budget_rejections_total Public read query-budget admission rejections due to global in-flight query saturation\n\
          # TYPE tsink_read_admission_query_budget_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_query_budget_rejections_total {}\n",
         snapshot.query_budget_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_oversize_queries_rejections_total Public read rejections for single requests that exceed the global query budget\n\
          # TYPE tsink_read_admission_oversize_queries_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_oversize_queries_rejections_total {}\n",
         snapshot.oversize_queries_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_acquire_wait_nanoseconds_total Total wait time for admitted public reads to acquire request-slot and query-budget permits\n\
          # TYPE tsink_read_admission_acquire_wait_nanoseconds_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_acquire_wait_nanoseconds_total {}\n",
         snapshot.acquire_wait_nanos_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_active_requests Active public read requests currently holding global admission request slots\n\
          # TYPE tsink_read_admission_active_requests gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_active_requests {}\n",
         snapshot.active_requests
-    ));
+    );
     body.push_str(
         "# HELP tsink_read_admission_active_queries Active public read query units currently reserved against the global admission budget\n\
          # TYPE tsink_read_admission_active_queries gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_read_admission_active_queries {}\n",
         snapshot.active_queries
-    ));
+    );
 }
 
 fn append_tenant_admission_metrics(
-    body: &mut String,
+    body: &mut dyn MetricsBodyWriter,
     snapshot: tenant::TenantAdmissionMetricsSnapshot,
 ) {
     body.push_str(
         "# HELP tsink_tenant_admission_read_rejections_total Tenant-scoped read admission rejections from per-tenant in-flight limits\n\
          # TYPE tsink_tenant_admission_read_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_tenant_admission_read_rejections_total {}\n",
         snapshot.read_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_tenant_admission_write_rejections_total Tenant-scoped write admission rejections from per-tenant in-flight limits\n\
          # TYPE tsink_tenant_admission_write_rejections_total counter\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_tenant_admission_write_rejections_total {}\n",
         snapshot.write_rejections_total
-    ));
+    );
     body.push_str(
         "# HELP tsink_tenant_admission_active_reads Active tenant-scoped read requests currently holding per-tenant admission permits\n\
          # TYPE tsink_tenant_admission_active_reads gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_tenant_admission_active_reads {}\n",
         snapshot.active_reads
-    ));
+    );
     body.push_str(
         "# HELP tsink_tenant_admission_active_writes Active tenant-scoped write requests currently holding per-tenant admission permits\n\
          # TYPE tsink_tenant_admission_active_writes gauge\n",
     );
-    body.push_str(&format!(
+    metrics_write!(
+        body,
         "tsink_tenant_admission_active_writes {}\n",
         snapshot.active_writes
-    ));
+    );
     body.push_str(
         "# HELP tsink_tenant_admission_surface_rejections_total Tenant-scoped admission rejections by protected surface\n\
          # TYPE tsink_tenant_admission_surface_rejections_total counter\n",
@@ -2959,9 +3856,10 @@ fn append_tenant_admission_metrics(
         ("metadata", snapshot.metadata_rejections_total),
         ("retention", snapshot.retention_rejections_total),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_tenant_admission_surface_rejections_total{{surface=\"{surface}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_tenant_admission_surface_active_requests Active tenant-scoped requests by protected surface\n\
@@ -2973,9 +3871,10 @@ fn append_tenant_admission_metrics(
         ("metadata", snapshot.metadata_active_requests),
         ("retention", snapshot.retention_active_requests),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_tenant_admission_surface_active_requests{{surface=\"{surface}\"}} {value}\n"
-        ));
+        );
     }
     body.push_str(
         "# HELP tsink_tenant_admission_surface_active_units Active tenant-scoped resource units reserved by protected surface\n\
@@ -2987,22 +3886,243 @@ fn append_tenant_admission_metrics(
         ("metadata", snapshot.metadata_active_units),
         ("retention", snapshot.retention_active_units),
     ] {
-        body.push_str(&format!(
+        metrics_write!(
+            body,
             "tsink_tenant_admission_surface_active_units{{surface=\"{surface}\"}} {value}\n"
-        ));
+        );
     }
 }
 
-fn prometheus_escape_label_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+fn prometheus_escape_label_value(value: &str) -> PrometheusEscapedLabel<'_> {
+    PrometheusEscapedLabel(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_metrics_body_accepts_exact_ceiling_and_rejects_next_byte() {
+        let exact = "x".repeat(METRICS_MAX_RESPONSE_BYTES);
+        let mut accepted = BoundedMetricsBody::new();
+        accepted.push_str(&exact);
+        assert_eq!(accepted.len(), METRICS_MAX_RESPONSE_BYTES);
+        assert_eq!(
+            accepted
+                .into_bytes()
+                .expect("the exact response ceiling should be accepted")
+                .len(),
+            METRICS_MAX_RESPONSE_BYTES
+        );
+
+        let mut rejected = BoundedMetricsBody::new();
+        rejected.push_str(&exact);
+        rejected.push_str("y");
+        assert_eq!(rejected.len(), METRICS_MAX_RESPONSE_BYTES);
+        assert!(
+            rejected.into_bytes().is_err(),
+            "the first byte over the ceiling must latch overflow without growing the body"
+        );
+    }
+
+    #[test]
+    fn streaming_label_escaping_honors_the_body_ceiling() {
+        let mut short = String::new();
+        let escaped = prometheus_escape_label_value("a\\b\n\"c");
+        metrics_write!(&mut short, "{escaped}");
+        assert_eq!(short, "a\\\\b\\n\\\"c");
+        assert!(!std::mem::needs_drop::<PrometheusEscapedLabel<'_>>());
+
+        let oversized_label = "\"".repeat(METRICS_MAX_RESPONSE_BYTES / 2 + 1);
+        let escaped = prometheus_escape_label_value(&oversized_label);
+        let mut body = BoundedMetricsBody::new();
+        metrics_write!(&mut body, "{escaped}");
+        assert_eq!(body.len(), METRICS_MAX_RESPONSE_BYTES);
+        assert!(
+            body.into_bytes().is_err(),
+            "streaming escaping must stop at the response cap without an escaped String"
+        );
+    }
+
+    #[test]
+    fn metrics_body_replay_honors_cancellation_and_releases_accounting() {
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("query budget should build");
+        let cancellation = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(cancellation.clone())
+            .expect("query should admit");
+        let render = |body: &mut dyn MetricsBodyWriter| {
+            let label = prometheus_escape_label_value("tenant\\a\n\"");
+            metrics_write!(body, "tsink_test_metric{{tenant=\"{label}\"}} 1\n");
+        };
+
+        let mut counter = CountingMetricsBody::new(&execution);
+        render(&mut counter);
+        assert!(counter.control_error.is_none());
+        assert!(!counter.overflowed);
+        let expected_len = counter.len;
+        execution
+            .charge_returned_bytes(u64::try_from(expected_len).expect("length should fit"))
+            .expect("measured bytes should admit");
+        let reservation = execution
+            .reserve_memory(modeled_metrics_response_preflight_bytes(expected_len))
+            .expect("measured response memory should admit");
+        let body = BoundedMetricsBody::try_with_exact_capacity(expected_len)
+            .expect("test body should allocate");
+
+        cancellation.cancel();
+        let mut controlled = ControlledMetricsBody::new(body, &execution);
+        render(&mut controlled);
+        assert!(matches!(
+            controlled.control_error,
+            Some(tsink::QueryBudgetError::Cancelled)
+        ));
+        drop(controlled);
+        drop(reservation);
+        drop(execution);
+
+        let after = budget.snapshot();
+        assert_eq!(after.queries_started_total, 1);
+        assert_eq!(after.queries_completed_total, 1);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_response_reservation_enforces_exact_memory_boundary() {
+        const SOURCE_BYTES: u64 = 32 * 1024;
+        const BODY_LEN: usize = 4 * 1024;
+        let response_bytes = modeled_metrics_response_preflight_bytes(BODY_LEN);
+        let exact_peak = SOURCE_BYTES.saturating_add(response_bytes);
+
+        let exact_budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits {
+            max_shared_memory_bytes: Some(exact_peak),
+            per_query: tsink::QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak),
+                ..tsink::QueryWorkLimits::default()
+            },
+            ..tsink::QueryBudgetLimits::default()
+        })
+        .expect("exact budget should build");
+        let exact_execution = exact_budget.begin_query().expect("query should admit");
+        let source = exact_execution
+            .reserve_memory(SOURCE_BYTES)
+            .expect("source snapshot should fit");
+        let mut response = exact_execution
+            .reserve_memory(response_bytes)
+            .expect("response memory M should fit beside the source snapshot");
+        let body = BoundedMetricsBody::try_with_exact_capacity(BODY_LEN)
+            .expect("test body should allocate");
+        response
+            .resize(modeled_metrics_response_preflight_bytes(body.capacity()))
+            .expect("actual exact capacity should remain within M");
+        drop(body);
+        drop(response);
+        drop(source);
+        drop(exact_execution);
+        let exact_after = exact_budget.snapshot();
+        assert_eq!(exact_after.peak_shared_reserved_memory_bytes, exact_peak);
+        assert_eq!(exact_after.queries_started_total, 1);
+        assert_eq!(exact_after.queries_completed_total, 1);
+        assert_eq!(exact_after.active_queries, 0);
+        assert_eq!(exact_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_after.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits {
+            max_shared_memory_bytes: Some(exact_peak - 1),
+            per_query: tsink::QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak - 1),
+                ..tsink::QueryWorkLimits::default()
+            },
+            ..tsink::QueryBudgetLimits::default()
+        })
+        .expect("one-under budget should build");
+        let one_under_execution = one_under_budget.begin_query().expect("query should admit");
+        let source = one_under_execution
+            .reserve_memory(SOURCE_BYTES)
+            .expect("source snapshot should still fit at M-1");
+        assert!(
+            one_under_execution.reserve_memory(response_bytes).is_err(),
+            "response reservation must reject before body allocation at M-1"
+        );
+        let mut errors = MetricsCollectionErrors::default();
+        errors.insert(MetricsCollector::ExpositionBody);
+        let fallback = metrics_fallback_response(errors);
+        assert!(fallback.body.len() <= METRICS_FALLBACK_RESPONSE_BYTES);
+        drop(source);
+        drop(one_under_execution);
+        let one_under_after = one_under_budget.snapshot();
+        assert_eq!(one_under_after.queries_started_total, 1);
+        assert_eq!(one_under_after.queries_completed_total, 1);
+        assert_eq!(one_under_after.active_queries, 0);
+        assert_eq!(one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            one_under_after
+                .shared_memory_rejections_total
+                .saturating_add(one_under_after.per_query_memory_rejections_total),
+            1
+        );
+        assert_eq!(one_under_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_collection_errors_deduplicate_and_render_in_stable_order() {
+        let mut errors = MetricsCollectionErrors::default();
+        errors.insert(MetricsCollector::RulesRuntime);
+        errors.insert(MetricsCollector::StorageListMetrics);
+        errors.insert(MetricsCollector::RulesRuntime);
+        errors.insert(MetricsCollector::ExpositionBody);
+
+        let mut body = String::new();
+        append_metrics_collection_errors(&mut body, errors);
+        assert!(body.contains("tsink_metrics_collection_errors 3\n"));
+        let storage = body
+            .find("collector=\"storage_list_metrics\"")
+            .expect("storage error should render");
+        let rules = body
+            .find("collector=\"rules_runtime\"")
+            .expect("rules error should render");
+        let exposition = body
+            .find("collector=\"exposition_body\"")
+            .expect("exposition error should render");
+        assert!(storage < rules && rules < exposition);
+        assert_eq!(body.matches("collector=\"rules_runtime\"").count(), 1);
+    }
+
+    #[test]
+    fn metrics_fallback_is_fixed_parseable_and_bounded() {
+        let mut errors = MetricsCollectionErrors::default();
+        errors.insert(MetricsCollector::OperationalSnapshots);
+        errors.insert(MetricsCollector::ExpositionBody);
+        let response = metrics_fallback_response(errors);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.len() <= METRICS_FALLBACK_RESPONSE_BYTES);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str()),
+            Some(METRICS_CONTENT_TYPE)
+        );
+        let body = std::str::from_utf8(&response.body).expect("fallback is Prometheus text");
+        assert!(body.contains("tsink_metrics_collection_errors 2\n"));
+        assert!(body.contains("collector=\"operational_snapshots\""));
+        assert!(body.contains("collector=\"exposition_body\""));
+        assert!(!body.contains("tsink_memory_used_bytes"));
+        for sample in [
+            "tsink_cluster_hotspot_skewed_shards 0\n",
+            "tsink_cluster_hotspot_skewed_tenants 0\n",
+            "tsink_cluster_hotspot_max_shard_score 0\n",
+            "tsink_cluster_hotspot_max_tenant_score 0\n",
+        ] {
+            assert!(body.contains(sample));
+        }
+    }
 
     #[test]
     fn background_work_metrics_render_fixed_worker_and_event_labels() {
@@ -3153,11 +4273,12 @@ mod tests {
         let mut body = String::new();
         append_usage_metrics(
             &mut body,
-            &crate::usage::UsageLedgerStatus {
+            &crate::usage::UsageAccountingMetricsSnapshot {
                 record_failures_total: 7,
                 retained_records: 3,
                 earliest_retained_sequence: Some(9),
-                ..crate::usage::UsageLedgerStatus::default()
+                recent_record_limit: crate::usage::DEFAULT_USAGE_LEDGER_RECENT_RECORDS,
+                ..crate::usage::UsageAccountingMetricsSnapshot::default()
             },
         );
 
@@ -3202,13 +4323,13 @@ mod tests {
         let mut body = String::new();
         append_edge_sync_metrics(
             &mut body,
-            &edge_sync::EdgeSyncSourceStatusSnapshot {
+            &edge_sync::EdgeSyncSourceMetricsSnapshot {
                 persistence_fenced: true,
                 cleanup_pending: true,
                 degraded: true,
-                ..edge_sync::EdgeSyncSourceStatusSnapshot::default()
+                ..edge_sync::EdgeSyncSourceMetricsSnapshot::default()
             },
-            &edge_sync::EdgeSyncAcceptStatusSnapshot::default(),
+            &edge_sync::EdgeSyncAcceptMetricsSnapshot::default(),
         );
 
         assert!(body.contains("tsink_edge_sync_queue_health{state=\"persistence_fenced\"} 1\n"));
@@ -3221,14 +4342,13 @@ mod tests {
         let mut body = String::new();
         append_cluster_audit_metrics(
             &mut body,
-            &crate::cluster::audit::ClusterAuditHealthSnapshot {
+            &crate::cluster::audit::ClusterAuditMetricsSnapshot {
                 enabled: true,
                 retained_entries: 3,
                 log_bytes: 512,
                 cleanup_pending: true,
                 persistence_fenced: true,
                 degraded: true,
-                ..crate::cluster::audit::ClusterAuditHealthSnapshot::default()
             },
         );
 

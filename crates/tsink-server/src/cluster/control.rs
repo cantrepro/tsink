@@ -1,4 +1,4 @@
-use crate::cluster::membership::MembershipView;
+use crate::cluster::membership::{ClusterNode, MembershipView};
 use crate::cluster::ring::{ring_hash_version_name, ShardRing, ShardRingSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -11,6 +11,10 @@ use tsink::disk_budget::LocalDiskBudget;
 
 pub const CONTROL_STATE_SCHEMA_VERSION: u16 = 1;
 const CONTROL_STATE_MAGIC: &str = "tsink-control-state";
+const CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const CONTROL_REBALANCE_VIRTUAL_NODES_PER_NODE: usize = 128;
+const CONTROL_REBALANCE_BTREE_ENTRY_ALLOWANCE_BYTES: u64 = 256;
+const CONTROL_REBALANCE_FIXED_SCRATCH_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +236,66 @@ impl ClusterHandoffSnapshot {
             pending_rows_total: 0,
             shards: Vec::new(),
         }
+    }
+}
+
+/// Minimal control-state input needed by the cluster-hotspot exporter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlHotspotShardSnapshot {
+    pub shard: u32,
+    pub pending_rows: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlHotspotSnapshot {
+    pub handoff_shards: Vec<ControlHotspotShardSnapshot>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlMetricsProjection {
+    pub handoff: ClusterHandoffSnapshot,
+    pub hotspot: ControlHotspotSnapshot,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlStatusProjection {
+    pub handoff: ClusterHandoffSnapshot,
+    pub hotspot: ControlHotspotSnapshot,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlRebalanceNodeSnapshot {
+    pub id: String,
+    pub status: ControlNodeStatus,
+}
+
+/// Minimal live control-state input needed by the rebalance status producer.
+///
+/// The current and desired ownership rows preserve request-time candidate freshness without
+/// cloning the complete persisted control state (membership metadata, leader diagnostics, and
+/// handoff error strings are intentionally excluded).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlRebalanceProjection {
+    pub ring_version: u64,
+    pub nodes: Vec<ControlRebalanceNodeSnapshot>,
+    pub current_assignments: Vec<Vec<String>>,
+    pub desired_assignments: Option<Vec<Vec<String>>>,
+    pub handoff: ClusterHandoffSnapshot,
+    pub hotspot: ControlHotspotSnapshot,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the projection releases its query-memory reservation"]
+pub(crate) struct AccountedControlRebalanceProjection {
+    pub projection: ControlRebalanceProjection,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl std::ops::Deref for AccountedControlRebalanceProjection {
+    type Target = ControlRebalanceProjection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
     }
 }
 
@@ -604,6 +668,367 @@ impl ControlState {
                 .then_with(|| left.to_node_id.cmp(&right.to_node_id))
         });
         snapshot
+    }
+
+    pub(crate) fn metrics_projection_retained_bytes_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<u64, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let mut retained_bytes =
+            modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(self.transitions.len());
+        let mut active_transitions = 0usize;
+        for transition in &self.transitions {
+            execution.checkpoint()?;
+            retained_bytes = retained_bytes
+                .saturating_add(modeled_control_metrics_str_bytes(&transition.from_node_id))
+                .saturating_add(modeled_control_metrics_str_bytes(&transition.to_node_id));
+            if transition.handoff.phase.is_active() {
+                active_transitions = active_transitions.saturating_add(1);
+            }
+        }
+        Ok(
+            retained_bytes.saturating_add(modeled_control_metrics_vec_bytes::<
+                ControlHotspotShardSnapshot,
+            >(active_transitions)),
+        )
+    }
+
+    /// Materializes the metrics-only control projection after its caller has reserved the result.
+    ///
+    /// The canonical control-state transition order already matches the exporter order, so this
+    /// path needs no temporary map or sorting allocation. Diagnostic handoff errors are excluded
+    /// because the Prometheus exporter does not expose them.
+    pub(crate) fn metrics_projection_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<ControlMetricsProjection, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let mut active_transitions = 0usize;
+        for transition in &self.transitions {
+            execution.checkpoint()?;
+            if transition.handoff.phase.is_active() {
+                active_transitions = active_transitions.saturating_add(1);
+            }
+        }
+        let mut handoff = ClusterHandoffSnapshot::empty();
+        handoff.shards = Vec::with_capacity(self.transitions.len());
+        let mut hotspot = ControlHotspotSnapshot {
+            handoff_shards: Vec::with_capacity(active_transitions),
+        };
+
+        for transition in &self.transitions {
+            execution.checkpoint()?;
+            let progress = &transition.handoff;
+            handoff.total_shards = handoff.total_shards.saturating_add(1);
+            handoff.copied_rows_total = handoff
+                .copied_rows_total
+                .saturating_add(progress.copied_rows);
+            handoff.pending_rows_total = handoff
+                .pending_rows_total
+                .saturating_add(progress.pending_rows);
+            if progress.phase.is_active() {
+                handoff.in_progress_shards = handoff.in_progress_shards.saturating_add(1);
+                hotspot.handoff_shards.push(ControlHotspotShardSnapshot {
+                    shard: transition.shard,
+                    pending_rows: progress.pending_rows,
+                });
+            }
+            if progress.resumed_count > 0 {
+                handoff.resumed_shards = handoff.resumed_shards.saturating_add(1);
+            }
+            match progress.phase {
+                ShardHandoffPhase::Warmup => {
+                    handoff.warmup_shards = handoff.warmup_shards.saturating_add(1)
+                }
+                ShardHandoffPhase::Cutover => {
+                    handoff.cutover_shards = handoff.cutover_shards.saturating_add(1)
+                }
+                ShardHandoffPhase::FinalSync => {
+                    handoff.final_sync_shards = handoff.final_sync_shards.saturating_add(1)
+                }
+                ShardHandoffPhase::Completed => {
+                    handoff.completed_shards = handoff.completed_shards.saturating_add(1)
+                }
+                ShardHandoffPhase::Failed => {
+                    handoff.failed_shards = handoff.failed_shards.saturating_add(1)
+                }
+            }
+            handoff.shards.push(ShardHandoffSnapshot {
+                shard: transition.shard,
+                from_node_id: clone_control_metrics_string(&transition.from_node_id),
+                to_node_id: clone_control_metrics_string(&transition.to_node_id),
+                activation_ring_version: transition.activation_ring_version,
+                phase: progress.phase,
+                copied_rows: progress.copied_rows,
+                pending_rows: progress.pending_rows,
+                resumed_count: progress.resumed_count,
+                started_unix_ms: progress.started_unix_ms,
+                updated_unix_ms: progress.updated_unix_ms,
+                last_error: None,
+            });
+        }
+
+        Ok(ControlMetricsProjection { handoff, hotspot })
+    }
+
+    /// Measures every allocation retained by the schema-complete control status projection.
+    ///
+    /// Unlike the metrics-only projection, this includes diagnostic handoff errors.
+    pub(crate) fn status_projection_retained_bytes_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<u64, tsink::QueryBudgetError> {
+        let mut retained_bytes =
+            self.metrics_projection_retained_bytes_with_execution(execution)?;
+        for transition in &self.transitions {
+            execution.checkpoint()?;
+            if let Some(last_error) = transition.handoff.last_error.as_deref() {
+                retained_bytes =
+                    retained_bytes.saturating_add(modeled_control_metrics_str_bytes(last_error));
+            }
+        }
+        Ok(retained_bytes)
+    }
+
+    /// Materializes the schema-complete handoff and minimal hotspot status inputs.
+    ///
+    /// The caller must reserve `status_projection_retained_bytes_with_execution` before calling
+    /// this method. The handoff rows are sorted exactly like `handoff_snapshot`; shard uniqueness
+    /// makes the comparator total for valid control state, so the in-place unstable sort needs no
+    /// temporary allocation.
+    pub(crate) fn status_projection_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<ControlStatusProjection, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let ControlMetricsProjection {
+            mut handoff,
+            hotspot,
+        } = self.metrics_projection_with_execution(execution)?;
+        for (shard, transition) in handoff.shards.iter_mut().zip(&self.transitions) {
+            execution.checkpoint()?;
+            shard.last_error = transition
+                .handoff
+                .last_error
+                .as_deref()
+                .map(clone_control_metrics_string);
+        }
+        handoff.shards.sort_unstable_by(|left, right| {
+            left.shard
+                .cmp(&right.shard)
+                .then_with(|| left.from_node_id.cmp(&right.from_node_id))
+                .then_with(|| left.to_node_id.cmp(&right.to_node_id))
+        });
+        execution.checkpoint()?;
+        Ok(ControlStatusProjection { handoff, hotspot })
+    }
+
+    /// Captures live ownership, handoff, and hotspot inputs for the admin rebalance response.
+    ///
+    /// The reservation is established before any ownership, node, or handoff collection is
+    /// materialized. Desired-ring construction has a separately modeled virtual-node/sort peak;
+    /// the guard is shrunk to the exact retained projection after that scratch is released.
+    pub(crate) fn rebalance_projection_with_execution(
+        &self,
+        local_node_id: &str,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedControlRebalanceProjection, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let peak_bytes =
+            self.modeled_rebalance_projection_peak_bytes_with_execution(local_node_id, execution)?;
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let ControlMetricsProjection { handoff, hotspot } =
+            self.metrics_projection_with_execution(execution)?;
+        execution.checkpoint()?;
+        let current_assignments = self
+            .effective_ring_snapshot_at_ring_version(self.ring_version.max(1))
+            .assignments;
+        execution.checkpoint()?;
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| ControlRebalanceNodeSnapshot {
+                id: clone_control_metrics_string(&node.id),
+                status: node.status,
+            })
+            .collect::<Vec<_>>();
+        execution.checkpoint()?;
+
+        let desired_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    ControlNodeStatus::Active | ControlNodeStatus::Joining
+                )
+            })
+            .map(|node| ClusterNode {
+                id: clone_control_metrics_string(&node.id),
+                endpoint: clone_control_metrics_string(&node.endpoint),
+            })
+            .collect::<Vec<_>>();
+        let desired_assignments = if desired_nodes.is_empty() {
+            None
+        } else {
+            let desired_membership = MembershipView {
+                local_node_id: clone_control_metrics_string(local_node_id),
+                nodes: desired_nodes,
+            };
+            let desired = ShardRing::build(
+                self.ring.shard_count,
+                self.ring.replication_factor,
+                &desired_membership,
+            )
+            .ok()
+            .map(ShardRing::into_snapshot)
+            .map(|ring| ring.assignments);
+            drop(desired_membership);
+            desired
+        };
+        execution.checkpoint()?;
+
+        let projection = ControlRebalanceProjection {
+            ring_version: self.ring_version,
+            nodes,
+            current_assignments,
+            desired_assignments,
+            handoff,
+            hotspot,
+        };
+        reservation.resize(modeled_control_rebalance_projection_retained_bytes(
+            &projection,
+        ))?;
+        Ok(AccountedControlRebalanceProjection {
+            projection,
+            _reservation: reservation,
+        })
+    }
+
+    fn modeled_rebalance_projection_peak_bytes_with_execution(
+        &self,
+        local_node_id: &str,
+        execution: &tsink::QueryExecution,
+    ) -> Result<u64, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let shard_count = self.ring.assignments.len();
+        let active_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    ControlNodeStatus::Active | ControlNodeStatus::Joining
+                )
+            })
+            .count();
+        let replicas = usize::from(self.ring.replication_factor).min(active_nodes);
+        let mut max_node_id_len = local_node_id.len();
+        for node in &self.nodes {
+            execution.checkpoint()?;
+            max_node_id_len = max_node_id_len.max(node.id.len());
+        }
+        for owners in &self.ring.assignments {
+            execution.checkpoint()?;
+            for owner in owners {
+                max_node_id_len = max_node_id_len.max(owner.len());
+            }
+        }
+        for transition in &self.transitions {
+            execution.checkpoint()?;
+            max_node_id_len = max_node_id_len
+                .max(transition.from_node_id.len())
+                .max(transition.to_node_id.len());
+        }
+
+        let mut current_assignment_bytes =
+            modeled_control_metrics_vec_bytes::<Vec<String>>(shard_count);
+        for (shard, owners) in self.ring.assignments.iter().enumerate() {
+            execution.checkpoint()?;
+            let transition_growth = self
+                .transitions
+                .iter()
+                .filter(|transition| usize::try_from(transition.shard).ok() == Some(shard))
+                .count();
+            let owner_slots = owners.len().saturating_add(transition_growth);
+            current_assignment_bytes = current_assignment_bytes
+                .saturating_add(modeled_control_metrics_vec_bytes::<String>(owner_slots))
+                .saturating_add(
+                    u64::try_from(owner_slots)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(modeled_control_metrics_len_bytes(max_node_id_len)),
+                );
+        }
+
+        let desired_assignment_bytes =
+            modeled_control_metrics_vec_bytes::<Vec<String>>(shard_count).saturating_add(
+                u64::try_from(shard_count)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(
+                        modeled_control_metrics_vec_bytes::<String>(replicas).saturating_add(
+                            u64::try_from(replicas)
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(modeled_control_metrics_len_bytes(max_node_id_len)),
+                        ),
+                    ),
+            );
+        let output_node_bytes =
+            modeled_control_metrics_vec_bytes::<ControlRebalanceNodeSnapshot>(self.nodes.len())
+                .saturating_add(self.nodes.iter().fold(0u64, |bytes, node| {
+                    bytes.saturating_add(modeled_control_metrics_str_bytes(&node.id))
+                }));
+        let handoff_bytes = self.metrics_projection_retained_bytes_with_execution(execution)?;
+
+        let desired_membership_bytes =
+            modeled_control_metrics_vec_bytes::<ClusterNode>(active_nodes)
+                .saturating_add(self.nodes.iter().fold(0u64, |bytes, node| {
+                    if matches!(
+                        node.status,
+                        ControlNodeStatus::Active | ControlNodeStatus::Joining
+                    ) {
+                        bytes
+                            .saturating_add(modeled_control_metrics_str_bytes(&node.id))
+                            .saturating_add(modeled_control_metrics_str_bytes(&node.endpoint))
+                    } else {
+                        bytes
+                    }
+                }))
+                .saturating_add(modeled_control_metrics_len_bytes(local_node_id.len()));
+        let virtual_node_count =
+            active_nodes.saturating_mul(CONTROL_REBALANCE_VIRTUAL_NODES_PER_NODE);
+        let virtual_node_storage = u64::try_from(virtual_node_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(std::mem::size_of::<(u64, String)>())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(modeled_control_metrics_len_bytes(max_node_id_len)),
+            )
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES);
+        let sort_scratch = u64::try_from(virtual_node_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(std::mem::size_of::<(u64, String)>()).unwrap_or(u64::MAX))
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES);
+        let owner_set_scratch = u64::try_from(replicas).unwrap_or(u64::MAX).saturating_mul(
+            u64::try_from(std::mem::size_of::<&str>())
+                .unwrap_or(u64::MAX)
+                .saturating_add(CONTROL_REBALANCE_BTREE_ENTRY_ALLOWANCE_BYTES),
+        );
+
+        Ok(handoff_bytes
+            .saturating_add(current_assignment_bytes)
+            .saturating_add(desired_assignment_bytes)
+            .saturating_add(output_node_bytes)
+            .saturating_add(desired_membership_bytes)
+            .saturating_add(virtual_node_storage)
+            .saturating_add(sort_scratch)
+            .saturating_add(owner_set_scratch)
+            .saturating_add(modeled_control_metrics_len_bytes(
+                max_node_id_len.saturating_add(32),
+            ))
+            .saturating_add(CONTROL_REBALANCE_FIXED_SCRATCH_BYTES))
     }
 
     pub fn apply_begin_shard_handoff(
@@ -1041,6 +1466,140 @@ fn sort_transitions(transitions: &mut [ShardOwnershipTransition]) {
                     .cmp(&right.activation_ring_version)
             })
     });
+}
+
+pub(crate) fn modeled_control_metrics_projection_retained_bytes(
+    projection: &ControlMetricsProjection,
+) -> u64 {
+    modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(projection.handoff.shards.capacity())
+        .saturating_add(
+            projection
+                .handoff
+                .shards
+                .iter()
+                .fold(0u64, |retained_bytes, shard| {
+                    retained_bytes
+                        .saturating_add(modeled_control_metrics_string_bytes(&shard.from_node_id))
+                        .saturating_add(modeled_control_metrics_string_bytes(&shard.to_node_id))
+                }),
+        )
+        .saturating_add(modeled_control_metrics_vec_bytes::<
+            ControlHotspotShardSnapshot,
+        >(projection.hotspot.handoff_shards.capacity()))
+}
+
+pub(crate) fn modeled_control_status_projection_retained_bytes(
+    projection: &ControlStatusProjection,
+) -> u64 {
+    modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(projection.handoff.shards.capacity())
+        .saturating_add(
+            projection
+                .handoff
+                .shards
+                .iter()
+                .fold(0u64, |retained_bytes, shard| {
+                    retained_bytes
+                        .saturating_add(modeled_control_metrics_string_bytes(&shard.from_node_id))
+                        .saturating_add(modeled_control_metrics_string_bytes(&shard.to_node_id))
+                        .saturating_add(
+                            shard
+                                .last_error
+                                .as_ref()
+                                .map(modeled_control_metrics_string_bytes)
+                                .unwrap_or(0),
+                        )
+                }),
+        )
+        .saturating_add(modeled_control_metrics_vec_bytes::<
+            ControlHotspotShardSnapshot,
+        >(projection.hotspot.handoff_shards.capacity()))
+}
+
+fn modeled_control_rebalance_projection_retained_bytes(
+    projection: &ControlRebalanceProjection,
+) -> u64 {
+    let assignment_bytes = |assignments: &Vec<Vec<String>>| {
+        modeled_control_metrics_vec_bytes::<Vec<String>>(assignments.capacity()).saturating_add(
+            assignments.iter().fold(0u64, |bytes, owners| {
+                bytes
+                    .saturating_add(modeled_control_metrics_vec_bytes::<String>(
+                        owners.capacity(),
+                    ))
+                    .saturating_add(owners.iter().fold(0u64, |bytes, owner| {
+                        bytes.saturating_add(modeled_control_metrics_string_bytes(owner))
+                    }))
+            }),
+        )
+    };
+    modeled_control_metrics_vec_bytes::<ControlRebalanceNodeSnapshot>(projection.nodes.capacity())
+        .saturating_add(projection.nodes.iter().fold(0u64, |bytes, node| {
+            bytes.saturating_add(modeled_control_metrics_string_bytes(&node.id))
+        }))
+        .saturating_add(assignment_bytes(&projection.current_assignments))
+        .saturating_add(
+            projection
+                .desired_assignments
+                .as_ref()
+                .map(assignment_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(
+            projection.handoff.shards.capacity(),
+        ))
+        .saturating_add(projection.handoff.shards.iter().fold(0u64, |bytes, shard| {
+            bytes
+                .saturating_add(modeled_control_metrics_string_bytes(&shard.from_node_id))
+                .saturating_add(modeled_control_metrics_string_bytes(&shard.to_node_id))
+        }))
+        .saturating_add(modeled_control_metrics_vec_bytes::<
+            ControlHotspotShardSnapshot,
+        >(projection.hotspot.handoff_shards.capacity()))
+}
+
+fn modeled_control_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_control_metrics_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_control_metrics_len_bytes(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        u64::try_from(len)
+            .unwrap_or(u64::MAX)
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_control_metrics_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn clone_control_metrics_string(value: &str) -> String {
+    let mut cloned = String::with_capacity(value.len());
+    cloned.push_str(value);
+    cloned
 }
 
 fn rewrite_shard_owner(owners: &mut Vec<String>, from_node_id: &str, to_node_id: &str) {

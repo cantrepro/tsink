@@ -509,9 +509,9 @@ source roots because a move can add one output record per source. A candidate la
 `MaintenanceDependencyWindowExceeded`. The cursor commits only after staging, `Prepared`/`Committing`
 publication, catalog visibility, and source retirement succeed. Failure keeps the cursor for durable
 recovery; reaching an item boundary conservatively schedules another page, so an exact multiple needs
-one empty terminal page before the worker may claim a clean full cycle. Startup, close, and
-capacity-reclamation retention paths remain complete lifecycle operations rather than background
-pages.
+one empty terminal page before the worker may claim a clean full cycle. Startup and close retain
+complete lifecycle drains. Capacity-reclamation retention is also complete and can be reached from
+background flush or rollup pressure, so that fallback remains a separate pass-budget integration.
 
 Live-metadata reconciliation no longer snapshots the complete materialized-series set. A
 process-local scalar cursor visits one ordered series ID at a time and charges that series'
@@ -728,6 +728,31 @@ worker pass instead of independently doubling the shared item and byte envelope.
 drain retains its multi-lane settling loop because it is a finite lifecycle operation rather than
 an idle background wake.
 
+Before ordinary background planning, compaction replacement recovery uses a retained,
+clone-shared `ReadDir` cursor. One raw namespace entry or one admitted marker owns the wake; an
+empty terminal step is required before planning can resume. Marker files are capped at 4 MiB and
+16,384 combined source/output records. A conservative decoded String/Vec/path envelope is checked
+against the pass before the file is opened or decoded, and the initial path, opened handle, and
+post-read path must identify the same regular file. Admission, identity, or decode failure leaves
+the marker and source/output paths untouched and resets the cursor for a later retry. Startup,
+close, and standalone compaction deliberately keep the exhaustive recovery helper.
+
+The separate post-flush clean fence before production background compaction is also incremental.
+It pre-admits a retained `ReadDir`/path/scratch model to shared storage memory and the maintenance
+byte envelope. The portable model charges twice the encoded payload for each simultaneously owned
+path/name buffer (two marker-directory paths, one recognized marker path, and its filename) plus
+64 KiB for directory-stream, `DirEntry`, maximum raw-name, metadata, and non-owned scratch.
+Allocator metadata and runtime/kernel state remain outside that model. The cursor consumes exactly
+one raw namespace entry per wake (including unknown or non-UTF-8 names) and retains that reservation
+between wakes. A stable empty terminal probe is required before any segment planning or mutation.
+Post-flush marker publication is serialized by the compaction gate, invalidates the cursor, and
+advances a process-local generation so a marker inserted behind an old cursor cannot be missed.
+Recognized markers retain the established deferred error, marker-shaped links or non-files remain
+corruption, and the global 16,384-entry ceiling is unchanged. Terminal, publication, error, close,
+and drop reset the cursor and release its reservation before the data-path process lease. Foreground
+snapshot/close/manual compaction plus finite background flush and catalog-refresh callers keep the
+exhaustive helper; migrating the latter two requires separate staged-output lifetime work.
+
 For a governed compaction, output encoding first measures the complete staged disk peak without
 publishing: all output-file bytes, simultaneous Preparing/Ready replacement-marker payloads,
 destination-allocation-unit allowances for staged entries and missing ancestry, and one new
@@ -775,7 +800,8 @@ boundary measurable.
 These fields are work/concurrency/cadence bounds, not a CPU quota. Active flush and rollup postings
 traversal consume the shared item/byte controls, and each rollup source read is additionally bounded
 by an internal `QueryExecution` whose modeled memory and work can only be tightened by the finite
-maintenance byte ceiling. That same source-scoped execution remains live through raw and
+maintenance byte ceiling. The selected sources do not yet consume one shared residual
+wake-level allowance. Each source-scoped execution remains live through raw and
 existing-materialized reads, downsampling, duplicate filtering, and output-row construction. It
 preflights retained point vectors, downsample output/value payload, numeric scratch, and cloned row
 identities against the per-query and shared query-memory ceilings; failure precedes pending state,
@@ -788,7 +814,10 @@ interpreted as a universal per-worker CPU/work guarantee. Finite compute-only v3
 but continuous pointer churn can restart it before convergence. `close()` unparks and joins all
 owned workers—even if an
 earlier join reports a panic—but cannot portably interrupt a filesystem operation that has already
-entered the kernel. The remaining pass-budget integrations are residual Phase-2 work.
+entered the kernel. Exhaustive post-flush fences still reached by finite background flush and
+catalog refresh, full-root disk reconciliation, registry/rollup journal discovery and merges,
+aggregate rollup work/state clones, and pressure-path complete fallbacks remain residual Phase 2
+integrations.
 
 ### Local-disk accounting boundary
 
@@ -1271,11 +1300,14 @@ final result reservation. Its self-admitted compatibility form consumes and drop
 fanout-warning side channel before returning, so that metadata cannot keep the locally owned query
 lease alive; execution-aware server calls leave that guard for the response adapter to consume.
 The public Prometheus metadata handlers (`/api/v1/series`, `/api/v1/labels`,
-`/api/v1/label/:name/values`, and `/api/v1/metadata`) and internal metadata calls carrying finite
-`query_limits` require complete detailed results, admit their projection and exact JSON body/header
-envelope, and retain guards until `HttpResponse` construction. The socket header buffer plus
-runtime, kernel, and TLS allocations after that explicit handoff remain outside the portable
-model.
+`/api/v1/label/:name/values`, and `/api/v1/metadata`) and internal metadata calls require complete
+detailed results, admit their projection and exact JSON body/header envelope, and retain guards
+until `HttpResponse` construction. Modern internal callers can tighten that envelope with
+`query_limits`; legacy `/internal/v1/select_series` and `/internal/v1/list_metrics` requests that
+omit the additive field inherit the finite Server per-query ceiling, tightened by the storage
+instance. The legacy wire response still omits the additive accounting field, but no longer takes
+an uncontrolled storage or handoff-bridge path. The socket header buffer plus runtime, kernel, and
+TLS allocations after that explicit handoff remain outside the portable model.
 
 `/api/v1/status/tsdb` likewise requires query execution admission and a completely accounted
 detailed metric listing; it no longer converts a listing failure into a false empty success.
@@ -1289,12 +1321,100 @@ cumulative returned-byte limits. `ExpertUnlimited` keeps metric enumeration unbo
 using this execution-aware path and the adapter's fixed encoded ceiling. Backends that expose
 neither query admission nor complete detailed listing accounting fail closed.
 
-Remaining named HTTP boundaries are the legacy internal metadata paths without `query_limits`;
-the best-effort `/metrics` collector; rebalance status and post-effect pause/resume/run reporting;
-the support bundle that composes and duplicates those responses; and the operational snapshot
-clones plus projection/JSON-tree construction peak assembled by `/api/v1/status/tsdb` before its
-measured retained-tree guard is established. Those status sources have independent producer caps
-where documented, but they do not yet share one reserve-before-clone query envelope.
+The core storage producer now also exposes
+`Storage::status_observability_snapshot_with_execution`. The built-in engine measures and reserves
+the complete retained status clone while its source guards are held, materializes every dynamic
+field only after admission, and returns the snapshot with its reservation. The conservative
+backend default fails closed instead of calling the unaccounted legacy snapshot; tenant-scoped and
+distributed adapters forward the contract. The direct `/api/v1/status/tsdb` handler consumes it
+under the metric-enumeration execution and now does the same for its allocation-bearing
+write/fanout, outbox, consensus/handoff, digest, hotspot/rebalance, tenant, audit, security/RBAC,
+usage, managed-control-plane, and edge-sync producers; its fixed planner projection is
+allocation-free. Exact/one-under memory, pre-cancel, schema-equivalence, source-path, and
+zero-residual tests cover those producer slices. Their private guards remain live while the
+response borrows them.
+
+The final `serde_json::Value` tree is still constructed before its retained allocation can be
+measured and reserved. Its completed tree, exact encoded body, and headers remain guarded through
+`HttpResponse` construction, but the construction peak is in-progress adapter work rather than a
+reserve-before-allocation claim.
+
+The best-effort `/metrics` collector admits one root execution for complete metric enumeration,
+the accounted hotspot transform, built-in storage observability, local/offline disk and rollup
+labels, rules, and all allocation-bearing cluster projections. Those projections reserve before
+cloning or materialization; fixed-cardinality and scalar sources are copied or borrowed. The
+control projection does not clone the complete control state, and rebalance exposition reuses
+minimal data cached by the scheduler rather than rebuilding a plan during a scrape. A
+cancellation-aware counting pass first enforces a fixed 1 MiB normal exposition ceiling and exact
+returned-byte admission. A second controlled pass writes into exactly admitted capacity and keeps
+the modeled body/header reservation live through `HttpResponse` construction.
+
+Admission, incomplete third-party storage accounting, collector, cancellation, returned-byte,
+body-memory, or ceiling failures do not invoke a legacy uncontrolled path. They preserve the
+established HTTP 200 contract and return a Prometheus-parseable fallback bounded to 4 KiB, with
+`tsink_metrics_collection_error` identifying the failed fixed collector. Reservations end after
+response construction, not after socket, runtime, TLS, or kernel transmission. This is therefore
+an exact portable scrape-owned projection/body boundary, not a process-RSS or transport-memory
+ceiling. It also does not bound the process-global hotspot tracker's retained shard and tenant
+maps; those remain a separate cardinality-policy gate.
+
+That gate is semantic, not merely an unimplemented allocator charge. The current singleton never
+removes identities, publishes saturating process-lifetime counters, resets on restart, computes
+tenant-scoped scores from global totals, and supplies shard ordering to automatic rebalance. A
+finite bound therefore requires an explicit maintainer choice between rejecting new identities to
+preserve exact totals, publishing bounded/windowed or otherwise incomplete tenant telemetry, or
+removing tenant identities and retaining only finite-ring shard counters. Per-runtime ownership
+and whether non-exact shard signals may influence rebalance are part of the same `HUMAN GATE`;
+silent eviction or approximation is not an accepted resource-limit implementation.
+
+Admin rebalance status, pause, resume, and run now admit one root execution for the complete metric
+list, minimal live control projection, shared hotspot-tracker clone and transform, full scheduler
+status projection, and cancellation-aware two-pass response encoding. Each dynamic producer
+reserves its complete modeled peak before materialization, and the serializer admits exact
+returned bytes plus body/header capacity through `HttpResponse` construction. Pause, resume, and
+run reserve a small error fallback before applying their effect; if later projection or response
+admission fails, the error reports `effectApplied: true` and the resulting state. The successful
+wire schema is unchanged. This closes the direct admin-rebalance producer and serializer boundary,
+not the process-global hotspot tracker's retained shard/tenant cardinality policy.
+
+The support-bundle adapter has its own bounded composition envelope. It admits one root execution
+before child collection. TSDB status and rebalance reuse that execution rather than self-admitting,
+so a cluster-enabled profile with `max_concurrent_queries = 1` completes without a nested query.
+Every support-specific child API reserves the exact modeled retained bytes of its completed
+`HttpResponse` before returning it to the orchestrator; the response is destroyed before its
+reservation, and all eleven guards remain cumulative through final composition. A fixed 16 MiB
+aggregate cap bounds those simultaneously retained child bodies and headers. The parent base
+reserves root-string bytes, 256 KiB of bounded serialization scratch, and the response-header
+allowance without counting already-guarded child bytes.
+
+Valid JSON sections serialize borrowed raw bodies without constructing a duplicate
+`serde_json::Value` tree. Non-JSON sections decode a bounded prefix and retain at most 8,192
+characters plus a truncation marker. A counting pass checkpoints cancellation and enforces a
+separate fixed 16 MiB encoded ceiling; the write pass charges the final bundle's exact returned
+HTTP response-body bytes once, pre-admits exact output capacity, and keeps the final body/header
+reservation live through `HttpResponse` construction. Child source operations still charge their
+canonical logical returned work. Query-pressure failures use the structured read-error contract;
+child-retention or encoded-ceiling overflow returns `413`.
+
+This closes composition, encoding, and the completed child-response handoff from the support-child
+APIs onward. It does not account tenant/actor parsing or the synthetic child-request/header copies
+prepared before the parent setup reservation, nor does it retrospectively account legacy snapshot,
+clone, or serialization work used to create each child response before its support-specific
+completed-response guard is established. Those adapter-setup and operational child-source
+transients remain open boundaries. Socket, runtime, allocator, kernel, and TLS allocations after
+response construction remain outside the portable model.
+
+Tenant override lookup does not clone the input `HttpRequest` or its body. It inspects the raw
+query/form value, rejects a decoded length above the 16 KiB tenant label-value ceiling before
+decoding, and builds only a two-header compatibility view for override/scope conflict validation.
+That makes this pre-reservation parse finite, but its allocation and the actor/synthetic-request
+copies are not yet charged to the root execution.
+
+Remaining named HTTP boundaries include the support bundle's pre-reservation request setup and
+operational child-source production, plus the JSON-tree construction peak assembled by
+`/api/v1/status/tsdb` before its measured retained-tree guard is established.
+The direct TSDB sources named above now share one reserve-before-clone query envelope. `/metrics`
+and direct admin-rebalance reporting are likewise no longer in this producer-boundary list.
 The default-tenant and distributed series-row adapters, tenant/distributed metric-name row-scan
 adapters, other backends that do not advertise complete accounting, and caller-owned results after
 a detailed guard is consumed also remain explicit boundaries. Core and async metric-name row scans
@@ -1326,18 +1446,26 @@ tenant policy on top of the canonical structured rejection path, but no standard
 per-tenant cardinality profile is published. Background workers have fixed inspectable topology
 and cadence. Because those cadences are not independently configurable yet, a custom profile that
 specifies different values is rejected during build instead of being silently ignored. The shared
-maintenance item/byte pair currently bounds compaction, sealed-chunk
-persistence, active-flush discovery, retention/tiering root/action pagination, finite non-tiered
-unknown-dirty catalog reconciliation, finite compute-only v3 catalog reading/application, and
-finite read-write catalog publication with committed-tombstone recovery preflight, finite
-background post-flush marker recovery, and rollup postings traversal; each rollup source read and
-its downstream transform/row assembly share one finite query/maintenance envelope. Tiered writer
-publication retains one complete, hard-bounded snapshot, but its simultaneous memory peak is
-admitted before publication.
+maintenance item/byte pair currently bounds compaction planning plus one finite
+replacement-recovery outcome, sealed-chunk persistence, active-flush discovery,
+retention/tiering root/action pagination, finite non-tiered unknown-dirty catalog reconciliation,
+finite compute-only v3 catalog reading/application, finite read-write catalog publication with
+committed-tombstone recovery preflight, finite background post-flush marker recovery, and rollup
+postings traversal. Each individual rollup source read and transform uses a finite
+query/maintenance envelope, but a page currently grants that full envelope to every selected
+source rather than sharing one residual wake-level allowance. Tiered writer publication retains one
+complete, hard-bounded snapshot, but its simultaneous memory peak is admitted before publication.
 Finite explicit/manual rollup calls share the background cursor and advance at most one
 item/byte-bounded policy/source page; bounded status counters plus the continuation policy and
 exclusive series ID distinguish partial progress until a terminal page proves the cycle complete.
 Only explicit `ExpertUnlimited` drains that complete rollup cycle in one manual call.
+
+Whole worker wakes are therefore not yet universally pass-bounded. Remaining integrations include
+the exhaustive post-flush fence reached by finite background flush and catalog refresh; full-root
+disk-budget reconciliation reached by ordinary governed filesystem mutations; registry and rollup
+journal discovery/merge work; aggregate rollup source work and whole-policy state clones; and
+complete reclamation/flush fallbacks reached from background pressure paths. Kernel-entered
+filesystem calls remain a separate non-preemptible portability boundary.
 
 ## Why profile constants remain provisional
 

@@ -484,17 +484,6 @@ pub(crate) async fn handle_admin_cluster_repair_resume(
     )
 }
 
-async fn admin_cluster_hotspot_snapshot(
-    storage: &Arc<dyn Storage>,
-    cluster_context: Option<&ClusterRequestContext>,
-) -> ClusterHotspotSnapshot {
-    let storage = Arc::clone(storage);
-    let metrics = tokio::task::spawn_blocking(move || storage.list_metrics().unwrap_or_default())
-        .await
-        .unwrap_or_default();
-    cluster_hotspot_snapshot_for_request(&metrics, cluster_context, None)
-}
-
 pub(crate) async fn handle_admin_cluster_repair_cancel(
     cluster_context: Option<&ClusterRequestContext>,
 ) -> HttpResponse {
@@ -597,113 +586,75 @@ pub(crate) async fn handle_admin_cluster_rebalance_pause(
     storage: &Arc<dyn Storage>,
     cluster_context: Option<&ClusterRequestContext>,
 ) -> HttpResponse {
-    let Some(cluster_context) = cluster_context else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let Some(digest_runtime) = cluster_context.digest_runtime.as_ref() else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let control = digest_runtime.pause_rebalance();
-    let snapshot = digest_runtime.rebalance_snapshot();
-    let hotspot_snapshot = admin_cluster_hotspot_snapshot(storage, Some(cluster_context)).await;
-    admin_rebalance_success_response(
-        200,
-        AdminRebalanceOperation::Pause,
-        &cluster_context.runtime.membership.local_node_id,
-        control,
-        snapshot,
-        hotspot_snapshot,
-        digest_runtime.is_rebalance_run_inflight(),
-        "cluster rebalance scheduler is paused",
-    )
+    execute_admin_cluster_rebalance(storage, cluster_context, AdminRebalanceOperation::Pause).await
 }
 
 pub(crate) async fn handle_admin_cluster_rebalance_resume(
     storage: &Arc<dyn Storage>,
     cluster_context: Option<&ClusterRequestContext>,
 ) -> HttpResponse {
-    let Some(cluster_context) = cluster_context else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let Some(digest_runtime) = cluster_context.digest_runtime.as_ref() else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let control = digest_runtime.resume_rebalance();
-    let snapshot = digest_runtime.rebalance_snapshot();
-    let hotspot_snapshot = admin_cluster_hotspot_snapshot(storage, Some(cluster_context)).await;
-    admin_rebalance_success_response(
-        200,
-        AdminRebalanceOperation::Resume,
-        &cluster_context.runtime.membership.local_node_id,
-        control,
-        snapshot,
-        hotspot_snapshot,
-        digest_runtime.is_rebalance_run_inflight(),
-        "cluster rebalance scheduler is resumed",
-    )
+    execute_admin_cluster_rebalance(storage, cluster_context, AdminRebalanceOperation::Resume).await
 }
 
 pub(crate) async fn handle_admin_cluster_rebalance_run(
     storage: &Arc<dyn Storage>,
     cluster_context: Option<&ClusterRequestContext>,
 ) -> HttpResponse {
-    let Some(cluster_context) = cluster_context else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let Some(digest_runtime) = cluster_context.digest_runtime.as_ref() else {
-        return admin_rebalance_error_response(
-            503,
-            "rebalance_runtime_unavailable",
-            "cluster rebalance scheduler runtime is not available",
-        );
-    };
-    let control = digest_runtime.rebalance_control_snapshot();
-    let snapshot = match digest_runtime.trigger_rebalance_run().await {
-        Ok(snapshot) => snapshot,
-        Err(RebalanceRunTriggerError::AlreadyRunning) => {
-            return admin_rebalance_error_response(
-                409,
-                "rebalance_run_in_progress",
-                "a rebalance run is already in progress",
-            );
-        }
-    };
-    let hotspot_snapshot = admin_cluster_hotspot_snapshot(storage, Some(cluster_context)).await;
-    admin_rebalance_success_response(
-        200,
-        AdminRebalanceOperation::Run,
-        &cluster_context.runtime.membership.local_node_id,
-        control,
-        snapshot,
-        hotspot_snapshot,
-        digest_runtime.is_rebalance_run_inflight(),
-        "cluster rebalance scheduler run completed",
-    )
+    execute_admin_cluster_rebalance(storage, cluster_context, AdminRebalanceOperation::Run).await
 }
 
 pub(crate) async fn handle_admin_cluster_rebalance_status(
     storage: &Arc<dyn Storage>,
     cluster_context: Option<&ClusterRequestContext>,
+) -> HttpResponse {
+    execute_admin_cluster_rebalance(storage, cluster_context, AdminRebalanceOperation::Status).await
+}
+
+pub(crate) async fn handle_admin_cluster_rebalance_status_with_execution(
+    storage: &Arc<dyn Storage>,
+    cluster_context: Option<&ClusterRequestContext>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedHttpResponse, HttpResponse> {
+    let mut response_reservation = None;
+    let response = execute_admin_cluster_rebalance_impl(
+        storage,
+        cluster_context,
+        AdminRebalanceOperation::Status,
+        Some(execution),
+        Some(&mut response_reservation),
+        false,
+    )
+    .await;
+    match response_reservation {
+        Some(reservation) => Ok(AccountedHttpResponse {
+            response,
+            reservation,
+        }),
+        None => account_completed_http_response(response, execution).map_err(|error| {
+            admin_rebalance_response_error_response(
+                AdminRebalanceResponseError::Budget(error),
+                None,
+            )
+        }),
+    }
+}
+
+async fn execute_admin_cluster_rebalance(
+    storage: &Arc<dyn Storage>,
+    cluster_context: Option<&ClusterRequestContext>,
+    operation: AdminRebalanceOperation,
+) -> HttpResponse {
+    execute_admin_cluster_rebalance_impl(storage, cluster_context, operation, None, None, true)
+        .await
+}
+
+async fn execute_admin_cluster_rebalance_impl(
+    storage: &Arc<dyn Storage>,
+    cluster_context: Option<&ClusterRequestContext>,
+    operation: AdminRebalanceOperation,
+    shared_execution: Option<&tsink::QueryExecution>,
+    retained_response_reservation: Option<&mut Option<tsink::QueryMemoryReservation>>,
+    charge_http_returned_bytes: bool,
 ) -> HttpResponse {
     let Some(cluster_context) = cluster_context else {
         return admin_rebalance_error_response(
@@ -719,17 +670,236 @@ pub(crate) async fn handle_admin_cluster_rebalance_status(
             "cluster rebalance scheduler runtime is not available",
         );
     };
-    let control = digest_runtime.rebalance_control_snapshot();
-    let snapshot = digest_runtime.rebalance_snapshot();
-    let hotspot_snapshot = admin_cluster_hotspot_snapshot(storage, Some(cluster_context)).await;
-    admin_rebalance_success_response(
+    if operation == AdminRebalanceOperation::Run && digest_runtime.is_rebalance_run_inflight() {
+        return admin_rebalance_error_response(
+            409,
+            "rebalance_run_in_progress",
+            "a rebalance run is already in progress",
+        );
+    }
+    if storage.list_metrics_execution_accounting() != tsink::QueryExecutionAccounting::Complete {
+        return admin_rebalance_error_response(
+            500,
+            "rebalance_query_accounting_unavailable",
+            "admin rebalance status requires complete metric-enumeration accounting",
+        );
+    }
+    let (execution, cancellation_guard) = match shared_execution {
+        Some(execution) => (execution.clone(), None),
+        None => {
+            let cancellation = tsink::QueryCancellationToken::new();
+            let cancellation_guard = TsdbStatusCancellationGuard {
+                token: cancellation.clone(),
+            };
+            let execution = match storage
+                .begin_query_execution(tsink::QueryWorkLimits::default(), cancellation)
+            {
+                Ok(Some(execution)) => execution,
+                Ok(None) => {
+                    return admin_rebalance_error_response(
+                        500,
+                        "rebalance_query_accounting_unavailable",
+                        "admin rebalance status requires query execution admission",
+                    )
+                }
+                Err(tsink::TsinkError::QueryBudget(error)) => {
+                    return admin_rebalance_response_error_response(
+                        AdminRebalanceResponseError::Budget(error),
+                        None,
+                    )
+                }
+                Err(_) => {
+                    return admin_rebalance_error_response(
+                        500,
+                        "rebalance_query_admission_failed",
+                        "admin rebalance query admission failed",
+                    )
+                }
+            };
+            (execution, Some(cancellation_guard))
+        }
+    };
+    let worker_storage = Arc::clone(storage);
+    let worker_execution = execution.clone();
+    let metrics_result = tokio::task::spawn_blocking(move || {
+        worker_storage.list_metrics_with_execution_result(&worker_execution)
+    })
+    .await;
+    let metrics_result = match metrics_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(tsink::TsinkError::QueryBudget(error))) => {
+            return admin_rebalance_response_error_response(
+                AdminRebalanceResponseError::Budget(error),
+                None,
+            )
+        }
+        Ok(Err(_)) => {
+            return admin_rebalance_error_response(
+                500,
+                "rebalance_storage_list_failed",
+                "admin rebalance metric enumeration failed",
+            )
+        }
+        Err(_) => {
+            return admin_rebalance_error_response(
+                500,
+                "rebalance_task_failed",
+                "admin rebalance metric-enumeration task failed",
+            )
+        }
+    };
+    let guarded_metrics = match validate_complete_metric_enumeration_result(metrics_result) {
+        Ok(guarded) => guarded,
+        Err(error) => {
+            return admin_rebalance_error_response(
+                500,
+                "rebalance_query_accounting_invalid",
+                error
+                    .status_message()
+                    .replace("TSDB status", "admin rebalance"),
+            )
+        }
+    };
+    if let Err(error) = execution.checkpoint() {
+        return admin_rebalance_response_error_response(
+            AdminRebalanceResponseError::Budget(error),
+            None,
+        );
+    }
+
+    let node_id = cluster_context.runtime.membership.local_node_id.as_str();
+    let mut fallback_reservation = if operation == AdminRebalanceOperation::Status {
+        None
+    } else {
+        match reserve_admin_rebalance_effect_fallback(&execution, node_id) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                return admin_rebalance_response_error_response(
+                    AdminRebalanceResponseError::Budget(error),
+                    None,
+                )
+            }
+        }
+    };
+    let effect = match operation {
+        AdminRebalanceOperation::Pause => {
+            let control = digest_runtime.pause_rebalance();
+            Some(AdminRebalanceAppliedEffect {
+                operation,
+                node_id,
+                rebalance_paused: control.paused,
+                rebalance_run_completed: false,
+            })
+        }
+        AdminRebalanceOperation::Resume => {
+            let control = digest_runtime.resume_rebalance();
+            Some(AdminRebalanceAppliedEffect {
+                operation,
+                node_id,
+                rebalance_paused: control.paused,
+                rebalance_run_completed: false,
+            })
+        }
+        AdminRebalanceOperation::Run => {
+            if let Err(RebalanceRunTriggerError::AlreadyRunning) =
+                digest_runtime.trigger_rebalance_run().await
+            {
+                return admin_rebalance_error_response(
+                    409,
+                    "rebalance_run_in_progress",
+                    "a rebalance run is already in progress",
+                );
+            }
+            Some(AdminRebalanceAppliedEffect {
+                operation,
+                node_id,
+                rebalance_paused: digest_runtime.rebalance_control_snapshot().paused,
+                rebalance_run_completed: true,
+            })
+        }
+        AdminRebalanceOperation::Status => None,
+    };
+
+    let control_projection =
+        match digest_runtime.rebalance_control_projection_with_execution(&execution) {
+            Ok(projection) => projection,
+            Err(error) => {
+                return admin_rebalance_response_error_response(
+                    AdminRebalanceResponseError::Budget(error),
+                    effect,
+                )
+            }
+        };
+    let hotspot_snapshot =
+        match hotspot::build_rebalance_hotspot_snapshot_with_control_metrics_execution(
+            &guarded_metrics.series,
+            Some(&cluster_context.runtime.ring),
+            Some(&control_projection.hotspot),
+            &execution,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return admin_rebalance_response_error_response(
+                    AdminRebalanceResponseError::Budget(error),
+                    effect,
+                )
+            }
+        };
+    let snapshot = match digest_runtime.rebalance_status_snapshot_with_execution(
+        &control_projection,
+        &hotspot_snapshot.tracker,
+        &execution,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return admin_rebalance_response_error_response(
+                AdminRebalanceResponseError::Budget(error),
+                effect,
+            )
+        }
+    };
+    let message = match operation {
+        AdminRebalanceOperation::Pause => "cluster rebalance scheduler is paused",
+        AdminRebalanceOperation::Resume => "cluster rebalance scheduler is resumed",
+        AdminRebalanceOperation::Run => "cluster rebalance scheduler run completed",
+        AdminRebalanceOperation::Status => "cluster rebalance scheduler status",
+    };
+    let accounted_response = admin_rebalance_success_response(
         200,
-        AdminRebalanceOperation::Status,
-        &cluster_context.runtime.membership.local_node_id,
-        control,
-        snapshot,
-        hotspot_snapshot,
+        operation,
+        node_id,
+        &snapshot,
+        &hotspot_snapshot.snapshot,
         digest_runtime.is_rebalance_run_inflight(),
-        "cluster rebalance scheduler status",
-    )
+        message,
+        &execution,
+        charge_http_returned_bytes,
+    );
+    let (response, response_reservation) = match accounted_response {
+        Ok(AccountedHttpResponse {
+            response,
+            reservation,
+        }) => (response, Some(reservation)),
+        Err(error) => (admin_rebalance_response_error_response(error, effect), None),
+    };
+    drop(snapshot);
+    drop(hotspot_snapshot);
+    drop(control_projection);
+    let GuardedMetricEnumeration {
+        series,
+        reservation,
+    } = guarded_metrics;
+    drop(series);
+    drop(reservation);
+    drop(fallback_reservation.take());
+    if let Some(response_reservation) = response_reservation {
+        if let Some(retained_response_reservation) = retained_response_reservation {
+            *retained_response_reservation = Some(response_reservation);
+        } else {
+            drop(response_reservation);
+        }
+    }
+    drop(execution);
+    drop(cancellation_guard);
+    response
 }

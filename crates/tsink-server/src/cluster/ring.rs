@@ -156,6 +156,16 @@ impl ShardRing {
         }
     }
 
+    pub(crate) fn into_snapshot(self) -> ShardRingSnapshot {
+        ShardRingSnapshot {
+            hash_version: self.hash_version,
+            shard_count: self.shard_count,
+            replication_factor: self.replication_factor,
+            virtual_nodes_per_node: self.virtual_nodes_per_node,
+            assignments: self.assignments,
+        }
+    }
+
     pub fn shard_for_series_id(&self, series_id: u64) -> u32 {
         (series_id % u64::from(self.shard_count)) as u32
     }

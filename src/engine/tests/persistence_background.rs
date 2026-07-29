@@ -6360,7 +6360,8 @@ fn snapshot_postrename_cleanup_preserves_a_raced_staging_path() {
     let destination_for_hook = snapshot_path.clone();
     let observed_staging = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
     let staging_for_hook = std::sync::Arc::clone(&observed_staging);
-    let sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once(
+    let sync_failure = crate::engine::fs_utils::fail_directory_sync_matching_once_under(
+        synchronized_parent.clone(),
         move |path| {
             if path
                 .file_name()
@@ -6412,6 +6413,11 @@ fn snapshot_postrename_cleanup_preserves_a_raced_staging_path() {
         .unwrap_or_else(|poison| poison.into_inner())
         .clone()
         .unwrap();
+    assert_eq!(
+        raced_staging.parent(),
+        Some(temp_dir.path()),
+        "the process-global failpoint must only capture this snapshot's staging path"
+    );
     assert_eq!(
         std::fs::read(raced_staging.join("foreign")).unwrap(),
         b"foreign-state",
@@ -7491,6 +7497,179 @@ fn background_retention_publication_error_retries_cursor_then_reaches_later_segm
 
     storage.clear_catalog_transition_post_index_mutation_hook();
     storage.close().unwrap();
+}
+
+#[test]
+fn real_post_flush_publication_invalidates_a_retained_compaction_fence_before_marker_publish() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path();
+    let lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("post_flush_clean_fence_publication", &[])
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let storage = bounded_retention_page_storage(&lane_path, 2, 1);
+    storage.persist_series_registry_index().unwrap();
+
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    let unknown_entry = marker_dir.join("operator-owned");
+    std::fs::write(&unknown_entry, b"keep").unwrap();
+
+    let initial_attempted = {
+        let _compaction_guard = storage.compaction_gate();
+        ChunkStorage::compact_next_background_compactor_with_bounded_post_flush_fence(
+            Some(data_path),
+            storage
+                .coordination
+                .background_post_flush_clean_fence_cursor
+                .as_ref(),
+            storage.coordination.post_flush_marker_generation.as_ref(),
+            storage.memory.as_ref(),
+            1,
+            u64::MAX,
+            None,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .expect("the unknown entry should leave a retained pre-publication cursor")
+    };
+    assert!(!initial_attempted);
+    assert!(storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes
+            > 0
+    );
+    std::fs::remove_file(&unknown_entry).unwrap();
+
+    let generation_before = storage
+        .coordination
+        .post_flush_marker_generation
+        .load(Ordering::Acquire);
+    storage.set_catalog_transition_post_index_mutation_hook({
+        let compaction_lock = Arc::clone(&storage.coordination.compaction_lock);
+        let marker_generation = Arc::clone(&storage.coordination.post_flush_marker_generation);
+        let clean_fence_cursor = Arc::clone(
+            &storage
+                .coordination
+                .background_post_flush_clean_fence_cursor,
+        );
+        let marker_dir = marker_dir.clone();
+        move || {
+            assert!(
+                compaction_lock.try_lock().is_none(),
+                "the real staged publisher must still own the compaction gate"
+            );
+            assert_eq!(
+                marker_generation.load(Ordering::Acquire),
+                generation_before + 1,
+                "clean-fence invalidation must precede the real marker transaction"
+            );
+            assert!(
+                !clean_fence_cursor.lock().has_active_scan(),
+                "publication invalidation must drop the behind-cursor ReadDir"
+            );
+            assert!(
+                std::fs::read_dir(&marker_dir).unwrap().any(|entry| {
+                    entry
+                        .ok()
+                        .and_then(|entry| entry.file_name().into_string().ok())
+                        .is_some_and(|name| {
+                            super::super::maintenance::is_post_flush_replacement_marker_name(&name)
+                        })
+                }),
+                "the injected failure must observe the real durable replacement marker"
+            );
+            Err(TsinkError::Other(
+                "injected post-flush clean-fence publication failure".to_string(),
+            ))
+        }
+    });
+
+    mark_post_flush_maintenance_pending(&storage);
+    let publication_error = storage
+        .run_post_flush_maintenance_if_pending()
+        .expect_err("the real staged publication hook must fail after marker publication");
+    storage.clear_catalog_transition_post_index_mutation_hook();
+    assert!(publication_error
+        .to_string()
+        .contains("injected post-flush clean-fence publication failure"));
+    assert_eq!(
+        storage
+            .coordination
+            .post_flush_marker_generation
+            .load(Ordering::Acquire),
+        generation_before + 1
+    );
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "the real publisher must release the retained cursor reservation"
+    );
+    assert!(
+        super::super::maintenance::ensure_no_pending_post_flush_replacement(data_path).is_err(),
+        "the injected post-publication failure must leave the real marker durable"
+    );
+
+    let corrupt_lane = data_path.join("corrupt-compaction-probe");
+    let corrupt_root = corrupt_lane
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000001");
+    std::fs::create_dir_all(&corrupt_root).unwrap();
+    std::fs::write(corrupt_root.join("manifest.bin"), b"not-a-manifest").unwrap();
+    let corrupt_compactor = super::super::Compactor::new(&corrupt_lane, 8);
+    let recorded_changes = AtomicUsize::new(0);
+    let fence_error = {
+        let _compaction_guard = storage.compaction_gate();
+        ChunkStorage::compact_next_background_compactor_with_bounded_post_flush_fence(
+            Some(data_path),
+            storage
+                .coordination
+                .background_post_flush_clean_fence_cursor
+                .as_ref(),
+            storage.coordination.post_flush_marker_generation.as_ref(),
+            storage.memory.as_ref(),
+            1,
+            u64::MAX,
+            Some(&corrupt_compactor),
+            None,
+            false,
+            None,
+            None,
+            |_| {
+                recorded_changes.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect_err("the restarted fence must detect the marker before corrupt planning")
+    };
+    assert!(fence_error
+        .to_string()
+        .contains("post-flush replacement is pending"));
+    assert_eq!(recorded_changes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0
+    );
+
+    storage.abandon_without_close_for_tests().unwrap();
 }
 
 #[test]

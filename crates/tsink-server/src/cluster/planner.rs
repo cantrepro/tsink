@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tsink::{MetricSeries, SeriesMatcherOp, SeriesSelection};
+use tsink::{MetricSeries, QueryBudgetError, QueryExecution, SeriesMatcherOp, SeriesSelection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadPlanOperation {
@@ -16,11 +16,21 @@ pub enum ReadPlanOperation {
 }
 
 impl ReadPlanOperation {
+    const METRICS_ORDER: [Self; 3] = [Self::ListMetrics, Self::SelectPoints, Self::SelectSeries];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SelectSeries => "select_series",
             Self::ListMetrics => "list_metrics",
             Self::SelectPoints => "select_points",
+        }
+    }
+
+    const fn metrics_index(self) -> usize {
+        match self {
+            Self::SelectSeries => 0,
+            Self::ListMetrics => 1,
+            Self::SelectPoints => 2,
         }
     }
 }
@@ -60,6 +70,7 @@ pub struct ReadPlannerMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ReadPlannerOperationMetricsSnapshot {
     pub operation: String,
     pub requests_total: u64,
@@ -69,8 +80,23 @@ pub struct ReadPlannerOperationMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ReadPlannerLabeledMetricsSnapshot {
     pub operations: Vec<ReadPlannerOperationMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPlannerOperationMetricsExpositionSnapshot {
+    pub operation: ReadPlanOperation,
+    pub requests_total: u64,
+    pub candidate_shards_total: u64,
+    pub pruned_shards_total: u64,
+    pub remote_targets_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadPlannerLabeledMetricsExpositionSnapshot {
+    pub operations: [Option<ReadPlannerOperationMetricsExpositionSnapshot>; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +109,24 @@ pub struct ReadPlannerLastPlanSnapshot {
     pub local_shards: u32,
     pub remote_targets: u32,
     pub remote_shards: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPlannerLastPlanExpositionSnapshot {
+    pub operation: ReadPlanOperation,
+    pub ring_version: u64,
+    pub time_range: Option<(i64, i64)>,
+    pub candidate_shards: u32,
+    pub pruned_shards: u32,
+    pub local_shards: u32,
+    pub remote_targets: u32,
+    pub remote_shards: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadPlannerStatusExpositionSnapshot {
+    pub operations: [Option<ReadPlannerOperationMetricsExpositionSnapshot>; 3],
+    pub last_plans: [Option<ReadPlannerLastPlanExpositionSnapshot>; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,10 +173,10 @@ static READ_PLANNER_LAST_PLANS: OnceLock<Mutex<BTreeMap<String, ReadPlannerLastP
 
 #[derive(Debug, Clone, Default)]
 struct ReadPlannerLabeledMetrics {
-    operation_requests_total: BTreeMap<String, u64>,
-    operation_candidate_shards_total: BTreeMap<String, u64>,
-    operation_pruned_shards_total: BTreeMap<String, u64>,
-    operation_remote_targets_total: BTreeMap<String, u64>,
+    operation_requests_total: [u64; 3],
+    operation_candidate_shards_total: [u64; 3],
+    operation_pruned_shards_total: [u64; 3],
+    operation_remote_targets_total: [u64; 3],
 }
 
 pub fn read_planner_metrics_snapshot() -> ReadPlannerMetricsSnapshot {
@@ -146,40 +190,108 @@ pub fn read_planner_metrics_snapshot() -> ReadPlannerMetricsSnapshot {
     }
 }
 
+#[allow(dead_code)]
 pub fn read_planner_labeled_metrics_snapshot() -> ReadPlannerLabeledMetricsSnapshot {
     with_read_planner_labeled_metrics(|metrics| {
-        let mut operations = metrics
-            .operation_requests_total
-            .iter()
-            .map(
-                |(operation, requests_total)| ReadPlannerOperationMetricsSnapshot {
-                    operation: operation.clone(),
-                    requests_total: *requests_total,
-                    candidate_shards_total: metrics
-                        .operation_candidate_shards_total
-                        .get(operation)
-                        .copied()
-                        .unwrap_or(0),
-                    pruned_shards_total: metrics
-                        .operation_pruned_shards_total
-                        .get(operation)
-                        .copied()
-                        .unwrap_or(0),
-                    remote_targets_total: metrics
-                        .operation_remote_targets_total
-                        .get(operation)
-                        .copied()
-                        .unwrap_or(0),
-                },
-            )
-            .collect::<Vec<_>>();
-        operations.sort_by(|left, right| left.operation.cmp(&right.operation));
+        let operations = ReadPlanOperation::METRICS_ORDER
+            .into_iter()
+            .filter_map(|operation| {
+                let index = operation.metrics_index();
+                let requests_total = metrics.operation_requests_total[index];
+                (requests_total > 0).then(|| ReadPlannerOperationMetricsSnapshot {
+                    operation: operation.as_str().to_string(),
+                    requests_total,
+                    candidate_shards_total: metrics.operation_candidate_shards_total[index],
+                    pruned_shards_total: metrics.operation_pruned_shards_total[index],
+                    remote_targets_total: metrics.operation_remote_targets_total[index],
+                })
+            })
+            .collect();
         ReadPlannerLabeledMetricsSnapshot { operations }
     })
 }
 
+pub fn read_planner_labeled_metrics_exposition_snapshot(
+) -> ReadPlannerLabeledMetricsExpositionSnapshot {
+    with_read_planner_labeled_metrics(|metrics| {
+        let mut operations = [None; 3];
+        for (output_index, operation) in ReadPlanOperation::METRICS_ORDER.into_iter().enumerate() {
+            let index = operation.metrics_index();
+            let requests_total = metrics.operation_requests_total[index];
+            if requests_total > 0 {
+                operations[output_index] = Some(ReadPlannerOperationMetricsExpositionSnapshot {
+                    operation,
+                    requests_total,
+                    candidate_shards_total: metrics.operation_candidate_shards_total[index],
+                    pruned_shards_total: metrics.operation_pruned_shards_total[index],
+                    remote_targets_total: metrics.operation_remote_targets_total[index],
+                });
+            }
+        }
+        ReadPlannerLabeledMetricsExpositionSnapshot { operations }
+    })
+}
+
+#[allow(dead_code)]
 pub fn read_planner_last_plans_snapshot() -> Vec<ReadPlannerLastPlanSnapshot> {
     with_read_planner_last_plans(|plans| plans.values().cloned().collect())
+}
+
+/// Captures the allocation-free read-planner fields used by status exposition.
+///
+/// Both operation collections have a fixed three-value domain. Representing that domain as
+/// ordered arrays avoids cloning the retained operation-name strings or allocating temporary
+/// vectors merely to sort them for status output.
+pub fn read_planner_status_exposition_snapshot_with_execution(
+    execution: &QueryExecution,
+) -> Result<ReadPlannerStatusExpositionSnapshot, QueryBudgetError> {
+    execution.checkpoint()?;
+    let operations = with_read_planner_labeled_metrics(|metrics| {
+        let mut operations = [None; 3];
+        for (output_index, operation) in ReadPlanOperation::METRICS_ORDER.into_iter().enumerate() {
+            let index = operation.metrics_index();
+            let requests_total = metrics.operation_requests_total[index];
+            if requests_total > 0 {
+                operations[output_index] = Some(ReadPlannerOperationMetricsExpositionSnapshot {
+                    operation,
+                    requests_total,
+                    candidate_shards_total: metrics.operation_candidate_shards_total[index],
+                    pruned_shards_total: metrics.operation_pruned_shards_total[index],
+                    remote_targets_total: metrics.operation_remote_targets_total[index],
+                });
+            }
+        }
+        operations
+    });
+    execution.checkpoint()?;
+    let last_plans = with_read_planner_last_plans(read_planner_last_plan_exposition_snapshot_from);
+    execution.checkpoint()?;
+    Ok(ReadPlannerStatusExpositionSnapshot {
+        operations,
+        last_plans,
+    })
+}
+
+fn read_planner_last_plan_exposition_snapshot_from(
+    plans: &mut BTreeMap<String, ReadPlannerLastPlanSnapshot>,
+) -> [Option<ReadPlannerLastPlanExpositionSnapshot>; 3] {
+    let mut last_plans = [None; 3];
+    for (output_index, operation) in ReadPlanOperation::METRICS_ORDER.into_iter().enumerate() {
+        let Some(plan) = plans.get(operation.as_str()) else {
+            continue;
+        };
+        last_plans[output_index] = Some(ReadPlannerLastPlanExpositionSnapshot {
+            operation,
+            ring_version: plan.ring_version,
+            time_range: plan.time_range,
+            candidate_shards: plan.candidate_shards,
+            pruned_shards: plan.pruned_shards,
+            local_shards: plan.local_shards,
+            remote_targets: plan.remote_targets,
+            remote_shards: plan.remote_shards,
+        });
+    }
+    last_plans
 }
 
 fn with_read_planner_labeled_metrics<T>(
@@ -204,7 +316,8 @@ fn with_read_planner_last_plans<T>(
 }
 
 fn record_plan_metrics(plan: &ReadExecutionPlan) {
-    let operation = plan.operation.as_str().to_string();
+    let operation = plan.operation;
+    let operation_name = operation.as_str();
     let candidate_shards =
         u64::from(u32::try_from(plan.candidate_shards.len()).unwrap_or(u32::MAX));
     let local_shards = u64::from(u32::try_from(plan.local_shards.len()).unwrap_or(u32::MAX));
@@ -227,33 +340,19 @@ fn record_plan_metrics(plan: &ReadExecutionPlan) {
     READ_PLANNER_REMOTE_SHARDS_TOTAL.fetch_add(remote_shards, Ordering::Relaxed);
 
     with_read_planner_labeled_metrics(|metrics| {
-        let requests = metrics
-            .operation_requests_total
-            .entry(operation.clone())
-            .or_insert(0);
-        *requests = requests.saturating_add(1);
-
-        let candidates = metrics
-            .operation_candidate_shards_total
-            .entry(operation.clone())
-            .or_insert(0);
-        *candidates = candidates.saturating_add(candidate_shards);
-
-        let pruned = metrics
-            .operation_pruned_shards_total
-            .entry(operation.clone())
-            .or_insert(0);
-        *pruned = pruned.saturating_add(u64::from(plan.pruned_shards));
-
-        let remotes = metrics
-            .operation_remote_targets_total
-            .entry(operation.clone())
-            .or_insert(0);
-        *remotes = remotes.saturating_add(remote_targets);
+        let index = operation.metrics_index();
+        metrics.operation_requests_total[index] =
+            metrics.operation_requests_total[index].saturating_add(1);
+        metrics.operation_candidate_shards_total[index] =
+            metrics.operation_candidate_shards_total[index].saturating_add(candidate_shards);
+        metrics.operation_pruned_shards_total[index] = metrics.operation_pruned_shards_total[index]
+            .saturating_add(u64::from(plan.pruned_shards));
+        metrics.operation_remote_targets_total[index] =
+            metrics.operation_remote_targets_total[index].saturating_add(remote_targets);
     });
 
     let snapshot = ReadPlannerLastPlanSnapshot {
-        operation: operation.clone(),
+        operation: operation_name.to_string(),
         ring_version: plan.ring_version,
         time_range: plan.time_range,
         candidate_shards: u32::try_from(plan.candidate_shards.len()).unwrap_or(u32::MAX),
@@ -269,7 +368,7 @@ fn record_plan_metrics(plan: &ReadExecutionPlan) {
         .unwrap_or(u32::MAX),
     };
     with_read_planner_last_plans(|plans| {
-        plans.insert(operation.clone(), snapshot.clone());
+        plans.insert(operation_name.to_string(), snapshot.clone());
     });
 }
 
@@ -640,5 +739,162 @@ mod tests {
                 .map(|target| target.shards.len())
                 .sum::<usize>();
         assert_eq!(coverage, 64);
+    }
+
+    #[test]
+    fn exposition_metrics_snapshot_is_copy_and_uses_fixed_operation_order() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<ReadPlannerOperationMetricsExpositionSnapshot>();
+        assert_copy::<ReadPlannerLabeledMetricsExpositionSnapshot>();
+
+        let planner = build_planner();
+        planner
+            .plan_select_series(&SeriesSelection::new(), 1)
+            .expect("series plan should succeed");
+        planner
+            .plan_list_metrics(1)
+            .expect("list-metrics plan should succeed");
+        planner
+            .plan_select_points(&[], 0, 1, 1)
+            .expect("points plan should succeed");
+
+        let snapshot = read_planner_labeled_metrics_exposition_snapshot();
+        let operations = snapshot
+            .operations
+            .iter()
+            .flatten()
+            .map(|operation| operation.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec!["list_metrics", "select_points", "select_series"]
+        );
+    }
+
+    #[test]
+    fn status_exposition_snapshot_is_fixed_copy_and_preserves_operation_order() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<ReadPlannerLastPlanExpositionSnapshot>();
+        assert_copy::<ReadPlannerStatusExpositionSnapshot>();
+
+        let planner = build_planner();
+        planner
+            .plan_select_series(&SeriesSelection::new(), 7)
+            .expect("series plan should succeed");
+        planner
+            .plan_list_metrics(8)
+            .expect("list-metrics plan should succeed");
+        planner
+            .plan_select_points(&[], 10, 20, 9)
+            .expect("points plan should succeed");
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("status test budget should build");
+        let execution = budget.begin_query().expect("status query should admit");
+
+        let snapshot = read_planner_status_exposition_snapshot_with_execution(&execution)
+            .expect("status snapshot should succeed");
+        assert_eq!(
+            snapshot
+                .operations
+                .iter()
+                .flatten()
+                .map(|operation| operation.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_metrics", "select_points", "select_series"]
+        );
+        assert_eq!(
+            snapshot
+                .last_plans
+                .iter()
+                .flatten()
+                .map(|plan| plan.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_metrics", "select_points", "select_series"]
+        );
+
+        let mut fixture = BTreeMap::from([
+            (
+                "select_series".to_string(),
+                ReadPlannerLastPlanSnapshot {
+                    operation: "select_series".to_string(),
+                    ring_version: 17,
+                    time_range: Some((3, 5)),
+                    candidate_shards: 11,
+                    pruned_shards: 13,
+                    local_shards: 7,
+                    remote_targets: 2,
+                    remote_shards: 4,
+                },
+            ),
+            (
+                "list_metrics".to_string(),
+                ReadPlannerLastPlanSnapshot {
+                    operation: "list_metrics".to_string(),
+                    ring_version: 19,
+                    time_range: None,
+                    candidate_shards: 23,
+                    pruned_shards: 29,
+                    local_shards: 31,
+                    remote_targets: 37,
+                    remote_shards: 41,
+                },
+            ),
+        ]);
+        assert_eq!(
+            read_planner_last_plan_exposition_snapshot_from(&mut fixture),
+            [
+                Some(ReadPlannerLastPlanExpositionSnapshot {
+                    operation: ReadPlanOperation::ListMetrics,
+                    ring_version: 19,
+                    time_range: None,
+                    candidate_shards: 23,
+                    pruned_shards: 29,
+                    local_shards: 31,
+                    remote_targets: 37,
+                    remote_shards: 41,
+                }),
+                None,
+                Some(ReadPlannerLastPlanExpositionSnapshot {
+                    operation: ReadPlanOperation::SelectSeries,
+                    ring_version: 17,
+                    time_range: Some((3, 5)),
+                    candidate_shards: 11,
+                    pruned_shards: 13,
+                    local_shards: 7,
+                    remote_targets: 2,
+                    remote_shards: 4,
+                }),
+            ]
+        );
+
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn status_exposition_snapshot_honors_precancellation_without_residual_memory() {
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("status test budget should build");
+        let cancellation = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(tsink::QueryWorkLimits::default(), cancellation.clone())
+            .expect("status query should admit");
+        cancellation.cancel();
+
+        let error = read_planner_status_exposition_snapshot_with_execution(&execution)
+            .expect_err("the pre-cancelled status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 }

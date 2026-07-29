@@ -55,6 +55,19 @@ returned when that response fits, while an outer memory error remains when even 
 be admitted. It also makes the three intentionally unbounded test configurations explicit. The
 complete rerun is recorded below; the initial failures are not hidden as environmental.
 
+### 2026-07-29 continuation audit
+
+- Branch: `pivot`
+- Continuation base revision: `ae480bc873dc4885cd9744164d644686e73276e9`
+- Workspace version: `0.10.2`
+- Working tree: retained the existing multi-phase goal changes; no unrelated edits were discarded
+
+This continuation resumed the first unfinished Phase 2 accounting gate from that exact base. It
+re-audited direct status, metrics, internal-read, support-bundle, activation, and background
+recovery boundaries rather than treating earlier progress prose as proof. The evidence and
+remaining gaps below describe the resulting working tree; they are not release or publication
+claims.
+
 ## Verified baseline inventory and contradictions
 
 The statements in this section describe the unmodified baseline. The roadmap ledger below records
@@ -93,8 +106,11 @@ the changes made since that snapshot.
   [`ADR 0001`](adr/0001-write-contract.md) documentation.
 - `DONE` Declare Rust 1.89 as the MSRV, add CI coverage, and pass the locked all-target workspace
   check on that toolchain.
-- `DONE` Verify crate contents and the package dry run. The current package contains 264 files and excludes
-  `GOAL.md`, `docs/goal-progress.md`, `.github`, and `scripts`.
+- `DONE` Verify crate contents and package dry runs. The current root package contains 324 entries
+  and excludes `GOAL.md`, `docs/goal-progress.md`, `.github`, `scripts`, and benchmark results.
+  The exact five-crate workspace set shares one version; protocol and core archives receive Cargo's
+  full package verification, and the exact server, testkit, and UniFFI archives compile offline
+  against those packaged foundations.
 - `DONE` Improve documentation of the primary embedded lifecycle and canonical write APIs.
 - `DONE` Re-audit public examples, finite-profile defaults, on-disk layout, and tuning guidance
   against the implementation. Correct Python naming/restore usage, boolean CLI examples, real
@@ -103,9 +119,9 @@ the changes made since that snapshot.
   automatic publication from `master`. Published GitHub Releases and manual tag dispatches now
   require a real version tag at the exact checked-out revision, a promoted and empty-Unreleased
   changelog, the release workflow's Ubuntu verification matrix, MSRV validation, a server-version
-  smoke test, and package dry runs. It does not currently depend on the separate Windows CI or
-  benchmark jobs. Actual registry publication remains fail closed until every mandatory GOAL
-  release gate exists.
+  smoke test, exact five-crate version agreement, and package/archive verification in dependency
+  order. It does not currently depend on the separate Windows CI or benchmark jobs. Actual registry
+  publication remains fail closed until every mandatory GOAL release gate exists.
 - `DONE` Complete crates.io/PyPI metadata for the server and Python binding packages while keeping
   repository-only measurement and migration helper scripts out of runtime package contents.
 - `DONE` Pass the complete post-change formatting, lint, test, documentation, no-default-feature,
@@ -418,8 +434,22 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   one policy and one item/byte-bounded source-postings page, return structured continuation state,
   retain the cursor on global failure, and require an empty terminal page for an exact multiple.
   Rollup status uses traversal counters rather than re-enumerating every source. Explicit
-  `ExpertUnlimited` alone drains the complete policy/source cycle in one manual call. Close now
-  caps maintenance-gate,
+  `ExpertUnlimited` alone drains the complete policy/source cycle in one manual call.
+  Finite engine-background compaction now retains a clone-shared replacement-marker directory
+  cursor and lets one raw namespace entry or one admitted marker own the wake before ordinary
+  planning. Marker input has fixed 4 MiB and 16,384-record caps, conservative decoded
+  String/Vec/path memory is admitted before decode, and the pathname, opened handle, and post-read
+  entry must retain one file identity. Exact N/N+1 record and decoded-byte tests, cursor
+  continuation/restart, same-size replacement-race, oversized-input, and no-mutation failure tests
+  cover the boundary. Startup, close, and standalone compaction retain exhaustive recovery. The
+  production background pre-compaction post-flush clean fence now separately retains a
+  shared-memory-accounted `ReadDir` cursor, consumes one admitted raw namespace entry per wake, and
+  requires a marker-generation-stable terminal probe before planning. Its portable model charges
+  twice each simultaneously owned path/name payload plus a fixed 64 KiB directory-stream and
+  entry-scratch allowance; the long-valid-path boundary verifies six-times data-path growth for the
+  two marker-directory owners and recognized entry path. Marker publication invalidates the cursor;
+  terminal, reset, and error release its reservation. Foreground, flush, and catalog callers remain
+  exhaustive. Close now caps maintenance-gate,
   writer-drain, and compaction-drain waits with the
   configured lifecycle timeout, caps settling at 128 compaction passes, and reports close outcomes,
   waits, timeouts, passes, total duration, and join duration. Blocking filesystem calls cannot be
@@ -546,8 +576,10 @@ remains Phase 2 work, as permitted by the Phase 1 charter's “once implemented�
   B/point target. The clean/multi-host RSS matrix, modeled-to-process reconciliation, high-scale
   and larger-shape query breadth, and non-memory calibration remain open, so exact profile
   constants are provisional.
-- `DEFERRED` Complete byte reservations for remaining transient and non-write memory growth,
-  the residual background pass integrations, and final profile measurements.
+- `IN PROGRESS` Complete byte reservations for remaining transient and non-write memory growth,
+  the residual background pass integrations, and final profile measurements. This is required
+  Phase 2 work: only allocator/runtime/kernel/TLS behavior outside tsink's portable ownership model
+  remains an accepted documented exclusion.
 
 Phase 2 remains incomplete. Enforced memory totals are modeled estimates rather than RSS; the
 measurement harness now reports an OS process-wide RSS high-water separately, and several
@@ -1256,9 +1288,11 @@ debt and additional WAL and query-accounting boundaries:
   tenant/distributed detailed-list guard tests.
 - Public Prometheus metadata and finite-limit internal metadata already retain their source,
   projection, body, and header guards through `HttpResponse` construction. The audited remaining
-  HTTP boundaries are legacy internal metadata without `query_limits`, best-effort `/metrics`,
-  rebalance reporting, and the support bundle; these are now explicitly documented rather than
-  being grouped into an ambiguous “metadata HTTP” gap.
+  HTTP boundaries at that checkpoint were legacy internal metadata without `query_limits`,
+  best-effort `/metrics`, rebalance reporting, and the support bundle; these were explicitly
+  documented rather than being grouped into an ambiguous “metadata HTTP” gap. The adapter-owned
+  support-bundle slice is closed below, while its operational child producers remain separate
+  boundaries.
 - `/api/v1/status/tsdb` now requires one admitted execution and complete detailed metric-list
   accounting, propagates enumeration failures through stable error envelopes, reserves the full
   hotspot tracker clone/map/union/top-N transformation under that execution, checkpoints and
@@ -1284,16 +1318,275 @@ debt and additional WAL and query-accounting boundaries:
   verification, CI benchmark smokes, and complete constrained profile matrix remain before any
   constant is qualified.
 
+The 2026-07-29 continuation re-audited those remaining gates and closed another bounded HTTP slice:
+
+- The package jobs had fallen behind the five-crate workspace. CI and release verification now
+  require exactly `tsink`, `tsink-protocol`, `tsink-server`, `tsink-test`, and `tsink-uniffi` at one
+  version. Protocol and core receive Cargo's full offline package verification; each exact
+  downstream archive is then extracted and checked offline against those packaged foundations.
+  The reproduced archives contain 324 core, 14 protocol, 84 server, 12 testkit, and 18 UniFFI
+  files. A bare downstream package command correctly cannot resolve the unpublished protocol
+  crate; the verified workflow supplies the same-version source patch during assembly and replaces
+  it with the extracted protocol archive for the final check.
+- The best-effort `/metrics` metric-list and hotspot path now requires complete detailed accounting,
+  admits one execution, validates and retains the listing result guard through the accounted
+  hotspot transform, and holds the hotspot reservation and execution through exposition
+  construction. Admission, storage, missing/undersized false-`Complete`, and hotspot-budget
+  failures preserve the existing `200` collector-error contract and never call the uncontrolled
+  listing or transform. Default and no-default focused suites pass 11/11 each. Other operational
+  snapshot clones, the cloned hotspot control-state input, and the uncapped growable exposition
+  body remain explicit boundaries.
+- `GET /api/v1/admin/support_bundle` now bounds its adapter-owned response accumulation,
+  composition, and encoding. A fixed 16 MiB aggregate cap bounds retained child bodies and headers;
+  the parent reserves root strings, 256 KiB of bounded serialization scratch, and response-header
+  preflight before combined output allocation. Valid child JSON is serialized from borrowed raw
+  bodies rather than duplicated into a `serde_json::Value` tree; non-JSON fallback text is limited
+  to 8,192 decoded characters. Two-pass pretty encoding enforces a separate fixed 16 MiB response
+  ceiling, charges exact returned bytes, pre-admits exact body capacity, and keeps the modeled
+  body/header reservation live through `HttpResponse` construction. The initial focused default
+  and no-default suites passed 9/9 each, covering raw JSON and Unicode/invalid-UTF-8 fallback,
+  exact/one-under returned-byte and memory admission, both fixed ceilings, cancellation and
+  structured pressure/error mapping, Test/Edge/custom one-query profiles, compatibility headers
+  and schema, and zero residual query resources. At that checkpoint, completed child responses
+  still crossed an unreserved handoff; the later continuation below closes it. Tenant/actor and
+  synthetic-request/header preparation before the parent reservation remained outside that claim.
+- The quick B/point job is now an execution/health smoke instead of enforcing the unqualified
+  0.75/1.0 target. Its one modified-tree run retained 4,096,000 points with zero workload failures
+  and measured 2.047495 effective B/point, so the target report was false while the health smoke
+  correctly remained green. This is not a qualified capacity or compression row.
+- The Criterion smoke exposed and closed four harness defects rather than weakening finite
+  production limits: empty Bash arrays now work on Bash 3.2; the million-point fixture seeds in
+  10,000-row batches; that explicit scaling case uses a finite Embedded-derived query envelope with
+  a one-million-element intermediate limit and 64 MiB per-query memory under the unchanged 128 MiB
+  shared cap; and an explicit suite selector prevents filtered-out comprehensive fixtures from
+  running eagerly. Quick mode now executes eight intended cases, including the million-point select
+  and 64-segment refresh, while full mode retains the 64/256/1,024 refresh matrix. The final quick
+  run passed; the million-point select measured 34.542–35.022 ms and the 64-segment refresh measured
+  3.0542 s. The cached comparison is restricted to those eight current IDs and passed with a worst
+  observed change of +8.3% against its restored, unpinned cache. These modified-tree, cache-relative
+  observations are smoke evidence, not a stable regression baseline.
+- A proposed compound tenant/default-tenant row-accounting shortcut was reviewed and removed before
+  publication. It materialized and charged offset-skipped/off-page points as returned work, could
+  double-charge metadata plus point composition, and moved budget admission ahead of compatibility
+  validation. Those adapters remain honestly `Unaccounted` until a lower-level scoped-versus-legacy
+  paged contract or counter-transfer mechanism can preserve final-logical-result semantics.
+- Before the support-bundle slice, the settled 12-file working diff passed formatting and diff
+  checks, warning-denied all-feature workspace Clippy, warning-denied no-default all-target
+  checking, the Rust 1.89 all-target check, warning-denied all-feature rustdoc, and the final exact
+  archive flow described above. The complete warning-denied no-default workspace test command also
+  passes: 1,235 core tests in 443.65 s,
+  42 async tests, 4 concurrency tests, 2 crash-durability tests, 70 core integration tests,
+  893 server tests with one intentional fixture-regeneration ignore, and all remaining testkit,
+  UniFFI, integration, and doc tests completed with zero failures.
+- After the support-bundle slice, the current 15-file working diff passes formatting and diff
+  checks, warning-denied all-feature server Clippy, and warning-denied no-default server all-target
+  checking. The full server package suite with localhost socket access passes all 901 active server
+  tests with one intentional fixture-regeneration ignore, plus all 46 active migration-binary tests
+  with its matching fixture-regeneration ignore.
+- A later 2026-07-29 continuation closes the remaining `/metrics` scrape-owned projection and
+  exposition boundary. One admitted `QueryExecution` now covers complete metric enumeration,
+  accounted hotspot transformation, built-in storage observability, local/offline disk and rollup
+  labels, rules, and the cluster control, write, fanout, outbox, digest, and rebalance projections.
+  Allocation-bearing projections reserve before cloning or materialization; scalar and
+  fixed-cardinality projections are copied or borrowed. A cancellation-aware counting pass
+  enforces a fixed 1 MiB normal exposition ceiling and exact returned-byte admission, followed by
+  an exact-capacity controlled pass whose body/header reservation remains live through
+  `HttpResponse` construction. Collection or body failures preserve the HTTP 200 contract with a
+  Prometheus-parseable fallback bounded to 4 KiB and never invoke an uncontrolled fallback.
+  Environment-derived protocol configuration is initialized before listener binding, so a first
+  scrape cannot perform that lazy initialization outside the request model.
+- Exact/one-under and cancellation coverage includes
+  `metrics_endpoint_enforces_exact_returned_byte_boundary`,
+  `metrics_response_reservation_enforces_exact_memory_boundary`,
+  `metrics_body_replay_honors_cancellation_and_releases_accounting`,
+  `metrics_fallback_is_fixed_parseable_and_bounded`,
+  `metrics_observability_projection_has_exact_memory_boundary_and_retains_guard`,
+  `control_metrics_projection_reserves_exact_output_before_materialization`, and the write,
+  fanout, outbox, digest, and rebalance projection boundary tests. The network-enabled server
+  package suite passes 936/936 active library tests and 48/48 active migration-binary tests, with
+  one intentional fixture-regeneration ignore in each binary. Workspace all-target checking,
+  warning-denied all-feature Clippy, and all-feature rustdoc pass.
+- This closes scrape-time projection and body work only. The process-global hotspot tracker still
+  retains uncapped shard and tenant maps between scrapes. A safe bound requires an explicit
+  product policy because eviction or approximation changes published per-identity totals and
+  automatic rebalance ordering; scrape accounting does not solve that retained-state boundary.
+- Legacy `/internal/v1/select_series` and `/internal/v1/list_metrics` calls that omit the additive
+  `query_limits` field now inherit a finite Server per-query ceiling tightened by the storage
+  instance. They require complete accounting and admission, keep local result, handoff bridge,
+  encoding, and response reservations under one execution, and preserve the legacy wire shape by
+  omitting the additive accounting field. Exact-boundary, cancellation, false-accounting,
+  handoff, and zero-residual tests close this former compatibility exception.
+- The older single-series `/internal/v1/select` request now uses the same finite Server ceiling and
+  complete one-selector batch implementation internally. Local result, cutover handoff merge,
+  exact two-pass JSON encoding, and response memory remain under one cancellation-aware execution,
+  while the request and exact `{"points": ...}` response shape stay unchanged. Exact
+  sample/returned-byte/memory N/N-1, false-accounting, cancellation, bridge, and zero-residual tests
+  close the last unaccounted internal read compatibility route.
+- Three characterization tests now pin the unresolved activation-convergence boundary without
+  changing production behavior:
+  `divergent_membership_view_rejects_proofless_newly_active_leader_repair`,
+  `balanced_joiner_can_be_planned_for_activation_without_control_catchup_evidence`, and
+  `removed_recommission_target_enters_postcommit_fanout_without_proposal_entry`. They prove that
+  activation planning has no catch-up evidence, a lagging voter correctly rejects a proof-less
+  newly Active leader before log repair, and a Removed recommission target can miss its own
+  proposal entry. A volatile optimistic `peer_next_index` gate would not close this; durable joint
+  configuration and receiver-verifiable membership proof remain required.
+- Full corrected workspace matrices pass with localhost socket access. The all-feature run passes
+  1,241/1,241 core tests, every async/integration/testkit/UniFFI/doc-test binary, and 941/941 active
+  server tests with one intentional fixture-regeneration ignore. The no-default run passes the
+  same 1,241 core tests and every remaining workspace binary, including 937/937 active server tests
+  with the same ignore. Those runs exposed and then verified two deterministic test/contract
+  fixes: plain async results now release their query execution before reply publication, and
+  process-global directory-sync failpoints can be scoped so concurrent snapshots cannot replace a
+  test's observed staging identity.
+
+The 2026-07-29 continuation completed two more producer slices without completing either the
+direct TSDB-status adapter or Phase 2:
+
+- Core storage now exposes a schema-complete
+  `status_observability_snapshot_with_execution` projection. The built-in engine measures and
+  reserves the full retained clone while source guards are held, allocates only after admission,
+  and returns a wrapper that retains the reservation. The `Storage` default fails closed instead
+  of calling `observability_snapshot`; tenant-scoped and distributed adapters forward the
+  contract. Evidence includes `default_storage_refuses_unaccounted_status_projection`,
+  `status_projection_is_schema_complete_and_field_equivalent`,
+  `status_projection_has_exact_memory_boundary_and_retains_guard`,
+  `cancelled_status_projection_stops_before_policy_copy`, and
+  `status_observability_delegates_schema_and_releases_reservation`. This closes the core producer,
+  and the direct `/api/v1/status/tsdb` consumer now uses it.
+- Direct `/api/v1/status/tsdb` now admits one root execution before external-disk and storage
+  observability production and retains it across complete metric enumeration plus its
+  allocation-bearing write/fanout, outbox, consensus/persistence/handoff, digest,
+  hotspot/rebalance, tenant, audit, security/RBAC, usage, managed-control-plane, and edge-sync
+  projections, plus its allocation-free fixed planner projection. Each dynamic producer measures
+  and reserves its complete dynamic output before materialization; private wrappers prevent
+  extraction and remain live while response fields are borrowed. Usage replaces three separately
+  sampled journal/tenant/report generations with one
+  state-to-health generation and allocation-free reconciliation scalars. Managed control plane
+  replaces three state-lock generations with one coherent projection, and edge sync accounts both
+  populated source diagnostics and the two strings owned by its disabled default. Source guards
+  forbid the legacy calls in this handler. Evidence includes
+  `status_tsdb_cluster_path_uses_only_accounted_single_generation_producers`,
+  `status_tsdb_usage_projection_preserves_tenant_filtered_schema_values`,
+  `usage_status_projection_enforces_exact_peak_before_output_clones`,
+  `status_projection_enforces_exact_peak_before_any_output_clone` in the managed-control-plane
+  module, and edge sync's
+  `status_projection_enforces_exact_peak_before_output_clones`. This closes the named dynamic
+  source-producer slice, not the adapter's final JSON-tree construction peak. The support-bundle
+  handoff is closed separately below.
+- Focused verification after direct integration passes all 18 `status_tsdb` tests, all three
+  usage-status projection tests, all three managed-control-plane projection tests, and all three
+  edge-sync projection tests. `cargo check -p tsink-server --bin tsink-server --locked` is
+  warning-free, and
+  `cargo clippy -p tsink-server --all-targets --all-features --locked -- -D warnings` passes.
+- The integrated working tree also passes `cargo fmt --all -- --check`, `git diff --check`, both
+  locked workspace all-target check matrices, warning-denied locked all-feature workspace Clippy,
+  and warning-denied locked all-feature workspace rustdoc. Full test matrices remain to be rerun
+  after the next adapter slice rather than being claimed from the earlier pre-integration run.
+- Admin rebalance status, pause, resume, and run now share one admitted root execution across
+  complete metric enumeration, the minimal live control projection, one accounted hotspot
+  tracker/projection, the full scheduler status, and exact cancellation-aware response encoding.
+  Producer guards remain live while their projections are serialized, and the exact response
+  reservation remains live through `HttpResponse` construction; the established successful
+  response shape is unchanged. Mutations reserve a bounded fallback before applying their effect;
+  a later projection or serialization failure truthfully reports `effectApplied: true` and the
+  resulting state. Evidence includes
+  `admin_rebalance_live_control_and_full_status_producers_enforce_exact_peak_limits`,
+  `admin_rebalance_json_enforces_exact_memory_returned_and_cancellation_boundaries`,
+  `admin_cluster_rebalance_status_uses_one_execution_and_releases_all_reservations`,
+  `admin_cluster_rebalance_cancellation_releases_the_root_execution`, and
+  `admin_cluster_rebalance_pause_reports_post_effect_memory_failure_truthfully`. This closes the
+  direct admin-rebalance request path, not the process-global retained hotspot policy. The
+  support-bundle handoff is closed separately below.
+- The support bundle now admits one root execution before collecting children. TSDB status and
+  rebalance reuse it without self-admission or child returned-byte charging. Each of the eleven
+  support-specific child APIs establishes an exact same-execution reservation around its completed
+  response before returning to the orchestrator; response-first wrapper layout releases the
+  allocation before its guard, and every wrapper remains live through final composition. The
+  16 MiB aggregate cap remains, the parent base excludes already-guarded child bytes, and the
+  final bundle charges HTTP response-body bytes exactly once; child sources still charge canonical
+  logical returned work. Tenant override resolution now rejects decoded IDs above 16 KiB before
+  decoding, constructs only the two-header compatibility view, and never clones the potentially
+  64 MiB HTTP request body. Focused verification passes 14/14 support-bundle tests, 18/18 direct
+  TSDB-status tests, and 7/7 admin-rebalance tests. The cluster-enabled one-query regression
+  returns `200` for both TSDB status and rebalance with exactly one admitted execution. This closes
+  the completed child-response handoff. Tenant/actor and synthetic-request/header preparation
+  before the parent reservation plus legacy child snapshot/serialization transients before the
+  response guard remain open adapter work.
+- Production background compaction now replaces its exhaustive post-flush clean fence with a
+  retained, shared-memory-accounted cursor that consumes one admitted raw namespace entry per wake.
+  It cannot enter lane planning or mutation until an empty terminal probe observes the same
+  marker-publication generation that began the cycle. Publication resets the cursor before placing
+  a marker behind it; terminal, error, reset, close, and drop release the reservation before the
+  data-path lease. The path model covers both retained marker-directory copies, the recognized
+  full marker path, file-name scratch, and 64 KiB of platform directory-stream scratch. The
+  16,384-entry namespace cap, marker deferral, marker-shaped corruption checks, and exhaustive
+  foreground, flush, and catalog fences remain unchanged. The portable capacity model charges
+  twice each simultaneously owned path/name payload plus the fixed 64 KiB directory-stream
+  allowance; the long-path regression pins six-times data-path growth for the two directory owners
+  and recognized entry path. Verification passes the 25/25 recovery, 9/9 shutdown, 7/7 context,
+  and 47/47 post-flush focused suites, the lifecycle no-planning and real staged-publication
+  ordering regressions, both all-target check feature matrices, and warning-denied all-feature
+  workspace Clippy. The all-feature workspace run passed all 1,261 core tests and every non-server
+  suite; its sandboxed server phase was rerun with loopback permission and passed 999 tests with
+  one intentional fixture-regeneration ignore. The complete no-default workspace matrix then
+  passed end to end with the same core and server counts. Two unrelated fixed-delay/live-sample
+  tests exposed by the full parallel matrix were made deterministic: remote-refresh backoff now
+  uses bounded condition polling, and independently sampled filesystem-availability values are
+  compared for JSON shape rather than unstable byte-for-byte equality. Final closure also passes
+  `cargo fmt --all -- --check`, `git diff --check`, both locked all-target check feature matrices,
+  warning-denied all-feature workspace rustdoc, package content listing, and full core package
+  verification (326 files, 8.4 MiB unpacked, 1.5 MiB compressed). Incremental integration for
+  finite background flush and catalog refresh remains a later staged output-lifetime slice.
+- `HUMAN GATE`: the retained hotspot policy cannot be completed truthfully without a maintainer
+  compatibility decision. The current process-global tracker never removes shard or normalized
+  tenant identities, publishes saturating process-lifetime totals, and resets only on restart.
+  Tenant scoping happens after global totals and denominators are computed, so even an identity
+  omitted from a tenant-scoped response can change the returned score. Shard pressure also feeds
+  automatic rebalance ordering. No finite profile-sized bound can preserve all of those exact
+  semantics for arbitrarily many accepted identities.
+  The maintainer must choose among: (a) exact per-runtime tracking with finite-ring shard slots and
+  a configured lifetime tenant capacity that atomically rejects otherwise-valid ingest, query, or
+  repair work before a new identity exceeds the cap; (b) a bounded rolling or epoch tenant window
+  with explicit completeness/overflow metadata and versioned non-lifetime semantics, while
+  retaining exact finite-ring shard counters for rebalance; or (c) deprecating tenant identity
+  telemetry and retaining only exact bounded per-runtime shard tracking. The same decision must
+  approve replacing accidental process-global aggregation with per-server or cluster-runtime
+  ownership and must say whether any non-exact shard signal may influence automatic rebalance.
+  No cap, eviction, reset, or approximation is being inferred before that decision.
+- Unblocked hotspot characterization now pins cross-instance mixing, lifetime retention,
+  tenant-scope/global-denominator behavior, top-eight truncation versus full aggregate values, and
+  shard removal/merge effects on candidate ordering. The focused hotspot suite passes 9/9, the new
+  repair-ordering test passes, and the existing hotter-mismatch ranking regression still passes.
+  Remaining safe work is to expose fixed-label retained identity counts, modeled identity
+  bytes/high-water, and reset/generation observability. Current ingest hotspot counters are
+  recorded before later
+  row-admission/write outcome, which must also remain documented or be changed as part of the
+  selected contract.
+
 The next required Phase 2 work is:
 
-1. Finish the remaining locked verification variants for this continuation: the full no-default
-   test run, final warning-denied rustdoc/package checks, and CI benchmark smokes.
-2. Address the remaining best-effort metrics/rebalance/support-bundle operational HTTP boundaries
-   or retain their explicit semantics, and close the default-tenant/distributed series-row and
-   tenant/distributed metric-row adapter gaps where exact page-work reconciliation is possible.
-3. Calibrate the shared query envelope under constrained direct, async, PromQL, HTTP, and
+1. Resolve the retained-hotspot `HUMAN GATE` above. After a maintainer selects the compatibility
+   contract, implement instance ownership, shard capacity tied to a finite ring, the selected
+   tenant capacity/window/removal behavior, overflow/rejection observability, and explicit
+   rebalance semantics. Until then, continue only the non-semantic characterization and
+   observability work listed above.
+2. Replace direct `/api/v1/status/tsdb`'s allocate-then-measure JSON-tree construction with a
+   reserve-before-allocation or direct-streaming envelope while preserving its schema and exact
+   1 MiB response boundary, then account the support bundle's pre-reservation tenant/actor/request
+   setup and remaining legacy operational child producers before their completed-response guards
+   are established.
+3. Close default-tenant/distributed series-row and tenant/distributed metric-row adapter gaps only
+   after exact paged-work reconciliation can preserve canonical logical result charging.
+4. Finish the remaining background pass-budget integrations: the exhaustive post-flush fence
+   still reached by finite background flush and catalog refresh; full-root disk reconciliation
+   after governed mutations; registry/rollup journal discovery and merge work; aggregate rollup
+   source/state work; and complete pressure-path reclamation/flush fallbacks.
+5. Implement the cluster activation membership-certificate/joint-configuration convergence proof;
+   characterization now pins the gap, but it has not been reclassified as an accepted exclusion.
+6. Calibrate the shared query envelope under constrained direct, async, PromQL, HTTP, and
    distributed workloads, keeping logical-versus-physical byte evidence separate from
    process-memory measurements.
-4. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
+7. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
    revise the shipped provisional constants and record the final evidence. Preserve the explicit
    expert-only unlimited migration path and deterministic base-plus-override contract.

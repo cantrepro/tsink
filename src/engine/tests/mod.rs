@@ -67,6 +67,7 @@ mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;
+mod metrics_observability;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
@@ -77,6 +78,7 @@ mod retention_policy;
 mod rollup_write_batching;
 mod rollups;
 mod series_selection;
+mod status_observability;
 mod write_transient_memory;
 
 pub(crate) fn assert_engine_memory_usage_reconciled(storage: &ChunkStorage) {

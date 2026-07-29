@@ -2565,12 +2565,20 @@ fn expert_unlimited_compute_only_suppresses_repeated_refresh_attempts_while_cach
     denied_permissions.set_mode(0o000);
     std::fs::set_permissions(&level_root, denied_permissions).unwrap();
 
-    std::thread::sleep(Duration::from_millis(5));
-    assert_eq!(
-        storage
-            .select("compute_only_refresh_failure_metric", &labels, 0, 10)
-            .unwrap(),
-        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
+    let expected_cached_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+    assert!(
+        wait_for_condition(Duration::from_secs(2), Duration::from_millis(5), || {
+            let selected = storage
+                .select("compute_only_refresh_failure_metric", &labels, 0, 10)
+                .unwrap();
+            let snapshot = storage.observability_snapshot();
+            selected == expected_cached_points
+                && !snapshot.remote.accessible
+                && snapshot.remote.catalog_refresh_errors_total >= 1
+                && snapshot.remote.consecutive_refresh_failures == 1
+                && snapshot.remote.backoff_active
+        }),
+        "timed out waiting for ExpertUnlimited remote refresh backoff while cached segments stayed readable"
     );
 
     let outage_snapshot = storage.observability_snapshot();

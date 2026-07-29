@@ -571,6 +571,22 @@ impl Storage for DistributedStorageAdapter {
         self.local_storage.query_budget()
     }
 
+    fn status_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<tsink::StorageStatusObservabilitySnapshot> {
+        self.local_storage
+            .status_observability_snapshot_with_execution(execution)
+    }
+
+    fn metrics_observability_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> TsinkResult<tsink::StorageMetricsObservabilitySnapshot> {
+        self.local_storage
+            .metrics_observability_snapshot_with_execution(execution)
+    }
+
     fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
         self.local_storage.insert_rows(rows)
     }
@@ -1185,6 +1201,35 @@ mod tests {
             }
             other => panic!("expected {expected} query limit, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn status_observability_delegates_schema_and_releases_reservation() {
+        let (storage, adapter) = make_bounded_adapter(&[]);
+        let budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("query budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let expected = serde_json::to_value(storage.observability_snapshot())
+            .expect("unaccounted snapshot should serialize");
+
+        let projected = adapter
+            .status_observability_snapshot_with_execution(&execution)
+            .expect("distributed adapter should delegate the accounted status projection");
+        assert_eq!(
+            serde_json::to_value(&projected).expect("accounted snapshot should serialize"),
+            expected,
+            "distributed delegation must preserve the complete local-storage schema"
+        );
+        let retained_bytes = projected.reserved_memory_bytes();
+        assert!(retained_bytes > 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, retained_bytes);
+
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
     }
 
     #[tokio::test]

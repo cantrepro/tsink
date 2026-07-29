@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use super::*;
 
 fn compaction_replacement_dir(data_path: &Path) -> PathBuf {
@@ -227,8 +229,14 @@ fn segment_rel_path(data_path: &Path, segment_root: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
+type CompactionMarkerPostOpenHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static FORCED_MARKER_CANDIDATE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static COMPACTION_MARKER_POST_OPEN_HOOK:
+        std::cell::RefCell<Option<CompactionMarkerPostOpenHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -248,6 +256,25 @@ pub(super) fn force_next_replacement_marker_candidate(
 ) -> ForcedMarkerCandidateGuard {
     FORCED_MARKER_CANDIDATE.with(|slot| *slot.borrow_mut() = Some(candidate));
     ForcedMarkerCandidateGuard
+}
+
+#[cfg(test)]
+pub(super) struct CompactionMarkerPostOpenHookGuard;
+
+#[cfg(test)]
+impl Drop for CompactionMarkerPostOpenHookGuard {
+    fn drop(&mut self) {
+        COMPACTION_MARKER_POST_OPEN_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_compaction_marker_post_open_hook<F>(hook: F) -> CompactionMarkerPostOpenHookGuard
+where
+    F: FnOnce(&Path) + 'static,
+{
+    COMPACTION_MARKER_POST_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    CompactionMarkerPostOpenHookGuard
 }
 
 fn replacement_marker_path(data_path: &Path) -> Result<PathBuf> {
@@ -483,6 +510,19 @@ fn compaction_replacement_marker_payload(
             "compaction replacement marker requires source segments".to_string(),
         ));
     }
+    let record_count = source_segments
+        .len()
+        .checked_add(output_segments.len())
+        .ok_or_else(|| {
+            TsinkError::InvalidConfiguration(
+                "compaction replacement marker record count overflowed".to_string(),
+            )
+        })?;
+    if record_count > MAX_COMPACTION_REPLACEMENT_RECORDS {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "compaction replacement marker has {record_count} records, exceeding the {MAX_COMPACTION_REPLACEMENT_RECORDS} record limit"
+        )));
+    }
 
     let source_segments = source_segments
         .iter()
@@ -498,7 +538,13 @@ fn compaction_replacement_marker_payload(
         source_segments,
         output_segments,
     };
-    Ok(serde_json::to_vec(&marker)?)
+    let payload = serde_json::to_vec(&marker)?;
+    if payload.len() as u64 > MAX_COMPACTION_REPLACEMENT_MARKER_BYTES {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "compaction replacement marker exceeds the {MAX_COMPACTION_REPLACEMENT_MARKER_BYTES} byte limit"
+        )));
+    }
+    Ok(payload)
 }
 
 struct ValidatedCompactionReplacement {
@@ -508,10 +554,45 @@ struct ValidatedCompactionReplacement {
     output_segments: Vec<PathBuf>,
 }
 
-fn parse_compaction_replacement_marker(
-    data_path: &Path,
+fn regular_compaction_marker_read_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+}
+
+fn compaction_replacement_record_count(marker: &CompactionReplacementMarker) -> Result<usize> {
+    let record_count = marker
+        .source_segments
+        .len()
+        .checked_add(marker.output_segments.len())
+        .ok_or_else(|| {
+            TsinkError::DataCorruption(
+                "compaction replacement marker record count overflowed".to_string(),
+            )
+        })?;
+    if record_count > MAX_COMPACTION_REPLACEMENT_RECORDS {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker has {record_count} records, exceeding the {MAX_COMPACTION_REPLACEMENT_RECORDS} record limit"
+        )));
+    }
+    Ok(record_count)
+}
+
+fn read_compaction_replacement_marker(
     path: &Path,
-) -> Result<ValidatedCompactionReplacement> {
+    expected_len: Option<u64>,
+) -> Result<CompactionReplacementMarker> {
     let metadata = fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
         path: path.to_path_buf(),
         source,
@@ -524,8 +605,115 @@ fn parse_compaction_replacement_marker(
             path.display()
         )));
     }
-    let bytes = fs::read(path)?;
-    let marker: CompactionReplacementMarker = serde_json::from_slice(&bytes)?;
+    if metadata.len() > MAX_COMPACTION_REPLACEMENT_MARKER_BYTES {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker exceeds the {MAX_COMPACTION_REPLACEMENT_MARKER_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    if expected_len.is_some_and(|expected| metadata.len() != expected) {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker changed size before bounded decode: {}",
+            path.display()
+        )));
+    }
+    let initial_identity =
+        same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut file = regular_compaction_marker_read_options()
+        .open(path)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let opened_metadata = file.metadata().map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&opened_metadata)
+        || !opened_metadata.file_type().is_file()
+        || opened_metadata.len() != metadata.len()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker changed before its opened handle was validated: {}",
+            path.display()
+        )));
+    }
+    let opened_identity = same_file::Handle::from_file(file.try_clone().map_err(|source| {
+        TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?)
+    .map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if opened_identity != initial_identity {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker changed identity while opening: {}",
+            path.display()
+        )));
+    }
+    #[cfg(test)]
+    COMPACTION_MARKER_POST_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.by_ref()
+        .take(MAX_COMPACTION_REPLACEMENT_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_COMPACTION_REPLACEMENT_MARKER_BYTES
+        || bytes.len() as u64 != metadata.len()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker changed size or exceeded its byte limit while reading: {}",
+            path.display()
+        )));
+    }
+    let after_metadata = fs::symlink_metadata(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::engine::fs_utils::is_link_or_reparse_point(&after_metadata)
+        || !after_metadata.file_type().is_file()
+        || after_metadata.len() != metadata.len()
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker changed entry type or size while reading: {}",
+            path.display()
+        )));
+    }
+    let current_identity =
+        same_file::Handle::from_path(path).map_err(|source| TsinkError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if opened_identity != current_identity {
+        return Err(TsinkError::DataCorruption(format!(
+            "compaction replacement marker path changed while reading: {}",
+            path.display()
+        )));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let marker = CompactionReplacementMarker::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    compaction_replacement_record_count(&marker)?;
+    Ok(marker)
+}
+
+fn validate_compaction_replacement_marker(
+    data_path: &Path,
+    marker: CompactionReplacementMarker,
+) -> Result<ValidatedCompactionReplacement> {
     let phase = match (marker.version, marker.phase) {
         (LEGACY_COMPACTION_REPLACEMENT_VERSION, None) => CompactionReplacementPhase::Ready,
         (COMPACTION_REPLACEMENT_VERSION, Some(phase)) => phase,
@@ -586,6 +774,16 @@ fn parse_compaction_replacement_marker(
         source_segments,
         output_segments,
     })
+}
+
+fn parse_compaction_replacement_marker(
+    data_path: &Path,
+    path: &Path,
+) -> Result<ValidatedCompactionReplacement> {
+    validate_compaction_replacement_marker(
+        data_path,
+        read_compaction_replacement_marker(path, None)?,
+    )
 }
 
 fn marker_matches_plan(
@@ -684,7 +882,15 @@ fn apply_compaction_replacement_marker(
     // it or moving any source out of the segment namespace.
     crate::engine::fs_utils::sync_parent_dir(marker_path)?;
     let marker = parse_compaction_replacement_marker(data_path, marker_path)?;
+    apply_validated_compaction_replacement_marker(data_path, marker_path, marker, local_disk_budget)
+}
 
+fn apply_validated_compaction_replacement_marker(
+    data_path: &Path,
+    marker_path: &Path,
+    marker: ValidatedCompactionReplacement,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<Option<CompactionOutcome>> {
     if marker.phase == CompactionReplacementPhase::Preparing {
         rollback_output_segments(&marker.output_segments, local_disk_budget)?;
         crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
@@ -936,6 +1142,258 @@ fn pending_source_retirement_entry_count(
         }
     }
     Ok(count)
+}
+
+fn apply_validated_compaction_replacement_with_disk_budget(
+    data_path: &Path,
+    marker_path: &Path,
+    marker: ValidatedCompactionReplacement,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<Option<CompactionOutcome>> {
+    let Some(budget) = local_disk_budget else {
+        return apply_validated_compaction_replacement_marker(data_path, marker_path, marker, None);
+    };
+    if !budget.governs_entry(marker_path)? {
+        return apply_validated_compaction_replacement_marker(data_path, marker_path, marker, None);
+    }
+    if marker.phase != CompactionReplacementPhase::Ready {
+        return apply_validated_compaction_replacement_marker(
+            data_path,
+            marker_path,
+            marker,
+            local_disk_budget,
+        );
+    }
+
+    let retirement_entries =
+        pending_source_retirement_entry_count(data_path, marker_path, &marker.source_segments)?;
+    let retirement_peak = retirement_entries
+        .checked_mul(budget.snapshot_restore_entry_staging_allowance_bytes()?)
+        .ok_or_else(|| {
+            TsinkError::Other(
+                "compaction recovery retirement peak exceeds the supported range".to_string(),
+            )
+        })?;
+    budget.with_reconciled_recovery_reservation(
+        crate::DiskCategory::Temporary,
+        retirement_peak,
+        || apply_validated_compaction_replacement_marker(data_path, marker_path, marker, None),
+    )
+}
+
+impl BackgroundCompactionRecoveryCursor {
+    pub(super) fn reset(&mut self) {
+        self.scan = None;
+    }
+
+    fn begin_scan(&mut self, data_path: &Path) -> Result<bool> {
+        debug_assert!(self.scan.is_none());
+        let marker_dir = compaction_replacement_dir(data_path);
+        let metadata = match fs::symlink_metadata(&marker_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: marker_dir,
+                    source,
+                })
+            }
+        };
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_dir()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "compaction replacement marker directory is link-like or not a directory: {}",
+                marker_dir.display()
+            )));
+        }
+        crate::engine::fs_utils::sync_dir(&marker_dir)?;
+        let entries = fs::read_dir(&marker_dir).map_err(|source| TsinkError::IoWithPath {
+            path: marker_dir.clone(),
+            source,
+        })?;
+        self.scan = Some(BackgroundCompactionMarkerScan {
+            marker_dir,
+            entries,
+            observed_entries: 0,
+        });
+        Ok(true)
+    }
+
+    fn next_marker_path(&mut self) -> Result<BoundedCompactionMarkerPathStep> {
+        let scan = self
+            .scan
+            .as_mut()
+            .expect("bounded compaction marker scan must be initialized");
+        let Some(entry) = scan.entries.next() else {
+            self.scan = None;
+            return Ok(BoundedCompactionMarkerPathStep::NoPending);
+        };
+        if scan.observed_entries == crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: BOUNDED_COMPACTION_RECOVERY_OPERATION,
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: scan.observed_entries.saturating_add(1),
+            });
+        }
+        scan.observed_entries = scan.observed_entries.checked_add(1).ok_or_else(|| {
+            TsinkError::Other(format!(
+                "compaction replacement marker namespace entry counter overflow at {}",
+                scan.marker_dir.display()
+            ))
+        })?;
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: scan.marker_dir.clone(),
+            source,
+        })?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_compaction_replacement_marker_name)
+        {
+            return Ok(BoundedCompactionMarkerPathStep::EntryConsumed);
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?;
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "compaction replacement marker is link-like or not regular: {}",
+                path.display()
+            )));
+        }
+        Ok(BoundedCompactionMarkerPathStep::Marker {
+            path,
+            marker_bytes: metadata.len(),
+        })
+    }
+}
+
+enum BoundedCompactionMarkerPathStep {
+    NoPending,
+    EntryConsumed,
+    Marker { path: PathBuf, marker_bytes: u64 },
+}
+
+pub(super) fn bounded_compaction_marker_decode_bytes(
+    data_path: &Path,
+    marker_path: &Path,
+    marker_bytes: u64,
+) -> u64 {
+    let payload_bytes = usize::try_from(marker_bytes).unwrap_or(usize::MAX);
+    // Even a zero-length JSON string occupies two payload bytes. Use that deliberately loose
+    // lower bound to admit Vec slots before serde can materialize either record list.
+    let possible_record_slots = payload_bytes
+        .saturating_add(1)
+        .checked_div(2)
+        .unwrap_or(usize::MAX)
+        .min(MAX_COMPACTION_REPLACEMENT_RECORDS.saturating_mul(2));
+    let path_prefix_bytes = data_path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_mul(BOUNDED_COMPACTION_MARKER_PATH_PREFIX_COPIES);
+    let per_record_bytes = BOUNDED_COMPACTION_MARKER_RECORD_BYTES.saturating_add(path_prefix_bytes);
+    let modeled = BOUNDED_COMPACTION_MARKER_DECODE_BASE_BYTES
+        .saturating_add(payload_bytes.saturating_mul(BOUNDED_COMPACTION_MARKER_PAYLOAD_COPIES))
+        .saturating_add(
+            marker_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                .saturating_mul(2),
+        )
+        .saturating_add(possible_record_slots.saturating_mul(per_record_bytes));
+    u64::try_from(modeled).unwrap_or(u64::MAX)
+}
+
+fn validate_finite_compaction_recovery_envelope(
+    selected_items: usize,
+    selected_bytes: u64,
+    limits: CompactionPassLimits,
+) -> Result<()> {
+    if selected_items > limits.max_directory_entries {
+        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: BOUNDED_COMPACTION_RECOVERY_OPERATION,
+            item_limit: limits.max_directory_entries,
+            byte_limit: limits.max_decoded_bytes,
+            selected_items,
+            selected_bytes,
+        });
+    }
+    if selected_bytes > limits.max_decoded_bytes {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: BOUNDED_COMPACTION_RECOVERY_OPERATION,
+            limit: limits.max_decoded_bytes,
+            required: selected_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn next_background_compaction_replacement_bounded(
+    cursor: &mut BackgroundCompactionRecoveryCursor,
+    data_path: &Path,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    limits: CompactionPassLimits,
+) -> Result<BackgroundCompactionRecoveryStep> {
+    let outcome = (|| {
+        if limits.max_directory_entries == 0 {
+            return Ok(BackgroundCompactionRecoveryStep::AllowanceExhausted);
+        }
+        if cursor.scan.is_none() && !cursor.begin_scan(data_path)? {
+            return Ok(BackgroundCompactionRecoveryStep::NoPending);
+        }
+        let (marker_path, marker_bytes) = match cursor.next_marker_path()? {
+            BoundedCompactionMarkerPathStep::NoPending => {
+                return Ok(BackgroundCompactionRecoveryStep::NoPending)
+            }
+            BoundedCompactionMarkerPathStep::EntryConsumed => {
+                return Ok(BackgroundCompactionRecoveryStep::NamespaceEntryConsumed)
+            }
+            BoundedCompactionMarkerPathStep::Marker { path, marker_bytes } => (path, marker_bytes),
+        };
+        if marker_bytes > MAX_COMPACTION_REPLACEMENT_MARKER_BYTES {
+            return Err(TsinkError::DataCorruption(format!(
+                "compaction replacement marker exceeds the {MAX_COMPACTION_REPLACEMENT_MARKER_BYTES} byte limit: {}",
+                marker_path.display()
+            )));
+        }
+        let selected_bytes =
+            bounded_compaction_marker_decode_bytes(data_path, &marker_path, marker_bytes);
+        validate_finite_compaction_recovery_envelope(0, selected_bytes, limits)?;
+        crate::engine::fs_utils::sync_parent_dir(&marker_path)?;
+        let marker = read_compaction_replacement_marker(&marker_path, Some(marker_bytes))?;
+        let selected_items = compaction_replacement_record_count(&marker)?;
+        validate_finite_compaction_recovery_envelope(selected_items, selected_bytes, limits)?;
+        let marker = validate_compaction_replacement_marker(data_path, marker)?;
+        let phase = marker.phase;
+        let recovered = apply_validated_compaction_replacement_with_disk_budget(
+            data_path,
+            &marker_path,
+            marker,
+            local_disk_budget,
+        )?;
+        match (phase, recovered) {
+            (CompactionReplacementPhase::Preparing, None) => {
+                Ok(BackgroundCompactionRecoveryStep::PreparingRolledBack)
+            }
+            (CompactionReplacementPhase::Ready, Some(outcome)) => {
+                Ok(BackgroundCompactionRecoveryStep::Ready(outcome))
+            }
+            _ => Err(TsinkError::Other(
+                "compaction replacement recovery phase changed unexpectedly".to_string(),
+            )),
+        }
+    })();
+    if outcome.is_err() {
+        cursor.reset();
+    }
+    outcome
 }
 
 fn retire_source_segment(
@@ -1235,38 +1693,14 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements_with_disk_budg
     marker_paths.sort();
 
     for marker_path in marker_paths {
-        let outcome = if let Some(budget) = local_disk_budget {
-            if budget.governs_entry(&marker_path)? {
-                crate::engine::fs_utils::sync_parent_dir(&marker_path)?;
-                let marker = parse_compaction_replacement_marker(data_path, &marker_path)?;
-                if marker.phase == CompactionReplacementPhase::Ready {
-                    let retirement_entries = pending_source_retirement_entry_count(
-                        data_path,
-                        &marker_path,
-                        &marker.source_segments,
-                    )?;
-                    let retirement_peak = retirement_entries
-                        .checked_mul(budget.snapshot_restore_entry_staging_allowance_bytes()?)
-                        .ok_or_else(|| {
-                            TsinkError::Other(
-                                "compaction recovery retirement peak exceeds the supported range"
-                                    .to_string(),
-                            )
-                        })?;
-                    budget.with_reconciled_recovery_reservation(
-                        crate::DiskCategory::Temporary,
-                        retirement_peak,
-                        || apply_compaction_replacement_marker(data_path, &marker_path, None),
-                    )?
-                } else {
-                    apply_compaction_replacement_marker(data_path, &marker_path, local_disk_budget)?
-                }
-            } else {
-                apply_compaction_replacement_marker(data_path, &marker_path, None)?
-            }
-        } else {
-            apply_compaction_replacement_marker(data_path, &marker_path, None)?
-        };
+        crate::engine::fs_utils::sync_parent_dir(&marker_path)?;
+        let marker = parse_compaction_replacement_marker(data_path, &marker_path)?;
+        let outcome = apply_validated_compaction_replacement_with_disk_budget(
+            data_path,
+            &marker_path,
+            marker,
+            local_disk_budget,
+        )?;
         if let Some(outcome) = outcome {
             // A later marker may fail. Return each committed Ready diff immediately so runtime
             // callers cannot lose an already-unlinked marker's catalog update behind that error.

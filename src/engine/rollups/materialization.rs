@@ -1221,6 +1221,13 @@ impl ChunkStorage {
         progress
     }
 
+    pub(super) fn rollup_traversal_cycle_complete(&self) -> bool {
+        self.rollup_run_coordination_context()
+            .traversal_cursor
+            .lock()
+            .cycle_complete
+    }
+
     fn rollup_source_page_limits(&self) -> BackgroundRollupPassLimits {
         // A bounded page retains decoded labels plus the canonical source key for every selected
         // series. Model the temporary canonical bytes conservatively as another three identities;

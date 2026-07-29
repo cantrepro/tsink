@@ -111,6 +111,7 @@ pub struct ReadFanoutMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ReadFanoutOperationMetricsSnapshot {
     pub operation: String,
     pub requests_total: u64,
@@ -118,6 +119,7 @@ pub struct ReadFanoutOperationMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ReadFanoutPeerMetricsSnapshot {
     pub node_id: String,
     pub operation: String,
@@ -129,10 +131,56 @@ pub struct ReadFanoutPeerMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ReadFanoutLabeledMetricsSnapshot {
     pub operations: Vec<ReadFanoutOperationMetricsSnapshot>,
     pub peers: Vec<ReadFanoutPeerMetricsSnapshot>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFanoutOperationMetricsExpositionSnapshot {
+    pub operation: String,
+    pub requests_total: u64,
+    pub failures_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFanoutPeerMetricsExpositionSnapshot {
+    pub node_id: String,
+    pub operation: String,
+    pub remote_requests_total: u64,
+    pub remote_failures_total: u64,
+    pub remote_request_duration_nanos_total: u64,
+    pub remote_request_duration_count: u64,
+    pub remote_request_duration_buckets: [u64; 8],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadFanoutLabeledMetricsExpositionSnapshot {
+    pub operations: Vec<ReadFanoutOperationMetricsExpositionSnapshot>,
+    pub peers: Vec<ReadFanoutPeerMetricsExpositionSnapshot>,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub struct AccountedReadFanoutLabeledMetricsSnapshot {
+    snapshot: ReadFanoutLabeledMetricsExpositionSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedReadFanoutLabeledMetricsSnapshot {
+    #[must_use]
+    pub fn snapshot(&self) -> &ReadFanoutLabeledMetricsExpositionSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+const FANOUT_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 const FANOUT_OPERATION_SELECT_SERIES: &str = "select_series";
 const FANOUT_OPERATION_LIST_METRICS: &str = "list_metrics";
@@ -1199,6 +1247,7 @@ pub fn read_fanout_metrics_snapshot() -> ReadFanoutMetricsSnapshot {
     }
 }
 
+#[allow(dead_code)]
 pub fn read_fanout_labeled_metrics_snapshot() -> ReadFanoutLabeledMetricsSnapshot {
     with_fanout_labeled_metrics(|metrics| {
         let mut operations = metrics
@@ -1239,6 +1288,134 @@ pub fn read_fanout_labeled_metrics_snapshot() -> ReadFanoutLabeledMetricsSnapsho
 
         ReadFanoutLabeledMetricsSnapshot { operations, peers }
     })
+}
+
+pub fn read_fanout_labeled_metrics_snapshot_with_execution(
+    execution: &QueryExecution,
+) -> Result<AccountedReadFanoutLabeledMetricsSnapshot, QueryBudgetError> {
+    execution.checkpoint()?;
+    with_fanout_labeled_metrics(|metrics| {
+        read_fanout_labeled_metrics_snapshot_from(metrics, execution)
+    })
+}
+
+fn read_fanout_labeled_metrics_snapshot_from(
+    metrics: &ReadFanoutLabeledMetrics,
+    execution: &QueryExecution,
+) -> Result<AccountedReadFanoutLabeledMetricsSnapshot, QueryBudgetError> {
+    execution.checkpoint()?;
+    let operation_count = metrics.operation_requests_total.len();
+    let peer_count = metrics.peer_metrics.len();
+    let peak_bytes =
+        modeled_fanout_metrics_vec_bytes::<ReadFanoutOperationMetricsExpositionSnapshot>(
+            operation_count,
+        )
+        .saturating_add(modeled_fanout_metrics_vec_bytes::<
+            ReadFanoutPeerMetricsExpositionSnapshot,
+        >(peer_count))
+        .saturating_add(
+            metrics
+                .operation_requests_total
+                .keys()
+                .fold(0u64, |bytes, operation| {
+                    bytes.saturating_add(modeled_fanout_metrics_string_bytes(operation))
+                }),
+        )
+        .saturating_add(metrics.peer_metrics.keys().fold(
+            0u64,
+            |bytes, (node_id, operation)| {
+                bytes
+                    .saturating_add(modeled_fanout_metrics_string_bytes(node_id))
+                    .saturating_add(modeled_fanout_metrics_string_bytes(operation))
+            },
+        ));
+    let mut reservation = execution.reserve_memory(peak_bytes)?;
+
+    let mut operations = Vec::with_capacity(operation_count);
+    for (operation, requests_total) in &metrics.operation_requests_total {
+        execution.checkpoint()?;
+        operations.push(ReadFanoutOperationMetricsExpositionSnapshot {
+            operation: operation.clone(),
+            requests_total: *requests_total,
+            failures_total: metrics
+                .operation_failures_total
+                .get(operation)
+                .copied()
+                .unwrap_or(0),
+        });
+    }
+    operations.sort_by(|left, right| left.operation.cmp(&right.operation));
+
+    let mut peers = Vec::with_capacity(peer_count);
+    for ((node_id, operation), peer) in &metrics.peer_metrics {
+        execution.checkpoint()?;
+        peers.push(ReadFanoutPeerMetricsExpositionSnapshot {
+            node_id: node_id.clone(),
+            operation: operation.clone(),
+            remote_requests_total: peer.remote_requests_total,
+            remote_failures_total: peer.remote_failures_total,
+            remote_request_duration_nanos_total: peer.remote_request_latency.sum_nanos,
+            remote_request_duration_count: peer.remote_request_latency.count,
+            remote_request_duration_buckets: peer.remote_request_latency.bucket_counts,
+        });
+    }
+    let snapshot = ReadFanoutLabeledMetricsExpositionSnapshot { operations, peers };
+    reservation.resize(modeled_fanout_metrics_snapshot_bytes(&snapshot))?;
+    Ok(AccountedReadFanoutLabeledMetricsSnapshot {
+        snapshot,
+        _reservation: reservation,
+    })
+}
+
+fn modeled_fanout_metrics_snapshot_bytes(
+    snapshot: &ReadFanoutLabeledMetricsExpositionSnapshot,
+) -> u64 {
+    modeled_fanout_metrics_vec_bytes::<ReadFanoutOperationMetricsExpositionSnapshot>(
+        snapshot.operations.capacity(),
+    )
+    .saturating_add(modeled_fanout_metrics_vec_bytes::<
+        ReadFanoutPeerMetricsExpositionSnapshot,
+    >(snapshot.peers.capacity()))
+    .saturating_add(snapshot.operations.iter().fold(0u64, |bytes, operation| {
+        bytes.saturating_add(modeled_fanout_metrics_string_capacity_bytes(
+            &operation.operation,
+        ))
+    }))
+    .saturating_add(snapshot.peers.iter().fold(0u64, |bytes, peer| {
+        bytes
+            .saturating_add(modeled_fanout_metrics_string_capacity_bytes(&peer.node_id))
+            .saturating_add(modeled_fanout_metrics_string_capacity_bytes(
+                &peer.operation,
+            ))
+    }))
+}
+
+fn modeled_fanout_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(FANOUT_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_fanout_metrics_string_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(FANOUT_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_fanout_metrics_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(FANOUT_METRICS_ALLOCATION_ALLOWANCE_BYTES)
 }
 
 fn with_fanout_labeled_metrics<T>(mut f: impl FnMut(&mut ReadFanoutLabeledMetrics) -> T) -> T {
@@ -5768,5 +5945,113 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn fanout_metrics_projection_enforces_exact_memory_and_cancellation() {
+        let mut peer = PerPeerFanoutMetrics {
+            remote_requests_total: 4,
+            remote_failures_total: 1,
+            ..PerPeerFanoutMetrics::default()
+        };
+        peer.remote_request_latency.record(10_000_000);
+        let metrics = ReadFanoutLabeledMetrics {
+            operation_requests_total: BTreeMap::from([
+                (FANOUT_OPERATION_LIST_METRICS.to_string(), 2),
+                (FANOUT_OPERATION_SELECT_SERIES.to_string(), 3),
+            ]),
+            operation_failures_total: BTreeMap::from([(
+                FANOUT_OPERATION_SELECT_SERIES.to_string(),
+                1,
+            )]),
+            peer_metrics: BTreeMap::from([(
+                (
+                    "projection-peer".to_string(),
+                    FANOUT_REMOTE_OPERATION_SELECT_BATCH.to_string(),
+                ),
+                peer,
+            )]),
+        };
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(1024 * 1024),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(1024 * 1024),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration execution should admit");
+        let snapshot = read_fanout_labeled_metrics_snapshot_from(&metrics, &calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = snapshot.accounted_bytes();
+        assert!(exact_bytes > 1);
+        assert_eq!(
+            snapshot
+                .snapshot()
+                .operations
+                .iter()
+                .map(|operation| operation.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_metrics", "select_series"]
+        );
+        drop(snapshot);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact execution should admit");
+        let snapshot = read_fanout_labeled_metrics_snapshot_from(&metrics, &exact)
+            .expect("the exact modeled limit should pass");
+        assert_eq!(snapshot.accounted_bytes(), exact_bytes);
+        drop(snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes - 1),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under execution should admit");
+        match read_fanout_labeled_metrics_snapshot_from(&metrics, &one_under)
+            .expect_err("one byte below the modeled limit must fail")
+        {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+
+        let cancellation = QueryCancellationToken::new();
+        let cancelled_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancelled = cancelled_budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("cancelled execution should initially admit");
+        cancellation.cancel();
+        assert!(matches!(
+            read_fanout_labeled_metrics_snapshot_from(&metrics, &cancelled),
+            Err(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(cancelled.snapshot().memory_reserved_bytes, 0);
     }
 }

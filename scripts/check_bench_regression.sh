@@ -1,13 +1,27 @@
+#!/usr/bin/env bash
 set -euo pipefail
 
 THRESHOLD="${1:-50}"
 THRESHOLD_FRAC=$(awk "BEGIN {printf \"%.6f\", $THRESHOLD / 100}")
+BENCH_FILTER="${TSINK_BENCH_REGRESSION_FILTER:-}"
 
-shopt -s globstar nullglob
-FILES=(target/criterion/**/change/estimates.json)
+FILES=()
+while IFS= read -r f; do
+  bench="${f#target/criterion/}"
+  bench="${bench%/change/estimates.json}"
+  if [[ -n "$BENCH_FILTER" ]] && ! [[ "$bench" =~ $BENCH_FILTER ]]; then
+    continue
+  fi
+  FILES+=("$f")
+done < <(
+  if [[ -d target/criterion ]]; then
+    find target/criterion -type f -path '*/change/estimates.json' -print | LC_ALL=C sort
+  fi
+)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
-  echo "No baseline found — skipping regression check (first run)."
+  echo "REGRESSION_CHECK status=skipped reason=no_change_estimates"
+  echo "No in-scope Criterion change estimates were produced; no regression comparison was performed."
   exit 0
 fi
 
@@ -16,7 +30,11 @@ for f in "${FILES[@]}"; do
   bench="${f#target/criterion/}"
   bench="${bench%/change/estimates.json}"
 
-  pct=$(jq -r '.mean.point_estimate' "$f")
+  if ! pct=$(jq -er '.mean.point_estimate | select(type == "number")' "$f"); then
+    echo "FAIL: $bench has no numeric mean point estimate"
+    FAILED=1
+    continue
+  fi
   display=$(awk "BEGIN {printf \"%.1f\", $pct * 100}")
 
   if awk "BEGIN {exit !($pct > $THRESHOLD_FRAC)}"; then
@@ -29,8 +47,8 @@ done
 
 echo ""
 if [[ "$FAILED" -eq 1 ]]; then
-  echo "One or more benchmarks regressed beyond the ${THRESHOLD}% threshold."
+  echo "Criterion regression check failed: a comparison exceeded the ${THRESHOLD}% threshold or a change estimate was invalid."
   exit 1
 else
-  echo "All benchmarks within the ${THRESHOLD}% regression threshold."
+  echo "All in-scope cached benchmark comparisons are within the ${THRESHOLD}% threshold."
 fi

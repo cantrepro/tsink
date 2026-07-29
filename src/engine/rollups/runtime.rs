@@ -2,6 +2,37 @@ use super::policy::{encode_rollup_policies, load_rollup_policies};
 use super::*;
 use crate::engine::series::SeriesKey;
 
+const ROLLUP_METRICS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: usize = 64;
+
+fn rollup_metrics_capacity_upper(required: usize) -> Result<usize> {
+    if required == 0 {
+        return Ok(0);
+    }
+    required.checked_next_power_of_two().ok_or_else(|| {
+        TsinkError::Other(
+            "rollup metrics snapshot allocation capacity exceeds the supported range".to_string(),
+        )
+    })
+}
+
+fn modeled_rollup_metrics_retained_bytes(policy_count: usize, label_bytes: usize) -> Result<u64> {
+    let policies_capacity = rollup_metrics_capacity_upper(policy_count)?;
+    let labels_capacity = rollup_metrics_capacity_upper(label_bytes)?;
+    let bytes = policies_capacity
+        .checked_mul(std::mem::size_of::<RollupMetricsPolicyStatus>())
+        .and_then(|bytes| bytes.checked_add(labels_capacity))
+        .and_then(|bytes| {
+            bytes.checked_add(2 * ROLLUP_METRICS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+        })
+        .ok_or_else(|| {
+            TsinkError::Other(
+                "rollup metrics snapshot retained-byte model exceeds the supported range"
+                    .to_string(),
+            )
+        })?;
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
 impl RollupRuntimeState {
     pub(in crate::engine) fn new_with_disk_budget(
         data_path: Option<PathBuf>,
@@ -757,6 +788,135 @@ impl<'a> RollupStateStoreContext<'a> {
 
     pub(super) fn policy_stats_snapshot(self) -> BTreeMap<String, PolicyRunState> {
         self.state.policy_stats.read().clone()
+    }
+
+    pub(super) fn metrics_policy_snapshot(
+        self,
+        execution: &crate::QueryExecution,
+        reservation: &mut crate::QueryMemoryReservation,
+        max_observed_timestamp: Option<i64>,
+        traversal_cycle_complete: bool,
+    ) -> Result<(Vec<RollupMetricsPolicyStatus>, String, bool)> {
+        execution.checkpoint()?;
+        let _visibility = self.state.snapshot_visibility.read();
+        let policies = self.state.policies.read();
+        let policy_stats = self.state.policy_stats.read();
+        execution.checkpoint()?;
+
+        let label_bytes = policies.iter().try_fold(0usize, |bytes, policy| {
+            bytes
+                .checked_add(policy.id.len())
+                .and_then(|bytes| bytes.checked_add(policy.metric.len()))
+                .ok_or_else(|| {
+                    TsinkError::Other(
+                        "rollup metrics label bytes exceed the supported range".to_string(),
+                    )
+                })
+        })?;
+        let retained_bytes = modeled_rollup_metrics_retained_bytes(policies.len(), label_bytes)?;
+        let total_reservation =
+            reservation
+                .bytes()
+                .checked_add(retained_bytes)
+                .ok_or_else(|| {
+                    TsinkError::Other(
+                        "storage metrics snapshot reservation exceeds the supported range"
+                            .to_string(),
+                    )
+                })?;
+        reservation.resize(total_reservation)?;
+
+        let mut projected = Vec::new();
+        projected.try_reserve_exact(policies.len()).map_err(|_| {
+            TsinkError::Other("rollup metrics policy allocation failed".to_string())
+        })?;
+        let mut label_arena = String::new();
+        label_arena
+            .try_reserve_exact(label_bytes)
+            .map_err(|_| TsinkError::Other("rollup metrics label allocation failed".to_string()))?;
+        let actual_modeled_bytes = projected
+            .capacity()
+            .checked_mul(std::mem::size_of::<RollupMetricsPolicyStatus>())
+            .and_then(|bytes| bytes.checked_add(label_arena.capacity()))
+            .and_then(|bytes| {
+                bytes.checked_add(2 * ROLLUP_METRICS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES)
+            })
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "rollup metrics allocated capacity exceeds the supported range".to_string(),
+                )
+            })?;
+        if u64::try_from(actual_modeled_bytes).unwrap_or(u64::MAX) > retained_bytes {
+            return Err(TsinkError::Other(
+                "rollup metrics allocator exceeded its reserved capacity upper bound".to_string(),
+            ));
+        }
+
+        let max_observed_timestamp = max_observed_timestamp.unwrap_or(i64::MIN);
+        let mut all_policies_complete = true;
+        for policy in policies.iter() {
+            execution.checkpoint()?;
+            #[cfg(test)]
+            self.state
+                .test_hooks
+                .metrics_snapshot_policy_copies
+                .fetch_add(1, Ordering::Relaxed);
+
+            let runtime = policy_stats.get(&policy.id);
+            let materialized_through = runtime
+                .filter(|state| state.source_traversal_complete)
+                .and_then(|state| state.materialized_through);
+            let source_traversal_complete =
+                runtime.is_some_and(|state| state.source_traversal_complete);
+            all_policies_complete &= source_traversal_complete;
+
+            let policy_id_start = label_arena.len();
+            label_arena.push_str(&policy.id);
+            let policy_id = policy_id_start..label_arena.len();
+            let metric_start = label_arena.len();
+            label_arena.push_str(&policy.metric);
+            let metric = metric_start..label_arena.len();
+            projected.push(RollupMetricsPolicyStatus {
+                policy_id,
+                metric,
+                aggregation: policy.aggregation,
+                interval: policy.interval,
+                matched_series: runtime.map_or(0, |state| state.matched_series),
+                materialized_series: runtime.map_or(0, |state| state.materialized_series),
+                materialized_through,
+                lag: materialized_through.and_then(|through| {
+                    (max_observed_timestamp != i64::MIN)
+                        .then_some(max_observed_timestamp.saturating_sub(through))
+                }),
+                source_traversal_complete,
+                last_run_started_at_ms: runtime.and_then(|state| state.last_run_started_at_ms),
+                last_run_completed_at_ms: runtime.and_then(|state| state.last_run_completed_at_ms),
+                last_run_duration_nanos: runtime.map_or(0, |state| state.last_run_duration_nanos),
+            });
+        }
+        debug_assert_eq!(projected.len(), policies.len());
+        debug_assert_eq!(label_arena.len(), label_bytes);
+        Ok((
+            projected,
+            label_arena,
+            traversal_cycle_complete && all_policies_complete,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn metrics_snapshot_policy_copies(self) -> u64 {
+        self.state
+            .test_hooks
+            .metrics_snapshot_policy_copies
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_metrics_snapshot_policy_copies(self) {
+        self.state
+            .test_hooks
+            .metrics_snapshot_policy_copies
+            .store(0, Ordering::Relaxed);
     }
 
     fn load_policies(self) -> Result<Vec<RollupPolicy>> {

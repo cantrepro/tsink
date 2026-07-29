@@ -80,19 +80,76 @@ compatibility and is not yet covered by a stable support promise.
 - Hard PromQL parser ceilings of 64 KiB of UTF-8 input, 16,384 non-EOF tokens, and 64 nested
   expression levels, including iterative handling and bounded construction of long unary,
   operator, and subquery chains.
+- A schema-complete `Storage::status_observability_snapshot_with_execution` projection for the
+  built-in engine. It reserves the complete retained status clone before materializing dynamic
+  fields, retains that reservation with the returned snapshot, and has exact/one-under,
+  cancellation, and schema-equivalence coverage. The third-party backend default fails closed,
+  while tenant-scoped and distributed adapters forward the execution-aware contract.
 
 ### Changed
 
 - `GET /api/v1/status/tsdb` now fails closed unless metric enumeration exposes complete detailed
-  query accounting, propagates storage errors instead of reporting a false zero-series success,
-  reserves its hotspot transformation under one execution, and enforces a fixed 1 MiB encoded
-  response ceiling while retaining the measured JSON tree and exact body/header guards through
-  response construction. The fixed response ceiling no longer tightens `ExpertUnlimited` metric
-  enumeration; legacy operational snapshot clones and JSON-tree construction remain an explicit
-  status-adapter accounting boundary.
+  query accounting and now carries one root execution through the schema-complete core storage and
+  external-disk projections plus the allocation-bearing write/fanout, outbox,
+  consensus/handoff, digest, hotspot/rebalance, tenant, audit, security/RBAC, usage,
+  managed-control-plane, and edge-sync status producers, together with the allocation-free fixed
+  planner projection. Each dynamic producer reserves before materialization, and its private guard
+  remains live while the response tree borrows the projection. Storage errors are propagated
+  instead of becoming a false zero-series success. A
+  fixed 1 MiB encoded response ceiling retains the measured JSON tree and exact body/header guards
+  through response construction without tightening `ExpertUnlimited` metric enumeration. The
+  adapter still constructs that JSON tree before its retained-tree reservation is established;
+  this construction peak and the process-global retained hotspot policy remain explicit
+  boundaries.
+- Admin rebalance status, pause, resume, and run now use one root query execution across complete
+  metric enumeration, live control input, the shared hotspot tracker projection, scheduler status,
+  and exact response serialization. The established successful response schema is unchanged.
+  When a mutating operation takes effect but later projection or response admission fails, the
+  structured error reports `data.effectApplied: true` and the resulting pause/run state instead of
+  implying that no effect occurred. The retained hotspot source-cardinality policy remains open.
+- The best-effort `/metrics` collector now uses one query execution across complete metric
+  enumeration, hotspot transformation, storage observability, rules, and allocation-bearing
+  cluster projections. A cancellation-aware counting pass and exact-capacity write pass enforce a
+  1 MiB normal response ceiling with exact returned-byte and modeled body/header admission;
+  failures preserve HTTP 200 with a Prometheus-parseable fallback bounded to 4 KiB. Protocol
+  configuration is initialized before listener binding so a first scrape cannot perform lazy
+  environment allocation. Retained hotspot source cardinality and transport/runtime memory remain
+  separate boundaries.
+- Legacy `/internal/v1/select_series` and `/internal/v1/list_metrics` requests that omit the
+  additive `query_limits` field now inherit a finite Server per-query ceiling tightened by the
+  storage instance, require complete accounting, and keep local, handoff, encoding, and response
+  work under one execution while preserving the legacy response shape without `accounting`.
+- The legacy single-series `/internal/v1/select` request now runs through the finite, completely
+  accounted one-selector batch path, including cutover handoff and exact response encoding, while
+  retaining its original request and `{"points": ...}` response wire shape.
+- `GET /api/v1/admin/support_bundle` now caps aggregate retained child responses, admits one root
+  execution before child collection, and retains an exact same-execution guard around every
+  completed child response before it crosses back to the orchestrator. TSDB status and rebalance
+  reuse that execution instead of self-admitting; the parent composition reservation excludes
+  already-guarded child bytes, and only the final bundle charges HTTP response-body bytes. Child
+  source operations still charge their canonical logical returned work. Valid child JSON is
+  serialized without a duplicate parsed tree, non-JSON fallback text is bounded, and the fixed
+  16 MiB final response has exact body/header admission. Structured query-pressure and oversize
+  responses replace uncontrolled composition. Legacy operational child snapshot/serialization
+  transients plus bounded tenant/actor and synthetic-request setup before the parent reservation
+  remain explicit adapter boundaries. Tenant override resolution now rejects decoded IDs above the
+  16 KiB label-value ceiling before decoding and no longer clones the potentially 64 MiB request
+  body.
 - Empty-policy background rollup passes no longer drain every writer permit. They retain the
   existing worker-success/cursor-cleanup behavior under the rollup transaction lock, still reject
   a fenced snapshot publication, and leave a pending checkpoint retry intact on that error.
+- Background compaction replacement recovery now retains a finite directory cursor and consumes
+  at most one namespace entry or one admitted marker per wake before planning. Marker decode has
+  fixed 4 MiB/16K-record caps, conservative pre-decode memory admission, and same-file identity
+  checks; startup, close, and standalone recovery remain exhaustive.
+- The separate post-flush fence before production background compaction now retains a
+  shared-memory-accounted `ReadDir` cursor and consumes one admitted raw marker-namespace entry per
+  wake. Its path-scaled model covers both retained directory paths, the full recognized entry path,
+  file-name scratch, and 64 KiB of directory-stream/platform scratch. Compaction cannot plan or
+  mutate until a marker-publication-generation-stable terminal probe proves the namespace clean;
+  publication invalidates the cursor, and terminal, error, reset, close, or drop releases its
+  reservation before the data-path lease. Foreground, flush, catalog-refresh, and standalone
+  exhaustive fences are unchanged.
 - Persistent opens now state and test their fail-closed WAL boundary explicitly: the complete
   published WAL prefix is validated strictly before logical replay, including every byte in a
   markerless legacy WAL before a current publication marker is adopted, even when
@@ -123,12 +180,20 @@ compatibility and is not yet covered by a stable support promise.
   ref is a real `VERSION`/`vVERSION` tag at the immutable trigger commit, rejects a tag that moved
   after the event, and requires the first two changelog sections to be an empty `Unreleased`
   section followed by the promoted version. It runs all-feature, no-default-feature, MSRV,
-  server-version, documentation, and package gates and always builds the Python artifacts,
-  installing native wheels before upload. Release/manual runs for the same tag share one
-  concurrency group, and missing wheel or sdist output is a hard failure. crates.io publication
-  remains disabled until the mandatory storage/crash/compatibility and final-artifact integrity
-  gates exist; PyPI publication remains disabled while cross-compiled wheel targets lack
-  equivalent runtime smoke coverage.
+  server-version, documentation, and package gates and always builds the Python artifacts.
+  Package gates require the exact five-crate workspace set and one version, fully verify the
+  protocol and core archives, then compile each exact downstream archive offline against those
+  packaged foundations. Native wheels are installed before upload. Release/manual runs for the
+  same tag share one concurrency group, and missing wheel or sdist output is a hard failure.
+  crates.io publication remains disabled until the mandatory storage/crash/compatibility and
+  final-artifact integrity gates exist; PyPI publication remains disabled while cross-compiled
+  wheel targets lack equivalent runtime smoke coverage.
+- CI now treats the quick bytes-per-point workload as a health smoke and reports its still
+  unqualified size target without enforcing it. The quick Criterion path is Bash 3.2 compatible,
+  dispatches only its intended benchmark groups, limits cached comparisons to the eight cases that
+  actually ran, and keeps the million-point select finite through chunked fixture writes plus an
+  explicit Embedded-derived query envelope. The larger persisted-refresh shapes remain in the full
+  benchmark mode.
 - PromQL `info()` discovery and series reads now reuse the caller's admitted `QueryExecution`.
   They no longer acquire a nested query permit or escape request-tightened series and memory
   accounting.

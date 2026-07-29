@@ -30,6 +30,17 @@ fn post_flush_failure_with_recovery(
     }
 }
 
+fn after_invalidating_background_post_flush_clean_fence<T>(
+    cursor: &parking_lot::Mutex<BackgroundPostFlushCleanFenceCursor>,
+    marker_generation: &AtomicU64,
+    publish_marker: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // Keep marker creation inside this callback boundary: a retained ReadDir must be dropped and
+    // its generation advanced before the marker can enter the namespace behind that cursor.
+    invalidate_background_post_flush_clean_fence(cursor, marker_generation)?;
+    publish_marker()
+}
+
 enum PostFlushCatalogPublication {
     Published(usize),
     Deferred,
@@ -119,6 +130,13 @@ impl ChunkStorage {
     pub(in crate::engine::storage_engine) fn reset_background_post_flush_recovery_cursor(&self) {
         self.coordination
             .background_post_flush_recovery_cursor
+            .lock()
+            .reset();
+    }
+
+    pub(in crate::engine::storage_engine) fn reset_background_post_flush_clean_fence_cursor(&self) {
+        self.coordination
+            .background_post_flush_clean_fence_cursor
             .lock()
             .reset();
     }
@@ -818,13 +836,23 @@ impl ChunkStorage {
                 None
             };
 
-        let mut replacement = match publish_prepared_replacement(
-            data_path,
-            self.post_flush_segment_path_resolver(),
-            &retired_roots,
-            &promotions,
-            tier_moves,
-            self.persisted.local_disk_budget.as_ref(),
+        // The caller holds the shared compaction gate, so clean-fence reset, generation advance,
+        // marker publication, and any immediate recovery are serialized with the compactor.
+        let mut replacement = match after_invalidating_background_post_flush_clean_fence(
+            self.coordination
+                .background_post_flush_clean_fence_cursor
+                .as_ref(),
+            self.coordination.post_flush_marker_generation.as_ref(),
+            || {
+                publish_prepared_replacement(
+                    data_path,
+                    self.post_flush_segment_path_resolver(),
+                    &retired_roots,
+                    &promotions,
+                    tier_moves,
+                    self.persisted.local_disk_budget.as_ref(),
+                )
+            },
         ) {
             Ok(replacement) => replacement,
             Err(err) => {
@@ -1113,5 +1141,31 @@ impl ChunkStorage {
         };
         self.drain_live_metadata_reconciliation_pages()?;
         Ok(recovered_expired.saturating_add(removed))
+    }
+}
+
+#[cfg(test)]
+mod publication_order_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn marker_publication_callback_runs_only_after_clean_fence_invalidation() {
+        let cursor = parking_lot::Mutex::new(BackgroundPostFlushCleanFenceCursor::default());
+        let marker_generation = AtomicU64::new(41);
+        after_invalidating_background_post_flush_clean_fence(&cursor, &marker_generation, || {
+            assert_eq!(marker_generation.load(Ordering::Acquire), 42);
+            Ok(())
+        })
+        .unwrap();
+
+        let overflow_generation = AtomicU64::new(u64::MAX);
+        let publication_ran = AtomicBool::new(false);
+        after_invalidating_background_post_flush_clean_fence(&cursor, &overflow_generation, || {
+            publication_ran.store(true, Ordering::Release);
+            Ok(())
+        })
+        .expect_err("generation overflow must stop before marker publication");
+        assert!(!publication_ran.load(Ordering::Acquire));
     }
 }

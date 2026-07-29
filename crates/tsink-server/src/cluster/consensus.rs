@@ -1,6 +1,9 @@
 use crate::cluster::control::{
-    encode_control_state_file, ControlHandoffMutationOutcome, ControlMembershipMutationOutcome,
-    ControlNodeStatus, ControlState, ControlStateStore,
+    encode_control_state_file, modeled_control_metrics_projection_retained_bytes,
+    modeled_control_status_projection_retained_bytes, AccountedControlRebalanceProjection,
+    ClusterHandoffSnapshot, ControlHandoffMutationOutcome, ControlHotspotSnapshot,
+    ControlMembershipMutationOutcome, ControlMetricsProjection, ControlNodeStatus, ControlState,
+    ControlStateStore, ControlStatusProjection,
 };
 use crate::cluster::membership::MembershipView;
 use crate::cluster::rpc::{
@@ -39,6 +42,7 @@ const DEFAULT_CONTROL_SUSPECT_TIMEOUT_SECS: u64 = 6;
 const DEFAULT_CONTROL_DEAD_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_CONTROL_LEADER_LEASE_SECS: u64 = 6;
 const CONTROL_SYNC_MAX_ATTEMPTS: usize = 4;
+const CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 
 #[cfg(test)]
 struct ControlCheckpointPublishFailureGuard {
@@ -619,6 +623,91 @@ pub struct ControlPersistenceStatus {
     pub pending_checkpoint: Option<ControlCommitPosition>,
     pub cleanup_debt: bool,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlMetricsSnapshot {
+    pub liveness: ControlLivenessSnapshot,
+    pub persistence: ControlPersistenceStatus,
+    pub handoff: ClusterHandoffSnapshot,
+    pub hotspot: ControlHotspotSnapshot,
+}
+
+impl ControlMetricsSnapshot {
+    pub(crate) fn empty(local_node_id: String) -> Self {
+        Self {
+            liveness: ControlLivenessSnapshot::empty(local_node_id),
+            persistence: ControlPersistenceStatus {
+                fenced: false,
+                pending_checkpoint: None,
+                cleanup_debt: false,
+                detail: None,
+            },
+            handoff: ClusterHandoffSnapshot::empty(),
+            hotspot: ControlHotspotSnapshot {
+                handoff_shards: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Consensus metrics output whose dynamic allocations stay charged to the caller's query.
+#[derive(Debug)]
+pub(crate) struct AccountedControlMetricsSnapshot {
+    pub snapshot: ControlMetricsSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl AccountedControlMetricsSnapshot {
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl Deref for AccountedControlMetricsSnapshot {
+    type Target = ControlMetricsSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+/// Schema-complete consensus/control-state input for the TSDB status response.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlStatusSnapshot {
+    pub liveness: ControlLivenessSnapshot,
+    pub persistence: ControlPersistenceStatus,
+    pub handoff: ClusterHandoffSnapshot,
+    pub hotspot: ControlHotspotSnapshot,
+}
+
+/// Status output whose dynamic allocations remain charged until every borrowed field is dropped.
+///
+/// The inner snapshot is intentionally private and this wrapper has no extraction method, so a
+/// caller cannot move the output away from its reservation.
+#[derive(Debug)]
+#[must_use = "dropping the status snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedControlStatusSnapshot {
+    snapshot: ControlStatusSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl AccountedControlStatusSnapshot {
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl Deref for AccountedControlStatusSnapshot {
+    type Target = ControlStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2209,6 +2298,7 @@ impl ControlConsensusRuntime {
         self.local_is_control_leader_locked(&state)
     }
 
+    #[allow(dead_code)]
     pub fn liveness_snapshot(&self) -> ControlLivenessSnapshot {
         let state = self
             .state
@@ -2254,6 +2344,259 @@ impl ControlConsensusRuntime {
             dead_peers,
             peers,
         }
+    }
+
+    /// Captures the live, minimal control-state input needed by rebalance status under one lock.
+    ///
+    /// The control-state projection establishes its reservation while this lock is held, closing
+    /// the measurement-to-clone race without copying unrelated consensus/liveness state.
+    pub(crate) fn rebalance_projection_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedControlRebalanceProjection, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        state
+            .control_state
+            .rebalance_projection_with_execution(&self.local_node_id, execution)
+    }
+
+    /// Captures every schema-visible consensus/control input needed by TSDB status under one lock.
+    ///
+    /// The complete retained output is measured and reserved before any peer, leader, persistence,
+    /// or handoff diagnostic is cloned. The private accounted wrapper then keeps that reservation
+    /// alive for as long as any status field can be borrowed.
+    pub(crate) fn status_snapshot_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedControlStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let liveness_bytes =
+            self.modeled_metrics_liveness_retained_bytes_with_execution(&state, execution)?;
+        let persistence_bytes = control_persistence_detail(&state)
+            .map(modeled_control_metrics_str_bytes)
+            .unwrap_or(0);
+        let control_bytes = state
+            .control_state
+            .status_projection_retained_bytes_with_execution(execution)?;
+        let peak_bytes = liveness_bytes
+            .saturating_add(persistence_bytes)
+            .saturating_add(control_bytes);
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let now_ms = unix_timestamp_millis();
+        let mut peers = Vec::with_capacity(state.peer_heartbeat.len());
+        let mut suspect_peers = 0usize;
+        let mut dead_peers = 0usize;
+        for (node_id, heartbeat) in &state.peer_heartbeat {
+            execution.checkpoint()?;
+            let status = self.peer_liveness_status(heartbeat, now_ms);
+            if status == ControlPeerLivenessStatus::Suspect {
+                suspect_peers = suspect_peers.saturating_add(1);
+            }
+            if status == ControlPeerLivenessStatus::Dead {
+                dead_peers = dead_peers.saturating_add(1);
+            }
+            peers.push(ControlPeerLivenessSnapshot {
+                node_id: clone_control_metrics_string(node_id),
+                status,
+                last_success_unix_ms: heartbeat.last_success_unix_ms,
+                last_failure_unix_ms: heartbeat.last_failure_unix_ms,
+                consecutive_failures: heartbeat.consecutive_failures,
+            });
+        }
+        let leader_node_id = state
+            .control_state
+            .leader_node_id
+            .as_deref()
+            .map(clone_control_metrics_string);
+        let leader_last_contact_unix_ms = leader_node_id
+            .as_ref()
+            .map(|_| state.last_leader_contact_unix_ms);
+        let leader_contact_age_ms =
+            leader_last_contact_unix_ms.map(|contact_ms| now_ms.saturating_sub(contact_ms));
+        let liveness = ControlLivenessSnapshot {
+            local_node_id: clone_control_metrics_string(&self.local_node_id),
+            current_term: state.current_term,
+            commit_index: state.commit_index,
+            leader_node_id,
+            leader_last_contact_unix_ms,
+            leader_contact_age_ms,
+            leader_stale: self.leader_is_stale_locked(&state, now_ms),
+            suspect_peers,
+            dead_peers,
+            peers,
+        };
+        let persistence = ControlPersistenceStatus {
+            fenced: state.persistence_fence.is_some()
+                || state.checkpoint_pending.is_some()
+                || state.pending_durable_candidate.is_some(),
+            pending_checkpoint: state
+                .checkpoint_pending
+                .as_ref()
+                .map(|pending| pending.position),
+            cleanup_debt: state.cleanup_debt.is_some(),
+            detail: control_persistence_detail(&state).map(clone_control_metrics_string),
+        };
+        let projection = state
+            .control_state
+            .status_projection_with_execution(execution)?;
+        let retained_bytes = modeled_control_metrics_liveness_retained_bytes(&liveness)
+            .saturating_add(
+                persistence
+                    .detail
+                    .as_ref()
+                    .map(modeled_control_metrics_string_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(modeled_control_status_projection_retained_bytes(
+                &projection,
+            ));
+        reservation.resize(retained_bytes)?;
+        let ControlStatusProjection { handoff, hotspot } = projection;
+
+        Ok(AccountedControlStatusSnapshot {
+            snapshot: ControlStatusSnapshot {
+                liveness,
+                persistence,
+                handoff,
+                hotspot,
+            },
+            _reservation: reservation,
+        })
+    }
+
+    /// Captures every consensus/control-state input needed by `/metrics` under one state lock.
+    ///
+    /// Dynamic output is measured and reserved before any peer, leader, or handoff String/Vec is
+    /// cloned. The returned reservation keeps the projection charged until the exporter is done
+    /// with it.
+    pub(crate) fn metrics_snapshot_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedControlMetricsSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let liveness_bytes =
+            self.modeled_metrics_liveness_retained_bytes_with_execution(&state, execution)?;
+        let control_bytes = state
+            .control_state
+            .metrics_projection_retained_bytes_with_execution(execution)?;
+        let mut reservation =
+            execution.reserve_memory(liveness_bytes.saturating_add(control_bytes))?;
+        execution.checkpoint()?;
+
+        let now_ms = unix_timestamp_millis();
+        let mut peers = Vec::with_capacity(state.peer_heartbeat.len());
+        let mut suspect_peers = 0usize;
+        let mut dead_peers = 0usize;
+        for (node_id, heartbeat) in &state.peer_heartbeat {
+            execution.checkpoint()?;
+            let status = self.peer_liveness_status(heartbeat, now_ms);
+            if status == ControlPeerLivenessStatus::Suspect {
+                suspect_peers = suspect_peers.saturating_add(1);
+            }
+            if status == ControlPeerLivenessStatus::Dead {
+                dead_peers = dead_peers.saturating_add(1);
+            }
+            peers.push(ControlPeerLivenessSnapshot {
+                node_id: clone_control_metrics_string(node_id),
+                status,
+                last_success_unix_ms: heartbeat.last_success_unix_ms,
+                last_failure_unix_ms: heartbeat.last_failure_unix_ms,
+                consecutive_failures: heartbeat.consecutive_failures,
+            });
+        }
+        let leader_node_id = state
+            .control_state
+            .leader_node_id
+            .as_deref()
+            .map(clone_control_metrics_string);
+        let leader_last_contact_unix_ms = leader_node_id
+            .as_ref()
+            .map(|_| state.last_leader_contact_unix_ms);
+        let leader_contact_age_ms =
+            leader_last_contact_unix_ms.map(|contact_ms| now_ms.saturating_sub(contact_ms));
+        let liveness = ControlLivenessSnapshot {
+            local_node_id: clone_control_metrics_string(&self.local_node_id),
+            current_term: state.current_term,
+            commit_index: state.commit_index,
+            leader_node_id,
+            leader_last_contact_unix_ms,
+            leader_contact_age_ms,
+            leader_stale: self.leader_is_stale_locked(&state, now_ms),
+            suspect_peers,
+            dead_peers,
+            peers,
+        };
+        let persistence = ControlPersistenceStatus {
+            fenced: state.persistence_fence.is_some()
+                || state.checkpoint_pending.is_some()
+                || state.pending_durable_candidate.is_some(),
+            pending_checkpoint: state
+                .checkpoint_pending
+                .as_ref()
+                .map(|pending| pending.position),
+            cleanup_debt: state.cleanup_debt.is_some(),
+            detail: None,
+        };
+        let projection = state
+            .control_state
+            .metrics_projection_with_execution(execution)?;
+        let retained_bytes = modeled_control_metrics_liveness_retained_bytes(&liveness)
+            .saturating_add(modeled_control_metrics_projection_retained_bytes(
+                &projection,
+            ));
+        reservation.resize(retained_bytes)?;
+        let ControlMetricsProjection { handoff, hotspot } = projection;
+
+        Ok(AccountedControlMetricsSnapshot {
+            snapshot: ControlMetricsSnapshot {
+                liveness,
+                persistence,
+                handoff,
+                hotspot,
+            },
+            _reservation: reservation,
+        })
+    }
+
+    fn modeled_metrics_liveness_retained_bytes_with_execution(
+        &self,
+        state: &ConsensusState,
+        execution: &tsink::QueryExecution,
+    ) -> Result<u64, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let mut retained_bytes = modeled_control_metrics_str_bytes(&self.local_node_id)
+            .saturating_add(modeled_control_metrics_vec_bytes::<
+                ControlPeerLivenessSnapshot,
+            >(state.peer_heartbeat.len()));
+        if let Some(leader_node_id) = state.control_state.leader_node_id.as_deref() {
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_control_metrics_str_bytes(leader_node_id));
+        }
+        for node_id in state.peer_heartbeat.keys() {
+            execution.checkpoint()?;
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_control_metrics_str_bytes(node_id));
+        }
+        Ok(retained_bytes)
     }
 
     fn validate_local_proposal_locked(
@@ -3827,6 +4170,72 @@ fn load_log_file(path: &Path) -> Result<ControlLogFileV1, String> {
         .map_err(|err| format!("failed to parse control-log file {}: {err}", path.display()))
 }
 
+fn control_persistence_detail(state: &ConsensusState) -> Option<&str> {
+    state
+        .persistence_fence
+        .as_deref()
+        .or_else(|| {
+            state
+                .checkpoint_pending
+                .as_ref()
+                .map(|pending| pending.detail.as_str())
+        })
+        .or(state.cleanup_debt.as_deref())
+}
+
+fn modeled_control_metrics_liveness_retained_bytes(snapshot: &ControlLivenessSnapshot) -> u64 {
+    modeled_control_metrics_string_bytes(&snapshot.local_node_id)
+        .saturating_add(
+            snapshot
+                .leader_node_id
+                .as_ref()
+                .map(modeled_control_metrics_string_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_control_metrics_vec_bytes::<
+            ControlPeerLivenessSnapshot,
+        >(snapshot.peers.capacity()))
+        .saturating_add(snapshot.peers.iter().fold(0u64, |retained_bytes, peer| {
+            retained_bytes.saturating_add(modeled_control_metrics_string_bytes(&peer.node_id))
+        }))
+}
+
+fn modeled_control_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_control_metrics_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn modeled_control_metrics_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        0
+    } else {
+        u64::try_from(value.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_add(CONTROL_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+    }
+}
+
+fn clone_control_metrics_string(value: &str) -> String {
+    let mut cloned = String::with_capacity(value.len());
+    cloned.push_str(value);
+    cloned
+}
+
 fn unix_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3856,7 +4265,9 @@ fn parse_env_u64(var: &str, default: u64, enforce_positive: bool) -> Result<u64,
 mod tests {
     use super::*;
     use crate::cluster::config::ClusterConfig;
-    use crate::cluster::control::ControlState;
+    use crate::cluster::control::{
+        ControlState, ShardHandoffPhase, ShardHandoffProgress, ShardOwnershipTransition,
+    };
     use crate::cluster::membership::{ClusterNode, MembershipView};
     use crate::cluster::ring::ShardRing;
     use crate::cluster::rpc::{
@@ -3866,6 +4277,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tsink::disk_budget::LocalDiskLimits;
+    use tsink::{
+        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        QueryWorkLimits,
+    };
 
     fn sample_membership_and_state() -> (MembershipView, ControlState) {
         let config = ClusterConfig {
@@ -3938,6 +4353,62 @@ mod tests {
             .restore_recovery_snapshot(state, log, true)
             .expect("local leader fixture should persist");
         assert!(runtime.is_local_control_leader());
+    }
+
+    fn configure_metrics_projection_fixture(runtime: &ControlConsensusRuntime) {
+        let now_ms = unix_timestamp_millis();
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.control_state.leader_node_id = Some("node-b".to_string());
+        state.last_leader_contact_unix_ms = now_ms;
+        state.persistence_fence = Some("diagnostic fence detail".repeat(256));
+        state.checkpoint_pending = Some(ControlCheckpointPending {
+            position: ControlCommitPosition { index: 17, term: 4 },
+            detail: "diagnostic checkpoint detail".repeat(256),
+        });
+        state.cleanup_debt = Some("diagnostic cleanup detail".repeat(256));
+        state.control_state.transitions = vec![
+            ShardOwnershipTransition {
+                shard: 0,
+                from_node_id: "node-a".to_string(),
+                to_node_id: "node-b".to_string(),
+                activation_ring_version: 2,
+                handoff: ShardHandoffProgress {
+                    phase: ShardHandoffPhase::Warmup,
+                    copied_rows: 41,
+                    pending_rows: 37,
+                    resumed_count: 1,
+                    started_unix_ms: now_ms.saturating_sub(10),
+                    updated_unix_ms: now_ms,
+                    last_error: Some("diagnostic handoff detail".repeat(256)),
+                },
+            },
+            ShardOwnershipTransition {
+                shard: 1,
+                from_node_id: "node-a".to_string(),
+                to_node_id: "node-b".to_string(),
+                activation_ring_version: 2,
+                handoff: ShardHandoffProgress {
+                    phase: ShardHandoffPhase::Completed,
+                    copied_rows: 73,
+                    pending_rows: 0,
+                    resumed_count: 0,
+                    started_unix_ms: now_ms.saturating_sub(20),
+                    updated_unix_ms: now_ms.saturating_sub(1),
+                    last_error: Some("completed diagnostic handoff detail".repeat(256)),
+                },
+            },
+        ];
+        state.peer_heartbeat.insert(
+            "node-b".to_string(),
+            PeerHeartbeatState {
+                last_success_unix_ms: Some(now_ms),
+                last_failure_unix_ms: None,
+                consecutive_failures: 0,
+            },
+        );
     }
 
     fn set_in_memory_node_status(
@@ -4403,6 +4874,80 @@ mod tests {
     }
 
     #[test]
+    fn removed_recommission_target_enters_postcommit_fanout_without_proposal_entry() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "removed-recommission",
+            64,
+        );
+        force_local_leader(&runtime);
+        set_in_memory_node_status(&runtime, "node-b", ControlNodeStatus::Removed);
+        let mut candidate = {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime.reconcile_dynamic_peers_locked(&mut state);
+            assert_eq!(
+                runtime.control_voter_node_ids_locked(&state),
+                vec!["node-a".to_string()]
+            );
+            assert!(
+                runtime.control_peer_nodes_locked(&state).is_empty(),
+                "a Removed target is omitted from the proposal fan-out"
+            );
+            state.clone()
+        };
+
+        let (entry, _, _, _) = runtime
+            .prepare_proposal_locked(
+                &mut candidate,
+                InternalControlCommand::RecommissionNode {
+                    node_id: "node-b".to_string(),
+                    endpoint: None,
+                },
+            )
+            .expect("recommission proposal should prepare");
+        candidate.commit_index = entry.index;
+        runtime
+            .apply_committed_entries_in_memory_locked(&mut candidate)
+            .expect("old single-node quorum should apply recommission");
+        assert_eq!(
+            candidate
+                .control_state
+                .node_record("node-b")
+                .map(|node| node.status),
+            Some(ControlNodeStatus::Active),
+            "the old single-node quorum activates the target"
+        );
+        assert_eq!(
+            runtime.control_peer_nodes_locked(&candidate),
+            vec![("node-b".to_string(), "127.0.0.1:9302".to_string())],
+            "the activated target joins the post-commit fan-out"
+        );
+
+        let observed = match runtime
+            .build_peer_plan_locked(&candidate, "node-b")
+            .expect("post-commit target plan should build")
+        {
+            PeerPlan::Append(request) => request,
+            PeerPlan::InstallSnapshot(_) => {
+                panic!("optimistic post-commit progress should produce an append notice")
+            }
+        };
+        assert!(
+            observed.entries.is_empty(),
+            "the Removed target must not receive the recommission proposal entry in the initial fan-out"
+        );
+        assert_eq!(observed.prev_log_index, entry.index);
+        assert_eq!(observed.leader_commit, entry.index);
+    }
+
+    #[test]
     fn append_rejects_unknown_leader_node() {
         let temp_dir = TempDir::new().expect("temp dir should create");
         let (membership, bootstrap_state) = sample_membership_and_state();
@@ -4484,6 +5029,90 @@ mod tests {
             assert_eq!(after.stepped_down_term, before.stepped_down_term);
             assert_eq!(after.entries, before.entries);
         }
+    }
+
+    #[test]
+    fn divergent_membership_view_rejects_proofless_newly_active_leader_repair() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let new_leader = open_runtime_for_node(
+            &temp_dir,
+            "node-b",
+            "127.0.0.1:9302",
+            &["node-a@127.0.0.1:9301", "node-c@127.0.0.1:9303"],
+            "newly-active-leader",
+            64,
+        );
+        let lagging_voter = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302", "node-c@127.0.0.1:9303"],
+            "lagging-voter",
+            64,
+        );
+        force_local_leader(&new_leader);
+        set_in_memory_node_status(&lagging_voter, "node-b", ControlNodeStatus::Joining);
+
+        let before = lagging_voter.log_recovery_snapshot();
+        {
+            let mut state = new_leader
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.current_term = before.current_term.saturating_add(10);
+            assert!(new_leader.local_is_control_leader_locked(&state));
+            assert!(new_leader.is_active_membership_node_locked(&state, "node-b"));
+        }
+        assert_eq!(
+            lagging_voter
+                .current_state()
+                .node_record("node-b")
+                .map(|node| node.status),
+            Some(ControlNodeStatus::Joining),
+            "the receiver fixture must retain its pre-activation membership view"
+        );
+
+        let append_request = {
+            let state = new_leader
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match new_leader
+                .build_peer_plan_locked(&state, "node-a")
+                .expect("new leader append plan should build")
+            {
+                PeerPlan::Append(request) => request,
+                PeerPlan::InstallSnapshot(_) => {
+                    panic!("a fresh peer should receive an append plan")
+                }
+            }
+        };
+        let append = lagging_voter
+            .handle_append_request(append_request)
+            .expect("proof-less append should return a protocol rejection");
+        assert!(!append.success);
+        assert_eq!(append.message.as_deref(), Some("leader_not_active_voter"));
+        assert_eq!(append.term, before.current_term);
+
+        let snapshot = lagging_voter
+            .handle_install_snapshot_request(InternalControlInstallSnapshotRequest {
+                term: before.current_term.saturating_add(10),
+                leader_node_id: "node-b".to_string(),
+                snapshot_last_index: 1,
+                snapshot_last_term: before.current_term.saturating_add(10),
+                state: serde_json::to_value(new_leader.current_state())
+                    .expect("new leader snapshot fixture should encode"),
+            })
+            .expect("proof-less snapshot should return a protocol rejection");
+        assert!(!snapshot.success);
+        assert_eq!(snapshot.message.as_deref(), Some("leader_not_active_voter"));
+        assert_eq!(snapshot.term, before.current_term);
+
+        let after = lagging_voter.log_recovery_snapshot();
+        assert_eq!(after.current_term, before.current_term);
+        assert_eq!(after.stepped_down_term, before.stepped_down_term);
+        assert_eq!(after.commit_index, before.commit_index);
+        assert_eq!(after.entries, before.entries);
     }
 
     #[test]
@@ -5393,6 +6022,446 @@ mod tests {
         );
         assert_eq!(snapshot.leader_contact_age_ms, Some(0));
         assert!(!snapshot.leader_stale);
+    }
+
+    #[test]
+    fn control_metrics_projection_reserves_exact_output_before_materialization() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = runtime
+            .metrics_snapshot_with_execution(&calibration)
+            .expect("calibration projection should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(
+            calibration.snapshot().memory_reserved_bytes,
+            exact_bytes,
+            "the accounted wrapper must retain the entire projection reservation"
+        );
+        assert_eq!(calibrated.liveness.local_node_id, "node-a");
+        assert_eq!(
+            calibrated.liveness.leader_node_id.as_deref(),
+            Some("node-b")
+        );
+        assert_eq!(
+            calibrated.persistence.pending_checkpoint,
+            Some(ControlCommitPosition { index: 17, term: 4 })
+        );
+        assert!(calibrated.persistence.fenced);
+        assert!(calibrated.persistence.cleanup_debt);
+        assert_eq!(
+            calibrated.persistence.detail, None,
+            "the metrics projection must not copy persistence diagnostics"
+        );
+        assert_eq!(calibrated.handoff.shards.len(), 2);
+        assert!(calibrated
+            .handoff
+            .shards
+            .iter()
+            .all(|shard| shard.last_error.is_none()));
+        assert_eq!(
+            calibrated.hotspot.handoff_shards,
+            vec![crate::cluster::control::ControlHotspotShardSnapshot {
+                shard: 0,
+                pending_rows: 37,
+            }]
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = runtime
+            .metrics_snapshot_with_execution(&exact)
+            .expect("the exact metrics projection limit should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), exact_bytes);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().active_queries, 0);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .metrics_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the projection model must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected metrics projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "a failed reservation must happen before projection materialization"
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn control_metrics_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+        let budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("test budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("test query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .metrics_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let status = budget.snapshot();
+        assert_eq!(status.active_queries, 0);
+        assert_eq!(status.shared_reserved_memory_bytes, 0);
+        assert_eq!(status.cancellations_total, 1);
+        assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn control_status_projection_preserves_legacy_snapshot_values() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_leader_contact_unix_ms = u64::MAX;
+            state
+                .peer_heartbeat
+                .get_mut("node-b")
+                .expect("peer fixture should exist")
+                .last_success_unix_ms = Some(u64::MAX);
+            state.control_state.transitions.reverse();
+        }
+
+        let legacy_liveness = runtime.liveness_snapshot();
+        let legacy_persistence = runtime.persistence_status();
+        let legacy_handoff = runtime.current_state().handoff_snapshot();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let status = runtime
+            .status_snapshot_with_execution(&execution)
+            .expect("status projection should succeed");
+
+        assert_eq!(&status.liveness, &legacy_liveness);
+        assert_eq!(&status.persistence, &legacy_persistence);
+        assert_eq!(&status.handoff, &legacy_handoff);
+        assert_eq!(
+            status.hotspot.handoff_shards,
+            vec![crate::cluster::control::ControlHotspotShardSnapshot {
+                shard: 0,
+                pending_rows: 37,
+            }]
+        );
+        assert_eq!(
+            status.persistence.detail.as_deref(),
+            Some("diagnostic fence detail".repeat(256).as_str())
+        );
+        assert!(status
+            .handoff
+            .shards
+            .iter()
+            .all(|shard| shard.last_error.is_some()));
+        assert_eq!(
+            status
+                .handoff
+                .shards
+                .iter()
+                .map(|shard| shard.shard)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "status handoff ordering must match the sorted legacy snapshot"
+        );
+
+        drop(status);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let budget_status = budget.snapshot();
+        assert_eq!(budget_status.active_queries, 0);
+        assert_eq!(budget_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn control_status_projection_preserves_persistence_detail_precedence() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        let cases = [
+            (
+                Some("fence"),
+                Some("checkpoint"),
+                Some("cleanup"),
+                Some("fence"),
+            ),
+            (
+                None,
+                Some("checkpoint"),
+                Some("cleanup"),
+                Some("checkpoint"),
+            ),
+            (None, None, Some("cleanup"), Some("cleanup")),
+            (None, None, None, None),
+        ];
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+
+        for (fence, checkpoint, cleanup, expected) in cases {
+            {
+                let mut state = runtime
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.persistence_fence = fence.map(str::to_string);
+                state.checkpoint_pending = checkpoint.map(|detail| ControlCheckpointPending {
+                    position: ControlCommitPosition { index: 17, term: 4 },
+                    detail: detail.to_string(),
+                });
+                state.cleanup_debt = cleanup.map(str::to_string);
+            }
+            let legacy = runtime.persistence_status();
+            let status = runtime
+                .status_snapshot_with_execution(&execution)
+                .expect("status projection should succeed");
+            assert_eq!(&status.persistence, &legacy);
+            assert_eq!(status.persistence.detail.as_deref(), expected);
+            drop(status);
+            assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        }
+
+        drop(execution);
+        let budget_status = budget.snapshot();
+        assert_eq!(budget_status.active_queries, 0);
+        assert_eq!(budget_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn control_status_projection_enforces_exact_peak_before_materialization() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = runtime
+            .status_snapshot_with_execution(&calibration)
+            .expect("calibration status projection should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(
+            calibration.snapshot().memory_reserved_bytes,
+            exact_bytes,
+            "the wrapper must retain the complete status projection reservation"
+        );
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            exact_bytes,
+            "the measured retained output is the complete materialization peak"
+        );
+        assert!(calibrated.persistence.detail.is_some());
+        assert!(calibrated
+            .handoff
+            .shards
+            .iter()
+            .all(|shard| shard.last_error.is_some()));
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_status = runtime
+            .status_snapshot_with_execution(&exact)
+            .expect("the exact status projection limit should pass");
+        assert_eq!(exact_status.accounted_bytes(), exact_bytes);
+        drop(exact_status);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_budget_status = exact_budget.snapshot();
+        assert_eq!(exact_budget_status.active_queries, 0);
+        assert_eq!(exact_budget_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_budget_status.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .status_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the status projection peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected status projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the N-1 rejection must happen before any status field is cloned"
+        );
+        drop(one_under);
+        let one_under_status = one_under_budget.snapshot();
+        assert_eq!(one_under_status.active_queries, 0);
+        assert_eq!(one_under_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn control_status_projection_honors_precancellation_without_residual_memory() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "node-a",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .status_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let budget_status = budget.snapshot();
+        assert_eq!(budget_status.active_queries, 0);
+        assert_eq!(budget_status.shared_reserved_memory_bytes, 0);
+        assert_eq!(budget_status.cancellations_total, 1);
+        assert_eq!(budget_status.accounting_invariant_violations_total, 0);
     }
 
     #[test]

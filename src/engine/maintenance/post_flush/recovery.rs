@@ -24,11 +24,15 @@ const POST_FLUSH_REPLACEMENT_MARKER_SUFFIX: &str = ".json";
 const MAX_POST_FLUSH_REPLACEMENT_MARKER_BYTES: u64 = 4 * 1024 * 1024;
 pub(super) const MAX_POST_FLUSH_REPLACEMENT_RECORDS: usize = 16 * 1024;
 const BOUNDED_POST_FLUSH_MARKER_CURSOR_BASE_BYTES: usize = 4 * 1024;
+const BOUNDED_POST_FLUSH_CLEAN_FENCE_DIRECTORY_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
+const BOUNDED_POST_FLUSH_CLEAN_FENCE_OWNED_CAPACITY_MULTIPLIER: usize = 2;
 const BOUNDED_POST_FLUSH_MARKER_PARSE_BASE_BYTES: usize = 16 * 1024;
 const BOUNDED_POST_FLUSH_MARKER_PARSE_PAYLOAD_COPIES: usize = 6;
 const BOUNDED_POST_FLUSH_TRANSITION_RECORD_BYTES: usize = 1024;
 const BOUNDED_POST_FLUSH_TRANSITION_PATH_COPIES: usize = 16;
 const BOUNDED_POST_FLUSH_RECOVERY_OPERATION: &str = "bounded post-flush replacement recovery";
+const BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION: &str =
+    "bounded post-flush pre-compaction clean fence";
 
 static POST_FLUSH_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -102,6 +106,30 @@ struct BackgroundPostFlushMarkerScan {
 #[derive(Default)]
 pub(in crate::engine::storage_engine) struct BackgroundPostFlushRecoveryCursor {
     scan: Option<BackgroundPostFlushMarkerScan>,
+}
+
+struct BackgroundPostFlushCleanFenceScan {
+    marker_dir: PathBuf,
+    entries: ReadDir,
+    observed_entries: usize,
+    marker_generation: u64,
+    _memory_reservation: RemoteCatalogMemoryReservation,
+}
+
+/// Process-local continuation for the background compactor's post-flush clean fence.
+///
+/// Unlike replacement recovery, this cursor never interprets or mutates a marker. It proves that
+/// one generation-stable namespace cycle is empty before ordinary compaction may inspect segment
+/// roots. Foreground, flush, and catalog callers retain the strict exhaustive fence.
+#[derive(Default)]
+pub(in crate::engine::storage_engine) struct BackgroundPostFlushCleanFenceCursor {
+    scan: Option<BackgroundPostFlushCleanFenceScan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::engine::storage_engine) enum BackgroundPostFlushCleanFenceStep {
+    Clean,
+    EnvelopeConsumed,
 }
 
 pub(super) struct BoundedRuntimeReplacement {
@@ -791,6 +819,51 @@ fn bounded_marker_cursor_reservation_bytes(data_path: &Path) -> usize {
     )
 }
 
+fn bounded_clean_fence_cursor_reservation_bytes(data_path: &Path) -> usize {
+    // Model before constructing any joined path. Three simultaneously live allocations scale
+    // with the configured data path: the retained marker-dir PathBuf, the directory-path state
+    // owned by ReadDir, and `DirEntry::path()` for a recognized marker. Twice each observed
+    // path/name payload conservatively covers ordinary geometric capacity growth; the separate
+    // marker-name charge covers `DirEntry::file_name()` while the full entry path is live. One byte
+    // per owned path/name covers its terminator or separator. The fixed allowance is reserved for
+    // ReadDir's platform directory stream (including the common 32-KiB libc buffer),
+    // DirEntry/maximum raw-name storage, metadata, and non-owned scratch. Allocator metadata and
+    // runtime/kernel state remain outside the portable ownership model.
+    let marker_name_bytes = POST_FLUSH_REPLACEMENT_MARKER_PREFIX
+        .len()
+        .saturating_add(16)
+        .saturating_add(1)
+        .saturating_add(16)
+        .saturating_add(POST_FLUSH_REPLACEMENT_MARKER_SUFFIX.len());
+    let marker_dir_encoded_bytes = data_path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_add(1)
+        .saturating_add(POST_FLUSH_REPLACEMENT_DIR_NAME.len());
+    let owned_marker_dir_bytes = marker_dir_encoded_bytes.saturating_add(1);
+    let owned_marker_name_bytes = marker_name_bytes.saturating_add(1);
+    let owned_marker_path_bytes = marker_dir_encoded_bytes
+        .saturating_add(1)
+        .saturating_add(marker_name_bytes)
+        .saturating_add(1);
+
+    BOUNDED_POST_FLUSH_CLEAN_FENCE_DIRECTORY_STREAM_SCRATCH_BYTES
+        .saturating_add(
+            owned_marker_dir_bytes
+                .saturating_mul(2)
+                .saturating_mul(BOUNDED_POST_FLUSH_CLEAN_FENCE_OWNED_CAPACITY_MULTIPLIER),
+        )
+        .saturating_add(
+            owned_marker_path_bytes
+                .saturating_mul(BOUNDED_POST_FLUSH_CLEAN_FENCE_OWNED_CAPACITY_MULTIPLIER),
+        )
+        .saturating_add(
+            owned_marker_name_bytes
+                .saturating_mul(BOUNDED_POST_FLUSH_CLEAN_FENCE_OWNED_CAPACITY_MULTIPLIER),
+        )
+}
+
 fn bounded_marker_parse_reservation_bytes(marker_path: &Path, marker_bytes: u64) -> usize {
     usize::try_from(marker_bytes)
         .unwrap_or(usize::MAX)
@@ -803,6 +876,208 @@ fn bounded_marker_parse_reservation_bytes(marker_path: &Path, marker_bytes: u64)
                 .len()
                 .saturating_mul(2),
         )
+}
+
+impl BackgroundPostFlushCleanFenceCursor {
+    pub(in crate::engine::storage_engine) fn reset(&mut self) {
+        self.scan = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn has_active_scan(&self) -> bool {
+        self.scan.is_some()
+    }
+
+    fn begin_scan(
+        &mut self,
+        data_path: &Path,
+        marker_generation: u64,
+        memory_reservation: RemoteCatalogMemoryReservation,
+    ) -> Result<bool> {
+        debug_assert!(self.scan.is_none());
+        let marker_dir = replacement_marker_dir(data_path);
+        let metadata = match fs::symlink_metadata(&marker_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: marker_dir,
+                    source,
+                })
+            }
+        };
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_dir()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "post-flush replacement marker root is link-like or not a directory: {}",
+                marker_dir.display()
+            )));
+        }
+
+        // An apparently absent marker is not a clean fence until the namespace containing a
+        // prior unlink is durable. Synchronize once per generation-stable scan cycle.
+        crate::engine::fs_utils::sync_dir(&marker_dir)?;
+        let entries = fs::read_dir(&marker_dir).map_err(|source| TsinkError::IoWithPath {
+            path: marker_dir.clone(),
+            source,
+        })?;
+        self.scan = Some(BackgroundPostFlushCleanFenceScan {
+            marker_dir,
+            entries,
+            observed_entries: 0,
+            marker_generation,
+            _memory_reservation: memory_reservation,
+        });
+        Ok(true)
+    }
+
+    fn next_entry(&mut self) -> Result<BackgroundPostFlushCleanFenceEntryStep> {
+        let scan = self
+            .scan
+            .as_mut()
+            .expect("bounded post-flush clean-fence scan must be initialized");
+        let Some(entry) = scan.entries.next() else {
+            let marker_generation = scan.marker_generation;
+            self.scan = None;
+            return Ok(BackgroundPostFlushCleanFenceEntryStep::Terminal { marker_generation });
+        };
+        if scan.observed_entries == crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
+            return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                limit: crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+                required: scan.observed_entries.saturating_add(1),
+            });
+        }
+        scan.observed_entries = scan.observed_entries.checked_add(1).ok_or_else(|| {
+            TsinkError::Other(format!(
+                "post-flush clean-fence namespace entry counter overflow at {}",
+                scan.marker_dir.display()
+            ))
+        })?;
+        let entry = entry.map_err(|source| TsinkError::IoWithPath {
+            path: scan.marker_dir.clone(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(BackgroundPostFlushCleanFenceEntryStep::EntryConsumed);
+        };
+        if !is_post_flush_replacement_marker_name(name) {
+            return Ok(BackgroundPostFlushCleanFenceEntryStep::EntryConsumed);
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
+            path: path.clone(),
+            source,
+        })?;
+        if crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "post-flush replacement marker entry is link-like or not regular: {}",
+                path.display()
+            )));
+        }
+        Err(TsinkError::Other(format!(
+            "segment operation deferred while a durable post-flush replacement is pending: {}",
+            path.display()
+        )))
+    }
+}
+
+enum BackgroundPostFlushCleanFenceEntryStep {
+    Terminal { marker_generation: u64 },
+    EntryConsumed,
+}
+
+pub(in crate::engine::storage_engine) fn invalidate_background_post_flush_clean_fence(
+    cursor: &parking_lot::Mutex<BackgroundPostFlushCleanFenceCursor>,
+    marker_generation: &AtomicU64,
+) -> Result<()> {
+    let current = marker_generation.load(Ordering::Acquire);
+    let next = current.checked_add(1).ok_or_else(|| {
+        TsinkError::Other("post-flush marker publication generation overflowed".to_string())
+    })?;
+    let mut cursor = cursor.lock();
+    cursor.reset();
+    marker_generation.store(next, Ordering::Release);
+    Ok(())
+}
+
+pub(in crate::engine::storage_engine) fn advance_background_post_flush_clean_fence<F>(
+    cursor: &mut BackgroundPostFlushCleanFenceCursor,
+    data_path: &Path,
+    marker_generation: &AtomicU64,
+    item_limit: usize,
+    byte_limit: u64,
+    mut reserve_memory: F,
+) -> Result<BackgroundPostFlushCleanFenceStep>
+where
+    F: FnMut(usize) -> Result<RemoteCatalogMemoryReservation>,
+{
+    let outcome = (|| {
+        if item_limit == 0 {
+            return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                item_limit,
+                byte_limit,
+                selected_items: 0,
+                selected_bytes: 0,
+            });
+        }
+
+        let required_memory = bounded_clean_fence_cursor_reservation_bytes(data_path);
+        let required_bytes = u64::try_from(required_memory).unwrap_or(u64::MAX);
+        if required_bytes > byte_limit {
+            return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                limit: byte_limit,
+                required: required_bytes,
+            });
+        }
+
+        let current_generation = marker_generation.load(Ordering::Acquire);
+        if cursor
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.marker_generation != current_generation)
+        {
+            cursor.reset();
+            return Ok(BackgroundPostFlushCleanFenceStep::EnvelopeConsumed);
+        }
+
+        if cursor.scan.is_none() {
+            // Admission precedes the marker-directory PathBuf, ReadDir, and per-entry scratch.
+            let reservation = reserve_memory(required_memory)?;
+            if !cursor.begin_scan(data_path, current_generation, reservation)? {
+                return if marker_generation.load(Ordering::Acquire) == current_generation {
+                    Ok(BackgroundPostFlushCleanFenceStep::Clean)
+                } else {
+                    Ok(BackgroundPostFlushCleanFenceStep::EnvelopeConsumed)
+                };
+            }
+        }
+
+        match cursor.next_entry()? {
+            BackgroundPostFlushCleanFenceEntryStep::EntryConsumed => {
+                Ok(BackgroundPostFlushCleanFenceStep::EnvelopeConsumed)
+            }
+            BackgroundPostFlushCleanFenceEntryStep::Terminal {
+                marker_generation: observed_generation,
+            } => {
+                if marker_generation.load(Ordering::Acquire) == observed_generation {
+                    Ok(BackgroundPostFlushCleanFenceStep::Clean)
+                } else {
+                    Ok(BackgroundPostFlushCleanFenceStep::EnvelopeConsumed)
+                }
+            }
+        }
+    })();
+    if outcome.is_err() {
+        cursor.reset();
+    }
+    outcome
 }
 
 impl BackgroundPostFlushRecoveryCursor {
@@ -2338,6 +2613,378 @@ mod tests {
         fn current_bytes(&self) -> usize {
             self.accounting.current_bytes()
         }
+    }
+
+    #[test]
+    fn bounded_clean_fence_enforces_exact_memory_and_maintenance_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let short_data_path = temp.path().join("short");
+        let mut data_path = temp.path().join("data");
+        for index in 0..6 {
+            data_path = data_path.join(format!(
+                "long-valid-component-{index:02}-{}",
+                "x".repeat(64)
+            ));
+        }
+        fs::create_dir_all(&data_path).unwrap();
+        let marker_dir = replacement_marker_dir(&data_path);
+        let required = bounded_clean_fence_cursor_reservation_bytes(&data_path);
+        let required_u64 = u64::try_from(required).unwrap();
+        let short_required = bounded_clean_fence_cursor_reservation_bytes(&short_data_path);
+        let path_growth = data_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .checked_sub(short_data_path.as_os_str().as_encoded_bytes().len())
+            .expect("the nested test path must be longer");
+        assert!(
+            path_growth > 512,
+            "the test must exercise a valid long path"
+        );
+        assert_eq!(
+            required.checked_sub(short_required).unwrap(),
+            path_growth * 6,
+            "the two owned marker-directory paths and recognized entry path must each charge twice the observed path growth"
+        );
+        let generation = AtomicU64::new(0);
+
+        let absent_memory = TestRecoveryMemory::with_budget(required_u64);
+        let mut absent_cursor = BackgroundPostFlushCleanFenceCursor::default();
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut absent_cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| absent_memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::Clean
+        );
+        assert_eq!(absent_memory.current_bytes(), 0);
+
+        fs::create_dir_all(&marker_dir).unwrap();
+        fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+
+        let maintenance_memory = TestRecoveryMemory::unlimited();
+        let mut maintenance_cursor = BackgroundPostFlushCleanFenceCursor::default();
+        let byte_error = advance_background_post_flush_clean_fence(
+            &mut maintenance_cursor,
+            &data_path,
+            &generation,
+            1,
+            required_u64 - 1,
+            |bytes| maintenance_memory.reserve(bytes),
+        )
+        .expect_err("one byte below the clean-fence cursor peak must reject");
+        assert!(matches!(
+            byte_error,
+            TsinkError::MaintenanceWorkItemTooLarge {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                limit,
+                required: actual,
+            } if limit == required_u64 - 1 && actual == required_u64
+        ));
+        assert_eq!(maintenance_memory.current_bytes(), 0);
+
+        let item_error = advance_background_post_flush_clean_fence(
+            &mut maintenance_cursor,
+            &data_path,
+            &generation,
+            0,
+            required_u64,
+            |bytes| maintenance_memory.reserve(bytes),
+        )
+        .expect_err("a zero-item pass must not inspect the marker namespace");
+        assert!(matches!(
+            item_error,
+            TsinkError::MaintenanceDependencyWindowExceeded {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                item_limit: 0,
+                selected_items: 0,
+                ..
+            }
+        ));
+        assert_eq!(maintenance_memory.current_bytes(), 0);
+
+        let below_memory = TestRecoveryMemory::with_budget(required_u64 - 1);
+        let mut below_cursor = BackgroundPostFlushCleanFenceCursor::default();
+        let memory_error = advance_background_post_flush_clean_fence(
+            &mut below_cursor,
+            &data_path,
+            &generation,
+            1,
+            required_u64,
+            |bytes| below_memory.reserve(bytes),
+        )
+        .expect_err("one byte below the shared cursor reservation must reject");
+        assert!(matches!(
+            memory_error,
+            TsinkError::MemoryBudgetExceeded { budget, required: actual }
+                if budget == required - 1 && actual == required
+        ));
+        assert_eq!(below_memory.current_bytes(), 0);
+
+        let exact_memory = TestRecoveryMemory::with_budget(required_u64);
+        let mut exact_cursor = BackgroundPostFlushCleanFenceCursor::default();
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut exact_cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| exact_memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+        );
+        assert_eq!(
+            exact_memory.current_bytes(),
+            required,
+            "the admitted cursor reservation must remain live between wakes"
+        );
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut exact_cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| exact_memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::Clean
+        );
+        assert_eq!(
+            exact_memory.current_bytes(),
+            0,
+            "the terminal empty probe must release the retained cursor reservation"
+        );
+
+        fs::remove_file(marker_dir.join("operator-owned")).unwrap();
+        let empty_memory = TestRecoveryMemory::with_budget(required_u64);
+        let mut empty_cursor = BackgroundPostFlushCleanFenceCursor::default();
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut empty_cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| empty_memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::Clean
+        );
+        assert_eq!(empty_memory.current_bytes(), 0);
+    }
+
+    #[test]
+    fn bounded_clean_fence_restarts_after_publication_and_defers_the_marker() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let marker_dir = replacement_marker_dir(&data_path);
+        fs::create_dir_all(&marker_dir).unwrap();
+        fs::write(marker_dir.join("operator-a"), b"keep").unwrap();
+        fs::write(marker_dir.join("operator-b"), b"keep").unwrap();
+
+        let required = bounded_clean_fence_cursor_reservation_bytes(&data_path);
+        let required_u64 = u64::try_from(required).unwrap();
+        let memory = TestRecoveryMemory::unlimited();
+        let generation = AtomicU64::new(0);
+        let cursor = parking_lot::Mutex::new(BackgroundPostFlushCleanFenceCursor::default());
+
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut cursor.lock(),
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+        );
+        assert_eq!(memory.current_bytes(), required);
+
+        invalidate_background_post_flush_clean_fence(&cursor, &generation).unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(
+            memory.current_bytes(),
+            0,
+            "publication invalidation must release a behind-cursor reservation immediately"
+        );
+
+        let marker_path = marker_dir.join("transaction-0000000000000001-0000000000000002.json");
+        fs::write(&marker_path, b"pending").unwrap();
+        let deferred = loop {
+            match advance_background_post_flush_clean_fence(
+                &mut cursor.lock(),
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            ) {
+                Ok(BackgroundPostFlushCleanFenceStep::EnvelopeConsumed) => {}
+                Ok(BackgroundPostFlushCleanFenceStep::Clean) => {
+                    panic!("a generation-restarted scan must not miss the new marker")
+                }
+                Err(err) => break err,
+            }
+        };
+        assert!(deferred
+            .to_string()
+            .contains("post-flush replacement is pending"));
+        assert!(marker_path.is_file());
+        assert_eq!(memory.current_bytes(), 0);
+
+        assert!(ensure_no_pending_post_flush_replacement(&data_path).is_err());
+        fs::remove_file(&marker_path).unwrap();
+        ensure_no_pending_post_flush_replacement(&data_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_clean_fence_generation_mismatch_cannot_claim_a_terminal_cycle() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let marker_dir = replacement_marker_dir(&data_path);
+        fs::create_dir_all(&marker_dir).unwrap();
+        fs::write(marker_dir.join("operator-a"), b"keep").unwrap();
+
+        let required = bounded_clean_fence_cursor_reservation_bytes(&data_path);
+        let required_u64 = u64::try_from(required).unwrap();
+        let memory = TestRecoveryMemory::unlimited();
+        let generation = AtomicU64::new(7);
+        let mut cursor = BackgroundPostFlushCleanFenceCursor::default();
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+        );
+        assert_eq!(memory.current_bytes(), required);
+
+        generation.store(8, Ordering::Release);
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+        );
+        assert_eq!(
+            memory.current_bytes(),
+            0,
+            "a generation mismatch must reset rather than accepting the old terminal probe"
+        );
+    }
+
+    #[test]
+    fn bounded_clean_fence_enforces_the_exact_global_namespace_cap() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let marker_dir = replacement_marker_dir(&data_path);
+        fs::create_dir_all(&marker_dir).unwrap();
+        for name in ["operator-a", "operator-b", "operator-c"] {
+            fs::write(marker_dir.join(name), b"keep").unwrap();
+        }
+
+        let required = bounded_clean_fence_cursor_reservation_bytes(&data_path);
+        let required_u64 = u64::try_from(required).unwrap();
+        let memory = TestRecoveryMemory::unlimited();
+        let generation = AtomicU64::new(0);
+        let mut cursor = BackgroundPostFlushCleanFenceCursor::default();
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+        );
+        cursor
+            .scan
+            .as_mut()
+            .expect("the scan must remain live")
+            .observed_entries = crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES - 1;
+
+        assert_eq!(
+            advance_background_post_flush_clean_fence(
+                &mut cursor,
+                &data_path,
+                &generation,
+                1,
+                required_u64,
+                |bytes| memory.reserve(bytes),
+            )
+            .unwrap(),
+            BackgroundPostFlushCleanFenceStep::EnvelopeConsumed,
+            "the exact namespace cap must still admit its final entry"
+        );
+        let error = advance_background_post_flush_clean_fence(
+            &mut cursor,
+            &data_path,
+            &generation,
+            1,
+            required_u64,
+            |bytes| memory.reserve(bytes),
+        )
+        .expect_err("the first entry above the global cap must reject");
+        assert!(matches!(
+            error,
+            TsinkError::MaintenanceNamespaceLimitExceeded {
+                operation: BOUNDED_POST_FLUSH_CLEAN_FENCE_OPERATION,
+                limit,
+                required,
+            } if limit == crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES
+                && required == limit + 1
+        ));
+        assert_eq!(memory.current_bytes(), 0);
+    }
+
+    #[test]
+    fn bounded_clean_fence_rejects_marker_shaped_non_files_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let marker_dir = replacement_marker_dir(&data_path);
+        let marker_path = marker_dir.join("transaction-0000000000000001-0000000000000002.json");
+        fs::create_dir_all(&marker_path).unwrap();
+
+        let required = bounded_clean_fence_cursor_reservation_bytes(&data_path);
+        let memory = TestRecoveryMemory::unlimited();
+        let generation = AtomicU64::new(0);
+        let mut cursor = BackgroundPostFlushCleanFenceCursor::default();
+        let error = advance_background_post_flush_clean_fence(
+            &mut cursor,
+            &data_path,
+            &generation,
+            1,
+            u64::try_from(required).unwrap(),
+            |bytes| memory.reserve(bytes),
+        )
+        .expect_err("marker-shaped directories must remain corruption");
+        assert!(matches!(error, TsinkError::DataCorruption(_)));
+        assert!(marker_path.is_dir());
+        assert_eq!(memory.current_bytes(), 0);
     }
 
     #[test]

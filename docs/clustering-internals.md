@@ -504,9 +504,33 @@ TLS is implemented with `rustls` (no OpenSSL). The crypto provider is installed 
 - Query requests and shard hits
 - Repair mismatches, series and point gaps, and rows inserted
 
-`build_cluster_hotspot_snapshot` computes a ranked list of hot shards and tenants by combining these counters with current storage series counts from the local engine. Each shard receives a `pressure_score` based on its workload, a `movement_cost_score` based on pending handoff rows, and a `skew_factor` normalised against the mean across all shards. Shards whose `skew_factor` exceeds `SHARD_SKEW_THRESHOLD` (4×) are flagged with `recommend_move = true`. Tenant skew uses `TENANT_SKEW_THRESHOLD` (4×) in the same way.
+The current tracker is one process-global singleton. It retains every observed shard ID and
+normalized tenant string indefinitely, uses saturating process-lifetime counters, and resets only
+when the process restarts. Ingest hotspot inputs are recorded before later row-admission and write
+outcomes. A tenant-scoped snapshot filters identities only after computing totals and slot
+denominators from the complete global tracker, so identities omitted from the response can still
+change its scores.
 
-The hotspot snapshot is exposed through the cluster status API and can be used to guide manual or automatic shard rebalancing decisions.
+`build_cluster_hotspot_snapshot` computes a ranked list of hot shards and tenants by combining
+these counters with current storage series counts from the local engine. Each shard receives
+weighted `pressure_score` and `movement_cost_score` values from its ingest, query, storage, and
+repair ratios, plus a `skew_factor` normalized against the mean across all retained shard slots.
+A shard is flagged with `recommend_move = true` when its skew is at least
+`SHARD_SKEW_THRESHOLD` (4×) and it has no pending handoff rows. Tenant skew uses
+`TENANT_SKEW_THRESHOLD` (4×) in the same way.
+
+The hotspot snapshot is exposed through the cluster status API and can be used to guide manual or
+automatic shard rebalancing decisions. Automatic rebalance consumes the shard scores and ordering,
+so dropping, merging, evicting, or windowing shard identities is a semantic change rather than a
+memory-only optimization.
+
+The retained-identity bound is therefore a `HUMAN GATE`. A finite implementation must select one
+published contract: exact per-runtime counters plus admission rejection at a configured tenant
+capacity; bounded/windowed tenant telemetry with explicit incomplete or overflow semantics; or
+removal of per-tenant hotspot identities while retaining exact shard slots tied to the finite
+ring. Moving the tracker from accidental process-global aggregation to per-server or
+cluster-runtime ownership also requires approval because multi-instance processes currently share
+totals. Until that contract is selected, no eviction, approximation, or silent cap is applied.
 
 ---
 

@@ -6,6 +6,7 @@ use super::*;
 
 impl Compactor {
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
+        self.reset_background_compaction_recovery_cursor();
         let recovered = finalize_pending_compaction_replacements_with_disk_budget(
             &self.data_path,
             self.local_disk_budget.as_ref(),
@@ -25,6 +26,7 @@ impl Compactor {
         &self,
         tombstones: &TombstoneMap,
     ) -> Result<CompactionOutcome> {
+        self.reset_background_compaction_recovery_cursor();
         let recovered = finalize_pending_compaction_replacements_with_disk_budget(
             &self.data_path,
             self.local_disk_budget.as_ref(),
@@ -33,6 +35,54 @@ impl Compactor {
             return Ok(recovered);
         }
         self.compact_once_with_changes_after_recovery(tombstones)
+    }
+
+    /// One finite engine-background pass. Any admitted recovery namespace entry or marker owns
+    /// the wake; regular planning starts only after a retained scan proves there is no pending
+    /// replacement.
+    pub(in crate::engine) fn compact_background_once_with_changes(
+        &self,
+    ) -> Result<CompactionOutcome> {
+        let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
+        self.compact_background_once_with_changes_using_tombstones(&tombstones)
+    }
+
+    /// Engine-integrated finite background compaction uses the authoritative tombstone map.
+    pub(in crate::engine) fn compact_background_once_with_changes_using_tombstones(
+        &self,
+        tombstones: &TombstoneMap,
+    ) -> Result<CompactionOutcome> {
+        let recovery = {
+            let mut state = self
+                .planning_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            execution::next_background_compaction_replacement_bounded(
+                &mut state.background_recovery,
+                &self.data_path,
+                self.local_disk_budget.as_ref(),
+                self.pass_limits,
+            )?
+        };
+        match recovery {
+            BackgroundCompactionRecoveryStep::NoPending => {
+                self.compact_once_with_changes_after_recovery(tombstones)
+            }
+            BackgroundCompactionRecoveryStep::Ready(outcome) => Ok(outcome),
+            BackgroundCompactionRecoveryStep::AllowanceExhausted
+            | BackgroundCompactionRecoveryStep::NamespaceEntryConsumed
+            | BackgroundCompactionRecoveryStep::PreparingRolledBack => {
+                Ok(CompactionOutcome::default())
+            }
+        }
+    }
+
+    fn reset_background_compaction_recovery_cursor(&self) {
+        let mut state = self
+            .planning_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.background_recovery.reset();
     }
 
     fn compact_once_with_changes_after_recovery(

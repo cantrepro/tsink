@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsink::{DiskCategory, LocalDiskBudget, Row, TsinkError};
+use tsink::{
+    DiskCategory, LocalDiskBudget, QueryBudgetError, QueryExecution, QueryMemoryReservation, Row,
+    TsinkError,
+};
 
 pub const CLUSTER_OUTBOX_MAX_ENTRIES_ENV: &str = "TSINK_CLUSTER_OUTBOX_MAX_ENTRIES";
 pub const CLUSTER_OUTBOX_MAX_BYTES_ENV: &str = "TSINK_CLUSTER_OUTBOX_MAX_BYTES";
@@ -293,12 +296,101 @@ pub struct OutboxStalledPeerSnapshot {
     pub first_stalled_unix_ms: u64,
 }
 
+/// Schema-complete hinted-handoff input for the TSDB status response.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutboxStatusSnapshot {
+    pub metrics: OutboxMetricsSnapshot,
+    pub config: OutboxConfig,
+    pub peers: Vec<OutboxPeerBacklogSnapshot>,
+    pub stalled_peers: Vec<OutboxStalledPeerSnapshot>,
+}
+
+/// Status output whose dynamic allocations remain charged until every borrowed field is dropped.
+///
+/// The inner snapshot is intentionally private and this wrapper has no extraction method, so a
+/// caller cannot move the output away from its reservation.
+#[derive(Debug)]
+#[must_use = "dropping the status snapshot releases its query-memory reservation"]
+pub struct AccountedOutboxStatusSnapshot {
+    snapshot: OutboxStatusSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedOutboxStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedOutboxStatusSnapshot {
+    type Target = OutboxStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxStalledPeerMetricsExpositionSnapshot {
+    pub oldest_age_ms: u64,
+    pub first_stalled_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboxPeerMetricsExpositionSnapshot {
+    pub node_id: String,
+    pub queued_entries: u64,
+    pub queued_bytes: u64,
+    pub oldest_enqueued_unix_ms: Option<u64>,
+    pub stalled: Option<OutboxStalledPeerMetricsExpositionSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboxMetricsExpositionSnapshot {
+    pub peers: Vec<OutboxPeerMetricsExpositionSnapshot>,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the snapshot releases its query-memory reservation"]
+pub struct AccountedOutboxMetricsSnapshot {
+    snapshot: OutboxMetricsExpositionSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedOutboxMetricsSnapshot {
+    #[must_use]
+    pub fn snapshot(&self) -> &OutboxMetricsExpositionSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedOutboxMetricsSnapshot {
+    type Target = OutboxMetricsExpositionSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+const OUTBOX_METRICS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const OUTBOX_METRICS_CHECKPOINT_INTERVAL: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct HintedHandoffOutbox {
     path: PathBuf,
     config: OutboxConfig,
     local_disk_budget: Option<Arc<LocalDiskBudget>>,
     state: Arc<Mutex<OutboxState>>,
+    #[cfg(test)]
+    metrics_projection_node_id_clones: Arc<AtomicU64>,
+    #[cfg(test)]
+    status_projection_node_id_clones: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -310,6 +402,14 @@ struct OutboxState {
     log_records: u64,
     next_id: u64,
     active_stalled_peers: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutboxStatusPeerAccumulator<'a> {
+    node_id: &'a str,
+    queued_entries: u64,
+    queued_bytes: u64,
+    oldest_enqueued_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +724,10 @@ impl HintedHandoffOutbox {
                 next_id,
                 active_stalled_peers: BTreeMap::new(),
             })),
+            #[cfg(test)]
+            metrics_projection_node_id_clones: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            status_projection_node_id_clones: Arc::new(AtomicU64::new(0)),
         };
 
         {
@@ -649,6 +753,7 @@ impl HintedHandoffOutbox {
         &self.path
     }
 
+    #[allow(dead_code)]
     pub fn config(&self) -> OutboxConfig {
         self.config
     }
@@ -902,6 +1007,7 @@ impl HintedHandoffOutbox {
         }
     }
 
+    #[allow(dead_code)]
     pub fn peer_backlog_snapshot(&self) -> Vec<OutboxPeerBacklogSnapshot> {
         let state = self
             .state
@@ -934,6 +1040,7 @@ impl HintedHandoffOutbox {
         peers
     }
 
+    #[allow(dead_code)]
     pub fn stalled_peer_snapshot(&self) -> Vec<OutboxStalledPeerSnapshot> {
         let now = unix_timestamp_millis();
         let mut state = self
@@ -941,6 +1048,351 @@ impl HintedHandoffOutbox {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         refresh_observability_locked(&mut state, &self.config, now)
+    }
+
+    /// Captures every hinted-handoff input needed by TSDB status under one state lock.
+    ///
+    /// Aggregate counters are sampled before stalled-peer transitions, preserving the legacy
+    /// status call order. Both ordered peer vectors and any newly persisted stalled-peer keys are
+    /// measured and reserved before the first node identifier is copied. The returned private
+    /// wrapper retains the output charge for as long as any projected field can be borrowed.
+    pub fn status_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedOutboxStatusSnapshot, QueryBudgetError> {
+        self.status_snapshot_at_with_execution(execution, unix_timestamp_millis())
+    }
+
+    fn status_snapshot_at_with_execution(
+        &self,
+        execution: &QueryExecution,
+        now_unix_ms: u64,
+    ) -> Result<AccountedOutboxStatusSnapshot, QueryBudgetError> {
+        execution.checkpoint()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let metrics = outbox_metrics_snapshot();
+        let config = self.config;
+        let peer_count = state.peer_queued_bytes.len();
+        let scratch_bytes =
+            modeled_outbox_metrics_vec_bytes::<OutboxStatusPeerAccumulator<'_>>(peer_count);
+        let mut reservation = execution.reserve_memory(scratch_bytes)?;
+        execution.checkpoint()?;
+
+        let mut peer_inputs = Vec::with_capacity(peer_count);
+        for (index, (node_id, queued_bytes)) in state.peer_queued_bytes.iter().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            peer_inputs.push(OutboxStatusPeerAccumulator {
+                node_id,
+                queued_entries: 0,
+                queued_bytes: *queued_bytes,
+                oldest_enqueued_unix_ms: None,
+            });
+        }
+        for (index, entry) in state.pending.values().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            let Ok(peer_index) =
+                peer_inputs.binary_search_by(|peer| peer.node_id.cmp(entry.peer_node_id.as_str()))
+            else {
+                continue;
+            };
+            let peer = &mut peer_inputs[peer_index];
+            peer.queued_entries = peer.queued_entries.saturating_add(1);
+            peer.oldest_enqueued_unix_ms = Some(
+                peer.oldest_enqueued_unix_ms
+                    .map_or(entry.enqueued_unix_ms, |oldest| {
+                        oldest.min(entry.enqueued_unix_ms)
+                    }),
+            );
+        }
+
+        let mut retained_bytes =
+            modeled_outbox_metrics_vec_bytes::<OutboxPeerBacklogSnapshot>(peer_count);
+        let mut stalled_peer_count = 0usize;
+        let mut stalled_string_bytes = 0u64;
+        let mut transition_bytes = 0u64;
+        for (index, peer) in peer_inputs.iter().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_outbox_metrics_str_bytes(peer.node_id));
+            if outbox_stalled_peer_age_ms(
+                &config,
+                now_unix_ms,
+                peer.queued_entries,
+                peer.queued_bytes,
+                peer.oldest_enqueued_unix_ms,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            stalled_peer_count = stalled_peer_count.saturating_add(1);
+            stalled_string_bytes =
+                stalled_string_bytes.saturating_add(modeled_outbox_metrics_str_bytes(peer.node_id));
+            if !state.active_stalled_peers.contains_key(peer.node_id) {
+                transition_bytes = transition_bytes
+                    .saturating_add(modeled_outbox_metrics_map_entry_bytes(peer.node_id));
+            }
+        }
+        retained_bytes = retained_bytes
+            .saturating_add(
+                modeled_outbox_metrics_vec_bytes::<OutboxStalledPeerSnapshot>(stalled_peer_count),
+            )
+            .saturating_add(stalled_string_bytes);
+        let peak_bytes = retained_bytes.saturating_add(scratch_bytes.max(transition_bytes));
+        reservation.resize(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let mut peers = Vec::with_capacity(peer_count);
+        let mut stalled_peers = Vec::with_capacity(stalled_peer_count);
+        let mut max_stalled_age_ms = 0u64;
+        for (index, peer) in peer_inputs.iter().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            peers.push(OutboxPeerBacklogSnapshot {
+                node_id: self.clone_status_node_id(peer.node_id),
+                queued_entries: peer.queued_entries,
+                queued_bytes: peer.queued_bytes,
+                oldest_enqueued_unix_ms: peer.oldest_enqueued_unix_ms,
+            });
+            let Some(oldest_age_ms) = outbox_stalled_peer_age_ms(
+                &config,
+                now_unix_ms,
+                peer.queued_entries,
+                peer.queued_bytes,
+                peer.oldest_enqueued_unix_ms,
+            ) else {
+                continue;
+            };
+            let Some(oldest_enqueued_unix_ms) = peer.oldest_enqueued_unix_ms else {
+                continue;
+            };
+            let first_stalled_unix_ms = state
+                .active_stalled_peers
+                .get(peer.node_id)
+                .copied()
+                .unwrap_or(now_unix_ms);
+            max_stalled_age_ms = max_stalled_age_ms.max(oldest_age_ms);
+            stalled_peers.push(OutboxStalledPeerSnapshot {
+                node_id: self.clone_status_node_id(peer.node_id),
+                queued_entries: peer.queued_entries,
+                queued_bytes: peer.queued_bytes,
+                oldest_enqueued_unix_ms,
+                oldest_age_ms,
+                first_stalled_unix_ms,
+            });
+        }
+        drop(peer_inputs);
+
+        // Publish stalled-peer transitions only after every checkpointable projection step.
+        execution.checkpoint()?;
+        state.active_stalled_peers.retain(|node_id, _| {
+            stalled_peers
+                .binary_search_by(|peer| peer.node_id.as_str().cmp(node_id.as_str()))
+                .is_ok()
+        });
+        let mut new_stalled_peers = 0u64;
+        for peer in &stalled_peers {
+            if state.active_stalled_peers.contains_key(&peer.node_id) {
+                continue;
+            }
+            state.active_stalled_peers.insert(
+                self.clone_status_node_id(&peer.node_id),
+                peer.first_stalled_unix_ms,
+            );
+            new_stalled_peers = new_stalled_peers.saturating_add(1);
+        }
+        if new_stalled_peers > 0 {
+            CLUSTER_OUTBOX_STALLED_ALERTS_TOTAL.fetch_add(new_stalled_peers, Ordering::Relaxed);
+        }
+        update_outbox_gauges(&state);
+        CLUSTER_OUTBOX_STALLED_PEERS.store(stalled_peers.len() as u64, Ordering::Relaxed);
+        CLUSTER_OUTBOX_STALLED_OLDEST_AGE_MS.store(max_stalled_age_ms, Ordering::Relaxed);
+
+        let snapshot = OutboxStatusSnapshot {
+            metrics,
+            config,
+            peers,
+            stalled_peers,
+        };
+        reservation.resize(modeled_outbox_status_snapshot_bytes(&snapshot))?;
+        Ok(AccountedOutboxStatusSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    /// Captures the peer backlog and stalled-peer inputs needed by `/metrics` under one lock.
+    ///
+    /// The ordered output vector is also the aggregation index, so this avoids building the two
+    /// temporary String-keyed maps used by the status snapshots. Dynamic output and a
+    /// conservative allowance for newly persisted stalled-peer keys are reserved before any node
+    /// identifier is copied. The returned guard retains only the output charge after the
+    /// configured outbox state assumes ownership of any new stalled-peer keys.
+    pub fn metrics_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedOutboxMetricsSnapshot, QueryBudgetError> {
+        execution.checkpoint()?;
+        let now_unix_ms = unix_timestamp_millis();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let peer_count = state.peer_queued_bytes.len();
+        let mut retained_bytes =
+            modeled_outbox_metrics_vec_bytes::<OutboxPeerMetricsExpositionSnapshot>(peer_count);
+        let mut transition_bytes = 0u64;
+        for (index, node_id) in state.peer_queued_bytes.keys().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_outbox_metrics_str_bytes(node_id));
+            if !state.active_stalled_peers.contains_key(node_id) {
+                transition_bytes = transition_bytes
+                    .saturating_add(modeled_outbox_metrics_map_entry_bytes(node_id));
+            }
+        }
+        let peak_bytes = retained_bytes.saturating_add(transition_bytes);
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let mut peers = Vec::with_capacity(peer_count);
+        for (index, (node_id, queued_bytes)) in state.peer_queued_bytes.iter().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            peers.push(OutboxPeerMetricsExpositionSnapshot {
+                node_id: self.clone_metrics_node_id(node_id),
+                queued_entries: 0,
+                queued_bytes: *queued_bytes,
+                oldest_enqueued_unix_ms: None,
+                stalled: None,
+            });
+        }
+
+        for (index, entry) in state.pending.values().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            let Ok(peer_index) = peers
+                .binary_search_by(|peer| peer.node_id.as_str().cmp(entry.peer_node_id.as_str()))
+            else {
+                continue;
+            };
+            let peer = &mut peers[peer_index];
+            peer.queued_entries = peer.queued_entries.saturating_add(1);
+            peer.oldest_enqueued_unix_ms = Some(
+                peer.oldest_enqueued_unix_ms
+                    .map_or(entry.enqueued_unix_ms, |oldest| {
+                        oldest.min(entry.enqueued_unix_ms)
+                    }),
+            );
+        }
+
+        let age_threshold_ms = self.config.stalled_peer_age_secs.saturating_mul(1_000);
+        let mut max_stalled_age_ms = 0u64;
+        for (index, peer) in peers.iter_mut().enumerate() {
+            checkpoint_outbox_metrics(execution, index)?;
+            if peer.queued_entries == 0
+                || peer.queued_entries < self.config.stalled_peer_min_entries
+                || peer.queued_bytes < self.config.stalled_peer_min_bytes
+            {
+                continue;
+            }
+            let Some(oldest_enqueued_unix_ms) = peer.oldest_enqueued_unix_ms else {
+                continue;
+            };
+            let oldest_age_ms = now_unix_ms.saturating_sub(oldest_enqueued_unix_ms);
+            if oldest_age_ms < age_threshold_ms {
+                continue;
+            }
+            let first_stalled_unix_ms = state
+                .active_stalled_peers
+                .get(&peer.node_id)
+                .copied()
+                .unwrap_or(now_unix_ms);
+            max_stalled_age_ms = max_stalled_age_ms.max(oldest_age_ms);
+            peer.stalled = Some(OutboxStalledPeerMetricsExpositionSnapshot {
+                oldest_age_ms,
+                first_stalled_unix_ms,
+            });
+        }
+
+        // Do not make externally visible stalled-transition changes until all checkpointable
+        // projection work has completed.
+        execution.checkpoint()?;
+        state.active_stalled_peers.retain(|node_id, _| {
+            peers
+                .binary_search_by(|peer| peer.node_id.as_str().cmp(node_id.as_str()))
+                .is_ok_and(|index| peers[index].stalled.is_some())
+        });
+        let mut new_stalled_peers = 0u64;
+        for peer in &peers {
+            let Some(stalled) = peer.stalled else {
+                continue;
+            };
+            if state.active_stalled_peers.contains_key(&peer.node_id) {
+                continue;
+            }
+            state.active_stalled_peers.insert(
+                self.clone_metrics_node_id(&peer.node_id),
+                stalled.first_stalled_unix_ms,
+            );
+            new_stalled_peers = new_stalled_peers.saturating_add(1);
+        }
+        if new_stalled_peers > 0 {
+            CLUSTER_OUTBOX_STALLED_ALERTS_TOTAL.fetch_add(new_stalled_peers, Ordering::Relaxed);
+        }
+        let stalled_peer_count = peers.iter().filter(|peer| peer.stalled.is_some()).count();
+        update_outbox_gauges(&state);
+        CLUSTER_OUTBOX_STALLED_PEERS.store(stalled_peer_count as u64, Ordering::Relaxed);
+        CLUSTER_OUTBOX_STALLED_OLDEST_AGE_MS.store(max_stalled_age_ms, Ordering::Relaxed);
+
+        let snapshot = OutboxMetricsExpositionSnapshot { peers };
+        reservation.resize(modeled_outbox_metrics_snapshot_bytes(&snapshot))?;
+        Ok(AccountedOutboxMetricsSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_metrics_node_id(&self, node_id: &str) -> String {
+        #[cfg(test)]
+        self.metrics_projection_node_id_clones
+            .fetch_add(1, Ordering::Relaxed);
+        node_id.to_owned()
+    }
+
+    fn clone_status_node_id(&self, node_id: &str) -> String {
+        #[cfg(test)]
+        self.status_projection_node_id_clones
+            .fetch_add(1, Ordering::Relaxed);
+        node_id.to_owned()
+    }
+
+    #[cfg(test)]
+    fn metrics_projection_node_id_clones(&self) -> u64 {
+        self.metrics_projection_node_id_clones
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn reset_metrics_projection_node_id_clones(&self) {
+        self.metrics_projection_node_id_clones
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn status_projection_node_id_clones(&self) -> u64 {
+        self.status_projection_node_id_clones
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn reset_status_projection_node_id_clones(&self) {
+        self.status_projection_node_id_clones
+            .store(0, Ordering::Relaxed);
     }
 
     fn cleanup_once(&self) -> Result<(), String> {
@@ -1376,6 +1828,92 @@ fn local_disk_growth_capacity_exhausted(budget: &LocalDiskBudget) -> bool {
         >= growth_limit
 }
 
+fn checkpoint_outbox_metrics(
+    execution: &QueryExecution,
+    index: usize,
+) -> Result<(), QueryBudgetError> {
+    if index.is_multiple_of(OUTBOX_METRICS_CHECKPOINT_INTERVAL) {
+        execution.checkpoint()?;
+    }
+    Ok(())
+}
+
+fn outbox_stalled_peer_age_ms(
+    config: &OutboxConfig,
+    now_unix_ms: u64,
+    queued_entries: u64,
+    queued_bytes: u64,
+    oldest_enqueued_unix_ms: Option<u64>,
+) -> Option<u64> {
+    if queued_entries == 0
+        || queued_entries < config.stalled_peer_min_entries
+        || queued_bytes < config.stalled_peer_min_bytes
+    {
+        return None;
+    }
+    let oldest_enqueued_unix_ms = oldest_enqueued_unix_ms?;
+    let oldest_age_ms = now_unix_ms.saturating_sub(oldest_enqueued_unix_ms);
+    (oldest_age_ms >= config.stalled_peer_age_secs.saturating_mul(1_000)).then_some(oldest_age_ms)
+}
+
+fn modeled_outbox_status_snapshot_bytes(snapshot: &OutboxStatusSnapshot) -> u64 {
+    modeled_outbox_metrics_vec_bytes::<OutboxPeerBacklogSnapshot>(snapshot.peers.capacity())
+        .saturating_add(snapshot.peers.iter().fold(0u64, |bytes, peer| {
+            bytes.saturating_add(modeled_outbox_metrics_string_capacity_bytes(&peer.node_id))
+        }))
+        .saturating_add(
+            modeled_outbox_metrics_vec_bytes::<OutboxStalledPeerSnapshot>(
+                snapshot.stalled_peers.capacity(),
+            ),
+        )
+        .saturating_add(snapshot.stalled_peers.iter().fold(0u64, |bytes, peer| {
+            bytes.saturating_add(modeled_outbox_metrics_string_capacity_bytes(&peer.node_id))
+        }))
+}
+
+fn modeled_outbox_metrics_snapshot_bytes(snapshot: &OutboxMetricsExpositionSnapshot) -> u64 {
+    modeled_outbox_metrics_vec_bytes::<OutboxPeerMetricsExpositionSnapshot>(
+        snapshot.peers.capacity(),
+    )
+    .saturating_add(snapshot.peers.iter().fold(0u64, |bytes, peer| {
+        bytes.saturating_add(modeled_outbox_metrics_string_capacity_bytes(&peer.node_id))
+    }))
+}
+
+fn modeled_outbox_metrics_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(OUTBOX_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_outbox_metrics_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(OUTBOX_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_outbox_metrics_string_capacity_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(OUTBOX_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_outbox_metrics_map_entry_bytes(node_id: &str) -> u64 {
+    modeled_outbox_metrics_str_bytes(node_id)
+        .saturating_add(u64::try_from(std::mem::size_of::<(String, u64)>()).unwrap_or(u64::MAX))
+        .saturating_add(OUTBOX_METRICS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
 fn refresh_observability_locked(
     state: &mut OutboxState,
     config: &OutboxConfig,
@@ -1517,7 +2055,10 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use tsink::{DataPoint, Label, LocalDiskLimits, Row};
+    use tsink::{
+        DataPoint, Label, LocalDiskLimits, QueryBudget, QueryBudgetLimits, QueryCancellationToken,
+        QueryLimitReason, QueryWorkLimits, Row,
+    };
 
     fn sample_rows() -> Vec<Row> {
         vec![
@@ -1559,6 +2100,52 @@ mod tests {
     fn open_budgeted_outbox(path: PathBuf, budget: Arc<LocalDiskBudget>) -> HintedHandoffOutbox {
         HintedHandoffOutbox::open_with_disk_budget(path, test_outbox_config(), Some(budget))
             .expect("budgeted outbox should open")
+    }
+
+    fn configured_metrics_projection_outbox(path: PathBuf) -> HintedHandoffOutbox {
+        let outbox = open_outbox(path);
+        let now_unix_ms = unix_timestamp_millis();
+        let enqueued_unix_ms = now_unix_ms.saturating_sub(5_000);
+        let first_stalled_unix_ms = now_unix_ms.saturating_sub(2_000);
+        let mut state = outbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, node_id, queued_bytes) in [(1, "node-b", 11), (2, "node-c", 17)] {
+            state.pending.insert(
+                id,
+                OutboxEntry {
+                    id,
+                    peer_node_id: node_id.to_string(),
+                    endpoint: "127.0.0.1:9302".to_string(),
+                    idempotency_key: format!("tsink:test:outbox:metrics:{id}"),
+                    ring_version: DEFAULT_INTERNAL_RING_VERSION,
+                    required_capabilities: Vec::new(),
+                    rows: Vec::new(),
+                    queue_bytes: queued_bytes,
+                    enqueued_unix_ms,
+                    next_attempt_unix_ms: enqueued_unix_ms,
+                    attempts: 0,
+                },
+            );
+            state
+                .peer_queued_bytes
+                .insert(node_id.to_string(), queued_bytes);
+        }
+        state.queued_bytes = 28;
+        state.next_id = 3;
+        state
+            .active_stalled_peers
+            .insert("node-b".to_string(), first_stalled_unix_ms);
+        drop(state);
+        outbox.reset_metrics_projection_node_id_clones();
+        outbox.reset_status_projection_node_id_clones();
+        outbox
+    }
+
+    fn outbox_status_projection_test_lock() -> &'static Mutex<()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn encoded_test_enqueue_bytes(idempotency_key: &str) -> u64 {
@@ -2235,6 +2822,411 @@ mod tests {
         assert!(
             metrics_after.cleanup_compactions_total >= metrics_before.cleanup_compactions_total
         );
+    }
+
+    #[test]
+    fn outbox_status_projection_matches_legacy_dynamic_values_and_order() {
+        let _test_guard = outbox_status_projection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("temp dir");
+        let outbox = configured_metrics_projection_outbox(temp.path().join("status-values.log"));
+        let now_unix_ms = unix_timestamp_millis();
+
+        // Prime the legacy transition state so the comparison itself is idempotent.
+        {
+            let mut state = outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(refresh_observability_locked(
+                &mut state,
+                &outbox.config,
+                now_unix_ms,
+            ));
+        }
+        let expected_metrics = outbox_metrics_snapshot();
+        let expected_config = outbox.config();
+        let expected_peers = outbox.peer_backlog_snapshot();
+        let expected_stalled_peers = {
+            let mut state = outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            refresh_observability_locked(&mut state, &outbox.config, now_unix_ms)
+        };
+        outbox.reset_status_projection_node_id_clones();
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let projected = outbox
+            .status_snapshot_at_with_execution(&execution, now_unix_ms)
+            .expect("status projection should succeed");
+
+        assert_eq!(projected.metrics, expected_metrics);
+        assert_eq!(projected.config, expected_config);
+        assert_eq!(projected.peers, expected_peers);
+        assert_eq!(projected.stalled_peers, expected_stalled_peers);
+        assert_eq!(
+            projected
+                .peers
+                .iter()
+                .map(|peer| peer.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-b", "node-c"]
+        );
+        assert_eq!(
+            projected
+                .stalled_peers
+                .iter()
+                .map(|peer| peer.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-b", "node-c"]
+        );
+        assert_eq!(outbox.status_projection_node_id_clones(), 4);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn outbox_status_projection_reserves_peak_before_clones_and_releases_exactly() {
+        let _test_guard = outbox_status_projection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("temp dir");
+        let calibration_outbox =
+            configured_metrics_projection_outbox(temp.path().join("status-calibration.log"));
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = calibration_outbox
+            .status_snapshot_with_execution(&calibration)
+            .expect("calibration status projection should succeed");
+        let retained_bytes = calibrated.accounted_bytes();
+        let peak_bytes = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(retained_bytes > 0);
+        assert!(
+            peak_bytes > retained_bytes,
+            "the peak must include the newly persisted stalled-peer key"
+        );
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, retained_bytes);
+        assert_eq!(
+            calibration_outbox.status_projection_node_id_clones(),
+            5,
+            "two peer outputs, two stalled outputs, and one new state key should be copied"
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_released = calibration_budget.snapshot();
+        assert_eq!(calibration_released.active_queries, 0);
+        assert_eq!(calibration_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(
+            calibration_released.accounting_invariant_violations_total,
+            0
+        );
+
+        let exact_outbox =
+            configured_metrics_projection_outbox(temp.path().join("status-exact.log"));
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = exact_outbox
+            .status_snapshot_with_execution(&exact)
+            .expect("the exact modeled peak should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), retained_bytes);
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            peak_bytes
+        );
+        assert_eq!(exact_outbox.status_projection_node_id_clones(), 5);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.active_queries, 0);
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        let one_under_outbox =
+            configured_metrics_projection_outbox(temp.path().join("status-one-under.log"));
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = one_under_outbox
+            .status_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the modeled peak must reject");
+        let failed_scratch_bytes = match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert!(exceeded.current > 0);
+                assert_eq!(
+                    exceeded.current.saturating_add(exceeded.requested),
+                    peak_bytes
+                );
+                exceeded.current
+            }
+            other => panic!("unexpected status projection error: {other}"),
+        };
+        assert_eq!(
+            one_under_outbox.status_projection_node_id_clones(),
+            0,
+            "the failed peak reservation must precede every status node-id copy"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            failed_scratch_bytes,
+            "only the borrowed-ID aggregation scratch may be admitted before N-1 rejects"
+        );
+        {
+            let state = one_under_outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !state.active_stalled_peers.contains_key("node-c"),
+                "rejected materialization must not publish stalled transitions"
+            );
+        }
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.active_queries, 0);
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn outbox_status_projection_honors_precancellation_without_clones_or_residual_memory() {
+        let _test_guard = outbox_status_projection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("temp dir");
+        let outbox = configured_metrics_projection_outbox(temp.path().join("status-cancelled.log"));
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = outbox
+            .status_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(outbox.status_projection_node_id_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        {
+            let state = outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!state.active_stalled_peers.contains_key("node-c"));
+        }
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_projection_reserves_peak_before_node_id_clones_and_releases_exactly() {
+        let temp = TempDir::new().expect("temp dir");
+        let calibration_outbox =
+            configured_metrics_projection_outbox(temp.path().join("calibration.log"));
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = calibration_outbox
+            .metrics_snapshot_with_execution(&calibration)
+            .expect("calibration projection should succeed");
+        let retained_bytes = calibrated.accounted_bytes();
+        let peak_bytes = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(retained_bytes > 0);
+        assert!(
+            peak_bytes > retained_bytes,
+            "the peak must include the missing stalled-state key allowance"
+        );
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, retained_bytes);
+        assert_eq!(
+            calibration_outbox.metrics_projection_node_id_clones(),
+            3,
+            "two returned peer identifiers and one new stalled-state key should be copied"
+        );
+        assert_eq!(
+            calibrated
+                .peers
+                .iter()
+                .map(|peer| peer.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-b", "node-c"]
+        );
+        assert!(calibrated.peers.iter().all(|peer| peer.queued_entries == 1));
+        assert!(calibrated.peers.iter().all(|peer| peer.stalled.is_some()));
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_outbox = configured_metrics_projection_outbox(temp.path().join("exact.log"));
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = exact_outbox
+            .metrics_snapshot_with_execution(&exact)
+            .expect("the exact modeled peak should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), retained_bytes);
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            peak_bytes
+        );
+        assert_eq!(exact_outbox.metrics_projection_node_id_clones(), 3);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().active_queries, 0);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_outbox =
+            configured_metrics_projection_outbox(temp.path().join("one-under.log"));
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(peak_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(peak_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = one_under_outbox
+            .metrics_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the modeled peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, peak_bytes);
+            }
+            other => panic!("unexpected metrics projection error: {other}"),
+        }
+        assert_eq!(
+            one_under_outbox.metrics_projection_node_id_clones(),
+            0,
+            "the failed peak reservation must precede every projection node-id copy"
+        );
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0
+        );
+        {
+            let state = one_under_outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !state.active_stalled_peers.contains_key("node-c"),
+                "rejected materialization must not publish stalled transitions"
+            );
+        }
+        drop(one_under);
+        let released = one_under_budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_projection_honors_precancellation_without_clones_or_residual_memory() {
+        let temp = TempDir::new().expect("temp dir");
+        let outbox = configured_metrics_projection_outbox(temp.path().join("cancelled.log"));
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = outbox
+            .metrics_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(outbox.metrics_projection_node_id_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        {
+            let state = outbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!state.active_stalled_peers.contains_key("node-c"));
+        }
+        drop(execution);
+
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
     }
 
     #[test]

@@ -424,19 +424,33 @@ impl Drop for TombstoneMemoryReservation<'_> {
     }
 }
 
+impl MemoryAccountingState {
+    fn reservation_admission_context(&self) -> MemoryReservationAdmissionContext<'_> {
+        MemoryReservationAdmissionContext {
+            reservation_admission_lock: &self.reservation_admission_lock,
+            used_bytes: &self.used_bytes,
+            tombstone_staged_bytes: &self.tombstone_staged_bytes,
+            remote_catalog_staging: self.remote_catalog_staging.as_ref(),
+            write_transient: self.write_transient.as_ref(),
+            budget_bytes: &self.budget_bytes,
+            memory_rejections_total: &self.rejections_total,
+        }
+    }
+
+    pub(in crate::engine::storage_engine) fn remote_catalog_memory_reservation(
+        &self,
+        requested_bytes: usize,
+    ) -> Result<RemoteCatalogMemoryReservation> {
+        self.remote_catalog_staging
+            .new_reservation(requested_bytes, self.reservation_admission_context())
+    }
+}
+
 impl ChunkStorage {
     pub(in super::super) fn memory_reservation_admission_context(
         &self,
     ) -> MemoryReservationAdmissionContext<'_> {
-        MemoryReservationAdmissionContext {
-            reservation_admission_lock: &self.memory.reservation_admission_lock,
-            used_bytes: &self.memory.used_bytes,
-            tombstone_staged_bytes: &self.memory.tombstone_staged_bytes,
-            remote_catalog_staging: self.memory.remote_catalog_staging.as_ref(),
-            write_transient: self.memory.write_transient.as_ref(),
-            budget_bytes: &self.memory.budget_bytes,
-            memory_rejections_total: &self.memory.rejections_total,
-        }
+        self.memory.reservation_admission_context()
     }
 
     pub(in super::super) fn remote_catalog_memory_reservation(
@@ -444,8 +458,7 @@ impl ChunkStorage {
         requested_bytes: usize,
     ) -> Result<RemoteCatalogMemoryReservation> {
         self.memory
-            .remote_catalog_staging
-            .new_reservation(requested_bytes, self.memory_reservation_admission_context())
+            .remote_catalog_memory_reservation(requested_bytes)
     }
 
     pub(in super::super) fn resize_remote_catalog_memory_reservation(
@@ -671,6 +684,27 @@ impl ChunkStorage {
             .take();
     }
 
+    pub(in super::super) fn memory_observability_snapshot_modeled_retained_bytes(
+        &self,
+    ) -> Result<u64> {
+        let mut total = crate::storage::modeled_status_observability_vec_bytes::<String>(
+            KNOWN_EXCLUDED_MEMORY_CATEGORIES.len(),
+        )?;
+        for category in KNOWN_EXCLUDED_MEMORY_CATEGORIES {
+            total = total
+                .checked_add(crate::storage::modeled_status_observability_string_bytes(
+                    category.len(),
+                )?)
+                .ok_or_else(|| {
+                    TsinkError::Other(
+                        "memory status observability retained-byte model exceeds the supported range"
+                            .to_string(),
+                    )
+                })?;
+        }
+        Ok(total)
+    }
+
     pub(in super::super) fn memory_observability_snapshot(
         &self,
     ) -> crate::MemoryObservabilitySnapshot {
@@ -767,6 +801,97 @@ impl ChunkStorage {
                 approaching_limit_basis_points: finite_budget
                     .map(|_| MEMORY_APPROACHING_LIMIT_BASIS_POINTS),
                 approaching_limit_bytes,
+                active_backpressured_writers,
+                backpressure_events_total: self
+                    .memory
+                    .backpressure_events_total
+                    .load(Ordering::Acquire),
+                rejections_total: self.memory.rejections_total.load(Ordering::Acquire),
+            },
+        }
+    }
+
+    pub(in super::super) fn memory_metrics_observability_snapshot(
+        &self,
+    ) -> crate::MemoryMetricsObservabilitySnapshot {
+        let memory_accounting = self.memory_accounting_context();
+        if !self.memory.accounting_enabled {
+            memory_accounting.refresh_memory_usage();
+        }
+
+        let accounted_bytes = memory_accounting.used_value();
+        let persisted_mmap_bytes = context::MemoryAccountingContext::component_value(
+            &self.memory.persisted_mmap_used_bytes,
+        );
+        let budget = memory_accounting.budget_value();
+        let finite_budget = (budget != usize::MAX).then_some(budget);
+        let approaching_limit_bytes = finite_budget.map(|budget| {
+            let numerator = (budget as u128)
+                .saturating_mul(u128::from(MEMORY_APPROACHING_LIMIT_BASIS_POINTS))
+                .saturating_add(9_999);
+            u64::try_from((numerator / 10_000).min(u64::MAX.into())).unwrap_or(u64::MAX)
+        });
+        let active_backpressured_writers = self
+            .memory
+            .active_backpressured_writers
+            .load(Ordering::Acquire);
+        let pressure_level = if self.storage_health_degraded() {
+            crate::MemoryPressureLevel::Degraded
+        } else if active_backpressured_writers > 0 {
+            crate::MemoryPressureLevel::Backpressured
+        } else if finite_budget.is_some_and(|budget| accounted_bytes >= budget) {
+            crate::MemoryPressureLevel::Rejecting
+        } else if approaching_limit_bytes
+            .is_some_and(|threshold| (accounted_bytes as u128) >= u128::from(threshold))
+        {
+            crate::MemoryPressureLevel::ApproachingLimit
+        } else {
+            crate::MemoryPressureLevel::Normal
+        };
+
+        crate::MemoryMetricsObservabilitySnapshot {
+            excluded_bytes: 0,
+            excluded_bytes_known: false,
+            registry_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.registry_used_bytes,
+            ),
+            metadata_cache_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.metadata_used_bytes,
+            ),
+            persisted_index_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.persisted_index_used_bytes,
+            ),
+            persisted_mmap_bytes,
+            tombstone_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.tombstone_used_bytes,
+            )
+            .saturating_add(context::MemoryAccountingContext::component_value(
+                &self.memory.tombstone_staged_bytes,
+            )),
+            remote_catalog_staging_bytes: self.memory.remote_catalog_staging.current_bytes(),
+            wal_writer_buffer_bytes: memory_accounting.wal_writer_buffer_used_value(),
+            wal_series_definition_cache_bytes: context::MemoryAccountingContext::component_value(
+                &self.memory.wal_series_definition_cache_used_bytes,
+            ),
+            write_transient_bytes: self.memory.write_transient.current_bytes(),
+            peak_write_transient_bytes: self
+                .memory
+                .write_transient
+                .peak_bytes
+                .load(Ordering::Acquire)
+                .min(usize::MAX as u64) as usize,
+            write_transient_reservations_total: self
+                .memory
+                .write_transient
+                .reservations_total
+                .load(Ordering::Acquire),
+            write_transient_rejections_total: self
+                .memory
+                .write_transient
+                .rejections_total
+                .load(Ordering::Acquire),
+            pressure: crate::MemoryPressureMetricsSnapshot {
+                level: Some(pressure_level),
                 active_backpressured_writers,
                 backpressure_events_total: self
                     .memory

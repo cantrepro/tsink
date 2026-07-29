@@ -1,7 +1,8 @@
-use crate::cluster::control::ControlState;
+use crate::cluster::control::{ControlHotspotSnapshot, ControlState};
 use crate::cluster::replication::stable_series_identity_hash;
 use crate::cluster::ring::ShardRing;
 use crate::tenant;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,21 @@ const TENANT_SKEW_THRESHOLD: f64 = 4.0;
 const HOTSPOT_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 const HOTSPOT_BTREE_ENTRY_ALLOWANCE_BYTES: u64 = 256;
 const HOTSPOT_FIXED_SCRATCH_BYTES: u64 = 16 * 1024;
+
+#[derive(Clone, Copy)]
+enum HotspotControlInput<'a> {
+    State(&'a ControlState),
+    Metrics(&'a ControlHotspotSnapshot),
+}
+
+impl HotspotControlInput<'_> {
+    fn transition_count(self) -> usize {
+        match self {
+            Self::State(state) => state.transitions.len(),
+            Self::Metrics(snapshot) => snapshot.handoff_shards.len(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotspotShardCountersSnapshot {
@@ -42,7 +58,8 @@ pub struct HotspotTrackerSnapshot {
     pub tenants: Vec<HotspotTenantCountersSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HotShardSnapshot {
     pub shard: u32,
     pub ingest_rows_total: u64,
@@ -59,7 +76,8 @@ pub struct HotShardSnapshot {
     pub recommend_move: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TenantHotspotSnapshot {
     pub tenant_id: String,
     pub ingest_rows_total: u64,
@@ -71,7 +89,8 @@ pub struct TenantHotspotSnapshot {
     pub skew_factor: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClusterHotspotSnapshot {
     pub generated_unix_ms: u64,
     pub hot_shards: Vec<HotShardSnapshot>,
@@ -86,6 +105,14 @@ pub struct ClusterHotspotSnapshot {
 #[derive(Debug)]
 pub struct AccountedClusterHotspotSnapshot {
     pub snapshot: ClusterHotspotSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+/// Admin-rebalance hotspot output plus the exact tracker generation used for move candidates.
+#[derive(Debug)]
+pub(crate) struct AccountedRebalanceHotspotSnapshot {
+    pub snapshot: ClusterHotspotSnapshot,
+    pub tracker: HotspotTrackerSnapshot,
     _reservation: tsink::QueryMemoryReservation,
 }
 
@@ -199,6 +226,7 @@ pub(crate) fn hotspot_tracker_snapshot_for_rows(
     hotspot_tracker_snapshot_from_tracker(&tracker)
 }
 
+#[allow(dead_code)]
 pub fn build_cluster_hotspot_snapshot(
     metrics: &[MetricSeries],
     ring: Option<&ShardRing>,
@@ -214,6 +242,7 @@ pub fn build_cluster_hotspot_snapshot(
     )
 }
 
+#[allow(dead_code)]
 pub fn build_cluster_hotspot_snapshot_with_limit(
     metrics: &[MetricSeries],
     ring: Option<&ShardRing>,
@@ -223,10 +252,10 @@ pub fn build_cluster_hotspot_snapshot_with_limit(
 ) -> ClusterHotspotSnapshot {
     let tracker = hotspot_tracker_snapshot();
     build_cluster_hotspot_snapshot_from_tracker_controlled(
-        tracker,
+        &tracker,
         metrics,
         ring,
-        control_state,
+        control_state.map(HotspotControlInput::State),
         tenant_scope,
         top_n,
         None,
@@ -240,10 +269,144 @@ pub fn build_cluster_hotspot_snapshot_with_limit(
 /// The reservation is established while the tracker lock is held, so a concurrent new
 /// tenant/shard cannot grow the cloned tracker beyond the admitted model between measurement and
 /// materialization.
+#[allow(dead_code)]
 pub fn build_cluster_hotspot_snapshot_with_execution(
     metrics: &[MetricSeries],
     ring: Option<&ShardRing>,
     control_state: Option<&ControlState>,
+    tenant_scope: Option<&str>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedClusterHotspotSnapshot, tsink::QueryBudgetError> {
+    build_cluster_hotspot_snapshot_with_control_input_execution(
+        metrics,
+        ring,
+        control_state.map(HotspotControlInput::State),
+        tenant_scope,
+        execution,
+    )
+}
+
+pub(crate) fn build_cluster_hotspot_snapshot_with_control_metrics_execution(
+    metrics: &[MetricSeries],
+    ring: Option<&ShardRing>,
+    control: Option<&ControlHotspotSnapshot>,
+    tenant_scope: Option<&str>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedClusterHotspotSnapshot, tsink::QueryBudgetError> {
+    build_cluster_hotspot_snapshot_with_control_input_execution(
+        metrics,
+        ring,
+        control.map(HotspotControlInput::Metrics),
+        tenant_scope,
+        execution,
+    )
+}
+
+/// Builds the admin rebalance hotspot and retains the same accounted tracker snapshot for live
+/// move-candidate scoring. This prevents the response from cloning the global tracker twice or
+/// mixing candidate and hotspot data from different tracker generations.
+pub(crate) fn build_rebalance_hotspot_snapshot_with_control_metrics_execution(
+    metrics: &[MetricSeries],
+    ring: Option<&ShardRing>,
+    control: Option<&ControlHotspotSnapshot>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedRebalanceHotspotSnapshot, tsink::QueryBudgetError> {
+    build_rebalance_hotspot_snapshot_with_control_metrics_tenant_execution(
+        metrics, ring, control, None, execution,
+    )
+}
+
+/// Builds the tracker-retaining hotspot projection for a tenant-scoped status response.
+///
+/// The returned tracker is the exact generation used for the tenant-scoped hotspot output, so a
+/// downstream rebalance projection can score candidates without a second global tracker clone.
+pub(crate) fn build_rebalance_hotspot_snapshot_with_control_metrics_tenant_execution(
+    metrics: &[MetricSeries],
+    ring: Option<&ShardRing>,
+    control: Option<&ControlHotspotSnapshot>,
+    tenant_scope: Option<&str>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedRebalanceHotspotSnapshot, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let metric_tenant_string_bytes = modeled_metric_tenant_string_bytes(metrics, Some(execution))?;
+    let control = control.map(HotspotControlInput::Metrics);
+    let (tracker, reservation) = with_hotspot_tracker(|tracker| {
+        prepare_rebalance_hotspot_tracker_with_execution(
+            tracker,
+            metrics.len(),
+            metric_tenant_string_bytes,
+            ring,
+            control,
+            execution,
+        )
+    })?;
+    finish_rebalance_hotspot_snapshot_with_execution(
+        tracker,
+        reservation,
+        metrics,
+        ring,
+        control,
+        tenant_scope,
+        execution,
+    )
+}
+
+fn prepare_rebalance_hotspot_tracker_with_execution(
+    tracker: &HotspotTracker,
+    metric_count: usize,
+    metric_tenant_string_bytes: u64,
+    ring: Option<&ShardRing>,
+    control: Option<HotspotControlInput<'_>>,
+    execution: &tsink::QueryExecution,
+) -> Result<(HotspotTrackerSnapshot, tsink::QueryMemoryReservation), tsink::QueryBudgetError> {
+    let peak_bytes = modeled_hotspot_peak_bytes(
+        tracker,
+        metric_count,
+        metric_tenant_string_bytes,
+        ring,
+        control,
+        DEFAULT_TOP_N,
+        Some(execution),
+    )?;
+    let reservation = execution.reserve_memory(peak_bytes)?;
+    let snapshot = hotspot_tracker_snapshot_from_tracker_controlled(tracker, Some(execution))?;
+    Ok((snapshot, reservation))
+}
+
+fn finish_rebalance_hotspot_snapshot_with_execution(
+    tracker: HotspotTrackerSnapshot,
+    mut reservation: tsink::QueryMemoryReservation,
+    metrics: &[MetricSeries],
+    ring: Option<&ShardRing>,
+    control: Option<HotspotControlInput<'_>>,
+    tenant_scope: Option<&str>,
+    execution: &tsink::QueryExecution,
+) -> Result<AccountedRebalanceHotspotSnapshot, tsink::QueryBudgetError> {
+    execution.checkpoint()?;
+    let snapshot = build_cluster_hotspot_snapshot_from_tracker_controlled(
+        &tracker,
+        metrics,
+        ring,
+        control,
+        tenant_scope,
+        DEFAULT_TOP_N,
+        Some(execution),
+    )?;
+    reservation.resize(
+        modeled_hotspot_tracker_snapshot_retained_bytes(&tracker)
+            .saturating_add(modeled_hotspot_result_retained_bytes(&snapshot)),
+    )?;
+    Ok(AccountedRebalanceHotspotSnapshot {
+        snapshot,
+        tracker,
+        _reservation: reservation,
+    })
+}
+
+fn build_cluster_hotspot_snapshot_with_control_input_execution(
+    metrics: &[MetricSeries],
+    ring: Option<&ShardRing>,
+    control: Option<HotspotControlInput<'_>>,
     tenant_scope: Option<&str>,
     execution: &tsink::QueryExecution,
 ) -> Result<AccountedClusterHotspotSnapshot, tsink::QueryBudgetError> {
@@ -255,7 +418,7 @@ pub fn build_cluster_hotspot_snapshot_with_execution(
             metrics.len(),
             metric_tenant_string_bytes,
             ring,
-            control_state,
+            control,
             DEFAULT_TOP_N,
             Some(execution),
         )?;
@@ -265,10 +428,10 @@ pub fn build_cluster_hotspot_snapshot_with_execution(
     })?;
     execution.checkpoint()?;
     let snapshot = build_cluster_hotspot_snapshot_from_tracker_controlled(
-        tracker,
+        &tracker,
         metrics,
         ring,
-        control_state,
+        control,
         tenant_scope,
         DEFAULT_TOP_N,
         Some(execution),
@@ -281,10 +444,10 @@ pub fn build_cluster_hotspot_snapshot_with_execution(
 }
 
 fn build_cluster_hotspot_snapshot_from_tracker_controlled(
-    tracker: HotspotTrackerSnapshot,
+    tracker: &HotspotTrackerSnapshot,
     metrics: &[MetricSeries],
     ring: Option<&ShardRing>,
-    control_state: Option<&ControlState>,
+    control: Option<HotspotControlInput<'_>>,
     tenant_scope: Option<&str>,
     top_n: usize,
     execution: Option<&tsink::QueryExecution>,
@@ -314,20 +477,31 @@ fn build_cluster_hotspot_snapshot_from_tracker_controlled(
     }
 
     let mut handoff_pending_by_shard = BTreeMap::<u32, u64>::new();
-    if let Some(state) = control_state {
-        for transition in &state.transitions {
-            hotspot_checkpoint(execution)?;
-            if transition.handoff.phase.is_active() {
-                *handoff_pending_by_shard
-                    .entry(transition.shard)
-                    .or_insert(0) = handoff_pending_by_shard
-                    .get(&transition.shard)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(transition.handoff.pending_rows);
+    let mut record_handoff = |shard: u32, pending_rows: u64| {
+        hotspot_checkpoint(execution)?;
+        *handoff_pending_by_shard.entry(shard).or_insert(0) = handoff_pending_by_shard
+            .get(&shard)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(pending_rows);
+        hotspot_observe_intermediate(execution, handoff_pending_by_shard.len())
+    };
+    match control {
+        Some(HotspotControlInput::State(state)) => {
+            for transition in &state.transitions {
+                if transition.handoff.phase.is_active() {
+                    record_handoff(transition.shard, transition.handoff.pending_rows)?;
+                } else {
+                    hotspot_checkpoint(execution)?;
+                }
             }
-            hotspot_observe_intermediate(execution, handoff_pending_by_shard.len())?;
         }
+        Some(HotspotControlInput::Metrics(snapshot)) => {
+            for handoff in &snapshot.handoff_shards {
+                record_handoff(handoff.shard, handoff.pending_rows)?;
+            }
+        }
+        None => {}
     }
 
     let mut shard_ingest = BTreeMap::<u32, u64>::new();
@@ -571,14 +745,14 @@ fn modeled_hotspot_peak_bytes(
     metric_count: usize,
     metric_tenant_string_bytes: u64,
     ring: Option<&ShardRing>,
-    control_state: Option<&ControlState>,
+    control: Option<HotspotControlInput<'_>>,
     top_n: usize,
     execution: Option<&tsink::QueryExecution>,
 ) -> Result<u64, tsink::QueryBudgetError> {
     hotspot_checkpoint(execution)?;
     let tracker_shards = tracker.shards.len();
     let tracker_tenants = tracker.tenants.len();
-    let transition_count = control_state.map_or(0, |state| state.transitions.len());
+    let transition_count = control.map_or(0, HotspotControlInput::transition_count);
 
     let mut tracker_tenant_string_bytes = 0u64;
     for tenant in tracker.tenants.keys() {
@@ -651,6 +825,16 @@ fn modeled_hotspot_result_retained_bytes(snapshot: &ClusterHotspotSnapshot) -> u
             snapshot.tenant_hotspots.capacity(),
         ))
         .saturating_add(snapshot.tenant_hotspots.iter().fold(0u64, |bytes, tenant| {
+            bytes.saturating_add(modeled_string_len_bytes(tenant.tenant_id.capacity()))
+        }))
+}
+
+fn modeled_hotspot_tracker_snapshot_retained_bytes(snapshot: &HotspotTrackerSnapshot) -> u64 {
+    modeled_vec_capacity_bytes::<HotspotShardCountersSnapshot>(snapshot.shards.capacity())
+        .saturating_add(modeled_vec_capacity_bytes::<HotspotTenantCountersSnapshot>(
+            snapshot.tenants.capacity(),
+        ))
+        .saturating_add(snapshot.tenants.iter().fold(0u64, |bytes, tenant| {
             bytes.saturating_add(modeled_string_len_bytes(tenant.tenant_id.capacity()))
         }))
 }
@@ -957,6 +1141,202 @@ mod tests {
         QueryWorkLimits,
     };
 
+    fn tenant_counters<'a>(
+        snapshot: &'a HotspotTrackerSnapshot,
+        tenant_id: &str,
+    ) -> Option<&'a HotspotTenantCountersSnapshot> {
+        snapshot
+            .tenants
+            .iter()
+            .find(|tenant| tenant.tenant_id == tenant_id)
+    }
+
+    #[test]
+    fn process_global_tracker_combines_logically_independent_server_activity() {
+        const SERVER_A_TENANT: &str = "hotspot-characterization-server-a";
+        const SERVER_B_TENANT: &str = "hotspot-characterization-server-b";
+
+        let before = hotspot_tracker_snapshot();
+        let before_a = tenant_counters(&before, SERVER_A_TENANT)
+            .map(|tenant| (tenant.query_requests_total, tenant.query_units_total))
+            .unwrap_or_default();
+        let before_b = tenant_counters(&before, SERVER_B_TENANT)
+            .map(|tenant| (tenant.query_requests_total, tenant.query_units_total))
+            .unwrap_or_default();
+
+        // The producer API has no instance identity. These calls model activity from two
+        // otherwise-independent server runtimes in the same process.
+        record_tenant_query(SERVER_A_TENANT, 2, 3);
+        record_tenant_query(SERVER_B_TENANT, 5, 7);
+
+        let combined = hotspot_tracker_snapshot();
+        let server_a = tenant_counters(&combined, SERVER_A_TENANT)
+            .expect("server A identity must be retained");
+        let server_b = tenant_counters(&combined, SERVER_B_TENANT)
+            .expect("server B identity must be retained");
+        assert_eq!(
+            (server_a.query_requests_total, server_a.query_units_total),
+            (before_a.0.saturating_add(2), before_a.1.saturating_add(3))
+        );
+        assert_eq!(
+            (server_b.query_requests_total, server_b.query_units_total),
+            (before_b.0.saturating_add(5), before_b.1.saturating_add(7))
+        );
+    }
+
+    #[test]
+    fn process_global_tracker_retains_inactive_tenant_identity_and_totals() {
+        const RETAINED_TENANT: &str = "hotspot-characterization-retained";
+        const LATER_TENANT: &str = "hotspot-characterization-later";
+
+        record_tenant_query(RETAINED_TENANT, 4, 9);
+        let first = hotspot_tracker_snapshot();
+        let retained_before = tenant_counters(&first, RETAINED_TENANT)
+            .expect("the first identity must be present")
+            .clone();
+
+        record_tenant_query(LATER_TENANT, 1, 1);
+        let later = hotspot_tracker_snapshot();
+        let retained_after = tenant_counters(&later, RETAINED_TENANT)
+            .expect("inactive identity must remain present");
+        assert_eq!(retained_after, &retained_before);
+        assert!(
+            tenant_counters(&later, LATER_TENANT).is_some(),
+            "new activity must grow the retained identity set without removing the old identity"
+        );
+    }
+
+    #[test]
+    fn tenant_scope_filters_output_after_global_pressure_denominators() {
+        let scoped_tenant = HotspotTenantCountersSnapshot {
+            tenant_id: "scope-a".to_string(),
+            ingest_rows_total: 100,
+            query_requests_total: 0,
+            query_units_total: 0,
+            repair_rows_inserted_total: 0,
+        };
+        let scoped_only = HotspotTrackerSnapshot {
+            generated_unix_ms: 1,
+            shards: Vec::new(),
+            tenants: vec![scoped_tenant.clone()],
+        };
+        let with_other_tenant = HotspotTrackerSnapshot {
+            generated_unix_ms: 1,
+            shards: Vec::new(),
+            tenants: vec![
+                scoped_tenant,
+                HotspotTenantCountersSnapshot {
+                    tenant_id: "scope-b".to_string(),
+                    ingest_rows_total: 1,
+                    query_requests_total: 0,
+                    query_units_total: 0,
+                    repair_rows_inserted_total: 0,
+                },
+            ],
+        };
+
+        let isolated = build_cluster_hotspot_snapshot_from_tracker_controlled(
+            &scoped_only,
+            &[],
+            None,
+            None,
+            Some("scope-a"),
+            DEFAULT_TOP_N,
+            None,
+        )
+        .expect("isolated scoped snapshot should build");
+        let global = build_cluster_hotspot_snapshot_from_tracker_controlled(
+            &with_other_tenant,
+            &[],
+            None,
+            None,
+            Some("scope-a"),
+            DEFAULT_TOP_N,
+            None,
+        )
+        .expect("global scoped snapshot should build");
+
+        assert_eq!(isolated.tenant_hotspots.len(), 1);
+        assert_eq!(global.tenant_hotspots.len(), 1);
+        assert_eq!(
+            global.tenant_hotspots[0].ingest_rows_total,
+            isolated.tenant_hotspots[0].ingest_rows_total
+        );
+        assert!(
+            global.tenant_hotspots[0].pressure_score > isolated.tenant_hotspots[0].pressure_score,
+            "an unreturned global identity currently changes the scoped tenant's denominator"
+        );
+    }
+
+    #[test]
+    fn default_top_eight_truncation_preserves_full_set_skew_and_max_aggregates() {
+        let tenants = (0..10)
+            .map(|index| {
+                let (ingest, requests, units, repair) = match index {
+                    0 | 1 => (1, 0, 0, 0),
+                    2 | 3 => (0, 1, 0, 0),
+                    4 | 5 => (0, 0, 1, 0),
+                    6 | 7 => (0, 0, 0, 1),
+                    8 | 9 => (0, 0, 0, 0),
+                    _ => unreachable!("fixture contains exactly ten tenants"),
+                };
+                HotspotTenantCountersSnapshot {
+                    tenant_id: format!("aggregate-{index:02}"),
+                    ingest_rows_total: ingest,
+                    query_requests_total: requests,
+                    query_units_total: units,
+                    repair_rows_inserted_total: repair,
+                }
+            })
+            .collect::<Vec<_>>();
+        let tracker = HotspotTrackerSnapshot {
+            generated_unix_ms: 1,
+            shards: Vec::new(),
+            tenants,
+        };
+        let metrics = [8, 9]
+            .into_iter()
+            .map(|index| MetricSeries {
+                name: format!("aggregate_storage_{index}"),
+                labels: vec![Label::new(
+                    tenant::TENANT_LABEL,
+                    format!("aggregate-{index:02}"),
+                )],
+            })
+            .collect::<Vec<_>>();
+
+        let default_top = build_cluster_hotspot_snapshot_from_tracker_controlled(
+            &tracker,
+            &metrics,
+            None,
+            None,
+            None,
+            DEFAULT_TOP_N,
+            None,
+        )
+        .expect("default top-eight snapshot should build");
+        assert_eq!(default_top.tenant_hotspots.len(), DEFAULT_TOP_N);
+        assert_eq!(
+            default_top.skewed_tenants, 10,
+            "the skew aggregate is computed before truncating ten identities to eight"
+        );
+        assert!((default_top.max_tenant_score - 15.0).abs() < f64::EPSILON);
+
+        let aggregates_without_rows = build_cluster_hotspot_snapshot_from_tracker_controlled(
+            &tracker, &metrics, None, None, None, 0, None,
+        )
+        .expect("zero-row snapshot should still compute aggregates");
+        assert!(aggregates_without_rows.tenant_hotspots.is_empty());
+        assert_eq!(
+            aggregates_without_rows.skewed_tenants,
+            default_top.skewed_tenants
+        );
+        assert_eq!(
+            aggregates_without_rows.max_tenant_score,
+            default_top.max_tenant_score
+        );
+    }
+
     #[test]
     fn accounted_hotspot_honors_cancellation_without_leaking_a_query_slot() {
         let budget =
@@ -978,6 +1358,40 @@ mod tests {
         assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
         assert_eq!(snapshot.cancellations_total, 1);
         assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn metrics_control_projection_preserves_active_handoff_pressure() {
+        let control = ControlHotspotSnapshot {
+            handoff_shards: vec![
+                crate::cluster::control::ControlHotspotShardSnapshot {
+                    shard: 3,
+                    pending_rows: 11,
+                },
+                crate::cluster::control::ControlHotspotShardSnapshot {
+                    shard: 3,
+                    pending_rows: 7,
+                },
+            ],
+        };
+        let snapshot = build_cluster_hotspot_snapshot_from_tracker_controlled(
+            &HotspotTrackerSnapshot {
+                generated_unix_ms: 1,
+                shards: Vec::new(),
+                tenants: Vec::new(),
+            },
+            &[],
+            None,
+            Some(HotspotControlInput::Metrics(&control)),
+            None,
+            DEFAULT_TOP_N,
+            None,
+        )
+        .expect("metrics-only control input should transform");
+
+        assert_eq!(snapshot.hot_shards.len(), 1);
+        assert_eq!(snapshot.hot_shards[0].shard, 3);
+        assert_eq!(snapshot.hot_shards[0].handoff_pending_rows, 18);
     }
 
     #[test]
@@ -1007,7 +1421,7 @@ mod tests {
         };
 
         let error = build_cluster_hotspot_snapshot_from_tracker_controlled(
-            tracker,
+            &tracker,
             &[],
             None,
             None,
@@ -1032,6 +1446,149 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_hotspot_tracker_input_enforces_exact_peak_before_clone() {
+        fn budget_with_memory_limit(limit: Option<u64>) -> QueryBudget {
+            QueryBudget::new(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: limit,
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: limit,
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .expect("hotspot producer test budget should build")
+        }
+
+        fn build_from_local_tracker(
+            tracker: &HotspotTracker,
+            metrics: &[MetricSeries],
+            control: &ControlHotspotSnapshot,
+            execution: &tsink::QueryExecution,
+        ) -> Result<AccountedRebalanceHotspotSnapshot, QueryBudgetError> {
+            let metric_tenant_string_bytes =
+                modeled_metric_tenant_string_bytes(metrics, Some(execution))?;
+            let control = Some(HotspotControlInput::Metrics(control));
+            let (tracker, reservation) = prepare_rebalance_hotspot_tracker_with_execution(
+                tracker,
+                metrics.len(),
+                metric_tenant_string_bytes,
+                None,
+                control,
+                execution,
+            )?;
+            finish_rebalance_hotspot_snapshot_with_execution(
+                tracker,
+                reservation,
+                metrics,
+                None,
+                control,
+                None,
+                execution,
+            )
+        }
+
+        let mut tracker = HotspotTracker::default();
+        tracker.shards.insert(
+            7,
+            HotspotShardCounters {
+                ingest_rows_total: 11,
+                query_requests_total: 2,
+                query_shard_hits_total: 3,
+                repair_mismatches_total: 1,
+                repair_series_gap_total: 1,
+                repair_point_gap_total: 2,
+                repair_rows_inserted_total: 1,
+            },
+        );
+        tracker.tenants.insert(
+            "team-a".to_string(),
+            HotspotTenantCounters {
+                ingest_rows_total: 11,
+                query_requests_total: 2,
+                query_units_total: 3,
+                repair_rows_inserted_total: 1,
+            },
+        );
+        let metrics = vec![MetricSeries {
+            name: "hotspot_exact".to_string(),
+            labels: vec![Label::new(tenant::TENANT_LABEL, "team-a")],
+        }];
+        let control = ControlHotspotSnapshot {
+            handoff_shards: vec![crate::cluster::control::ControlHotspotShardSnapshot {
+                shard: 7,
+                pending_rows: 5,
+            }],
+        };
+
+        let calibration_budget = budget_with_memory_limit(None);
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let snapshot = build_from_local_tracker(&tracker, &metrics, &control, &calibration)
+            .expect("calibration hotspot should build");
+        let retained = calibration.snapshot().memory_reserved_bytes;
+        let peak = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(peak >= retained);
+        assert!(retained > 0);
+        assert_eq!(snapshot.snapshot.hot_shards.len(), 1);
+        assert_eq!(snapshot.snapshot.tenant_hotspots.len(), 1);
+        drop(snapshot);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(calibration_budget.snapshot().active_queries, 0);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = budget_with_memory_limit(Some(peak));
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let snapshot = build_from_local_tracker(&tracker, &metrics, &control, &exact)
+            .expect("the exact hotspot peak should pass");
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            peak
+        );
+        drop(snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().active_queries, 0);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_budget = budget_with_memory_limit(Some(peak.saturating_sub(1)));
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = build_from_local_tracker(&tracker, &metrics, &control, &one_under)
+            .expect_err("one byte below the hotspot peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, peak);
+            }
+            other => panic!("unexpected rebalance hotspot error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the failed reservation must precede the tracker clone"
+        );
+        drop(one_under);
+        let one_under_after = one_under_budget.snapshot();
+        assert_eq!(one_under_after.active_queries, 0);
+        assert_eq!(one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
     fn accounted_hotspot_retains_and_releases_its_result_guard() {
         let budget =
             QueryBudget::new(QueryBudgetLimits::default()).expect("test budget should build");
@@ -1041,10 +1598,21 @@ mod tests {
             labels: vec![Label::new(tenant::TENANT_LABEL, "team-a")],
         }];
 
-        let snapshot =
-            build_cluster_hotspot_snapshot_with_execution(&metrics, None, None, None, &execution)
-                .expect("accounted hotspot transform should succeed");
-        assert_eq!(snapshot.tenant_hotspots.len(), 1);
+        let snapshot = build_cluster_hotspot_snapshot_with_execution(
+            &metrics,
+            None,
+            None,
+            Some("team-a"),
+            &execution,
+        )
+        .expect("accounted hotspot transform should succeed");
+        assert!(
+            snapshot
+                .tenant_hotspots
+                .iter()
+                .any(|tenant| tenant.tenant_id == "team-a"),
+            "the accounted result must retain the fixture tenant even when the process-global tracker contains other identities"
+        );
         assert!(execution.snapshot().memory_reserved_bytes > 0);
         assert!(execution.snapshot().intermediate_vector_size >= 1);
         assert!(budget.snapshot().shared_reserved_memory_bytes > 0);

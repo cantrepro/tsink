@@ -1,9 +1,9 @@
 use super::{
-    elapsed_nanos_u64, Arc, AtomicBool, AtomicU8, BackgroundWorkerRuntimeState,
-    BackgroundWorkerSupervisorState, ChunkStorage, Compactor, Duration, Instant,
-    MaintenancePassSelection, Mutex, Ordering, PendingPersistedSegmentDiff, Result,
-    StorageObservabilityCounters, StorageRuntimeMode, TsinkError, DEFAULT_FLUSH_INTERVAL,
-    STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
+    elapsed_nanos_u64, Arc, AtomicBool, AtomicU64, AtomicU8, BackgroundPostFlushCleanFenceCursor,
+    BackgroundWorkerRuntimeState, BackgroundWorkerSupervisorState, ChunkStorage, Compactor,
+    Duration, Instant, MaintenancePassSelection, MemoryAccountingState, Mutex, Ordering,
+    PendingPersistedSegmentDiff, Result, StorageObservabilityCounters, StorageRuntimeMode,
+    TsinkError, DEFAULT_FLUSH_INTERVAL, STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
 };
 use crate::engine::tombstone::TombstoneMap;
 use parking_lot::RwLock;
@@ -258,6 +258,11 @@ impl ChunkStorage {
         lifecycle: std::sync::Weak<AtomicU8>,
         compaction_lock: Arc<Mutex<()>>,
         post_flush_replacement_data_path: Option<PathBuf>,
+        post_flush_clean_fence_cursor: Arc<Mutex<BackgroundPostFlushCleanFenceCursor>>,
+        post_flush_marker_generation: Arc<AtomicU64>,
+        memory: Arc<MemoryAccountingState>,
+        maintenance_max_items_per_pass: usize,
+        maintenance_max_bytes_per_pass: u64,
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
         tombstones: Arc<RwLock<TombstoneMap>>,
@@ -297,8 +302,13 @@ impl ChunkStorage {
                         compaction_interval,
                         || Self::lock_compaction_gate(compaction_lock.as_ref()),
                         || {
-                            Self::compact_next_background_compactor_with_changes(
+                            let attempted = Self::compact_next_background_compactor_with_bounded_post_flush_fence(
                                 post_flush_replacement_data_path.as_deref(),
+                                post_flush_clean_fence_cursor.as_ref(),
+                                post_flush_marker_generation.as_ref(),
+                                memory.as_ref(),
+                                maintenance_max_items_per_pass,
+                                maintenance_max_bytes_per_pass,
                                 numeric_compactor.as_ref(),
                                 blob_compactor.as_ref(),
                                 prefer_blob,
@@ -309,7 +319,9 @@ impl ChunkStorage {
                                     persisted_index_dirty.store(true, Ordering::SeqCst);
                                 },
                             )?;
-                            prefer_blob = !prefer_blob;
+                            if attempted {
+                                prefer_blob = !prefer_blob;
+                            }
                             Ok(())
                         },
                     ) {
@@ -339,6 +351,11 @@ impl ChunkStorage {
                         .as_deref()
                         .and_then(Path::parent)
                         .map(Path::to_path_buf),
+                    Arc::clone(&self.coordination.background_post_flush_clean_fence_cursor),
+                    Arc::clone(&self.coordination.post_flush_marker_generation),
+                    Arc::clone(&self.memory),
+                    self.runtime.maintenance_max_items_per_pass,
+                    self.runtime.maintenance_max_bytes_per_pass,
                     self.persisted.numeric_compactor.clone(),
                     self.persisted.blob_compactor.clone(),
                     Arc::clone(&self.visibility.tombstones),
